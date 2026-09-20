@@ -368,6 +368,7 @@ impl Engine {
                 parent,
             )?;
         }
+        import::record_conversation_scope(&self.storage, file_path, &conversation_id);
         // Check if file is unchanged (mtime match = fully imported, nothing new)
         if self.storage.is_file_imported(file_path)? {
             return Ok(0);

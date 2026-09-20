@@ -1366,6 +1366,137 @@ fn test_incremental_import_only_new_chunks() {
     // The key assertion: no error occurred during incremental import.
 }
 
+/// Test: a conversation's `conversation_scope` row is derived from the
+/// transcript's OWN recorded `cwd`, independent of `chunks.project_name`
+/// (derived from the dash-encoded transcript folder). A session run from a
+/// subdirectory (`.../foo/sub`) is stored under the folder-derived project
+/// "foo-sub", but its scope evidence names "foo" — the project
+/// `resolve_project_from_cwd` (the same function the hook uses at recall
+/// time) resolves that cwd to.
+#[test]
+fn conversation_scope_recorded_from_transcript_cwd_independent_of_chunk_project_name() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+    let projects_dir = tmp.path().join("projects");
+    let project_dir = projects_dir.join("-Users-x-projects-foo-sub");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let jsonl_path = project_dir.join("conv-scope-test.jsonl");
+    let content = r#"{"type":"user","message":{"content":[{"type":"text","text":"Fix the bug"}]},"timestamp":"2026-09-01T10:00:00Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Looking into it"}]},"timestamp":"2026-09-01T10:00:01Z"}
+{"type":"attachment","cwd":"/Users/x/projects/foo/sub"}
+{"type":"user","message":{"content":[{"type":"text","text":"Also check the token refresh logic here please"}]},"timestamp":"2026-09-01T10:00:02Z"}
+"#;
+    std::fs::write(&jsonl_path, content).unwrap();
+
+    let engine = csr_engine::engine::Engine::new(&db_path, &projects_dir).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let count1 = rt.block_on(engine.import_conversations(None)).unwrap();
+    assert!(count1 > 0, "first import should produce chunks");
+
+    let conv_id = "conv-scope-test".to_string();
+    let scopes = engine
+        .storage()
+        .conversation_scopes(std::slice::from_ref(&conv_id))
+        .unwrap();
+    assert_eq!(
+        scopes.get(&conv_id),
+        Some(&"foo".to_string()),
+        "scope evidence must name the project the transcript's own cwd resolves to"
+    );
+
+    // chunks.project_name is untouched: still the dash-decoded folder name.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let project_name: String = conn
+        .query_row(
+            "SELECT project_name FROM chunks WHERE conversation_id = ?1 LIMIT 1",
+            [&conv_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(project_name, "foo-sub");
+    let recorded_at_1: String = conn
+        .query_row(
+            "SELECT recorded_at FROM conversation_scope WHERE conversation_id = ?1",
+            [&conv_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+
+    // A second, unchanged import pass performs ZERO writes to conversation_scope:
+    // the row's recorded_at must not move, and no new chunks are produced.
+    let count2 = rt.block_on(engine.import_conversations(None)).unwrap();
+    assert_eq!(
+        count2, 0,
+        "unchanged transcript should produce no new chunks"
+    );
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let recorded_at_2: String = conn
+        .query_row(
+            "SELECT recorded_at FROM conversation_scope WHERE conversation_id = ?1",
+            [&conv_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded_at_1, recorded_at_2,
+        "an already-scoped, already-imported transcript must not rewrite its scope row"
+    );
+}
+
+/// Test: a transcript imported before this feature existed (no
+/// `conversation_scope` row, but already fully imported — `is_file_imported`
+/// would short-circuit) gets a row on its very next import pass, because the
+/// scope helper is called before that early return.
+#[test]
+fn already_imported_unchanged_transcript_with_no_scope_row_gets_one_on_next_pass() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+    let projects_dir = tmp.path().join("projects");
+    let project_dir = projects_dir.join("-Users-x-projects-bar");
+    std::fs::create_dir_all(&project_dir).unwrap();
+
+    let jsonl_path = project_dir.join("conv-legacy-test.jsonl");
+    let content = r#"{"type":"user","message":{"content":[{"type":"text","text":"Fix the legacy bug please"}]},"timestamp":"2026-09-01T10:00:00Z"}
+{"type":"attachment","cwd":"/Users/x/projects/bar"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"On it, checking the module now"}]},"timestamp":"2026-09-01T10:00:01Z"}
+"#;
+    std::fs::write(&jsonl_path, content).unwrap();
+
+    let engine = csr_engine::engine::Engine::new(&db_path, &projects_dir).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(engine.import_conversations(None)).unwrap();
+
+    let conv_id = "conv-legacy-test".to_string();
+    assert!(engine.storage().has_conversation_scope(&conv_id).unwrap());
+
+    // Simulate a pre-feature import: the transcript was already fully
+    // imported (mtime tracked) but its scope row is missing.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "DELETE FROM conversation_scope WHERE conversation_id = ?1",
+        [&conv_id],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(!engine.storage().has_conversation_scope(&conv_id).unwrap());
+
+    // Next pass: the file is unchanged (is_file_imported short-circuits chunk
+    // parsing), but the scope row must still appear.
+    let count = rt.block_on(engine.import_conversations(None)).unwrap();
+    assert_eq!(
+        count, 0,
+        "unchanged transcript should still produce 0 new chunks"
+    );
+    let scopes = engine
+        .storage()
+        .conversation_scopes(std::slice::from_ref(&conv_id))
+        .unwrap();
+    assert_eq!(scopes.get(&conv_id), Some(&"bar".to_string()));
+}
+
 /// Test: import_current_transcript shared helper works with real transcript.
 #[test]
 fn test_import_current_transcript_helper() {

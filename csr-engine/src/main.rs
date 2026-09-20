@@ -392,6 +392,15 @@ enum BackfillAction {
         #[arg(long)]
         agent_transcripts: bool,
     },
+    /// Record each conversation's scope from its transcript's own recorded
+    /// `cwd` (hook-scope evidence) — walks every transcript under
+    /// `--projects-dir` and writes a `conversation_scope` row wherever one is
+    /// missing and resolvable. Safe to re-run: first writer wins.
+    ConversationScope {
+        /// Print counts without writing any conversation_scope rows.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1120,6 +1129,27 @@ async fn run() -> Result<()> {
         if !dry_run {
             println!("restart Claude Code: the running MCP server holds its own index");
         }
+        return Ok(());
+    }
+
+    if let Some(Commands::Backfill {
+        action: BackfillAction::ConversationScope { dry_run },
+    }) = &args.command
+    {
+        let storage = if *dry_run {
+            csr_engine::storage::Storage::open_read_only(&args.db_path)?
+        } else {
+            if let Some(parent) = args.db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            csr_engine::storage::Storage::open(&args.db_path)?
+        };
+        let stats = csr_engine::import::backfill_conversation_scope(
+            &storage,
+            &args.projects_dir,
+            *dry_run,
+        )?;
+        println!("{}", serde_json::to_string(&stats)?);
         return Ok(());
     }
 

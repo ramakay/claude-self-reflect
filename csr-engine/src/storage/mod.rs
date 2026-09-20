@@ -965,6 +965,33 @@ impl Storage {
         )
     }
 
+    /// `true` iff `conversation_id` already has a `conversation_scope` row.
+    pub fn has_conversation_scope(&self, conversation_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::has_conversation_scope(&conn, conversation_id)
+    }
+
+    /// First-writer-wins insert of a conversation's hook-scope evidence.
+    /// Returns `true` if a row was written, `false` if one already existed.
+    pub fn insert_conversation_scope(
+        &self,
+        conversation_id: &str,
+        cwd: &str,
+        scope_project: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::insert_conversation_scope(&conn, conversation_id, cwd, scope_project)
+    }
+
+    /// Batched `conversation_id -> scope_project` lookup.
+    pub fn conversation_scopes(
+        &self,
+        ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::conversation_scopes(&conn, ids)
+    }
+
     /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
     /// aux-source adapter can rebuild it from scratch on reimport (idempotent even when
     /// the source document shrinks). See `queries::delete_chunks_for_conversation`.

@@ -244,6 +244,7 @@ impl FileWatcher {
                 parent,
             )?;
         }
+        import::record_conversation_scope(&self.storage, file_path, &conv_id);
 
         // Skip if already imported
         if self.storage.is_file_imported(file_path)? {

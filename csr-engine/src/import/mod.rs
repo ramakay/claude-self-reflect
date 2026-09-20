@@ -439,6 +439,128 @@ pub(crate) fn sidechain_parent_message_key(path: &Path) -> Option<String> {
     None
 }
 
+/// The first non-empty top-level `cwd` string field in the transcript's first
+/// 64 lines — Claude Code writes it on early `attachment`-type rows (observed
+/// around line 4), well inside this bound. Malformed lines are skipped, not
+/// fatal; a transcript with no `cwd` field at all (or none within the first
+/// 64 lines) returns `None`, which is the fail-closed evidence case: no scope
+/// row is ever written for it. Modeled on `sidechain_parent_message_key`'s
+/// bounded-read shape.
+pub fn read_transcript_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(64).map_while(Result::ok) {
+        let Ok(parsed) = sonic_rs::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = parsed.get("cwd").and_then(serde_json::Value::as_str) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// What `resolve_conversation_scope` did for one transcript — the CLI
+/// backfill's per-outcome counter; the import-time wrapper
+/// (`record_conversation_scope`) discards this and only logs on `Err`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeOutcome {
+    /// A `conversation_scope` row already existed; nothing was read or written.
+    AlreadyRecorded,
+    /// A row was written (or, under `dry_run`, would have been).
+    Recorded,
+    /// No `cwd` field was found in the transcript's first 64 lines.
+    NoCwd,
+    /// A `cwd` was found but `resolve_project_from_cwd` returned `None`.
+    Unresolved,
+}
+
+/// Core hook-scope-evidence primitive shared by the import-time wrapper and
+/// the CLI backfill. Cheap when the row already exists: one PK lookup, no
+/// file read. Otherwise reads the transcript's recorded `cwd` and, if the
+/// same resolver the hook itself uses at recall time agrees on a project,
+/// records it (first-writer-wins). `dry_run` skips the write but still
+/// reports what would have happened.
+pub(crate) fn resolve_conversation_scope(
+    storage: &crate::storage::Storage,
+    file_path: &Path,
+    conversation_id: &str,
+    dry_run: bool,
+) -> Result<ScopeOutcome> {
+    if storage.has_conversation_scope(conversation_id)? {
+        return Ok(ScopeOutcome::AlreadyRecorded);
+    }
+    let Some(cwd) = read_transcript_cwd(file_path) else {
+        return Ok(ScopeOutcome::NoCwd);
+    };
+    let Some(scope_project) = crate::search::cross_project::resolve_project_from_cwd(&cwd) else {
+        return Ok(ScopeOutcome::Unresolved);
+    };
+    if !dry_run {
+        storage.insert_conversation_scope(conversation_id, &cwd, &scope_project)?;
+    }
+    Ok(ScopeOutcome::Recorded)
+}
+
+/// Import-time helper: record a conversation's hook-scope evidence, but never
+/// fail the import over it. Called from both importer paths, positioned
+/// before the `is_file_imported` early return, so unchanged, already-imported
+/// transcripts get a row on their next visit.
+pub(crate) fn record_conversation_scope(
+    storage: &crate::storage::Storage,
+    file_path: &Path,
+    conversation_id: &str,
+) {
+    if let Err(e) = resolve_conversation_scope(storage, file_path, conversation_id, false) {
+        tracing::warn!(
+            conversation_id,
+            error = %e,
+            "record_conversation_scope failed (non-fatal; import continues)"
+        );
+    }
+}
+
+/// Per-outcome counts for `backfill_conversation_scope`, serialized as-is by
+/// the `conversation-scope` CLI action.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct ConversationScopeStats {
+    pub scanned: usize,
+    pub already_recorded: usize,
+    pub recorded: usize,
+    pub no_cwd: usize,
+    pub unresolved: usize,
+}
+
+/// Walk every transcript under `projects_dir` (main + nested sidechain) and
+/// apply `resolve_conversation_scope` to each. Honors the caller's
+/// `--db-path` (via `storage`) and `--projects-dir` (via `projects_dir`) —
+/// no path is hardcoded here.
+pub fn backfill_conversation_scope(
+    storage: &crate::storage::Storage,
+    projects_dir: &Path,
+    dry_run: bool,
+) -> Result<ConversationScopeStats> {
+    let mut stats = ConversationScopeStats::default();
+    for (dir, _project_name) in discover_projects(projects_dir)? {
+        for file_path in list_conversation_jsonl_files(&dir)? {
+            stats.scanned += 1;
+            let conversation_id = file_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            match resolve_conversation_scope(storage, &file_path, &conversation_id, dry_run)? {
+                ScopeOutcome::AlreadyRecorded => stats.already_recorded += 1,
+                ScopeOutcome::Recorded => stats.recorded += 1,
+                ScopeOutcome::NoCwd => stats.no_cwd += 1,
+                ScopeOutcome::Unresolved => stats.unresolved += 1,
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Cold producer input: reuse the message-coordinate parser and its running
 /// context floor, not the legacy MAX speaker aggregate used for display.
 pub fn transcript_inputs(
@@ -3000,5 +3122,72 @@ mod tests {
         let text = extract_message_text(&msg);
         assert!(!text.contains("sk-abc123"));
         assert!(text.contains("[private]"));
+    }
+
+    // --- read_transcript_cwd ---
+
+    fn write_jsonl(lines: &[String]) -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("t.jsonl");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        temp
+    }
+
+    #[test]
+    fn read_transcript_cwd_finds_cwd_on_line_four() {
+        let lines = vec![
+            r#"{"type":"summary","summary":"s"}"#.to_string(),
+            r#"{"type":"user","message":{"content":"hi"}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":"hey"}}"#.to_string(),
+            r#"{"type":"attachment","cwd":"/Users/x/projects/foo/sub"}"#.to_string(),
+            r#"{"type":"user","message":{"content":"more"}}"#.to_string(),
+        ];
+        let temp = write_jsonl(&lines);
+        let cwd = read_transcript_cwd(&temp.path().join("t.jsonl"));
+        assert_eq!(cwd, Some("/Users/x/projects/foo/sub".to_string()));
+    }
+
+    #[test]
+    fn read_transcript_cwd_returns_none_when_absent() {
+        let lines = vec![
+            r#"{"type":"user","message":{"content":"hi"}}"#.to_string(),
+            r#"{"type":"assistant","message":{"content":"hey"}}"#.to_string(),
+        ];
+        let temp = write_jsonl(&lines);
+        assert_eq!(read_transcript_cwd(&temp.path().join("t.jsonl")), None);
+    }
+
+    #[test]
+    fn read_transcript_cwd_skips_malformed_lines() {
+        let lines = vec![
+            "not json at all {{{".to_string(),
+            "".to_string(),
+            r#"{"type":"attachment","cwd":"/Users/x/projects/bar"}"#.to_string(),
+        ];
+        let temp = write_jsonl(&lines);
+        let cwd = read_transcript_cwd(&temp.path().join("t.jsonl"));
+        assert_eq!(cwd, Some("/Users/x/projects/bar".to_string()));
+    }
+
+    #[test]
+    fn read_transcript_cwd_beyond_line_64_is_none() {
+        let mut lines: Vec<String> = (0..70)
+            .map(|i| format!(r#"{{"type":"user","message":{{"content":"line {i}"}}}}"#))
+            .collect();
+        // Put the only cwd row at line 65 (0-indexed 64) — one past the 64-line bound.
+        lines[64] = r#"{"type":"attachment","cwd":"/Users/x/projects/late"}"#.to_string();
+        let temp = write_jsonl(&lines);
+        assert_eq!(read_transcript_cwd(&temp.path().join("t.jsonl")), None);
+    }
+
+    #[test]
+    fn read_transcript_cwd_empty_string_cwd_is_skipped() {
+        let lines = vec![
+            r#"{"type":"attachment","cwd":""}"#.to_string(),
+            r#"{"type":"attachment","cwd":"/Users/x/projects/real"}"#.to_string(),
+        ];
+        let temp = write_jsonl(&lines);
+        let cwd = read_transcript_cwd(&temp.path().join("t.jsonl"));
+        assert_eq!(cwd, Some("/Users/x/projects/real".to_string()));
     }
 }

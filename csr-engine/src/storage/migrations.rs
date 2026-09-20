@@ -1850,6 +1850,22 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
 
+    // Hook-scope evidence: which project a conversation's OWN recorded `cwd`
+    // resolves to, independent of `chunks.project_name` (derived from the
+    // dash-encoded transcript folder name, which is not always the same
+    // directory a subdirectory-scoped session actually ran from). First
+    // writer wins (`INSERT OR IGNORE` at the call site) — this is evidence
+    // about where the transcript's own recorded activity happened, not a
+    // mutable label to be overwritten by a later pass.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_scope (
+            conversation_id TEXT PRIMARY KEY,
+            cwd             TEXT NOT NULL,
+            scope_project   TEXT NOT NULL,
+            recorded_at     TEXT DEFAULT (datetime('now'))
+        );",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

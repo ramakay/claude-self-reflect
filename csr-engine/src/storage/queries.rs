@@ -3697,6 +3697,66 @@ pub fn get_memory_registry_by_origin_session(
     Ok(out)
 }
 
+// ─── Hook-scope evidence (conversation_scope) ───
+
+/// `true` iff `conversation_id` already has a `conversation_scope` row.
+/// One PK lookup — the cheap path the import-time helper takes on every
+/// already-scoped, already-imported transcript.
+pub fn has_conversation_scope(conn: &Connection, conversation_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversation_scope WHERE conversation_id = ?1)",
+        params![conversation_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+    .map_err(Into::into)
+}
+
+/// First-writer-wins: `INSERT OR IGNORE` against the `conversation_id`
+/// PRIMARY KEY. Returns `true` if a row was written, `false` if one already
+/// existed (no-op) — evidence about where a transcript's own recorded
+/// activity happened is never overwritten by a later pass.
+pub fn insert_conversation_scope(
+    conn: &Connection,
+    conversation_id: &str,
+    cwd: &str,
+    scope_project: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO conversation_scope (conversation_id, cwd, scope_project)
+         VALUES (?1, ?2, ?3)",
+        params![conversation_id, cwd, scope_project],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Batched `conversation_id -> scope_project` lookup for exactly the ids
+/// asked for. Empty input returns an empty map without touching the DB —
+/// callers with nothing to look up (every candidate already project-matched)
+/// pay no query at all.
+pub fn conversation_scopes(conn: &Connection, ids: &[String]) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let sql = format!(
+        "SELECT conversation_id, scope_project FROM conversation_scope \
+         WHERE conversation_id IN ({})",
+        string_placeholders(ids.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (conversation_id, scope_project) = row?;
+        out.insert(conversation_id, scope_project);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4309,5 +4369,63 @@ mod tests {
             .unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
+    }
+
+    #[test]
+    fn conversation_scope_insert_is_first_writer_wins() {
+        let conn = mem();
+        let first =
+            insert_conversation_scope(&conn, "conv-1", "/Users/x/projects/foo", "foo").unwrap();
+        assert!(first, "first insert must write a row");
+
+        // A second insert with a DIFFERENT cwd/scope must not overwrite —
+        // evidence about where a transcript's own recorded activity happened
+        // is never replaced by a later pass.
+        let second =
+            insert_conversation_scope(&conn, "conv-1", "/Users/x/projects/bar", "bar").unwrap();
+        assert!(!second, "second insert on the same id must be a no-op");
+
+        let (cwd, scope): (String, String) = conn
+            .query_row(
+                "SELECT cwd, scope_project FROM conversation_scope WHERE conversation_id = 'conv-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd, "/Users/x/projects/foo");
+        assert_eq!(scope, "foo");
+    }
+
+    #[test]
+    fn conversation_scope_has_row_reflects_insert() {
+        let conn = mem();
+        assert!(!has_conversation_scope(&conn, "conv-2").unwrap());
+        insert_conversation_scope(&conn, "conv-2", "/Users/x/projects/foo", "foo").unwrap();
+        assert!(has_conversation_scope(&conn, "conv-2").unwrap());
+    }
+
+    #[test]
+    fn conversation_scopes_batches_and_skips_missing_ids() {
+        let conn = mem();
+        insert_conversation_scope(&conn, "conv-a", "/Users/x/projects/foo", "foo").unwrap();
+        insert_conversation_scope(&conn, "conv-b", "/Users/x/projects/bar/sub", "bar").unwrap();
+
+        let ids = vec![
+            "conv-a".to_string(),
+            "conv-b".to_string(),
+            "conv-missing".to_string(),
+        ];
+        let scopes = conversation_scopes(&conn, &ids).unwrap();
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes.get("conv-a"), Some(&"foo".to_string()));
+        assert_eq!(scopes.get("conv-b"), Some(&"bar".to_string()));
+        assert_eq!(scopes.get("conv-missing"), None);
+    }
+
+    #[test]
+    fn conversation_scopes_empty_input_touches_nothing() {
+        let conn = mem();
+        let scopes = conversation_scopes(&conn, &[]).unwrap();
+        assert!(scopes.is_empty());
     }
 }
