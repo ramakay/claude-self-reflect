@@ -488,7 +488,15 @@ pub(crate) fn resolve_conversation_scope(
     conversation_id: &str,
     dry_run: bool,
 ) -> Result<ScopeOutcome> {
-    if storage.has_conversation_scope(conversation_id)? {
+    let already_recorded = match storage.has_conversation_scope(conversation_id) {
+        Ok(found) => found,
+        // A dry run opens the database read-only, so migrations never ran. On a
+        // database that predates `conversation_scope` the lookup fails, and
+        // nothing can have been recorded there yet.
+        Err(_) if dry_run => false,
+        Err(e) => return Err(e),
+    };
+    if already_recorded {
         return Ok(ScopeOutcome::AlreadyRecorded);
     }
     let Some(cwd) = read_transcript_cwd(file_path) else {
@@ -3167,6 +3175,22 @@ mod tests {
         let temp = write_jsonl(&lines);
         let cwd = read_transcript_cwd(&temp.path().join("t.jsonl"));
         assert_eq!(cwd, Some("/Users/x/projects/bar".to_string()));
+    }
+
+    #[test]
+    fn dry_run_scope_backfill_survives_a_database_without_the_table() {
+        let lines = vec![r#"{"type":"attachment","cwd":"/Users/x/projects/foo/sub"}"#.to_string()];
+        let temp = write_jsonl(&lines);
+        let path = temp.path().join("t.jsonl");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| Ok(conn.execute_batch("DROP TABLE conversation_scope")?))
+            .unwrap();
+
+        let outcome = resolve_conversation_scope(&storage, &path, "t", true).unwrap();
+        assert_eq!(outcome, ScopeOutcome::Recorded);
+        // A real run still surfaces the missing table rather than hiding it.
+        assert!(resolve_conversation_scope(&storage, &path, "t", false).is_err());
     }
 
     #[test]
