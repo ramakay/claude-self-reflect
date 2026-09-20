@@ -647,13 +647,20 @@ fn check_no_reused_sessions(db_path: &Path, session_ids: &[String]) -> Result<()
 // ─── Readback ───
 
 struct RetrievedRow {
+    rank: i64,
     memory_id: String,
+    source_type: String,
 }
 
+/// Every row the hook recorded for this session's `prompt_submit` impression(s),
+/// in the hook's own write order. This is the FULL exposure list (F5): scoring
+/// only the target chunk's rank throws away everything else the hook exposed,
+/// so two arms with byte-identical target-rank outcomes but different sibling
+/// exposure could not otherwise be told apart.
 fn readback_retrieved(conn: &Connection, session_id: &str) -> Result<Vec<RetrievedRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT it.memory_id \
+            "SELECT it.rank, it.memory_id, it.source_type \
              FROM rerank_exposure_items it \
              JOIN rerank_exposure_impressions imp ON imp.impression_id = it.impression_id \
              WHERE imp.session_id = ?1 AND imp.surface = 'prompt_submit' \
@@ -663,7 +670,9 @@ fn readback_retrieved(conn: &Connection, session_id: &str) -> Result<Vec<Retriev
     let rows = stmt
         .query_map([session_id], |row| {
             Ok(RetrievedRow {
-                memory_id: row.get(0)?,
+                rank: row.get(0)?,
+                memory_id: row.get(1)?,
+                source_type: row.get(2)?,
             })
         })
         .map_err(|e| format!("query retrieved set: {e}"))?;
@@ -732,6 +741,14 @@ struct ScoreLine {
     rendered: bool,
     n_retrieved: usize,
     exposed_projects: BTreeMap<String, i64>,
+    /// F5: the full ordered exposure list the hook recorded for this
+    /// session's prompt_submit impression(s) — `[rank, memory_id,
+    /// source_type]` per row, in the hook's own write order. Scoring only
+    /// the target's rank cannot distinguish two arms whose sibling exposure
+    /// differs but whose target-rank outcome happens to match.
+    exposure: Vec<(i64, String, String)>,
+    /// Sorted rendered memory ids (from `retrieval_events`) for this session.
+    rendered_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -814,6 +831,10 @@ struct Provenance {
     seed: u64,
     engine_init_secs: f64,
     results_hash: String,
+    /// blake3 over just the concatenated per-line `exposure` lists (F5) — lets
+    /// two arms be compared on "the full exposure lists match" with one
+    /// string, independent of `results_hash`'s broader per-line payload.
+    exposure_lists_blake3: String,
 }
 
 /// Identity fields pulled from `index/manifest.json` so a base/fix arm pair
@@ -1111,6 +1132,13 @@ async fn run(config: Config) -> Result<(), String> {
             }
         }
 
+        let exposure: Vec<(i64, String, String)> = retrieved
+            .iter()
+            .map(|r| (r.rank, r.memory_id.clone(), r.source_type.clone()))
+            .collect();
+        let mut rendered_ids: Vec<String> = rendered_set.iter().cloned().collect();
+        rendered_ids.sort();
+
         lines.push(ScoreLine {
             chunk_id: item.chunk_id.clone(),
             conversation_id: item.conversation_id.clone(),
@@ -1119,6 +1147,8 @@ async fn run(config: Config) -> Result<(), String> {
             rendered,
             n_retrieved,
             exposed_projects,
+            exposure,
+            rendered_ids,
         });
     }
     drop(readback_conn);
@@ -1141,6 +1171,20 @@ async fn run(config: Config) -> Result<(), String> {
     let scores_path = config.out_dir.join("scores.ndjson");
     std::fs::write(&scores_path, &scores_bytes)
         .map_err(|e| format!("write {}: {e}", scores_path.display()))?;
+
+    // F5: a hash over just the concatenated per-line exposure lists (not the
+    // whole scores.ndjson) — two arms can be compared for "the full exposure
+    // lists match, not just each target's rank" with this one string, without
+    // either arm's other fields (which are expected to legitimately differ,
+    // e.g. `stored_project`) obscuring the comparison.
+    let mut exposure_lists_bytes: Vec<u8> = Vec::new();
+    for line in &lines {
+        let s = serde_json::to_string(&line.exposure)
+            .map_err(|e| format!("serialize exposure list: {e}"))?;
+        exposure_lists_bytes.extend_from_slice(s.as_bytes());
+        exposure_lists_bytes.push(b'\n');
+    }
+    let exposure_lists_blake3 = blake3::hash(&exposure_lists_bytes).to_hex().to_string();
 
     let sampling_filters = SamplingFilters {
         source: "conversation",
@@ -1222,6 +1266,7 @@ async fn run(config: Config) -> Result<(), String> {
         seed: config.seed,
         engine_init_secs,
         results_hash: results_hash.clone(),
+        exposure_lists_blake3,
     };
 
     let out = SummaryOut { body, provenance };
