@@ -35,6 +35,32 @@
 //!
 //! Optional: CSR_HOOKRECALL_N (default 200), CSR_HOOKRECALL_SEED (default 7).
 //!
+//! Optional replay-hardening knobs:
+//!
+//!   CSR_HOOKRECALL_SAMPLE_IDS      path to either a prior scores.ndjson (each
+//!                                   line's "chunk_id" field is taken) or a
+//!                                   plain newline list of chunk ids. When set,
+//!                                   project sampling is bypassed entirely:
+//!                                   exactly those chunks are loaded, in file
+//!                                   order (a missing id aborts the run).
+//!                                   CSR_HOOKRECALL_SAMPLE_PROJECT becomes
+//!                                   optional in this mode (used only for the
+//!                                   source_project_items_exposed count when
+//!                                   present).
+//!   CSR_HOOKRECALL_EXPECT_MANIFEST blake3 hex of index/manifest.json. When
+//!                                   set, the manifest hash is computed BEFORE
+//!                                   the Engine is constructed and the run
+//!                                   aborts on mismatch. The hash is always
+//!                                   recorded in provenance.
+//!
+//! The run also aborts at startup if CSR_DISABLE_RECURSIVE_HOOKS is set in the
+//! environment (this harness calls `prompt_submit::handle` directly, which does
+//! not itself honor that guard, so a leaked value would silently produce
+//! results a real hook invocation would have suppressed) and aborts before the
+//! first hook call if any synthetic session id this run will use already
+//! appears in `rerank_exposure_impressions` or `retrieval_events` (a reused
+//! scratch DB would double count).
+//!
 //! Run:
 //!   CSR_HOOKRECALL_DB=/tmp/csr-recall/x/db.sqlite \
 //!   CSR_HOOKRECALL_PROJECTS=/tmp/csr-recall/x/projects-empty \
@@ -55,7 +81,7 @@ use csr_engine::engine::Engine;
 use csr_engine::extraction::provenance::is_csr_emission;
 use csr_engine::hooks::{prompt_submit, HookInput};
 use csr_engine::temporal::parse_timestamp;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -174,7 +200,12 @@ struct Config {
     projects_dir: PathBuf,
     out_dir: PathBuf,
     label: String,
-    sample_project: String,
+    /// Required unless `sample_ids_path` is set (explicit-ids mode).
+    sample_project: Option<String>,
+    /// Explicit-ids mode: bypass project sampling, load exactly these ids.
+    sample_ids_path: Option<PathBuf>,
+    /// blake3 hex of `index/manifest.json` the run must match, if set.
+    expect_manifest: Option<String>,
     cwd: PathBuf,
     n: usize,
     seed: u64,
@@ -182,16 +213,42 @@ struct Config {
     now_raw: String,
 }
 
+impl Config {
+    /// Display-safe project label — the real value in normal mode, empty
+    /// string in explicit-ids mode when no project was given.
+    fn sample_project_display(&self) -> String {
+        self.sample_project.clone().unwrap_or_default()
+    }
+}
+
 fn require_env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
 }
 
 fn load_config() -> Result<Config, String> {
+    if std::env::var("CSR_DISABLE_RECURSIVE_HOOKS").is_ok() {
+        return Err(
+            "CSR_DISABLE_RECURSIVE_HOOKS is set in this process's environment — \
+             prompt_submit::handle (called directly by this harness) does not itself \
+             honor that guard, so results would not reflect what a real hook invocation \
+             would have done. Unset it and rerun."
+                .to_string(),
+        );
+    }
+
     let db_path_raw = require_env("CSR_HOOKRECALL_DB")?;
     let projects_dir = PathBuf::from(require_env("CSR_HOOKRECALL_PROJECTS")?);
     let out_dir = PathBuf::from(require_env("CSR_HOOKRECALL_OUT")?);
     let label = require_env("CSR_HOOKRECALL_LABEL")?;
-    let sample_project = require_env("CSR_HOOKRECALL_SAMPLE_PROJECT")?;
+    let sample_ids_path = std::env::var("CSR_HOOKRECALL_SAMPLE_IDS")
+        .ok()
+        .map(PathBuf::from);
+    let sample_project = match std::env::var("CSR_HOOKRECALL_SAMPLE_PROJECT") {
+        Ok(v) => Some(v),
+        Err(_) if sample_ids_path.is_some() => None,
+        Err(_) => return Err("CSR_HOOKRECALL_SAMPLE_PROJECT is required".to_string()),
+    };
+    let expect_manifest = std::env::var("CSR_HOOKRECALL_EXPECT_MANIFEST").ok();
     let cwd_raw = require_env("CSR_HOOKRECALL_CWD")?;
     let now_raw = require_env("CSR_HOOKRECALL_NOW")?;
 
@@ -253,6 +310,8 @@ fn load_config() -> Result<Config, String> {
         out_dir,
         label,
         sample_project,
+        sample_ids_path,
+        expect_manifest,
         cwd,
         n,
         seed,
@@ -308,6 +367,79 @@ fn fetch_raw_candidates(
     Ok(out)
 }
 
+/// Read `CSR_HOOKRECALL_SAMPLE_IDS`'s file: each non-empty line is either a
+/// JSON object carrying a `chunk_id` string field (a prior scores.ndjson) or a
+/// bare chunk id. Order is preserved — explicit-ids mode replays in file order,
+/// never the seeded hash order the normal sampler uses.
+fn read_explicit_ids(path: &Path) -> Result<(Vec<String>, Vec<u8>), String> {
+    let raw = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let id = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => match value.get("chunk_id").and_then(|v| v.as_str()) {
+                Some(chunk_id) => chunk_id.to_string(),
+                None => line.to_string(),
+            },
+            Err(_) => line.to_string(),
+        };
+        ids.push(id);
+    }
+    Ok((ids, raw))
+}
+
+/// Load exactly `ids`, in `ids` order. Errors if any id has no matching chunk.
+fn fetch_candidates_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<RawCandidate>, String> {
+    if ids.is_empty() {
+        return Err("CSR_HOOKRECALL_SAMPLE_IDS file contained no chunk ids".to_string());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT id, conversation_id, timestamp, content FROM chunks WHERE id IN ({placeholders})"
+    );
+    let mut stmt = sql_prepare(conn, &sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok(RawCandidate {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                timestamp: row.get(2)?,
+                content: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query candidates by id: {e}"))?;
+    let mut by_id: HashMap<String, RawCandidate> = HashMap::new();
+    for r in rows {
+        let c = r.map_err(|e| format!("read candidate-by-id row: {e}"))?;
+        by_id.insert(c.id.clone(), c);
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    let mut missing = Vec::new();
+    for id in ids {
+        match by_id.remove(id) {
+            Some(c) => out.push(c),
+            None => missing.push(id.clone()),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "CSR_HOOKRECALL_SAMPLE_IDS named {} chunk id(s) not present in the DB: {}",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
+fn sql_prepare<'a>(conn: &'a Connection, sql: &str) -> Result<rusqlite::Statement<'a>, String> {
+    conn.prepare(sql).map_err(|e| format!("prepare: {e}"))
+}
+
 fn fetch_conversation_ids(conn: &Connection) -> Result<HashSet<String>, String> {
     let mut stmt = conn
         .prepare("SELECT DISTINCT conversation_id FROM chunks")
@@ -359,6 +491,65 @@ struct SampleItem {
     prompt: String,
 }
 
+/// Age + harness-block + self-referential filters, shared by the seeded
+/// sampler and explicit-ids replay.
+fn pool_filter_candidate(
+    c: RawCandidate,
+    now: DateTime<Utc>,
+    counters: &mut SkipCounters,
+) -> Option<PoolItem> {
+    let parsed = parse_timestamp(&c.timestamp);
+    let Some(parsed) = parsed else {
+        counters.excluded_age_window += 1;
+        return None;
+    };
+    let age_days = (now - parsed).num_seconds() as f64 / 86400.0;
+    if !(0.0..=SAMPLE_AGE_MAX_DAYS).contains(&age_days) {
+        counters.excluded_age_window += 1;
+        return None;
+    }
+    if mirror_opens_with_harness_block(&c.content) {
+        counters.skipped_harness_opening += 1;
+        return None;
+    }
+    if mirror_is_self_referential_noise(&c.content) {
+        counters.skipped_self_referential += 1;
+        return None;
+    }
+    Some(PoolItem {
+        id: c.id,
+        conversation_id: c.conversation_id,
+        content: c.content,
+    })
+}
+
+/// The mirrored `early_exit` predicates, shared by the seeded sampler and
+/// explicit-ids replay.
+fn accept_pool_item(item: PoolItem, counters: &mut SkipCounters) -> Option<SampleItem> {
+    let prompt: String = item.content.chars().take(PROMPT_TRUNCATE_CHARS).collect();
+    if mirror_is_harness_turn(&prompt) {
+        counters.skipped_harness_turn_early_exit += 1;
+        return None;
+    }
+    if mirror_is_continuation_prompt(&prompt) {
+        counters.skipped_continuation += 1;
+        return None;
+    }
+    if prompt.starts_with('/') {
+        counters.skipped_slash += 1;
+        return None;
+    }
+    if prompt.trim().len() < 3 {
+        counters.skipped_short += 1;
+        return None;
+    }
+    Some(SampleItem {
+        chunk_id: item.id,
+        conversation_id: item.conversation_id,
+        prompt,
+    })
+}
+
 /// Build the eligible pool (id-ordered, age + harness-block + self-referential
 /// filters applied) then walk it in seeded hash order, accepting up to `n`
 /// prompts that also survive the mirrored `early_exit` predicates.
@@ -369,31 +560,10 @@ fn build_sample(
     n: usize,
     counters: &mut SkipCounters,
 ) -> Vec<SampleItem> {
-    let mut pool: Vec<PoolItem> = Vec::new();
-    for c in raw {
-        let Some(parsed) = parse_timestamp(&c.timestamp) else {
-            counters.excluded_age_window += 1;
-            continue;
-        };
-        let age_days = (now - parsed).num_seconds() as f64 / 86400.0;
-        if !(0.0..=SAMPLE_AGE_MAX_DAYS).contains(&age_days) {
-            counters.excluded_age_window += 1;
-            continue;
-        }
-        if mirror_opens_with_harness_block(&c.content) {
-            counters.skipped_harness_opening += 1;
-            continue;
-        }
-        if mirror_is_self_referential_noise(&c.content) {
-            counters.skipped_self_referential += 1;
-            continue;
-        }
-        pool.push(PoolItem {
-            id: c.id,
-            conversation_id: c.conversation_id,
-            content: c.content,
-        });
-    }
+    let pool: Vec<PoolItem> = raw
+        .into_iter()
+        .filter_map(|c| pool_filter_candidate(c, now, counters))
+        .collect();
 
     // Seeded deterministic order: blake3(seed:chunk_id) hex ascending.
     let mut hashed: Vec<(String, PoolItem)> = pool
@@ -412,30 +582,66 @@ fn build_sample(
         if sample.len() >= n {
             break;
         }
-        let prompt: String = item.content.chars().take(PROMPT_TRUNCATE_CHARS).collect();
-        if mirror_is_harness_turn(&prompt) {
-            counters.skipped_harness_turn_early_exit += 1;
-            continue;
+        if let Some(accepted) = accept_pool_item(item, counters) {
+            sample.push(accepted);
         }
-        if mirror_is_continuation_prompt(&prompt) {
-            counters.skipped_continuation += 1;
-            continue;
-        }
-        if prompt.starts_with('/') {
-            counters.skipped_slash += 1;
-            continue;
-        }
-        if prompt.trim().len() < 3 {
-            counters.skipped_short += 1;
-            continue;
-        }
-        sample.push(SampleItem {
-            chunk_id: item.id,
-            conversation_id: item.conversation_id,
-            prompt,
-        });
     }
     sample
+}
+
+/// Explicit-ids replay: apply the same pool + accept filters as `build_sample`,
+/// but walk `raw` in its given (file) order and never cap or hash-reorder — the
+/// caller already named the exact set it wants.
+fn build_explicit_sample(
+    raw: Vec<RawCandidate>,
+    now: DateTime<Utc>,
+    counters: &mut SkipCounters,
+) -> Vec<SampleItem> {
+    let pool: Vec<PoolItem> = raw
+        .into_iter()
+        .filter_map(|c| pool_filter_candidate(c, now, counters))
+        .collect();
+    pool.into_iter()
+        .filter_map(|item| accept_pool_item(item, counters))
+        .collect()
+}
+
+/// Abort if any of `session_ids` already appears in `rerank_exposure_impressions`
+/// or `retrieval_events`. Session ids are deterministic (`SESSION_NAMESPACE` v5
+/// of label:seed:index), so a reused scratch DB would otherwise silently merge
+/// this run's writes with a prior run's and double count.
+fn check_no_reused_sessions(db_path: &Path, session_ids: &[String]) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    let conn = open_ro(db_path)?;
+    let placeholders = session_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let params: Vec<&dyn rusqlite::ToSql> = session_ids
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    for table in ["rerank_exposure_impressions", "retrieval_events"] {
+        let sql =
+            format!("SELECT session_id FROM {table} WHERE session_id IN ({placeholders}) LIMIT 1");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare reused-session check on {table}: {e}"))?;
+        let hit: Option<String> = stmt
+            .query_row(params.as_slice(), |row| row.get(0))
+            .optional()
+            .map_err(|e| format!("query reused-session check on {table}: {e}"))?;
+        if let Some(sid) = hit {
+            return Err(format!(
+                "synthetic session id {sid} already has a row in {table} — this scratch DB was \
+                 already used for a run with this label+seed; double counting would result"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ─── Readback ───
@@ -451,7 +657,7 @@ fn readback_retrieved(conn: &Connection, session_id: &str) -> Result<Vec<Retriev
              FROM rerank_exposure_items it \
              JOIN rerank_exposure_impressions imp ON imp.impression_id = it.impression_id \
              WHERE imp.session_id = ?1 AND imp.surface = 'prompt_submit' \
-             ORDER BY imp.shown_at, it.rank",
+             ORDER BY imp.shown_at, it.rank, it.memory_id",
         )
         .map_err(|e| format!("prepare retrieved query: {e}"))?;
     let rows = stmt
@@ -548,6 +754,14 @@ struct SamplingFilters {
     now: String,
 }
 
+/// Present when `CSR_HOOKRECALL_SAMPLE_IDS` bypassed project sampling —
+/// identifies exactly which file drove the run and its exact bytes.
+#[derive(Serialize)]
+struct ExplicitSampleProvenance {
+    path: String,
+    blake3: String,
+}
+
 #[derive(Serialize)]
 struct SummaryBody {
     label: String,
@@ -571,6 +785,8 @@ struct SummaryBody {
     sampling_filters: SamplingFilters,
     retrieved_set_semantics: String,
     mirrored_predicates: Vec<String>,
+    /// `Some` iff `CSR_HOOKRECALL_SAMPLE_IDS` was set for this run.
+    explicit_sample: Option<ExplicitSampleProvenance>,
 }
 
 #[derive(Serialize)]
@@ -716,17 +932,39 @@ async fn run(config: Config) -> Result<(), String> {
     std::fs::create_dir_all(&config.out_dir)
         .map_err(|e| format!("create output dir {}: {e}", config.out_dir.display()))?;
 
-    eprintln!(
-        "hook_recall_replay: sampling candidates for project {}",
-        config.sample_project
-    );
+    let mut explicit_sample_provenance: Option<ExplicitSampleProvenance> = None;
     let sample_conn = open_ro(&config.db_path)?;
-    let raw = fetch_raw_candidates(&sample_conn, &config.sample_project)?;
-    let conversation_ids = fetch_conversation_ids(&sample_conn)?;
+    let (raw, conversation_ids) = if let Some(ids_path) = &config.sample_ids_path {
+        eprintln!(
+            "hook_recall_replay: loading explicit sample ids from {}",
+            ids_path.display()
+        );
+        let (ids, raw_file_bytes) = read_explicit_ids(ids_path)?;
+        let raw = fetch_candidates_by_ids(&sample_conn, &ids)?;
+        let conversation_ids = fetch_conversation_ids(&sample_conn)?;
+        explicit_sample_provenance = Some(ExplicitSampleProvenance {
+            path: ids_path.to_string_lossy().to_string(),
+            blake3: blake3::hash(&raw_file_bytes).to_hex().to_string(),
+        });
+        (raw, conversation_ids)
+    } else {
+        let sample_project = config
+            .sample_project
+            .as_deref()
+            .expect("sample_project required outside explicit-ids mode");
+        eprintln!("hook_recall_replay: sampling candidates for project {sample_project}");
+        let raw = fetch_raw_candidates(&sample_conn, sample_project)?;
+        let conversation_ids = fetch_conversation_ids(&sample_conn)?;
+        (raw, conversation_ids)
+    };
     drop(sample_conn);
 
     let mut counters = SkipCounters::default();
-    let sample = build_sample(raw, config.now, config.seed, config.n, &mut counters);
+    let sample = if config.sample_ids_path.is_some() {
+        build_explicit_sample(raw, config.now, &mut counters)
+    } else {
+        build_sample(raw, config.now, config.seed, config.n, &mut counters)
+    };
     eprintln!(
         "hook_recall_replay: sampled {} prompts (n_skipped={})",
         sample.len(),
@@ -747,6 +985,33 @@ async fn run(config: Config) -> Result<(), String> {
             ));
         }
         sessions.push((item, sid));
+    }
+
+    // A reused scratch DB (a second run against the same clone with the same
+    // label/seed) would double count: the synthetic session ids are
+    // deterministic, so a stale row from a prior run would still be there
+    // when this run's readback queries for it.
+    let session_ids: Vec<String> = sessions.iter().map(|(_, sid)| sid.clone()).collect();
+    check_no_reused_sessions(&config.db_path, &session_ids)?;
+
+    // CSR_HOOKRECALL_EXPECT_MANIFEST: compute + check the index manifest hash
+    // BEFORE the Engine (and its HNSW load) exists, so a mismatch aborts
+    // before any work is wasted.
+    let index_dir = config
+        .db_path
+        .parent()
+        .map(|p| p.join("index"))
+        .unwrap_or_else(|| PathBuf::from("index"));
+    let index_manifest = read_index_manifest_identity(&index_dir);
+    if let Some(expected) = &config.expect_manifest {
+        if &index_manifest.blake3 != expected {
+            return Err(format!(
+                "CSR_HOOKRECALL_EXPECT_MANIFEST ({expected}) does not match {}'s blake3 ({}) — \
+                 refusing to run against a differently-dumped index",
+                index_dir.join("manifest.json").display(),
+                index_manifest.blake3
+            ));
+        }
     }
 
     eprintln!(
@@ -839,7 +1104,9 @@ async fn run(config: Config) -> Result<(), String> {
                 .unwrap_or_else(|| NOT_A_CHUNK_KEY.to_string());
             *exposed_projects.entry(key.clone()).or_insert(0) += 1;
             *exposed_project_totals.entry(key.clone()).or_insert(0) += 1;
-            if key == config.sample_project {
+            // Only counted when a sample project was given — in explicit-ids
+            // mode without one, "the source project" has no meaning.
+            if config.sample_project.as_deref() == Some(key.as_str()) {
                 source_project_items_exposed += 1;
             }
         }
@@ -847,7 +1114,7 @@ async fn run(config: Config) -> Result<(), String> {
         lines.push(ScoreLine {
             chunk_id: item.chunk_id.clone(),
             conversation_id: item.conversation_id.clone(),
-            stored_project: config.sample_project.clone(),
+            stored_project: config.sample_project_display(),
             retrieved_rank,
             rendered,
             n_retrieved,
@@ -885,7 +1152,7 @@ async fn run(config: Config) -> Result<(), String> {
         content_length_max_chars: CONTENT_LEN_MAX,
         opens_with_harness_block_excluded: true,
         self_referential_noise_excluded: true,
-        sample_project: config.sample_project.clone(),
+        sample_project: config.sample_project_display(),
         requested_n: config.n,
         seed: config.seed,
         cwd: cwd_string.clone(),
@@ -921,6 +1188,7 @@ async fn run(config: Config) -> Result<(), String> {
             search candidates'; hit_at_5 is the operative metric."
             .to_string(),
         mirrored_predicates: mirrored_predicates_list(),
+        explicit_sample: explicit_sample_provenance,
     };
 
     let body_json =
@@ -932,13 +1200,11 @@ async fn run(config: Config) -> Result<(), String> {
     let db_size_bytes = std::fs::metadata(&config.db_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let index_dir = config
-        .db_path
-        .parent()
-        .map(|p| p.join("index"))
-        .unwrap_or_else(|| PathBuf::from("index"));
+    // `index_dir` / `index_manifest` were computed before Engine::new (the
+    // CSR_HOOKRECALL_EXPECT_MANIFEST check) — reused here rather than
+    // re-read, since the run never dumps the index and the value cannot
+    // have changed.
     let index_dir_size_bytes = dir_size_bytes(&index_dir);
-    let index_manifest = read_index_manifest_identity(&index_dir);
 
     let provenance = Provenance {
         build_commit: env!("CSR_BUILD_GIT_SHA").to_string(),
