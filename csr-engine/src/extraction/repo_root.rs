@@ -130,6 +130,116 @@ fn walk_up_for_git_dir(dir: &Path) -> Option<String> {
     None
 }
 
+/// Cache: directory → resolved repo identity (or `None`). Separate from
+/// [`CACHE`] above — that one keys on `--show-toplevel` (a repo's own
+/// checkout path, which DIFFERS between a main checkout and each of its
+/// linked worktrees); this one keys on `--git-common-dir` (shared by all of
+/// them), so the two must never be merged into one cache.
+type IdentityCache = Mutex<HashMap<PathBuf, Option<String>>>;
+
+static IDENTITY_CACHE: OnceLock<IdentityCache> = OnceLock::new();
+
+fn identity_cache() -> &'static IdentityCache {
+    IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve a stable identity for the repository (if any) `dir` belongs to:
+/// the absolute git COMMON directory. This is one identity for a repository's
+/// main checkout, every subdirectory beneath it, AND every one of its linked
+/// worktrees — a linked worktree's own `.git` is a FILE pointing at
+/// `<main>/.git/worktrees/<name>`, and `--git-common-dir` resolves through
+/// that back to the one shared `.git` every worktree points at. Two unrelated
+/// repositories that happen to share a leaf directory name (e.g.
+/// `/opt/customer-a/app` and `/srv/customer-b/app`) get two different
+/// identities, unlike a bare leaf-name or `resolve_project_from_cwd` label.
+///
+/// `dir` must exist and be a directory — unlike [`repo_root_for_file`]'s
+/// deleted-file fallback, this answers for a `cwd` a live session is claiming
+/// to have run from right now, not a historical row whose file may be gone.
+///
+/// Fail-soft everywhere: no `git` binary, `dir` outside any work tree, `dir`
+/// missing, any I/O error — all `None`, never a guess. If the `git`
+/// subprocess itself cannot run (binary missing), falls back to walking up
+/// for the nearest ancestor containing a `.git` DIRECTORY and returns its
+/// canonical path; a `.git` FILE (a linked worktree, without `git` available
+/// to resolve it back to the shared common dir) yields `None` rather than
+/// being treated as its own separate identity.
+pub fn repo_identity_for_dir(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    if let Some(hit) = identity_cache()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(dir).cloned())
+    {
+        return hit;
+    }
+
+    let identity = git_common_dir(dir).or_else(|| walk_up_for_git_directory(dir));
+
+    if let Ok(mut guard) = identity_cache().lock() {
+        guard.insert(dir.to_path_buf(), identity.clone());
+    }
+    identity
+}
+
+/// Spawn `git -C <dir> rev-parse --path-format=absolute --git-common-dir`.
+/// `None` on any failure. Ambient `GIT_*` env is stripped for the same reason
+/// as [`git_toplevel`] above — this resolver answers for the explicit `dir`
+/// it was given, never for a hook's ambient repository.
+fn git_common_dir(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let output = cmd
+        .arg("-C")
+        .arg(dir)
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(canonicalize_or_as_is(trimmed))
+}
+
+/// Walk up from `dir` for the nearest ancestor (including `dir` itself) with
+/// a `.git` DIRECTORY — never a FILE (a linked worktree's `.git` is a file,
+/// and without `git` available there is no way to resolve it back to the
+/// shared common dir, so it must answer `None`, not invent a separate
+/// identity for it).
+fn walk_up_for_git_directory(dir: &Path) -> Option<String> {
+    let mut cur = Some(dir.to_path_buf());
+    while let Some(d) = cur {
+        let candidate = d.join(".git");
+        if candidate.is_dir() {
+            return Some(canonicalize_or_as_is(&candidate.to_string_lossy()));
+        }
+        cur = d.parent().map(|p| p.to_path_buf());
+    }
+    None
+}
+
+fn canonicalize_or_as_is(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +303,121 @@ mod tests {
             .as_ref()
             .map(|g| fs::canonicalize(g).unwrap_or_else(|_| PathBuf::from(g)));
         assert_eq!(got_canon, Some(expected));
+    }
+
+    // --- repo_identity_for_dir ---
+
+    /// `git init -q <repo>` with ambient `GIT_*` stripped (see the module-doc
+    /// rationale above). Returns `false` — never panics — when `git` itself
+    /// is unavailable, so callers can skip cleanly instead of failing.
+    fn git_init(repo: &Path) -> bool {
+        let mut init = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                init.env_remove(&k);
+            }
+        }
+        init.arg("init")
+            .arg("-q")
+            .arg(repo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        let mut cmd = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn subdir_of_a_repo_shares_the_repo_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        if !git_init(&repo) {
+            return; // git unavailable — skip cleanly
+        }
+        let root_identity = repo_identity_for_dir(&repo);
+        let sub_identity = repo_identity_for_dir(&repo.join("sub"));
+        assert!(root_identity.is_some());
+        assert_eq!(root_identity, sub_identity);
+    }
+
+    #[test]
+    fn linked_worktree_shares_the_main_checkouts_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git_init(&repo) {
+            return;
+        }
+        // A worktree needs at least one commit to branch from.
+        fs::write(repo.join("f.txt"), "x").unwrap();
+        if !git(&repo, &["add", "-A"]) || !git(&repo, &["commit", "-q", "-m", "init"]) {
+            return; // git present but commit failed (no identity configured, etc.) — skip
+        }
+        let worktree = tmp.path().join("wt");
+        if !git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "wtbranch",
+            ],
+        ) {
+            return; // git present but worktree add failed — skip cleanly
+        }
+
+        let main_identity = repo_identity_for_dir(&repo);
+        let worktree_identity = repo_identity_for_dir(&worktree);
+        assert!(main_identity.is_some());
+        assert_eq!(main_identity, worktree_identity);
+    }
+
+    #[test]
+    fn two_repos_with_the_same_leaf_name_have_different_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("customer-a").join("app");
+        let b = tmp.path().join("customer-b").join("app");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        if !git_init(&a) || !git_init(&b) {
+            return;
+        }
+
+        let ia = repo_identity_for_dir(&a);
+        let ib = repo_identity_for_dir(&b);
+        assert!(ia.is_some());
+        assert!(ib.is_some());
+        assert_ne!(ia, ib);
+    }
+
+    #[test]
+    fn non_git_directory_has_no_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plain");
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(repo_identity_for_dir(&dir), None);
+    }
+
+    #[test]
+    fn nonexistent_directory_has_no_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("does-not-exist");
+        assert_eq!(repo_identity_for_dir(&gone), None);
     }
 }
