@@ -677,6 +677,16 @@ impl Storage {
         queries::mark_file_imported(&conn, path, chunks)
     }
 
+    /// Transcript files recorded per conversation id. See
+    /// `queries::import_paths_for_conversations`.
+    pub fn import_paths_for_conversations(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::import_paths_for_conversations(&conn, conversation_ids)
+    }
+
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
     /// for aux-source adapters. See `queries::get_import_state_mtime`.
     pub fn get_import_state_mtime(&self, file_path: &str) -> Result<Option<String>> {

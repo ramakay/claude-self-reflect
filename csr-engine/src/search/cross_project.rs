@@ -63,6 +63,26 @@ pub fn normalize_project_scope(project: Option<&str>) -> (Option<String>, String
     }
 }
 
+/// Encode a path the way Claude Code names its `~/.claude/projects` folders.
+///
+/// Claude Code does `path.replace(/[^a-zA-Z0-9]/g, "-")` (verified in the shipped
+/// binary, 2.1.226). That regex carries no `u` flag, so it runs over UTF-16 code
+/// units, not scalar values: an accented BMP character costs one dash, but a
+/// non-BMP one (emoji, rarer CJK) is a surrogate pair and costs *two*.
+pub(crate) fn encode_project_folder(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else {
+            for _ in 0..c.len_utf16() {
+                out.push('-');
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -104,6 +104,44 @@ fn git_toplevel(dir: &Path) -> Option<String> {
     }
 }
 
+/// The repository `dir` belongs to right now, as the canonical path of its git
+/// COMMON directory: one value for a main checkout, every subdirectory under
+/// it and every linked worktree, and a different value for a nested repository
+/// or submodule sitting inside that checkout.
+///
+/// For comparing two directories in the same instant, never for storing: a
+/// path says nothing about which repository lived there last month. No
+/// fallback of any kind. `git` missing, too old for `--path-format` (before
+/// 2.31), a `safe.directory` refusal, a directory that is gone: all `None`,
+/// and every caller treats `None` as "not the same repository".
+pub fn git_common_dir(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let output = cmd
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(trimmed).ok()?;
+    Some(resolved.to_string_lossy().into_owned())
+}
+
 /// Backfill fallback: walk up from `dir` looking for the nearest ancestor
 /// (including `dir` itself) that contains a `.git` entry — matches
 /// `extraction::repo_path::canonical_repo_path`'s ancestor walk, but returns
@@ -159,6 +197,67 @@ mod tests {
             .as_ref()
             .map(|g| fs::canonicalize(g).unwrap_or_else(|_| PathBuf::from(g)));
         assert_eq!(got_canon, Some(expected));
+    }
+
+    /// `git <args>` with ambient `GIT_*` stripped (see the test above).
+    /// `false` when git is unavailable, so callers skip instead of failing.
+    fn git(args: &[&str], dir: &Path) -> bool {
+        let mut cmd = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn common_dir_is_shared_by_subdirectories_and_worktrees_but_not_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("sub/deeper")).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        let expected = fs::canonicalize(repo.join(".git"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(git_common_dir(&repo), Some(expected.clone()));
+        assert_eq!(
+            git_common_dir(&repo.join("sub/deeper")),
+            Some(expected.clone())
+        );
+
+        // A linked worktree answers with the main repository's common dir.
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        if git(&["add", "a.txt"], &repo)
+            && git(&["commit", "-q", "-m", "a"], &repo)
+            && git(&["worktree", "add", "-q", "../wt", "-b", "wt"], &repo)
+        {
+            assert_eq!(
+                git_common_dir(&tmp.path().join("wt")),
+                Some(expected.clone())
+            );
+        }
+
+        // A repository nested inside the checkout is its own repository.
+        let nested = repo.join("vendor/other");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(git(&["init", "-q"], &nested));
+        let nested_id = git_common_dir(&nested).unwrap();
+        assert_ne!(nested_id, expected);
+
+        assert_eq!(git_common_dir(tmp.path()), None);
+        assert_eq!(git_common_dir(&tmp.path().join("missing")), None);
     }
 
     #[test]

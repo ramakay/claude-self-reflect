@@ -65,6 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these options. `CSR_HEADLESS_USER_SETTINGS=0` goes further and drops user,
   project and local settings with `--setting-sources ""`, for installs whose
   children need nothing from them.
+- **A session started in a subdirectory recalls its own history.** The prompt
+  hook kept a recalled chunk only when its stored project label equalled the
+  project resolved from the asking cwd. The label comes from the folder Claude
+  Code files a transcript under, so a session started in `repo/sub` is stored
+  as `repo-sub` while the hook asks for `repo`, and none of it ever came back.
+  A chunk under another label now also passes when every transcript file
+  recorded for its conversation sits in a folder that decodes, on the
+  filesystem as it is now, to exactly one existing directory inside the
+  asker's checkout, and git reports the same repository for that directory.
+  Nothing is stored: no migration, no re-import, history is visible on the
+  first prompt after upgrading. A directory that is gone, a name that decodes
+  two ways (`repo/sub` next to a sibling `repo-sub`), a nested repository, a
+  missing or pre-2.31 git: all keep the exact match. Measured against the
+  published 9.5.6 on real transcripts, 30 prompts per frame: subdirectory
+  sessions 0 -> 23 source chunks injected, root sessions 27 -> 26, a sibling
+  repository 0 and 0, and 0 again once a sibling directory with the same
+  encoded name exists.
 - **Search overfetches past deleted index points.** `hnsw_rs` cannot delete,
   so a removed chunk or reflection only loses its id and the dead point still
   wins neighbour slots. Search asked for exactly `limit` neighbours and

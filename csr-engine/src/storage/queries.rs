@@ -1052,6 +1052,34 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
     Ok(())
 }
 
+/// Every `import_state.file_path` recorded for each of `conversation_ids`.
+/// An id with no row is absent from the map. The id is a transcript file stem,
+/// which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`), so one id
+/// can carry several paths and the caller has to account for all of them.
+pub fn import_paths_for_conversations(
+    conn: &Connection,
+    conversation_ids: &[String],
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    if conversation_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; conversation_ids.len()].join(",");
+    let sql = format!(
+        "SELECT conversation_id, file_path FROM import_state
+         WHERE conversation_id IN ({placeholders}) ORDER BY file_path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(conversation_ids.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (conversation_id, file_path) = row?;
+        out.entry(conversation_id).or_default().push(file_path);
+    }
+    Ok(out)
+}
+
 /// Read the stored mtime for an import_state row keyed by an arbitrary `file_path`
 /// string. Aux-source adapters (plans, tasks, ...) key `import_state` by a synthetic
 /// id (e.g. `"plan:<slug>"`) that isn't a real filesystem path, so `is_file_imported`

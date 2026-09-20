@@ -14,7 +14,7 @@
 //!
 //! Always returns Ok(()) — never blocks Claude Code (catch-all wrapper).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
@@ -283,7 +283,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // 2. Search chunks (past conversations) — scoped to current project
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
     let chunk_results =
-        search_chunks_with_vec(engine, &query_vec, 15, 0.55, &current_project).await;
+        search_chunks_with_vec(engine, &query_vec, 15, 0.55, &current_project, cwd).await;
 
     // 3. Search reflections (stored insights) — scoped to current project
     let reflection_results =
@@ -741,6 +741,26 @@ async fn search_chunks_with_vec(
     limit: usize,
     min_score: f32,
     project: &str,
+    cwd: &Path,
+) -> Vec<RawResult> {
+    search_chunks_with_vec_core(engine, query_vec, limit, min_score, project, |paths| {
+        super::scope_folder::conversations_in_asker_repo(paths, cwd)
+    })
+    .await
+}
+
+/// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
+/// decide which conversations widen without a filesystem or `git`. `same_repo`
+/// is called at most once, and only when some candidate's label differs from
+/// `project` and has a recorded transcript path: a prompt whose candidates all
+/// match by label costs no lookup beyond the one batched query.
+async fn search_chunks_with_vec_core(
+    engine: &Engine,
+    query_vec: &[f32],
+    limit: usize,
+    min_score: f32,
+    project: &str,
+    same_repo: impl FnOnce(&HashMap<String, Vec<String>>) -> HashSet<String>,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -767,14 +787,42 @@ async fn search_chunks_with_vec(
             .flatten()
             .collect()
     });
+    // A candidate filed under another label can still be this repository: a
+    // session started in a subdirectory is labelled after that subdirectory's
+    // folder. See `scope_folder` for the rule. A failed lookup widens nothing.
+    let mut mismatched: Vec<String> = Vec::new();
+    if !project.is_empty() {
+        for chunk in fetched.iter().filter(|c| c.project_name != project) {
+            if !mismatched.contains(&chunk.conversation_id) {
+                mismatched.push(chunk.conversation_id.clone());
+            }
+        }
+    }
+    let widened = if mismatched.is_empty() {
+        HashSet::new()
+    } else {
+        match storage.import_paths_for_conversations(&mismatched) {
+            Ok(paths) if !paths.is_empty() => same_repo(&paths),
+            Ok(_) => HashSet::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "import_state lookup failed; exact project match only");
+                HashSet::new()
+            }
+        }
+    };
+
     let mut chunk_by_id: std::collections::HashMap<String, _> =
         fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
 
     for result in &results {
         {
             if let Some(chunk) = chunk_by_id.remove(&result.id) {
-                // Project scope filter: skip chunks from other projects
-                if !project.is_empty() && chunk.project_name != project {
+                // Project scope filter: the label matches, or the conversation
+                // was filed from inside the asker's repository.
+                if !project.is_empty()
+                    && chunk.project_name != project
+                    && !widened.contains(&chunk.conversation_id)
+                {
                     continue;
                 }
 
@@ -1247,6 +1295,114 @@ pub fn symbol_overlap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine over three chunks filed under three labels, with the transcript
+    /// paths `import_state` would hold for them. Returns the recalled ids and
+    /// the path map `same_repo` was handed (`None` when it was never called).
+    async fn recall_across_labels(
+        project: &str,
+        import_rows: &[(&str, &str)],
+        widen: &[&str],
+    ) -> (Vec<String>, Option<HashMap<String, Vec<String>>>) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, conversation_id, label) in [
+            ("root-chunk", "root-session", "repo"),
+            ("sub-chunk", "sub-session", "repo-sub"),
+            ("other-chunk", "other-session", "other"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: label.into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: format!("work recorded under {label}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        for (file_path, conversation_id) in import_rows {
+            storage
+                .upsert_import_state_explicit(file_path, conversation_id, 1, "0")
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let seen = std::cell::RefCell::new(None);
+        let mut ids: Vec<String> =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 10, 0.0, project, |paths| {
+                *seen.borrow_mut() = Some(paths.clone());
+                widen.iter().map(|id| id.to_string()).collect()
+            })
+            .await
+            .into_iter()
+            .filter_map(|result| result.memory_id)
+            .collect();
+        ids.sort();
+        (ids, seen.into_inner())
+    }
+
+    const IMPORT_ROWS: [(&str, &str); 3] = [
+        (
+            "/cc/projects/-u-projects-repo/root-session.jsonl",
+            "root-session",
+        ),
+        (
+            "/cc/projects/-u-projects-repo-sub/sub-session.jsonl",
+            "sub-session",
+        ),
+        (
+            "/cc/projects/-u-projects-other/other-session.jsonl",
+            "other-session",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn a_conversation_the_repository_test_accepts_is_recalled_under_another_label() {
+        let (ids, seen) = recall_across_labels("repo", &IMPORT_ROWS, &["sub-session"]).await;
+        assert_eq!(ids, ["root-chunk", "sub-chunk"]);
+        // Only the candidates whose label differs are put to the test, with
+        // every path recorded for them; the exact match never is.
+        let seen = seen.expect("same_repo is consulted when a label differs");
+        let mut asked: Vec<&String> = seen.keys().collect();
+        asked.sort();
+        assert_eq!(asked, ["other-session", "sub-session"]);
+        assert_eq!(
+            seen["sub-session"],
+            ["/cc/projects/-u-projects-repo-sub/sub-session.jsonl"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_the_repository_test_rejects_stays_out() {
+        let (ids, _) = recall_across_labels("repo", &IMPORT_ROWS, &[]).await;
+        assert_eq!(ids, ["root-chunk"]);
+    }
+
+    #[tokio::test]
+    async fn no_recorded_transcript_path_means_no_repository_test_at_all() {
+        // Differing labels but nothing in import_state: nothing to decide on.
+        let (ids, seen) = recall_across_labels("repo", &[], &["sub-session"]).await;
+        assert_eq!(ids, ["root-chunk"]);
+        assert!(seen.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_search_never_consults_the_repository_test() {
+        let (ids, seen) = recall_across_labels("", &IMPORT_ROWS, &[]).await;
+        assert_eq!(ids, ["other-chunk", "root-chunk", "sub-chunk"]);
+        assert!(seen.is_none());
+    }
 
     // --- episode recency ranking (Route B stale-anchor fix) ---
 
