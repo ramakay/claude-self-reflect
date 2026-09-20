@@ -26,6 +26,13 @@
 //!   ever written a baseline, [`badge_unread`] returns `None` and the
 //!   statusline drops the segment — it never renders `0`, which would claim
 //!   "nothing new" on evidence nobody gathered.
+//! * The badge counts **dreams, in the unit the journal page lists them**:
+//!   active consequence clusters whose receipt-bearing conclusion was never
+//!   delivered. It used to count every receipted per-symbol verdict across
+//!   every project — 12,326 on a corpus whose journal page showed 6 dreams,
+//!   growing ~10x faster than the one-per-session channels could drain it.
+//!   A number the reader cannot find at the URL printed next to it is not a
+//!   badge.
 //! * A delivery row proves the user was shown something. Its absence proves
 //!   nothing, so nothing is ever inferred from it beyond "do not repeat".
 
@@ -35,20 +42,21 @@ use sha2::{Digest, Sha256};
 
 use super::Storage;
 
-/// `meta` key: number of undelivered conclusions counted by the last pass.
+/// `meta` key: number of unread dreams counted by the last pass. Kept for
+/// `status` consumers; the arithmetic runs on [`META_BADGE_IDS`].
 pub const META_BADGE_TOTAL: &str = "dream_badge_total";
+/// `meta` key: JSON array of the conclusion ids behind [`META_BADGE_TOTAL`],
+/// bounded by the journal's active-cluster cap. Its presence is also the
+/// unit marker: a baseline written before the badge counted dreams has a
+/// total but no id list, and [`badge_unread`] refuses to render it.
+pub const META_BADGE_IDS: &str = "dream_badge_ids";
 /// `meta` key: RFC3339 timestamp of the pass that wrote
 /// [`META_BADGE_TOTAL`] — reported by `status` so the badge can say *when*
-/// it was measured. It is never used for the arithmetic itself (see
-/// [`META_BADGE_CURSOR`]).
+/// it was measured. It is never used for the arithmetic itself: unread is
+/// "which of the measured ids still have no delivery row", which needs no
+/// timestamp and cannot double-count a delivery written in the same second
+/// as the baseline.
 pub const META_BADGE_AT: &str = "dream_badge_at";
-/// `meta` key: `MAX(dream_deliveries.id)` at the moment the baseline was
-/// measured. Deliveries are subtracted by **id**, not by timestamp:
-/// `delivered_at` is `datetime('now')` at one-second granularity, so a
-/// delivery written in the same second as the baseline could otherwise be
-/// counted on both sides of the subtraction. An autoincrement id cannot
-/// alias.
-pub const META_BADGE_CURSOR: &str = "dream_badge_cursor";
 
 /// Which surface showed a dream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,85 +290,86 @@ pub fn claim_delivery(
         .unwrap_or(false)
 }
 
-/// Count distinct dreams delivered after row id `cursor`.
-fn deliveries_after(conn: &Connection, cursor: i64) -> Result<i64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT dream_id) FROM dream_deliveries WHERE id > ?1",
-        params![cursor],
-        |row| row.get(0),
-    )?;
-    Ok(count)
-}
-
-/// Highest delivery row id, or 0 when nothing has ever been delivered.
-fn delivery_cursor(conn: &Connection) -> Result<i64> {
-    let cursor: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(id), 0) FROM dream_deliveries",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(cursor)
-}
-
-/// Count the receipt-bearing conclusions that have never been delivered on
-/// any channel. Run at the end of a pass, not on a hot path.
-pub fn count_undelivered(conn: &Connection) -> Result<i64> {
-    let mut projects = conn.prepare("SELECT DISTINCT project FROM witness_ledger")?;
-    let names: Vec<String> = projects
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut undelivered = 0_i64;
-    for project in names {
-        for headline in receipted_conclusions(conn, &project)? {
-            let delivered: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM dream_deliveries WHERE dream_id = ?1",
-                params![headline.id],
-                |row| row.get(0),
-            )?;
-            if delivered == 0 {
-                undelivered += 1;
-            }
+/// Conclusion ids of the dreams the journal page lists as active and that no
+/// channel has delivered yet. Run at the end of a pass, not on a hot path —
+/// the cluster feed parses every v2 episode.
+///
+/// Only a receipt-bearing conclusion counts (honesty rule 1), and the list is
+/// bounded by the feed's own per-partition cap, so the badge can never exceed
+/// what the reader finds at the journal URL.
+pub fn unread_dream_ids(conn: &Connection) -> Result<Vec<String>> {
+    let feed = super::dream_clusters::load_dream_clusters(conn, None)?;
+    let mut ids: Vec<String> = Vec::new();
+    for cluster in &feed.active {
+        let conclusion = &cluster.conclusion;
+        let Some(receipt) = conclusion
+            .receipt_oid
+            .as_deref()
+            .map(str::trim)
+            .filter(|receipt| !receipt.is_empty())
+        else {
+            continue;
+        };
+        let id = conclusion_id(
+            &cluster.project,
+            &conclusion.file,
+            conclusion.symbol.as_deref(),
+            &conclusion.verdict,
+            receipt,
+        );
+        if !ids.contains(&id) && !delivered_on_any_channel(conn, &id)? {
+            ids.push(id);
         }
     }
-    Ok(undelivered)
+    Ok(ids)
+}
+
+fn delivered_on_any_channel(conn: &Connection, dream_id: &str) -> Result<bool> {
+    let delivered: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dream_deliveries WHERE dream_id = ?1",
+        params![dream_id],
+        |row| row.get(0),
+    )?;
+    Ok(delivered > 0)
 }
 
 /// Recompute the statusline badge baseline. Called at the end of a completed
 /// pass; fail-soft, since a badge is never worth failing a cycle over.
 pub fn refresh_badge_baseline(storage: &Storage) {
-    let total = match storage.with_connection(count_undelivered) {
-        Ok(total) => total,
+    let ids = match storage.with_connection(unread_dream_ids) {
+        Ok(ids) => ids,
         Err(error) => {
             tracing::debug!(%error, "dream badge baseline unavailable (non-fatal)");
             return;
         }
     };
-    let cursor = storage.with_connection(delivery_cursor).unwrap_or(0);
-    let _ = storage.set_meta(META_BADGE_TOTAL, &total.to_string());
-    let _ = storage.set_meta(META_BADGE_CURSOR, &cursor.to_string());
+    let Ok(encoded) = serde_json::to_string(&ids) else {
+        return;
+    };
+    let _ = storage.set_meta(META_BADGE_IDS, &encoded);
+    let _ = storage.set_meta(META_BADGE_TOTAL, &ids.len().to_string());
     let _ = storage.set_meta(META_BADGE_AT, &chrono::Utc::now().to_rfc3339());
 }
 
-/// Unread dream count for the statusline: the last pass's measured baseline
-/// minus the dreams delivered since that pass. `None` when no pass has
-/// written a baseline — the caller must then render nothing at all, never a
-/// zero.
+/// Unread dream count for the statusline: the dreams the last pass measured
+/// as unread, minus those delivered since. `None` when no pass has written a
+/// baseline **in this unit** — the caller must then render nothing at all,
+/// never a zero, and never a total measured in the old per-verdict unit.
 pub fn badge_unread(storage: &Storage) -> Option<i64> {
-    let total = storage
-        .get_meta(META_BADGE_TOTAL)
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())?;
-    let cursor = storage
-        .get_meta(META_BADGE_CURSOR)
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let delivered = storage
-        .with_connection(|conn| deliveries_after(conn, cursor))
-        .unwrap_or(0);
-    Some((total - delivered).max(0))
+    let raw = storage.get_meta(META_BADGE_IDS).ok().flatten()?;
+    let ids: Vec<String> = serde_json::from_str(&raw).ok()?;
+    let still_unread = storage
+        .with_connection(|conn| {
+            let mut unread = 0_i64;
+            for id in &ids {
+                if !delivered_on_any_channel(conn, id)? {
+                    unread += 1;
+                }
+            }
+            Ok(unread)
+        })
+        .ok()?;
+    Some(still_unread)
 }
 
 /// When the badge baseline was measured, for `status`. `None` until a pass
@@ -533,21 +542,81 @@ mod tests {
         );
     }
 
+    /// One open todo whose session touched `file` — enough for the cluster
+    /// feed to raise one active dream once `file` carries a verdict.
+    fn seed_open_item(storage: &Storage, project: &str, session: &str, file: &str) {
+        let json = format!(
+            r#"{{"schema":"v2","session_id":"{session}","project":"{project}","timestamp":"2026-01-01T00:00:00Z","todos":[{{"content":"finish the leftover work from {session}","status":"pending"}}],"files_modified":["{file}"]}}"#
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES (?1, ?2, '[]', '2026-01-01T00:00:00Z')",
+                    params![format!("ep-{session}"), json],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn badge_counts_undelivered_conclusions_and_falls_as_they_are_delivered() {
+    fn badge_counts_journal_dreams_not_raw_verdicts() {
         let storage = Storage::open_memory().unwrap();
-        seed(&storage, "proj", "src/a.rs", "alpha_fn", Some("abc1234"));
-        seed(&storage, "proj", "src/b.rs", "beta_fn", Some("def5678"));
+        // Three receipted verdicts, but only one of them sits under an open
+        // item — the journal page lists ONE dream, so the badge says 1.
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/a.rs",
+            "alpha_fn",
+            Some("abc1234"),
+        );
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/b.rs",
+            "beta_fn",
+            Some("def5678"),
+        );
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/c.rs",
+            "gamma_fn",
+            Some("0123abc"),
+        );
+        seed_open_item(&storage, "proj", "sess-1", "/repo/src/a.rs");
+        refresh_badge_baseline(&storage);
+        assert_eq!(badge_unread(&storage), Some(1));
+    }
+
+    #[test]
+    fn badge_falls_as_a_dream_is_delivered() {
+        let storage = Storage::open_memory().unwrap();
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/a.rs",
+            "alpha_fn",
+            Some("abc1234"),
+        );
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/b.rs",
+            "beta_fn",
+            Some("def5678"),
+        );
+        seed_open_item(&storage, "proj", "sess-1", "/repo/src/a.rs");
+        seed_open_item(&storage, "proj", "sess-2", "/repo/src/b.rs");
         refresh_badge_baseline(&storage);
         assert_eq!(badge_unread(&storage), Some(2));
 
-        let first = storage
-            .with_connection(|conn| receipted_conclusions(conn, "proj"))
-            .unwrap()
-            .remove(0);
+        let first = storage.with_connection(unread_dream_ids).unwrap().remove(0);
         assert!(claim_delivery(
             &storage,
-            &first.id,
+            &first,
             DeliveryChannel::Prompt,
             Some("s1")
         ));
@@ -557,24 +626,31 @@ mod tests {
             "a delivered dream stops being unread"
         );
 
+        // A delivery of something the badge never counted changes nothing.
+        assert!(claim_delivery(
+            &storage,
+            "not-a-journal-dream",
+            DeliveryChannel::Recap,
+            Some("s1")
+        ));
+        assert_eq!(badge_unread(&storage), Some(1));
+
         // A pass re-measuring after the delivery agrees with the arithmetic.
         refresh_badge_baseline(&storage);
         assert_eq!(badge_unread(&storage), Some(1));
     }
 
     #[test]
-    fn badge_never_goes_negative() {
+    fn a_baseline_in_the_old_per_verdict_unit_is_never_rendered() {
         let storage = Storage::open_memory().unwrap();
-        storage.set_meta(META_BADGE_TOTAL, "1").unwrap();
-        storage.set_meta(META_BADGE_CURSOR, "0").unwrap();
-        for id in ["a", "b", "c"] {
-            assert!(claim_delivery(
-                &storage,
-                id,
-                DeliveryChannel::Prompt,
-                Some("s")
-            ));
-        }
-        assert_eq!(badge_unread(&storage), Some(0));
+        storage.set_meta(META_BADGE_TOTAL, "12326").unwrap();
+        storage
+            .set_meta(META_BADGE_AT, "2026-09-20T03:11:38Z")
+            .unwrap();
+        assert_eq!(
+            badge_unread(&storage),
+            None,
+            "a total with no id list was measured in verdicts, not dreams"
+        );
     }
 }

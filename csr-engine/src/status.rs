@@ -324,8 +324,8 @@ impl DreamBudgetUsage {
 /// Statusline badge state (delivery channel (a)).
 #[derive(Serialize, Debug, PartialEq, Eq, Default)]
 pub struct DreamBadgeStatus {
-    /// Dreams measured as undelivered by the last pass, minus those
-    /// delivered since. `None` until a pass has measured a baseline — the
+    /// Dreams the journal page lists as active that the last pass measured
+    /// as undelivered, minus those delivered since. `None` until a pass has measured a baseline — the
     /// statusline then shows no badge at all rather than a fabricated zero.
     pub unread: Option<i64>,
     /// When that baseline was measured.
@@ -1605,7 +1605,8 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
         ));
     }
     let dream_total = report.dream.dreams.total();
-    if dream_total > 0 || report.dream.corrections_7d > 0 {
+    let dream_segment_open = dream_total > 0 || report.dream.corrections_7d > 0;
+    if dream_segment_open {
         out.push_str(&format!(" | ☾ {dream_total} dreams"));
         if report.dream.corrections_7d > 0 {
             out.push_str(&format!(" · {} corrections", report.dream.corrections_7d));
@@ -1624,11 +1625,17 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     // them. `None` (no pass has ever measured a baseline) prints nothing at
     // all — a `0` here would claim "nothing new" on evidence nobody
     // gathered. A measured 0 is also silent: the badge exists to point at
-    // something unread.
+    // something unread. It joins the dreams segment when one is open — one
+    // moon per line, not two.
     if let Some(unread) = report.dream.badge.unread.filter(|&count| count > 0) {
-        match report.dream.server.url.as_deref() {
-            Some(url) => out.push_str(&format!(" | ☾ {unread} unread {url}")),
-            None => out.push_str(&format!(" | ☾ {unread} unread")),
+        out.push_str(if dream_segment_open {
+            " · "
+        } else {
+            " | ☾ "
+        });
+        out.push_str(&format!("{unread} unread"));
+        if let Some(url) = report.dream.server.url.as_deref() {
+            out.push_str(&format!(" {url}"));
         }
     }
     // v10 "dreaming" Full channel: only speak up when there's something to
@@ -2203,6 +2210,21 @@ mod tests {
         report.dream.server.url = Some("http://127.0.0.1:7373/".into());
         let line = format_compact(&report, 0);
         assert!(line.contains("☾ 3 unread http://127.0.0.1:7373/"), "{line}");
+    }
+
+    #[test]
+    fn compact_badge_joins_the_dreams_segment_instead_of_adding_a_second_moon() {
+        let mut report = base_report();
+        report.dream.dreams.unfinished = 5;
+        report.dream.corrections_7d = 4;
+        report.dream.badge.unread = Some(6);
+        report.dream.server.url = Some("http://127.0.0.1:7373/".into());
+        let line = format_compact(&report, 0);
+        assert!(
+            line.contains("☾ 5 dreams · 4 corrections · 6 unread http://127.0.0.1:7373/"),
+            "{line}"
+        );
+        assert_eq!(line.matches('☾').count(), 1, "{line}");
     }
 
     #[test]
