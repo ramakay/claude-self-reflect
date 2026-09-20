@@ -490,7 +490,6 @@ impl ClaimedStdout {
     }
 }
 
-/// Main hook dispatcher. Parses stdin, routes to handler.
 /// Whether a hook can run on an import-only engine that skips loading and
 /// persisting the HNSW index (see [`crate::engine::Engine::new_import_only`]).
 ///
@@ -510,14 +509,35 @@ impl ClaimedStdout {
 /// Edit/Write. On a 300k-chunk corpus each invocation was paying a full
 /// `HnswIo::load_hnsw` walk plus a ~644MB dump of the graph and data files.
 ///
+/// `subagent-stop` reads a child transcript, embeds its intent events and
+/// writes them to SQLite; it never queries or inserts into the index. It is
+/// the most frequent hook in an agent-heavy session (275 of 728 fires in one
+/// measured 10-hour window) and was paying a ~700ms graph load for an ~11ms
+/// body.
+///
 /// Everything else stays on the full engine. `session-start` and
 /// `prompt-submit` query the index (recap, predictive injection) and genuinely
-/// need it loaded.
+/// need it loaded, except for the prompts [`hook_needs_index`] rules out.
 pub fn is_import_only_hook(hook_name: &str) -> bool {
     matches!(
         hook_name,
-        "precompact" | "session-end" | "stop" | "post-tool-use"
+        "precompact" | "session-end" | "stop" | "post-tool-use" | "subagent-stop"
     )
+}
+
+/// Whether this invocation will query the HNSW index, decided from the hook
+/// name and its parsed input before the engine is built.
+///
+/// Loading the graph is the dominant cost of a hook process on a large corpus
+/// (measured 2026-09-19 at 259k chunks: ~880ms of a 1.1s wall clock for a
+/// `prompt-submit` whose handler returned in 0ms). `prompt-submit` leaves
+/// before any search for harness turns, continuation prompts, slash commands
+/// and bare acknowledgments, so those run on the import-only engine too.
+pub fn hook_needs_index(hook_name: &str, input: &HookInput) -> bool {
+    if is_import_only_hook(hook_name) {
+        return false;
+    }
+    !(hook_name == "prompt-submit" && prompt_submit::exits_before_search(input.prompt.as_deref()))
 }
 
 /// Whether a hook is allowed to persist HNSW changes to the on-disk cache
@@ -565,7 +585,17 @@ pub fn hook_may_persist_index(hook_name: &str) -> bool {
     matches!(hook_name, "stop")
 }
 
-pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
+/// Main hook dispatcher: routes the parsed input to its handler.
+///
+/// `input` is read by the caller, ahead of engine construction, because
+/// [`hook_needs_index`] picks the engine from it; `stdin_elapsed` is how long
+/// that read took, kept for the timing line.
+pub async fn dispatch_hook(
+    hook_name: &str,
+    engine: &Engine,
+    input: HookInput,
+    stdin_elapsed: std::time::Duration,
+) -> Result<()> {
     // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
     // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
     // the user's hook config and would otherwise fire CSR hooks — most damagingly
@@ -578,9 +608,11 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
         return Ok(());
     }
 
+    // Phase marks stay cumulative from the start of the stdin read, as they
+    // were when this function did the read itself.
     let t0 = std::time::Instant::now();
-    let input = read_stdin_json();
-    let t_stdin = t0.elapsed();
+    let t_stdin = stdin_elapsed;
+    let elapsed = || stdin_elapsed + t0.elapsed();
 
     // Field-presence diagnostic: hook=0ms exits are indistinguishable from a
     // missing prompt without this (live debugging 2026-07-30).
@@ -595,7 +627,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
 
     let cwd = resolve_hook_cwd(input.cwd.as_deref());
 
-    let t_setup = t0.elapsed();
+    let t_setup = elapsed();
 
     let result = match hook_name {
         "session-start" => session_start::handle(&input, engine, &cwd).await,
@@ -611,7 +643,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
             Ok(())
         }
     };
-    let t_hook = t0.elapsed();
+    let t_hook = elapsed();
 
     // Persist HNSW changes only if this hook's role allows it — see
     // `hook_may_persist_index`, the sole allowlist. Injection-critical hooks
@@ -623,7 +655,7 @@ pub async fn dispatch_hook(hook_name: &str, engine: &Engine) -> Result<()> {
     if hook_may_persist_index(hook_name) {
         engine.flush_index().await;
     }
-    let t_total = t0.elapsed();
+    let t_total = elapsed();
 
     // Resolve project name for logging
     let cwd_str = cwd.to_string_lossy();
@@ -857,6 +889,8 @@ mod tests {
         // durable copy went to SQLite first.
         assert!(is_import_only_hook("stop"));
         assert!(is_import_only_hook("post-tool-use"));
+        // subagent-stop embeds intent events and writes them to SQLite.
+        assert!(is_import_only_hook("subagent-stop"));
         // session-start/prompt-submit query the index and MUST keep it loaded.
         // A regression that added either here would make it search an empty
         // index and silently return nothing.
@@ -866,6 +900,38 @@ mod tests {
                 "{full} must not be treated as import-only"
             );
         }
+    }
+
+    #[test]
+    fn the_index_is_loaded_only_for_invocations_that_search() {
+        let with_prompt = |prompt: &str| HookInput {
+            prompt: Some(prompt.to_string()),
+            ..Default::default()
+        };
+        assert!(hook_needs_index(
+            "prompt-submit",
+            &with_prompt("fix the statusline badge count")
+        ));
+        for index_free in [
+            "continue",
+            "/compact",
+            "ok",
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
+        ] {
+            assert!(
+                !hook_needs_index("prompt-submit", &with_prompt(index_free)),
+                "{index_free}"
+            );
+        }
+        assert!(!hook_needs_index("prompt-submit", &HookInput::default()));
+        // The prompt carve-out belongs to prompt-submit alone: session-start
+        // has no prompt and always searches.
+        assert!(hook_needs_index("session-start", &HookInput::default()));
+        assert!(hook_needs_index("session-briefing", &HookInput::default()));
+        assert!(!hook_needs_index(
+            "stop",
+            &with_prompt("fix the statusline badge count")
+        ));
     }
 
     #[test]
