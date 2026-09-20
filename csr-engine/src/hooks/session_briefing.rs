@@ -213,6 +213,7 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
             .arg("json")
             // User hooks off and no transcript left behind for the watcher to
             // re-import. User settings stay loaded unless the user opts out.
+            // Built-in tools (Bash, Edit, Write, Agent, ...) are off either way.
             .args(&isolation_args)
             .arg("--strict-mcp-config")
             .arg("--mcp-config")

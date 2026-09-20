@@ -64,6 +64,11 @@ fn keeps_user_settings(flag: Option<&str>) -> bool {
 ///   SessionStart hook. With `CSR_HEADLESS_USER_SETTINGS=0` the child gets
 ///   `--setting-sources ""` instead: no user, project or local settings at
 ///   all. Neither option reaches hooks or plugins set by managed policy.
+/// * `--tools ""` empties the built-in tool set (Bash, Edit, Write, Agent,
+///   ...), which the child otherwise inherits under the user's permission
+///   mode regardless of which settings/MCP options above are in play. Every
+///   call site's prompt is a pure text task (summary/extraction), so no
+///   built-in tool is ever needed.
 /// * `--no-session-persistence` writes no transcript, so the watcher never
 ///   re-imports the headless call as if it were a real conversation.
 ///
@@ -83,8 +88,11 @@ pub fn isolation_args() -> Vec<String> {
     isolation_args_for(&help, headless_keeps_user_settings())
 }
 
-/// [`isolation_args`] for a given `claude --help` text. No option is
-/// variadic, so the result can sit anywhere before `--mcp-config`.
+/// [`isolation_args`] for a given `claude --help` text. `--tools ""` is
+/// variadic in the claude CLI (it would swallow a following positional
+/// argument), so every caller must place `isolation_args` after the prompt
+/// positional. The other options here are not variadic and could sit
+/// anywhere before `--mcp-config`.
 fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
     let mut args = Vec::new();
     if keep_user_settings {
@@ -94,6 +102,14 @@ fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
         }
     } else if help.contains("--setting-sources") {
         args.push("--setting-sources".to_string());
+        args.push(String::new());
+    }
+    // `--tools <` (not the prose mention of `--tools` in `--allowedTools` /
+    // `--disallowedTools` help lines) empties the built-in tool set. Placed
+    // before `--no-session-persistence` so an option flag always follows it
+    // on a current CLI, rather than leaving it as the trailing argument.
+    if help.contains("--tools <") {
+        args.push("--tools".to_string());
         args.push(String::new());
     }
     if help.contains("--no-session-persistence") {
@@ -256,13 +272,19 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    const HELP_CURRENT: &str = "  --no-session-persistence   Disable session persistence\n  --setting-sources <sources>   Comma-separated list\n  --settings <file-or-json>   Path to a settings JSON file\n";
+    const HELP_CURRENT: &str = "  --no-session-persistence   Disable session persistence\n  --setting-sources <sources>   Comma-separated list\n  --settings <file-or-json>   Path to a settings JSON file\n  --tools <tools...>   Comma-separated list of tools to allow\n";
 
     #[test]
     fn isolation_drops_settings_and_the_transcript() {
         assert_eq!(
             isolation_args_for(HELP_CURRENT, false),
-            ["--setting-sources", "", "--no-session-persistence"]
+            [
+                "--setting-sources",
+                "",
+                "--tools",
+                "",
+                "--no-session-persistence"
+            ]
         );
     }
 
@@ -287,8 +309,43 @@ mod tests {
             [
                 "--settings",
                 r#"{"disableAllHooks":true}"#,
+                "--tools",
+                "",
                 "--no-session-persistence"
             ]
+        );
+    }
+
+    #[test]
+    fn isolation_empties_the_builtin_tool_set_when_the_cli_lists_it() {
+        assert_eq!(
+            isolation_args_for("  --tools <tools...>   Comma-separated list\n", false),
+            ["--tools", ""]
+        );
+        assert_eq!(
+            isolation_args_for("  --tools <tools...>   Comma-separated list\n", true),
+            ["--tools", ""]
+        );
+    }
+
+    #[test]
+    fn isolation_tools_flag_is_never_triggered_by_allowed_or_disallowed_tools() {
+        let help = "  --allowedTools, --allowed-tools <tools...>   Allow tools\n  --disallowedTools, --disallowed-tools <tools...>   Disallow tools\n";
+        assert!(isolation_args_for(help, false).is_empty());
+        assert!(isolation_args_for(help, true).is_empty());
+    }
+
+    #[test]
+    fn isolation_puts_tools_before_no_session_persistence_so_a_flag_always_follows() {
+        // `--tools ""` is variadic; on a current CLI it must never be the
+        // trailing argument of isolation_args itself.
+        let args = isolation_args_for(HELP_CURRENT, false);
+        let tools_pos = args.iter().position(|a| a == "--tools").unwrap();
+        assert_eq!(args[tools_pos + 1], "");
+        assert_eq!(
+            args.get(tools_pos + 2).map(String::as_str),
+            Some("--no-session-persistence"),
+            "an option flag must follow --tools \"\" so it never swallows a positional arg"
         );
     }
 

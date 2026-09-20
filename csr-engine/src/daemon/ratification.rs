@@ -162,6 +162,7 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
             cmd.args(["-p", "-", "--output-format", "json"]);
             // User hooks off and no transcript left behind for the watcher to
             // re-import. User settings stay loaded unless the user opts out.
+            // Built-in tools (Bash, Edit, Write, Agent, ...) are off either way.
             cmd.args(&isolation_args);
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
