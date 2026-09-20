@@ -94,8 +94,16 @@ const EXACT_SCAN_THRESHOLD: usize = 256;
 // `blank_orphan_reflections` only blank the id-map slot, so a rewritten chunk
 // leaves a dead point in the graph that can still win a nearest-neighbour
 // slot. `search_index` overfetches by the number of dead points (capped here)
-// so tombstones near the query don't eat live result slots.
+// so tombstones near the query don't eat live result slots. The cap bounds the
+// cost, so it also bounds the promise: a query with more than this many dead
+// points nearer than its live results can still come back short.
 const TOMBSTONE_OVERFETCH_CAP: usize = 256;
+
+/// Neighbours to ask hnsw_rs for so that `limit` live results survive the
+/// dead-id filter. Exactly `limit` when nothing is dead.
+fn fetch_budget(limit: usize, dead: usize) -> usize {
+    limit + dead.min(TOMBSTONE_OVERFETCH_CAP)
+}
 
 const MANIFEST_VERSION: u32 = 2;
 const LEGACY_MANIFEST_VERSION: u32 = 1;
@@ -311,8 +319,7 @@ impl SearchEngine {
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
-        let knbn = limit + dead.min(TOMBSTONE_OVERFETCH_CAP);
-        let neighbours = index.search(query_vec, knbn, EF_SEARCH);
+        let neighbours = index.search(query_vec, fetch_budget(limit, dead), EF_SEARCH);
 
         let mut results: Vec<SearchResult> = neighbours
             .into_iter()
@@ -2433,10 +2440,36 @@ mod tests {
             results.iter().all(|r| engine.has_chunk(&r.id)),
             "every returned id must be a live (non-blanked) chunk: {results:?}"
         );
-        assert!(
-            results.iter().any(|r| r.id == "seam"),
-            "the live seam id must be among the results: {results:?}"
+        // Identity goes through the exact scan, not the approximate walk: on this
+        // near-orthogonal corpus hnsw_rs misses a query's own neighbourhood in ~3%
+        // of builds (see `assert_self_query_correct`). When that happens the walk
+        // meets no dead point either, so the two assertions above hold regardless.
+        let exact = SearchEngine::exact_scan(
+            &engine.chunk_index,
+            &engine.chunk_id_map,
+            &seam,
+            1,
+            0.0,
+            None,
         );
+        assert_eq!(
+            exact.first().map(|r| r.id.as_str()),
+            Some("seam"),
+            "the rewritten seam must stay the exact nearest live neighbour"
+        );
+    }
+
+    // The fetch budget on its own, with no graph walk involved: unchanged with
+    // no dead points, one extra neighbour per dead point, capped.
+    #[test]
+    fn fetch_budget_grows_with_dead_points_up_to_the_cap() {
+        assert_eq!(fetch_budget(5, 0), 5);
+        assert_eq!(fetch_budget(5, 10), 15);
+        assert_eq!(
+            fetch_budget(5, TOMBSTONE_OVERFETCH_CAP),
+            5 + TOMBSTONE_OVERFETCH_CAP
+        );
+        assert_eq!(fetch_budget(5, 100_000), 5 + TOMBSTONE_OVERFETCH_CAP);
     }
 
     // Guards the byte-identical requirement: with zero dead points, tombstone

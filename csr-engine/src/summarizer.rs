@@ -123,20 +123,16 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             // every narrative call fires all 6 CSR hooks and its Stop hook stores
             // the analyst transcript as a session_episode (meta-episode pollution).
             cmd.env("CSR_DISABLE_RECURSIVE_HOOKS", "1");
-            if let Some(model) = &candidate {
-                cmd.args(["--model", model]);
-            }
-            cmd.args(["-p", "-", "--output-format", "json"]);
-            // User hooks off and no transcript left behind for the watcher to
-            // re-import. User settings stay loaded unless the user opts out.
-            // Built-in tools (Bash, Edit, Write, Agent, ...) are off either way.
-            cmd.args(&isolation_args);
-            // Must come LAST: --mcp-config is variadic in the claude CLI and would
-            // consume any positional arg that followed it.
-            if let Some(path) = &mcp_config_path {
-                cmd.args(["--strict-mcp-config", "--mcp-config"]);
-                cmd.arg(path);
-            }
+            // Prompt on stdin. User hooks off and no transcript left behind for
+            // the watcher to re-import. User settings stay loaded unless the user
+            // opts out. Built-in tools (Bash, Edit, Write, Agent, ...) are off
+            // either way.
+            cmd.args(crate::narrative::headless_argv(
+                "-",
+                candidate.as_deref(),
+                &isolation_args,
+                mcp_config_path.as_deref(),
+            ));
             let mut child = match cmd
                 .stdout(Stdio::piped())
                 // Piped intentionally — required for model-not-found detection on the failure path; do not revert to null().

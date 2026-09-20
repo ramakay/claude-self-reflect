@@ -201,31 +201,23 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
 
     for candidate in crate::narrative::model_candidates() {
         let mut cmd = Command::new("claude");
-        cmd.arg("-p")
-            // The prompt MUST precede --mcp-config: that flag is variadic in the
-            // claude CLI and consumes any trailing positional arg as another config
-            // file path, failing with ENAMETOOLONG on the episode text.
-            .arg(prompt);
-        if let Some(model) = &candidate {
-            cmd.arg("--model").arg(model);
-        }
-        cmd.arg("--output-format")
-            .arg("json")
-            // User hooks off and no transcript left behind for the watcher to
-            // re-import. User settings stay loaded unless the user opts out.
-            // Built-in tools (Bash, Edit, Write, Agent, ...) are off either way.
-            .args(&isolation_args)
-            .arg("--strict-mcp-config")
-            .arg("--mcp-config")
-            .arg(&mcp_config_path)
-            // No --dangerously-skip-permissions: episodes are session-derived text and
-            // the empty MCP config means zero tools, so this is a pure text summary.
-            // Skipping permissions would only widen the blast radius if an episode
-            // contained adversarial content. Print mode won't prompt interactively.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .env("CSR_DISABLE_RECURSIVE_HOOKS", "1"); // signal to nested csr-engine to skip hooks
+        // User hooks off and no transcript left behind for the watcher to
+        // re-import. User settings stay loaded unless the user opts out.
+        // Built-in tools (Bash, Edit, Write, Agent, ...) are off either way.
+        cmd.args(crate::narrative::headless_argv(
+            prompt,
+            candidate.as_deref(),
+            &isolation_args,
+            Some(&mcp_config_path),
+        ))
+        // No --dangerously-skip-permissions: episodes are session-derived text and
+        // the empty MCP config means zero tools, so this is a pure text summary.
+        // Skipping permissions would only widen the blast radius if an episode
+        // contained adversarial content. Print mode won't prompt interactively.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .env("CSR_DISABLE_RECURSIVE_HOOKS", "1"); // signal to nested csr-engine to skip hooks
 
         let mut child = cmd.spawn()?;
 

@@ -156,20 +156,16 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
             // inherit hook config; without it each extraction call fires all CSR
             // hooks and Stop stores the extractor transcript as an episode.
             cmd.env("CSR_DISABLE_RECURSIVE_HOOKS", "1");
-            if let Some(model) = &candidate {
-                cmd.args(["--model", model]);
-            }
-            cmd.args(["-p", "-", "--output-format", "json"]);
-            // User hooks off and no transcript left behind for the watcher to
-            // re-import. User settings stay loaded unless the user opts out.
-            // Built-in tools (Bash, Edit, Write, Agent, ...) are off either way.
-            cmd.args(&isolation_args);
-            // Must come LAST: --mcp-config is variadic in the claude CLI and would
-            // consume any positional arg that followed it.
-            if let Some(path) = &mcp_config_path {
-                cmd.args(["--strict-mcp-config", "--mcp-config"]);
-                cmd.arg(path);
-            }
+            // Prompt on stdin. User hooks off and no transcript left behind for
+            // the watcher to re-import. User settings stay loaded unless the user
+            // opts out. Built-in tools (Bash, Edit, Write, Agent, ...) are off
+            // either way.
+            cmd.args(crate::narrative::headless_argv(
+                "-",
+                candidate.as_deref(),
+                &isolation_args,
+                mcp_config_path.as_deref(),
+            ));
             let mut child = match cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

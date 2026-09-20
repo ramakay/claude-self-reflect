@@ -90,9 +90,8 @@ pub fn isolation_args() -> Vec<String> {
 
 /// [`isolation_args`] for a given `claude --help` text. `--tools ""` is
 /// variadic in the claude CLI (it would swallow a following positional
-/// argument), so every caller must place `isolation_args` after the prompt
-/// positional. The other options here are not variadic and could sit
-/// anywhere before `--mcp-config`.
+/// argument), so these go after the prompt positional: [`headless_argv`]
+/// owns that order. The other options here are not variadic.
 fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
     let mut args = Vec::new();
     if keep_user_settings {
@@ -116,6 +115,36 @@ fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
         args.push("--no-session-persistence".to_string());
     }
     args
+}
+
+/// Argv for a headless narrative child, after the executable name. Every spawn
+/// site builds its command from this, so the order is decided in one place.
+///
+/// `prompt` is the print-mode positional: the prompt text itself, or `-` when
+/// the prompt is piped on stdin. It goes first because `--tools <tools...>`
+/// and `--mcp-config <configs...>` are variadic in the claude CLI and swallow
+/// any positional that follows them (the episode text once failed as a config
+/// path with ENAMETOOLONG). After it, every token is a flag or a flag's value.
+pub fn headless_argv(
+    prompt: &str,
+    model: Option<&str>,
+    isolation: &[String],
+    mcp_config: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = vec!["-p".into(), prompt.into()];
+    if let Some(model) = model {
+        argv.push("--model".into());
+        argv.push(model.into());
+    }
+    argv.push("--output-format".into());
+    argv.push("json".into());
+    argv.extend(isolation.iter().map(std::ffi::OsString::from));
+    if let Some(path) = mcp_config {
+        argv.push("--strict-mcp-config".into());
+        argv.push("--mcp-config".into());
+        argv.push(path.into());
+    }
+    argv
 }
 
 /// Path to an EMPTY MCP config, for use with `--strict-mcp-config` so a
@@ -346,6 +375,84 @@ mod tests {
             args.get(tools_pos + 2).map(String::as_str),
             Some("--no-session-persistence"),
             "an option flag must follow --tools \"\" so it never swallows a positional arg"
+        );
+    }
+
+    // The one positional is argv[1]; after it every token is a flag or the
+    // value of the flag before it. Checked for every shape a spawn site builds:
+    // stdin prompt or inline prompt, with and without a model, with and without
+    // the MCP config, on a current CLI and on one that lists no isolation option.
+    #[test]
+    fn headless_argv_never_puts_a_positional_after_a_variadic_option() {
+        let mcp = std::path::Path::new("/tmp/briefing-mcp.json");
+        let takes_value = [
+            "--model",
+            "--output-format",
+            "--settings",
+            "--setting-sources",
+            "--tools",
+            "--mcp-config",
+        ];
+        for keep in [true, false] {
+            for help in [HELP_CURRENT, ""] {
+                let isolation = isolation_args_for(help, keep);
+                for prompt in ["-", "summarise these episodes"] {
+                    for model in [None, Some("haiku")] {
+                        for mcp_config in [None, Some(mcp)] {
+                            let argv: Vec<String> =
+                                headless_argv(prompt, model, &isolation, mcp_config)
+                                    .into_iter()
+                                    .map(|a| a.into_string().unwrap())
+                                    .collect();
+                            assert_eq!(argv[0], "-p", "{argv:?}");
+                            assert_eq!(argv[1], prompt, "{argv:?}");
+                            let mut i = 2;
+                            while i < argv.len() {
+                                assert!(
+                                    argv[i].starts_with("--"),
+                                    "positional {:?} after the prompt in {argv:?}",
+                                    argv[i]
+                                );
+                                i += if takes_value.contains(&argv[i].as_str()) {
+                                    2
+                                } else {
+                                    1
+                                };
+                            }
+                            assert_eq!(i, argv.len(), "a flag lost its value in {argv:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn headless_argv_on_a_current_cli_matches_the_verified_order() {
+        let argv = headless_argv(
+            "-",
+            Some("haiku"),
+            &isolation_args_for(HELP_CURRENT, true),
+            Some(std::path::Path::new("/tmp/briefing-mcp.json")),
+        );
+        assert_eq!(
+            argv,
+            [
+                "-p",
+                "-",
+                "--model",
+                "haiku",
+                "--output-format",
+                "json",
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+                "--tools",
+                "",
+                "--no-session-persistence",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "/tmp/briefing-mcp.json",
+            ]
         );
     }
 
