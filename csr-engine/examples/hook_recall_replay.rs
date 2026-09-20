@@ -581,10 +581,79 @@ struct Provenance {
     db_path: String,
     db_size_bytes: u64,
     index_dir_size_bytes: u64,
+    /// `index/manifest.json`'s own `created_at` (empty string if the manifest
+    /// is missing or unreadable). Two arms whose clones came from different
+    /// live index dumps carry different `created_at` values even when the DB
+    /// clone step ran identically, because an HNSW re-dump changes the graph
+    /// layout without changing the DB.
+    index_manifest_created_at: String,
+    index_manifest_chunk_embeddings_expected: u64,
+    index_manifest_reflection_embeddings_expected: u64,
+    /// blake3 of the raw `manifest.json` bytes — the sturdiest signal, since a
+    /// re-dump can leave `created_at` and the `_expected` counts unchanged
+    /// while `chunk_id_map` order (and therefore the HNSW graph) still moved.
+    /// Empty string if the manifest is missing or unreadable.
+    index_manifest_blake3: String,
     now: String,
     seed: u64,
     engine_init_secs: f64,
     results_hash: String,
+}
+
+/// Identity fields pulled from `index/manifest.json` so a base/fix arm pair
+/// built from different live-index dumps is visible in the results instead
+/// of silently producing a shifted HNSW top-k. Read as generic JSON, not the
+/// crate's private `search::IndexManifest`, mirroring the read-only access
+/// pattern already used by `search::mod`'s own tests.
+struct IndexManifestIdentity {
+    created_at: String,
+    chunk_embeddings_expected: u64,
+    reflection_embeddings_expected: u64,
+    blake3: String,
+}
+
+fn read_index_manifest_identity(index_dir: &Path) -> IndexManifestIdentity {
+    let manifest_path = index_dir.join("manifest.json");
+    let raw = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!(
+                "hook_recall_replay: no index manifest at {} ({e}) — provenance will record it as absent",
+                manifest_path.display()
+            );
+            return IndexManifestIdentity {
+                created_at: String::new(),
+                chunk_embeddings_expected: 0,
+                reflection_embeddings_expected: 0,
+                blake3: String::new(),
+            };
+        }
+    };
+    let blake3_hex = blake3::hash(&raw).to_hex().to_string();
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "hook_recall_replay: index manifest at {} is not valid JSON ({e}) — \
+                 created_at/expected counts will be empty, the raw-byte hash is still recorded",
+                manifest_path.display()
+            );
+            return IndexManifestIdentity {
+                created_at: String::new(),
+                chunk_embeddings_expected: 0,
+                reflection_embeddings_expected: 0,
+                blake3: blake3_hex,
+            };
+        }
+    };
+    IndexManifestIdentity {
+        created_at: value["created_at"].as_str().unwrap_or_default().to_string(),
+        chunk_embeddings_expected: value["chunk_embeddings_expected"].as_u64().unwrap_or(0),
+        reflection_embeddings_expected: value["reflection_embeddings_expected"]
+            .as_u64()
+            .unwrap_or(0),
+        blake3: blake3_hex,
+    }
 }
 
 #[derive(Serialize)]
@@ -869,6 +938,7 @@ async fn run(config: Config) -> Result<(), String> {
         .map(|p| p.join("index"))
         .unwrap_or_else(|| PathBuf::from("index"));
     let index_dir_size_bytes = dir_size_bytes(&index_dir);
+    let index_manifest = read_index_manifest_identity(&index_dir);
 
     let provenance = Provenance {
         build_commit: env!("CSR_BUILD_GIT_SHA").to_string(),
@@ -877,6 +947,11 @@ async fn run(config: Config) -> Result<(), String> {
         db_path: config.db_path.to_string_lossy().to_string(),
         db_size_bytes,
         index_dir_size_bytes,
+        index_manifest_created_at: index_manifest.created_at,
+        index_manifest_chunk_embeddings_expected: index_manifest.chunk_embeddings_expected,
+        index_manifest_reflection_embeddings_expected: index_manifest
+            .reflection_embeddings_expected,
+        index_manifest_blake3: index_manifest.blake3,
         now: config.now_raw.clone(),
         seed: config.seed,
         engine_init_secs,
