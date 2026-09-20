@@ -541,6 +541,9 @@ fn invoke_claude_p(model: Option<&str>, prompt: &str) -> AdjudicateAttempt {
         // tool (Bash, Edit, Write, Agent) under the user's permission mode.
         .arg("--tools")
         .arg("")
+        // No user settings (plugins, SessionStart hooks) and no transcript
+        // left behind for the watcher to re-import.
+        .args(crate::narrative::isolation_args())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())

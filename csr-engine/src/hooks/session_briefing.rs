@@ -219,6 +219,9 @@ pub(crate) fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative
             // --mcp-config so the flag terminates that list.
             .arg("--tools")
             .arg("")
+            // No user settings (plugins, SessionStart hooks) and no transcript
+            // left behind for the watcher to re-import.
+            .args(crate::narrative::isolation_args())
             // No --dangerously-skip-permissions: episodes are session-derived text and
             // with zero tools this is a pure text summary. Skipping permissions would
             // only widen the blast radius if an episode contained adversarial content.
