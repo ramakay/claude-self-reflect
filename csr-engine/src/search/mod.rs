@@ -90,6 +90,13 @@ const MAX_LAYER: usize = 16;
 // exact cosine over ≤256 384-dim vectors is well under a millisecond anyway.
 const EXACT_SCAN_THRESHOLD: usize = 256;
 
+// hnsw_rs has no true deletion: `remove_chunk`/`remove_reflection`/
+// `blank_orphan_reflections` only blank the id-map slot, so a rewritten chunk
+// leaves a dead point in the graph that can still win a nearest-neighbour
+// slot. `search_index` overfetches by the number of dead points (capped here)
+// so tombstones near the query don't eat live result slots.
+const TOMBSTONE_OVERFETCH_CAP: usize = 256;
+
 const MANIFEST_VERSION: u32 = 2;
 const LEGACY_MANIFEST_VERSION: u32 = 1;
 static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -243,12 +250,22 @@ impl SearchEngine {
         if self.chunk_id_map.is_empty() {
             return Vec::new();
         }
+        // O(1): chunk_id_set holds exactly the live (non-blanked) ids — kept in
+        // sync by insert_chunk/remove_chunk and rebuilt from the non-empty
+        // entries of the loaded manifest on `load_from_disk`. There is no
+        // orphan-blanking pass for chunks (unlike reflections), so this stays
+        // accurate without a dedicated counter.
+        let dead = self
+            .chunk_id_map
+            .len()
+            .saturating_sub(self.chunk_id_set.len());
         self.search_index(
             &self.chunk_index,
             &self.chunk_id_map,
             query_vec,
             limit,
             min_score,
+            dead,
         )
     }
 
@@ -262,15 +279,26 @@ impl SearchEngine {
         if self.reflection_id_map.is_empty() {
             return Vec::new();
         }
+        // O(1): active_reflection_count is already the accurate live count,
+        // kept correct across insert/remove/blank_orphan_reflections and load.
+        let dead = self
+            .reflection_id_map
+            .len()
+            .saturating_sub(self.active_reflection_count);
         self.search_index(
             &self.reflection_index,
             &self.reflection_id_map,
             query_vec,
             limit,
             min_score,
+            dead,
         )
     }
 
+    /// `dead` is the number of blanked (tombstoned) entries in `id_map`. When
+    /// `dead == 0` this asks hnsw_rs for exactly `limit` neighbours — same
+    /// call, same result set as before tombstone overfetch existed — so a
+    /// freshly built/loaded index with no rewrites is byte-identical.
     fn search_index(
         &self,
         index: &Hnsw<'static, f32, DistCosine>,
@@ -278,11 +306,13 @@ impl SearchEngine {
         query_vec: &[f32],
         limit: usize,
         min_score: f32,
+        dead: usize,
     ) -> Vec<SearchResult> {
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
-        let neighbours = index.search(query_vec, limit, EF_SEARCH);
+        let knbn = limit + dead.min(TOMBSTONE_OVERFETCH_CAP);
+        let neighbours = index.search(query_vec, knbn, EF_SEARCH);
 
         let mut results: Vec<SearchResult> = neighbours
             .into_iter()
@@ -2351,5 +2381,111 @@ mod tests {
         // mmap-origin point and the point that was inserted heap-side before the dump.
         assert_self_query_correct(&reloaded, &vecs[0], "c0", 3, 0.1);
         assert_self_query_correct(&reloaded, &newv, "c_new", 3, 0.1);
+    }
+
+    // hnsw_rs has no true deletion: `remove_chunk` only blanks the id-map slot,
+    // so a chunk rewritten repeatedly (the plan-reimport path: remove_chunk then
+    // insert_chunk with the same deterministic id, see import/plans.rs) leaves one
+    // dead point per rewrite sitting in the graph near the query. Below the fix,
+    // `search_index` asked hnsw_rs for exactly `limit` neighbours, so those dead
+    // points — being near-duplicates of the query — win result slots ahead of live
+    // points. Above EXACT_SCAN_THRESHOLD (256) only, since the exact-scan path
+    // already filters blanks with no slot budget to exhaust.
+    #[test]
+    fn tombstoned_rewrites_do_not_starve_live_results() {
+        let mut vecs = synthetic_vectors(401);
+        let seam = vecs.pop().unwrap(); // index 400: distinct from the 400 base points
+        let mut engine = SearchEngine::new(500);
+        for (i, v) in vecs.iter().enumerate() {
+            engine.insert_chunk(format!("c{i}"), v.clone());
+        }
+        assert!(
+            vecs.len() > EXACT_SCAN_THRESHOLD,
+            "corpus must exceed EXACT_SCAN_THRESHOLD so search_index walks the HNSW path"
+        );
+
+        engine.insert_chunk("seam".to_string(), seam.clone());
+
+        // Mirror the production rewrite path (import/plans.rs: remove_chunk then
+        // insert_chunk under the SAME deterministic id) 10 times. Each cycle leaves
+        // one dead point — a tiny perturbation of `seam`, so it sits right next to
+        // the query — behind in the graph.
+        for iter in 0..10u32 {
+            engine.remove_chunk("seam");
+            let perturbed: Vec<f32> = seam
+                .iter()
+                .enumerate()
+                .map(|(j, v)| v + 1e-4 * ((iter as f32 + 1.0) * (j as f32 + 1.0)).sin())
+                .collect();
+            engine.insert_chunk("seam".to_string(), perturbed);
+        }
+
+        let dead = engine.chunk_id_map.len() - engine.chunk_id_set.len();
+        assert_eq!(dead, 10, "10 rewrites must leave exactly 10 blanked slots");
+
+        let results = engine.search_chunks(&seam, 5, 0.0);
+        assert_eq!(
+            results.len(),
+            5,
+            "5 dead tombstones near the query must not eat live result slots: {results:?}"
+        );
+        assert!(
+            results.iter().all(|r| engine.has_chunk(&r.id)),
+            "every returned id must be a live (non-blanked) chunk: {results:?}"
+        );
+        assert!(
+            results.iter().any(|r| r.id == "seam"),
+            "the live seam id must be among the results: {results:?}"
+        );
+    }
+
+    // Guards the byte-identical requirement: with zero dead points, tombstone
+    // overfetch must not change the call to hnsw_rs or the returned results —
+    // the upgrade rehearsal asserts byte-identical hook injections against 9.5.6.
+    #[test]
+    fn zero_dead_points_returns_exactly_the_direct_limit_sized_fetch() {
+        let vecs = synthetic_vectors(300);
+        let mut engine = SearchEngine::new(400);
+        for (i, v) in vecs.iter().enumerate() {
+            engine.insert_chunk(format!("c{i}"), v.clone());
+        }
+        assert_eq!(
+            engine.chunk_id_map.len() - engine.chunk_id_set.len(),
+            0,
+            "no rewrites happened — there must be zero dead points"
+        );
+
+        let via_search_chunks = engine.search_chunks(&vecs[7], 5, 0.0);
+
+        // Reproduce the pre-tombstone-overfetch call directly: exactly `limit`
+        // neighbours from hnsw_rs, same filter/sort/truncate as search_index.
+        let neighbours = engine.chunk_index.search(&vecs[7], 5, EF_SEARCH);
+        let mut direct: Vec<SearchResult> = neighbours
+            .into_iter()
+            .filter_map(|n| {
+                let score = 1.0 - n.distance;
+                let id_map = &engine.chunk_id_map;
+                if score >= 0.0 && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
+                    Some(SearchResult {
+                        id: id_map[n.d_id].clone(),
+                        score,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        direct.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        direct.truncate(5);
+
+        assert_eq!(via_search_chunks.len(), direct.len());
+        for (a, b) in via_search_chunks.iter().zip(direct.iter()) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.score, b.score);
+        }
     }
 }
