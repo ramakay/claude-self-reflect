@@ -15,6 +15,7 @@ pub mod precompact;
 pub mod prompt_submit;
 pub mod reaction;
 pub mod recap;
+mod scope_folder;
 pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;

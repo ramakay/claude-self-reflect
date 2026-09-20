@@ -69,7 +69,7 @@ pub fn same_project_family(current: &str, candidate: &str) -> bool {
 /// non-BMP one (emoji, rarer CJK) is a surrogate pair and costs *two*. Mapping per
 /// `char` would emit one dash there and miss the stored folder — the same silent
 /// empty-result failure this whole branch exists to fix, just narrower.
-fn encode_project_folder(path: &str) -> String {
+pub(crate) fn encode_project_folder(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for c in path.chars() {
         if c.is_ascii_alphanumeric() {
