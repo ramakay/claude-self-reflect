@@ -44,11 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were retrieved memory. The MCP server now claims fd 1 for JSON-RPC before the
   engine is built, and hooks quarantine stdout across engine construction and
   after their injection is written. Unix only; other platforms are unchanged.
-- **Headless `claude -p` children stop firing the user's hooks and leave no
-  transcript.** Narration, ratification and briefing children now run with
-  `--settings '{"disableAllHooks":true}'` and `--no-session-persistence`, so a
-  narrative call no longer runs every plugin's SessionStart hook and no longer
-  adds its own session to the corpus. User, project and local settings stay
+- **Headless `claude -p` children get no tools, stop firing the user's hooks
+  and leave no transcript.** Narration, ratification and briefing children now
+  run with `--tools ""`, `--settings '{"disableAllHooks":true}'` and
+  `--no-session-persistence`. Before, a print-mode child inherited every
+  built-in tool (Bash, Edit, Write, Agent) under the user's permission mode;
+  the empty MCP config only removed MCP tools. On Claude Code 2.1.278 the
+  child's init lists 27 tools without the option and none with it. A
+  narrative call also no longer runs every plugin's SessionStart hook and no
+  longer adds its own session to the corpus. User, project and local settings stay
   loaded, so credentials, provider switches, proxies, client certificates and
   telemetry opt-outs configured there keep working. Each option is passed only
   when `claude --help` lists it, checked once per narrative call, so an older
@@ -57,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   these options. `CSR_HEADLESS_USER_SETTINGS=0` goes further and drops user,
   project and local settings with `--setting-sources ""`, for installs whose
   children need nothing from them.
+- **Deleted index points no longer eat search results.** `hnsw_rs` cannot
+  delete, so a removed chunk or reflection only loses its id and the dead
+  point still wins neighbour slots. Search asked for exactly `limit`
+  neighbours and filtered afterwards: in the regression test, a chunk rewritten
+  ten times left 1 live result for a limit of 5. Search now fetches `limit`
+  plus the number of dead points (capped at 256) and truncates. With no dead
+  points the index call is unchanged. Indexes of 256 points or fewer use the
+  exact scan and were never affected.
 - **The crate builds on Windows.** `file_identity()` called the Unix-only
   `MetadataExt::ino()` unconditionally. Unix keeps the inode; Windows uses the
   file's creation time (#271).
