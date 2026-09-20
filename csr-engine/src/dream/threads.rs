@@ -669,6 +669,14 @@ fn invoke_claude_p(model: Option<&str>, prompt: &str) -> ActorAttempt {
     };
     let mut cmd = std::process::Command::new("claude");
     cmd.args(claude_p_argv(model, prompt, &mcp_config_path))
+        // The argv above already strips settings unconditionally (the extractor
+        // must never see CLAUDE.md); take only the transcript flag from the
+        // shared probe.
+        .args(
+            crate::narrative::isolation_args()
+                .into_iter()
+                .filter(|arg| arg == "--no-session-persistence"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
