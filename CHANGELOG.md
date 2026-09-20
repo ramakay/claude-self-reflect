@@ -5,6 +5,61 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.5.7] - 2026-09-20
+
+### Fixed
+
+- **Hooks that only read no longer rewrite the whole HNSW index.** Every hook
+  ended with `flush_index()`, and one dirty flag covered both the chunk and the
+  reflection index, so a read-only hook could rewrite about a gigabyte of index
+  files. In `hook-timing.log` that showed as prompt-submit `flush=868ms` through
+  `19601ms`, worst case 25,557 ms against Claude Code's 30 s hook budget; a hook
+  killed at the budget loses its injection silently. The dirty flag is now split
+  per index, and persisting the index is a hook role: only `stop` does it;
+  prompt-submit, post-tool-use and the session hooks never do. Measured for
+  the same change on `main` (#309), on a 445,748-chunk index with 400
+  reflections missing from the cache: prompt-submit
+  `flush=1203ms total=1996ms` before, `flush=0ms total=729ms` after, with all
+  four index files and the manifest untouched by mtime.
+- **One large embed call no longer parks gigabytes in the ONNX arena.**
+  `embed()` let fastembed batch 256 documents at a time, each batch padded to
+  its longest sequence, and the ONNX CPU arena never returns that allocation.
+  Batches are capped at 16 for every call site. Measured with
+  `examples/embed_batch_rss.rs` at 256 documents: 12.45 GB max RSS before,
+  1.44 GB after, and no slower (4.9 to 5.3 s before, 4.7 to 4.8 s after).
+  Output order and values are unchanged; a test compares batched against
+  single embeds to 1e-5.
+- **Library prints stay off the channels Claude Code reads.** `hnsw_rs` prints
+  to stdout from library code (a point counter every 50,000 inserts, and a
+  "could not open file" line when a cache file is missing). On the MCP server
+  that corrupted the JSON-RPC stream; in hooks it reached the model as if it
+  were retrieved memory. The MCP server now claims fd 1 for JSON-RPC before the
+  engine is built, and hooks quarantine stdout across engine construction and
+  after their injection is written. Unix only; other platforms are unchanged.
+- **Headless `claude -p` children load no user settings and leave no
+  transcript.** Narration, ratification and briefing children now run with
+  `--setting-sources ""` and `--no-session-persistence` when the installed CLI
+  supports them (checked once per process against `claude --help`), so they stop
+  firing the user's hooks and stop adding their own sessions to the corpus.
+  Set `CSR_HEADLESS_USER_SETTINGS=1` to keep user settings; hooks stay disabled
+  for the child in that mode.
+- **The crate builds on Windows.** `file_identity()` called the Unix-only
+  `MetadataExt::ino()` unconditionally. Unix keeps the inode; Windows uses the
+  file's creation time (#271).
+
+### Changed
+
+- The prompt-submit hook caps its code-graph symbol probes at 12 per prompt and
+  fetches chunk rows in one batch instead of one query per hit. New opt-outs
+  `CSR_NO_GRAPH_SLICES=1` and `CSR_NO_ANTI_PATTERNS=1` trade that recall for
+  latency (#299).
+
+### Security
+
+- Lockfile-only dependency bumps that clear `cargo audit` on the 9.5 line:
+  rustls 0.23.45 and rustls-webpki 0.103.15 (RUSTSEC-2026-0285), h2 0.4.19
+  (RUSTSEC-2026-0258), rkyv 0.8.18 (RUSTSEC-2026-0233, -0234, -0235).
+
 ## [9.5.6] - 2026-09-09
 
 ### Changed
