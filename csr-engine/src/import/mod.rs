@@ -1341,25 +1341,59 @@ fn sanitize_message_for_search(
         .and_then(|value| value.as_str())
         .map(str::to_owned);
     let scrub_wrappers = matches!(msg_type.as_deref(), Some("user" | "human"));
+    let text = if scrub_wrappers && is_harness_written_row(message) {
+        RowText::Drop
+    } else {
+        RowText::Keep { scrub_wrappers }
+    };
 
     if let Some(content) = message
         .get_mut("message")
         .and_then(|value| value.get_mut("content"))
     {
-        sanitize_content(content, scrub_wrappers, sanitizer);
+        sanitize_content(content, text, sanitizer);
     } else if let Some(content) = message.get_mut("content") {
-        sanitize_content(content, scrub_wrappers, sanitizer);
+        sanitize_content(content, text, sanitizer);
     }
+}
+
+/// What the sanitizer does with a row's prose. Tool blocks are judged on their own.
+#[derive(Clone, Copy)]
+enum RowText {
+    Keep {
+        scrub_wrappers: bool,
+    },
+    /// The harness wrote this row into the user channel; nobody typed it.
+    Drop,
+}
+
+/// Rows Claude Code writes into the user channel itself: task notifications,
+/// messages from peer sessions, idle notices. Indexed as prose they came back as
+/// the owner's own history. A coordinator's message to a subagent
+/// (`origin.kind == "coordinator"`) is a real instruction and stays.
+fn is_harness_written_row(message: &serde_json::Value) -> bool {
+    let prompt_source = message
+        .get("promptSource")
+        .and_then(serde_json::Value::as_str);
+    let origin = message
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str);
+    prompt_source == Some("system") || matches!(origin, Some("task-notification" | "peer"))
 }
 
 fn sanitize_content(
     content: &mut serde_json::Value,
-    scrub_wrappers: bool,
+    row_text: RowText,
     sanitizer: &mut CsrMessageSanitizer,
 ) {
     if let Some(text) = content.as_str() {
-        *content =
-            serde_json::Value::String(sanitize_text_for_search(text, scrub_wrappers, sanitizer));
+        *content = serde_json::Value::String(match row_text {
+            RowText::Keep { scrub_wrappers } => {
+                sanitize_text_for_search(text, scrub_wrappers, sanitizer)
+            }
+            RowText::Drop => String::new(),
+        });
         return;
     }
 
@@ -1393,6 +1427,9 @@ fn sanitize_content(
                 }
             }
             Some("text") => {
+                let RowText::Keep { scrub_wrappers } = row_text else {
+                    continue;
+                };
                 if let Some(text) = item.get_mut("text") {
                     if let Some(raw) = text.as_str() {
                         *text = serde_json::Value::String(sanitize_text_for_search(
@@ -2820,6 +2857,98 @@ mod tests {
         }
         assert!(v3.contains("USER PROSE BEFORE"));
         assert!(v3.contains("USER PROSE AFTER"));
+    }
+
+    #[test]
+    fn rows_the_harness_wrote_into_the_user_channel_are_not_indexed_as_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("harness-rows.jsonl");
+        let user_row = |text: &str, extra: serde_json::Value| {
+            let mut row = serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-09-19T21:00:00Z",
+                "message": {"role": "user", "content": text}
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            row
+        };
+        let lines = [
+            user_row(
+                "TYPED PROMPT trace the prompt-submit latency",
+                serde_json::json!({"origin": {"kind": "human"}, "promptSource": "typed"}),
+            ),
+            user_row(
+                "<task-notification>\n<task-id>NOTIFICATION MUST DISAPPEAR</task-id>\n</task-notification>",
+                serde_json::json!({
+                    "origin": {"kind": "task-notification"},
+                    "promptSource": "system",
+                    "turnOrigin": "task_notification"
+                }),
+            ),
+            // Subagent transcripts carry the origin without a promptSource.
+            user_row(
+                "Another Claude session sent a message: PEER MESSAGE MUST DISAPPEAR",
+                serde_json::json!({"origin": {"kind": "peer"}, "isMeta": true}),
+            ),
+            user_row(
+                "[Cross-session idle notice] IDLE NOTICE MUST DISAPPEAR",
+                serde_json::json!({"promptSource": "system", "isMeta": true}),
+            ),
+            user_row(
+                "The coordinator sent a message while you were working:\nCOORDINATOR ORDER stop and report",
+                serde_json::json!({"origin": {"kind": "coordinator"}}),
+            ),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-09-19T21:00:05Z",
+                "origin": {"kind": "task-notification"},
+                "promptSource": "system",
+                "message": {"content": [
+                    {"type": "text", "text": "ARRAY NOTIFICATION MUST DISAPPEAR"},
+                    {"type": "tool_result", "tool_use_id": "read-call", "content": "SIBLING RESULT MUST STAY"}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let serialized =
+            serde_json::to_string(&parse_jsonl_messages_for_search(&path).unwrap()).unwrap();
+        let indexed = parse_jsonl_file(&path, "project")
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in [
+            "NOTIFICATION MUST DISAPPEAR",
+            "PEER MESSAGE MUST DISAPPEAR",
+            "IDLE NOTICE MUST DISAPPEAR",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "sanitizer kept {forbidden}"
+            );
+            assert!(!indexed.contains(forbidden), "index kept {forbidden}");
+        }
+        for retained in [
+            "TYPED PROMPT",
+            "COORDINATOR ORDER",
+            "SIBLING RESULT MUST STAY",
+        ] {
+            assert!(serialized.contains(retained), "sanitizer lost {retained}");
+            assert!(indexed.contains(retained), "index lost {retained}");
+        }
     }
 
     #[test]
