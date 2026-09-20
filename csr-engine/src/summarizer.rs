@@ -110,6 +110,12 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
         })
         .ok();
 
+    // Probed once per call, outside the model loop, and never cached for the
+    // process: see narrative::isolation_args.
+    let isolation_args = tokio::task::spawn_blocking(crate::narrative::isolation_args)
+        .await
+        .unwrap_or_default();
+
     for candidate in crate::narrative::model_candidates() {
         let attempt = tokio::time::timeout(HAIKU_TIMEOUT, async {
             let mut cmd = tokio::process::Command::new("claude");
@@ -123,7 +129,7 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             cmd.args(["-p", "-", "--output-format", "json"]);
             // No user settings (plugins, SessionStart hooks) and no transcript
             // left behind for the watcher to re-import.
-            cmd.args(crate::narrative::isolation_args());
+            cmd.args(&isolation_args);
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {

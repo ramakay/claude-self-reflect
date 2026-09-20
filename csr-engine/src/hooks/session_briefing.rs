@@ -195,6 +195,9 @@ async fn handle_inner(_input: &HookInput, engine: &Engine, cwd: &Path) -> Result
 fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNarrative> {
     let mcp_config_path = crate::narrative::minimal_mcp_config()?;
     let mut last_err: Option<anyhow::Error> = None;
+    // Probed once per call, outside the model loop, and never cached for the
+    // process: see narrative::isolation_args.
+    let isolation_args = crate::narrative::isolation_args();
 
     for candidate in crate::narrative::model_candidates() {
         let mut cmd = Command::new("claude");
@@ -210,7 +213,7 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
             .arg("json")
             // No user settings (plugins, SessionStart hooks) and no transcript
             // left behind for the watcher to re-import.
-            .args(crate::narrative::isolation_args())
+            .args(&isolation_args)
             .arg("--strict-mcp-config")
             .arg("--mcp-config")
             .arg(&mcp_config_path)

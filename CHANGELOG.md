@@ -21,14 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reflections missing from the cache: prompt-submit
   `flush=1203ms total=1996ms` before, `flush=0ms total=729ms` after, with all
   four index files and the manifest untouched by mtime.
+  On this line, with a 2,577-chunk corpus whose on-disk cache trailed SQLite by
+  297 chunks, the published 9.5.6 rewrote all nine index files on the first
+  prompt-submit and this build rewrote none across eight, with byte-identical
+  injections. The trade: until the next `stop` persists, each prompt-submit
+  re-inserts the missing vectors in memory (211 ms against 84 ms p50 on that
+  corpus, 60 ms after `stop`).
 - **One large embed call no longer parks gigabytes in the ONNX arena.**
   `embed()` let fastembed batch 256 documents at a time, each batch padded to
   its longest sequence, and the ONNX CPU arena never returns that allocation.
   Batches are capped at 16 for every call site. Measured with
   `examples/embed_batch_rss.rs` at 256 documents: 12.45 GB max RSS before,
   1.44 GB after, and no slower (4.9 to 5.3 s before, 4.7 to 4.8 s after).
-  Output order and values are unchanged; a test compares batched against
-  single embeds to 1e-5.
+  Output order is preserved; values match single-document embeddings within
+  1e-5 in the regression test, so a near-tied pair of results can swap.
+  Ordinary imports already embedded 10 documents at a time and are unaffected:
+  importing 160 transcripts (2,280 chunks) peaked at 1.05 GB on both versions.
 - **Library prints stay off the channels Claude Code reads.** `hnsw_rs` prints
   to stdout from library code (a point counter every 50,000 inserts, and a
   "could not open file" line when a cache file is missing). On the MCP server
@@ -38,11 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after their injection is written. Unix only; other platforms are unchanged.
 - **Headless `claude -p` children load no user settings and leave no
   transcript.** Narration, ratification and briefing children now run with
-  `--setting-sources ""` and `--no-session-persistence` when the installed CLI
-  supports them (checked once per process against `claude --help`), so they stop
-  firing the user's hooks and stop adding their own sessions to the corpus.
-  Set `CSR_HEADLESS_USER_SETTINGS=1` to keep user settings; hooks stay disabled
-  for the child in that mode.
+  `--setting-sources ""` and `--no-session-persistence`, so they stop firing the
+  user's hooks and stop adding their own sessions to the corpus. Each option is
+  passed only when `claude --help` lists it, checked once per narrative call, so
+  an older CLI behaves as before and a CLI upgrade is picked up without a daemon
+  restart. User settings are kept automatically when `settings.json` holds what
+  the child needs to reach the API: `apiKeyHelper`, `awsAuthRefresh`,
+  `awsCredentialExport`, or an `env` entry that selects a provider, carries a
+  token or routes the connection (`ANTHROPIC_*`, `AWS_*`, `CLAUDE_CODE_USE_*`,
+  `GOOGLE_*`, `CLOUD_ML_*`, `VERTEX_*`, proxy and CA-bundle variables). In that
+  mode hooks are switched off with `--settings '{"disableAllHooks":true}'`
+  where the CLI lists `--settings`. `CSR_HEADLESS_USER_SETTINGS=1` forces
+  keeping user settings and `=0` forces dropping them.
 - **The crate builds on Windows.** `file_identity()` called the Unix-only
   `MetadataExt::ino()` unconditionally. Unix keeps the inode; Windows uses the
   file's creation time (#271).

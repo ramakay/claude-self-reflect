@@ -37,13 +37,68 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
-/// Opt-out for [`isolation_args`]: keep loading the user's settings files in
-/// headless children. For installs whose credentials live there (`apiKeyHelper`,
-/// an `env` block selecting Bedrock or Vertex); hooks are still switched off.
+/// Whether headless children keep loading the user's settings files.
+///
+/// `CSR_HEADLESS_USER_SETTINGS=1` forces it and `=0` forces full isolation.
+/// Unset, the settings file decides: one that carries what the child needs to
+/// reach the API is kept, because dropping it turns every call into an
+/// authentication failure. Hooks are switched off either way.
 fn headless_keeps_user_settings() -> bool {
-    std::env::var("CSR_HEADLESS_USER_SETTINGS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    match std::env::var("CSR_HEADLESS_USER_SETTINGS") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        _ => user_settings_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|text| settings_carry_api_access(&text)),
+    }
+}
+
+fn user_settings_path() -> Option<std::path::PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => Some(std::path::PathBuf::from(dir).join("settings.json")),
+        _ => dirs::home_dir().map(|h| h.join(".claude").join("settings.json")),
+    }
+}
+
+/// True when a Claude Code settings file holds something a headless child
+/// cannot reach the API without: a credential helper, or an `env` entry that
+/// selects a provider, carries a token, or routes the connection (proxy, CA
+/// bundle). Anything else in `env` (telemetry switches and the like) does not
+/// count, and an unreadable file counts as nothing.
+fn settings_carry_api_access(settings_json: &str) -> bool {
+    const HELPERS: [&str; 3] = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"];
+    const ENV_PREFIXES: [&str; 7] = [
+        "ANTHROPIC_",
+        "AWS_",
+        "CLAUDE_CODE_USE_",
+        "CLAUDE_CODE_SKIP_",
+        "GOOGLE_",
+        "CLOUD_ML_",
+        "VERTEX_",
+    ];
+    const ENV_NAMES: [&str; 5] = [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+    ];
+    let Ok(settings) = serde_json::from_str::<Value>(settings_json) else {
+        return false;
+    };
+    HELPERS
+        .iter()
+        .any(|key| settings.get(key).is_some_and(|v| !v.is_null()))
+        || settings
+            .get("env")
+            .and_then(Value::as_object)
+            .is_some_and(|env| {
+                env.keys().any(|name| {
+                    let name = name.to_ascii_uppercase();
+                    ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+                        || ENV_NAMES.contains(&name.as_str())
+                })
+            })
 }
 
 /// Argv that cuts a headless `claude -p` child off from the machine's Claude
@@ -55,21 +110,20 @@ fn headless_keeps_user_settings() -> bool {
 /// * `--no-session-persistence` writes no transcript, so the watcher never
 ///   re-imports the headless call as if it were a real conversation.
 ///
-/// Both are checked against `claude --help` once per process (~55ms): a CLI
-/// that predates an option rejects it outright, which would fail every call.
+/// Both are checked against `claude --help` (~55ms): a CLI that predates an
+/// option rejects it outright, which would fail every call. Call this once per
+/// narrative operation, outside the model-candidate loop. It is deliberately
+/// not cached for the life of the process: the daemon outlives CLI upgrades,
+/// and one empty `--help` would otherwise switch isolation off for good.
 pub fn isolation_args() -> Vec<String> {
-    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    ARGS.get_or_init(|| {
-        let help = std::process::Command::new("claude")
-            .arg("--help")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default();
-        isolation_args_for(&help, headless_keeps_user_settings())
-    })
-    .clone()
+    let help = std::process::Command::new("claude")
+        .arg("--help")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    isolation_args_for(&help, headless_keeps_user_settings())
 }
 
 /// [`isolation_args`] for a given `claude --help` text. No option is
@@ -279,6 +333,36 @@ mod tests {
                 "--no-session-persistence"
             ]
         );
+    }
+
+    #[test]
+    fn settings_that_carry_api_access_are_kept() {
+        for settings in [
+            r#"{"apiKeyHelper":"/usr/local/bin/key.sh"}"#,
+            r#"{"awsAuthRefresh":"aws sso login"}"#,
+            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1"}}"#,
+            r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}"#,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#,
+            r#"{"env":{"https_proxy":"http://proxy.example:8080"}}"#,
+            r#"{"env":{"NODE_EXTRA_CA_CERTS":"/etc/ssl/corp.pem"}}"#,
+        ] {
+            assert!(settings_carry_api_access(settings), "{settings}");
+        }
+    }
+
+    #[test]
+    fn settings_without_api_access_are_dropped() {
+        for settings in [
+            "",
+            "not json",
+            "{}",
+            r#"{"apiKeyHelper":null}"#,
+            r#"{"env":{}}"#,
+            r#"{"env":{"DO_NOT_TRACK":"1","SOME_PLUGIN_TELEMETRY":"0"}}"#,
+            r#"{"model":"opus","hooks":{},"enabledPlugins":{"x@y":true}}"#,
+        ] {
+            assert!(!settings_carry_api_access(settings), "{settings}");
+        }
     }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/claude_p_result.json");
