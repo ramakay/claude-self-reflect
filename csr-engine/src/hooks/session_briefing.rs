@@ -211,8 +211,8 @@ fn invoke_narrative_briefing(prompt: &str) -> Result<crate::narrative::ParsedNar
         }
         cmd.arg("--output-format")
             .arg("json")
-            // No user settings (plugins, SessionStart hooks) and no transcript
-            // left behind for the watcher to re-import.
+            // User hooks off and no transcript left behind for the watcher to
+            // re-import. User settings stay loaded unless the user opts out.
             .args(&isolation_args)
             .arg("--strict-mcp-config")
             .arg("--mcp-config")

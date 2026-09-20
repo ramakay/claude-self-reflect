@@ -1,8 +1,8 @@
-//! Shared logic for AI-narrative `claude -p` invocations (session briefing +
-//! session story): opt-out gate, model fallback chain, JSON result parsing,
-//! and a persistence-safe content hash.
+//! Shared logic for AI-narrative `claude -p` invocations (session briefing,
+//! session story, ratification): opt-out gate, model fallback chain, child
+//! isolation arguments, JSON result parsing, and a persistence-safe content hash.
 //!
-//! The two call sites keep their own process plumbing (sync vs tokio); only
+//! The three call sites keep their own process plumbing (sync vs tokio); only
 //! the pure decision/parsing logic lives here.
 
 use serde_json::Value;
