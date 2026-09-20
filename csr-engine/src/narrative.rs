@@ -37,80 +37,37 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
-/// Whether headless children keep loading the user's settings files.
+/// Whether headless children keep loading the user's, project's and local
+/// settings files. They do unless `CSR_HEADLESS_USER_SETTINGS=0` asks for full
+/// isolation.
 ///
-/// `CSR_HEADLESS_USER_SETTINGS=1` forces it and `=0` forces full isolation.
-/// Unset, the settings files decide, and the doubt goes to keeping them:
-/// dropping a file that carried the child's way to the API turns every call
-/// into an authentication failure, while keeping one costs only some
-/// isolation. Hooks are switched off either way.
+/// Keeping them is the default because nothing here can tell which file
+/// carries the child's way to the API: credentials, provider switches,
+/// proxies, client certificates and telemetry opt-outs all live in settings,
+/// and Claude Code resolves more settings files than this process can
+/// enumerate (the canonical git root's local file, alternate user-settings
+/// names). Dropping the wrong one turns every call into a silent failure;
+/// keeping one costs only some isolation. Hooks are switched off either way.
 fn headless_keeps_user_settings() -> bool {
-    match std::env::var("CSR_HEADLESS_USER_SETTINGS") {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        _ => settings_paths().iter().any(|path| {
-            std::fs::read_to_string(path).is_ok_and(|text| settings_may_carry_api_access(&text))
-        }),
-    }
+    keeps_user_settings(std::env::var("CSR_HEADLESS_USER_SETTINGS").ok().as_deref())
 }
 
-/// Every settings file `--setting-sources ""` would stop the child loading:
-/// the user's, and the project and local ones of the directory it starts in.
-fn settings_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::with_capacity(3);
-    match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) if !dir.is_empty() => {
-            paths.push(std::path::PathBuf::from(dir).join("settings.json"))
-        }
-        _ => paths.extend(dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))),
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd.join(".claude").join("settings.json"));
-        paths.push(cwd.join(".claude").join("settings.local.json"));
-    }
-    paths
+fn keeps_user_settings(flag: Option<&str>) -> bool {
+    !flag.is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
-/// False only when a settings file provably holds nothing the child could
-/// need to reach the API. There is deliberately no list of credential
-/// variables here: Claude Code keeps adding them (API keys, OAuth tokens,
-/// provider switches, proxies, client certificates), and a name missing from
-/// such a list would silently break a working install. So the test runs the
-/// other way. A file is safe to drop when every `env` entry is a telemetry
-/// switch and no top-level key is named like a credential helper; a file that
-/// cannot be parsed, or holds anything else, is kept.
-fn settings_may_carry_api_access(settings_json: &str) -> bool {
-    let Ok(Value::Object(settings)) = serde_json::from_str::<Value>(settings_json) else {
-        return true;
-    };
-    let helper_like = settings.iter().any(|(key, value)| {
-        let key = key.to_ascii_lowercase();
-        !value.is_null()
-            && ["helper", "auth", "credential", "apikey", "token"]
-                .iter()
-                .any(|needle| key.contains(needle))
-    });
-    let env_beyond_telemetry = match settings.get("env") {
-        None | Some(Value::Null) => false,
-        Some(Value::Object(env)) => env.keys().any(|name| {
-            let name = name.to_ascii_uppercase();
-            !(name.contains("TELEMETRY") || name == "DO_NOT_TRACK")
-        }),
-        Some(_) => true,
-    };
-    helper_like || env_beyond_telemetry
-}
-
-/// Argv that cuts a headless `claude -p` child off from the machine's Claude
-/// Code setup. Every CSR spawn site passes it.
+/// Argv that keeps a headless `claude -p` child from acting on the machine's
+/// Claude Code setup. Every CSR spawn site passes it.
 ///
-/// * `--setting-sources ""` loads no user, project or local settings, so the
-///   child runs none of the user's plugins and none of their SessionStart
-///   hooks.
+/// * `--settings '{"disableAllHooks":true}'` switches the user's hooks off
+///   for the child, so a narrative call no longer runs every plugin's
+///   SessionStart hook. With `CSR_HEADLESS_USER_SETTINGS=0` the child gets
+///   `--setting-sources ""` instead: no user, project or local settings at
+///   all. Neither option reaches hooks or plugins set by managed policy.
 /// * `--no-session-persistence` writes no transcript, so the watcher never
 ///   re-imports the headless call as if it were a real conversation.
 ///
-/// Both are checked against `claude --help` (~55ms): a CLI that predates an
+/// Each is checked against `claude --help` (~55ms): a CLI that predates an
 /// option rejects it outright, which would fail every call. Call this once per
 /// narrative operation, outside the model-candidate loop. It is deliberately
 /// not cached for the life of the process: the daemon outlives CLI upgrades,
@@ -336,39 +293,12 @@ mod tests {
     }
 
     #[test]
-    fn settings_that_may_carry_api_access_are_kept() {
-        for settings in [
-            r#"{"apiKeyHelper":"/usr/local/bin/key.sh"}"#,
-            r#"{"awsAuthRefresh":"aws sso login"}"#,
-            r#"{"awsCredentialExport":"/usr/local/bin/creds"}"#,
-            r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1"}}"#,
-            r#"{"env":{"CLAUDE_CODE_USE_VERTEX":"1"}}"#,
-            r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#,
-            r#"{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"token"}}"#,
-            r#"{"env":{"CLAUDE_CODE_CLIENT_CERT":"/etc/ssl/client.pem","CLAUDE_CODE_CLIENT_KEY":"/etc/ssl/client.key"}}"#,
-            r#"{"env":{"https_proxy":"http://proxy.example:8080"}}"#,
-            r#"{"env":{"NODE_EXTRA_CA_CERTS":"/etc/ssl/corp.pem"}}"#,
-            // A variable this code has never heard of is kept, not dropped.
-            r#"{"env":{"DO_NOT_TRACK":"1","SOME_FUTURE_CREDENTIAL":"x"}}"#,
-            r#"{"env":"not an object"}"#,
-            "not json",
-            "[]",
-        ] {
-            assert!(settings_may_carry_api_access(settings), "{settings}");
+    fn user_settings_are_kept_unless_explicitly_dropped() {
+        for flag in [None, Some(""), Some("1"), Some("true"), Some("yes")] {
+            assert!(keeps_user_settings(flag), "{flag:?}");
         }
-    }
-
-    #[test]
-    fn settings_with_nothing_access_related_are_dropped() {
-        for settings in [
-            "{}",
-            r#"{"apiKeyHelper":null}"#,
-            r#"{"env":{}}"#,
-            r#"{"env":null}"#,
-            r#"{"env":{"DO_NOT_TRACK":"1","SOME_PLUGIN_TELEMETRY":"0","X_NO_TELEMETRY":"1"}}"#,
-            r#"{"model":"opus","hooks":{},"enabledPlugins":{"x@y":true},"autoUpdatesChannel":"latest","permissions":{}}"#,
-        ] {
-            assert!(!settings_may_carry_api_access(settings), "{settings}");
+        for flag in [Some("0"), Some("false"), Some("FALSE")] {
+            assert!(!keeps_user_settings(flag), "{flag:?}");
         }
     }
 

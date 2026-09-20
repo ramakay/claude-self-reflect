@@ -46,20 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after their injection is written. Unix only; other platforms are unchanged.
 - **Headless `claude -p` children stop firing the user's hooks and leave no
   transcript.** Narration, ratification and briefing children now run with
-  `--no-session-persistence`, so they stop adding their own sessions to the
-  corpus, and with one of two settings modes. When no settings file the child
-  would load (user, project, local) holds anything access-related, it runs
-  with `--setting-sources ""`: no user settings, plugins or hooks at all.
-  Otherwise the settings stay loaded and hooks are switched off with
-  `--settings '{"disableAllHooks":true}'`. The doubt goes to keeping them: a
-  file is dropped only when every `env` entry is a telemetry switch and no
-  top-level key is named like a credential helper, so an API key, OAuth token,
-  provider switch, proxy, CA bundle or client certificate configured in
-  `settings.json` keeps working after the upgrade. Each option is passed only
+  `--settings '{"disableAllHooks":true}'` and `--no-session-persistence`, so a
+  narrative call no longer runs every plugin's SessionStart hook and no longer
+  adds its own session to the corpus. User, project and local settings stay
+  loaded, so credentials, provider switches, proxies, client certificates and
+  telemetry opt-outs configured there keep working. Each option is passed only
   when `claude --help` lists it, checked once per narrative call, so an older
   CLI behaves as before and a CLI upgrade is picked up without a daemon
-  restart. `CSR_HEADLESS_USER_SETTINGS=1` forces keeping settings and `=0`
-  forces dropping them.
+  restart. Hooks and plugins set by managed policy are outside the reach of
+  these options. `CSR_HEADLESS_USER_SETTINGS=0` goes further and drops user,
+  project and local settings with `--setting-sources ""`, for installs whose
+  children need nothing from them.
 - **The crate builds on Windows.** `file_identity()` called the Unix-only
   `MetadataExt::ino()` unconditionally. Unix keeps the inode; Windows uses the
   file's creation time (#271).
