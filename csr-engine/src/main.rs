@@ -1338,22 +1338,27 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Write-only hooks (precompact, session-end) import a transcript but
-        // never search, so build an import-only engine that skips loading and
-        // re-dumping the whole HNSW graph — the dominant cost of these hooks on
-        // a large corpus. Everyone else needs the loaded index.
+        // Read the input before building the engine: whether this invocation
+        // will query the index depends on it (a harness turn or a "continue"
+        // never searches), and loading the whole HNSW graph is the dominant
+        // cost of a hook process on a large corpus. Hooks that only import or
+        // write run on the import-only engine, which skips that load and the
+        // re-dump. Everyone else needs the loaded index.
+        let stdin_started = std::time::Instant::now();
+        let input = csr_engine::hooks::read_stdin_json();
+        let stdin_elapsed = stdin_started.elapsed();
         let eng = {
             // Hook stdout is the injection channel. A stale or missing cache
             // makes `Engine::new` rebuild through hnsw_rs, which prints to
             // stdout; keep that off the channel until the handler owns it.
             let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
-            if csr_engine::hooks::is_import_only_hook(name) {
-                engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
-            } else {
+            if csr_engine::hooks::hook_needs_index(name, &input) {
                 engine::Engine::new(&args.db_path, &args.projects_dir)?
+            } else {
+                engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
             }
         };
-        csr_engine::hooks::dispatch_hook(name, &eng).await?;
+        csr_engine::hooks::dispatch_hook(name, &eng, input, stdin_elapsed).await?;
         return Ok(());
     }
 

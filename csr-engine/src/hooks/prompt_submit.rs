@@ -78,49 +78,23 @@ const MAX_SYMBOL_PROBES: usize = 12;
 const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 
 async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
-    // Extract prompt from input
-    let prompt = match input.prompt.as_deref() {
-        Some(p) if !p.is_empty() => p,
-        _ => return Ok(()), // No prompt → silent exit
-    };
-
-    // Nobody typed a harness turn, so nothing in it is a re-asked question.
-    // Live failure 2026-09-19: background-task notifications and
-    // cross-session messages each drew a PICKUP for an unrelated episode at
-    // 0.55-0.62 similarity, plus raw `<task-notification>` chunks as "past
-    // context". Silence is the only honest output here.
-    if is_harness_turn(prompt) {
-        return Ok(());
-    }
-
-    // Route A pickup: "continue"-class prompts are shorter than
-    // MIN_PROMPT_LENGTH and carry zero searchable signal — yet they are the
-    // one case where memory IS the task. No content to correlate, so recency
-    // picks the episode. Emit it imperatively, adjacent to the prompt (the
-    // position the model reliably reads), instead of silently skipping. Live
-    // failure 2026-07-07: the previous session advertised "just say continue"
-    // and this hook dropped that exact prompt.
-    if is_continuation_prompt(prompt) {
-        if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
-            emit_pickup(
-                &ep,
-                &age,
-                "the user asked to continue; the episode below is the work being resumed.",
-            );
-            record_episode_exposure(input, engine, cwd, prompt, None, "continue", &ep, None);
+    // Every exit that needs neither an embedding nor the index is decided in
+    // `early_exit`, which also picks the engine this process was built with.
+    let prompt = input.prompt.as_deref().unwrap_or_default();
+    match early_exit(prompt) {
+        Some(EarlyExit::Silent) => return Ok(()),
+        Some(EarlyExit::LineagePickup) => {
+            if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
+                emit_pickup(
+                    &ep,
+                    &age,
+                    "the user asked to continue; the episode below is the work being resumed.",
+                );
+                record_episode_exposure(input, engine, cwd, prompt, None, "continue", &ep, None);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-
-    // Fast-path: skip slash commands
-    if prompt.starts_with('/') {
-        return Ok(());
-    }
-
-    // Bare acknowledgments ("ok", "y") carry no intent signal worth an
-    // embedding pass.
-    if prompt.trim().len() < 3 {
-        return Ok(());
+        None => {}
     }
 
     let embeddings = engine.embeddings();
@@ -782,6 +756,67 @@ fn ancestry_releases_for_prompt(
                 .map(|releases| (chunk_id.clone(), releases))
         })
         .collect()
+}
+
+/// How a prompt leaves `handle_inner` before anything embeds it or queries
+/// the index.
+#[derive(Debug, PartialEq, Eq)]
+enum EarlyExit {
+    /// Nothing to inject.
+    Silent,
+    /// Route A pickup by recency: SQLite only, no embedding, no index.
+    LineagePickup,
+}
+
+/// The exits that run before the first embedding or index query, in order.
+/// One definition serves both the handler and [`exits_before_search`], so the
+/// engine choice made before startup cannot drift from what the handler does.
+/// Anything added here must stay index-free: these prompts run on an engine
+/// whose index is empty.
+fn early_exit(prompt: &str) -> Option<EarlyExit> {
+    // No prompt → silent exit
+    if prompt.is_empty() {
+        return Some(EarlyExit::Silent);
+    }
+
+    // Nobody typed a harness turn, so nothing in it is a re-asked question.
+    // Live failure 2026-09-19: background-task notifications and
+    // cross-session messages each drew a PICKUP for an unrelated episode at
+    // 0.55-0.62 similarity, plus raw `<task-notification>` chunks as "past
+    // context". Silence is the only honest output here.
+    if is_harness_turn(prompt) {
+        return Some(EarlyExit::Silent);
+    }
+
+    // Route A pickup: "continue"-class prompts are shorter than
+    // MIN_PROMPT_LENGTH and carry zero searchable signal — yet they are the
+    // one case where memory IS the task. No content to correlate, so recency
+    // picks the episode. Emit it imperatively, adjacent to the prompt (the
+    // position the model reliably reads), instead of silently skipping. Live
+    // failure 2026-07-07: the previous session advertised "just say continue"
+    // and this hook dropped that exact prompt.
+    if is_continuation_prompt(prompt) {
+        return Some(EarlyExit::LineagePickup);
+    }
+
+    // Fast-path: skip slash commands
+    if prompt.starts_with('/') {
+        return Some(EarlyExit::Silent);
+    }
+
+    // Bare acknowledgments ("ok", "y") carry no intent signal worth an
+    // embedding pass.
+    if prompt.trim().len() < 3 {
+        return Some(EarlyExit::Silent);
+    }
+
+    None
+}
+
+/// Whether this prompt is answered without the vector index, so the hook
+/// process can skip loading it (see `hooks::hook_needs_index`).
+pub(crate) fn exits_before_search(prompt: Option<&str>) -> bool {
+    early_exit(prompt.unwrap_or_default()).is_some()
 }
 
 /// A turn the harness wrote, not the user: task/system notifications and
@@ -1873,6 +1908,35 @@ mod tests {
             "continue",
         ] {
             assert!(!is_harness_turn(typed), "{typed}");
+        }
+    }
+
+    #[test]
+    fn early_exits_skip_the_index_and_searchable_prompts_do_not() {
+        assert_eq!(early_exit(""), Some(EarlyExit::Silent));
+        assert_eq!(
+            early_exit("<task-notification>\n<status>completed</status>\n</task-notification>"),
+            Some(EarlyExit::Silent)
+        );
+        assert_eq!(early_exit("/compact"), Some(EarlyExit::Silent));
+        assert_eq!(early_exit("ok"), Some(EarlyExit::Silent));
+        assert_eq!(early_exit("continue"), Some(EarlyExit::LineagePickup));
+        // A harness turn that happens to open with a continuation phrase stays silent.
+        assert_eq!(
+            early_exit("continue <task-notification>done</task-notification>"),
+            Some(EarlyExit::Silent)
+        );
+        assert!(exits_before_search(None));
+        assert!(exits_before_search(Some("continue")));
+        // Short but not a stock phrase: the intent classifier may route it to
+        // the Explore arm, which searches reflections.
+        for searched in [
+            "where is auth?",
+            "keep at it",
+            "fix the statusline badge count",
+        ] {
+            assert_eq!(early_exit(searched), None, "{searched}");
+            assert!(!exits_before_search(Some(searched)), "{searched}");
         }
     }
 
