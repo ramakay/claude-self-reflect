@@ -37,6 +37,60 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
+/// Opt-out for [`isolation_args`]: keep loading the user's settings files in
+/// headless children. For installs whose credentials live there (`apiKeyHelper`,
+/// an `env` block selecting Bedrock or Vertex); hooks are still switched off.
+fn headless_keeps_user_settings() -> bool {
+    std::env::var("CSR_HEADLESS_USER_SETTINGS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Argv that cuts a headless `claude -p` child off from the machine's Claude
+/// Code setup. Every CSR spawn site passes it.
+///
+/// * `--setting-sources ""` loads no user, project or local settings, so the
+///   child runs none of the user's plugins and none of their SessionStart
+///   hooks.
+/// * `--no-session-persistence` writes no transcript, so the watcher never
+///   re-imports the headless call as if it were a real conversation.
+///
+/// Both are checked against `claude --help` once per process (~55ms): a CLI
+/// that predates an option rejects it outright, which would fail every call.
+pub fn isolation_args() -> Vec<String> {
+    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ARGS.get_or_init(|| {
+        let help = std::process::Command::new("claude")
+            .arg("--help")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        isolation_args_for(&help, headless_keeps_user_settings())
+    })
+    .clone()
+}
+
+/// [`isolation_args`] for a given `claude --help` text. No option is
+/// variadic, so the result can sit anywhere before `--mcp-config`.
+fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if keep_user_settings {
+        if help.contains("--settings ") {
+            args.push("--settings".to_string());
+            args.push(r#"{"disableAllHooks":true}"#.to_string());
+        }
+    } else if help.contains("--setting-sources") {
+        args.push("--setting-sources".to_string());
+        args.push(String::new());
+    }
+    if help.contains("--no-session-persistence") {
+        args.push("--no-session-persistence".to_string());
+    }
+    args
+}
+
 /// Path to an EMPTY MCP config, for use with `--strict-mcp-config` so a
 /// `claude -p` subprocess loads ZERO MCP servers.
 ///
@@ -190,6 +244,42 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HELP_CURRENT: &str = "  --no-session-persistence   Disable session persistence\n  --setting-sources <sources>   Comma-separated list\n  --settings <file-or-json>   Path to a settings JSON file\n";
+
+    #[test]
+    fn isolation_drops_settings_and_the_transcript() {
+        assert_eq!(
+            isolation_args_for(HELP_CURRENT, false),
+            ["--setting-sources", "", "--no-session-persistence"]
+        );
+    }
+
+    #[test]
+    fn isolation_never_passes_an_option_the_cli_does_not_list() {
+        // An unknown option fails the whole call, so an old CLI (or no CLI:
+        // empty help) gets nothing rather than a guess.
+        assert!(isolation_args_for("", false).is_empty());
+        assert!(isolation_args_for("", true).is_empty());
+        assert_eq!(
+            isolation_args_for("  --setting-sources <sources>\n", false),
+            ["--setting-sources", ""]
+        );
+        // `--setting-sources` must not be mistaken for `--settings`.
+        assert!(isolation_args_for("  --setting-sources <sources>\n", true).is_empty());
+    }
+
+    #[test]
+    fn keeping_user_settings_still_switches_hooks_off() {
+        assert_eq!(
+            isolation_args_for(HELP_CURRENT, true),
+            [
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+                "--no-session-persistence"
+            ]
+        );
+    }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/claude_p_result.json");
 

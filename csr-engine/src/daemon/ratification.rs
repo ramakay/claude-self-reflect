@@ -154,6 +154,9 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
                 cmd.args(["--model", model]);
             }
             cmd.args(["-p", "-", "--output-format", "json"]);
+            // No user settings (plugins, SessionStart hooks) and no transcript
+            // left behind for the watcher to re-import.
+            cmd.args(crate::narrative::isolation_args());
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {
