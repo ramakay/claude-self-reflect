@@ -32,9 +32,16 @@ import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { get as httpsGet } from 'https';
 import { fileURLToPath } from 'url';
+import {
+  BINARY_NAME,
+  activationCommand,
+  detectStaleBinaries,
+  formatStaleWarning,
+  planInstall,
+  whichBinary,
+} from './lib.js';
 
 const REPO = 'ramakay/claude-self-reflect';
-const BINARY_NAME = 'csr-engine';
 const INSTALL_DIR = process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin');
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(SCRIPT_DIR, '..');
@@ -197,43 +204,40 @@ function findExpectedChecksum(checksumData, filename) {
 // ~/.claude/settings.json, registers the MCP server, and imports
 // conversation transcripts. Never do that from a package manager
 // lifecycle script unless the user explicitly opted in.
-function runOrExplainActivation(binaryPath) {
+function runOrExplainActivation(destPath, pathBinary) {
+  // Bare `csr-engine` is only safe advice when PATH really resolves to the
+  // binary we installed; otherwise it runs whatever shadows it.
+  const command = activationCommand({ destPath, pathBinary });
+
   if (process.env.CSR_AUTO_SETUP === '1') {
     console.log('  CSR_AUTO_SETUP=1 — running setup...');
     try {
-      execFileSync(binaryPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
+      execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
       console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
     } catch {
-      console.log('\n  Setup failed. Run manually: csr-engine setup\n');
+      console.log(`\n  Setup failed. Run manually: ${command} setup\n`);
       process.exitCode = 1;
     }
   } else {
     console.log('\n  \x1b[1mTo activate\x1b[0m (registers the MCP server, installs hooks,');
     console.log('  and imports your conversations), run:');
-    console.log('\n    \x1b[1;32mcsr-engine setup\x1b[0m\n');
+    console.log(`\n    \x1b[1;32m${command} setup\x1b[0m\n`);
     console.log('  Then restart Claude Code.\n');
   }
 }
 
-// --- Existing installation detection ---
+// --- Shadowed installation detection ---
 
-function findExistingBinary() {
-  const candidates = [
-    join(INSTALL_DIR, BINARY_NAME),
-    '/usr/local/bin/csr-engine',
-  ];
-  try {
-    const which = execFileSync('which', ['csr-engine'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (which) candidates.unshift(which);
-  } catch {}
-
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
+// An npm upgrade writes INSTALL_DIR/csr-engine, but hooks and the MCP server
+// are registered with the absolute path of whichever binary ran setup. If that
+// was a different copy, the upgrade is invisible to Claude Code. Report it;
+// never touch it — keeping another build first on PATH is a legitimate choice.
+function warnAboutStaleCopies(destPath, pathBinary) {
+  const warning = formatStaleWarning({
+    stale: detectStaleBinaries({ destPath, homeDir: homedir(), pathBinary }),
+    destPath,
+  });
+  if (warning) console.log(warning);
 }
 
 function detectPythonCSR() {
@@ -259,8 +263,9 @@ function detectPythonCSR() {
 
 async function main() {
   const target = detectTarget();
-  const existingBinary = findExistingBinary();
   const pythonSignals = detectPythonCSR();
+  const destPath = join(INSTALL_DIR, BINARY_NAME);
+  const pathBinary = whichBinary();
 
   // Get version from package.json (pinned to this release)
   const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -272,22 +277,24 @@ async function main() {
     console.log('  Your conversation data is preserved.\n');
   }
 
-  if (existingBinary) {
-    // Check if existing binary is the right version
-    try {
-      const version = execFileSync(existingBinary, ['--version'], {
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim();
-      if (version === pkgVersion || version === tag || version.includes(` ${pkgVersion}`)) {
-        console.log(`\n  \x1b[1;32mcsr-engine ${pkgVersion} already installed.\x1b[0m`);
-        runOrExplainActivation(existingBinary);
-        return;
-      }
-      console.log(`  Updating ${existingBinary} to ${tag}...`);
-    } catch {
-      console.log(`  Updating ${existingBinary}...`);
-    }
+  // The skip decision is about the destination and nothing else: this package
+  // owns INSTALL_DIR/csr-engine and no other path. `--version` is the only
+  // thing we run against a binary we did not just install.
+  const plan = planInstall({ destPath, pkgVersion });
+
+  if (plan.action === 'skip') {
+    console.log(`\n  \x1b[1;32mcsr-engine ${pkgVersion} already installed:\x1b[0m ${destPath}`);
+    warnAboutStaleCopies(destPath, pathBinary);
+    runOrExplainActivation(destPath, pathBinary);
+    return;
+  }
+
+  if (plan.reason === 'different') {
+    console.log(`  Replacing ${destPath} (${plan.installedVersion}) with ${pkgVersion}...`);
+  } else if (plan.reason === 'unknown') {
+    // Pre-10.1 binaries have no --version flag, so "unknown" is the normal
+    // answer on the first upgrade past this release.
+    console.log(`  Replacing ${destPath} (version unknown) with ${pkgVersion}...`);
   }
 
   // Download binary
@@ -325,13 +332,13 @@ async function main() {
       throw new Error('Archive entry csr-engine is not a regular file');
     }
 
-    const destPath = join(INSTALL_DIR, BINARY_NAME);
     copyFileSync(binaryPath, destPath);
     chmodSync(destPath, 0o755);
 
     console.log(`  \x1b[1;32mInstalled:\x1b[0m ${destPath}`);
 
-    runOrExplainActivation(destPath);
+    warnAboutStaleCopies(destPath, pathBinary);
+    runOrExplainActivation(destPath, pathBinary);
 
     if (pythonSignals.length > 0) {
       console.log('  Old Python stack can be cleaned up:');
