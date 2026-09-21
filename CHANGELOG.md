@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed — installers no longer leave you on the old binary
+### Fixed: installers no longer leave you on the old binary
 
 - `csr-engine --version` (and `-V`) now exists and prints
   `csr-engine <version>`. It exits before the database, the HNSW index or the

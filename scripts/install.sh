@@ -185,11 +185,14 @@ resolve_path() {
 
 # csr-engine paths a Claude Code config file has registered. Deliberately crude
 # (no jq dependency) and fail-open: a missing, unreadable or unexpected file
-# yields nothing, never an error.
+# yields nothing, never an error. Only "command" values count: ~/.claude.json
+# also holds project keys and history, and a working directory such as
+# /Users/me/projects/foo/csr-engine is not a binary.
 registered_paths() {
     [ -r "$1" ] || return 0
-    grep -o '"[^"]*/csr-engine[^"]*"' "$1" 2>/dev/null |
-        tr -d '"' | awk '{print $1}' | grep '/csr-engine$' | sort -u || true
+    grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*csr-engine[^"]*"' "$1" 2>/dev/null |
+        sed 's/^"command"[[:space:]]*:[[:space:]]*"//; s/"$//' |
+        awk '{print $1}' | grep '/csr-engine$' | sort -u || true
 }
 
 # Warn when something other than the binary we just wrote is the one that will
