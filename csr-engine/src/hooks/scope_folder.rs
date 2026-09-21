@@ -17,9 +17,11 @@
 //!    directories whose encoding equals the folder. Exactly one is an answer.
 //!    None (the directory is gone), two (`repo/sub` and a sibling `repo-sub`
 //!    both exist), or any filesystem error on the way is no answer.
-//! 3. The decoded directory must sit inside the asker's main checkout and git
-//!    must report the same common directory for it as for the asker's cwd, so
-//!    a nested repository or submodule is not folded into its parent.
+//! 3. The decoded directory must sit inside the working tree the asker is in
+//!    (or inside the main checkout, when the asker's worktree is kept inside
+//!    it and so shares its label), and git must report the same common
+//!    directory for it as for the asker's cwd, so a nested repository or
+//!    submodule is not folded into its parent.
 //! 4. A conversation widens only when every transcript file recorded for its
 //!    id passes, and there are few of them. File stems are not unique
 //!    (`journal.jsonl`, copied agent transcripts).
@@ -44,6 +46,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::extraction::repo_root::GitPlace;
 use crate::search::cross_project::encode_project_folder;
 
 /// Conversation id to the labels its chunks may carry and still be recalled.
@@ -102,37 +105,42 @@ impl Budget {
 }
 
 /// The rule for one prompt: decode from `/`, identities from `git`, and a hard
-/// stop at the budget's deadline even if a filesystem call or `git` hangs.
+/// stop at the budget's deadline even if a filesystem call or `git` hangs. The
+/// map is handed to the worker, so nothing is copied outside the deadline.
 pub(crate) fn conversations_in_asker_repo(
-    paths_by_conversation: &HashMap<String, Vec<String>>,
+    paths_by_conversation: HashMap<String, Vec<String>>,
     projects_dir: &Path,
     asker_cwd: &Path,
 ) -> RepoConversations {
+    let budget = Budget::for_prompt();
     within_deadline(
         paths_by_conversation,
         projects_dir,
         asker_cwd,
-        Budget::for_prompt(),
-        || {},
+        budget,
+        OnDrop(Some(|| {})),
     )
 }
 
-/// The same rule for the MCP server, with the server's budget. `finished` runs
-/// on the worker when it is really over, which can be long after this returns:
-/// the server uses it to never start a second worker beside a stuck one.
+/// The same rule for the MCP server, over every conversation at once. The
+/// server's budget starts before `load_paths` runs, so reading the table is
+/// paid for out of it; the map is handed to the worker, not copied.
+///
+/// `finished` runs when the evaluation is really over, which for a worker
+/// stuck on a dead mount is long after this returns: the server uses it to
+/// never start a second worker beside a stuck one.
 pub(crate) fn conversations_in_client_repo(
-    paths_by_conversation: &HashMap<String, Vec<String>>,
+    load_paths: impl FnOnce() -> Option<HashMap<String, Vec<String>>>,
     projects_dir: &Path,
     client_dir: &Path,
     finished: impl FnOnce() + Send + 'static,
 ) -> RepoConversations {
-    within_deadline(
-        paths_by_conversation,
-        projects_dir,
-        client_dir,
-        Budget::for_server(),
-        finished,
-    )
+    let finished = OnDrop(Some(finished));
+    let budget = Budget::for_server();
+    let Some(paths) = load_paths() else {
+        return RepoConversations::new();
+    };
+    within_deadline(paths, projects_dir, client_dir, budget, finished)
 }
 
 /// Runs its closure when dropped: on return, on panic, and when the thread
@@ -151,46 +159,50 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 /// is checked between steps, but a single `read_dir` on a dead network mount
 /// cannot be interrupted; the caller must not hang with it. A late answer is
 /// dropped, which widens nothing.
-fn within_deadline(
-    paths_by_conversation: &HashMap<String, Vec<String>>,
+fn within_deadline<F: FnOnce() + Send + 'static>(
+    paths_by_conversation: HashMap<String, Vec<String>>,
     projects_dir: &Path,
     asker_cwd: &Path,
     budget: Budget,
-    finished: impl FnOnce() + Send + 'static,
+    finished: OnDrop<F>,
 ) -> RepoConversations {
-    let wait = budget.deadline.saturating_duration_since(Instant::now());
-    let (paths, projects_dir, asker_cwd) = (
-        paths_by_conversation.clone(),
-        projects_dir.to_path_buf(),
-        asker_cwd.to_path_buf(),
-    );
+    let deadline = budget.deadline;
+    if budget.expired() {
+        return RepoConversations::new();
+    }
+    let (projects_dir, asker_cwd) = (projects_dir.to_path_buf(), asker_cwd.to_path_buf());
     let (tx, rx) = std::sync::mpsc::channel();
-    let finished = OnDrop(Some(finished));
     let worker = std::thread::Builder::new().spawn(move || {
         let _finished = finished;
         let _ = tx.send(conversations_in_asker_repo_with(
-            &paths,
+            &paths_by_conversation,
             &projects_roots(&projects_dir),
             &asker_cwd,
             Path::new("/"),
-            &crate::extraction::repo_root::git_common_dir,
+            &crate::extraction::repo_root::git_place,
             budget,
         ));
     });
     if worker.is_err() {
         return RepoConversations::new();
     }
-    rx.recv_timeout(wait).unwrap_or_default()
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
 }
 
-/// The configured projects directory as given and as the filesystem resolves
-/// it. The watcher stores canonical transcript paths and the hook importer
-/// stores them as handed over, so a stored path may use either spelling.
+/// Every spelling a stored transcript path may use for the configured projects
+/// directory: as given, made absolute without resolving symlinks (a relative
+/// `--projects-dir` is stored absolute by the watcher), and as the filesystem
+/// resolves it.
 fn projects_roots(projects_dir: &Path) -> Vec<PathBuf> {
     let mut roots = vec![projects_dir.to_path_buf()];
-    if let Ok(canonical) = std::fs::canonicalize(projects_dir) {
-        if canonical != projects_dir {
-            roots.push(canonical);
+    let spellings = [
+        std::path::absolute(projects_dir).ok(),
+        std::fs::canonicalize(projects_dir).ok(),
+    ];
+    for spelling in spellings.into_iter().flatten() {
+        if !roots.contains(&spelling) {
+            roots.push(spelling);
         }
     }
     roots
@@ -203,7 +215,7 @@ pub(crate) fn conversations_in_asker_repo_with(
     projects_roots: &[PathBuf],
     asker_cwd: &Path,
     fs_root: &Path,
-    identity_of: &dyn Fn(&Path, Instant) -> Option<String>,
+    place_of: &dyn Fn(&Path, Instant) -> Option<GitPlace>,
     mut budget: Budget,
 ) -> RepoConversations {
     // Only conversations every one of whose files names a folder can pass, so
@@ -225,7 +237,7 @@ pub(crate) fn conversations_in_asker_repo_with(
         }
     }
 
-    let mut asker: Option<Option<(String, PathBuf)>> = None;
+    let mut asker: Option<Option<(String, Vec<PathBuf>)>> = None;
     let mut in_repo: HashSet<&str> = HashSet::new();
     for folder in folders {
         // Once the budget is gone nothing further can pass: stop, do not decode.
@@ -236,13 +248,13 @@ pub(crate) fn conversations_in_asker_repo_with(
         let passed = (|| {
             let decoded =
                 std::fs::canonicalize(decode_folder(fs_root, folder, &mut budget)?).ok()?;
-            let (asker_identity, checkout) = asker
-                .get_or_insert_with(|| asker_repository(asker_cwd, identity_of, deadline))
+            let (asker_identity, territory) = asker
+                .get_or_insert_with(|| asker_repository(asker_cwd, place_of, deadline))
                 .as_ref()?;
-            if !decoded.starts_with(checkout) || !budget.take_git_call() {
+            if !territory.iter().any(|root| decoded.starts_with(root)) || !budget.take_git_call() {
                 return None;
             }
-            (identity_of(&decoded, deadline)? == *asker_identity).then_some(())
+            (place_of(&decoded, deadline)?.common_dir == *asker_identity).then_some(())
         })()
         .is_some();
         if passed {
@@ -263,21 +275,28 @@ pub(crate) fn conversations_in_asker_repo_with(
         .collect()
 }
 
-/// The asker's repository identity and its main checkout directory. `None`
-/// when the cwd is in no repository, or the common directory is not the
-/// ordinary `<checkout>/.git` (a bare repository has no checkout to be inside).
+/// The asker's repository identity and the directories its project label
+/// covers: the working tree it is in, and also the main checkout when that
+/// working tree is a linked worktree kept inside it (`repo/.worktrees/x`
+/// resolves to the same label as `repo`). A linked worktree elsewhere on disk
+/// has its own label and covers only itself. `None` when the cwd is in no
+/// working tree.
 fn asker_repository(
     asker_cwd: &Path,
-    identity_of: &dyn Fn(&Path, Instant) -> Option<String>,
+    place_of: &dyn Fn(&Path, Instant) -> Option<GitPlace>,
     deadline: Instant,
-) -> Option<(String, PathBuf)> {
-    let identity = identity_of(asker_cwd, deadline)?;
-    let common_dir = Path::new(&identity);
-    if common_dir.file_name()? != ".git" {
-        return None;
+) -> Option<(String, Vec<PathBuf>)> {
+    let place = place_of(asker_cwd, deadline)?;
+    let mut territory = vec![place.toplevel.clone()];
+    let common_dir = Path::new(&place.common_dir);
+    if common_dir.file_name().is_some_and(|name| name == ".git") {
+        if let Some(main_checkout) = common_dir.parent() {
+            if place.toplevel != main_checkout && place.toplevel.starts_with(main_checkout) {
+                territory.push(main_checkout.to_path_buf());
+            }
+        }
     }
-    let checkout = common_dir.parent()?.to_path_buf();
-    Some((identity, checkout))
+    Some((place.common_dir, territory))
 }
 
 /// The Claude Code folder a transcript file lives in: the immediate child of
@@ -380,23 +399,46 @@ mod tests {
         }
     }
 
-    /// Identity stub: the nearest ancestor holding a `.git` directory, the way
+    /// Probe stub: the nearest ancestor holding a `.git` directory, the way
     /// git answers for an ordinary checkout, a subdirectory or a nested repo.
-    fn nearest_git_dir(dir: &Path, _deadline: Instant) -> Option<String> {
+    fn nearest_git_dir(dir: &Path, _deadline: Instant) -> Option<GitPlace> {
         let mut cur = Some(dir);
         while let Some(d) = cur {
             let git = d.join(".git");
             if git.is_dir() {
-                return Some(
-                    std::fs::canonicalize(git)
+                return Some(GitPlace {
+                    toplevel: std::fs::canonicalize(d).unwrap(),
+                    common_dir: std::fs::canonicalize(git)
                         .unwrap()
                         .to_string_lossy()
                         .into_owned(),
-                );
+                });
             }
             cur = d.parent();
         }
         None
+    }
+
+    /// Probe stub for a repository with one linked worktree: anything under
+    /// `worktree` is that working tree, anything else under `main` is the main
+    /// checkout, and both share `main/.git`.
+    fn with_linked_worktree(
+        main: PathBuf,
+        worktree: PathBuf,
+    ) -> impl Fn(&Path, Instant) -> Option<GitPlace> {
+        move |dir: &Path, _deadline: Instant| {
+            let toplevel = if dir.starts_with(&worktree) {
+                worktree.clone()
+            } else if dir.starts_with(&main) {
+                main.clone()
+            } else {
+                return None;
+            };
+            Some(GitPlace {
+                toplevel,
+                common_dir: main.join(".git").to_string_lossy().into_owned(),
+            })
+        }
     }
 
     fn rows(rows: &[(&str, Vec<&str>)]) -> HashMap<String, Vec<String>> {
@@ -704,7 +746,8 @@ mod tests {
             widen(&root, "Users/u/projects/plain", &table),
             Vec::<String>::new()
         );
-        let bare = |_: &Path, _: Instant| Some("/srv/git/repo.git".to_string());
+        // A bare repository has no working tree, so git gives no place at all.
+        let bare = |_: &Path, _: Instant| None;
         assert!(conversations_in_asker_repo_with(
             &rows(&table),
             &[PathBuf::from("/cc/projects")],
@@ -714,6 +757,80 @@ mod tests {
             roomy(),
         )
         .is_empty());
+    }
+
+    /// A stored path may spell the projects directory three ways.
+    #[test]
+    fn the_projects_directory_is_known_by_every_spelling_a_stored_path_may_use() {
+        let relative = projects_roots(Path::new("cc-projects"));
+        assert_eq!(relative[0], Path::new("cc-projects"));
+        assert!(relative.contains(&std::env::current_dir().unwrap().join("cc-projects")));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let roots = projects_roots(&link);
+            assert!(roots.contains(&link));
+            assert!(roots.contains(&std::fs::canonicalize(&real).unwrap()));
+            let stored = format!("{}/-u-projects-repo/s.jsonl", link.display());
+            assert_eq!(transcript_folder(&roots, &stored), Some("-u-projects-repo"));
+        }
+    }
+
+    /// A linked worktree beside the main checkout has its own label, so it
+    /// covers its own subdirectory sessions and not the main checkout's. One
+    /// kept inside the main checkout shares the label and covers both.
+    #[test]
+    fn a_linked_worktree_covers_what_its_label_covers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        mkdirs(
+            &root,
+            &[
+                "Users/u/projects/repo/sub",
+                "Users/u/projects/repo/.worktrees/x/sub",
+                "Users/u/projects/repo-wt/sub",
+            ],
+        );
+        let main = root.join("Users/u/projects/repo");
+        let table = [
+            ("main-sub", vec!["-Users-u-projects-repo-sub/a.jsonl"]),
+            ("beside-sub", vec!["-Users-u-projects-repo-wt-sub/b.jsonl"]),
+            (
+                "inside-sub",
+                vec!["-Users-u-projects-repo--worktrees-x-sub/c.jsonl"],
+            ),
+        ];
+        let ask = |cwd: &str, worktree: &str| {
+            let probe = with_linked_worktree(main.clone(), root.join(worktree));
+            let mut ids: Vec<String> = conversations_in_asker_repo_with(
+                &rows(&table),
+                &[PathBuf::from("/cc/projects")],
+                &root.join(cwd),
+                &root,
+                &probe,
+                roomy(),
+            )
+            .into_keys()
+            .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(
+            ask("Users/u/projects/repo-wt/sub", "Users/u/projects/repo-wt"),
+            ["beside-sub"]
+        );
+        assert_eq!(
+            ask(
+                "Users/u/projects/repo/.worktrees/x",
+                "Users/u/projects/repo/.worktrees/x"
+            ),
+            ["inside-sub", "main-sub"]
+        );
     }
 
     #[test]
@@ -760,7 +877,7 @@ mod tests {
         let over = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&over);
         let widened = conversations_in_client_repo(
-            &HashMap::new(),
+            || Some(HashMap::new()),
             Path::new("/cc/projects"),
             Path::new("/"),
             move || {
@@ -773,5 +890,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(over.load(Ordering::SeqCst), 1);
+
+        // A failed read never starts a worker and still reports.
+        let seen = Arc::clone(&over);
+        let widened = conversations_in_client_repo(
+            || None,
+            Path::new("/cc/projects"),
+            Path::new("/"),
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert!(widened.is_empty());
+        assert_eq!(over.load(Ordering::SeqCst), 2);
     }
 }

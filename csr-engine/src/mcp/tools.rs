@@ -260,19 +260,8 @@ pub async fn reflect_on_past(
     // or empty, supplement with keyword search results
     let semantic_top_score = enriched.iter().map(|e| e.score).fold(0.0f32, f32::max);
     if semantic_top_score < 0.5 {
-        // The keyword index filters by label only. When the scope reaches past
-        // the label, search unfiltered and keep what the scope admits.
         let fts_chunks = match &scope {
-            Some(scope) if scope.reaches_past_label() => {
-                storage.fts5_search(query, limit * 4, None).map(|chunks| {
-                    chunks
-                        .into_iter()
-                        .filter(|c| scope.admits(&c.project_name, &c.conversation_id))
-                        .take(limit)
-                        .collect::<Vec<_>>()
-                })
-            }
-            Some(scope) => storage.fts5_search(query, limit, Some(scope.project.as_str())),
+            Some(scope) => scope.keyword_search(storage, query, limit),
             None => storage.fts5_search(query, limit, None),
         };
         if let Ok(fts_chunks) = fts_chunks {

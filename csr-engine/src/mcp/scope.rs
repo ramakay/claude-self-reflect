@@ -22,9 +22,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::hooks::scope_folder::RepoConversations;
+use crate::hooks::scope_folder::{RepoConversations, MAX_PATHS_PER_CONVERSATION};
+use crate::import::ConversationChunk;
 use crate::search::cross_project::{resolve_client_dir, resolve_project_from_cwd};
 use crate::storage::Storage;
+
+/// A keyword search asks the index once per label the scope reaches. A
+/// repository with sessions started in more subdirectories than this keeps the
+/// first ones by name; the rest are still found by the semantic search.
+const MAX_KEYWORD_LABELS: usize = 8;
 
 /// How long one server process trusts its answer about which conversations
 /// belong to the client's repository. The answer costs a full `import_state`
@@ -32,19 +38,29 @@ use crate::storage::Storage;
 const REPO_CONVERSATIONS_TTL: Duration = Duration::from_secs(60);
 
 type Cached = (String, Instant, Arc<RepoConversations>);
-static REPO_CONVERSATIONS: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
-/// One worker at a time. The rule gives up at its deadline, but a worker stuck
-/// on a dead mount stays behind. The flag is the worker's to clear, so while
-/// one is stuck no other is started and the scope is the last answer or the
-/// label alone.
-static EVALUATING: AtomicBool = AtomicBool::new(false);
+
+/// What one server process remembers about the client's repository.
+#[derive(Default)]
+struct ScopeCache {
+    answer: Mutex<Option<Cached>>,
+    /// One worker at a time. The rule gives up at its deadline, but a worker
+    /// stuck on a dead mount stays behind. The flag is the worker's to clear,
+    /// so while one is stuck no other is started and the scope is the last
+    /// answer or the label alone.
+    evaluating: AtomicBool,
+}
+
+fn process_cache() -> Arc<ScopeCache> {
+    static CACHE: OnceLock<Arc<ScopeCache>> = OnceLock::new();
+    Arc::clone(CACHE.get_or_init(Default::default))
+}
 
 /// What a project-scoped search may return.
 pub struct SearchScope {
     pub project: String,
     /// Conversations stored under another label but filed from inside the
-    /// client's repository, with the labels their chunks may carry. Empty when
-    /// the scope is not the client's own.
+    /// client's repository, with the labels their chunks may carry. Never holds
+    /// `project` itself, and is empty when the scope is not the client's own.
     repo_conversations: Arc<RepoConversations>,
 }
 
@@ -62,7 +78,13 @@ impl SearchScope {
         projects_dir: &Path,
         project: Option<&str>,
     ) -> (Option<Self>, String) {
-        Self::resolve_with(storage, projects_dir, project, resolve_client_dir())
+        Self::resolve_with(
+            storage,
+            projects_dir,
+            project,
+            resolve_client_dir(),
+            &process_cache(),
+        )
     }
 
     fn resolve_with(
@@ -70,6 +92,7 @@ impl SearchScope {
         projects_dir: &Path,
         project: Option<&str>,
         client_dir: Option<String>,
+        cache: &Arc<ScopeCache>,
     ) -> (Option<Self>, String) {
         let own = client_dir
             .as_deref()
@@ -83,7 +106,9 @@ impl SearchScope {
             },
         };
         let repo_conversations = match &own {
-            Some((name, dir)) if *name == project => repo_conversations(storage, projects_dir, dir),
+            Some((name, dir)) if *name == project => {
+                repo_conversations(storage, projects_dir, dir, name, cache)
+            }
             _ => Arc::new(RepoConversations::new()),
         };
         let label = project.clone();
@@ -105,9 +130,39 @@ impl SearchScope {
                 .is_some_and(|labels| labels.contains(project_name))
     }
 
-    /// True when the scope holds conversations stored under another label.
-    pub fn reaches_past_label(&self) -> bool {
-        !self.repo_conversations.is_empty()
+    /// The keyword fallback inside the scope. The label query is the one that
+    /// ran before scopes existed, so what it returns cannot be crowded out by
+    /// anything added here; each label the scope reaches gets its own query,
+    /// filtered in SQL before the limit, and keeps what the scope admits.
+    pub fn keyword_search(
+        &self,
+        storage: &Storage,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationChunk>> {
+        let mut found = storage.fts5_search(query, limit, Some(self.project.as_str()))?;
+        let labels: std::collections::BTreeSet<&str> = self
+            .repo_conversations
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut seen: HashSet<String> = found.iter().map(|c| c.id.clone()).collect();
+        let mut extra = 0usize;
+        for label in labels.into_iter().take(MAX_KEYWORD_LABELS) {
+            for chunk in storage.fts5_search(query, limit, Some(label))? {
+                if extra == limit {
+                    return Ok(found);
+                }
+                if self.admits(&chunk.project_name, &chunk.conversation_id)
+                    && seen.insert(chunk.id.clone())
+                {
+                    found.push(chunk);
+                    extra += 1;
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Every chunk id inside the scope, for `search_chunks_filtered`.
@@ -130,17 +185,19 @@ impl SearchScope {
     }
 }
 
-/// Conversations filed from inside the repository `client_dir` belongs to,
-/// remembered per server process for [`REPO_CONVERSATIONS_TTL`]. Any failure
-/// is an empty set: the scope is then the label alone, as it always was.
+/// Conversations filed from inside the repository `client_dir` belongs to but
+/// stored under a label other than `own_label`, remembered per server process
+/// for [`REPO_CONVERSATIONS_TTL`]. Any failure is an empty set: the scope is
+/// then the label alone, as it always was.
 fn repo_conversations(
     storage: &Storage,
     projects_dir: &Path,
     client_dir: &str,
+    own_label: &str,
+    cache: &Arc<ScopeCache>,
 ) -> Arc<RepoConversations> {
-    let cache = REPO_CONVERSATIONS.get_or_init(|| Mutex::new(None));
     let mut stale = None;
-    if let Ok(guard) = cache.lock() {
+    if let Ok(guard) = cache.answer.lock() {
         if let Some((dir, at, set)) = guard.as_ref() {
             if dir == client_dir {
                 if at.elapsed() < REPO_CONVERSATIONS_TTL {
@@ -150,24 +207,32 @@ fn repo_conversations(
             }
         }
     }
-    if EVALUATING.swap(true, Ordering::SeqCst) {
+    if cache.evaluating.swap(true, Ordering::SeqCst) {
         // Another search is evaluating right now: the last answer, or none.
         return stale.unwrap_or_default();
     }
-    let set = Arc::new(match storage.all_import_paths() {
-        Ok(paths) => crate::hooks::scope_folder::conversations_in_client_repo(
-            &paths,
-            projects_dir,
-            Path::new(client_dir),
-            || EVALUATING.store(false, Ordering::SeqCst),
-        ),
-        Err(e) => {
-            tracing::warn!(error = %e, "import_state read failed; project scope is the label only");
-            EVALUATING.store(false, Ordering::SeqCst);
-            RepoConversations::new()
-        }
+    let mut set = crate::hooks::scope_folder::conversations_in_client_repo(
+        || match storage.all_import_paths(MAX_PATHS_PER_CONVERSATION) {
+            Ok(paths) => Some(paths),
+            Err(e) => {
+                tracing::warn!(error = %e, "import_state read failed; project scope is the label only");
+                None
+            }
+        },
+        projects_dir,
+        Path::new(client_dir),
+        {
+            let cache = Arc::clone(cache);
+            move || cache.evaluating.store(false, Ordering::SeqCst)
+        },
+    );
+    // Root sessions are in scope by label already; keep only what reaches past it.
+    set.retain(|_, labels| {
+        labels.remove(own_label);
+        !labels.is_empty()
     });
-    if let Ok(mut guard) = cache.lock() {
+    let set = Arc::new(set);
+    if let Ok(mut guard) = cache.answer.lock() {
         *guard = Some((client_dir.to_string(), Instant::now(), Arc::clone(&set)));
     }
     set
@@ -177,22 +242,27 @@ fn repo_conversations(
 mod tests {
     use super::*;
 
+    fn insert(storage: &Storage, id: &str, conversation_id: &str, label: &str, content: &str) {
+        let chunk = crate::import::ConversationChunk {
+            id: id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            project_name: label.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: content.to_string(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+    }
+
     fn storage_with(rows: &[(&str, &str, &str)], import_rows: &[(&str, &str)]) -> Storage {
         let storage = Storage::open_memory().unwrap();
         for (id, conversation_id, label) in rows {
-            let chunk = crate::import::ConversationChunk {
-                id: id.to_string(),
-                conversation_id: conversation_id.to_string(),
-                project_name: label.to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                content: format!("work recorded under {label}"),
-                message_count: 1,
-                summary: None,
-                author: crate::provenance::Speaker::User,
-                seq: 0,
-                is_sidechain: false,
-            };
-            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            let content = format!("work recorded under {label}");
+            insert(&storage, id, conversation_id, label, &content);
         }
         for (file_path, conversation_id) in import_rows {
             storage
@@ -200,6 +270,12 @@ mod tests {
                 .unwrap();
         }
         storage
+    }
+
+    /// A cache of its own per test: the process-wide one would let two tests
+    /// running side by side see each other's flag and answer.
+    fn fresh() -> Arc<ScopeCache> {
+        Arc::default()
     }
 
     fn sorted(ids: HashSet<String>) -> Vec<String> {
@@ -212,13 +288,13 @@ mod tests {
     fn all_is_no_scope_and_an_unknown_client_directory_is_no_scope() {
         let storage = storage_with(&[], &[]);
         let cc = Path::new("/cc/projects");
-        let (scope, label) = SearchScope::resolve_with(&storage, cc, Some("ALL"), None);
+        let (scope, label) = SearchScope::resolve_with(&storage, cc, Some("ALL"), None, &fresh());
         assert!(scope.is_none());
         assert_eq!(label, "all");
-        let (scope, label) = SearchScope::resolve_with(&storage, cc, None, None);
+        let (scope, label) = SearchScope::resolve_with(&storage, cc, None, None, &fresh());
         assert!(scope.is_none());
         assert_eq!(label, "all");
-        let (scope, label) = SearchScope::resolve_with(&storage, cc, Some(""), None);
+        let (scope, label) = SearchScope::resolve_with(&storage, cc, Some(""), None, &fresh());
         assert!(scope.is_none());
         assert_eq!(label, "all");
     }
@@ -234,6 +310,7 @@ mod tests {
             Path::new("/cc/projects"),
             Some("other"),
             Some("/u/projects/repo".to_string()),
+            &fresh(),
         );
         let scope = scope.unwrap();
         assert_eq!(label, "other");
@@ -290,8 +367,13 @@ mod tests {
             ],
         );
         let client_dir = repo.join("engine").to_string_lossy().into_owned();
-        let (scope, label) =
-            SearchScope::resolve_with(&storage, Path::new("/cc/projects"), None, Some(client_dir));
+        let (scope, label) = SearchScope::resolve_with(
+            &storage,
+            Path::new("/cc/projects"),
+            None,
+            Some(client_dir),
+            &fresh(),
+        );
         let scope = scope.unwrap();
         assert_eq!(label, "repo");
         assert_eq!(
@@ -301,5 +383,89 @@ mod tests {
         assert!(scope.admits("repo-engine", "s-sub"));
         assert!(!scope.admits("elsewhere", "s-sub"));
         assert!(!scope.admits("repo-tools", "s-tools"));
+    }
+
+    /// The keyword fallback: better-ranked matches from other projects, however
+    /// many, cannot push out the scope's own, because every query is filtered
+    /// by label before its limit. A chunk that shares the subdirectory's label
+    /// but whose conversation the folder rule did not place stays out.
+    #[test]
+    fn keyword_matches_elsewhere_cannot_crowd_out_the_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("projects/kwrepo");
+        std::fs::create_dir_all(repo.join("engine")).unwrap();
+        let mut cmd = std::process::Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(&k);
+            }
+        }
+        if !cmd
+            .arg("init")
+            .arg("-q")
+            .arg(&repo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return; // git unavailable in this environment
+        }
+        let folder = |dir: &Path| {
+            crate::search::cross_project::encode_project_folder(&dir.to_string_lossy())
+        };
+        let storage = storage_with(&[], &[]);
+        insert(&storage, "own", "s-root", "kwrepo", "the quuxflag switch");
+        insert(
+            &storage,
+            "sub",
+            "s-sub",
+            "kwrepo-engine",
+            "quuxflag in the engine",
+        );
+        insert(
+            &storage,
+            "unplaced",
+            "s-lost",
+            "kwrepo-engine",
+            "quuxflag too",
+        );
+        for i in 0..30 {
+            let id = format!("other-{i}");
+            insert(
+                &storage,
+                &id,
+                &id,
+                "elsewhere",
+                "quuxflag quuxflag quuxflag quuxflag",
+            );
+        }
+        let root_path = format!("/cc/projects/{}/s-root.jsonl", folder(&repo));
+        let sub_path = format!("/cc/projects/{}/s-sub.jsonl", folder(&repo.join("engine")));
+        for (path, id) in [(&root_path, "s-root"), (&sub_path, "s-sub")] {
+            storage
+                .upsert_import_state_explicit(path, id, 1, "0")
+                .unwrap();
+        }
+
+        let client_dir = repo.to_string_lossy().into_owned();
+        let (scope, _) = SearchScope::resolve_with(
+            &storage,
+            Path::new("/cc/projects"),
+            None,
+            Some(client_dir),
+            &fresh(),
+        );
+        let scope = scope.unwrap();
+        // The root session is in scope by label and is not carried as widened.
+        assert!(!scope.repo_conversations.contains_key("s-root"));
+        let mut found: Vec<String> = scope
+            .keyword_search(&storage, "quuxflag", 5)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        found.sort();
+        assert_eq!(found, ["own", "sub"]);
     }
 }

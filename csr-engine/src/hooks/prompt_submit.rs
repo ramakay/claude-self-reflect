@@ -760,7 +760,7 @@ async fn search_chunks_with_vec_core(
     limit: usize,
     min_score: f32,
     project: &str,
-    same_repo: impl FnOnce(&HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
+    same_repo: impl FnOnce(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -805,7 +805,7 @@ async fn search_chunks_with_vec_core(
             &mismatched,
             super::scope_folder::MAX_PATHS_PER_CONVERSATION,
         ) {
-            Ok(paths) if !paths.is_empty() => same_repo(&paths),
+            Ok(paths) if !paths.is_empty() => same_repo(paths),
             Ok(_) => HashMap::new(),
             Err(e) => {
                 tracing::warn!(error = %e, "import_state lookup failed; exact project match only");

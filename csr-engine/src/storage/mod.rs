@@ -689,9 +689,12 @@ impl Storage {
     }
 
     /// Every transcript path by conversation id. See `queries::all_import_paths`.
-    pub fn all_import_paths(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    pub fn all_import_paths(
+        &self,
+        max_paths_per_id: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::all_import_paths(&conn)
+        queries::all_import_paths(&conn, max_paths_per_id)
     }
 
     /// `(id, conversation_id, project_name)` for a set of conversations. See
