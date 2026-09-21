@@ -140,7 +140,7 @@ impl SearchScope {
         query: &str,
         limit: usize,
     ) -> Result<Vec<ConversationChunk>> {
-        let mut found = storage.fts5_search(query, limit, Some(self.project.as_str()))?;
+        let mut found = storage.fts5_search_in_label(query, limit, &self.project)?;
         let labels: std::collections::BTreeSet<&str> = self
             .repo_conversations
             .values()
@@ -150,7 +150,7 @@ impl SearchScope {
         let mut seen: HashSet<String> = found.iter().map(|c| c.id.clone()).collect();
         let mut extra = 0usize;
         for label in labels.into_iter().take(MAX_KEYWORD_LABELS) {
-            for chunk in storage.fts5_search(query, limit, Some(label))? {
+            for chunk in storage.fts5_search_in_label(query, limit, label)? {
                 if extra == limit {
                     return Ok(found);
                 }
@@ -383,6 +383,37 @@ mod tests {
         assert!(scope.admits("repo-engine", "s-sub"));
         assert!(!scope.admits("elsewhere", "s-sub"));
         assert!(!scope.admits("repo-tools", "s-tools"));
+    }
+
+    /// A directory named `all` is a project like any other once the scope is
+    /// resolved; only the tool argument `"all"` means everything.
+    #[test]
+    fn a_project_named_all_is_still_a_label_for_the_keyword_fallback() {
+        let storage = storage_with(&[], &[]);
+        insert(&storage, "own", "s-own", "all", "the quuxflag switch");
+        insert(
+            &storage,
+            "other",
+            "s-other",
+            "elsewhere",
+            "quuxflag quuxflag quuxflag",
+        );
+        let (scope, label) = SearchScope::resolve_with(
+            &storage,
+            Path::new("/cc/projects"),
+            None,
+            Some("/u/projects/all".to_string()),
+            &fresh(),
+        );
+        assert_eq!(label, "all");
+        let found: Vec<String> = scope
+            .unwrap()
+            .keyword_search(&storage, "quuxflag", 1)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(found, ["own"]);
     }
 
     /// The keyword fallback: better-ranked matches from other projects, however

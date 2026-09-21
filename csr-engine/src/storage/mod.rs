@@ -245,6 +245,18 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// Keyword search inside one label, taken literally. See
+    /// `queries::fts5_search_labelled`.
+    pub fn fts5_search_in_label(
+        &self,
+        query: &str,
+        limit: usize,
+        label: &str,
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search_labelled(&conn, query, limit, Some(label))
+    }
+
     // ─── Reflection tag queries ───
 
     pub fn get_reflections_by_tag(

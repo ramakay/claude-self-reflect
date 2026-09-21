@@ -502,11 +502,24 @@ pub fn get_chunk_ids_in_timerange(
 // ─── FTS5 full-text search ───
 
 /// Search chunks using FTS5 full-text search (for file path lookup etc.).
+/// `project` is a tool argument here: `"all"` means no filter.
 pub fn fts5_search(
     conn: &Connection,
     query: &str,
     limit: usize,
     project: Option<&str>,
+) -> Result<Vec<ConversationChunk>> {
+    fts5_search_labelled(conn, query, limit, project.filter(|p| *p != "all"))
+}
+
+/// [`fts5_search`] with `label` taken literally, for a caller that already
+/// resolved its scope: a project whose directory is named `all` is a label
+/// like any other.
+pub fn fts5_search_labelled(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    label: Option<&str>,
 ) -> Result<Vec<ConversationChunk>> {
     // Sanitize for FTS5: split into OR-joined quoted words
     // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
@@ -529,7 +542,7 @@ pub fn fts5_search(
         .collect::<Vec<_>>()
         .join(" OR ");
 
-    let chunks = if let Some(p) = project.filter(|p| *p != "all") {
+    let chunks = if let Some(p) = label {
         let mut stmt = conn.prepare(
             "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary
              FROM chunks c
@@ -1068,8 +1081,9 @@ pub fn import_paths_for_conversations(
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let mut stmt =
         conn.prepare("SELECT file_path FROM import_state WHERE conversation_id = ?1 LIMIT ?2")?;
+    let mut asked: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for conversation_id in conversation_ids {
-        if out.contains_key(conversation_id) {
+        if !asked.insert(conversation_id.as_str()) {
             continue;
         }
         let mut paths = stmt
@@ -2982,10 +2996,12 @@ mod tests {
         file("nine", 9);
         file("journal", 500);
 
-        let ids: Vec<String> = ["one", "eight", "nine", "journal", "absent", "one"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let ids: Vec<String> = [
+            "one", "eight", "nine", "journal", "absent", "one", "journal", "absent",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let got = import_paths_for_conversations(&conn, &ids, 8).unwrap();
         let mut keys: Vec<&String> = got.keys().collect();
         keys.sort();

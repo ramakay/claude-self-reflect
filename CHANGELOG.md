@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   64 directory listings, 4 `git` calls and 250 ms. Known limit: the filesystem
   is read as it is now, so a deleted sibling `repo-sub` whose name now decodes
   to an existing `repo/sub` is taken for the subdirectory. Measured against
-  the published 9.5.6 on real transcripts, 30 prompts per frame, four runs:
+  the published 9.5.6 on real transcripts, 30 prompts per frame, five runs:
   subdirectory sessions 0 -> 23 to 27 source chunks injected; a sibling
   repository 0 and 0; 0 again once a sibling directory with the same encoded
   name exists. Root sessions asked from the subdirectory went 24 to 27 ->
@@ -96,9 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `csr_get_more` now fall back to `CLAUDE_PROJECT_DIR`, which Claude Code
   exports to the stdio servers it starts. The scope is the project label plus
   the subdirectory sessions the rule above places in the same repository, so
-  turning the scope on does not hide them; the keyword fallback asks the index
-  once per label in the scope, so matches from other projects cannot crowd
-  them out. `project: "all"` still searches everything, a client that sets
+  turning the scope on does not hide them. The keyword fallback asks the index
+  for the project's own label, then for up to eight further labels in the
+  scope, alphabetically, adding at most `limit` results from them; each query
+  is filtered by label before its limit, so matches under other labels cannot
+  crowd these out. `project: "all"` still searches everything, a client that sets
   neither variable is unchanged, and the code-graph, file and provenance tools
   resolve their project as before. A session stored under another label whose
   starting directory no longer exists (a removed worktree, a deleted scratch
