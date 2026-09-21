@@ -15,6 +15,9 @@ set -e
 REPO="ramakay/claude-self-reflect"
 INSTALL_DIR="${CSR_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="csr-engine"
+# How to spell `csr-engine setup` in advice we print. check_shadow replaces this
+# with the absolute path whenever the bare name would resolve to another copy.
+SETUP_CMD="$BINARY_NAME"
 
 # --- Helpers ---
 
@@ -106,7 +109,7 @@ download_and_install() {
     fi
 
     # Extract
-    info "Extracting" "to ${INSTALL_DIR}..."
+    info "Extracting" "${TARBALL}..."
     mkdir -p "$INSTALL_DIR"
     tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
 
@@ -153,14 +156,107 @@ check_path() {
 
 # --- Verify ---
 
+# `--version` and `--help` are the only invocations here: they exit before the
+# database, the HNSW index or the model cache is touched. `status` opens the
+# user's live database, which an installer has no business doing.
 verify() {
-    if "${INSTALL_DIR}/${BINARY_NAME}" status --compact >/dev/null 2>&1; then
+    if "${INSTALL_DIR}/${BINARY_NAME}" --version >/dev/null 2>&1; then
         ok "Verified" "binary works"
     elif "${INSTALL_DIR}/${BINARY_NAME}" --help >/dev/null 2>&1; then
         ok "Verified" "binary works"
     else
         err "Binary installed but failed to execute. Check architecture compatibility."
     fi
+}
+
+# --- Shadowed installation ---
+
+# Resolve symlinks where the platform can, otherwise return the input. Only
+# used to compare two paths, so degrading to a string compare is safe.
+resolve_path() {
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$1" 2>/dev/null || printf '%s\n' "$1"
+    elif readlink -f / >/dev/null 2>&1; then
+        readlink -f "$1" 2>/dev/null || printf '%s\n' "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# csr-engine paths a Claude Code config file has registered. Deliberately crude
+# (no jq dependency) and fail-open: a missing, unreadable or unexpected file
+# yields nothing, never an error.
+registered_paths() {
+    [ -r "$1" ] || return 0
+    grep -o '"[^"]*/csr-engine[^"]*"' "$1" 2>/dev/null |
+        tr -d '"' | awk '{print $1}' | grep '/csr-engine$' | sort -u || true
+}
+
+# Warn when something other than the binary we just wrote is the one that will
+# actually run: hooks and the MCP server are registered with the absolute path
+# of whichever copy ran setup. Read-only, never fatal — keeping a different
+# build earlier on PATH is a legitimate choice.
+check_shadow() {
+    DEST="${INSTALL_DIR}/${BINARY_NAME}"
+    DEST_REAL="$(resolve_path "$DEST")"
+    SETUP_CMD="$BINARY_NAME"
+
+    SHADOW=""
+    ON_PATH="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
+    if [ -z "$ON_PATH" ]; then
+        SETUP_CMD="$DEST"
+    elif [ "$(resolve_path "$ON_PATH")" != "$DEST_REAL" ]; then
+        SHADOW="$ON_PATH"
+        SETUP_CMD="$DEST"
+    fi
+
+    STALE_HOOKS=""
+    for p in $(registered_paths "$HOME/.claude/settings.json"); do
+        if [ "$(resolve_path "$p")" != "$DEST_REAL" ]; then
+            STALE_HOOKS="$p"
+        fi
+    done
+
+    STALE_MCP=""
+    for p in $(registered_paths "$HOME/.claude.json"); do
+        if [ "$(resolve_path "$p")" != "$DEST_REAL" ]; then
+            STALE_MCP="$p"
+        fi
+    done
+
+    if [ -z "$SHADOW" ] && [ -z "$STALE_HOOKS" ] && [ -z "$STALE_MCP" ]; then
+        return 0
+    fi
+    SETUP_CMD="$DEST"
+
+    printf '\n  \033[1;33mWARNING: a different csr-engine is still the one in use.\033[0m\n\n'
+    printf '  Just installed:  %s\n' "$DEST"
+    if [ -n "$SHADOW" ]; then
+        printf '  First on PATH:   %s\n' "$SHADOW"
+    fi
+    if [ -n "$STALE_HOOKS" ]; then
+        printf '  Claude Code hooks: %s\n' "$STALE_HOOKS"
+    fi
+    if [ -n "$STALE_MCP" ]; then
+        printf '  MCP server:        %s\n' "$STALE_MCP"
+    fi
+    printf '\n  Nothing outside %s was changed — the other copy was left in place.\n' "$INSTALL_DIR"
+
+    if [ -n "$STALE_HOOKS" ] || [ -n "$STALE_MCP" ]; then
+        printf '\n  To point Claude Code at the binary just installed:\n\n'
+        if [ -n "$STALE_MCP" ]; then
+            # `claude mcp add` refuses to overwrite an existing entry, so
+            # re-running setup on its own cannot repoint the MCP server.
+            printf '    claude mcp remove claude-self-reflect -s user\n'
+        fi
+        printf '    %s setup\n' "$DEST"
+        printf '    # Then restart Claude Code\n'
+    fi
+    if [ -n "$SHADOW" ]; then
+        printf '\n  The bare %s command still resolves to %s.\n' "$BINARY_NAME" "$SHADOW"
+        printf '  Run %s by absolute path, or put %s earlier on PATH.\n' "$DEST" "$INSTALL_DIR"
+    fi
+    printf '\n'
 }
 
 # --- Main ---
@@ -184,6 +280,7 @@ Build from source instead:
     download_and_install
     verify
     check_path
+    check_shadow
 
     # Setup writes hooks into ~/.claude/settings.json, registers the MCP
     # server, and imports conversation transcripts — that needs explicit
@@ -218,13 +315,13 @@ Build from source instead:
             printf '\n  \033[32m✓\033[0m  Done. Restart Claude Code to activate.\n\n'
         else
             printf '\n  \033[33m⚠\033[0m  Setup encountered errors. Try manually:\n'
-            printf '    %s setup\n' "$BINARY_NAME"
+            printf '    %s setup\n' "$SETUP_CMD"
             printf '    # Then restart Claude Code\n\n'
             exit 1
         fi
     else
         printf '\n  \033[1mNot yet active.\033[0m To register MCP, install hooks, and import conversations:\n'
-        printf '    %s setup\n' "$BINARY_NAME"
+        printf '    %s setup\n' "$SETUP_CMD"
         printf '    # Then restart Claude Code\n\n'
     fi
 }
