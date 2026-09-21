@@ -56,11 +56,29 @@ export function shellQuote(value) {
   return `'${str.replace(/'/g, "'\\''")}'`;
 }
 
-/** Pull the version out of clap's `csr-engine 10.1.0` line. */
+const DIGITS = /^\d+$/;
+const VERSION_SUFFIX = /^[0-9A-Za-z.+-]*$/;
+
+/**
+ * Pull the version out of clap's `csr-engine 10.1.0` line.
+ *
+ * The last whitespace-delimited token of the first line must be
+ * `<int>.<int>.<int>` with an optional semver suffix. Checked piecewise with
+ * anchored, unambiguous patterns rather than one backtracking regex: this runs
+ * on whatever a binary at the destination prints, so it has to be linear time.
+ */
 export function parseVersion(output) {
-  const firstLine = String(output || '').trim().split('\n')[0].trim();
-  const match = firstLine.match(/(\d+\.\d+\.\d+[0-9A-Za-z.+-]*)$/);
-  return match ? match[1] : null;
+  const firstLine = String(output || '').slice(0, 512).split('\n')[0].trim();
+  const token = firstLine.split(/\s+/).pop() || '';
+  const parts = token.split('.');
+  if (parts.length < 3 || !DIGITS.test(parts[0]) || !DIGITS.test(parts[1])) return null;
+  // The third component is the patch number, optionally followed by a
+  // prerelease or build suffix that may itself contain dots.
+  const rest = parts.slice(2).join('.');
+  let i = 0;
+  while (i < rest.length && rest[i] >= '0' && rest[i] <= '9') i += 1;
+  if (i === 0 || !VERSION_SUFFIX.test(rest.slice(i))) return null;
+  return token;
 }
 
 /**

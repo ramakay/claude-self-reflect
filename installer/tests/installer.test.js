@@ -147,6 +147,19 @@ describe('version parsing', () => {
     assert.equal(parseVersion(''), null);
     assert.equal(parseVersion(null), null);
     assert.equal(parseVersion("error: unexpected argument '--version' found"), null);
+    assert.equal(parseVersion('csr-engine 10.1'), null);
+    assert.equal(parseVersion('csr-engine 10.1.x'), null);
+    assert.equal(parseVersion('csr-engine 10.1.0 extra'), null);
+  });
+
+  test('keeps build metadata and stays linear on long input', () => {
+    assert.equal(parseVersion('csr-engine 9.5.8+build.7'), '9.5.8+build.7');
+    // A pathological line must neither match nor take measurable time.
+    const hostile = `csr-engine 9.9.9${'0'.repeat(200000)}!`;
+    const started = process.hrtime.bigint();
+    assert.equal(parseVersion(hostile), null);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(elapsedMs < 200, `parseVersion took ${elapsedMs} ms`);
   });
 });
 
