@@ -172,6 +172,15 @@ download_and_install() {
         err "${INSTALL_DIR}/${BINARY_NAME} is a directory (or a link to one). Remove it, or set CSR_INSTALL_DIR elsewhere."
     fi
 
+    # Scope note: none of this defends against a principal that can already
+    # write to INSTALL_DIR. Such a principal can rename the staging directory
+    # from its writable parent, or swap the destination between the check above
+    # and the move below. The default ~/.local/bin is user-owned, so that
+    # principal is the user; pointing CSR_INSTALL_DIR at a shared writable
+    # directory is the user's choice and is not a threat model we cover. What
+    # follows guards against the accidents — a symlink or hard link left at the
+    # destination, a half-written binary — not against a co-resident attacker.
+    #
     # Stage, then rename over the destination. Copying onto the destination
     # would follow a symlink or hard link sitting there and overwrite a binary
     # elsewhere on the system, and an interrupted copy would truncate the

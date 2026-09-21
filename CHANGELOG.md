@@ -17,14 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the binary that had just been replaced. Setup now snapshots the whole
   existing entry out of `~/.claude.json`, removes it, and re-adds it once. If
   that retry fails, the snapshot is replayed with `claude mcp add-json`, which
-  restores `command`, `args`, `env` and anything else it held; on a Claude Code
-  without `add-json` the fallback replays only the command and args, and the
-  message says the env vars were lost. If the snapshot cannot be read, nothing
-  is removed. The error always states which of those happened, and gives
-  commands that match — `remove` then `add` while an entry is still present,
-  `add` alone when none is. If `claude` cannot be run at all, that is now an
-  error too — the old fallback wrote a file Claude Code ignores and reported
-  success.
+  restores `command`, `args`, `env` and anything else it held. On a Claude Code
+  without `add-json` there is one fallback, and only for stdio entries: it
+  replays the command and its args behind a `--` separator, so arguments like
+  `--serve` reach the server rather than Claude's own option parser, and the
+  message says the env vars were lost. An SSE or HTTP entry, or one this form
+  cannot express, is not guessed at — the error prints its JSON as a ready
+  `claude mcp add-json` command instead. If the snapshot cannot be read,
+  nothing is removed at all.
+- The error states what actually happened to the old entry — left alone, put
+  back exactly, put back without its env, lost, or replaced by something else
+  that claimed the name while setup was running — and gives commands that
+  match: `remove` then `add` whenever an entry is present, `add` alone when
+  none is. If `claude` cannot be run at all, that is now an error too — the old
+  fallback wrote a file Claude Code ignores and reported success.
 - A failed MCP registration no longer costs you hooks and the conversation
   import: setup finishes those, prints the details once under "Setup
   Incomplete", and exits non-zero.

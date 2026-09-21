@@ -214,17 +214,27 @@ describe('install.sh: staging the binary', { skip: !HAVE_SH && 'no /bin/sh' }, (
     assert.deepEqual(stageLeftovers(dirs.installdir), [], 'no staging directory left');
   });
 
-  test('a destination symlinked to an outside file is still replaced', () => {
+  test('a failed staging write exits 1, spares the old binary and cleans up', () => {
     const { dirs } = buildRelease();
-    const outside = join(dirs.outside, 'other-install');
-    writeFileSync(outside, 'ORIGINAL OTHER INSTALL');
-    symlinkSync(outside, join(dirs.installdir, 'csr-engine'));
+    const dest = join(dirs.installdir, 'csr-engine');
+    writeFileSync(dest, 'EXISTING BINARY');
+    chmodSync(dest, 0o755);
 
-    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1' } });
+    // A `cat` that fails mid-install, so `set -e` aborts after the staging
+    // directory exists and the EXIT trap is the only thing that removes it.
+    const sabotage = tempDir('sabotage');
+    writeFileSync(join(sabotage, 'cat'), '#!/bin/sh\necho "cat refused" >&2\nexit 1\n');
+    chmodSync(join(sabotage, 'cat'), 0o755);
 
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(readFileSync(outside, 'utf8'), 'ORIGINAL OTHER INSTALL');
-    assert.equal(lstatSync(join(dirs.installdir, 'csr-engine')).isSymbolicLink(), false);
+    const result = runInstall({
+      dirs,
+      extraEnv: { CSR_SKIP_SETUP: '1' },
+      pathPrefix: [sabotage],
+    });
+
+    assert.notEqual(result.status, 0, 'a failed staging write must not report success');
+    assert.equal(readFileSync(dest, 'utf8'), 'EXISTING BINARY', 'old binary untouched');
+    assert.deepEqual(stageLeftovers(dirs.installdir), [], 'EXIT trap removed the staging dir');
   });
 
   test('an install directory containing a space produces quoted, pasteable hints', () => {
