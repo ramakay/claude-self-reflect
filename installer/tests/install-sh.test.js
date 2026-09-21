@@ -421,6 +421,33 @@ describe('install.sh: install directory', { skip: !HAVE_SH && 'no /bin/sh' }, ()
     assert.equal(result.stdout.includes('reached='), false);
   });
 
+  test('the PATH hint names no rc file when HOME is unset', () => {
+    // CSR_INSTALL_DIR gets past the HOME guard; the hint must then not point
+    // at "/.zshrc", which is what an empty $HOME used to produce.
+    const result = drive('check_path', {
+      PATH: '/usr/bin:/bin',
+      CSR_INSTALL_DIR: '/opt/csr/bin',
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Add this to your shell configuration:/);
+    assert.match(result.stdout, /export PATH=\/opt\/csr\/bin:"\$PATH"/);
+    assert.equal(result.stdout.includes('/.zshrc'), false, result.stdout);
+  });
+
+  test('the PATH hint names the rc file when HOME is set', () => {
+    const home = tempDir('path-hint');
+    const result = drive('check_path', {
+      PATH: '/usr/bin:/bin',
+      HOME: home,
+      CSR_INSTALL_DIR: '/opt/csr/bin',
+      SHELL: '/bin/zsh',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`Add this to ${home.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}/\\.zshrc:`));
+    assert.match(result.stdout, /export PATH=\/opt\/csr\/bin:"\$PATH"/);
+  });
+
   test('makes a relative CSR_INSTALL_DIR absolute', () => {
     const base = tempDir('relative');
     const result = spawnSync(SH, ['-c', `. ${SOURCEABLE}; printf '%s\\n' "$INSTALL_DIR"`], {
