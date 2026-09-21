@@ -1703,33 +1703,32 @@ pub(crate) fn mark_file_imported_with_suppression(
 /// with more rows than that, is absent from the map. The id is a transcript
 /// file stem, which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`):
 /// one id can carry several paths and the caller has to account for all of
-/// them, while a stem shared by thousands of files must not cost a prompt
-/// thousands of rows. The count runs on the conversation_id index alone.
+/// them, while a stem shared by millions of files must not cost a prompt
+/// millions of rows. Each id reads at most `max_paths_per_id + 1` index
+/// entries: no count, no sort, so the work is bounded by the id list alone.
 pub fn import_paths_for_conversations(
     conn: &Connection,
     conversation_ids: &[String],
     max_paths_per_id: usize,
 ) -> Result<HashMap<String, Vec<String>>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    if conversation_ids.is_empty() {
-        return Ok(out);
-    }
-    let placeholders = vec!["?"; conversation_ids.len()].join(",");
-    let sql = format!(
-        "SELECT conversation_id, file_path FROM import_state
-         WHERE conversation_id IN (
-             SELECT conversation_id FROM import_state
-             WHERE conversation_id IN ({placeholders})
-             GROUP BY conversation_id HAVING COUNT(*) <= {max_paths_per_id})
-         ORDER BY file_path"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(conversation_ids.iter()), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (conversation_id, file_path) = row?;
-        out.entry(conversation_id).or_default().push(file_path);
+    let mut stmt =
+        conn.prepare("SELECT file_path FROM import_state WHERE conversation_id = ?1 LIMIT ?2")?;
+    for conversation_id in conversation_ids {
+        if out.contains_key(conversation_id) {
+            continue;
+        }
+        let mut paths = stmt
+            .query_map(
+                params![conversation_id, (max_paths_per_id + 1) as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if paths.is_empty() || paths.len() > max_paths_per_id {
+            continue;
+        }
+        paths.sort();
+        out.insert(conversation_id.clone(), paths);
     }
     Ok(out)
 }
@@ -4345,5 +4344,35 @@ mod tests {
             .unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
+    }
+
+    /// An id keeps its paths only while it has few of them. The per-id read
+    /// stops one row past the cap, so a stem with any number of files costs
+    /// the same as one with nine.
+    #[test]
+    fn import_paths_are_returned_only_for_ids_with_few_of_them() {
+        let conn = mem();
+        let file = |stem: &str, n: usize| {
+            for i in 0..n {
+                let path = format!("/cc/projects/-f{i}/{stem}.jsonl");
+                upsert_import_state_explicit(&conn, &path, stem, 1, "0").unwrap();
+            }
+        };
+        file("one", 1);
+        file("eight", 8);
+        file("nine", 9);
+        file("journal", 500);
+
+        let ids: Vec<String> = ["one", "eight", "nine", "journal", "absent", "one"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let got = import_paths_for_conversations(&conn, &ids, 8).unwrap();
+        let mut keys: Vec<&String> = got.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["eight", "one"]);
+        assert_eq!(got["one"], ["/cc/projects/-f0/one.jsonl"]);
+        assert_eq!(got["eight"].len(), 8);
+        assert!(got["eight"].windows(2).all(|w| w[0] < w[1]));
     }
 }
