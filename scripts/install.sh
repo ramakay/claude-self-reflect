@@ -213,6 +213,22 @@ check_path() {
     info "Note:" "${INSTALL_DIR} is not in your PATH."
 
     SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+    # Quoted: this line is meant to be pasted, and an install directory with
+    # a space would otherwise put only its first word on PATH.
+    if [ "$SHELL_NAME" = "fish" ]; then
+        PATH_LINE="fish_add_path $(shell_quote "$INSTALL_DIR")"
+    else
+        PATH_LINE="export PATH=$(shell_quote "$INSTALL_DIR"):\"\$PATH\""
+    fi
+
+    # Only reachable with CSR_INSTALL_DIR set (the top of the script refuses
+    # to run without HOME otherwise). There is no rc file to name, and
+    # "/.zshrc" would be a wrong instruction, so give the line on its own.
+    if [ -z "${HOME:-}" ]; then
+        printf '\n  Add this to your shell configuration:\n    %s\n\n' "$PATH_LINE"
+        return
+    fi
+
     case "$SHELL_NAME" in
         zsh)  RC="$HOME/.zshrc" ;;
         bash) RC="$HOME/.bashrc" ;;
@@ -223,14 +239,7 @@ check_path() {
     if [ -f "$RC" ] && grep -q "$INSTALL_DIR" "$RC" 2>/dev/null; then
         info "Found" "PATH entry in $RC (restart your shell)"
     else
-        # Quoted: this line is meant to be pasted, and an install directory with
-        # a space would otherwise put only its first word on PATH.
-        printf '\n  Add this to %s:\n' "$RC"
-        if [ "$SHELL_NAME" = "fish" ]; then
-            printf '    fish_add_path %s\n\n' "$(shell_quote "$INSTALL_DIR")"
-        else
-            printf '    export PATH=%s:"$PATH"\n\n' "$(shell_quote "$INSTALL_DIR")"
-        fi
+        printf '\n  Add this to %s:\n    %s\n\n' "$RC" "$PATH_LINE"
     fi
 }
 
