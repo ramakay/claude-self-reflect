@@ -120,6 +120,14 @@ export function planInstall({ destPath, pkgVersion, probe = probeVersion }) {
  * write to the install directory, and the copy would then follow it right back
  * outside. Exclusive creation fails on an existing name of any kind, and every
  * byte is written through that one descriptor — never reopened by name.
+ *
+ * Scope note: this does not make the install directory safe against a principal
+ * that can already write to it — such a principal can swap the destination
+ * between the rename and anything we checked before it. The default
+ * ~/.local/bin is user-owned, so that principal is the user; pointing
+ * CSR_INSTALL_DIR at a shared writable directory is the user's choice. What is
+ * guarded here is the accident: a link left at the destination, a truncated
+ * binary from an interrupted copy.
  */
 export function installBinary(sourcePath, destPath) {
   const stagePath = join(
