@@ -5,6 +5,36 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — installers no longer leave you on the old binary
+
+- `csr-engine --version` (and `-V`) now exists and prints
+  `csr-engine <version>`. It exits before the database, the HNSW index or the
+  model cache is opened.
+- npm postinstall decides whether to download by probing the destination —
+  `CSR_INSTALL_DIR` or `~/.local/bin` — and nothing else. It previously probed
+  the first `csr-engine` on PATH with a `--version` flag that did not exist, so
+  the "already installed" branch was unreachable and every install
+  re-downloaded the release tarball.
+- postinstall no longer prints `Updating /usr/local/bin/csr-engine...` before
+  writing to a different directory. Messages now name the path being written.
+- Both installers warn when a different csr-engine will still be the one that
+  runs: first on PATH, registered as a Claude Code hook in
+  `~/.claude/settings.json`, or registered as the MCP server in
+  `~/.claude.json`. Paths are compared by realpath, so a symlink to the
+  installed binary is not flagged. The check is read-only and fails open on any
+  unreadable or malformed file; nothing is deleted, edited or elevated, and the
+  exit code stays 0 — keeping another build earlier on PATH is a legitimate
+  choice.
+- The activation hint prints the absolute path when a bare `csr-engine` would
+  resolve somewhere else.
+- `claude-self-reflect <command>` now prefers the npm-managed binary over
+  whatever is first on PATH, instead of proxying to a build the upgrade
+  replaced.
+- `scripts/install.sh` verifies the new binary with `--version`/`--help`
+  instead of `status`, which opened the user's live database.
+
 ## [10.1.0] - 2026-08-08
 
 ### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
