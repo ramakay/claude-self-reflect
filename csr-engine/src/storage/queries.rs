@@ -1714,8 +1714,9 @@ pub fn import_paths_for_conversations(
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let mut stmt =
         conn.prepare("SELECT file_path FROM import_state WHERE conversation_id = ?1 LIMIT ?2")?;
+    let mut asked: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for conversation_id in conversation_ids {
-        if out.contains_key(conversation_id) {
+        if !asked.insert(conversation_id.as_str()) {
             continue;
         }
         let mut paths = stmt
@@ -4363,10 +4364,12 @@ mod tests {
         file("nine", 9);
         file("journal", 500);
 
-        let ids: Vec<String> = ["one", "eight", "nine", "journal", "absent", "one"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let ids: Vec<String> = [
+            "one", "eight", "nine", "journal", "absent", "one", "journal", "absent",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let got = import_paths_for_conversations(&conn, &ids, 8).unwrap();
         let mut keys: Vec<&String> = got.keys().collect();
         keys.sort();
