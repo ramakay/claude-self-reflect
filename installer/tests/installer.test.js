@@ -28,6 +28,7 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -168,10 +169,11 @@ describe('install decision (destination only)', () => {
     assert.deepEqual(plan, { action: 'install', reason: 'different', installedVersion: '9.5.7' });
   });
 
-  test('missing dest installs, and a current copy elsewhere does not make it skip', () => {
-    const dir = tempDir('missing');
-    fakeBinary(dir, 'csr-engine-elsewhere', '10.1.0');
-    const plan = planInstall({ destPath: join(dir, 'csr-engine'), pkgVersion: '10.1.0' });
+  test('missing dest installs', () => {
+    const plan = planInstall({
+      destPath: join(tempDir('missing'), 'csr-engine'),
+      pkgVersion: '10.1.0',
+    });
     assert.deepEqual(plan, { action: 'install', reason: 'missing', installedVersion: null });
   });
 
@@ -247,6 +249,71 @@ describe('writing the binary', () => {
     assert.throws(() => installBinary(join(installDir, 'does-not-exist'), dest));
     assert.equal(readFileSync(dest, 'utf8'), 'EXISTING BINARY', 'untouched on failure');
     assert.deepEqual(readdirSync(installDir), ['csr-engine'], 'staging file cleaned up');
+  });
+
+  test('a pre-planted stage name cannot redirect the write', () => {
+    const installDir = tempDir('stage-trap');
+    const outside = join(tempDir('stage-outside'), 'other-install');
+    writeFileSync(outside, 'ORIGINAL OTHER INSTALL');
+
+    // The old scheme was `.csr-engine.<pid>.tmp`: predictable, so anyone who
+    // can write to the install directory could plant a symlink there and have
+    // the copy follow it back outside.
+    const predictable = join(installDir, `.csr-engine.${process.pid}.tmp`);
+    symlinkSync(outside, predictable);
+
+    const source = join(tempDir('stage-src'), 'csr-engine');
+    writeFileSync(source, 'NEW BINARY');
+    const dest = join(installDir, 'csr-engine');
+    installBinary(source, dest);
+
+    assert.equal(readFileSync(outside, 'utf8'), 'ORIGINAL OTHER INSTALL', 'trap not followed');
+    assert.equal(readFileSync(dest, 'utf8'), 'NEW BINARY');
+    assert.equal(lstatSync(dest).isSymbolicLink(), false);
+    // The planted symlink is still there, untouched — we never open by that
+    // name and we never delete anything we did not create.
+    assert.equal(lstatSync(predictable).isSymbolicLink(), true);
+    assert.deepEqual(
+      readdirSync(installDir).filter((n) => n.endsWith('.tmp')),
+      [`.csr-engine.${process.pid}.tmp`],
+      'no staging file of our own left behind'
+    );
+  });
+
+  test('a directory at the destination fails and leaves no staging file', () => {
+    const installDir = tempDir('dir-dest');
+    const dest = join(installDir, 'csr-engine');
+    mkdirSync(dest);
+    const source = join(tempDir('dir-src'), 'csr-engine');
+    writeFileSync(source, 'NEW BINARY');
+
+    // POSIX rename() onto a non-empty-or-not directory fails rather than
+    // dropping the file inside it, which is what `mv` would have done.
+    assert.throws(
+      () => installBinary(source, dest),
+      (e) => ['EISDIR', 'ENOTDIR', 'EPERM', 'EEXIST'].includes(e.code),
+      'rename onto a directory must fail'
+    );
+    assert.equal(statSync(dest).isDirectory(), true, 'the directory is still there');
+    assert.deepEqual(
+      readdirSync(installDir).filter((n) => n.endsWith('.tmp')),
+      [],
+      'staging file cleaned up'
+    );
+    assert.deepEqual(readdirSync(dest), [], 'nothing was moved inside it');
+  });
+
+  test('the installed bytes are exactly the source bytes', () => {
+    const installDir = tempDir('bytes');
+    const source = join(tempDir('bytes-src'), 'csr-engine');
+    // Larger than the 1 MiB copy buffer, so the loop is exercised.
+    const payload = randomBytes(3 * 1024 * 1024 + 17);
+    writeFileSync(source, payload);
+
+    const dest = join(installDir, 'csr-engine');
+    installBinary(source, dest);
+    assert.deepEqual(readFileSync(dest), payload);
+    assert.equal(statSync(dest).mode & 0o777, 0o755);
   });
 });
 
@@ -366,7 +433,21 @@ describe('stale copy detection', () => {
     assert.deepEqual(detectStaleBinaries({ destPath: dest, homeDir: home, pathBinary: null }), []);
   });
 
-  test('paths with spaces survive, quoted or not', () => {
+  test('shell-quoted hook paths decode, including an escaped apostrophe', () => {
+    const home = tempDir('home-quoted');
+    const awkward = "/tmp/o'brien/CSR Tools/csr-engine";
+    // Exactly what csr_engine::shell::shell_quote writes for that path.
+    const quoted = "'/tmp/o'\\''brien/CSR Tools/csr-engine'";
+    writeHomeSettings(
+      home,
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: `${quoted} hook stop` }] }] },
+      })
+    );
+    assert.deepEqual(readHookBinaries(home), [awkward]);
+  });
+
+  test('legacy unquoted hook paths with spaces still decode (older setups wrote them)', () => {
     const home = tempDir('home-space');
     const spaced = '/Users/alice/CSR Tools/bin/csr-engine';
     writeHomeSettings(
@@ -380,8 +461,21 @@ describe('stale copy detection', () => {
     );
     mcpConfig(home, spaced);
 
-    assert.deepEqual(readHookBinaries(home), [spaced], 'unquoted and quoted both resolve');
+    assert.deepEqual(readHookBinaries(home), [spaced], 'bare and quoted both resolve');
     assert.equal(readMcpBinary(home), spaced, 'the whole command is the path');
+  });
+
+  test('an unterminated quote is ignored rather than guessed at', () => {
+    const home = tempDir('home-unterminated');
+    writeHomeSettings(
+      home,
+      JSON.stringify({
+        hooks: {
+          Stop: [{ hooks: [{ type: 'command', command: "'/tmp/broken/csr-engine hook stop" }] }],
+        },
+      })
+    );
+    assert.deepEqual(readHookBinaries(home), []);
   });
 
   test('a bare `csr-engine` hook command is left to the PATH check', () => {

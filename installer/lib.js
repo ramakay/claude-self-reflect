@@ -11,11 +11,10 @@
 
 import {
   accessSync,
-  chmodSync,
   closeSync,
   constants,
-  copyFileSync,
   existsSync,
+  fchmodSync,
   fstatSync,
   openSync,
   readSync,
@@ -23,8 +22,10 @@ import {
   renameSync,
   statSync,
   unlinkSync,
+  writeSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
+import { randomBytes } from 'crypto';
 import { basename, dirname, join } from 'path';
 
 export const BINARY_NAME = 'csr-engine';
@@ -110,22 +111,60 @@ export function planInstall({ destPath, pkgVersion, probe = probeVersion }) {
  * Copying straight onto the destination follows a symlink or hard link sitting
  * there, so an upgrade could overwrite a binary elsewhere on the system while
  * the installer claims nothing outside the install directory changed — and an
- * interrupted copy would leave the existing executable truncated. Stage a fresh
- * regular file beside the destination, chmod it, rename over the top: confined
- * to the install directory, atomic, and free of ETXTBSY on Linux when the old
+ * interrupted copy would leave the existing executable truncated. So: stage,
+ * then rename. Rename is atomic and cannot hit ETXTBSY on Linux when the old
  * binary is still running.
+ *
+ * The stage name is random and created with `wx`, i.e. `O_CREAT|O_EXCL`. A
+ * predictable name (a pid) could be pre-planted as a symlink by anyone who can
+ * write to the install directory, and the copy would then follow it right back
+ * outside. Exclusive creation fails on an existing name of any kind, and every
+ * byte is written through that one descriptor — never reopened by name.
  */
 export function installBinary(sourcePath, destPath) {
-  const stagePath = join(dirname(destPath), `.${basename(destPath)}.${process.pid}.tmp`);
+  const stagePath = join(
+    dirname(destPath),
+    `.${basename(destPath)}.${randomBytes(8).toString('hex')}.tmp`
+  );
+
+  let stageFd = null;
+  let sourceFd = null;
   try {
-    copyFileSync(sourcePath, stagePath);
-    chmodSync(stagePath, 0o755);
+    stageFd = openSync(stagePath, 'wx', 0o755);
+    sourceFd = openSync(sourcePath, constants.O_RDONLY);
+
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const read = readSync(sourceFd, buffer, 0, buffer.length, null);
+      if (read <= 0) break;
+      let written = 0;
+      while (written < read) {
+        written += writeSync(stageFd, buffer, written, read - written);
+      }
+    }
+
+    // `wx` honours the umask, so set the mode explicitly on the descriptor.
+    fchmodSync(stageFd, 0o755);
+    closeSync(stageFd);
+    stageFd = null;
+
     renameSync(stagePath, destPath);
   } catch (e) {
+    if (stageFd !== null) {
+      try {
+        closeSync(stageFd);
+      } catch {}
+    }
     try {
       unlinkSync(stagePath);
     } catch {}
     throw e;
+  } finally {
+    if (sourceFd !== null) {
+      try {
+        closeSync(sourceFd);
+      } catch {}
+    }
   }
 }
 
@@ -217,20 +256,55 @@ function stripQuotes(value) {
 }
 
 /**
+ * Decode a leading POSIX single-quoted word, which is what setup now writes.
+ * Inside single quotes everything is literal, and a literal apostrophe appears
+ * as `'\''` — close, escaped quote, reopen. Returns null when unterminated.
+ */
+function decodeSingleQuoted(command) {
+  let out = '';
+  let i = 1;
+  while (i < command.length) {
+    if (command[i] !== "'") {
+      out += command[i];
+      i += 1;
+    } else if (command.startsWith("'\\''", i)) {
+      out += "'";
+      i += 4;
+    } else {
+      return out;
+    }
+  }
+  return null;
+}
+
+/**
  * The executable out of a hook command string such as
  * `/usr/local/bin/csr-engine hook stop`.
  *
- * generate_hook_config always writes `<binary> hook <name>`, so everything
- * before the first ` hook ` is the executable — splitting on whitespace instead
- * would lose `/Users/alice/CSR Tools/csr-engine`. A bare `csr-engine ...`
- * resolves through PATH and is covered by the PATH check instead.
+ * Setup writes `<binary> hook <name>` with the binary shell-quoted when it
+ * needs it, so a leading `'` means the whole word is quoted and may contain
+ * `'\''`. Otherwise everything before the first ` hook ` is the executable —
+ * splitting on whitespace instead would lose `/Users/alice/CSR Tools/csr-engine`.
+ *
+ * Decoding stays lenient on purpose: settings.json files written by earlier
+ * releases carry the bare unquoted form, and detection has to recognise those
+ * too. A bare `csr-engine ...` resolves through PATH and is left to the PATH
+ * check.
  */
 function hookBinary(command) {
   if (typeof command !== 'string') return null;
   const trimmed = command.trim();
-  const marker = trimmed.indexOf(' hook ');
-  const raw = marker === -1 ? trimmed.split(/\s+/)[0] : trimmed.slice(0, marker);
-  const executable = stripQuotes(raw.trim());
+
+  let executable;
+  if (trimmed.startsWith("'")) {
+    executable = decodeSingleQuoted(trimmed);
+    if (executable === null) return null;
+  } else {
+    const marker = trimmed.indexOf(' hook ');
+    const raw = marker === -1 ? trimmed.split(/\s+/)[0] : trimmed.slice(0, marker);
+    executable = stripQuotes(raw.trim());
+  }
+
   return executable.includes('/') && basename(executable) === BINARY_NAME ? executable : null;
 }
 
