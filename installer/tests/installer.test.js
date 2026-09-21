@@ -478,6 +478,32 @@ describe('stale copy detection', () => {
     assert.deepEqual(readHookBinaries(home), []);
   });
 
+  test('a quoted word followed by junk is not decoded as ours', () => {
+    const home = tempDir('home-suffix');
+    writeHomeSettings(
+      home,
+      JSON.stringify({
+        hooks: {
+          // The shell runs /opt/csr-enginejunk here, not /opt/csr-engine, so
+          // reporting /opt/csr-engine would invent a stale registration.
+          Stop: [{ hooks: [{ type: 'command', command: "'/opt/csr-engine'junk hook stop" }] }],
+        },
+      })
+    );
+    assert.deepEqual(readHookBinaries(home), []);
+  });
+
+  test('a quoted word with no arguments still decodes', () => {
+    const home = tempDir('home-bare-quoted');
+    writeHomeSettings(
+      home,
+      JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: "'/opt/a b/csr-engine'" }] }] },
+      })
+    );
+    assert.deepEqual(readHookBinaries(home), ['/opt/a b/csr-engine']);
+  });
+
   test('a bare `csr-engine` hook command is left to the PATH check', () => {
     const home = tempDir('home-bare');
     writeHomeSettings(home, hookSettings('csr-engine'));

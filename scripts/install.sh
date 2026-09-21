@@ -115,8 +115,8 @@ download_and_install() {
     CHECKSUM_URL="https://github.com/${REPO}/releases/download/${VERSION}/${CHECKSUM_FILE}"
 
     TMPDIR="$(mktemp -d)"
-    STAGE=""
-    trap 'rm -rf "$TMPDIR"; [ -n "$STAGE" ] && rm -f "$STAGE"' EXIT
+    STAGE_DIR=""
+    trap 'rm -rf "$TMPDIR"; [ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"' EXIT
 
     info "Downloading" "${BINARY_NAME} ${VERSION} for ${TARGET}..."
 
@@ -163,28 +163,33 @@ download_and_install() {
         err "Binary not found in archive"
     fi
 
-    # `mv file existing-directory` moves the file *into* the directory, which
-    # would report a successful install and leave a stray temp file behind. A
-    # symlink at the destination is fine — that is what rename replaces.
-    if [ -d "${INSTALL_DIR}/${BINARY_NAME}" ] && [ ! -L "${INSTALL_DIR}/${BINARY_NAME}" ]; then
-        err "${INSTALL_DIR}/${BINARY_NAME} is a directory. Remove it, or set CSR_INSTALL_DIR elsewhere."
+    # `mv file some-directory` moves the file *into* the directory, which would
+    # report a successful install and leave a stray temp file behind. `-d`
+    # follows symlinks, so this also refuses a destination link pointing at a
+    # directory — which would land the binary outside INSTALL_DIR entirely. A
+    # link to a *file* is still fine: the rename replaces the link itself.
+    if [ -d "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+        err "${INSTALL_DIR}/${BINARY_NAME} is a directory (or a link to one). Remove it, or set CSR_INSTALL_DIR elsewhere."
     fi
 
-    # Stage inside INSTALL_DIR and rename over the destination. Copying onto it
+    # Stage, then rename over the destination. Copying onto the destination
     # would follow a symlink or hard link sitting there and overwrite a binary
     # elsewhere on the system, and an interrupted copy would truncate the
     # existing executable. Rename is atomic and cannot hit ETXTBSY on Linux.
     #
-    # mktemp creates the stage itself, with an unpredictable name and O_EXCL:
-    # a fixed `.csr-engine.$$.tmp` could be pre-planted as a symlink by anyone
-    # who can write to the install directory, and the copy would follow it
-    # straight back outside.
-    STAGE="$(mktemp "${INSTALL_DIR}/.${BINARY_NAME}.XXXXXX")" ||
-        err "Could not create a staging file in ${INSTALL_DIR}"
-    cat "$BINARY_PATH" > "$STAGE"
-    chmod 755 "$STAGE"
-    mv -f "$STAGE" "${INSTALL_DIR}/${BINARY_NAME}"
-    STAGE=""
+    # The stage lives in its own 0700 directory that mktemp creates. Staging a
+    # bare file would mean reopening the name mktemp just closed, and anyone who
+    # can write to INSTALL_DIR could unlink it in between and leave a symlink
+    # for `cat` to follow. Nobody else can enter the private directory, and it
+    # is on the same filesystem, so the move is still a rename.
+    STAGE_DIR="$(mktemp -d "${INSTALL_DIR}/.${BINARY_NAME}.XXXXXX")" ||
+        err "Could not create a staging directory in ${INSTALL_DIR}"
+    chmod 700 "$STAGE_DIR"
+    cat "$BINARY_PATH" > "${STAGE_DIR}/${BINARY_NAME}"
+    chmod 755 "${STAGE_DIR}/${BINARY_NAME}"
+    mv -f "${STAGE_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+    rmdir "$STAGE_DIR"
+    STAGE_DIR=""
 
     ok "Installed" "${INSTALL_DIR}/${BINARY_NAME}"
 }
@@ -305,7 +310,7 @@ try:
         sys.exit(0)
     raw = b""
     while len(raw) <= CAP:
-        chunk = os.read(fd, 1 << 20)
+        chunk = os.read(fd, min(1 << 20, CAP + 1 - len(raw)))
         if not chunk:
             break
         raw += chunk
@@ -334,6 +339,12 @@ def executable(command):
                 out.append("'")
                 i += 4
             else:
+                # A quoted word has to end the word: '/opt/csr-engine'junk runs
+                # /opt/csr-enginejunk, so decoding it as ours would invent a
+                # stale registration that does not exist.
+                rest = command[i + 1:]
+                if rest and not rest.startswith(" hook "):
+                    return ""
                 return "".join(out)
         return ""
     marker = command.find(" hook ")
@@ -364,6 +375,9 @@ else:
     if isinstance(command, str):
         out.append(command.strip())
 
+# One path per line. A path containing a newline cannot be framed this way and
+# is skipped on purpose: the shell reads this with `IFS= read -r`, and no
+# encoding scheme is worth carrying for a filename nobody has.
 for line in out:
     if line and "\n" not in line:
         print(line)
@@ -415,6 +429,11 @@ function executable(command) {
         out += "'";
         i += 4;
       } else {
+        // A quoted word has to end the word: '/opt/csr-engine'junk runs
+        // /opt/csr-enginejunk, so decoding it as ours would invent a stale
+        // registration that does not exist.
+        const rest = trimmed.slice(i + 1);
+        if (rest !== "" && !rest.startsWith(" hook ")) return "";
         return out;
       }
     }
@@ -447,6 +466,9 @@ if (mode === "hooks") {
   const server = servers && typeof servers === "object" ? servers["claude-self-reflect"] : null;
   if (server && typeof server.command === "string") out.push(server.command.trim());
 }
+// One path per line. A path containing a newline cannot be framed this way and
+// is skipped on purpose: the shell reads this with `IFS= read -r`, and no
+// encoding scheme is worth carrying for a filename nobody has.
 for (const line of out) if (line && !line.includes("\n")) console.log(line);
 JS
             ;;
