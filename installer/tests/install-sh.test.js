@@ -232,7 +232,7 @@ describe('install.sh: staging the binary', { skip: !HAVE_SH && 'no /bin/sh' }, (
       pathPrefix: [sabotage],
     });
 
-    assert.notEqual(result.status, 0, 'a failed staging write must not report success');
+    assert.equal(result.status, 1, `a failed staging write must exit 1: ${result.stderr}`);
     assert.equal(readFileSync(dest, 'utf8'), 'EXISTING BINARY', 'old binary untouched');
     assert.deepEqual(stageLeftovers(dirs.installdir), [], 'EXIT trap removed the staging dir');
   });
