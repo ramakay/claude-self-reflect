@@ -305,6 +305,34 @@ mod tests {
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
     }
 
+    /// The installers tell a user whose hooks point at a different copy of
+    /// csr-engine to re-run `<new binary> setup`, and that advice is only true
+    /// because the merge evicts CSR entries by command content rather than by
+    /// path. If eviction ever became path-sensitive, every upgrade would leave
+    /// the old absolute path installed alongside the new one and the printed
+    /// remedy would be a lie.
+    #[test]
+    fn test_merge_repoints_hooks_at_a_new_absolute_path() {
+        let mut settings: serde_json::Value = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook stop"}]}
+                ]
+            }
+        });
+
+        let new_config = generate_hook_config("/home/me/.local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "repointed, not duplicated");
+        assert_eq!(
+            stop[0]["hooks"][0]["command"].as_str().unwrap(),
+            "/home/me/.local/bin/csr-engine hook stop",
+            "the old absolute path must not survive"
+        );
+    }
+
     /// Regression test for the v9.2 agent-hook leak.
     ///
     /// We initially shipped v9.2 with an `agent`-type SessionStart hook. Agent hooks
