@@ -163,13 +163,26 @@ download_and_install() {
         err "Binary not found in archive"
     fi
 
+    # `mv file existing-directory` moves the file *into* the directory, which
+    # would report a successful install and leave a stray temp file behind. A
+    # symlink at the destination is fine — that is what rename replaces.
+    if [ -d "${INSTALL_DIR}/${BINARY_NAME}" ] && [ ! -L "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+        err "${INSTALL_DIR}/${BINARY_NAME} is a directory. Remove it, or set CSR_INSTALL_DIR elsewhere."
+    fi
+
     # Stage inside INSTALL_DIR and rename over the destination. Copying onto it
     # would follow a symlink or hard link sitting there and overwrite a binary
     # elsewhere on the system, and an interrupted copy would truncate the
     # existing executable. Rename is atomic and cannot hit ETXTBSY on Linux.
-    STAGE="${INSTALL_DIR}/.${BINARY_NAME}.$$.tmp"
-    cp "$BINARY_PATH" "$STAGE"
-    chmod +x "$STAGE"
+    #
+    # mktemp creates the stage itself, with an unpredictable name and O_EXCL:
+    # a fixed `.csr-engine.$$.tmp` could be pre-planted as a symlink by anyone
+    # who can write to the install directory, and the copy would follow it
+    # straight back outside.
+    STAGE="$(mktemp "${INSTALL_DIR}/.${BINARY_NAME}.XXXXXX")" ||
+        err "Could not create a staging file in ${INSTALL_DIR}"
+    cat "$BINARY_PATH" > "$STAGE"
+    chmod 755 "$STAGE"
     mv -f "$STAGE" "${INSTALL_DIR}/${BINARY_NAME}"
     STAGE=""
 
@@ -196,11 +209,13 @@ check_path() {
     if [ -f "$RC" ] && grep -q "$INSTALL_DIR" "$RC" 2>/dev/null; then
         info "Found" "PATH entry in $RC (restart your shell)"
     else
+        # Quoted: this line is meant to be pasted, and an install directory with
+        # a space would otherwise put only its first word on PATH.
         printf '\n  Add this to %s:\n' "$RC"
         if [ "$SHELL_NAME" = "fish" ]; then
-            printf '    fish_add_path %s\n\n' "$INSTALL_DIR"
+            printf '    fish_add_path %s\n\n' "$(shell_quote "$INSTALL_DIR")"
         else
-            printf '    export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
+            printf '    export PATH=%s:"$PATH"\n\n' "$(shell_quote "$INSTALL_DIR")"
         fi
     fi
 }
@@ -257,26 +272,77 @@ usable_python3() {
     return 0
 }
 
-# Print the raw command strings Claude Code has registered: every hook command
-# ($2 = hooks) or the user-scope MCP server command ($2 = mcp). Bounded and
-# fail-open in both readers — non-regular or oversized files, unreadable files
-# and malformed JSON all yield nothing.
+# Print the executables Claude Code has registered, one per line: the binary
+# behind every hook command ($2 = hooks) or the user-scope MCP server command
+# ($2 = mcp).
+#
+# Both readers open the file once with O_NONBLOCK, fstat that descriptor and
+# read at most the cap plus one byte from it — checking the pathname and then
+# reopening it would let the file grow past the cap, or be swapped for a FIFO,
+# between the two syscalls. Fail-open throughout: a non-regular or oversized
+# file, an unreadable one and malformed JSON all yield nothing.
+#
+# They also decode the executable, because setup now writes it POSIX-quoted
+# (`'/tmp/o'\''brien/CSR Tools/csr-engine' hook stop`) and unpicking `'\''` in
+# sh would be worse than doing it twice here. Decoding stays lenient: earlier
+# releases wrote the bare unquoted form and those settings files still exist.
 read_commands() {
     case "$JSON_READER" in
         python3)
             python3 - "$1" "$2" 2>/dev/null <<'PY' || true
-import json, os, sys
+import json, os, stat, sys
 
+CAP = 33554432
 path, mode = sys.argv[1], sys.argv[2]
+
 try:
-    if not os.path.isfile(path) or os.path.getsize(path) > 33554432:
-        sys.exit(0)
-    with open(path, "rb") as fh:
-        data = json.loads(fh.read().decode("utf-8", "replace"))
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
 except Exception:
     sys.exit(0)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        sys.exit(0)
+    raw = b""
+    while len(raw) <= CAP:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        raw += chunk
+    if len(raw) > CAP:
+        sys.exit(0)
+    data = json.loads(raw.decode("utf-8", "replace"))
+except Exception:
+    sys.exit(0)
+finally:
+    os.close(fd)
+
 if not isinstance(data, dict):
     sys.exit(0)
+
+
+def executable(command):
+    command = command.strip()
+    if command.startswith("'"):
+        out = []
+        i = 1
+        while i < len(command):
+            if command[i] != "'":
+                out.append(command[i])
+                i += 1
+            elif command[i:i + 4] == "'\\''":
+                out.append("'")
+                i += 4
+            else:
+                return "".join(out)
+        return ""
+    marker = command.find(" hook ")
+    token = command[:marker] if marker != -1 else command.split(" ")[0]
+    token = token.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] == '"':
+        token = token[1:-1]
+    return token
+
 
 out = []
 if mode == "hooks":
@@ -290,33 +356,77 @@ if mode == "hooks":
                 for hook in inner if isinstance(inner, list) else []:
                     command = hook.get("command") if isinstance(hook, dict) else None
                     if isinstance(command, str):
-                        out.append(command)
+                        out.append(executable(command))
 else:
     servers = data.get("mcpServers")
     server = servers.get("claude-self-reflect") if isinstance(servers, dict) else None
     command = server.get("command") if isinstance(server, dict) else None
     if isinstance(command, str):
-        out.append(command)
+        out.append(command.strip())
 
 for line in out:
-    if "\n" not in line:
+    if line and "\n" not in line:
         print(line)
 PY
             ;;
         node)
             node - "$1" "$2" 2>/dev/null <<'JS' || true
 const fs = require("fs");
+const CAP = 33554432;
 const path = process.argv[2];
 const mode = process.argv[3];
+
 let data;
+let fd = null;
 try {
-  const stat = fs.statSync(path);
-  if (!stat.isFile() || stat.size > 33554432) process.exit(0);
-  data = JSON.parse(fs.readFileSync(path, "utf8"));
+  fd = fs.openSync(path, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+  const info = fs.fstatSync(fd);
+  if (!info.isFile()) process.exit(0);
+  const buffer = Buffer.allocUnsafe(CAP + 1);
+  let total = 0;
+  for (;;) {
+    const read = fs.readSync(fd, buffer, total, Math.min(1 << 20, CAP + 1 - total), null);
+    if (read <= 0) break;
+    total += read;
+    if (total > CAP) process.exit(0);
+  }
+  data = JSON.parse(buffer.subarray(0, total).toString("utf8"));
 } catch {
   process.exit(0);
+} finally {
+  if (fd !== null) {
+    try {
+      fs.closeSync(fd);
+    } catch {}
+  }
 }
 if (!data || typeof data !== "object") process.exit(0);
+
+function executable(command) {
+  const trimmed = command.trim();
+  if (trimmed.startsWith("'")) {
+    let out = "";
+    let i = 1;
+    while (i < trimmed.length) {
+      if (trimmed[i] !== "'") {
+        out += trimmed[i];
+        i += 1;
+      } else if (trimmed.startsWith("'\\''", i)) {
+        out += "'";
+        i += 4;
+      } else {
+        return out;
+      }
+    }
+    return "";
+  }
+  const marker = trimmed.indexOf(" hook ");
+  let token = (marker === -1 ? trimmed.split(" ")[0] : trimmed.slice(0, marker)).trim();
+  if (token.length >= 2 && token[0] === '"' && token[token.length - 1] === '"') {
+    token = token.slice(1, -1);
+  }
+  return token;
+}
 
 const out = [];
 if (mode === "hooks") {
@@ -327,7 +437,7 @@ if (mode === "hooks") {
       for (const entry of entries) {
         const inner = entry && Array.isArray(entry.hooks) ? entry.hooks : [];
         for (const hook of inner) {
-          if (hook && typeof hook.command === "string") out.push(hook.command);
+          if (hook && typeof hook.command === "string") out.push(executable(hook.command));
         }
       }
     }
@@ -335,44 +445,21 @@ if (mode === "hooks") {
 } else {
   const servers = data.mcpServers;
   const server = servers && typeof servers === "object" ? servers["claude-self-reflect"] : null;
-  if (server && typeof server.command === "string") out.push(server.command);
+  if (server && typeof server.command === "string") out.push(server.command.trim());
 }
-for (const line of out) if (!line.includes("\n")) console.log(line);
+for (const line of out) if (line && !line.includes("\n")) console.log(line);
 JS
             ;;
         *) return 0 ;;
     esac
 }
 
-strip_quotes() {
-    case "$1" in
-        "$SQ"*"$SQ") _s="${1#"$SQ"}"; printf '%s\n' "${_s%"$SQ"}" ;;
-        '"'*'"')     _s="${1#\"}"; printf '%s\n' "${_s%\"}" ;;
-        *)           printf '%s\n' "$1" ;;
-    esac
-}
-
-# The executables behind those commands, one per line. Hook commands are always
-# written as `<binary> hook <name>`, so everything before the first " hook " is
-# the executable — splitting on whitespace would lose a path with a space. The
-# MCP command is the whole string.
+# Keep only absolute paths, and for hooks only ones actually named csr-engine.
 registered_executables() {
     _file="$1"
     _mode="$2"
     [ -f "$_file" ] || return 0
-    read_commands "$_file" "$_mode" | while IFS= read -r _cmd; do
-        if [ -z "$_cmd" ]; then
-            continue
-        fi
-        if [ "$_mode" = "hooks" ]; then
-            case "$_cmd" in
-                *" hook "*) _exe="${_cmd%% hook *}" ;;
-                *)          _exe="${_cmd%% *}" ;;
-            esac
-        else
-            _exe="$_cmd"
-        fi
-        _exe="$(strip_quotes "$_exe")"
+    read_commands "$_file" "$_mode" | while IFS= read -r _exe; do
         case "$_exe" in
             /*/"$BINARY_NAME") printf '%s\n' "$_exe" ;;
             /*)
