@@ -336,8 +336,13 @@ fn push_plan_chunks(
         if end <= start {
             end = content.len();
         }
+        // Plans are markdown, imported by delete-then-rebuild, so they have no
+        // byte cursor: index from zero and discard the offsets.
         super::push_chunk(
             chunks,
+            &mut Vec::new(),
+            0,
+            0,
             conversation_id,
             project_name,
             timestamp,

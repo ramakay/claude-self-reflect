@@ -1124,10 +1124,36 @@ fn test_incremental_import_only_new_chunks() {
     std::fs::write(&jsonl_path, grown_content).unwrap();
 
     // Incremental import — file changed (mtime differs) so it re-parses.
-    let _count3 = rt
+    // These messages are short enough that all five share one 900-char chunk, so
+    // the chunk COUNT does not move. The old guard early-returned on
+    // `chunks.len() <= prev_count` and dropped the two new messages on the floor.
+    let count3 = rt
         .block_on(engine.import_file(&jsonl_path, "myapp"))
         .unwrap();
-    // The key assertion: no error occurred during incremental import.
+    assert!(
+        count3 > 0,
+        "a grown transcript must rewrite its trailing chunk even when the chunk count is flat"
+    );
+
+    // And the appended content must actually be retrievable.
+    let conv_id = "conv-incr-test";
+    let ids = engine
+        .storage()
+        .get_chunk_ids_for_conversation(conv_id)
+        .unwrap();
+    let stored = ids
+        .iter()
+        .filter_map(|id| engine.storage().get_chunk_content(id).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        stored.contains("The token refresh was using an expired key"),
+        "appended message must be present in a stored chunk, not silently dropped"
+    );
+    assert!(
+        stored.contains("Run the tests to verify"),
+        "final appended message must be present in a stored chunk"
+    );
 }
 
 /// Test: import_current_transcript shared helper works with real transcript.
