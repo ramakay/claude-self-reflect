@@ -1,16 +1,31 @@
 /**
- * Installer helpers, kept out of postinstall.js so the install decision and the
- * stale-copy detection can be tested without a network, a package manager, or
- * the user's real HOME.
+ * Installer helpers, kept out of postinstall.js so the install decision, the
+ * binary write and the stale-copy detection can be tested without a network, a
+ * package manager, or the user's real HOME.
  *
- * Everything here is read-only. Nothing in this file writes, deletes, or
- * elevates: a user may deliberately keep a different csr-engine build first on
- * PATH, so a shadowed install is reported, never corrected.
+ * Only installBinary writes, and only inside the directory it is given.
+ * Everything else is read-only: a user may deliberately keep a different
+ * csr-engine build first on PATH, so a shadowed install is reported, never
+ * corrected.
  */
 
-import { existsSync, readFileSync, realpathSync } from 'fs';
+import {
+  accessSync,
+  chmodSync,
+  closeSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from 'fs';
 import { execFileSync } from 'child_process';
-import { join } from 'path';
+import { basename, dirname, join } from 'path';
 
 export const BINARY_NAME = 'csr-engine';
 export const MCP_SERVER_NAME = 'claude-self-reflect';
@@ -22,6 +37,22 @@ export function realPath(p) {
   } catch {
     return p;
   }
+}
+
+// A path made only of these needs no quoting, which keeps the common hint
+// readable. Anything else — spaces, quotes, $, ;, backticks — is quoted.
+const SHELL_SAFE = /^[A-Za-z0-9_./-]+$/;
+
+/**
+ * Make a path safe to paste into a shell. Printed commands are meant to be
+ * run: an install directory like `/Users/alice/CSR Tools/bin` would otherwise
+ * produce a hint that executes `/Users/alice/CSR`, and a directory name with
+ * shell metacharacters would run whatever they say.
+ */
+export function shellQuote(value) {
+  const str = String(value);
+  if (SHELL_SAFE.test(str)) return str;
+  return `'${str.replace(/'/g, "'\\''")}'`;
 }
 
 /** Pull the version out of clap's `csr-engine 10.1.0` line. */
@@ -73,6 +104,58 @@ export function planInstall({ destPath, pkgVersion, probe = probeVersion }) {
   return { action: 'install', reason: 'different', installedVersion };
 }
 
+/**
+ * Put `sourcePath` at `destPath` without ever writing through the destination.
+ *
+ * Copying straight onto the destination follows a symlink or hard link sitting
+ * there, so an upgrade could overwrite a binary elsewhere on the system while
+ * the installer claims nothing outside the install directory changed — and an
+ * interrupted copy would leave the existing executable truncated. Stage a fresh
+ * regular file beside the destination, chmod it, rename over the top: confined
+ * to the install directory, atomic, and free of ETXTBSY on Linux when the old
+ * binary is still running.
+ */
+export function installBinary(sourcePath, destPath) {
+  const stagePath = join(dirname(destPath), `.${basename(destPath)}.${process.pid}.tmp`);
+  try {
+    copyFileSync(sourcePath, stagePath);
+    chmodSync(stagePath, 0o755);
+    renameSync(stagePath, destPath);
+  } catch (e) {
+    try {
+      unlinkSync(stagePath);
+    } catch {}
+    throw e;
+  }
+}
+
+/** A candidate is usable only if it is a regular file we may execute. */
+export function isRunnableBinary(p) {
+  try {
+    if (!statSync(p).isFile()) return false;
+    accessSync(p, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick the csr-engine to run: the package-managed copy first, then PATH, then
+ * /usr/local/bin. Existence is not enough — a half-written or non-executable
+ * file at the destination must not hide a working fallback.
+ */
+export function findEngineBinary({ installDir, pathBinary }) {
+  const candidates = [join(installDir, BINARY_NAME)];
+  if (pathBinary) candidates.push(pathBinary);
+  candidates.push(`/usr/local/bin/${BINARY_NAME}`);
+
+  for (const p of candidates) {
+    if (isRunnableBinary(p)) return p;
+  }
+  return null;
+}
+
 /** The first csr-engine on PATH, or null. */
 export function whichBinary(exec = execFileSync) {
   try {
@@ -86,31 +169,74 @@ export function whichBinary(exec = execFileSync) {
   }
 }
 
-/** Read JSON, fail open: unreadable or malformed yields null, never a throw. */
-function readJson(path) {
+// Claude Code's configs are small. A multi-gigabyte valid JSON document would
+// exhaust the Node heap before any try/catch could help, and a config path
+// resolving to a FIFO would block the install forever.
+const MAX_CONFIG_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Read and parse a JSON config, fail open.
+ *
+ * Opens non-blocking so a FIFO cannot hang the installer, refuses anything that
+ * is not a regular file, and refuses anything over 32 MiB. Any read or parse
+ * failure yields null — no warning, no crash.
+ */
+export function readJsonConfig(path) {
+  let fd = null;
   try {
-    return JSON.parse(readFileSync(path, 'utf8'));
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > MAX_CONFIG_BYTES) return null;
+
+    const buffer = Buffer.allocUnsafe(stat.size);
+    let read = 0;
+    while (read < stat.size) {
+      const n = readSync(fd, buffer, read, stat.size - read, read);
+      if (n <= 0) break;
+      read += n;
+    }
+    return JSON.parse(buffer.subarray(0, read).toString('utf8'));
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {}
+    }
   }
 }
 
+function stripQuotes(value) {
+  const first = value[0];
+  const last = value[value.length - 1];
+  if (value.length >= 2 && first === last && (first === "'" || first === '"')) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
 /**
- * The binary out of a hook command string such as
- * `/usr/local/bin/csr-engine hook stop`. Hook commands are written unquoted and
- * run through a shell, so the first whitespace-delimited token is what the shell
- * executes. A bare `csr-engine ...` resolves through PATH and is covered by the
- * PATH check instead.
+ * The executable out of a hook command string such as
+ * `/usr/local/bin/csr-engine hook stop`.
+ *
+ * generate_hook_config always writes `<binary> hook <name>`, so everything
+ * before the first ` hook ` is the executable — splitting on whitespace instead
+ * would lose `/Users/alice/CSR Tools/csr-engine`. A bare `csr-engine ...`
+ * resolves through PATH and is covered by the PATH check instead.
  */
 function hookBinary(command) {
   if (typeof command !== 'string') return null;
-  const first = command.trim().split(/\s+/)[0];
-  return first.includes('/') && first.endsWith(`/${BINARY_NAME}`) ? first : null;
+  const trimmed = command.trim();
+  const marker = trimmed.indexOf(' hook ');
+  const raw = marker === -1 ? trimmed.split(/\s+/)[0] : trimmed.slice(0, marker);
+  const executable = stripQuotes(raw.trim());
+  return executable.includes('/') && basename(executable) === BINARY_NAME ? executable : null;
 }
 
 /** csr-engine paths registered as Claude Code hooks in ~/.claude/settings.json. */
 export function readHookBinaries(homeDir) {
-  const settings = readJson(join(homeDir, '.claude', 'settings.json'));
+  const settings = readJsonConfig(join(homeDir, '.claude', 'settings.json'));
   const hooks = settings && typeof settings === 'object' ? settings.hooks : null;
   if (!hooks || typeof hooks !== 'object') return [];
 
@@ -128,12 +254,16 @@ export function readHookBinaries(homeDir) {
   return [...new Set(found)];
 }
 
-/** The command Claude Code runs as our MCP server (user scope, ~/.claude.json). */
+/**
+ * The command Claude Code runs as our MCP server — user scope only. Project
+ * scope lives under `projects[<dir>].mcpServers` and is not ours to report.
+ * The whole string is the command; it is not a shell line.
+ */
 export function readMcpBinary(homeDir) {
-  const config = readJson(join(homeDir, '.claude.json'));
+  const config = readJsonConfig(join(homeDir, '.claude.json'));
   const servers = config && typeof config === 'object' ? config.mcpServers : null;
   const server = servers && typeof servers === 'object' ? servers[MCP_SERVER_NAME] : null;
-  const command = server && typeof server.command === 'string' ? server.command : null;
+  const command = server && typeof server.command === 'string' ? server.command.trim() : null;
   return command && command.includes('/') ? command : null;
 }
 
@@ -170,18 +300,18 @@ export function detectStaleBinaries({ destPath, homeDir, pathBinary }) {
   return [...byRealPath.values()];
 }
 
+/** Entries that setup is expected to repoint, i.e. everything except PATH. */
+export function registrationStale(stale) {
+  return stale.filter((s) => s.uses.includes('hooks') || s.uses.includes('MCP'));
+}
+
 /**
  * The warning text, or null when nothing shadows the destination.
  *
- * The remedies are the ones the engine actually performs:
- *  - hooks: `<dest> setup` runs `hook install --apply`, whose merge drops every
- *    CSR hook entry (matched on the command containing "csr-engine", not on its
- *    path) before re-adding them at the new absolute path. So setup repoints
- *    hooks on its own.
- *  - MCP: setup registers with `claude mcp add`, which refuses to overwrite an
- *    existing server ("MCP server claude-self-reflect already exists in user
- *    config") and exits 1. The old command therefore survives a plain re-run —
- *    it has to be removed first.
+ * The remedy is `<dest> setup`, verified against the engine: the hook merge
+ * evicts CSR entries by command content rather than by path, and
+ * register_mcp_server removes an existing user-scope registration before
+ * re-adding it, so one setup run repoints both.
  */
 export function formatStaleWarning({ stale, destPath }) {
   if (!stale || stale.length === 0) return null;
@@ -204,12 +334,7 @@ export function formatStaleWarning({ stale, destPath }) {
     lines.push('');
     lines.push('  To point Claude Code at the binary just installed, run:');
     lines.push('');
-    if (uses.has('MCP')) {
-      // `claude mcp add` will not overwrite an existing entry, so setup alone
-      // cannot repoint the MCP server.
-      lines.push(`    \x1b[1mclaude mcp remove ${MCP_SERVER_NAME} -s user\x1b[0m`);
-    }
-    lines.push(`    \x1b[1m${destPath} setup\x1b[0m`);
+    lines.push(`    \x1b[1m${shellQuote(destPath)} setup\x1b[0m`);
     lines.push('');
     lines.push('  Then restart Claude Code.');
   }
@@ -227,10 +352,35 @@ export function formatStaleWarning({ stale, destPath }) {
 }
 
 /**
- * What to tell the user to run: the bare command only when that is really the
- * binary we installed, otherwise the absolute path.
+ * What to print instead of "Done" when setup ran but Claude Code is still
+ * pointed at another binary. Setup claiming success is not evidence that the
+ * registrations moved, so the installers re-read them and say so.
+ */
+export function formatPendingActivation({ stale, destPath }) {
+  const lines = [
+    '',
+    '  \x1b[1;33mNot active yet.\x1b[0m Setup ran, but Claude Code still points at',
+    '  another csr-engine:',
+    '',
+  ];
+  for (const { path, uses } of stale) {
+    lines.push(`    ${path}  (${uses.map((x) => USE_LABELS[x]).join(', ')})`);
+  }
+  lines.push('');
+  lines.push('  Register it by hand, then restart Claude Code:');
+  lines.push('');
+  lines.push(`    claude mcp remove ${MCP_SERVER_NAME} -s user`);
+  lines.push(`    ${shellQuote(destPath)} setup`);
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * What to tell the user to run, ready to paste into a shell: the bare command
+ * only when that is really the binary we installed, otherwise the quoted
+ * absolute path.
  */
 export function activationCommand({ destPath, pathBinary }) {
   if (pathBinary && realPath(pathBinary) === realPath(destPath)) return BINARY_NAME;
-  return destPath;
+  return shellQuote(destPath);
 }

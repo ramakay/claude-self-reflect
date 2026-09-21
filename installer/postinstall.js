@@ -19,11 +19,9 @@ import {
   readFileSync,
   mkdirSync,
   createWriteStream,
-  chmodSync,
   unlinkSync,
   mkdtempSync,
   rmSync,
-  copyFileSync,
   lstatSync,
 } from 'fs';
 import { dirname, join, resolve } from 'path';
@@ -36,13 +34,20 @@ import {
   BINARY_NAME,
   activationCommand,
   detectStaleBinaries,
+  formatPendingActivation,
   formatStaleWarning,
+  installBinary,
   planInstall,
+  readJsonConfig,
+  registrationStale,
   whichBinary,
 } from './lib.js';
 
 const REPO = 'ramakay/claude-self-reflect';
-const INSTALL_DIR = process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin');
+// Absolute: every hint we print has to be runnable from anywhere, and a
+// relative CSR_INSTALL_DIR would otherwise produce advice that depends on the
+// caller's working directory.
+const INSTALL_DIR = resolve(process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin'));
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = resolve(SCRIPT_DIR, '..');
 const MAX_REDIRECTS = 5;
@@ -209,21 +214,40 @@ function runOrExplainActivation(destPath, pathBinary) {
   // binary we installed; otherwise it runs whatever shadows it.
   const command = activationCommand({ destPath, pathBinary });
 
-  if (process.env.CSR_AUTO_SETUP === '1') {
-    console.log('  CSR_AUTO_SETUP=1 — running setup...');
-    try {
-      execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
-      console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
-    } catch {
-      console.log(`\n  Setup failed. Run manually: ${command} setup\n`);
-      process.exitCode = 1;
-    }
-  } else {
+  if (process.env.CSR_AUTO_SETUP !== '1') {
     console.log('\n  \x1b[1mTo activate\x1b[0m (registers the MCP server, installs hooks,');
     console.log('  and imports your conversations), run:');
     console.log(`\n    \x1b[1;32m${command} setup\x1b[0m\n`);
     console.log('  Then restart Claude Code.\n');
+    return;
   }
+
+  // CSR_AUTO_SETUP=1 is the user's explicit opt-in to run setup from the
+  // package manager, and destPath is the binary this package owns reporting
+  // exactly this package's version — whether we downloaded it a second ago or
+  // found it already there. Running it is the consented action, not a probe.
+  console.log('  CSR_AUTO_SETUP=1 — running setup...');
+  try {
+    execFileSync(destPath, ['setup'], { stdio: 'inherit', timeout: 60000 });
+  } catch {
+    console.log(`\n  Setup failed. Run manually: ${command} setup\n`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // Setup exiting 0 is not evidence that the registrations moved. Re-read them:
+  // a hook or MCP entry still naming another binary means Claude Code will keep
+  // launching that one, and "Done" would be a lie.
+  const pending = registrationStale(
+    detectStaleBinaries({ destPath, homeDir: homedir(), pathBinary: null })
+  );
+  if (pending.length > 0) {
+    console.log(formatPendingActivation({ stale: pending, destPath }));
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log('\n  \x1b[32mDone. Restart Claude Code to activate.\x1b[0m\n');
 }
 
 // --- Shadowed installation detection ---
@@ -242,20 +266,19 @@ function warnAboutStaleCopies(destPath, pathBinary) {
 
 function detectPythonCSR() {
   const signals = [];
-  try {
-    const settingsPath = join(homedir(), '.claude', 'settings.json');
-    if (existsSync(settingsPath)) {
-      const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
-      const hooks = settings.hooks || {};
-      for (const entries of Object.values(hooks)) {
-        const hookStr = JSON.stringify(entries);
-        if (hookStr.includes('.py') && hookStr.includes('claude-self-reflect')) {
-          signals.push('Python hooks in settings.json');
-          break;
-        }
-      }
+  // Bounded read: this runs before the install decision, so a huge or
+  // non-regular settings.json must not be able to hang or OOM the install.
+  const settings = readJsonConfig(join(homedir(), '.claude', 'settings.json'));
+  const hooks = settings && typeof settings === 'object' ? settings.hooks : null;
+  if (!hooks || typeof hooks !== 'object') return signals;
+
+  for (const entries of Object.values(hooks)) {
+    const hookStr = JSON.stringify(entries);
+    if (hookStr.includes('.py') && hookStr.includes('claude-self-reflect')) {
+      signals.push('Python hooks in settings.json');
+      break;
     }
-  } catch {}
+  }
   return signals;
 }
 
@@ -332,8 +355,8 @@ async function main() {
       throw new Error('Archive entry csr-engine is not a regular file');
     }
 
-    copyFileSync(binaryPath, destPath);
-    chmodSync(destPath, 0o755);
+    // Staged rename, never a write through the destination — see installBinary.
+    installBinary(binaryPath, destPath);
 
     console.log(`  \x1b[1;32mInstalled:\x1b[0m ${destPath}`);
 
