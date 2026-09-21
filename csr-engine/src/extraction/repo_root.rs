@@ -112,10 +112,14 @@ fn git_toplevel(dir: &Path) -> Option<String> {
 /// For comparing two directories in the same instant, never for storing: a
 /// path says nothing about which repository lived there last month. No
 /// fallback of any kind. `git` missing, too old for `--path-format` (before
-/// 2.31), a `safe.directory` refusal, a directory that is gone: all `None`,
-/// and every caller treats `None` as "not the same repository".
-pub fn git_common_dir(dir: &Path) -> Option<String> {
-    if !dir.is_dir() {
+/// 2.31), a `safe.directory` refusal, a directory that is gone, or `git` still
+/// running at `deadline` (it is killed): all `None`, and every caller treats
+/// `None` as "not the same repository".
+pub fn git_common_dir(dir: &Path, deadline: std::time::Instant) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    if !dir.is_dir() || std::time::Instant::now() >= deadline {
         return None;
     }
     let mut cmd = Command::new("git");
@@ -124,16 +128,35 @@ pub fn git_common_dir(dir: &Path) -> Option<String> {
             cmd.env_remove(&k);
         }
     }
-    let output = cmd
+    let mut child = cmd
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    // The answer is one short line, far below the pipe buffer, so waiting for
+    // exit before reading cannot deadlock.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -219,6 +242,22 @@ mod tests {
             .unwrap_or(false)
     }
 
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    #[test]
+    fn a_deadline_already_past_answers_none_instead_of_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        assert!(git_common_dir(&repo, soon()).is_some());
+        assert_eq!(git_common_dir(&repo, std::time::Instant::now()), None);
+    }
+
     #[test]
     fn common_dir_is_shared_by_subdirectories_and_worktrees_but_not_nested_repos() {
         let tmp = tempfile::tempdir().unwrap();
@@ -231,9 +270,9 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        assert_eq!(git_common_dir(&repo), Some(expected.clone()));
+        assert_eq!(git_common_dir(&repo, soon()), Some(expected.clone()));
         assert_eq!(
-            git_common_dir(&repo.join("sub/deeper")),
+            git_common_dir(&repo.join("sub/deeper"), soon()),
             Some(expected.clone())
         );
 
@@ -244,7 +283,7 @@ mod tests {
             && git(&["worktree", "add", "-q", "../wt", "-b", "wt"], &repo)
         {
             assert_eq!(
-                git_common_dir(&tmp.path().join("wt")),
+                git_common_dir(&tmp.path().join("wt"), soon()),
                 Some(expected.clone())
             );
         }
@@ -253,11 +292,11 @@ mod tests {
         let nested = repo.join("vendor/other");
         fs::create_dir_all(&nested).unwrap();
         assert!(git(&["init", "-q"], &nested));
-        let nested_id = git_common_dir(&nested).unwrap();
+        let nested_id = git_common_dir(&nested, soon()).unwrap();
         assert_ne!(nested_id, expected);
 
-        assert_eq!(git_common_dir(tmp.path()), None);
-        assert_eq!(git_common_dir(&tmp.path().join("missing")), None);
+        assert_eq!(git_common_dir(tmp.path(), soon()), None);
+        assert_eq!(git_common_dir(&tmp.path().join("missing"), soon()), None);
     }
 
     #[test]

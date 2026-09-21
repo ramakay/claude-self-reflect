@@ -1052,13 +1052,17 @@ pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Resu
     Ok(())
 }
 
-/// Every `import_state.file_path` recorded for each of `conversation_ids`.
-/// An id with no row is absent from the map. The id is a transcript file stem,
-/// which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`), so one id
-/// can carry several paths and the caller has to account for all of them.
+/// The `import_state.file_path` rows recorded for each of `conversation_ids`,
+/// for ids that have at most `max_paths_per_id` of them. An id with no row, or
+/// with more rows than that, is absent from the map. The id is a transcript
+/// file stem, which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`):
+/// one id can carry several paths and the caller has to account for all of
+/// them, while a stem shared by thousands of files must not cost a prompt
+/// thousands of rows. The count runs on the conversation_id index alone.
 pub fn import_paths_for_conversations(
     conn: &Connection,
     conversation_ids: &[String],
+    max_paths_per_id: usize,
 ) -> Result<HashMap<String, Vec<String>>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     if conversation_ids.is_empty() {
@@ -1067,7 +1071,11 @@ pub fn import_paths_for_conversations(
     let placeholders = vec!["?"; conversation_ids.len()].join(",");
     let sql = format!(
         "SELECT conversation_id, file_path FROM import_state
-         WHERE conversation_id IN ({placeholders}) ORDER BY file_path"
+         WHERE conversation_id IN (
+             SELECT conversation_id FROM import_state
+             WHERE conversation_id IN ({placeholders})
+             GROUP BY conversation_id HAVING COUNT(*) <= {max_paths_per_id})
+         ORDER BY file_path"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(conversation_ids.iter()), |row| {
@@ -1076,6 +1084,50 @@ pub fn import_paths_for_conversations(
     for row in rows {
         let (conversation_id, file_path) = row?;
         out.entry(conversation_id).or_default().push(file_path);
+    }
+    Ok(out)
+}
+
+/// Every transcript path in `import_state`, grouped by conversation id. The
+/// whole-table form of [`import_paths_for_conversations`], for a project-scoped
+/// MCP search that has to know every conversation before it searches.
+pub fn all_import_paths(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id, file_path FROM import_state
+         WHERE conversation_id IS NOT NULL ORDER BY file_path",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (conversation_id, file_path) = row?;
+        out.entry(conversation_id).or_default().push(file_path);
+    }
+    Ok(out)
+}
+
+/// `(id, conversation_id, project_name)` of every chunk belonging to any of
+/// `conversation_ids`. Batched so a long id list stays under SQLite's
+/// bound-parameter limit.
+pub fn get_chunk_labels_for_conversations(
+    conn: &Connection,
+    conversation_ids: &[String],
+) -> Result<Vec<(String, String, String)>> {
+    let mut out = Vec::new();
+    for batch in conversation_ids.chunks(500) {
+        let placeholders = vec!["?"; batch.len()].join(",");
+        let sql = format!(
+            "SELECT id, conversation_id, project_name FROM chunks
+             WHERE conversation_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
     }
     Ok(out)
 }

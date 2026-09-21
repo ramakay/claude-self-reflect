@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::format::{self, EnrichedResult};
+use crate::mcp::scope::SearchScope;
 use crate::search::cross_project;
 use crate::search::decay;
 use crate::search::SearchEngine;
@@ -105,6 +106,7 @@ fn lookup_by_conv_tag(
 }
 
 /// Full semantic search with rich XML results.
+#[allow(clippy::too_many_arguments)]
 pub async fn reflect_on_past(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -113,6 +115,7 @@ pub async fn reflect_on_past(
     limit: usize,
     min_score: f32,
     project: Option<&str>,
+    projects_dir: &Path,
 ) -> Result<String> {
     // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
     // exact tag. Falls through to semantic search only when the tag matches
@@ -123,7 +126,7 @@ pub async fn reflect_on_past(
         }
     }
 
-    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
+    let (scope, scope_label) = SearchScope::resolve(storage, projects_dir, project);
 
     let embed_start = Instant::now();
     let query_vec = embed_query(embeddings, query).await?;
@@ -134,8 +137,8 @@ pub async fn reflect_on_past(
     // Search BOTH chunks and reflections, merge by score
     let (chunk_results, reflection_results) = {
         let idx = search.read().await;
-        let chunks = if let Some(ref p) = effective_project {
-            let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+        let chunks = if let Some(ref scope) = scope {
+            let ids = scope.chunk_ids(storage)?;
             idx.search_chunks_filtered(&query_vec, limit, min_score, &ids)
         } else {
             idx.search_chunks(&query_vec, limit, min_score)
@@ -170,8 +173,8 @@ pub async fn reflect_on_past(
                         r.score
                     };
                 // Cross-project multiplicative penalty
-                let final_score = if let Some(ref p) = effective_project {
-                    if c.project_name != *p {
+                let final_score = if let Some(ref scope) = scope {
+                    if !scope.admits(&c.project_name, &c.conversation_id) {
                         decayed_score * 0.3
                     } else {
                         decayed_score
@@ -214,8 +217,8 @@ pub async fn reflect_on_past(
                 .map(|t| t.trim_start_matches("project_").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
             // Cross-project multiplicative penalty
-            let final_score = if let Some(ref p) = effective_project {
-                if project_name != *p {
+            let final_score = if let Some(ref scope) = scope {
+                if project_name != scope.project {
                     decayed_score * 0.3
                 } else {
                     decayed_score
@@ -257,8 +260,22 @@ pub async fn reflect_on_past(
     // or empty, supplement with keyword search results
     let semantic_top_score = enriched.iter().map(|e| e.score).fold(0.0f32, f32::max);
     if semantic_top_score < 0.5 {
-        let fts_project = effective_project.as_deref();
-        if let Ok(fts_chunks) = storage.fts5_search(query, limit, fts_project) {
+        // The keyword index filters by label only. When the scope reaches past
+        // the label, search unfiltered and keep what the scope admits.
+        let fts_chunks = match &scope {
+            Some(scope) if scope.reaches_past_label() => {
+                storage.fts5_search(query, limit * 4, None).map(|chunks| {
+                    chunks
+                        .into_iter()
+                        .filter(|c| scope.admits(&c.project_name, &c.conversation_id))
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                })
+            }
+            Some(scope) => storage.fts5_search(query, limit, Some(scope.project.as_str())),
+            None => storage.fts5_search(query, limit, None),
+        };
+        if let Ok(fts_chunks) = fts_chunks {
             let existing_ids: HashSet<String> =
                 enriched.iter().map(|e| e.chunk.id.clone()).collect();
             for chunk in fts_chunks {
@@ -273,8 +290,8 @@ pub async fn reflect_on_past(
                     } else {
                         0.40
                     };
-                let final_fts_score = if let Some(ref p) = effective_project {
-                    if chunk.project_name != *p {
+                let final_fts_score = if let Some(ref scope) = scope {
+                    if !scope.admits(&chunk.project_name, &chunk.conversation_id) {
                         fts_score * 0.3
                     } else {
                         fts_score
@@ -457,12 +474,13 @@ pub async fn search_insights(
     search: &Arc<RwLock<SearchEngine>>,
     query: &str,
     project: Option<&str>,
+    projects_dir: &Path,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (scope, _) = SearchScope::resolve(storage, projects_dir, project);
     let query_vec = embed_query(embeddings, query).await?;
 
-    let results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+    let results = if let Some(ref scope) = scope {
+        let ids = scope.chunk_ids(storage)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(&query_vec, 10, 0.0, &ids)
     } else {
@@ -789,12 +807,13 @@ pub async fn search_by_concept(
     concept: &str,
     limit: usize,
     project: Option<&str>,
+    projects_dir: &Path,
 ) -> Result<String> {
-    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
+    let (scope, scope_label) = SearchScope::resolve(storage, projects_dir, project);
     let query_vec = embed_query(embeddings, concept).await?;
 
-    let results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+    let results = if let Some(ref scope) = scope {
+        let ids = scope.chunk_ids(storage)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(&query_vec, limit, 0.3, &ids)
     } else {
@@ -823,13 +842,14 @@ pub async fn get_more_results(
     limit: usize,
     min_score: f32,
     project: Option<&str>,
+    projects_dir: &Path,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (scope, _) = SearchScope::resolve(storage, projects_dir, project);
     let query_vec = embed_query(embeddings, query).await?;
     let fetch = offset + limit;
 
-    let all_results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+    let all_results = if let Some(ref scope) = scope {
+        let ids = scope.chunk_ids(storage)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(&query_vec, fetch, min_score, &ids)
     } else {

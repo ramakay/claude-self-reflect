@@ -682,9 +682,26 @@ impl Storage {
     pub fn import_paths_for_conversations(
         &self,
         conversation_ids: &[String],
+        max_paths_per_id: usize,
     ) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::import_paths_for_conversations(&conn, conversation_ids)
+        queries::import_paths_for_conversations(&conn, conversation_ids, max_paths_per_id)
+    }
+
+    /// Every transcript path by conversation id. See `queries::all_import_paths`.
+    pub fn all_import_paths(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::all_import_paths(&conn)
+    }
+
+    /// `(id, conversation_id, project_name)` for a set of conversations. See
+    /// `queries::get_chunk_labels_for_conversations`.
+    pub fn get_chunk_labels_for_conversations(
+        &self,
+        conversation_ids: &[String],
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_chunk_labels_for_conversations(&conn, conversation_ids)
     }
 
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,

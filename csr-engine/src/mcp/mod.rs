@@ -1,6 +1,7 @@
 pub mod completions;
 pub mod elicitation;
 pub mod resources;
+pub mod scope;
 pub mod tasks;
 pub mod tools;
 
@@ -276,6 +277,7 @@ impl CsrServer {
             limit,
             min_score,
             p.project.as_deref(),
+            &self.projects_dir,
         )
         .await;
 
@@ -376,6 +378,7 @@ impl CsrServer {
             &self.search,
             &p.query,
             p.project.as_deref(),
+            &self.projects_dir,
         )
         .await;
 
@@ -516,6 +519,7 @@ impl CsrServer {
             &p.concept,
             limit,
             p.project.as_deref(),
+            &self.projects_dir,
         )
         .await;
 
@@ -552,6 +556,7 @@ impl CsrServer {
             limit,
             min_score,
             p.project.as_deref(),
+            &self.projects_dir,
         )
         .await;
 

@@ -71,17 +71,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code files a transcript under, so a session started in `repo/sub` is stored
   as `repo-sub` while the hook asks for `repo`, and none of it ever came back.
   A chunk under another label now also passes when every transcript file
-  recorded for its conversation sits in a folder that decodes, on the
-  filesystem as it is now, to exactly one existing directory inside the
-  asker's checkout, and git reports the same repository for that directory.
-  Nothing is stored: no migration, no re-import, history is visible on the
-  first prompt after upgrading. A directory that is gone, a name that decodes
-  two ways (`repo/sub` next to a sibling `repo-sub`), a nested repository, a
-  missing or pre-2.31 git: all keep the exact match. Measured against the
-  published 9.5.6 on real transcripts, 30 prompts per frame: subdirectory
-  sessions 0 -> 23 source chunks injected, root sessions 27 -> 26, a sibling
-  repository 0 and 0, and 0 again once a sibling directory with the same
-  encoded name exists.
+  recorded for its conversation sits in a folder of the projects directory
+  that decodes, on the filesystem as it is now, to exactly one existing
+  directory inside the asker's checkout, git reports the same repository for
+  that directory, and the chunk carries that folder's label. Nothing is
+  stored: no migration, no re-import, history is visible on the first prompt
+  after upgrading. A directory that is gone, a name that decodes two ways
+  (`repo/sub` next to a sibling `repo-sub`), a directory that cannot be read,
+  a nested repository, a missing or pre-2.31 git: all keep the exact match.
+  The check runs only when a candidate's label differs, under one budget of
+  64 directory listings, 4 `git` calls and 250 ms. Known limit: the filesystem
+  is read as it is now, so a deleted sibling `repo-sub` whose name now decodes
+  to an existing `repo/sub` is taken for the subdirectory. Measured against
+  the published 9.5.6 on real transcripts, 30 prompts per frame, three runs:
+  subdirectory sessions 0 -> 23 to 27 source chunks injected; a sibling
+  repository 0 and 0; 0 again once a sibling directory with the same encoded
+  name exists. Root sessions asked from the subdirectory went 25 to 27 ->
+  21 to 26: the subdirectory's history now competes for the same five slots.
+- **An unscoped MCP search covers the current project again.** The search
+  tools document "current project" as the default scope, resolved from
+  `MCP_CLIENT_CWD`. Claude Code has never set that variable, so from Claude
+  Code every search without a `project` argument ran across all projects.
+  `csr_reflect_on_past`, `csr_search_insights`, `csr_search_by_concept` and
+  `csr_get_more` now fall back to `CLAUDE_PROJECT_DIR`, which Claude Code
+  exports to the stdio servers it starts. The scope is the project label plus
+  the subdirectory sessions the rule above places in the same repository, so
+  turning the scope on does not hide them; the keyword fallback follows the
+  same scope. `project: "all"` still searches everything, a client that sets
+  neither variable is unchanged, and the code-graph, file and provenance tools
+  resolve their project as before. Sessions whose starting directory no longer
+  exists (a removed worktree, a deleted scratch directory) are outside the
+  default scope and reachable with `project: "all"`.
 - **Search overfetches past deleted index points.** `hnsw_rs` cannot delete,
   so a removed chunk or reflection only loses its id and the dead point still
   wins neighbour slots. Search asked for exactly `limit` neighbours and

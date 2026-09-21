@@ -744,7 +744,7 @@ async fn search_chunks_with_vec(
     cwd: &Path,
 ) -> Vec<RawResult> {
     search_chunks_with_vec_core(engine, query_vec, limit, min_score, project, |paths| {
-        super::scope_folder::conversations_in_asker_repo(paths, cwd)
+        super::scope_folder::conversations_in_asker_repo(paths, engine.projects_dir(), cwd)
     })
     .await
 }
@@ -752,15 +752,15 @@ async fn search_chunks_with_vec(
 /// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
 /// decide which conversations widen without a filesystem or `git`. `same_repo`
 /// is called at most once, and only when some candidate's label differs from
-/// `project` and has a recorded transcript path: a prompt whose candidates all
-/// match by label costs no lookup beyond the one batched query.
+/// `project` and has a recorded transcript path. A prompt whose candidates all
+/// match by label costs nothing; any other costs one batched query first.
 async fn search_chunks_with_vec_core(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
     project: &str,
-    same_repo: impl FnOnce(&HashMap<String, Vec<String>>) -> HashSet<String>,
+    same_repo: impl FnOnce(&HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -799,14 +799,17 @@ async fn search_chunks_with_vec_core(
         }
     }
     let widened = if mismatched.is_empty() {
-        HashSet::new()
+        HashMap::new()
     } else {
-        match storage.import_paths_for_conversations(&mismatched) {
+        match storage.import_paths_for_conversations(
+            &mismatched,
+            super::scope_folder::MAX_PATHS_PER_CONVERSATION,
+        ) {
             Ok(paths) if !paths.is_empty() => same_repo(&paths),
-            Ok(_) => HashSet::new(),
+            Ok(_) => HashMap::new(),
             Err(e) => {
                 tracing::warn!(error = %e, "import_state lookup failed; exact project match only");
-                HashSet::new()
+                HashMap::new()
             }
         }
     };
@@ -818,10 +821,13 @@ async fn search_chunks_with_vec_core(
         {
             if let Some(chunk) = chunk_by_id.remove(&result.id) {
                 // Project scope filter: the label matches, or the conversation
-                // was filed from inside the asker's repository.
+                // was filed from inside the asker's repository and this chunk
+                // carries the label of the folder it was filed under.
                 if !project.is_empty()
                     && chunk.project_name != project
-                    && !widened.contains(&chunk.conversation_id)
+                    && !widened
+                        .get(&chunk.conversation_id)
+                        .is_some_and(|labels| labels.contains(&chunk.project_name))
                 {
                     continue;
                 }
@@ -1302,7 +1308,7 @@ mod tests {
     async fn recall_across_labels(
         project: &str,
         import_rows: &[(&str, &str)],
-        widen: &[&str],
+        widen: &[(&str, &str)],
     ) -> (Vec<String>, Option<HashMap<String, Vec<String>>>) {
         let root = tempfile::tempdir().unwrap();
         let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
@@ -1342,7 +1348,10 @@ mod tests {
         let mut ids: Vec<String> =
             search_chunks_with_vec_core(&engine, &[1.0, 0.0], 10, 0.0, project, |paths| {
                 *seen.borrow_mut() = Some(paths.clone());
-                widen.iter().map(|id| id.to_string()).collect()
+                widen
+                    .iter()
+                    .map(|(id, label)| (id.to_string(), HashSet::from([label.to_string()])))
+                    .collect()
             })
             .await
             .into_iter()
@@ -1369,7 +1378,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_conversation_the_repository_test_accepts_is_recalled_under_another_label() {
-        let (ids, seen) = recall_across_labels("repo", &IMPORT_ROWS, &["sub-session"]).await;
+        let (ids, seen) =
+            recall_across_labels("repo", &IMPORT_ROWS, &[("sub-session", "repo-sub")]).await;
         assert_eq!(ids, ["root-chunk", "sub-chunk"]);
         // Only the candidates whose label differs are put to the test, with
         // every path recorded for them; the exact match never is.
@@ -1384,6 +1394,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_widened_conversation_admits_only_the_label_of_its_folder() {
+        // import_state is written after the chunks, so a chunk overwritten by a
+        // same-stem file from elsewhere can sit under a conversation whose
+        // recorded path passes. Its label is that other file's, and it stays out.
+        let (ids, _) =
+            recall_across_labels("repo", &IMPORT_ROWS, &[("sub-session", "something-else")]).await;
+        assert_eq!(ids, ["root-chunk"]);
+    }
+
+    /// Through the production adapter: a real repository on disk, real `git`,
+    /// decode from `/`, several `import_state` rows for one id.
+    #[tokio::test]
+    async fn the_production_rule_recalls_a_subdirectory_session_of_a_real_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, tools) = (root.join("projects/repo"), root.join("projects/repo-tools"));
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let git_init = |dir: &Path| {
+            let mut cmd = std::process::Command::new("git");
+            for (k, _) in std::env::vars_os() {
+                if k.to_string_lossy().starts_with("GIT_") {
+                    cmd.env_remove(&k);
+                }
+            }
+            cmd.arg("init")
+                .arg("-q")
+                .arg(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git_init(&repo) || !git_init(&tools) {
+            return; // git unavailable in this environment
+        }
+        let projects_dir = root.join("cc");
+        let folder = |dir: &Path| {
+            crate::search::cross_project::encode_project_folder(&dir.to_string_lossy())
+        };
+        let in_sub = |name: &str| {
+            format!(
+                "{}/{}/{name}",
+                projects_dir.display(),
+                folder(&repo.join("sub"))
+            )
+        };
+        let in_tools = |name: &str| format!("{}/{}/{name}", projects_dir.display(), folder(&tools));
+
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, conversation_id, label) in [
+            ("root-chunk", "s-root", "repo"),
+            ("sub-chunk", "s-sub", "repo-sub"),
+            ("overwritten-chunk", "s-sub", "elsewhere"),
+            ("tools-chunk", "s-tools", "repo-tools"),
+            ("shared-stem-chunk", "journal", "repo-sub"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: label.into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: format!("work recorded under {label}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        for (file_path, conversation_id) in [
+            (in_sub("s-sub.jsonl"), "s-sub"),
+            (in_tools("s-tools.jsonl"), "s-tools"),
+            (in_sub("w1/journal.jsonl"), "journal"),
+            (in_tools("w2/journal.jsonl"), "journal"),
+        ] {
+            storage
+                .upsert_import_state_explicit(&file_path, conversation_id, 1, "0")
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            projects_dir,
+        );
+        let mut ids: Vec<String> =
+            search_chunks_with_vec(&engine, &[1.0, 0.0], 10, 0.0, "repo", &repo.join("sub"))
+                .await
+                .into_iter()
+                .filter_map(|result| result.memory_id)
+                .collect();
+        ids.sort();
+        assert_eq!(ids, ["root-chunk", "sub-chunk"]);
+    }
+
+    #[tokio::test]
     async fn a_conversation_the_repository_test_rejects_stays_out() {
         let (ids, _) = recall_across_labels("repo", &IMPORT_ROWS, &[]).await;
         assert_eq!(ids, ["root-chunk"]);
@@ -1392,7 +1501,7 @@ mod tests {
     #[tokio::test]
     async fn no_recorded_transcript_path_means_no_repository_test_at_all() {
         // Differing labels but nothing in import_state: nothing to decide on.
-        let (ids, seen) = recall_across_labels("repo", &[], &["sub-session"]).await;
+        let (ids, seen) = recall_across_labels("repo", &[], &[("sub-session", "repo-sub")]).await;
         assert_eq!(ids, ["root-chunk"]);
         assert!(seen.is_none());
     }

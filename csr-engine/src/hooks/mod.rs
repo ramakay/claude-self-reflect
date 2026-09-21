@@ -11,7 +11,7 @@ pub mod intent;
 pub mod post_tool_use;
 pub mod precompact;
 pub mod prompt_submit;
-mod scope_folder;
+pub(crate) mod scope_folder;
 pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;

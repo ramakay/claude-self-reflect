@@ -39,6 +39,28 @@ pub fn resolve_current_project() -> Option<String> {
     resolve_project_from_cwd(&cwd)
 }
 
+/// The directory the MCP client is working in: `MCP_CLIENT_CWD` when a client
+/// sets it, otherwise `CLAUDE_PROJECT_DIR`. Claude Code exports the second to
+/// every stdio MCP server it starts and has never set the first, so until this
+/// fallback an unscoped search from Claude Code always ran across all projects.
+pub fn resolve_client_dir() -> Option<String> {
+    client_dir_from(
+        std::env::var("MCP_CLIENT_CWD").ok(),
+        std::env::var("CLAUDE_PROJECT_DIR").ok(),
+    )
+}
+
+/// Env-free core of [`resolve_client_dir`]: the first value that is not blank.
+fn client_dir_from(
+    mcp_client_cwd: Option<String>,
+    claude_project_dir: Option<String>,
+) -> Option<String> {
+    [mcp_client_cwd, claude_project_dir]
+        .into_iter()
+        .flatten()
+        .find(|dir| !dir.trim().is_empty())
+}
+
 /// Normalize a project scope parameter.
 ///
 /// - `None` → auto-detect from `MCP_CLIENT_CWD`
@@ -127,6 +149,16 @@ mod tests {
                 "all"
             }
         );
+    }
+
+    #[test]
+    fn the_client_directory_prefers_mcp_client_cwd_and_falls_back_to_claude_project_dir() {
+        let dir = |s: &str| Some(s.to_string());
+        assert_eq!(client_dir_from(dir("/a"), dir("/b")), dir("/a"));
+        assert_eq!(client_dir_from(None, dir("/b")), dir("/b"));
+        assert_eq!(client_dir_from(dir("  "), dir("/b")), dir("/b"));
+        assert_eq!(client_dir_from(None, dir("")), None);
+        assert_eq!(client_dir_from(None, None), None);
     }
 
     // Pure function tests — no env var manipulation needed
