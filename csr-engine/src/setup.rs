@@ -42,12 +42,12 @@ pub async fn handle(
     // Step 2: Register as MCP server
     eprintln!("[2/6] Registering MCP server...");
     // A registration failure must not cost the user hooks and import, but it
-    // must not be reported as success either: print it here, finish the rest,
-    // and return it at the end so the exit code is non-zero and the installers
-    // take their failure branch.
+    // must not be reported as success either: note it here, finish the rest,
+    // and print the details once at the end. The returned error is deliberately
+    // one line so the caller's own rendering does not repeat the remedy.
     let mcp_error = register_mcp_server().err();
-    if let Some(e) = &mcp_error {
-        eprintln!("  Error: {e}");
+    if mcp_error.is_some() {
+        eprintln!("  MCP registration failed; details at the end of setup.");
     }
 
     // Step 3: Install hooks
@@ -89,16 +89,17 @@ pub async fn handle(
     let reflections = eng.storage().count_reflection_embeddings().unwrap_or(0);
     let projects = eng.storage().count_projects().unwrap_or(0);
 
-    if let Some(e) = mcp_error {
+    if let Some(detail) = mcp_error {
         eprintln!("\n=== Setup Incomplete ===\n");
         eprintln!("  Conversations: {}", conversations);
         eprintln!("  Reflections:   {}", reflections);
         eprintln!("  Projects:      {}", projects);
         eprintln!();
         eprintln!("  Hooks and import are done. The MCP server is NOT registered:");
-        eprintln!("  {e}");
+        eprintln!("  {detail}");
         eprintln!();
-        return Err(e);
+        // Short on purpose: the detail above is the only copy the user reads.
+        return Err(anyhow::anyhow!("MCP server not registered"));
     }
 
     eprintln!("\n=== Setup Complete ===\n");
@@ -150,14 +151,77 @@ fn mcp_add(binary_str: &str) -> std::io::Result<std::process::Output> {
         .output()
 }
 
-fn mcp_registration_error(binary_str: &str, stderr: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "could not register the MCP server: {}\n  Run these yourself, then restart Claude Code:\n    claude mcp remove {} -s user\n    claude mcp add {} {} -s user",
+fn mcp_remove() -> std::io::Result<std::process::Output> {
+    std::process::Command::new("claude")
+        .args(["mcp", "remove", MCP_SERVER_NAME, "-s", "user"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+}
+
+/// What happened to the registration that was there before we touched it.
+#[derive(Debug, PartialEq, Eq)]
+enum PriorEntry {
+    /// Never removed — either there was none, or the remove itself failed.
+    Untouched,
+    /// Removed, and putting it back worked.
+    Restored(String),
+    /// Removed, and putting it back also failed. The user is now unregistered
+    /// and has to be told exactly that.
+    Lost(String),
+}
+
+/// The message a human gets when we could not register the server.
+///
+/// Always names the one command that fixes it, with the path quoted for a
+/// shell, and is explicit about what happened to whatever was registered
+/// before — silently deleting a working registration and saying nothing would
+/// be worse than not upgrading at all.
+fn mcp_registration_error(binary_str: &str, stderr: &str, prior: &PriorEntry) -> String {
+    let quoted = crate::shell::shell_quote(binary_str);
+    let mut message = format!(
+        "could not register the MCP server: {}\n  Run this yourself, then restart Claude Code:\n    claude mcp add {} {} -s user",
         stderr.trim(),
         MCP_SERVER_NAME,
-        MCP_SERVER_NAME,
-        binary_str
-    )
+        quoted
+    );
+    match prior {
+        PriorEntry::Untouched => {}
+        PriorEntry::Restored(old) => {
+            message.push_str(&format!(
+                "\n  The previous registration ({old}) was put back, so Claude Code still works — with the old binary."
+            ));
+        }
+        PriorEntry::Lost(old) => {
+            message.push_str(&format!(
+                "\n  The previous registration ({old}) was removed and could not be restored. Nothing is registered right now."
+            ));
+        }
+    }
+    message
+}
+
+/// The command currently registered under our name in `~/.claude.json`.
+///
+/// Read directly rather than through `claude mcp get` so a broken CLI cannot
+/// hide it. Bounded and fail-open: a missing, oversized, non-regular or
+/// malformed file yields None, which only costs us the restore-on-failure path.
+fn current_mcp_command() -> Option<String> {
+    const MAX_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
+
+    let path = dirs::home_dir()?.join(".claude.json");
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+    config
+        .get("mcpServers")?
+        .get(MCP_SERVER_NAME)?
+        .get("command")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Register csr-engine as an MCP server with Claude Code.
@@ -166,20 +230,32 @@ fn mcp_registration_error(binary_str: &str, stderr: &str) -> anyhow::Error {
 /// registration still names the old one, and `claude mcp add` refuses to
 /// overwrite it. Failing quietly there is how setup used to print "Setup
 /// Complete" while Claude Code kept launching the binary that was just
-/// replaced — the `write_mcp_config` fallback below writes `mcpServers` into
-/// ~/.claude/settings.json, which Claude Code does not read for MCP at all.
-/// So: remove-then-add once, and surface anything else as an error.
-fn register_mcp_server() -> Result<()> {
-    let binary_path = std::env::current_exe()?;
+/// replaced. So: remove-then-add once, put the old entry back if the retry
+/// fails, and surface everything else.
+///
+/// Returns the detailed failure message; the caller decides where to print it.
+fn register_mcp_server() -> Result<(), String> {
+    let binary_path = std::env::current_exe().map_err(|e| {
+        mcp_registration_error(
+            "csr-engine",
+            &format!("cannot determine our own path: {e}"),
+            &PriorEntry::Untouched,
+        )
+    })?;
     let binary_str = binary_path.to_string_lossy().to_string();
 
     let output = match mcp_add(&binary_str) {
         Ok(output) => output,
-        Err(_) => {
-            // The `claude` binary could not be spawned at all — the one case
-            // the direct-write fallback still covers.
-            eprintln!("  `claude` CLI not found, writing MCP config directly...");
-            return write_mcp_config(&binary_str);
+        Err(e) => {
+            // `claude` could not be spawned at all. There used to be a fallback
+            // here that wrote `mcpServers` into ~/.claude/settings.json, which
+            // Claude Code does not read for MCP — it reported success while
+            // registering nothing.
+            return Err(mcp_registration_error(
+                &binary_str,
+                &format!("could not run `claude`: {e}"),
+                &PriorEntry::Untouched,
+            ));
         }
     };
 
@@ -190,71 +266,68 @@ fn register_mcp_server() -> Result<()> {
 
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if classify_add_failure(&stderr) == AddFailure::Fatal {
-        return Err(mcp_registration_error(&binary_str, &stderr));
+        return Err(mcp_registration_error(
+            &binary_str,
+            &stderr,
+            &PriorEntry::Untouched,
+        ));
     }
 
+    // Capture what is registered before removing it, so a failed retry does not
+    // leave the user with nothing.
+    let previous = current_mcp_command();
     eprintln!("  Existing registration found — repointing it at {binary_str}");
-    let removed = std::process::Command::new("claude")
-        .args(["mcp", "remove", MCP_SERVER_NAME, "-s", "user"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-    if let Err(e) = removed {
-        return Err(mcp_registration_error(&binary_str, &e.to_string()));
+
+    let removed = mcp_remove();
+    match removed {
+        Ok(ref out) if out.status.success() => {}
+        Ok(out) => {
+            // The old entry is still in place: report and stop.
+            return Err(mcp_registration_error(
+                &binary_str,
+                &format!(
+                    "`claude mcp remove` failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                &PriorEntry::Untouched,
+            ));
+        }
+        Err(e) => {
+            return Err(mcp_registration_error(
+                &binary_str,
+                &format!("could not run `claude mcp remove`: {e}"),
+                &PriorEntry::Untouched,
+            ));
+        }
     }
 
     // Exactly one retry: a second failure is a real problem, not a race.
-    match mcp_add(&binary_str) {
+    let retry_stderr = match mcp_add(&binary_str) {
         Ok(retry) if retry.status.success() => {
             eprintln!("  Registered via `claude mcp add`");
-            Ok(())
+            return Ok(());
         }
-        Ok(retry) => Err(mcp_registration_error(
-            &binary_str,
-            &String::from_utf8_lossy(&retry.stderr),
-        )),
-        Err(e) => Err(mcp_registration_error(&binary_str, &e.to_string())),
-    }
-}
-
-/// Write MCP server config directly to ~/.claude/settings.json.
-fn write_mcp_config(binary_path: &str) -> Result<()> {
-    let settings_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
-        .join(".claude")
-        .join("settings.json");
-
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
+        Ok(retry) => String::from_utf8_lossy(&retry.stderr).into_owned(),
+        Err(e) => format!("could not run `claude mcp add`: {e}"),
     };
 
-    // Add MCP server entry
-    let mcp_servers = settings
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("settings.json is not an object"))?
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
+    Err(mcp_registration_error(
+        &binary_str,
+        &retry_stderr,
+        &restore_previous(previous),
+    ))
+}
 
-    mcp_servers["claude-self-reflect"] = serde_json::json!({
-        "command": binary_path,
-        "args": [],
-        "scope": "user"
-    });
-
-    // Atomic write
-    let tmp_path = settings_path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, serde_json::to_string_pretty(&settings)?)?;
-    std::fs::rename(&tmp_path, &settings_path)?;
-
-    eprintln!("  MCP config written to {}", settings_path.display());
-    Ok(())
+/// Put back whatever we removed. One attempt, and the result is reported either
+/// way — the caller is already returning an error.
+fn restore_previous(previous: Option<String>) -> PriorEntry {
+    let Some(old) = previous else {
+        return PriorEntry::Untouched;
+    };
+    match mcp_add(&old) {
+        Ok(out) if out.status.success() => PriorEntry::Restored(old),
+        _ => PriorEntry::Lost(old),
+    }
 }
 
 /// Save the Anthropic API key to ~/.claude-self-reflect/.env
@@ -366,11 +439,11 @@ mod tests {
     /// The error a user sees has to contain both commands, with the real
     /// binary path — it is the only way out when the retry also fails.
     #[test]
-    fn test_mcp_registration_error_names_both_commands() {
-        let msg = mcp_registration_error("/home/me/.local/bin/csr-engine", "boom").to_string();
-        assert!(
-            msg.contains("claude mcp remove claude-self-reflect -s user"),
-            "{msg}"
+    fn test_mcp_registration_error_names_the_add_command() {
+        let msg = mcp_registration_error(
+            "/home/me/.local/bin/csr-engine",
+            "boom",
+            &PriorEntry::Untouched,
         );
         assert!(
             msg.contains(
@@ -378,6 +451,55 @@ mod tests {
             ),
             "{msg}"
         );
+        // By this point either nothing was removed, or it was removed and
+        // already restored — telling the user to remove again is noise.
+        assert!(!msg.contains("claude mcp remove"), "{msg}");
         assert!(msg.contains("boom"), "{msg}");
+        assert!(!msg.contains("previous registration"), "{msg}");
+    }
+
+    /// A path a shell would mangle has to be pasteable.
+    #[test]
+    fn test_mcp_registration_error_quotes_the_binary_path() {
+        let msg = mcp_registration_error(
+            "/Users/me/CSR Tools/csr-engine",
+            "boom",
+            &PriorEntry::Untouched,
+        );
+        assert!(
+            msg.contains(
+                "claude mcp add claude-self-reflect '/Users/me/CSR Tools/csr-engine' -s user"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// Removing a working registration and failing to re-add it is the worst
+    /// outcome available, so the two restore paths have to read differently.
+    #[test]
+    fn test_mcp_registration_error_reports_what_happened_to_the_old_entry() {
+        let restored = mcp_registration_error(
+            "/new/csr-engine",
+            "boom",
+            &PriorEntry::Restored("/old/csr-engine".to_string()),
+        );
+        assert!(restored.contains("/old/csr-engine"), "{restored}");
+        assert!(restored.contains("was put back"), "{restored}");
+
+        let lost = mcp_registration_error(
+            "/new/csr-engine",
+            "boom",
+            &PriorEntry::Lost("/old/csr-engine".to_string()),
+        );
+        assert!(lost.contains("/old/csr-engine"), "{lost}");
+        assert!(lost.contains("could not be restored"), "{lost}");
+        assert!(lost.contains("Nothing is registered right now"), "{lost}");
+    }
+
+    /// With nothing captured there is nothing to put back, and no `claude`
+    /// command is run.
+    #[test]
+    fn test_restore_previous_without_a_prior_entry_is_untouched() {
+        assert_eq!(restore_previous(None), PriorEntry::Untouched);
     }
 }

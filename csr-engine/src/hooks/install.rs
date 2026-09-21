@@ -8,7 +8,7 @@ use anyhow::Result;
 /// Handle the install subcommand.
 pub fn handle(apply: bool) -> Result<()> {
     let binary_path = std::env::current_exe()?;
-    let binary_str = binary_path.to_string_lossy();
+    let binary_str = shell_command_path(&binary_path);
 
     let config = generate_hook_config(&binary_str);
 
@@ -23,6 +23,30 @@ pub fn handle(apply: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Render the binary path for embedding in a hook command string.
+///
+/// Every hook entry is a single command string, which Claude Code runs through a
+/// POSIX shell — and there `\` is an escape character, not a separator. A Windows
+/// path is therefore delivered to the shell as `D:pathtocsr-engine.exe`, which
+/// exits 127 with "command not found" before the process starts, so the failure
+/// leaves no trace in hook-timing.log either. Forward slashes are accepted both by
+/// the shell and by Windows itself. On Unix the separators are left alone, since a
+/// backslash there is a legal filename character.
+///
+/// The result is then shell-quoted: an install under `/Users/me/CSR Tools/bin`
+/// would otherwise produce a hook that runs `/Users/me/CSR`, and an apostrophe,
+/// semicolon or `$(...)` in the path would change the command outright. Quoting
+/// happens after the separator fix so a quoted Windows path keeps its slashes.
+fn shell_command_path(binary: &std::path::Path) -> String {
+    let rendered = binary.to_string_lossy();
+    let normalized = if cfg!(windows) {
+        rendered.replace('\\', "/")
+    } else {
+        rendered.into_owned()
+    };
+    crate::shell::shell_quote(&normalized)
 }
 
 /// Generate the hook configuration JSON (public for testing).
@@ -231,6 +255,65 @@ mod tests {
         assert!(
             cmd.contains("csr-engine"),
             "Python precompact should be replaced"
+        );
+    }
+
+    #[test]
+    fn test_shell_command_path_survives_the_shell() {
+        #[cfg(windows)]
+        {
+            let rendered = shell_command_path(std::path::Path::new(
+                r"D:\Projects\claude-self-reflect\csr-engine.exe",
+            ));
+            assert_eq!(rendered, "D:/Projects/claude-self-reflect/csr-engine.exe");
+            assert!(
+                !rendered.contains('\\'),
+                "a surviving backslash is eaten by the shell and the hook exits 127"
+            );
+        }
+        #[cfg(unix)]
+        {
+            // A backslash is a legal character in a POSIX filename, so it must
+            // reach the shell as itself — which now means inside quotes.
+            let path = r"/opt/we\ird/csr-engine";
+            assert_eq!(
+                shell_command_path(std::path::Path::new(path)),
+                r"'/opt/we\ird/csr-engine'"
+            );
+        }
+    }
+
+    /// Claude Code runs each hook entry through a shell, so a path with a space
+    /// or an apostrophe has to be quoted or every hook exits 127 — while setup
+    /// still reports success.
+    #[test]
+    fn test_hook_commands_quote_awkward_paths_and_leave_plain_ones_bare() {
+        let plain = generate_hook_config("/home/me/.local/bin/csr-engine");
+        assert_eq!(
+            plain["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "/home/me/.local/bin/csr-engine hook stop",
+            "an ordinary path must not grow quotes"
+        );
+
+        let spaced = generate_hook_config(&crate::shell::shell_quote(
+            "/Users/me/CSR Tools/bin/csr-engine",
+        ));
+        assert_eq!(
+            spaced["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "'/Users/me/CSR Tools/bin/csr-engine' hook stop"
+        );
+
+        let quoted = shell_command_path(std::path::Path::new("/tmp/o'brien/CSR Tools/csr-engine"));
+        let config = generate_hook_config(&quoted);
+        assert_eq!(
+            config["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "'/tmp/o'\\''brien/CSR Tools/csr-engine' hook stop"
         );
     }
 

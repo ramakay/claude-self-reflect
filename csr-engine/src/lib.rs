@@ -16,6 +16,7 @@ pub mod provenance;
 pub mod runtime;
 pub mod search;
 pub mod setup;
+pub mod shell;
 pub mod status;
 pub mod storage;
 pub mod summarizer;
