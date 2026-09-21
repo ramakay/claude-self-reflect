@@ -41,7 +41,14 @@ pub async fn handle(
 
     // Step 2: Register as MCP server
     eprintln!("[2/6] Registering MCP server...");
-    register_mcp_server()?;
+    // A registration failure must not cost the user hooks and import, but it
+    // must not be reported as success either: print it here, finish the rest,
+    // and return it at the end so the exit code is non-zero and the installers
+    // take their failure branch.
+    let mcp_error = register_mcp_server().err();
+    if let Some(e) = &mcp_error {
+        eprintln!("  Error: {e}");
+    }
 
     // Step 3: Install hooks
     eprintln!("[3/6] Installing hooks...");
@@ -81,6 +88,18 @@ pub async fn handle(
     let conversations = eng.storage().count_conversations().unwrap_or(0);
     let reflections = eng.storage().count_reflection_embeddings().unwrap_or(0);
     let projects = eng.storage().count_projects().unwrap_or(0);
+
+    if let Some(e) = mcp_error {
+        eprintln!("\n=== Setup Incomplete ===\n");
+        eprintln!("  Conversations: {}", conversations);
+        eprintln!("  Reflections:   {}", reflections);
+        eprintln!("  Projects:      {}", projects);
+        eprintln!();
+        eprintln!("  Hooks and import are done. The MCP server is NOT registered:");
+        eprintln!("  {e}");
+        eprintln!();
+        return Err(e);
+    }
 
     eprintln!("\n=== Setup Complete ===\n");
     eprintln!("  Conversations: {}", conversations);
