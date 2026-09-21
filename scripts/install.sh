@@ -13,7 +13,6 @@
 set -e
 
 REPO="ramakay/claude-self-reflect"
-INSTALL_DIR="${CSR_INSTALL_DIR:-$HOME/.local/bin}"
 BINARY_NAME="csr-engine"
 # How to spell `csr-engine setup` in advice we print. check_shadow replaces this
 # with the absolute path whenever the bare name would resolve to another copy.
@@ -25,6 +24,50 @@ info()  { printf '  \033[1;34m%s\033[0m %s\n' "$1" "$2"; }
 ok()    { printf '  \033[1;32m%s\033[0m %s\n' "$1" "$2"; }
 warn()  { printf '  \033[1;33m%s\033[0m %s\n' "WARNING:" "$1" >&2; }
 err()   { printf '  \033[1;31m%s\033[0m %s\n' "ERROR:" "$1" >&2; exit 1; }
+
+# --- Install directory ---
+
+# Without HOME there is no sane default: the old expansion produced /.local/bin
+# and the config scans read /.claude.json. Ask for a destination instead.
+if [ -n "${CSR_INSTALL_DIR:-}" ]; then
+    INSTALL_DIR="$CSR_INSTALL_DIR"
+elif [ -n "${HOME:-}" ]; then
+    INSTALL_DIR="$HOME/.local/bin"
+else
+    err "HOME is not set. Set CSR_INSTALL_DIR to choose an install directory."
+fi
+
+# Absolute, so every path we print is runnable from anywhere.
+case "$INSTALL_DIR" in
+    /*) ;;
+    *)  INSTALL_DIR="$PWD/$INSTALL_DIR" ;;
+esac
+
+# Quote a path for pasting into a shell, but only when it needs it, so the
+# ordinary hint stays readable. An install directory containing a space would
+# otherwise produce a command that runs only its first word.
+SQ="'"
+shell_quote() {
+    case "$1" in
+        *[!A-Za-z0-9_./-]*) ;;
+        *) printf '%s\n' "$1"; return 0 ;;
+    esac
+    _rest="$1"
+    _out="$SQ"
+    while :; do
+        case "$_rest" in
+            *"$SQ"*)
+                _out="${_out}${_rest%%"$SQ"*}${SQ}\\${SQ}${SQ}"
+                _rest="${_rest#*"$SQ"}"
+                ;;
+            *)
+                _out="${_out}${_rest}${SQ}"
+                break
+                ;;
+        esac
+    done
+    printf '%s\n' "$_out"
+}
 
 # --- Detect platform ---
 
@@ -72,7 +115,8 @@ download_and_install() {
     CHECKSUM_URL="https://github.com/${REPO}/releases/download/${VERSION}/${CHECKSUM_FILE}"
 
     TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "$TMPDIR"' EXIT
+    STAGE=""
+    trap 'rm -rf "$TMPDIR"; [ -n "$STAGE" ] && rm -f "$STAGE"' EXIT
 
     info "Downloading" "${BINARY_NAME} ${VERSION} for ${TARGET}..."
 
@@ -119,8 +163,15 @@ download_and_install() {
         err "Binary not found in archive"
     fi
 
-    cp "$BINARY_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    # Stage inside INSTALL_DIR and rename over the destination. Copying onto it
+    # would follow a symlink or hard link sitting there and overwrite a binary
+    # elsewhere on the system, and an interrupted copy would truncate the
+    # existing executable. Rename is atomic and cannot hit ETXTBSY on Linux.
+    STAGE="${INSTALL_DIR}/.${BINARY_NAME}.$$.tmp"
+    cp "$BINARY_PATH" "$STAGE"
+    chmod +x "$STAGE"
+    mv -f "$STAGE" "${INSTALL_DIR}/${BINARY_NAME}"
+    STAGE=""
 
     ok "Installed" "${INSTALL_DIR}/${BINARY_NAME}"
 }
@@ -183,16 +234,182 @@ resolve_path() {
     fi
 }
 
-# csr-engine paths a Claude Code config file has registered. Deliberately crude
-# (no jq dependency) and fail-open: a missing, unreadable or unexpected file
-# yields nothing, never an error. Only "command" values count: ~/.claude.json
-# also holds project keys and history, and a working directory such as
-# /Users/me/projects/foo/csr-engine is not a binary.
-registered_paths() {
-    [ -r "$1" ] || return 0
-    grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*csr-engine[^"]*"' "$1" 2>/dev/null |
-        sed 's/^"command"[[:space:]]*:[[:space:]]*"//; s/"$//' |
-        awk '{print $1}' | grep '/csr-engine$' | sort -u || true
+# A JSON reader, or nothing. Grep cannot tell the user-scope MCP entry from a
+# project key or a working directory that merely ends in /csr-engine, and it
+# loses paths containing spaces, so abstain rather than guess.
+JSON_READER=""
+pick_json_reader() {
+    if usable_python3; then
+        JSON_READER="python3"
+    elif command -v node >/dev/null 2>&1; then
+        JSON_READER="node"
+    fi
+}
+
+usable_python3() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    # On macOS /usr/bin/python3 is a stub that pops the Xcode Command Line Tools
+    # installer when the tools are absent. Never run it in that state — this is
+    # a `curl | sh` installer. `xcode-select -p` only reports, it never prompts.
+    if [ "$(uname -s)" = "Darwin" ] && [ "$(command -v python3)" = "/usr/bin/python3" ]; then
+        xcode-select -p >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+# Print the raw command strings Claude Code has registered: every hook command
+# ($2 = hooks) or the user-scope MCP server command ($2 = mcp). Bounded and
+# fail-open in both readers — non-regular or oversized files, unreadable files
+# and malformed JSON all yield nothing.
+read_commands() {
+    case "$JSON_READER" in
+        python3)
+            python3 - "$1" "$2" 2>/dev/null <<'PY' || true
+import json, os, sys
+
+path, mode = sys.argv[1], sys.argv[2]
+try:
+    if not os.path.isfile(path) or os.path.getsize(path) > 33554432:
+        sys.exit(0)
+    with open(path, "rb") as fh:
+        data = json.loads(fh.read().decode("utf-8", "replace"))
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+
+out = []
+if mode == "hooks":
+    hooks = data.get("hooks")
+    if isinstance(hooks, dict):
+        for entries in hooks.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                inner = entry.get("hooks") if isinstance(entry, dict) else None
+                for hook in inner if isinstance(inner, list) else []:
+                    command = hook.get("command") if isinstance(hook, dict) else None
+                    if isinstance(command, str):
+                        out.append(command)
+else:
+    servers = data.get("mcpServers")
+    server = servers.get("claude-self-reflect") if isinstance(servers, dict) else None
+    command = server.get("command") if isinstance(server, dict) else None
+    if isinstance(command, str):
+        out.append(command)
+
+for line in out:
+    if "\n" not in line:
+        print(line)
+PY
+            ;;
+        node)
+            node - "$1" "$2" 2>/dev/null <<'JS' || true
+const fs = require("fs");
+const path = process.argv[2];
+const mode = process.argv[3];
+let data;
+try {
+  const stat = fs.statSync(path);
+  if (!stat.isFile() || stat.size > 33554432) process.exit(0);
+  data = JSON.parse(fs.readFileSync(path, "utf8"));
+} catch {
+  process.exit(0);
+}
+if (!data || typeof data !== "object") process.exit(0);
+
+const out = [];
+if (mode === "hooks") {
+  const hooks = data.hooks;
+  if (hooks && typeof hooks === "object") {
+    for (const entries of Object.values(hooks)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        const inner = entry && Array.isArray(entry.hooks) ? entry.hooks : [];
+        for (const hook of inner) {
+          if (hook && typeof hook.command === "string") out.push(hook.command);
+        }
+      }
+    }
+  }
+} else {
+  const servers = data.mcpServers;
+  const server = servers && typeof servers === "object" ? servers["claude-self-reflect"] : null;
+  if (server && typeof server.command === "string") out.push(server.command);
+}
+for (const line of out) if (!line.includes("\n")) console.log(line);
+JS
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+strip_quotes() {
+    case "$1" in
+        "$SQ"*"$SQ") _s="${1#"$SQ"}"; printf '%s\n' "${_s%"$SQ"}" ;;
+        '"'*'"')     _s="${1#\"}"; printf '%s\n' "${_s%\"}" ;;
+        *)           printf '%s\n' "$1" ;;
+    esac
+}
+
+# The executables behind those commands, one per line. Hook commands are always
+# written as `<binary> hook <name>`, so everything before the first " hook " is
+# the executable — splitting on whitespace would lose a path with a space. The
+# MCP command is the whole string.
+registered_executables() {
+    _file="$1"
+    _mode="$2"
+    [ -f "$_file" ] || return 0
+    read_commands "$_file" "$_mode" | while IFS= read -r _cmd; do
+        if [ -z "$_cmd" ]; then
+            continue
+        fi
+        if [ "$_mode" = "hooks" ]; then
+            case "$_cmd" in
+                *" hook "*) _exe="${_cmd%% hook *}" ;;
+                *)          _exe="${_cmd%% *}" ;;
+            esac
+        else
+            _exe="$_cmd"
+        fi
+        _exe="$(strip_quotes "$_exe")"
+        case "$_exe" in
+            /*/"$BINARY_NAME") printf '%s\n' "$_exe" ;;
+            /*)
+                # Any absolute command registered under our own MCP name is
+                # ours to report, whatever it is called.
+                if [ "$_mode" = "mcp" ]; then
+                    printf '%s\n' "$_exe"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Registrations that point somewhere other than the binary we just installed.
+# Sets STALE_HOOKS and STALE_MCP. Read-only and fail-open throughout.
+scan_registrations() {
+    STALE_HOOKS=""
+    STALE_MCP=""
+    [ -n "${HOME:-}" ] || return 0
+
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ "$(resolve_path "$p")" != "$DEST_REAL" ]; then
+            STALE_HOOKS="$p"
+        fi
+    done <<EOF
+$(registered_executables "$HOME/.claude/settings.json" hooks)
+EOF
+
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ "$(resolve_path "$p")" != "$DEST_REAL" ]; then
+            STALE_MCP="$p"
+        fi
+    done <<EOF
+$(registered_executables "$HOME/.claude.json" mcp)
+EOF
 }
 
 # Warn when something other than the binary we just wrote is the one that will
@@ -202,35 +419,25 @@ registered_paths() {
 check_shadow() {
     DEST="${INSTALL_DIR}/${BINARY_NAME}"
     DEST_REAL="$(resolve_path "$DEST")"
+    DEST_QUOTED="$(shell_quote "$DEST")"
     SETUP_CMD="$BINARY_NAME"
 
     SHADOW=""
     ON_PATH="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
     if [ -z "$ON_PATH" ]; then
-        SETUP_CMD="$DEST"
+        SETUP_CMD="$DEST_QUOTED"
     elif [ "$(resolve_path "$ON_PATH")" != "$DEST_REAL" ]; then
         SHADOW="$ON_PATH"
-        SETUP_CMD="$DEST"
+        SETUP_CMD="$DEST_QUOTED"
     fi
 
-    STALE_HOOKS=""
-    for p in $(registered_paths "$HOME/.claude/settings.json"); do
-        if [ "$(resolve_path "$p")" != "$DEST_REAL" ]; then
-            STALE_HOOKS="$p"
-        fi
-    done
-
-    STALE_MCP=""
-    for p in $(registered_paths "$HOME/.claude.json"); do
-        if [ "$(resolve_path "$p")" != "$DEST_REAL" ]; then
-            STALE_MCP="$p"
-        fi
-    done
+    pick_json_reader
+    scan_registrations
 
     if [ -z "$SHADOW" ] && [ -z "$STALE_HOOKS" ] && [ -z "$STALE_MCP" ]; then
         return 0
     fi
-    SETUP_CMD="$DEST"
+    SETUP_CMD="$DEST_QUOTED"
 
     printf '\n  \033[1;33mWARNING: a different csr-engine is still the one in use.\033[0m\n\n'
     printf '  Just installed:  %s\n' "$DEST"
@@ -246,13 +453,11 @@ check_shadow() {
     printf '\n  Nothing outside %s was changed — the other copy was left in place.\n' "$INSTALL_DIR"
 
     if [ -n "$STALE_HOOKS" ] || [ -n "$STALE_MCP" ]; then
+        # One setup run repoints both: the hook merge evicts CSR entries by
+        # command content rather than by path, and register_mcp_server removes
+        # an existing user-scope registration before re-adding it.
         printf '\n  To point Claude Code at the binary just installed:\n\n'
-        if [ -n "$STALE_MCP" ]; then
-            # `claude mcp add` refuses to overwrite an existing entry, so
-            # re-running setup on its own cannot repoint the MCP server.
-            printf '    claude mcp remove claude-self-reflect -s user\n'
-        fi
-        printf '    %s setup\n' "$DEST"
+        printf '    %s setup\n' "$DEST_QUOTED"
         printf '    # Then restart Claude Code\n'
     fi
     if [ -n "$SHADOW" ]; then
@@ -294,7 +499,10 @@ Build from source instead:
         RUN_SETUP=no
     elif [ "${CSR_AUTO_SETUP:-}" = "1" ]; then
         RUN_SETUP=yes
-    elif [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    # `-w /dev/tty` can pass while the process has no controlling terminal, and
+    # the first `> /dev/tty` would then abort the install under `set -e`. Open
+    # it for real in a subshell: a failure there is just a false condition.
+    elif [ -r /dev/tty ] && ( : > /dev/tty ) 2>/dev/null; then
         printf '\n  Setup registers the MCP server, installs 6 Claude Code hooks\n' > /dev/tty
         printf '  into ~/.claude/settings.json, and imports your conversations\n' > /dev/tty
         printf '  from ~/.claude/projects/ into a local index.\n\n' > /dev/tty
@@ -315,6 +523,24 @@ Build from source instead:
     if [ "$RUN_SETUP" = "yes" ]; then
         printf '\n  \033[1mRunning setup...\033[0m\n\n'
         if "${INSTALL_DIR}/${BINARY_NAME}" setup 2>&1; then
+            # Setup exiting 0 is not evidence that the registrations moved.
+            # Re-read them: a hook or MCP entry still naming another binary
+            # means Claude Code keeps launching that one.
+            scan_registrations
+            if [ -n "$STALE_HOOKS" ] || [ -n "$STALE_MCP" ]; then
+                printf '\n  \033[1;33m⚠  Not active yet.\033[0m Setup ran, but Claude Code still points at\n'
+                printf '  another csr-engine:\n\n'
+                if [ -n "$STALE_HOOKS" ]; then
+                    printf '    %s  (Claude Code hooks)\n' "$STALE_HOOKS"
+                fi
+                if [ -n "$STALE_MCP" ]; then
+                    printf '    %s  (MCP server)\n' "$STALE_MCP"
+                fi
+                printf '\n  Register it by hand, then restart Claude Code:\n\n'
+                printf '    claude mcp remove claude-self-reflect -s user\n'
+                printf '    %s setup\n\n' "$SETUP_CMD"
+                exit 1
+            fi
             printf '\n  \033[32m✓\033[0m  Done. Restart Claude Code to activate.\n\n'
         else
             printf '\n  \033[33m⚠\033[0m  Setup encountered errors. Try manually:\n'
