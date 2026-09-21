@@ -5,6 +5,91 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed: setup repoints the MCP registration, and the installers say when a different csr-engine is still in use
+
+- `csr-engine setup` now repoints the user-scope MCP registration. `claude mcp
+  add` has no overwrite flag and exits 1 with "already exists", which setup
+  treated as "claude CLI not found" before falling back to writing `mcpServers`
+  into `~/.claude/settings.json` — a key Claude Code does not read for MCP. An
+  upgrade therefore printed "Setup Complete" while Claude Code kept launching
+  the binary that had just been replaced. Setup now snapshots the whole
+  existing entry out of `~/.claude.json`, removes it, and re-adds it once. If
+  that retry fails, the snapshot is replayed with `claude mcp add-json`, which
+  restores `command`, `args`, `env` and anything else it held. On a Claude Code
+  without `add-json` there is one fallback, and only for stdio entries: it
+  replays the command and its args behind a `--` separator, so arguments like
+  `--serve` reach the server rather than Claude's own option parser, and the
+  message says the env vars were lost. An SSE or HTTP entry, or one this form
+  cannot express, is not guessed at — the error prints its JSON as a ready
+  `claude mcp add-json` command instead. If the snapshot cannot be read,
+  nothing is removed at all.
+- The error states what actually happened to the old entry — left alone, put
+  back exactly, put back without its env, lost, or replaced by something else
+  that claimed the name while setup was running — and gives commands that
+  match: `remove` then `add` whenever an entry is present, `add` alone when
+  none is. If `claude` cannot be run at all, that is now an error too — the old
+  fallback wrote a file Claude Code ignores and reported success.
+- A failed MCP registration no longer costs you hooks and the conversation
+  import: setup finishes those, prints the details once under "Setup
+  Incomplete", and exits non-zero.
+- Hook commands are written with the binary shell-quoted when it contains
+  anything outside `[A-Za-z0-9_./-]`. Claude Code runs each hook entry through
+  a shell, so an install under `CSR Tools` previously produced hooks that tried
+  to run the path up to the first space — every hook exited 127 while setup
+  reported success. Ordinary paths are unchanged.
+- `csr-engine --version` (and `-V`) now exists and prints
+  `csr-engine <version>`. It exits before the database, the HNSW index or the
+  model cache is opened.
+- npm postinstall decides whether to download by probing the destination —
+  `CSR_INSTALL_DIR` or `~/.local/bin` — and nothing else. It previously probed
+  the first `csr-engine` on PATH with a `--version` flag that did not exist, so
+  the "already installed" branch was unreachable and every install
+  re-downloaded the release tarball.
+- postinstall no longer prints `Updating /usr/local/bin/csr-engine...` before
+  writing to a different directory. Messages now name the path being written.
+- Both installers warn when a different csr-engine will still be the one that
+  runs: first on PATH, registered as a Claude Code hook in
+  `~/.claude/settings.json`, or registered as the user-scope MCP server in
+  `~/.claude.json`. They report it and print the remedy — nothing is deleted,
+  edited or elevated, and the exit code stays 0, because keeping another build
+  earlier on PATH is a legitimate choice. postinstall compares paths by
+  realpath, so a symlink to the installed binary is not flagged; `install.sh`
+  does the same where `realpath` or a working `readlink -f` exists and falls
+  back to comparing the strings, which can flag an equivalent symlink.
+- When either installer runs setup on the user's behalf, it re-reads the
+  registrations afterwards and reports "Not active yet" with a non-zero exit
+  instead of "Done" if a hook or MCP entry still names another binary.
+- `install.sh` reads Claude Code's configs with `python3`, else `node`, else
+  skips those checks. The previous `grep` could not tell the user-scope MCP
+  entry from a project key and lost paths containing spaces. Both readers
+  decode a shell-quoted hook path, and both still accept the unquoted form
+  earlier releases wrote.
+- Both installers stage the new binary and rename it over the destination
+  rather than copying onto it, which followed a symlink or hard link there and
+  could overwrite a binary elsewhere on the system — and truncated the existing
+  executable if the copy was interrupted. npm postinstall creates the stage
+  with `O_CREAT|O_EXCL` under a random name and writes through that descriptor;
+  `install.sh` stages inside a private `mktemp -d` directory, because a bare
+  staged file would have to be reopened by name. A destination that is a
+  directory, or a symlink pointing at one, is refused: `mv` would have moved
+  the binary inside it. A symlink pointing at a file is still replaced.
+- Config reads are bounded: one non-blocking open, a regular file only, and at
+  most 32 MiB plus one byte read from that same descriptor, so nothing can grow
+  past the cap or turn into a FIFO between the check and the read.
+- Every command either installer prints for you to paste — the activation hint,
+  the `PATH` line, the recovery commands — is shell-quoted when it needs it,
+  and the activation hint prints the absolute path when a bare `csr-engine`
+  would resolve somewhere else.
+- `claude-self-reflect <command>` now prefers the npm-managed binary over
+  whatever is first on PATH, instead of proxying to a build the upgrade
+  replaced, and requires a regular executable file so a half-written
+  destination does not hide a working fallback.
+- `scripts/install.sh` verifies the new binary with `--version`/`--help`
+  instead of `status`, which opened the user's live database. It also refuses
+  to guess an install directory when `HOME` is unset.
+
 ## [10.1.0] - 2026-08-08
 
 ### Dreaming and recap: memory that forgets on evidence and hands back one paragraph
