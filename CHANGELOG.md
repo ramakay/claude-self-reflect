@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed: installers no longer leave you on the old binary
+### Fixed: setup repoints the MCP registration, and the installers say when a different csr-engine is still in use
 
+- `csr-engine setup` now repoints the user-scope MCP registration. `claude mcp
+  add` has no overwrite flag and exits 1 with "already exists", which setup
+  treated as "claude CLI not found" before falling back to writing `mcpServers`
+  into `~/.claude/settings.json` — a key Claude Code does not read for MCP. An
+  upgrade therefore printed "Setup Complete" while Claude Code kept launching
+  the binary that had just been replaced. Setup now removes the entry and
+  re-adds it once; any other failure is an error naming the two commands to run
+  by hand, instead of a silent no-op.
 - `csr-engine --version` (and `-V`) now exists and prints
   `csr-engine <version>`. It exits before the database, the HNSW index or the
   model cache is opened.
@@ -21,19 +29,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writing to a different directory. Messages now name the path being written.
 - Both installers warn when a different csr-engine will still be the one that
   runs: first on PATH, registered as a Claude Code hook in
-  `~/.claude/settings.json`, or registered as the MCP server in
-  `~/.claude.json`. Paths are compared by realpath, so a symlink to the
-  installed binary is not flagged. The check is read-only and fails open on any
-  unreadable or malformed file; nothing is deleted, edited or elevated, and the
-  exit code stays 0 — keeping another build earlier on PATH is a legitimate
-  choice.
+  `~/.claude/settings.json`, or registered as the user-scope MCP server in
+  `~/.claude.json`. They report it and print the remedy — nothing is deleted,
+  edited or elevated, and the exit code stays 0, because keeping another build
+  earlier on PATH is a legitimate choice. postinstall compares paths by
+  realpath, so a symlink to the installed binary is not flagged; `install.sh`
+  does the same where `realpath` or a working `readlink -f` exists and falls
+  back to comparing the strings, which can flag an equivalent symlink.
+- When either installer runs setup on the user's behalf, it re-reads the
+  registrations afterwards and reports "Not active yet" with a non-zero exit
+  instead of "Done" if a hook or MCP entry still names another binary.
+- `install.sh` reads Claude Code's configs with `python3`, else `node`, else
+  skips those checks. The previous `grep` could not tell the user-scope MCP
+  entry from a project key and lost paths containing spaces.
+- Both installers stage the new binary inside the install directory and rename
+  it over the destination. Copying onto the destination followed a symlink or
+  hard link there, so an upgrade could overwrite a binary elsewhere on the
+  system, and an interrupted copy truncated the existing executable.
+- Config reads are bounded: a regular file only, 32 MiB maximum, non-blocking
+  open. A config path resolving to a FIFO used to hang the install.
 - The activation hint prints the absolute path when a bare `csr-engine` would
-  resolve somewhere else.
+  resolve somewhere else, and shell-quotes it when it contains a space or a
+  shell metacharacter.
 - `claude-self-reflect <command>` now prefers the npm-managed binary over
   whatever is first on PATH, instead of proxying to a build the upgrade
-  replaced.
+  replaced, and requires a regular executable file so a half-written
+  destination does not hide a working fallback.
 - `scripts/install.sh` verifies the new binary with `--version`/`--help`
-  instead of `status`, which opened the user's live database.
+  instead of `status`, which opened the user's live database. It also refuses
+  to guess an install directory when `HOME` is unset.
 
 ## [9.5.7] - 2026-09-20
 
