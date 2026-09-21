@@ -34,13 +34,19 @@ pub fn handle(apply: bool) -> Result<()> {
 /// leaves no trace in hook-timing.log either. Forward slashes are accepted both by
 /// the shell and by Windows itself. On Unix the separators are left alone, since a
 /// backslash there is a legal filename character.
+///
+/// The result is then shell-quoted: an install under `/Users/me/CSR Tools/bin`
+/// would otherwise produce a hook that runs `/Users/me/CSR`, and an apostrophe,
+/// semicolon or `$(...)` in the path would change the command outright. Quoting
+/// happens after the separator fix so a quoted Windows path keeps its slashes.
 fn shell_command_path(binary: &std::path::Path) -> String {
     let rendered = binary.to_string_lossy();
-    if cfg!(windows) {
+    let normalized = if cfg!(windows) {
         rendered.replace('\\', "/")
     } else {
         rendered.into_owned()
-    }
+    };
+    crate::shell::shell_quote(&normalized)
 }
 
 /// Generate the hook configuration JSON (public for testing).
@@ -268,10 +274,47 @@ mod tests {
         #[cfg(unix)]
         {
             // A backslash is a legal character in a POSIX filename, so it must
-            // reach the shell untouched.
+            // reach the shell as itself — which now means inside quotes.
             let path = r"/opt/we\ird/csr-engine";
-            assert_eq!(shell_command_path(std::path::Path::new(path)), path);
+            assert_eq!(
+                shell_command_path(std::path::Path::new(path)),
+                r"'/opt/we\ird/csr-engine'"
+            );
         }
+    }
+
+    /// Claude Code runs each hook entry through a shell, so a path with a space
+    /// or an apostrophe has to be quoted or every hook exits 127 — while setup
+    /// still reports success.
+    #[test]
+    fn test_hook_commands_quote_awkward_paths_and_leave_plain_ones_bare() {
+        let plain = generate_hook_config("/home/me/.local/bin/csr-engine");
+        assert_eq!(
+            plain["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "/home/me/.local/bin/csr-engine hook stop",
+            "an ordinary path must not grow quotes"
+        );
+
+        let spaced = generate_hook_config(&crate::shell::shell_quote(
+            "/Users/me/CSR Tools/bin/csr-engine",
+        ));
+        assert_eq!(
+            spaced["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "'/Users/me/CSR Tools/bin/csr-engine' hook stop"
+        );
+
+        let quoted = shell_command_path(std::path::Path::new("/tmp/o'brien/CSR Tools/csr-engine"));
+        let config = generate_hook_config(&quoted);
+        assert_eq!(
+            config["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            "'/tmp/o'\\''brien/CSR Tools/csr-engine' hook stop"
+        );
     }
 
     #[test]
@@ -343,6 +386,34 @@ mod tests {
         assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
         // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
+    }
+
+    /// The installers tell a user whose hooks point at a different copy of
+    /// csr-engine to re-run `<new binary> setup`, and that advice is only true
+    /// because the merge evicts CSR entries by command content rather than by
+    /// path. If eviction ever became path-sensitive, every upgrade would leave
+    /// the old absolute path installed alongside the new one and the printed
+    /// remedy would be a lie.
+    #[test]
+    fn test_merge_repoints_hooks_at_a_new_absolute_path() {
+        let mut settings: serde_json::Value = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook stop"}]}
+                ]
+            }
+        });
+
+        let new_config = generate_hook_config("/home/me/.local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        let stop = settings["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "repointed, not duplicated");
+        assert_eq!(
+            stop[0]["hooks"][0]["command"].as_str().unwrap(),
+            "/home/me/.local/bin/csr-engine hook stop",
+            "the old absolute path must not survive"
+        );
     }
 
     /// Regression test for the v9.2 agent-hook leak.
