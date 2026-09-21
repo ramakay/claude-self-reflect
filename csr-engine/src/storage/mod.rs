@@ -1093,9 +1093,10 @@ impl Storage {
     pub fn import_paths_for_conversations(
         &self,
         conversation_ids: &[String],
+        max_paths_per_id: usize,
     ) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::import_paths_for_conversations(&conn, conversation_ids)
+        queries::import_paths_for_conversations(&conn, conversation_ids, max_paths_per_id)
     }
 
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,

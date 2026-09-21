@@ -1698,13 +1698,17 @@ pub(crate) fn mark_file_imported_with_suppression(
     Ok(())
 }
 
-/// Every `import_state.file_path` recorded for each of `conversation_ids`.
-/// An id with no row is absent from the map. The id is a transcript file stem,
-/// which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`), so one id
-/// can carry several paths and the caller has to account for all of them.
+/// The `import_state.file_path` rows recorded for each of `conversation_ids`,
+/// for ids that have at most `max_paths_per_id` of them. An id with no row, or
+/// with more rows than that, is absent from the map. The id is a transcript
+/// file stem, which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`):
+/// one id can carry several paths and the caller has to account for all of
+/// them, while a stem shared by thousands of files must not cost a prompt
+/// thousands of rows. The count runs on the conversation_id index alone.
 pub fn import_paths_for_conversations(
     conn: &Connection,
     conversation_ids: &[String],
+    max_paths_per_id: usize,
 ) -> Result<HashMap<String, Vec<String>>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     if conversation_ids.is_empty() {
@@ -1713,7 +1717,11 @@ pub fn import_paths_for_conversations(
     let placeholders = vec!["?"; conversation_ids.len()].join(",");
     let sql = format!(
         "SELECT conversation_id, file_path FROM import_state
-         WHERE conversation_id IN ({placeholders}) ORDER BY file_path"
+         WHERE conversation_id IN (
+             SELECT conversation_id FROM import_state
+             WHERE conversation_id IN ({placeholders})
+             GROUP BY conversation_id HAVING COUNT(*) <= {max_paths_per_id})
+         ORDER BY file_path"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(conversation_ids.iter()), |row| {
