@@ -100,36 +100,101 @@ pub async fn handle(
     Ok(())
 }
 
+/// The MCP server name we own in Claude Code's user-scope config.
+const MCP_SERVER_NAME: &str = "claude-self-reflect";
+
+/// What a failed `claude mcp add` means.
+#[derive(Debug, PartialEq, Eq)]
+enum AddFailure {
+    /// The name is already taken — by an older copy of this binary at a
+    /// different absolute path, typically after an npm or install.sh upgrade.
+    /// `claude mcp add` has no overwrite flag, so the entry must be removed
+    /// before the new command can be registered.
+    AlreadyRegistered,
+    /// Anything else. Reported, never papered over.
+    Fatal,
+}
+
+fn classify_add_failure(stderr: &str) -> AddFailure {
+    if stderr.to_lowercase().contains("already exists") {
+        AddFailure::AlreadyRegistered
+    } else {
+        AddFailure::Fatal
+    }
+}
+
+fn mcp_add(binary_str: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("claude")
+        .args(["mcp", "add", MCP_SERVER_NAME, binary_str, "-s", "user"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+}
+
+fn mcp_registration_error(binary_str: &str, stderr: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "could not register the MCP server: {}\n  Run these yourself, then restart Claude Code:\n    claude mcp remove {} -s user\n    claude mcp add {} {} -s user",
+        stderr.trim(),
+        MCP_SERVER_NAME,
+        MCP_SERVER_NAME,
+        binary_str
+    )
+}
+
 /// Register csr-engine as an MCP server with Claude Code.
-/// Tries `claude mcp add` first, falls back to direct settings.json write.
+///
+/// An upgrade installs a new binary at a new absolute path while the user-scope
+/// registration still names the old one, and `claude mcp add` refuses to
+/// overwrite it. Failing quietly there is how setup used to print "Setup
+/// Complete" while Claude Code kept launching the binary that was just
+/// replaced — the `write_mcp_config` fallback below writes `mcpServers` into
+/// ~/.claude/settings.json, which Claude Code does not read for MCP at all.
+/// So: remove-then-add once, and surface anything else as an error.
 fn register_mcp_server() -> Result<()> {
     let binary_path = std::env::current_exe()?;
     let binary_str = binary_path.to_string_lossy().to_string();
 
-    // Try `claude mcp add` first
-    let result = std::process::Command::new("claude")
-        .args([
-            "mcp",
-            "add",
-            "claude-self-reflect",
-            &binary_str,
-            "-s",
-            "user",
-        ])
+    let output = match mcp_add(&binary_str) {
+        Ok(output) => output,
+        Err(_) => {
+            // The `claude` binary could not be spawned at all — the one case
+            // the direct-write fallback still covers.
+            eprintln!("  `claude` CLI not found, writing MCP config directly...");
+            return write_mcp_config(&binary_str);
+        }
+    };
+
+    if output.status.success() {
+        eprintln!("  Registered via `claude mcp add`");
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if classify_add_failure(&stderr) == AddFailure::Fatal {
+        return Err(mcp_registration_error(&binary_str, &stderr));
+    }
+
+    eprintln!("  Existing registration found — repointing it at {binary_str}");
+    let removed = std::process::Command::new("claude")
+        .args(["mcp", "remove", MCP_SERVER_NAME, "-s", "user"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output();
+    if let Err(e) = removed {
+        return Err(mcp_registration_error(&binary_str, &e.to_string()));
+    }
 
-    match result {
-        Ok(output) if output.status.success() => {
+    // Exactly one retry: a second failure is a real problem, not a race.
+    match mcp_add(&binary_str) {
+        Ok(retry) if retry.status.success() => {
             eprintln!("  Registered via `claude mcp add`");
             Ok(())
         }
-        _ => {
-            // Fallback: write directly to settings.json
-            eprintln!("  `claude` CLI not found, writing MCP config directly...");
-            write_mcp_config(&binary_str)
-        }
+        Ok(retry) => Err(mcp_registration_error(
+            &binary_str,
+            &String::from_utf8_lossy(&retry.stderr),
+        )),
+        Err(e) => Err(mcp_registration_error(&binary_str, &e.to_string())),
     }
 }
 
@@ -247,5 +312,53 @@ mod tests {
     fn test_count_total_files_nonexistent() {
         let count = count_total_files(Path::new("/tmp/nonexistent-csr-setup-test"));
         assert_eq!(count, 0);
+    }
+
+    /// The exact stderr Claude Code 2.1.x emits when the name is taken. Only
+    /// this case earns a remove-then-retry; everything else has to surface.
+    #[test]
+    fn test_classify_add_failure_already_exists() {
+        assert_eq!(
+            classify_add_failure("MCP server claude-self-reflect already exists in user config"),
+            AddFailure::AlreadyRegistered
+        );
+        assert_eq!(
+            classify_add_failure("  MCP server ALREADY EXISTS in user config\n"),
+            AddFailure::AlreadyRegistered
+        );
+    }
+
+    #[test]
+    fn test_classify_add_failure_anything_else_is_fatal() {
+        for stderr in [
+            "",
+            "error: unknown option '-s'",
+            "EACCES: permission denied, open '/Users/me/.claude.json'",
+            "Invalid transport type",
+        ] {
+            assert_eq!(
+                classify_add_failure(stderr),
+                AddFailure::Fatal,
+                "{stderr:?} must not trigger a remove"
+            );
+        }
+    }
+
+    /// The error a user sees has to contain both commands, with the real
+    /// binary path — it is the only way out when the retry also fails.
+    #[test]
+    fn test_mcp_registration_error_names_both_commands() {
+        let msg = mcp_registration_error("/home/me/.local/bin/csr-engine", "boom").to_string();
+        assert!(
+            msg.contains("claude mcp remove claude-self-reflect -s user"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "claude mcp add claude-self-reflect /home/me/.local/bin/csr-engine -s user"
+            ),
+            "{msg}"
+        );
+        assert!(msg.contains("boom"), "{msg}");
     }
 }
