@@ -20,22 +20,28 @@ const commands = {
   help: 'Show this help message'
 };
 
-/** Find the csr-engine binary. Checks common install locations. */
+/**
+ * Find the csr-engine binary.
+ *
+ * The package-managed copy comes first: this CLI ships pinned to an npm
+ * release, and preferring whatever is first on PATH means
+ * `claude-self-reflect setup` silently proxies to the older build the upgrade
+ * was meant to replace. PATH and /usr/local/bin stay as fallbacks for installs
+ * done through install.sh or by hand.
+ */
 function findBinary() {
   const installDir = process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin');
-  const candidates = [
-    join(installDir, 'csr-engine'),
-    '/usr/local/bin/csr-engine',
-  ];
+  const candidates = [join(installDir, 'csr-engine')];
 
-  // Also check PATH
   try {
     const which = execFileSync('which', ['csr-engine'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-    if (which) candidates.unshift(which);
+    if (which) candidates.push(which);
   } catch {}
+
+  candidates.push('/usr/local/bin/csr-engine');
 
   for (const p of candidates) {
     if (existsSync(p)) return p;
