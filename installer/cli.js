@@ -8,10 +8,10 @@
  */
 
 import { spawn, execFileSync } from 'child_process';
-import { existsSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
+import { findEngineBinary, whichBinary } from './lib.js';
 
 const commands = {
   setup: 'Import conversations, register MCP server, install hooks',
@@ -30,23 +30,8 @@ const commands = {
  * done through install.sh or by hand.
  */
 function findBinary() {
-  const installDir = process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin');
-  const candidates = [join(installDir, 'csr-engine')];
-
-  try {
-    const which = execFileSync('which', ['csr-engine'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (which) candidates.push(which);
-  } catch {}
-
-  candidates.push('/usr/local/bin/csr-engine');
-
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
+  const installDir = resolve(process.env.CSR_INSTALL_DIR || join(homedir(), '.local', 'bin'));
+  return findEngineBinary({ installDir, pathBinary: whichBinary() });
 }
 
 function runEngine(args) {
