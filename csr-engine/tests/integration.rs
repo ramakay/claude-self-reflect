@@ -1832,3 +1832,43 @@ mod codegraph_roundtrip {
         );
     }
 }
+
+// ─── `csr-engine --version`: the one probe an installer may run ───
+
+/// The npm postinstall and install.sh decide whether an already present binary
+/// is this release by running `--version` against it. That probe has to be free
+/// of side effects: no database, no HNSW index, no model cache, nothing created
+/// under HOME. Anything heavier would have a package manager opening the user's
+/// live data.
+#[test]
+fn test_version_flag_is_side_effect_free() {
+    for flag in ["--version", "-V"] {
+        let home = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .arg(flag)
+            .env("HOME", home.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "`csr-engine {flag}` exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("csr-engine {}", env!("CARGO_PKG_VERSION")),
+            "installers parse this exact line"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "`csr-engine {flag}` wrote into HOME: {leftovers:?}"
+        );
+    }
+}
