@@ -5,7 +5,7 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [9.5.8] - 2026-09-21
 
 ### Fixed: setup repoints the MCP registration, and the installers say when a different csr-engine is still in use
 
