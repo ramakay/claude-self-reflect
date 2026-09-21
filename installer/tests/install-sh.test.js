@@ -193,6 +193,40 @@ describe('install.sh: staging the binary', { skip: !HAVE_SH && 'no /bin/sh' }, (
     assert.deepEqual(stageLeftovers(dirs.installdir), []);
   });
 
+  test('a destination symlinked to an outside directory is refused', () => {
+    const { dirs } = buildRelease();
+    // `mv file symlink-to-directory` follows the link and drops the file inside
+    // that directory, which is how the binary would land outside INSTALL_DIR.
+    const outsideDir = join(dirs.outside, 'somewhere-else');
+    mkdirSync(outsideDir);
+    symlinkSync(outsideDir, join(dirs.installdir, 'csr-engine'));
+
+    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1' } });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /is a directory \(or a link to one\)/);
+    assert.deepEqual(readdirSync(outsideDir), [], 'nothing was written outside INSTALL_DIR');
+    assert.equal(
+      lstatSync(join(dirs.installdir, 'csr-engine')).isSymbolicLink(),
+      true,
+      'the link is left alone, not replaced'
+    );
+    assert.deepEqual(stageLeftovers(dirs.installdir), [], 'no staging directory left');
+  });
+
+  test('a destination symlinked to an outside file is still replaced', () => {
+    const { dirs } = buildRelease();
+    const outside = join(dirs.outside, 'other-install');
+    writeFileSync(outside, 'ORIGINAL OTHER INSTALL');
+    symlinkSync(outside, join(dirs.installdir, 'csr-engine'));
+
+    const result = runInstall({ dirs, extraEnv: { CSR_SKIP_SETUP: '1' } });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(outside, 'utf8'), 'ORIGINAL OTHER INSTALL');
+    assert.equal(lstatSync(join(dirs.installdir, 'csr-engine')).isSymbolicLink(), false);
+  });
+
   test('an install directory containing a space produces quoted, pasteable hints', () => {
     const { root, dirs } = buildRelease();
     const spaced = join(root, 'CSR Tools', 'bin');
@@ -268,6 +302,11 @@ describe('install.sh: config readers', { skip: !HAVE_SH && 'no /bin/sh' }, () =>
           PreCompact: [{ hooks: [{ type: 'command', command: QUOTED_COMMAND }] }],
           SessionStart: [{ hooks: [{ type: 'command', command: 'csr-engine hook session-start' }] }],
           Other: [{ hooks: [{ type: 'command', command: '/usr/bin/env node /some/other.js' }] }],
+          // The shell runs /opt/suffixed-csr-enginejunk here, so decoding the
+          // quoted part as ours would invent a registration nobody has.
+          Suffixed: [
+            { hooks: [{ type: 'command', command: "'/opt/suffixed/csr-engine'junk hook stop" }] },
+          ],
         },
       })
     );
@@ -321,6 +360,7 @@ describe('install.sh: config readers', { skip: !HAVE_SH && 'no /bin/sh' }, () =>
       assert.deepEqual(mcpLines, ['/opt/mcp/csr-engine']);
       assert.ok(!result.stdout.includes('/decoy/csr-engine'), 'project scope is not ours');
       assert.ok(!result.stdout.includes('/Users/me/projects/foo'), 'a project key is not a binary');
+      assert.ok(!result.stdout.includes('/opt/suffixed'), 'a quoted word plus junk is not ours');
     });
   }
 

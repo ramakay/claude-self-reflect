@@ -258,7 +258,8 @@ function stripQuotes(value) {
 /**
  * Decode a leading POSIX single-quoted word, which is what setup now writes.
  * Inside single quotes everything is literal, and a literal apostrophe appears
- * as `'\''` — close, escaped quote, reopen. Returns null when unterminated.
+ * as `'\''` — close, escaped quote, reopen. Returns the decoded word and
+ * whatever followed the closing quote, or null when unterminated.
  */
 function decodeSingleQuoted(command) {
   let out = '';
@@ -271,7 +272,7 @@ function decodeSingleQuoted(command) {
       out += "'";
       i += 4;
     } else {
-      return out;
+      return { executable: out, rest: command.slice(i + 1) };
     }
   }
   return null;
@@ -297,8 +298,13 @@ function hookBinary(command) {
 
   let executable;
   if (trimmed.startsWith("'")) {
-    executable = decodeSingleQuoted(trimmed);
-    if (executable === null) return null;
+    const decoded = decodeSingleQuoted(trimmed);
+    if (decoded === null) return null;
+    // A quoted word has to end the word: `'/opt/csr-engine'junk hook stop` runs
+    // /opt/csr-enginejunk, not /opt/csr-engine, so decoding it as ours would
+    // invent a stale registration that does not exist.
+    if (decoded.rest !== '' && !decoded.rest.startsWith(' hook ')) return null;
+    executable = decoded.executable;
   } else {
     const marker = trimmed.indexOf(' hook ');
     const raw = marker === -1 ? trimmed.split(/\s+/)[0] : trimmed.slice(0, marker);
