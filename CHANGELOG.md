@@ -14,10 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   treated as "claude CLI not found" before falling back to writing `mcpServers`
   into `~/.claude/settings.json` — a key Claude Code does not read for MCP. An
   upgrade therefore printed "Setup Complete" while Claude Code kept launching
-  the binary that had just been replaced. Setup now removes the entry and
-  re-adds it once. If that retry fails, the previous registration is put back;
-  the error says whether it was. If `claude` cannot be run at all, that is now
-  an error too — the old fallback wrote a file Claude Code ignores and reported
+  the binary that had just been replaced. Setup now snapshots the whole
+  existing entry out of `~/.claude.json`, removes it, and re-adds it once. If
+  that retry fails, the snapshot is replayed with `claude mcp add-json`, which
+  restores `command`, `args`, `env` and anything else it held; on a Claude Code
+  without `add-json` the fallback replays only the command and args, and the
+  message says the env vars were lost. If the snapshot cannot be read, nothing
+  is removed. The error always states which of those happened, and gives
+  commands that match — `remove` then `add` while an entry is still present,
+  `add` alone when none is. If `claude` cannot be run at all, that is now an
+  error too — the old fallback wrote a file Claude Code ignores and reported
   success.
 - A failed MCP registration no longer costs you hooks and the conversation
   import: setup finishes those, prints the details once under "Setup
@@ -54,16 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry from a project key and lost paths containing spaces. Both readers
   decode a shell-quoted hook path, and both still accept the unquoted form
   earlier releases wrote.
-- Both installers stage the new binary under a name they create exclusively
-  inside the install directory, then rename it over the destination. Copying
-  onto the destination followed a symlink or hard link there, so an upgrade
-  could overwrite a binary elsewhere on the system; a predictable staging name
-  could be pre-planted with a symlink to the same effect; and an interrupted
-  copy truncated the existing executable. A directory at the destination is
-  refused rather than moved into.
-- Config reads are bounded: one non-blocking open, a regular file only, 32 MiB
-  maximum, and at most that many bytes read from the descriptor that was
-  checked. A config path resolving to a FIFO used to hang the install.
+- Both installers stage the new binary and rename it over the destination
+  rather than copying onto it, which followed a symlink or hard link there and
+  could overwrite a binary elsewhere on the system — and truncated the existing
+  executable if the copy was interrupted. npm postinstall creates the stage
+  with `O_CREAT|O_EXCL` under a random name and writes through that descriptor;
+  `install.sh` stages inside a private `mktemp -d` directory, because a bare
+  staged file would have to be reopened by name. A destination that is a
+  directory, or a symlink pointing at one, is refused: `mv` would have moved
+  the binary inside it. A symlink pointing at a file is still replaced.
+- Config reads are bounded: one non-blocking open, a regular file only, and at
+  most 32 MiB plus one byte read from that same descriptor, so nothing can grow
+  past the cap or turn into a FIFO between the check and the read.
 - Every command either installer prints for you to paste — the activation hint,
   the `PATH` line, the recovery commands — is shell-quoted when it needs it,
   and the activation hint prints the absolute path when a bare `csr-engine`
