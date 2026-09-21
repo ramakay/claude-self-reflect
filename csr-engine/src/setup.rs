@@ -480,8 +480,11 @@ fn run_claude(args: &[String]) -> ClaudeOutcome {
 /// command, and without it an ordinary `args: ["--serve"]` is parsed as a flag
 /// to `claude` itself and the restore fails with the entry already deleted.
 fn legacy_restore_args(previous: &serde_json::Value) -> Option<Vec<String>> {
-    match previous.get("type").and_then(|t| t.as_str()) {
-        None | Some("stdio") => {}
+    // A missing field is the historical stdio shape; a present field of the
+    // wrong type is an entry this form cannot express, not one to guess at.
+    match previous.get("type") {
+        None => {}
+        Some(t) if t.as_str() == Some("stdio") => {}
         Some(_) => return None,
     }
     let command = previous.get("command")?.as_str()?.to_string();
@@ -495,8 +498,8 @@ fn legacy_restore_args(previous: &serde_json::Value) -> Option<Vec<String>> {
         "--".to_string(),
         command,
     ];
-    if let Some(extra) = previous.get("args").and_then(|a| a.as_array()) {
-        for value in extra {
+    if let Some(extra) = previous.get("args") {
+        for value in extra.as_array()? {
             // A non-string argument cannot be replayed on a command line, so
             // the whole fallback is off rather than silently lossy.
             args.push(value.as_str()?.to_string());
@@ -929,6 +932,12 @@ mod tests {
             serde_json::json!({"type": "stdio"}),
             serde_json::json!({"type": "stdio", "command": 7}),
             serde_json::json!({"type": "stdio", "command": "/old/csr-engine", "args": [7]}),
+            // Present but malformed fields are not "absent": a hand-edited
+            // `"args": "--serve"` must not be restored as a bare command.
+            serde_json::json!({"type": "stdio", "command": "/old/csr-engine", "args": "--serve"}),
+            serde_json::json!({"type": "stdio", "command": "/old/csr-engine", "args": {"a": 1}}),
+            serde_json::json!({"type": 5, "command": "/old/csr-engine"}),
+            serde_json::json!({"type": null, "command": "/old/csr-engine"}),
         ] {
             assert_eq!(legacy_restore_args(&entry), None, "{entry}");
         }
