@@ -6,7 +6,14 @@ use tracing_subscriber::EnvFilter;
 use csr_engine::engine;
 
 #[derive(Parser, Debug)]
-#[command(name = "csr-engine", about = "Claude Self-Reflect Rust Engine")]
+// `version` is load-bearing for the installers: they decide whether an already
+// present binary is this release by running `csr-engine --version` and nothing
+// else. Every other subcommand opens the user's live database.
+#[command(
+    name = "csr-engine",
+    version,
+    about = "Claude Self-Reflect Rust Engine"
+)]
 struct Args {
     /// SQLite database path
     #[arg(long, default_value_os_t = default_db_path(), global = true)]
