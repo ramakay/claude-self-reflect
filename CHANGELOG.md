@@ -15,8 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `~/.claude/settings.json` — a key Claude Code does not read for MCP. An
   upgrade therefore printed "Setup Complete" while Claude Code kept launching
   the binary that had just been replaced. Setup now removes the entry and
-  re-adds it once; any other failure is an error naming the two commands to run
-  by hand, instead of a silent no-op.
+  re-adds it once. If that retry fails, the previous registration is put back;
+  the error says whether it was. If `claude` cannot be run at all, that is now
+  an error too — the old fallback wrote a file Claude Code ignores and reported
+  success.
+- A failed MCP registration no longer costs you hooks and the conversation
+  import: setup finishes those, prints the details once under "Setup
+  Incomplete", and exits non-zero.
+- Hook commands are written with the binary shell-quoted when it contains
+  anything outside `[A-Za-z0-9_./-]`. Claude Code runs each hook entry through
+  a shell, so an install under `CSR Tools` previously produced hooks that tried
+  to run the path up to the first space — every hook exited 127 while setup
+  reported success. Ordinary paths are unchanged.
 - `csr-engine --version` (and `-V`) now exists and prints
   `csr-engine <version>`. It exits before the database, the HNSW index or the
   model cache is opened.
@@ -41,16 +51,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of "Done" if a hook or MCP entry still names another binary.
 - `install.sh` reads Claude Code's configs with `python3`, else `node`, else
   skips those checks. The previous `grep` could not tell the user-scope MCP
-  entry from a project key and lost paths containing spaces.
-- Both installers stage the new binary inside the install directory and rename
-  it over the destination. Copying onto the destination followed a symlink or
-  hard link there, so an upgrade could overwrite a binary elsewhere on the
-  system, and an interrupted copy truncated the existing executable.
-- Config reads are bounded: a regular file only, 32 MiB maximum, non-blocking
-  open. A config path resolving to a FIFO used to hang the install.
-- The activation hint prints the absolute path when a bare `csr-engine` would
-  resolve somewhere else, and shell-quotes it when it contains a space or a
-  shell metacharacter.
+  entry from a project key and lost paths containing spaces. Both readers
+  decode a shell-quoted hook path, and both still accept the unquoted form
+  earlier releases wrote.
+- Both installers stage the new binary under a name they create exclusively
+  inside the install directory, then rename it over the destination. Copying
+  onto the destination followed a symlink or hard link there, so an upgrade
+  could overwrite a binary elsewhere on the system; a predictable staging name
+  could be pre-planted with a symlink to the same effect; and an interrupted
+  copy truncated the existing executable. A directory at the destination is
+  refused rather than moved into.
+- Config reads are bounded: one non-blocking open, a regular file only, 32 MiB
+  maximum, and at most that many bytes read from the descriptor that was
+  checked. A config path resolving to a FIFO used to hang the install.
+- Every command either installer prints for you to paste — the activation hint,
+  the `PATH` line, the recovery commands — is shell-quoted when it needs it,
+  and the activation hint prints the absolute path when a bare `csr-engine`
+  would resolve somewhere else.
 - `claude-self-reflect <command>` now prefers the npm-managed binary over
   whatever is first on PATH, instead of proxying to a build the upgrade
   replaced, and requires a regular executable file so a half-written
