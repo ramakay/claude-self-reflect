@@ -797,6 +797,20 @@ async fn run() -> Result<()> {
 
     if let Some(Commands::RebuildIndex) = args.command {
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if eng.index_freshly_rebuilt() {
+            // Engine::new's own cache-miss path already streamed a fresh,
+            // compact index from SQLite and dumped it — the exact case an
+            // operator running this command most needs to be fast in (first
+            // run, or a corrupt manifest). Calling rebuild_search_index()
+            // again here would be a second, fully redundant ~11-min pass
+            // over the same corpus.
+            let (chunks, reflections) = (
+                eng.storage().count_chunk_embeddings().unwrap_or(0),
+                eng.storage().count_reflection_embeddings().unwrap_or(0),
+            );
+            println!("rebuilt index: {chunks} chunks, {reflections} reflections");
+            return Ok(());
+        }
         let (chunks, reflections) = eng.rebuild_search_index().await?;
         println!("rebuilt index: {chunks} chunks, {reflections} reflections");
         return Ok(());

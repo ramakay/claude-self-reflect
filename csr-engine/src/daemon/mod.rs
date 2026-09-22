@@ -612,11 +612,20 @@ impl Daemon {
         // handling). The daemon is where that deferred work actually runs, out
         // of the request path.
         let compaction_handle = {
-            let engine = Arc::new(crate::engine::Engine::from_parts(
+            // The daemon's real index directory (`self.index_dir`, next to
+            // the database) is independent of `self.projects_dir`
+            // (`~/.claude/projects`). `Engine::from_parts` derives
+            // `index_dir` as `projects_dir.join("index")`, which resolves
+            // to the wrong place here — use the explicit-index-dir
+            // constructor so this engine's `rebuild_search_index`/
+            // `dump_to_disk`/`clear_needs_compaction` all act on the same
+            // directory the marker check below reads.
+            let engine = Arc::new(crate::engine::Engine::from_parts_with_index_dir(
                 self.storage.clone(),
                 self.embeddings.clone(),
                 self.search.clone(),
                 self.projects_dir.clone(),
+                self.index_dir.clone(),
             ));
             let index_dir = self.index_dir.clone();
             let shutdown = shutdown.clone();
@@ -637,13 +646,41 @@ impl Daemon {
                         Err(_) => return,
                     };
                     tracing::info!("needs_compaction marker found — rebuilding HNSW index");
-                    match engine.rebuild_search_index().await {
-                        Ok((chunks, reflections)) => tracing::info!(
-                            chunks,
-                            reflections,
-                            "compaction rebuild complete, needs_compaction cleared"
-                        ),
-                        Err(e) => tracing::warn!(error = %e, "compaction rebuild failed"),
+                    // The streaming rebuild takes ~11 min on the real corpus
+                    // and does not check the shutdown flag mid-stream
+                    // (hnsw insert has no cancellation point). Race it
+                    // against shutdown rather than awaiting it
+                    // unconditionally: if shutdown wins, abandon this
+                    // rebuild without swapping `self.search` or touching
+                    // the marker — the on-disk generation stays exactly as
+                    // valid as it was before compaction started (tombstoned
+                    // but still fully reconciled), and the loop returns
+                    // immediately so the daemon's shutdown sequence does not
+                    // hang for the rebuild's remaining wall time. The
+                    // detached `spawn_blocking` thread inside
+                    // `rebuild_search_index` keeps running to completion in
+                    // the background regardless — nothing awaits its result
+                    // once this select arm is dropped, so it can neither
+                    // swap the index nor race the final shutdown flush.
+                    tokio::select! {
+                        result = engine.rebuild_search_index() => {
+                            match result {
+                                Ok((chunks, reflections)) => tracing::info!(
+                                    chunks,
+                                    reflections,
+                                    "compaction rebuild complete, needs_compaction cleared"
+                                ),
+                                Err(e) => tracing::warn!(error = %e, "compaction rebuild failed"),
+                            }
+                        }
+                        _ = wait_for_shutdown(&shutdown) => {
+                            tracing::info!(
+                                "compaction rebuild abandoned — shutdown requested, \
+                                 needs_compaction marker left in place for the next daemon start"
+                            );
+                            drop(permit);
+                            return;
+                        }
                     }
                     drop(permit);
                 }
@@ -710,9 +747,13 @@ impl Daemon {
         // transactionally. Await it so shutdown cannot detach a half-harvested
         // training attempt.
         let _ = trained_rerank_handle.await;
-        // Same index-mutation contract as plans/codex_rollout: a rebuild in
-        // flight swaps `self.search` and dumps it, so a detach could race the
-        // shutdown flush below. Await it fully rather than time it out.
+        // The loop itself races an in-flight rebuild against the shutdown
+        // flag (see the compaction loop above) and returns within one
+        // `wait_for_shutdown` poll interval (~200ms) if shutdown wins
+        // without ever swapping `self.search` — so awaiting it fully here
+        // cannot hang for the rebuild's remaining wall time, and (unlike a
+        // `tokio::time::timeout`) never risks detaching a task that is
+        // mid-swap/mid-dump.
         let _ = compaction_handle.await;
         // The journal server stops on the same flag (its graceful-shutdown
         // future polls it). Bounded by the shared timeout: an in-flight
@@ -736,6 +777,15 @@ impl Daemon {
 
         tracing::info!("daemon stopped");
         Ok(())
+    }
+}
+
+/// Resolves once the shutdown flag is set. Used to race a bounded-duration
+/// background task (e.g. the compaction rebuild) against graceful shutdown
+/// without polling the flag inline in the task itself.
+async fn wait_for_shutdown(shutdown: &AtomicBool) {
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 }
 
@@ -1692,6 +1742,84 @@ mod tests {
         std::env::set_var("CSR_NO_PROVENANCE_BACKFILL", "0");
         assert!(!provenance_backfill_disabled());
         std::env::remove_var("CSR_NO_PROVENANCE_BACKFILL");
+    }
+
+    // --- WP-D follow-up: compaction engine must use the daemon's real
+    // index_dir, not one derived from projects_dir ---
+
+    #[tokio::test]
+    async fn compaction_engine_writes_to_the_daemons_real_index_dir() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Deliberately NOT index_dir.parent() — mirrors the real daemon,
+        // whose projects_dir is `~/.claude/projects` and whose index_dir is
+        // `~/.claude-self-reflect/index`, two unrelated directories.
+        let projects_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("real_index");
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        for i in 0..10 {
+            storage
+                .insert_chunk(
+                    &ConversationChunk {
+                        id: format!("chunk-{i}"),
+                        conversation_id: "conv".into(),
+                        project_name: "proj".into(),
+                        timestamp: "2026-09-22T00:00:00Z".into(),
+                        content: "x".into(),
+                        message_count: 1,
+                        summary: None,
+                        author: Speaker::User,
+                        seq: 0,
+                        is_sidechain: false,
+                    },
+                    &vec![0.1_f32; EmbeddingEngine::dimension()],
+                )
+                .unwrap();
+        }
+
+        // Seed a persisted cache under the real index_dir, as a prior
+        // foreground `Engine::new` would have left it, and mark it as
+        // needing compaction (the `orphans_material` path).
+        let mut search = SearchEngine::new(64);
+        for i in 0..10 {
+            search.insert_chunk(
+                format!("chunk-{i}"),
+                vec![0.1_f32; EmbeddingEngine::dimension()],
+            );
+        }
+        search.dump_to_disk(&index_dir, 10, 0).unwrap();
+        crate::search::mark_needs_compaction(&index_dir);
+        assert!(crate::search::needs_compaction(&index_dir));
+
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search_arc = Arc::new(RwLock::new(search));
+        // Exactly what the daemon's compaction loop constructs.
+        let engine = crate::engine::Engine::from_parts_with_index_dir(
+            storage.clone(),
+            embeddings,
+            search_arc,
+            projects_dir.clone(),
+            index_dir.clone(),
+        );
+
+        let (chunks, _reflections) = engine.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks, 10);
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "the marker in the real index_dir must be cleared"
+        );
+        assert!(
+            index_dir.join("manifest.json").exists(),
+            "manifest.json in the real index_dir must be rewritten"
+        );
+        assert!(
+            !projects_dir.join("index").exists(),
+            "nothing must be written under projects_dir/index — from_parts's wrong derivation"
+        );
     }
 
     fn provenance_test_rig() -> (

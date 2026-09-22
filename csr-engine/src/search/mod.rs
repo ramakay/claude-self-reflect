@@ -96,6 +96,11 @@ const EXACT_SCAN_THRESHOLD: usize = 256;
 /// query cost when the live share of the index is tiny.
 const TOMBSTONE_OVERFETCH_CAP: usize = 20;
 
+/// Multiplier `search_index` scales `fetch_limit` by each time it escalates
+/// past tombstones, instead of jumping straight to the full index. Bounds
+/// escalation to O(log) steps while keeping each step's HNSW query cheap.
+const SEARCH_ESCALATION_FACTOR: usize = 4;
+
 /// Filename of the marker written under the index directory when a foreground
 /// process (`Engine::new` in an MCP server, hook, or CLI query command) finds
 /// the loaded HNSW cache materially tombstoned but defers the full rebuild
@@ -287,6 +292,36 @@ impl SearchEngine {
         blanked
     }
 
+    /// Total chunk id-map slots (live + blanked/tombstoned). O(1).
+    pub fn chunk_slot_count(&self) -> usize {
+        self.chunk_id_map.len()
+    }
+
+    /// Total reflection id-map slots (live + blanked/tombstoned). O(1).
+    pub fn reflection_slot_count(&self) -> usize {
+        self.reflection_id_map.len()
+    }
+
+    /// Cumulative count of blanked ("tombstoned") chunk slots — every id
+    /// ever removed from the DB while still occupying a neighbour position
+    /// in the HNSW graph (hnsw_rs cannot delete), not just the ones blanked
+    /// during this process's most recent reconciliation pass. O(1): both
+    /// `chunk_id_map` (every slot ever inserted) and `chunk_id_set` (live
+    /// ids only) are already maintained incrementally by `insert_chunk` /
+    /// `remove_chunk` / `blank_orphan_chunks`, so this never rescans the map.
+    pub fn chunk_tombstone_count(&self) -> usize {
+        self.chunk_id_map
+            .len()
+            .saturating_sub(self.chunk_id_set.len())
+    }
+
+    /// Reflection counterpart of [`Self::chunk_tombstone_count`].
+    pub fn reflection_tombstone_count(&self) -> usize {
+        self.reflection_id_map
+            .len()
+            .saturating_sub(self.reflection_id_set.len())
+    }
+
     /// Search chunk index. Returns results sorted by descending score.
     pub fn search_chunks(
         &self,
@@ -300,6 +335,7 @@ impl SearchEngine {
         self.search_index(
             &self.chunk_index,
             &self.chunk_id_map,
+            self.chunk_id_set.len(),
             query_vec,
             limit,
             min_score,
@@ -319,6 +355,7 @@ impl SearchEngine {
         self.search_index(
             &self.reflection_index,
             &self.reflection_id_map,
+            self.reflection_id_set.len(),
             query_vec,
             limit,
             min_score,
@@ -329,6 +366,7 @@ impl SearchEngine {
         &self,
         index: &Hnsw<'static, f32, DistCosine>,
         id_map: &[String],
+        live_count: usize,
         query_vec: &[f32],
         limit: usize,
         min_score: f32,
@@ -346,10 +384,12 @@ impl SearchEngine {
         // bare `index.search(query_vec, limit, ..)` can return fewer than
         // `limit` live results once tombstones are common (negative-drift
         // cache load, see `SearchEngine::load_from_disk`). Scale the request
-        // by the live/total ratio, capped, and escalate to the full index if
-        // still short — mirrors `search_chunks_filtered`'s adaptive overfetch.
+        // by the live/total ratio, capped, and escalate if still short —
+        // mirrors `search_chunks_filtered`'s adaptive overfetch. `live_count`
+        // comes from the caller's id-set length (O(1)) rather than a rescan
+        // of `id_map` here on every query.
         let max_elements = id_map.len();
-        let live = id_map.iter().filter(|s| !s.is_empty()).count().max(1);
+        let live = live_count.max(1);
         let mut fetch_limit = if live < max_elements {
             let scale = (max_elements as f64 / live as f64).min(TOMBSTONE_OVERFETCH_CAP as f64);
             ((limit as f64 * scale).ceil() as usize)
@@ -362,12 +402,23 @@ impl SearchEngine {
         let mut results = loop {
             let neighbours = index.search(query_vec, fetch_limit, EF_SEARCH);
 
+            // hnsw_rs returns neighbours sorted by ascending distance (best
+            // match first), so scores are monotonically non-increasing across
+            // this window. Track, over the whole fetched window, the lowest
+            // score seen and whether any slot in it was a tombstone — both
+            // needed below to decide whether a deeper fetch could possibly
+            // help, instead of assuming it always might.
+            let mut tail_score = f32::INFINITY;
+            let mut saw_tombstone = false;
             let found: Vec<SearchResult> = neighbours
                 .into_iter()
                 .filter_map(|n| {
                     // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
                     let score = 1.0 - n.distance;
-                    if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
+                    tail_score = tail_score.min(score);
+                    let is_tombstone = n.d_id < id_map.len() && id_map[n.d_id].is_empty();
+                    saw_tombstone |= is_tombstone;
+                    if score >= min_score && !is_tombstone && n.d_id < id_map.len() {
                         Some(SearchResult {
                             id: id_map[n.d_id].clone(),
                             score,
@@ -381,7 +432,24 @@ impl SearchEngine {
             if found.len() >= limit || fetch_limit >= max_elements {
                 break found;
             }
-            fetch_limit = max_elements;
+            // The window fell short of `limit`. A deeper fetch can only add
+            // more above-threshold live hits if (a) the window's weakest
+            // score has not yet dropped below `min_score` — since results
+            // only get weaker from here, once it has, nothing further out
+            // will qualify either — and (b) the shortfall could plausibly be
+            // tombstones rather than genuine score exhaustion (no tombstones
+            // in this window and still short means there just aren't enough
+            // qualifying points, deepening will not manufacture more).
+            if tail_score < min_score || !saw_tombstone {
+                break found;
+            }
+            // Escalate geometrically rather than jumping straight to the
+            // full index — bounds the cost of a fetch that only needed to
+            // clear a handful more tombstones.
+            fetch_limit = fetch_limit
+                .saturating_mul(SEARCH_ESCALATION_FACTOR)
+                .min(max_elements)
+                .max(fetch_limit + 1);
         };
 
         results.sort_by(|a, b| {
@@ -2575,6 +2643,47 @@ mod tests {
                 hit.id
             );
         }
+    }
+
+    #[test]
+    fn search_index_does_not_escalate_to_the_full_graph_on_plain_score_exhaustion() {
+        // Reviewer-found regression: the escalation loop used to jump
+        // straight from `fetch_limit` to `max_elements` (a full-graph beam
+        // search) any time the filtered result count fell short of `limit`
+        // — whether or not any tombstone was involved. On the real corpus
+        // (551k chunks) that turned every `min_score`-filtered query with
+        // fewer than `limit` qualifying hits into a ~700x-slower full-index
+        // scan, on the exact call `search_chunks(q, 15, 0.55)` the
+        // UserPromptSubmit hook makes on every typed prompt.
+        //
+        // No tombstones here — the shortfall is pure score exhaustion (an
+        // unreachable `min_score`), so a single bounded first-window search
+        // is enough to know no deeper fetch could add a qualifying hit.
+        // Assert both an empty result and a timing ceiling: a full-graph
+        // scan over 2,000 points would be measurably slower than a single
+        // bounded query even in a debug/CI build.
+        let mut engine = SearchEngine::new(2500);
+        // Comfortably above EXACT_SCAN_THRESHOLD (256) so this exercises the
+        // HNSW path, not `exact_scan`.
+        for i in 0..2000 {
+            engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+
+        let query = distinct_embedding(500);
+        let t0 = std::time::Instant::now();
+        let hits = engine.search_chunks(&query, 15, 2.0); // 2.0 > any cosine score
+        let elapsed = t0.elapsed();
+
+        assert!(
+            hits.is_empty(),
+            "an unreachable min_score must filter out every hit"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "search took {elapsed:?} — looks like it escalated to a full-graph \
+             scan instead of stopping once the window's tail score dropped \
+             below min_score"
+        );
     }
 
     #[test]

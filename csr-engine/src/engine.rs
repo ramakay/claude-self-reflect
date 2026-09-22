@@ -46,18 +46,50 @@ pub struct Engine {
     /// ones), but recovery costs a full re-insert of the corpus, which defeats
     /// the entire point of the import-only path.
     skip_index_persistence: bool,
+    /// True only when `Engine::new` took the cache-miss path (no on-disk
+    /// manifest, or one `load_from_disk` rejected outright — a corrupt file,
+    /// not negative drift) and built a fresh index from SQLite. That index
+    /// is compact by construction and already dumped+`clear_needs_compaction`ed
+    /// before this field is set — see [`Self::index_freshly_rebuilt`].
+    index_freshly_rebuilt: bool,
 }
 
 impl Engine {
     /// Create an engine from pre-built components (for testing).
+    ///
+    /// Derives `index_dir` as `projects_dir.join("index")`. That derivation
+    /// is only correct when the caller's real index directory actually lives
+    /// there — true for tests, but **not** for the daemon, whose real index
+    /// directory sits next to the database (`~/.claude-self-reflect/index`),
+    /// not under `projects_dir` (`~/.claude/projects`). A daemon-assembled
+    /// engine that persists the index (`flush_index`/`dump_to_disk`/
+    /// `rebuild_search_index`) must use [`Self::from_parts_with_index_dir`]
+    /// instead, or it silently writes the compacted HNSW cache into the
+    /// wrong directory and the real cache's `needs_compaction` marker is
+    /// never cleared.
     pub fn from_parts(
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
     ) -> Self {
-        // Derive index_dir from projects_dir for test constructor
         let index_dir = projects_dir.join("index");
+        Self::from_parts_with_index_dir(storage, embeddings, search, projects_dir, index_dir)
+    }
+
+    /// Create an engine from pre-built components with an explicit
+    /// `index_dir`, independent of `projects_dir`. Use this whenever the
+    /// caller already knows its real on-disk index directory (the daemon
+    /// does — see `Daemon::index_dir`) instead of relying on `from_parts`'s
+    /// `projects_dir.join("index")` derivation, which is wrong for any
+    /// caller whose database and projects tree live in different places.
+    pub fn from_parts_with_index_dir(
+        storage: Arc<Storage>,
+        embeddings: Arc<EmbeddingEngine>,
+        search: Arc<RwLock<SearchEngine>>,
+        projects_dir: PathBuf,
+        index_dir: PathBuf,
+    ) -> Self {
         Self {
             storage,
             embeddings,
@@ -65,6 +97,7 @@ impl Engine {
             projects_dir,
             index_dir,
             skip_index_persistence: false,
+            index_freshly_rebuilt: false,
         }
     }
 
@@ -88,6 +121,7 @@ impl Engine {
         let t_count = t0.elapsed();
 
         // Try loading from disk cache first
+        let mut index_freshly_rebuilt = false;
         let search = if let Some(cached) =
             SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count)
         {
@@ -125,14 +159,10 @@ impl Engine {
             // 1. Blank orphan entries (deleted from DB since last dump)
             // 2. Backfill missing entries (added to DB since last dump)
             let mut search = cached;
-            // Orphan share of each index, measured against the id set read for
-            // this reconciliation (not the earlier count, which writers can move).
-            let mut orphans_material = false;
             if let Ok(db_ids) = storage.load_all_reflection_ids() {
                 let db_id_set: std::collections::HashSet<&str> =
                     db_ids.iter().map(|s| s.as_str()).collect();
                 let blanked = search.blank_orphan_reflections(&db_id_set);
-                orphans_material |= blanked * ORPHAN_REBUILD_DIVISOR > db_id_set.len().max(1);
                 if blanked > 0 {
                     tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
                 }
@@ -170,7 +200,6 @@ impl Engine {
                 let db_id_set: std::collections::HashSet<&str> =
                     db_chunk_ids.iter().map(|s| s.as_str()).collect();
                 let orphan_chunks = search.blank_orphan_chunks(&db_id_set);
-                orphans_material |= orphan_chunks * ORPHAN_REBUILD_DIVISOR > db_id_set.len().max(1);
                 if orphan_chunks > 0 {
                     tracing::info!(orphan_chunks, "blanked orphan chunk entries in HNSW cache");
                 }
@@ -206,6 +235,19 @@ impl Engine {
             // `needs_compaction` marker tells the daemon's compaction loop
             // (or the explicit `rebuild-index` command) to do the rebuild
             // out-of-band.
+            //
+            // Materiality is the CUMULATIVE blank share of each id map
+            // (`chunk_tombstone_count`/`reflection_tombstone_count`, both
+            // O(1)) after this reconciliation, not the count of ids blanked
+            // during this one load. A per-load delta resets to 0 on every
+            // subsequent load/dump round trip (blanks persist through
+            // `dump_to_disk`), so a corpus that loses a handful of ids every
+            // few minutes would never cross the per-load threshold even as
+            // its cumulative tombstone share grows without bound.
+            let orphans_material = search.chunk_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+                > search.chunk_slot_count().max(1)
+                || search.reflection_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+                    > search.reflection_slot_count().max(1);
             if orphans_material {
                 tracing::info!(
                     "HNSW cache holds purged vectors — serving with tombstones, marked needs_compaction"
@@ -237,6 +279,7 @@ impl Engine {
             // A from-scratch rebuild is compact by construction (no
             // tombstones), so any pending compaction request is satisfied.
             crate::search::clear_needs_compaction(&index_dir);
+            index_freshly_rebuilt = true;
             let t_total = t0.elapsed();
 
             tracing::info!(
@@ -285,6 +328,7 @@ impl Engine {
             projects_dir: projects_dir.to_path_buf(),
             index_dir,
             skip_index_persistence: false,
+            index_freshly_rebuilt,
         })
     }
 
@@ -312,6 +356,7 @@ impl Engine {
             projects_dir: projects_dir.to_path_buf(),
             index_dir,
             skip_index_persistence: true,
+            index_freshly_rebuilt: false,
         })
     }
 
@@ -623,6 +668,19 @@ impl Engine {
         &self.index_dir
     }
 
+    /// True when this `Engine::new` call took the cache-miss path and built
+    /// a fresh, compact index from SQLite from scratch (first-ever run, or
+    /// `load_from_disk` rejecting a missing/corrupt manifest — interface 4,
+    /// out of WP-D's scope). That index is already dumped and has
+    /// `needs_compaction` cleared before construction returns, so callers
+    /// like the `rebuild-index` CLI command that would otherwise
+    /// unconditionally call [`Self::rebuild_search_index`] right after
+    /// constructing an `Engine` can skip a second, fully redundant ~11-min
+    /// rebuild of a corpus this size.
+    pub fn index_freshly_rebuilt(&self) -> bool {
+        self.index_freshly_rebuilt
+    }
+
     /// Flush the HNSW index to disk if it has been modified.
     /// Safe to call multiple times — skips if not dirty.
     pub async fn flush_index(&self) {
@@ -664,9 +722,59 @@ impl Engine {
     /// end so the persisted index is compact: search never has to over-fetch
     /// past tombstones, and the next process start loads from cache instead
     /// of rebuilding. Returns `(chunks, reflections)` indexed.
+    ///
+    /// The streaming rebuild itself is synchronous CPU/IO work that takes
+    /// minutes on the real corpus (hnsw insert is not async) — it runs on
+    /// `spawn_blocking`'s dedicated thread pool rather than directly inside
+    /// this `async fn`, so it never pins a tokio runtime worker for the
+    /// whole rebuild and starves every other task scheduled on that thread
+    /// (the daemon's compaction loop is the caller that matters here: it
+    /// shares a runtime with the file watcher and every other background
+    /// loop).
+    ///
+    /// `rebuild_search_index_streaming` reads its id lists once, at the
+    /// start of a pass that then runs for minutes — a live watcher/hook can
+    /// import new rows in that window. Immediately after the stream
+    /// completes, probe current DB ids and backfill anything the fresh
+    /// index is missing (the same additive-backfill path `Engine::new`
+    /// uses), so the swapped-in index never regresses recall for rows that
+    /// landed mid-rebuild.
     pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
-        let (fresh, chunk_count, reflection_count) =
-            rebuild_search_index_streaming(&self.storage, RECONCILE_BATCH)?;
+        let storage = self.storage.clone();
+        let (mut fresh, chunk_count, reflection_count) = tokio::task::spawn_blocking(move || {
+            rebuild_search_index_streaming(&storage, RECONCILE_BATCH)
+        })
+        .await
+        .context("rebuild_search_index_streaming task panicked")??;
+
+        if let Ok(db_ids) = self.storage.load_all_reflection_ids() {
+            let missing: Vec<String> = db_ids
+                .into_iter()
+                .filter(|id| !fresh.has_reflection(id))
+                .collect();
+            if !missing.is_empty() {
+                if let Ok(added) = backfill_missing_reflections(&self.storage, &mut fresh, &missing)
+                {
+                    if added > 0 {
+                        tracing::info!(added, "backfilled reflections that landed mid-rebuild");
+                    }
+                }
+            }
+        }
+        if let Ok(db_chunk_ids) = self.storage.load_all_chunk_ids() {
+            let missing: Vec<String> = db_chunk_ids
+                .into_iter()
+                .filter(|id| !fresh.has_chunk(id))
+                .collect();
+            if !missing.is_empty() {
+                if let Ok(added) = backfill_missing_chunks(&self.storage, &mut fresh, &missing) {
+                    if added > 0 {
+                        tracing::info!(added, "backfilled chunks that landed mid-rebuild");
+                    }
+                }
+            }
+        }
+
         *self.search.write().await = fresh;
         self.flush_index_checked().await?;
         // Compact by construction — clears any pending compaction request
