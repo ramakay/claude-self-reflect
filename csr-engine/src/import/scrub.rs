@@ -432,7 +432,9 @@ const PURGE_REFLECTION_BATCH: usize = 500;
 const MAINTENANCE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const BUSY_RETRIES: usize = 10;
 
-fn is_database_busy(error: &anyhow::Error) -> bool {
+/// Shared by every writer that has to survive another csr-engine process
+/// holding the SQLite write lock (scrub, Codex rollout import).
+pub(crate) fn is_database_busy(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<rusqlite::Error>(),

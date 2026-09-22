@@ -524,6 +524,7 @@ impl Daemon {
                                     files = stats.files_imported,
                                     chunks = stats.chunks_imported,
                                     vanished = stats.vanished,
+                                    failed = stats.failed,
                                     schema_misses = stats.schema_misses,
                                     csr_tool_blocks_suppressed = stats.csr_tool_blocks_suppressed,
                                     csr_hook_wrappers_scrubbed = stats.csr_hook_wrappers_scrubbed,

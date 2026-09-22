@@ -10,10 +10,18 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::engine::Engine;
+use crate::import::scrub::is_database_busy;
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, TrustTier};
 
 const ROLLOUT_EMBED_BATCH_SIZE: usize = 32;
+/// How many times one rollout is re-attempted after SQLite reports the database
+/// busy. A rollout is thousands of autocommit writes racing every other
+/// csr-engine process on the box, so a collision is a normal event, not a
+/// corpus-level failure.
+const ROLLOUT_BUSY_RETRIES: usize = 4;
+/// Base backoff between those attempts, multiplied by the attempt number.
+const ROLLOUT_BUSY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub(crate) struct RolloutFile {
@@ -53,6 +61,7 @@ pub(crate) struct RolloutImportStats {
     pub files_imported: usize,
     pub chunks_imported: usize,
     pub vanished: usize,
+    pub failed: usize,
     pub schema_misses: usize,
     pub csr_tool_blocks_suppressed: usize,
     pub csr_hook_wrappers_scrubbed: usize,
@@ -786,62 +795,104 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
         ..RolloutImportStats::default()
     };
     for file in files {
-        let Some(metadata) = scan_rollout_metadata(&file.path)? else {
-            stats.vanished += 1;
-            continue;
-        };
-        let old_ids = storage.get_chunk_ids_for_conversation(&metadata.conversation_id)?;
-        storage.delete_chunks_for_conversation(&metadata.conversation_id)?;
-        if !old_ids.is_empty() {
-            let mut index = engine.search().blocking_write();
-            for id in old_ids {
-                index.remove_chunk(&id);
+        match import_rollout_with_retries(engine, &file) {
+            Ok(None) => stats.vanished += 1,
+            Ok(Some(outcome)) => {
+                stats.schema_misses += outcome.schema_misses;
+                stats.csr_tool_blocks_suppressed += outcome.suppression.csr_tool_blocks_suppressed;
+                stats.csr_hook_wrappers_scrubbed += outcome.suppression.csr_hook_wrappers_scrubbed;
+                stats.files_imported += 1;
+                stats.chunks_imported += outcome.chunks;
+            }
+            // One unreadable or contended rollout is not a reason to abandon
+            // the remaining thousands: the pass used to propagate the first
+            // error and the loop only came back 30 minutes later. `import_state`
+            // is stamped only on success, so the file is retried next cycle.
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(
+                    file = %file.path.display(),
+                    %error,
+                    "Codex rollout file skipped"
+                );
             }
         }
-        let outcome = stream_rollout_chunk_batches(
-            &file.path,
-            &metadata,
-            ROLLOUT_EMBED_BATCH_SIZE,
-            |chunks, evidence| {
-                let texts = chunks
-                    .iter()
-                    .map(|chunk| chunk.content.as_str())
-                    .collect::<Vec<_>>();
-                let embeddings = engine.embeddings().embed(&texts)?;
-                let mut index = engine.search().blocking_write();
-                for ((chunk, chunk_evidence), embedding) in
-                    chunks.iter().zip(evidence).zip(embeddings)
-                {
-                    storage.insert_chunk_with_source(chunk, &embedding, "codex_rollout")?;
-                    storage.insert_chunk_provenance(
-                        &chunk.id,
-                        &ChunkProvenance {
-                            author: chunk.author,
-                            source_conv_id: metadata.conversation_id.clone(),
-                            supersedes: None,
-                        },
-                    )?;
-                    storage.replace_chunk_evidence(chunk_evidence)?;
-                    index.insert_chunk(chunk.id.clone(), embedding);
-                }
-                Ok(())
-            },
-        )?;
-        storage.bump_aux_counter_by("codex_rollout", outcome.schema_misses)?;
-        stats.schema_misses += outcome.schema_misses;
-        stats.csr_tool_blocks_suppressed += outcome.suppression.csr_tool_blocks_suppressed;
-        stats.csr_hook_wrappers_scrubbed += outcome.suppression.csr_hook_wrappers_scrubbed;
-        let key = file.path.to_string_lossy();
-        storage.upsert_import_state_explicit(
-            &key,
-            &metadata.conversation_id,
-            outcome.chunks,
-            &file.mtime,
-        )?;
-        stats.files_imported += 1;
-        stats.chunks_imported += outcome.chunks;
     }
     Ok(stats)
+}
+
+/// Import one rollout, re-attempting while SQLite reports the database busy.
+/// The import is idempotent — chunks are deleted and rebuilt per conversation
+/// and `import_state` is stamped last — so replaying a partial attempt neither
+/// duplicates rows nor strands the previous ones.
+fn import_rollout_with_retries(
+    engine: &Engine,
+    file: &RolloutFile,
+) -> Result<Option<RolloutStreamOutcome>> {
+    let mut attempt = 0;
+    loop {
+        match import_rollout(engine, file) {
+            Err(error) if attempt < ROLLOUT_BUSY_RETRIES && is_database_busy(&error) => {
+                attempt += 1;
+                std::thread::sleep(ROLLOUT_BUSY_BACKOFF * attempt as u32);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// `Ok(None)` means the rollout vanished between discovery and reading it,
+/// which is routine: Codex deletes session files aggressively.
+fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutStreamOutcome>> {
+    let storage = engine.storage();
+    let Some(metadata) = scan_rollout_metadata(&file.path)? else {
+        return Ok(None);
+    };
+    let old_ids = storage.get_chunk_ids_for_conversation(&metadata.conversation_id)?;
+    storage.delete_chunks_for_conversation(&metadata.conversation_id)?;
+    if !old_ids.is_empty() {
+        let mut index = engine.search().blocking_write();
+        for id in old_ids {
+            index.remove_chunk(&id);
+        }
+    }
+    let outcome = stream_rollout_chunk_batches(
+        &file.path,
+        &metadata,
+        ROLLOUT_EMBED_BATCH_SIZE,
+        |chunks, evidence| {
+            let texts = chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<Vec<_>>();
+            let embeddings = engine.embeddings().embed(&texts)?;
+            let mut index = engine.search().blocking_write();
+            for ((chunk, chunk_evidence), embedding) in chunks.iter().zip(evidence).zip(embeddings)
+            {
+                storage.insert_chunk_with_source(chunk, &embedding, "codex_rollout")?;
+                storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: metadata.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                )?;
+                storage.replace_chunk_evidence(chunk_evidence)?;
+                index.insert_chunk(chunk.id.clone(), embedding);
+            }
+            Ok(())
+        },
+    )?;
+    storage.bump_aux_counter_by("codex_rollout", outcome.schema_misses)?;
+    let key = file.path.to_string_lossy();
+    storage.upsert_import_state_explicit(
+        &key,
+        &metadata.conversation_id,
+        outcome.chunks,
+        &file.mtime,
+    )?;
+    Ok(Some(outcome))
 }
 
 #[cfg(test)]
@@ -947,6 +998,38 @@ mod tests {
         assert!(tiers.contains(&crate::provenance::TrustTier::UserHistory));
         assert!(tiers.contains(&crate::provenance::TrustTier::TrustedTool));
         assert!(tiers.contains(&crate::provenance::TrustTier::Unknown));
+    }
+
+    /// The pass used to propagate the first per-file error, so one unreadable
+    /// or write-locked rollout cost every file behind it until the next
+    /// 30-minute daemon cycle.
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_rollout_does_not_abort_the_pass() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        std::fs::copy(&source, root.path().join("rollout-good.jsonl")).unwrap();
+        let unreadable = root.path().join("rollout-aaa-unreadable.jsonl");
+        std::fs::copy(&source, &unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        let stats = import_changed_rollouts(&engine, root.path()).unwrap();
+
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(stats.files_discovered, 2);
+        assert_eq!(stats.files_imported, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.vanished, 0);
+        assert!(!storage
+            .get_chunk_ids_for_conversation("codex:modern-fixture")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
