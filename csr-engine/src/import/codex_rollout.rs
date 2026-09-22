@@ -13,6 +13,7 @@ use crate::engine::Engine;
 use crate::import::scrub::is_database_busy;
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, TrustTier};
+use crate::storage::Storage;
 
 const ROLLOUT_EMBED_BATCH_SIZE: usize = 32;
 /// How many times one rollout is re-attempted after SQLite reports the database
@@ -1086,8 +1087,7 @@ pub struct RestampStats {
 /// Deleted rollouts (capture-on-appearance means many are gone) are left
 /// unchanged and counted in `conversations_missing_file`, never fabricated.
 /// Guarded by [`RESTAMP_META_KEY`] so it runs at most once per database.
-pub fn restamp_codex_chunk_timestamps(engine: &Engine) -> Result<RestampStats> {
-    let storage = engine.storage();
+pub fn restamp_codex_chunk_timestamps(storage: &Storage) -> Result<RestampStats> {
     if storage.get_meta(RESTAMP_META_KEY)?.is_some() {
         return Ok(RestampStats {
             already_applied: true,
@@ -1118,29 +1118,29 @@ pub fn restamp_codex_chunk_timestamps(engine: &Engine) -> Result<RestampStats> {
             continue;
         }
 
-        let mut updated_here = 0usize;
-        let mut unmatched_here = 0usize;
+        // Accumulate this conversation's re-derived chunks and apply them in
+        // ONE transaction (`restamp_chunk_timestamps_batch`) instead of one
+        // autocommit UPDATE per chunk — a few thousand rows at most per
+        // conversation, so this stays small in memory.
+        let mut pending: Vec<(String, String, String, String)> = Vec::new();
         stream_rollout_chunk_batches(
             path,
             &metadata,
             ROLLOUT_EMBED_BATCH_SIZE,
             |chunks, _evidence| {
-                for chunk in chunks {
-                    let matched = storage.restamp_chunk_timestamp_if_content_matches(
-                        &chunk.id,
-                        &chunk.conversation_id,
-                        &chunk.content,
-                        &chunk.timestamp,
-                    )?;
-                    if matched {
-                        updated_here += 1;
-                    } else {
-                        unmatched_here += 1;
-                    }
-                }
+                pending.extend(chunks.iter().map(|chunk| {
+                    (
+                        chunk.id.clone(),
+                        chunk.conversation_id.clone(),
+                        chunk.content.clone(),
+                        chunk.timestamp.clone(),
+                    )
+                }));
                 Ok(())
             },
         )?;
+
+        let (updated_here, unmatched_here) = storage.restamp_chunk_timestamps_batch(&pending)?;
 
         stats.chunks_updated += updated_here;
         stats.chunks_unmatched += unmatched_here;
@@ -1458,9 +1458,34 @@ mod tests {
             "setup: simulated collapse should leave exactly one distinct timestamp"
         );
 
-        let restamp_stats = restamp_codex_chunk_timestamps(&engine).unwrap();
+        let fts_blocks_before = storage
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM chunks_fts_data", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map_err(Into::into)
+            })
+            .unwrap();
+
+        let restamp_stats = restamp_codex_chunk_timestamps(&storage).unwrap();
         assert!(!restamp_stats.already_applied);
         assert_eq!(restamp_stats.conversations_considered, 1);
+
+        // The content-guarded restamp UPDATE is timestamp-only — with
+        // chunks_fts_au scoped to `UPDATE OF content`, it must not touch
+        // chunks_fts_data at all (the FTS-bloat regression this fix closes).
+        let fts_blocks_after = storage
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM chunks_fts_data", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(
+            fts_blocks_before, fts_blocks_after,
+            "restamp must not grow chunks_fts_data"
+        );
         assert_eq!(restamp_stats.conversations_updated, 1);
         assert_eq!(restamp_stats.conversations_missing_file, 0);
         assert_eq!(restamp_stats.conversations_id_mismatch, 0);
@@ -1477,7 +1502,7 @@ mod tests {
         );
 
         // Idempotent: a second run is a no-op guarded by the meta marker.
-        let second = restamp_codex_chunk_timestamps(&engine).unwrap();
+        let second = restamp_codex_chunk_timestamps(&storage).unwrap();
         assert!(second.already_applied);
         assert_eq!(second.chunks_updated, 0);
         assert_eq!(second.conversations_considered, 0);
@@ -1499,7 +1524,7 @@ mod tests {
         // Capture-on-appearance: the source rollout is gone by backfill time.
         std::fs::remove_file(&target).unwrap();
 
-        let stats = restamp_codex_chunk_timestamps(&engine).unwrap();
+        let stats = restamp_codex_chunk_timestamps(&storage).unwrap();
         assert!(!stats.already_applied);
         assert_eq!(stats.conversations_considered, 1);
         assert_eq!(stats.conversations_missing_file, 1);

@@ -818,7 +818,7 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         active_forgetting,
     );
 
-    {
+    if crate::mcp::stage_probe::is_active() {
         let ranked: Vec<(String, String, f32)> = enriched
             .iter()
             .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
@@ -962,7 +962,7 @@ async fn reflect_gather_pass(
     let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
 
-    {
+    if crate::mcp::stage_probe::is_active() {
         let chunk_conv: HashMap<&str, &str> = chunks
             .iter()
             .map(|chunk| (chunk.id.as_str(), chunk.conversation_id.as_str()))
@@ -1244,11 +1244,17 @@ async fn reflect_gather_pass(
         }
     }
 
-    let enriched_conv: HashMap<String, String> = enriched
-        .iter()
-        .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone()))
-        .collect();
-    {
+    // Only built while a stage probe is active: `enriched_conv` exists solely
+    // to feed the `rerank`/`fuse_rrf` stage-probe checkpoints further down
+    // (see their record_stage calls), never the production ranking itself.
+    let probe_active = crate::mcp::stage_probe::is_active();
+    let enriched_conv: Option<HashMap<String, String>> = probe_active.then(|| {
+        enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone()))
+            .collect()
+    });
+    if probe_active {
         let mut ranked: Vec<(String, String, f32)> = enriched
             .iter()
             .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
@@ -1292,6 +1298,13 @@ async fn reflect_gather_pass(
             timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();
+    // Captured before `candidates` is moved into `rerank`/trained-rerank
+    // below — only used by the stage probe's rerank-breakdown checkpoint.
+    let candidates_for_probe: Option<(Vec<crate::search::rerank::RankCandidate>, Option<String>)> =
+        probe_active.then(|| {
+            let origin = crate::search::rerank::primacy_conv(&candidates);
+            (candidates.clone(), origin)
+        });
     let mut raw_order = candidates.clone();
     raw_order.sort_by(|left, right| {
         right
@@ -1376,7 +1389,7 @@ async fn reflect_gather_pass(
         .into_iter()
         .map(|c| c.id)
         .collect();
-    {
+    if let Some(enriched_conv) = enriched_conv.as_ref() {
         let ranked: Vec<(String, String, f32)> = order
             .iter()
             .map(|id| {
@@ -1388,6 +1401,14 @@ async fn reflect_gather_pass(
             })
             .collect();
         crate::mcp::stage_probe::record_stage("rerank", &ranked);
+        if let Some((candidates, origin)) = candidates_for_probe.as_ref() {
+            crate::mcp::stage_probe::record_rerank_breakdown(
+                candidates,
+                &order,
+                enriched_conv,
+                origin.as_deref(),
+            );
+        }
     }
     let rerank_rank: HashMap<&str, usize> = order
         .iter()
@@ -1417,6 +1438,21 @@ async fn reflect_gather_pass(
         .filter(|id| semantic_candidate_ids.contains(*id))
         .cloned()
         .collect();
+    // Captured before `fts_order` is moved into `final_order` below (the
+    // `SearchMode::Fts` arm takes it by value) — only used by the stage
+    // probe's fuse_rrf checkpoint.
+    let fts_ranked_for_probe: Option<Vec<(String, String)>> =
+        enriched_conv.as_ref().map(|enriched_conv| {
+            fts_order
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        enriched_conv.get(id).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        });
     // This establishes the initial order for every mode. The validity
     // partition runs later: it preserves the valid section byte-for-byte,
     // while active forgetting may reorder only the demoted section by
@@ -1426,7 +1462,7 @@ async fn reflect_gather_pass(
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
-    {
+    if let Some(enriched_conv) = enriched_conv.as_ref() {
         let ranked: Vec<(String, String, f32)> = final_order
             .iter()
             .map(|id| {
@@ -1438,6 +1474,12 @@ async fn reflect_gather_pass(
             })
             .collect();
         crate::mcp::stage_probe::record_stage("fuse_rrf", &ranked);
+        // FTS-side rank is separate from the fused rank just recorded above:
+        // it's the target's position in the keyword ranking that RRF fused
+        // with the semantic ranking, not the post-fusion position.
+        if let Some(fts_ranked) = fts_ranked_for_probe.as_ref() {
+            crate::mcp::stage_probe::record_fts_rank(fts_ranked);
+        }
     }
     let rank_of = |id: &str| {
         final_order
@@ -1481,7 +1523,7 @@ async fn reflect_gather_pass(
         .collect();
     format::dedupe_sidechain_origins(&mut enriched, &parent_of);
 
-    {
+    if crate::mcp::stage_probe::is_active() {
         let ranked: Vec<(String, String, f32)> = enriched
             .iter()
             .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
@@ -3644,6 +3686,96 @@ mod tests {
             Some(2),
             "target is the 3rd-most-similar of 5 chunks, 0-indexed rank 2"
         );
+
+        let rerank_sample = samples
+            .iter()
+            .find(|sample| sample.stage == "rerank")
+            .unwrap();
+        assert!(
+            !rerank_sample.rerank_breakdown.is_empty(),
+            "rerank checkpoint must capture a per-term breakdown when the target survives to it"
+        );
+        let target_rows: Vec<_> = rerank_sample
+            .rerank_breakdown
+            .iter()
+            .filter(|row| row.is_target)
+            .collect();
+        assert_eq!(
+            target_rows.len(),
+            1,
+            "exactly one row should be flagged as the target's own best chunk"
+        );
+        assert_eq!(target_rows[0].chunk_id, "stage-probe-2");
+        assert!(target_rows[0].breakdown.total.is_finite());
+        let displacer_rows: Vec<_> = rerank_sample
+            .rerank_breakdown
+            .iter()
+            .filter(|row| !row.is_target)
+            .collect();
+        assert_eq!(
+            displacer_rows.len(),
+            rerank_sample.target_rank.unwrap(),
+            "displacer count must equal the target's own rerank rank (everyone ranked above it)"
+        );
+
+        let fuse_rrf_sample = samples
+            .iter()
+            .find(|sample| sample.stage == "fuse_rrf")
+            .unwrap();
+        assert!(
+            fuse_rrf_sample.target_fts_rank.is_some(),
+            "target's own content is FTS-matchable, so fuse_rrf must also \
+             record its keyword-side rank, not just its fused rank"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_probe_is_inert_outside_an_active_scope() {
+        // `is_active()` must be false with no `scope()` wrapper — the
+        // production hot path (MCP tool, hooks) never wraps calls in
+        // `scope`, so every `(String, String, f32)` vector build gated on it
+        // must be skipped there. Exercised indirectly here: a call outside
+        // `scope` returns zero samples via the same production code path
+        // that skips the vector builds.
+        assert!(!crate::mcp::stage_probe::is_active());
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let chunk = crate::import::ConversationChunk {
+            id: "no-scope-0".into(),
+            conversation_id: "codex:no-scope-conv".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "no scope active".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let vector = [1.0_f32, 0.0, 0.0, 0.0];
+        storage.insert_chunk(&chunk, &vector).unwrap();
+        engine.insert_chunk(chunk.id, vector.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+
+        // No `scope()` wrapper — this must succeed exactly like production
+        // callers, and `is_active()` must read false throughout.
+        let output = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &vector,
+            "no scope active",
+            6,
+            0.0,
+            None,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("no-scope-0"));
+        assert!(!crate::mcp::stage_probe::is_active());
     }
 
     /// Two `scope()` calls interleaved via `tokio::join!` inside the SAME

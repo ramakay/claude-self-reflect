@@ -3653,6 +3653,58 @@ pub fn restamp_chunk_timestamp_if_content_matches(
     Ok(updated > 0)
 }
 
+/// Batched form of [`restamp_chunk_timestamp_if_content_matches`]: every
+/// `(chunk_id, conversation_id, content, new_timestamp)` row runs in ONE
+/// transaction instead of autocommitting per row. Each timestamp-only UPDATE
+/// still fires `chunks_fts_au` once per row (see the migration that scopes
+/// that trigger to `UPDATE OF content` — with the trigger fixed the batching
+/// here is purely a transaction-count/latency win, not an FTS-bloat fix by
+/// itself); batching is about not paying SQLite's fsync-per-autocommit cost
+/// 280,775 times on a corpus-wide backfill. Returns
+/// `(rows_matched, rows_unmatched)`. On error the whole batch rolls back —
+/// callers doing a best-effort backfill should call this per-conversation
+/// (a few thousand rows at most) rather than for the whole corpus in one
+/// call, so one drifted file can't roll back every other conversation's
+/// otherwise-clean restamp.
+pub fn restamp_chunk_timestamps_batch(
+    conn: &Connection,
+    updates: &[(String, String, String, String)],
+) -> Result<(usize, usize)> {
+    if updates.is_empty() {
+        return Ok((0, 0));
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<(usize, usize)> {
+        let mut matched = 0usize;
+        let mut unmatched = 0usize;
+        {
+            let mut stmt = conn.prepare(
+                "UPDATE chunks SET timestamp = ?1 WHERE id = ?2 AND conversation_id = ?3 AND content = ?4",
+            )?;
+            for (chunk_id, conversation_id, content, new_timestamp) in updates {
+                let updated =
+                    stmt.execute(params![new_timestamp, chunk_id, conversation_id, content])?;
+                if updated > 0 {
+                    matched += 1;
+                } else {
+                    unmatched += 1;
+                }
+            }
+        }
+        Ok((matched, unmatched))
+    })();
+    match result {
+        Ok(counts) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(counts)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
 pub fn set_chunk_saga_columns(
     conn: &Connection,

@@ -1389,6 +1389,17 @@ impl Storage {
         )
     }
 
+    /// Batched form of [`Storage::restamp_chunk_timestamp_if_content_matches`]:
+    /// runs every `(chunk_id, conversation_id, content, new_timestamp)` row in
+    /// one transaction. See `queries::restamp_chunk_timestamps_batch`.
+    pub fn restamp_chunk_timestamps_batch(
+        &self,
+        updates: &[(String, String, String, String)],
+    ) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::restamp_chunk_timestamps_batch(&conn, updates)
+    }
+
     pub fn list_all_import_state_file_paths(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::list_all_import_state_file_paths(&conn)

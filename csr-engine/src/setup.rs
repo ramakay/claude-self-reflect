@@ -79,6 +79,31 @@ pub async fn handle(
                 "  Imported {} Codex rollout chunks from {} changed files",
                 stats.chunks_imported, stats.files_imported
             );
+
+            // One-time, meta-guarded backfill for rollouts imported before
+            // the chunk-timestamp-collapse fix (see
+            // `restamp_codex_chunk_timestamps`'s doc). Runs under this same
+            // binary, so it always applies the fixed chunker — cheap on a
+            // no-op second run (single meta lookup).
+            let restamp_storage = eng.storage().clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::restamp_codex_chunk_timestamps(&restamp_storage)
+            })
+            .await
+            {
+                Ok(Ok(restamp_stats)) if !restamp_stats.already_applied => {
+                    eprintln!(
+                        "  Restamped {} Codex rollout chunks across {} conversations ({} missing file, {} unmatched)",
+                        restamp_stats.chunks_updated,
+                        restamp_stats.conversations_updated,
+                        restamp_stats.conversations_missing_file,
+                        restamp_stats.conversations_unmatched,
+                    );
+                }
+                Ok(Ok(_)) => {} // already_applied — silent, nothing to report
+                Ok(Err(e)) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
+                Err(e) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
+            }
         }
     }
 

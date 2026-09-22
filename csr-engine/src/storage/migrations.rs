@@ -23,7 +23,7 @@ const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
     END;
-    CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+    CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
         INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -174,6 +174,58 @@ fn migrate_chunks_fts(conn: &Connection) -> Result<()> {
     }
 
     verify_chunks_fts(conn)
+}
+
+fn chunks_fts_au_trigger_sql(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn is_content_scoped_au_trigger(sql: &str) -> bool {
+    let compact: String = sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.contains("afterupdateofcontenton")
+}
+
+/// Recreate `chunks_fts_au` scoped to `UPDATE OF content` if an
+/// already-migrated database still has the unscoped `AFTER UPDATE ON chunks`
+/// definition. `migrate_chunks_fts` above short-circuits once the
+/// external-content schema and a trigger COUNT of 3 already hold, so it never
+/// revisits an existing trigger's exact definition — this is a narrower,
+/// always-checked follow-up that does.
+///
+/// An unscoped trigger fires the delete+reinsert `chunks_fts` pair on every
+/// `UPDATE` to `chunks`, including timestamp-only restamps that never touch
+/// `content`. Measured on a `/tmp` clone: 280,775 timestamp-only restamp
+/// UPDATEs (`restamp_chunk_timestamp_if_content_matches`) grew
+/// `chunks_fts_data` from 51,745 blocks / 202.5 MB to 65,764 blocks /
+/// 257.2 MB (+54.6 MB, +27%) purely from re-inserting unchanged content.
+fn migrate_chunks_fts_au_content_scoped(conn: &Connection) -> Result<()> {
+    let Some(sql) = chunks_fts_au_trigger_sql(conn)? else {
+        // No chunks_fts_au trigger yet — migrate_chunks_fts (run earlier in
+        // `run()`) is responsible for creating the correct one from scratch.
+        return Ok(());
+    };
+    if is_content_scoped_au_trigger(&sql) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER chunks_fts_au;
+         CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
+             INSERT INTO chunks_fts(chunks_fts, rowid, content)
+             VALUES ('delete', old.rowid, old.content);
+             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;",
+    )?;
+    Ok(())
 }
 
 fn main_database_path(conn: &Connection) -> Result<Option<std::path::PathBuf>> {
@@ -807,6 +859,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     migrate_chunks_fts(conn)?;
+    migrate_chunks_fts_au_content_scoped(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).
@@ -2363,6 +2416,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trigger_count, 3);
+    }
+
+    fn chunks_fts_data_block_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM chunks_fts_data", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn timestamp_only_update_does_not_touch_chunks_fts() {
+        // Break caught: an `AFTER UPDATE ON chunks` (any column) trigger
+        // fires the delete+reinsert pair into chunks_fts on every UPDATE,
+        // including ones that never touch `content` — e.g. the WP-A
+        // timestamp-restamp backfill. Scoping the trigger to
+        // `UPDATE OF content` must leave chunks_fts_data's block count
+        // unchanged across a timestamp-only UPDATE.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 ('c1', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta gamma delta', 1);",
+        )
+        .unwrap();
+        let before = chunks_fts_data_block_count(&conn);
+
+        conn.execute(
+            "UPDATE chunks SET timestamp = ?1 WHERE id = 'c1'",
+            ["2026-09-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        let after = chunks_fts_data_block_count(&conn);
+        assert_eq!(
+            before, after,
+            "a timestamp-only UPDATE must not touch chunks_fts_data"
+        );
+        // Content still searchable and matches exactly once — the row
+        // itself was never deleted, just left alone.
+        assert_eq!(matching_live_ids(&conn, "alpha").len(), 1);
+
+        // A content UPDATE, by contrast, SHOULD still resync the index.
+        conn.execute(
+            "UPDATE chunks SET content = 'epsilon zeta' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "alpha").is_empty());
+        assert_eq!(matching_live_ids(&conn, "epsilon").len(), 1);
+    }
+
+    #[test]
+    fn legacy_unscoped_au_trigger_is_upgraded_to_content_scoped() {
+        // Simulates a database migrated before this fix: chunks_fts_au fires
+        // on ANY update. A later `run()` (which always calls
+        // migrate_chunks_fts_au_content_scoped, unlike migrate_chunks_fts
+        // itself, which short-circuits once the schema+trigger COUNT already
+        // match) must recreate it scoped to `UPDATE OF content` without
+        // losing FTS sync.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER chunks_fts_au;
+             CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+                 INSERT INTO chunks_fts(chunks_fts, rowid, content)
+                 VALUES ('delete', old.rowid, old.content);
+                 INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;",
+        )
+        .unwrap();
+        let legacy_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!is_content_scoped_au_trigger(&legacy_sql));
+
+        run(&conn).unwrap();
+
+        let upgraded_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            is_content_scoped_au_trigger(&upgraded_sql),
+            "sql was: {upgraded_sql}"
+        );
+
+        // Still functionally correct after the upgrade: content updates stay synced.
+        conn.execute_batch(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 ('c1', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta', 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chunks SET content = 'gamma delta' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "alpha").is_empty());
+        assert_eq!(matching_live_ids(&conn, "gamma").len(), 1);
     }
 
     #[test]

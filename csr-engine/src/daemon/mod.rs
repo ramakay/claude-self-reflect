@@ -487,6 +487,42 @@ impl Daemon {
         // switch off needs a daemon restart, nothing else.
         if codex_import_disabled() {
             tracing::info!("Codex rollout import disabled via CSR_NO_CODEX_IMPORT");
+        } else {
+            // One-time, meta-guarded backfill for Codex rollouts imported
+            // before the chunk-timestamp-collapse fix — runs once at daemon
+            // startup under this same (fixed-chunker) binary, so it never
+            // races an older daemon's re-imports. No-op after the first
+            // successful run (single meta lookup) — safe to attempt on
+            // every daemon start, not just the first.
+            let restamp_storage = self.storage.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                let Ok(permit) = heavy_work.acquire_owned().await else {
+                    return;
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    crate::import::codex_rollout::restamp_codex_chunk_timestamps(&restamp_storage)
+                })
+                .await;
+                match result {
+                    Ok(Ok(stats)) if !stats.already_applied => tracing::info!(
+                        conversations_considered = stats.conversations_considered,
+                        conversations_updated = stats.conversations_updated,
+                        conversations_missing_file = stats.conversations_missing_file,
+                        conversations_unmatched = stats.conversations_unmatched,
+                        chunks_updated = stats.chunks_updated,
+                        "Codex rollout chunk-timestamp backfill completed"
+                    ),
+                    Ok(Ok(_)) => {} // already_applied
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "Codex rollout chunk-timestamp backfill failed")
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Codex rollout chunk-timestamp backfill panicked")
+                    }
+                }
+            });
         }
         let codex_rollout_handle = {
             let engine = Arc::new(crate::engine::Engine::from_parts(

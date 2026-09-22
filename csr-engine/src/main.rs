@@ -1114,8 +1114,11 @@ async fn run() -> Result<()> {
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        let stats = csr_engine::import::codex_rollout::restamp_codex_chunk_timestamps(&eng)?;
+        // Storage only — this backfill never touches embeddings or the HNSW
+        // index, so it does not need a full `Engine` (1.2 GB load, possible
+        // index rebuild/dump on a cache miss).
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let stats = csr_engine::import::codex_rollout::restamp_codex_chunk_timestamps(&storage)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
         return Ok(());
     }

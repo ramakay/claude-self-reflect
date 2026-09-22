@@ -1,13 +1,24 @@
 //! Probe why `store_reflection` rows do not surface in `csr_reflect_on_past`.
-//! Loads the live index exactly as the MCP server does, then for each target
-//! reflection id: HNSW membership, raw `search_reflections` rank for the row's
-//! own text, brute-force cosine rank over every stored reflection embedding,
-//! and the full `reflect_on_past` pipeline output.
+//! Loads the target index exactly as the MCP server does, then for each
+//! target reflection id: HNSW membership, raw `search_reflections` rank for
+//! the row's own text, brute-force cosine rank over every stored reflection
+//! embedding, and the full `reflect_on_past` pipeline output.
+//!
 //!   cargo run --release --example probe_reflection -- <reflection_id>...
+//!   cargo run --release --example probe_reflection -- \
+//!       --db /tmp/csr-wpa/csr-engine.db --projects-dir <dir> <reflection_id>...
+//!
+//! `--db`/`--projects-dir` default to the live install (this probe predates
+//! WP-A's `/tmp`-clone convention and is still run against the live DB
+//! read-only by design — it never writes), but accept an override so it can
+//! also run as WP-A's post-restamp reflection-recall non-regression check
+//! against a `/tmp` clone, per this repo's "never touch the live DB" rule
+//! for anything that mutates state upstream of the probe (the restamp
+//! backfill it's meant to gate does).
 use anyhow::Result;
 use csr_engine::engine::Engine;
 use rusqlite::{Connection, OpenFlags};
-use std::path::Path;
+use std::path::PathBuf;
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
@@ -28,17 +39,24 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let db = Path::new("/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db");
-    let projects = Path::new("/Users/ramakrishnanannaswamy/.claude/projects");
+    let mut db = PathBuf::from("/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db");
+    let mut projects = PathBuf::from("/Users/ramakrishnanannaswamy/.claude/projects");
     let mut ids: Vec<String> = Vec::new();
     let mut query_override: Option<String> = None;
-    for a in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
         if let Some(q) = a.strip_prefix("q=") {
             query_override = Some(q.to_string());
+        } else if a == "--db" {
+            db = PathBuf::from(args.next().expect("--db needs a value"));
+        } else if a == "--projects-dir" {
+            projects = PathBuf::from(args.next().expect("--projects-dir needs a value"));
         } else {
             ids.push(a);
         }
     }
+    let db = db.as_path();
+    let projects = projects.as_path();
     let engine = Engine::new(db, projects)?;
     let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
