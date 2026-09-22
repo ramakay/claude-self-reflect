@@ -638,51 +638,7 @@ impl Daemon {
                         }
                         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                     }
-                    if !crate::search::needs_compaction(&index_dir) {
-                        continue;
-                    }
-                    let permit = match heavy_work.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return,
-                    };
-                    tracing::info!("needs_compaction marker found — rebuilding HNSW index");
-                    // The streaming rebuild takes ~11 min on the real corpus
-                    // and does not check the shutdown flag mid-stream
-                    // (hnsw insert has no cancellation point). Race it
-                    // against shutdown rather than awaiting it
-                    // unconditionally: if shutdown wins, abandon this
-                    // rebuild without swapping `self.search` or touching
-                    // the marker — the on-disk generation stays exactly as
-                    // valid as it was before compaction started (tombstoned
-                    // but still fully reconciled), and the loop returns
-                    // immediately so the daemon's shutdown sequence does not
-                    // hang for the rebuild's remaining wall time. The
-                    // detached `spawn_blocking` thread inside
-                    // `rebuild_search_index` keeps running to completion in
-                    // the background regardless — nothing awaits its result
-                    // once this select arm is dropped, so it can neither
-                    // swap the index nor race the final shutdown flush.
-                    tokio::select! {
-                        result = engine.rebuild_search_index() => {
-                            match result {
-                                Ok((chunks, reflections)) => tracing::info!(
-                                    chunks,
-                                    reflections,
-                                    "compaction rebuild complete, needs_compaction cleared"
-                                ),
-                                Err(e) => tracing::warn!(error = %e, "compaction rebuild failed"),
-                            }
-                        }
-                        _ = wait_for_shutdown(&shutdown) => {
-                            tracing::info!(
-                                "compaction rebuild abandoned — shutdown requested, \
-                                 needs_compaction marker left in place for the next daemon start"
-                            );
-                            drop(permit);
-                            return;
-                        }
-                    }
-                    drop(permit);
+                    compact_if_marked(&engine, &index_dir, &heavy_work, &shutdown).await;
                 }
             })
         };
@@ -787,6 +743,71 @@ async fn wait_for_shutdown(shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::SeqCst) {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
+}
+
+/// One compaction check-and-rebuild step: consumes the `needs_compaction`
+/// marker under `index_dir` (if present) by rebuilding `engine`'s search
+/// index. Factored out of the compaction loop so the loop-level wiring
+/// (marker check → heavy-work permit → shutdown race), not just
+/// `Engine::rebuild_search_index` in isolation, is directly callable from a
+/// test with `engine`'s `projects_dir` and `index_dir` unrelated — the same
+/// shape as the real daemon (see `compaction_engine_writes_to_the_daemons_real_index_dir`,
+/// which previously called `rebuild_search_index` directly and so never
+/// exercised this function's marker/select! wiring at all).
+///
+/// The streaming rebuild takes ~11 min on the real corpus and does not check
+/// the shutdown flag mid-stream (hnsw insert has no cancellation point).
+/// Race it against shutdown rather than awaiting it unconditionally: if
+/// shutdown wins, abandon this rebuild without swapping the index or
+/// touching the marker — the on-disk generation stays exactly as valid as it
+/// was before compaction started (tombstoned but still fully reconciled),
+/// and this function returns immediately so the daemon's shutdown sequence
+/// does not hang for the rebuild's remaining wall time. The detached
+/// `spawn_blocking` thread inside `rebuild_search_index` keeps running to
+/// completion in the background regardless — nothing awaits its result once
+/// this select arm is dropped, so it can neither swap the index nor race the
+/// final shutdown flush. `main`'s `runtime.shutdown_timeout` bounds how long
+/// the process itself waits for that abandoned thread on exit.
+///
+/// Returns `true` when a rebuild was attempted (whether it completed or was
+/// abandoned on shutdown), `false` when there was no marker to consume or
+/// the heavy-work semaphore was closed.
+async fn compact_if_marked(
+    engine: &crate::engine::Engine,
+    index_dir: &Path,
+    heavy_work: &Arc<Semaphore>,
+    shutdown: &AtomicBool,
+) -> bool {
+    if !crate::search::needs_compaction(index_dir) {
+        return false;
+    }
+    let permit = match heavy_work.clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    tracing::info!("needs_compaction marker found — rebuilding HNSW index");
+    tokio::select! {
+        result = engine.rebuild_search_index() => {
+            match result {
+                Ok((chunks, reflections)) => tracing::info!(
+                    chunks,
+                    reflections,
+                    "compaction rebuild complete, needs_compaction cleared"
+                ),
+                Err(e) => tracing::warn!(error = %e, "compaction rebuild failed"),
+            }
+        }
+        _ = wait_for_shutdown(shutdown) => {
+            tracing::info!(
+                "compaction rebuild abandoned — shutdown requested, \
+                 needs_compaction marker left in place for the next daemon start"
+            );
+            drop(permit);
+            return true;
+        }
+    }
+    drop(permit);
+    true
 }
 
 /// Acquire the daemon's serialized heavy-work slot, then recheck shutdown at
@@ -1806,8 +1827,16 @@ mod tests {
             index_dir.clone(),
         );
 
-        let (chunks, _reflections) = engine.rebuild_search_index().await.unwrap();
-        assert_eq!(chunks, 10);
+        // Drive the actual loop-level function (marker check → heavy-work
+        // permit → shutdown race), not `rebuild_search_index` directly —
+        // this is what previously left the daemon's `select!`/permit wiring
+        // untested at this level (reviewer finding, WP-D low #5).
+        let heavy_work = Arc::new(Semaphore::new(1));
+        let shutdown = AtomicBool::new(false);
+        let ran = compact_if_marked(&engine, &index_dir, &heavy_work, &shutdown).await;
+        assert!(ran, "a present marker must trigger a rebuild attempt");
+
+        assert_eq!(engine.search().read().await.chunk_count(), 10);
         assert!(
             !crate::search::needs_compaction(&index_dir),
             "the marker in the real index_dir must be cleared"
@@ -1819,6 +1848,80 @@ mod tests {
         assert!(
             !projects_dir.join("index").exists(),
             "nothing must be written under projects_dir/index — from_parts's wrong derivation"
+        );
+
+        // A second call with no marker present must be a no-op.
+        assert!(!compact_if_marked(&engine, &index_dir, &heavy_work, &shutdown).await);
+    }
+
+    #[tokio::test]
+    async fn compact_if_marked_abandons_the_rebuild_when_shutdown_is_already_set() {
+        // Same rig, but shutdown is set before the call — `wait_for_shutdown`
+        // resolves on its very first poll, so the select! must take that arm
+        // and leave the marker in place for the next daemon start (real
+        // rebuild work would otherwise be silently lost on a fast shutdown
+        // race right after the daemon starts a compaction).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let projects_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("real_index");
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+        for i in 0..10 {
+            storage
+                .insert_chunk(
+                    &ConversationChunk {
+                        id: format!("chunk-{i}"),
+                        conversation_id: "conv".into(),
+                        project_name: "proj".into(),
+                        timestamp: "2026-09-22T00:00:00Z".into(),
+                        content: "x".into(),
+                        message_count: 1,
+                        summary: None,
+                        author: Speaker::User,
+                        seq: 0,
+                        is_sidechain: false,
+                    },
+                    &vec![0.1_f32; EmbeddingEngine::dimension()],
+                )
+                .unwrap();
+        }
+        let mut search = SearchEngine::new(64);
+        for i in 0..10 {
+            search.insert_chunk(
+                format!("chunk-{i}"),
+                vec![0.1_f32; EmbeddingEngine::dimension()],
+            );
+        }
+        search.dump_to_disk(&index_dir, 10, 0).unwrap();
+        crate::search::mark_needs_compaction(&index_dir);
+
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search_arc = Arc::new(RwLock::new(search));
+        let engine = crate::engine::Engine::from_parts_with_index_dir(
+            storage.clone(),
+            embeddings,
+            search_arc,
+            projects_dir.clone(),
+            index_dir.clone(),
+        );
+
+        let heavy_work = Arc::new(Semaphore::new(1));
+        let shutdown = AtomicBool::new(true);
+        let t0 = std::time::Instant::now();
+        let ran = compact_if_marked(&engine, &index_dir, &heavy_work, &shutdown).await;
+        let elapsed = t0.elapsed();
+
+        assert!(ran, "shutdown-abandoned rebuild still counts as an attempt");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must return promptly once shutdown wins the race, elapsed={elapsed:?}"
+        );
+        assert!(
+            crate::search::needs_compaction(&index_dir),
+            "an abandoned rebuild must leave the marker for the next daemon start"
         );
     }
 

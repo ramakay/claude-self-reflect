@@ -196,4 +196,48 @@ mod tests {
             assert_eq!(resolve_tokio_workers(), expected);
         });
     }
+
+    // WP-D high finding: dropping a `tokio::runtime::Runtime` blocks the
+    // dropping thread until every task on its blocking pool returns (tokio
+    // 1.53.1 `src/runtime/runtime.rs`, `src/task/blocking.rs`). `main`'s
+    // `runtime.block_on(run())` can return while the daemon's compaction
+    // loop has abandoned *awaiting* (not cancelled) a `spawn_blocking`
+    // streaming HNSW rebuild — a bare `block_on` there would then hang in
+    // `Runtime::drop` for however long that rebuild takes (minutes on the
+    // real corpus). `main` instead does
+    // `let r = runtime.block_on(run()); runtime.shutdown_timeout(..); r` —
+    // this test proves `shutdown_timeout` actually bounds that wait rather
+    // than blocking for the abandoned task's full remaining duration.
+    #[test]
+    fn shutdown_timeout_bounds_the_wait_for_an_abandoned_blocking_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // Simulate the abandoned `rebuild_search_index_streaming` closure:
+        // long-running blocking work with no cancellation point, exactly
+        // like a real HNSW insert loop mid-rebuild.
+        runtime.spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
+
+        // The rest of `run()` completing promptly, as it does once shutdown
+        // wins the daemon's `select!`.
+        runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+
+        let t0 = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_millis(200));
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "shutdown_timeout must bound the wait for the abandoned blocking \
+             task instead of blocking for its full remaining duration \
+             (~5s here, minutes on the real corpus); elapsed={elapsed:?}"
+        );
+    }
 }

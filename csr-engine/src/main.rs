@@ -584,7 +584,24 @@ fn main() -> Result<()> {
         .worker_threads(workers)
         .enable_all()
         .build()?;
-    runtime.block_on(run())
+    let result = runtime.block_on(run());
+    // `run()` can return while a `spawn_blocking` task the daemon's
+    // compaction loop started (inside `Engine::rebuild_search_index`) is
+    // still streaming an HNSW rebuild on the blocking pool — shutdown
+    // abandons *awaiting* that task (see `daemon::compact_if_marked`'s
+    // `tokio::select!`), but the closure itself keeps running. A bare
+    // `runtime.block_on(run())` returning here would drop `runtime`
+    // implicitly, and dropping a `Runtime` blocks the dropping thread until
+    // every spawned blocking task returns (tokio 1.53.1
+    // `src/runtime/runtime.rs`, `src/task/blocking.rs`) — minutes, on the
+    // real corpus, well past whatever asked this process to stop (SIGTERM,
+    // an installer upgrade). `shutdown_timeout` bounds that wait instead of
+    // blocking indefinitely: the abandoned closure only builds an in-memory
+    // `SearchEngine` nothing will read once this process exits, so leaving
+    // its thread running past the timeout — until the OS reclaims it on
+    // process exit — is safe.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    result
 }
 
 async fn run() -> Result<()> {
@@ -809,6 +826,17 @@ async fn run() -> Result<()> {
             // run, or a corrupt manifest). Calling rebuild_search_index()
             // again here would be a second, fully redundant ~11-min pass
             // over the same corpus.
+            //
+            // `Engine::new` only logs that dump's failure as a non-fatal
+            // warning (foreground processes must never block startup on
+            // persistence), so without this call a failed dump would print
+            // "rebuilt" and exit 0 while the on-disk cache stayed stale or
+            // absent — every later startup would then rebuild inline for
+            // ~11 min instead of loading the cache this command claimed to
+            // have written. `flush_index_checked` is a no-op when the dump
+            // already succeeded (nothing dirty) and otherwise re-attempts
+            // and surfaces the error via `?`.
+            eng.flush_index_checked().await?;
             let (chunks, reflections) = (
                 eng.storage().count_chunk_embeddings().unwrap_or(0),
                 eng.storage().count_reflection_embeddings().unwrap_or(0),

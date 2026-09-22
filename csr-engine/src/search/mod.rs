@@ -101,6 +101,39 @@ const TOMBSTONE_OVERFETCH_CAP: usize = 20;
 /// escalation to O(log) steps while keeping each step's HNSW query cheap.
 const SEARCH_ESCALATION_FACTOR: usize = 4;
 
+// Reviewer-found regression (WP-D low #4): a wall-clock ceiling alone does
+// not guard the "no full-graph escalation on plain score exhaustion" fix —
+// a 2,000-point full-graph scan is cheap enough that a stale, unguarded
+// implementation can still pass a 200ms timing assertion. These
+// `thread_local` counters let a test assert a structural signal instead:
+// exactly how many times `index.search` was actually called, and the
+// largest `fetch_limit` any of those calls requested. `thread_local` (not a
+// shared global `static`) because cargo's default test harness runs each
+// `#[test]` to completion on one thread before that thread picks up
+// another — scoping per-thread means concurrent tests never see each
+// other's counts, with no explicit synchronization needed.
+#[cfg(test)]
+thread_local! {
+    static TEST_SEARCH_INDEX_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_SEARCH_INDEX_MAX_FETCH_LIMIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_search_index_test_counters() {
+    TEST_SEARCH_INDEX_CALLS.with(|c| c.set(0));
+    TEST_SEARCH_INDEX_MAX_FETCH_LIMIT.with(|c| c.set(0));
+}
+
+/// Returns `(calls, max_fetch_limit)` recorded by `search_index` since the
+/// last [`reset_search_index_test_counters`].
+#[cfg(test)]
+fn search_index_test_counters() -> (u64, u64) {
+    (
+        TEST_SEARCH_INDEX_CALLS.with(|c| c.get()),
+        TEST_SEARCH_INDEX_MAX_FETCH_LIMIT.with(|c| c.get()),
+    )
+}
+
 /// Filename of the marker written under the index directory when a foreground
 /// process (`Engine::new` in an MCP server, hook, or CLI query command) finds
 /// the loaded HNSW cache materially tombstoned but defers the full rebuild
@@ -400,6 +433,11 @@ impl SearchEngine {
         };
 
         let mut results = loop {
+            #[cfg(test)]
+            {
+                TEST_SEARCH_INDEX_CALLS.with(|c| c.set(c.get() + 1));
+                TEST_SEARCH_INDEX_MAX_FETCH_LIMIT.with(|c| c.set(c.get().max(fetch_limit as u64)));
+            }
             let neighbours = index.search(query_vec, fetch_limit, EF_SEARCH);
 
             // hnsw_rs returns neighbours sorted by ascending distance (best
@@ -531,6 +569,40 @@ impl SearchEngine {
     /// Whether the reflection index specifically needs a dump.
     pub fn is_reflection_dirty(&self) -> bool {
         self.reflection_dirty
+    }
+
+    /// Clear both dirty flags without dumping. `Engine::new`'s cached-load
+    /// path calls this after pure DB-mirroring reconciliation (orphan
+    /// blanking, additive backfill against `load_all_chunk_ids`/
+    /// `load_all_reflection_ids`) — work that only makes this engine's
+    /// in-memory maps agree with what the DB already says, not new content
+    /// this process is responsible for publishing.
+    ///
+    /// Reviewer-found ping-pong (WP-D medium #2): without this, a
+    /// long-lived foreground engine (MCP server, hook) that loaded BEFORE
+    /// the daemon's compaction swap keeps `chunk_dirty`/`reflection_dirty`
+    /// set from its own startup blanking. Its next unrelated dump (e.g. a
+    /// `store_reflection` flush, which only has new content on the
+    /// reflection side) then takes `dump_to_disk`'s "this side is dirty, so
+    /// publish it from memory" branch for the CHUNK side too — republishing
+    /// this process's pre-compaction, orphan-laden generation over the
+    /// generation the daemon just compacted. Last-writer-wins means the
+    /// compaction's tombstones come back, `orphans_material` trips again on
+    /// the next load, and the daemon runs another multi-minute rebuild for
+    /// no reason.
+    ///
+    /// Clearing here instead makes a later dump from this process take the
+    /// OTHER branch for an untouched, `manifest_backed` side: carry the
+    /// generation forward from whatever manifest is on disk **at dump
+    /// time** (re-read fresh, under `index.lock`, right before writing —
+    /// see `dump_to_disk`), which by then is the daemon's newer, compact
+    /// one. A genuine runtime content change (an actual `insert_chunk`/
+    /// `insert_reflection` from an import or a stored reflection, which
+    /// happen strictly after this call in `Engine::new`) still sets the
+    /// flag itself and is never lost by this.
+    pub fn clear_reconciliation_dirty(&mut self) {
+        self.chunk_dirty = false;
+        self.reflection_dirty = false;
     }
 
     /// Search chunk index but only return results whose IDs are in `allowed_ids`.
@@ -2670,13 +2742,39 @@ mod tests {
         }
 
         let query = distinct_embedding(500);
+        reset_search_index_test_counters();
         let t0 = std::time::Instant::now();
         let hits = engine.search_chunks(&query, 15, 2.0); // 2.0 > any cosine score
         let elapsed = t0.elapsed();
+        let (calls, max_fetch_limit) = search_index_test_counters();
 
         assert!(
             hits.is_empty(),
             "an unreachable min_score must filter out every hit"
+        );
+        // Structural signal (reviewer-found gap): a 2,000-point full-graph
+        // scan is cheap enough that a wall-clock ceiling alone does not
+        // catch a regression back to the old "escalate straight to
+        // max_elements" behaviour — that regressed version still passed
+        // this test's 200ms bound at 810.792µs. Assert directly on what
+        // `search_index` actually asked the HNSW graph for instead: exactly
+        // one call (no escalation at all — no tombstones means a deeper
+        // fetch could not add a qualifying hit), and that its `fetch_limit`
+        // never exceeded `limit * TOMBSTONE_OVERFETCH_CAP` (here, with no
+        // tombstones, the `live == max_elements` branch requests exactly
+        // `limit`).
+        assert_eq!(
+            calls, 1,
+            "no-tombstone score exhaustion must resolve in a single bounded \
+             search call, not escalate"
+        );
+        assert!(
+            max_fetch_limit <= (15 * TOMBSTONE_OVERFETCH_CAP) as u64,
+            "fetch_limit must never exceed limit * TOMBSTONE_OVERFETCH_CAP, got {max_fetch_limit}"
+        );
+        assert_eq!(
+            max_fetch_limit, 15,
+            "no tombstones and no escalation means fetch_limit stays exactly `limit`"
         );
         assert!(
             elapsed < std::time::Duration::from_millis(200),
