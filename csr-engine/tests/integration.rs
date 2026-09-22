@@ -625,13 +625,32 @@ fn test_format_recency_results_includes_age_stamp() {
 /// extraction note below), not a hand-labelled ground truth, so tests only
 /// lean on it where it says rank 1 was used — a false negative there just
 /// means the row is skipped, not misread.
+///
+/// `label` is the band of the PAGE's max raw score (what the original burst
+/// capture recorded as the search summary's `relevance` attribute), not
+/// necessarily rank 1's own band — rank 1 is chosen by rerank, which can
+/// promote a lower-raw-score result above a higher-raw-score one elsewhere
+/// on the page (row with `top=0.596, runner_up=0.722` labels `"partial"`
+/// because 0.722 is the page max, even though rank 1 itself is `"weak"`).
+/// `rank1_band` is `relevance_label(top)` computed at fixture-build time —
+/// use it, not `label`, whenever a test needs rank 1's actual band.
+///
+/// The 8 `fabricated: true` rows are real measurements (not the earlier
+/// lone-candidate synthesis): `examples/quick_check_floor_margin.rs` run
+/// read-only against the live DB (552,314 chunk vectors) on 2026-09-22,
+/// using the same 8 fabricated-probe texts as `examples/quick_check_floor.rs`
+/// (2026-08-03 baseline) — `top`/`runner_up` are that probe's real top-1 and
+/// top-2 exact-cosine scores, so `top - runner_up` is a genuine margin, not
+/// a synthesized one.
 #[derive(serde::Deserialize)]
 struct BurstFixtureRow {
     top: f32,
     runner_up: Option<f32>,
     #[allow(dead_code)]
     list_len: usize,
+    #[allow(dead_code)]
     label: String,
+    rank1_band: String,
     rank_used: Option<u32>,
     #[allow(dead_code)]
     requeried: Option<bool>,
@@ -665,23 +684,37 @@ fn fixture_chunk(id: &str, score: f32) -> EnrichedResult {
     }
 }
 
+/// The exact `format_quick_check` weak-band warning text at 8396ace (the
+/// commit this branch is based on, `git show 8396ace:csr-engine/src/format/mod.rs`),
+/// kept as a literal so the "before" side of this test is a real comparison,
+/// not an invented count. `format_search_results_with_rank_scores` at 8396ace
+/// had no caveat/warning of any kind in its `<summary>` — only `quick_check`
+/// carried this wording — so the true "before" state for the SEARCH path is
+/// 0 caveats, not a borrowed quick_check count.
+const OLD_QUICK_CHECK_SPURIOUS_WORDING: &str = "may be spurious";
+
 #[test]
 fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
     // Contract: for every burst where the session's next turn actually used
-    // the rank-1 result, the new wording must not call it spurious or
-    // indistinguishable from noise — that is exactly the mislabeling the 42%
-    // vs 18% immediate-re-query gap traces to.
+    // the rank-1 result, the new search-result wording must not call it
+    // spurious or indistinguishable from noise — that is exactly the
+    // mislabeling the 42% vs 18% immediate-re-query gap traces to.
+    //
+    // Receipt correction (WP-B review): `format_search_results_with_rank_scores`
+    // at 8396ace never emitted `OLD_QUICK_CHECK_SPURIOUS_WORDING` at all — that
+    // wording only ever existed in `format_quick_check`. So the honest "before"
+    // count for THIS renderer is 0/N, not N/N; what actually changed is that
+    // the renderer gained a `<caveat>` at all (previously none), and this test
+    // asserts the caveat it gained is never worded as a verdict against a hit
+    // that the session's own next turn proved correct.
     let fixture = load_burst_fixture();
     let mut checked = 0;
-    let mut before_spurious_count = 0; // what the OLD wording would have done
+    let mut caveated_after = 0;
     for row in &fixture {
-        if row.fabricated || row.rank_used != Some(1) || row.label != "weak" {
+        if row.fabricated || row.rank_used != Some(1) || row.rank1_band != "weak" {
             continue;
         }
         checked += 1;
-        // The old, now-removed behaviour: every weak-band result got the
-        // "may be spurious ... cannot tell them apart" wording unconditionally.
-        before_spurious_count += 1;
 
         let mut results = vec![fixture_chunk("rank1", row.top)];
         if let Some(second) = row.runner_up {
@@ -689,11 +722,25 @@ fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
         }
         let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
         assert!(
-            !xml.contains("spurious") && !xml.contains("indistinguishable"),
+            !xml.contains(OLD_QUICK_CHECK_SPURIOUS_WORDING) && !xml.contains("indistinguishable"),
             "row top={} runner_up={:?}: rank-1-correct weak result still reads as spurious: {xml}",
             row.top,
             row.runner_up
         );
+        // The false "clears the fabrication ceiling" claim (finding [high]
+        // #1) is the specific failure mode this fixture guards: a rank-1
+        // score below FABRICATED_PROBE_CEILING must never carry the ceiling
+        // clause, whether or not the margin made it decisive.
+        if row.top < format::FABRICATED_PROBE_CEILING {
+            assert!(
+                !xml.contains("clears the highest fabricated-probe score"),
+                "row top={} is below the ceiling and must not claim it cleared one: {xml}",
+                row.top
+            );
+        }
+        if xml.contains("<caveat>") {
+            caveated_after += 1;
+        }
     }
     assert!(
         checked > 0,
@@ -701,27 +748,69 @@ fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
     );
     println!(
         "WP-B receipt: rank-1-correct weak-band bursts checked={checked}, \
-         spurious-phrased under old wording={before_spurious_count}, under new wording=0"
+         spurious-phrased under old quick_check wording (search path never had it)=0/{checked}, \
+         carry a <caveat> under the new search-path wording={caveated_after}/{checked}"
     );
 }
 
 #[test]
 fn weak_band_fabricated_probes_still_carry_a_caveat() {
-    // Contract: the four fabricated-probe scores must still carry SOME
-    // caveat even though the literal wording changed — a weak match with no
-    // runner-up and a score below FABRICATED_PROBE_CEILING is exactly the
-    // "honest low-confidence" case, not the "decisive" one.
+    // Contract: fabricated-probe scores that are still in the WEAK band must
+    // still carry SOME caveat even though the literal wording changed.
+    //
+    // Review finding [medium]: testing fabricated probes as a lone candidate
+    // (no runner-up) is not what `quick_check` does once 2+ results exist —
+    // it always fetches a runner-up, so a fabricated probe with a real
+    // runner-up margin >= WEAK_BAND_DECISIVE_MARGIN would take the decisive
+    // branch. This fixture's fabricated rows now carry REAL runner-up scores
+    // (`examples/quick_check_floor_margin.rs`, read-only against the live DB,
+    // 2026-09-22, same 8 probe texts as `examples/quick_check_floor.rs`), so
+    // this test exercises the real margin, not a synthesized absence of one.
+    //
+    // Re-measuring surfaced a finding beyond what the review asked for: one
+    // of the 8 probes ("the team decision to rewrite anukriti in Elixir
+    // Phoenix LiveView") now scores 0.629 — that is corpus growth pushing a
+    // fabricated topic's nearest neighbour PAST WEAK_BAND_TOP (0.62)
+    // entirely, into the "partial" band, which carries no caveat at all by
+    // design. `FABRICATED_PROBE_CEILING` (0.605) and `WEAK_BAND_TOP` (0.62)
+    // are fixed constants measured 2026-08-03 against a smaller corpus;
+    // they are not recomputed as the corpus grows. That staleness is a
+    // real, live gap in the abstention system, but redefining those
+    // constants is a different, larger work item than this wording-only
+    // fix (spec: "Bands are unchanged") — flagged here via an explicit,
+    // non-silent assertion rather than papered over.
     let fixture = load_burst_fixture();
     let fabricated: Vec<_> = fixture.iter().filter(|r| r.fabricated).collect();
     assert_eq!(
         fabricated.len(),
-        4,
-        "expected the 4 known fabricated probes"
+        8,
+        "expected the 8 known fabricated probes"
     );
 
+    let still_weak: Vec<_> = fabricated
+        .iter()
+        .filter(|r| r.rank1_band == "weak")
+        .collect();
+    let drifted_out_of_weak: Vec<_> = fabricated
+        .iter()
+        .filter(|r| r.rank1_band != "weak")
+        .collect();
+
     let mut caveated = 0;
-    for row in &fabricated {
-        let results = vec![fixture_chunk("only", row.top)];
+    let mut max_margin = f32::MIN;
+    for row in &still_weak {
+        let runner_up = row.runner_up.unwrap_or_else(|| {
+            panic!(
+                "fabricated probe top={} has no runner-up in fixture",
+                row.top
+            )
+        });
+        max_margin = max_margin.max(row.top - runner_up);
+
+        let mut results = vec![fixture_chunk("only", row.top)];
+        if let Some(second) = row.runner_up {
+            results.push(fixture_chunk("second", second));
+        }
         let xml = format::format_quick_check(&results, "fabricated probe");
         assert!(
             xml.contains("<warning>"),
@@ -735,7 +824,43 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
         );
         caveated += 1;
     }
-    println!("WP-B receipt: fabricated probes still caveated = {caveated}/4");
+
+    // The margin half of the review finding, checked directly: every real
+    // fabricated-probe runner-up margin measured against the live corpus is
+    // below WEAK_BAND_DECISIVE_MARGIN, so none of the still-weak-band probes
+    // takes the decisive "leads the field" branch on margin alone.
+    assert!(
+        max_margin < format::WEAK_BAND_DECISIVE_MARGIN,
+        "a fabricated probe's real runner-up margin ({max_margin:.3}) reached \
+         WEAK_BAND_DECISIVE_MARGIN ({}) — it would now read as decisive",
+        format::WEAK_BAND_DECISIVE_MARGIN
+    );
+
+    // Explicit, visible receipt for the drift finding rather than a silently
+    // skipped row: confirm it really is the "partial, no caveat at all" case
+    // this comment describes, so a future re-measurement that moves it back
+    // into the weak band doesn't leave a stale assertion behind.
+    for row in &drifted_out_of_weak {
+        let results = vec![fixture_chunk("only", row.top)];
+        let xml = format::format_quick_check(&results, "fabricated probe");
+        assert!(
+            !xml.contains("<warning>"),
+            "expected this drifted-out-of-weak-band probe (top={}, band={}) to carry NO \
+             caveat under the current bands, confirming the corpus-drift finding — if this \
+             now fails, the drift finding may have self-corrected: {xml}",
+            row.top,
+            row.rank1_band
+        );
+    }
+
+    println!(
+        "WP-B receipt: fabricated probes still caveated = {caveated}/{} (still weak-band), \
+         max real runner-up margin = {max_margin:.3} (threshold {}), \
+         drifted out of weak band with zero caveat = {}/8 (corpus-growth staleness, not this fix)",
+        still_weak.len(),
+        format::WEAK_BAND_DECISIVE_MARGIN,
+        drifted_out_of_weak.len()
+    );
 }
 
 #[test]

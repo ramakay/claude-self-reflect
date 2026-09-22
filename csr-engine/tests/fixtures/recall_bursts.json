@@ -6,7 +6,8 @@
     "label": "weak",
     "rank_used": 5,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.533,
@@ -15,7 +16,8 @@
     "label": "weak",
     "rank_used": 6,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.557,
@@ -24,7 +26,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.539,
@@ -33,7 +36,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.591,
@@ -42,7 +46,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.515,
@@ -51,7 +56,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.523,
@@ -60,7 +66,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.677,
@@ -69,7 +76,8 @@
     "label": "partial",
     "rank_used": 1,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.547,
@@ -78,7 +86,8 @@
     "label": "weak",
     "rank_used": 4,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.417,
@@ -87,7 +96,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.37,
@@ -96,7 +106,8 @@
     "label": "weak",
     "rank_used": 7,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 1.0,
@@ -105,7 +116,8 @@
     "label": "high",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "high"
   },
   {
     "top": 0.613,
@@ -114,7 +126,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.481,
@@ -123,7 +136,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 1.0,
@@ -132,7 +146,8 @@
     "label": "high",
     "rank_used": 1,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "high"
   },
   {
     "top": 0.569,
@@ -141,7 +156,8 @@
     "label": "weak",
     "rank_used": 1,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.584,
@@ -150,7 +166,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.595,
@@ -159,7 +176,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.619,
@@ -168,7 +186,8 @@
     "label": "weak",
     "rank_used": 3,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.482,
@@ -177,7 +196,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.601,
@@ -186,7 +206,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.569,
@@ -195,7 +216,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.529,
@@ -204,7 +226,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.558,
@@ -213,7 +236,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.564,
@@ -222,7 +246,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.51,
@@ -231,7 +256,8 @@
     "label": "weak",
     "rank_used": 3,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.609,
@@ -240,7 +266,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.562,
@@ -249,7 +276,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.586,
@@ -258,7 +286,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.526,
@@ -267,7 +296,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.607,
@@ -276,7 +306,8 @@
     "label": "weak",
     "rank_used": 1,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.561,
@@ -285,7 +316,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.562,
@@ -294,7 +326,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.435,
@@ -303,7 +336,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.507,
@@ -312,7 +346,8 @@
     "label": "weak",
     "rank_used": 1,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.575,
@@ -321,7 +356,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.558,
@@ -330,7 +366,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.644,
@@ -339,7 +376,8 @@
     "label": "partial",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.612,
@@ -348,7 +386,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 1.0,
@@ -357,7 +396,8 @@
     "label": "high",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "high"
   },
   {
     "top": 0.37,
@@ -366,7 +406,8 @@
     "label": "weak",
     "rank_used": 2,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.551,
@@ -375,7 +416,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.518,
@@ -384,7 +426,8 @@
     "label": "weak",
     "rank_used": 6,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.447,
@@ -393,7 +436,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 1.0,
@@ -402,7 +446,8 @@
     "label": "high",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "high"
   },
   {
     "top": 0.472,
@@ -411,7 +456,8 @@
     "label": "weak",
     "rank_used": 4,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.698,
@@ -420,7 +466,8 @@
     "label": "partial",
     "rank_used": 6,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.482,
@@ -429,7 +476,8 @@
     "label": "weak",
     "rank_used": 2,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.606,
@@ -438,7 +486,8 @@
     "label": "weak",
     "rank_used": 4,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.477,
@@ -447,7 +496,8 @@
     "label": "weak",
     "rank_used": 1,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.668,
@@ -456,7 +506,8 @@
     "label": "partial",
     "rank_used": 7,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.563,
@@ -465,7 +516,8 @@
     "label": "weak",
     "rank_used": 1,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.586,
@@ -474,7 +526,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.67,
@@ -483,7 +536,8 @@
     "label": "partial",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.641,
@@ -492,7 +546,8 @@
     "label": "partial",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.42,
@@ -501,7 +556,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.369,
@@ -510,7 +566,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.59,
@@ -519,7 +576,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.577,
@@ -528,7 +586,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.671,
@@ -537,7 +596,8 @@
     "label": "partial",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.538,
@@ -546,7 +606,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.596,
@@ -555,7 +616,8 @@
     "label": "partial",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.652,
@@ -564,7 +626,8 @@
     "label": "high",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.618,
@@ -573,7 +636,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.676,
@@ -582,7 +646,8 @@
     "label": "partial",
     "rank_used": null,
     "requeried": false,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "partial"
   },
   {
     "top": 0.476,
@@ -591,7 +656,8 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
   },
   {
     "top": 0.471,
@@ -600,42 +666,87 @@
     "label": "weak",
     "rank_used": null,
     "requeried": true,
-    "fabricated": false
+    "fabricated": false,
+    "rank1_band": "weak"
+  },
+  {
+    "top": 0.589,
+    "runner_up": 0.508,
+    "list_len": 2,
+    "label": "weak",
+    "rank_used": null,
+    "requeried": null,
+    "fabricated": true,
+    "rank1_band": "weak"
+  },
+  {
+    "top": 0.606,
+    "runner_up": 0.597,
+    "list_len": 2,
+    "label": "weak",
+    "rank_used": null,
+    "requeried": null,
+    "fabricated": true,
+    "rank1_band": "weak"
+  },
+  {
+    "top": 0.629,
+    "runner_up": 0.628,
+    "list_len": 2,
+    "label": "weak",
+    "rank_used": null,
+    "requeried": null,
+    "fabricated": true,
+    "rank1_band": "partial"
   },
   {
     "top": 0.456,
-    "runner_up": null,
-    "list_len": 1,
+    "runner_up": 0.435,
+    "list_len": 2,
     "label": "weak",
     "rank_used": null,
     "requeried": null,
-    "fabricated": true
+    "fabricated": true,
+    "rank1_band": "weak"
   },
   {
-    "top": 0.461,
-    "runner_up": null,
-    "list_len": 1,
+    "top": 0.547,
+    "runner_up": 0.53,
+    "list_len": 2,
     "label": "weak",
     "rank_used": null,
     "requeried": null,
-    "fabricated": true
+    "fabricated": true,
+    "rank1_band": "weak"
   },
   {
-    "top": 0.583,
-    "runner_up": null,
-    "list_len": 1,
+    "top": 0.565,
+    "runner_up": 0.55,
+    "list_len": 2,
     "label": "weak",
     "rank_used": null,
     "requeried": null,
-    "fabricated": true
+    "fabricated": true,
+    "rank1_band": "weak"
   },
   {
-    "top": 0.588,
-    "runner_up": null,
-    "list_len": 1,
+    "top": 0.507,
+    "runner_up": 0.495,
+    "list_len": 2,
     "label": "weak",
     "rank_used": null,
     "requeried": null,
-    "fabricated": true
+    "fabricated": true,
+    "rank1_band": "weak"
+  },
+  {
+    "top": 0.454,
+    "runner_up": 0.44,
+    "list_len": 2,
+    "label": "weak",
+    "rank_used": null,
+    "requeried": null,
+    "fabricated": true,
+    "rank1_band": "weak"
   }
 ]

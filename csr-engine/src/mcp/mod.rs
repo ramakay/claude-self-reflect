@@ -380,7 +380,7 @@ impl CsrServer {
 
     #[tool(
         name = "csr_quick_check",
-        description = "Quick check if a topic was discussed before. Returns count and top match only. Much faster than full search - use for existence checks. Answers negatively: when nothing scores above the relevance floor it returns <found>false</found> with no preview, and matches in the weak band are labelled as possibly spurious.",
+        description = "Quick check if a topic was discussed before. Returns count and top match only. Much faster than full search - use for existence checks. Answers negatively: when nothing scores above the relevance floor it returns <found>false</found> with no preview. Matches in the weak band carry a margin-aware calibration caveat: absolute cosine is weakly calibrated in that band, but a result that clearly beats the field is not called spurious just for landing there.",
         annotations(
             title = "Quick Check",
             read_only_hint = true,
