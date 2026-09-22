@@ -358,32 +358,109 @@ fn render_stats(
 
 // ─── prompts ───
 
+/// Fixed reporting order for the `prompts` view's `hidden: ...` header line
+/// and JSON `hidden` map (inbox-B3 spec §3c) — not alphabetical, matches the
+/// spec's worked example so a human diffing successive runs sees a stable
+/// column order.
+const HIDDEN_CLASS_ORDER: [&str; 10] = [
+    "task_notification",
+    "queued_duplicate",
+    "local_command",
+    "slash_command_no_args",
+    "compaction_summary",
+    "interrupt_marker",
+    "cross_session_message",
+    "skill_body",
+    "meta",
+    "other_origin",
+];
+
+/// If `text` (already `strip_queued_prefix`-stripped) is a `<command-name>`
+/// echo carrying non-empty `<command-args>`, return the human-readable
+/// `"/name args"` display form — a typed slash command carrying an ask is a
+/// human prompt, not plumbing (inbox-B3 spec §3b). `None` for every other
+/// shape, including empty-args commands (those are hidden as
+/// `slash_command_no_args` instead).
+fn command_display_override(text: &str) -> Option<String> {
+    if !(text.starts_with("<command-name>") || text.starts_with("<command-message>")) {
+        return None;
+    }
+    let (name, args) = super::parse_command_tags(text)?;
+    if args.is_empty() {
+        return None;
+    }
+    Some(format!("{name} {args}"))
+}
+
 fn render_prompts(parsed: &ParsedTranscript, req: &TranscriptRequest) -> ViewData {
-    let items: Vec<RenderItem> = parsed
+    use std::collections::HashSet;
+
+    let mut hidden_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut seen_text: HashSet<String> = HashSet::new();
+    let mut items: Vec<RenderItem> = Vec::new();
+
+    for e in parsed
         .entries
         .iter()
         .filter(|e| e.role == Role::User && req.role.matches_role(Role::User))
         .filter(|e| !e.text.trim().is_empty())
         .filter(|e| turn_in_range(e.turn, req.turns))
-        .map(|e| {
-            let ts = e.timestamp.as_deref().unwrap_or("-");
-            let preview = truncate_chars(e.text.trim(), 300);
-            RenderItem {
-                turn: e.turn,
-                text: format!("[turn {}] {ts}: {}", e.turn, xml_escape(&preview)),
-                json: json!({
-                    "turn": e.turn,
-                    "timestamp": e.timestamp,
-                    "text": e.text,
-                }),
+    {
+        let stripped = super::strip_queued_prefix(&e.text);
+        let override_text = command_display_override(stripped);
+        let display_text: &str = override_text.as_deref().unwrap_or(e.text.as_str());
+
+        if !req.include_system {
+            if let Some(class) = super::prompt_noise_class(e) {
+                *hidden_counts.entry(class).or_insert(0) += 1;
+                continue;
             }
-        })
-        .collect();
+            let normalized = super::strip_queued_prefix(display_text).trim().to_string();
+            if !seen_text.insert(normalized) {
+                *hidden_counts.entry("queued_duplicate").or_insert(0) += 1;
+                continue;
+            }
+        }
+
+        let ts = e.timestamp.as_deref().unwrap_or("-");
+        let preview = truncate_chars(display_text.trim(), 300);
+        items.push(RenderItem {
+            turn: e.turn,
+            text: format!("[turn {}] {ts}: {}", e.turn, xml_escape(&preview)),
+            json: json!({
+                "turn": e.turn,
+                "timestamp": e.timestamp,
+                "text": display_text,
+            }),
+        });
+    }
+
+    let mut header_lines = vec!["<transcript_prompts>".to_string()];
+    if !req.include_system && hidden_counts.values().any(|&v| v > 0) {
+        let parts: Vec<String> = HIDDEN_CLASS_ORDER
+            .iter()
+            .filter_map(|k| hidden_counts.get(k).map(|v| format!("{k}={v}")))
+            .collect();
+        header_lines.push(format!(
+            "hidden: {} (include_system=true to show)",
+            parts.join(" ")
+        ));
+    }
+
+    let mut hidden_json = serde_json::Map::new();
+    for k in HIDDEN_CLASS_ORDER {
+        if let Some(v) = hidden_counts.get(k) {
+            hidden_json.insert(k.to_string(), json!(v));
+        }
+    }
 
     ViewData {
         view: "prompts",
-        extra_json: vec![],
-        header_lines: vec!["<transcript_prompts>".to_string()],
+        extra_json: vec![
+            ("hidden".to_string(), Value::Object(hidden_json)),
+            ("include_system".to_string(), json!(req.include_system)),
+        ],
+        header_lines,
         items,
         empty_message: "(no user prompts found)".to_string(),
     }
@@ -1113,6 +1190,291 @@ mod tests {
 
     // ─── prompts view ───
 
+    // ─── inbox-B3: prompts view noise classification ───
+    //
+    // One line of every noise class from the spec, in the order Claude Code
+    // would actually emit them in a real session. Text/timestamps are
+    // otherwise arbitrary but shaped exactly like real transcript content
+    // (see the receipt session in the work item spec).
+
+    fn write_prompt_noise_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("prompt_noise.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        // 1: typed human, origin.kind=human
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:01:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"do the first real thing"}}}}"#
+        )
+        .unwrap();
+
+        // 2: legacy human, no origin field at all
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:02:00Z","message":{{"role":"user","content":"legacy human turn, no origin field"}}}}"#
+        )
+        .unwrap();
+
+        // 3a: task-notification queue-operation enqueue copy
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-22T00:03:00Z","content":"<task-notification>background task finished</task-notification>"}}"#
+        )
+        .unwrap();
+        // 3b: the same task-notification, delivered
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:04:00Z","origin":{{"kind":"task-notification"}},"message":{{"role":"user","content":"<task-notification>background task finished</task-notification>"}}}}"#
+        )
+        .unwrap();
+
+        // 4a: queued human prompt (queue-operation enqueue)
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-22T00:05:00Z","content":"go build the widget"}}"#
+        )
+        .unwrap();
+        // 4b: the same prompt, delivered later with identical text
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:06:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"go build the widget"}}}}"#
+        )
+        .unwrap();
+
+        // 5: queued-only human attachment.queued_command (no delivered twin)
+        writeln!(
+            f,
+            r#"{{"type":"attachment","timestamp":"2026-09-22T00:07:00Z","attachment":{{"type":"queued_command","prompt":"ship the release notes","timestamp":"2026-09-22T00:07:00Z"}}}}"#
+        )
+        .unwrap();
+
+        // 6: isMeta skill body
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:08:00Z","isMeta":true,"message":{{"role":"user","content":"Base directory for this skill: /Users/x/.claude/skills/foo"}}}}"#
+        )
+        .unwrap();
+
+        // 7: peer cross-session-message, isMeta
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:09:00Z","origin":{{"kind":"peer"}},"isMeta":true,"message":{{"role":"user","content":"Another Claude session sent a message: <cross-session-message from=\"other\">check on the build</cross-session-message>"}}}}"#
+        )
+        .unwrap();
+
+        // 8a: local-command-caveat
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:10:00Z","isMeta":true,"message":{{"role":"user","content":"<local-command-caveat>Caveat: the messages below were generated by the user while running local commands.</local-command-caveat>"}}}}"#
+        )
+        .unwrap();
+        // 8b: command-name/compact with empty args
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:11:00Z","message":{{"role":"user","content":"<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"}}}}"#
+        )
+        .unwrap();
+        // 8c: local-command-stdout
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:12:00Z","isMeta":true,"message":{{"role":"user","content":"<local-command-stdout>Compacted conversation summary.</local-command-stdout>"}}}}"#
+        )
+        .unwrap();
+
+        // 9: command-name with a real ask — a typed slash command carrying
+        // an argument is a human prompt, not plumbing.
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:13:00Z","message":{{"role":"user","content":"<command-name>/codex:rescue</command-name>\n<command-message>codex:rescue</command-message>\n<command-args>fix the bug</command-args>"}}}}"#
+        )
+        .unwrap();
+
+        // 10: isCompactSummary
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:14:00Z","isCompactSummary":true,"message":{{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}}}"#
+        )
+        .unwrap();
+
+        // 11: interrupt marker
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:15:00Z","message":{{"role":"user","content":"[Request interrupted by user]"}}}}"#
+        )
+        .unwrap();
+
+        // 12: isMeta image companion
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:16:00Z","isMeta":true,"message":{{"role":"user","content":"[Image: source: clipboard.png]"}}}}"#
+        )
+        .unwrap();
+
+        path
+    }
+
+    /// (i) default (human-only) view shows exactly the 5 genuine human
+    /// prompts. (ii) header counts are exact per class.
+    #[test]
+    fn prompts_view_default_hides_noise_and_reports_exact_hidden_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_noise_fixture(dir.path());
+        let mut req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        req.json = true;
+        let out = transcript::run(dir.path(), &req);
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        let texts: Vec<String> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "do the first real thing",
+                "legacy human turn, no origin field",
+                "[queued] go build the widget",
+                "[queued] ship the release notes",
+                "/codex:rescue fix the bug",
+            ],
+            "got: {out}"
+        );
+
+        let hidden = &v["hidden"];
+        assert_eq!(hidden["task_notification"], json!(2));
+        assert_eq!(hidden["queued_duplicate"], json!(1));
+        assert_eq!(hidden["local_command"], json!(2));
+        assert_eq!(hidden["slash_command_no_args"], json!(1));
+        assert_eq!(hidden["compaction_summary"], json!(1));
+        assert_eq!(hidden["interrupt_marker"], json!(1));
+        assert_eq!(hidden["cross_session_message"], json!(1));
+        assert_eq!(hidden["skill_body"], json!(1));
+        assert_eq!(hidden["meta"], json!(1));
+        assert_eq!(hidden.get("other_origin"), None);
+        assert_eq!(v["include_system"], json!(false));
+    }
+
+    /// (iii) `include_system=true` reproduces the pre-change output: every
+    /// non-empty user entry, unfiltered, no hidden map populated.
+    #[test]
+    fn prompts_view_include_system_reproduces_every_user_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_noise_fixture(dir.path());
+        let mut req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        req.json = true;
+        req.include_system = true;
+        let out = transcript::run(dir.path(), &req);
+        let v: Value = serde_json::from_str(&out).unwrap();
+
+        assert_eq!(v["items"].as_array().unwrap().len(), 16, "got: {out}");
+        assert_eq!(v["include_system"], json!(true));
+        assert_eq!(v["hidden"], json!({}));
+
+        let text_out = transcript::run(
+            dir.path(),
+            &TranscriptRequest {
+                include_system: true,
+                ..base_req(ViewKind::Prompts, &path.to_string_lossy())
+            },
+        );
+        assert!(!text_out.contains("hidden:"));
+    }
+
+    /// (iv) surviving items' turn numbers must equal their turn numbers
+    /// under `include_system=true` — filtering never renumbers turns.
+    #[test]
+    fn prompts_view_turn_numbers_stable_across_include_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_noise_fixture(dir.path());
+
+        let mut full_req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        full_req.json = true;
+        full_req.include_system = true;
+        let full_out = transcript::run(dir.path(), &full_req);
+        let full_v: Value = serde_json::from_str(&full_out).unwrap();
+        let full_by_text: std::collections::HashMap<String, u64> = full_v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                (
+                    i["text"].as_str().unwrap().to_string(),
+                    i["turn"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+
+        let mut default_req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        default_req.json = true;
+        let default_out = transcript::run(dir.path(), &default_req);
+        let default_v: Value = serde_json::from_str(&default_out).unwrap();
+        for item in default_v["items"].as_array().unwrap() {
+            let text = item["text"].as_str().unwrap();
+            let turn = item["turn"].as_u64().unwrap();
+            // The delivered "go build the widget" collapses into the
+            // queued copy's turn, so look it up by the SAME text that
+            // survived (the queued form) rather than assuming identity.
+            assert_eq!(
+                full_by_text.get(text),
+                Some(&turn),
+                "turn number for {text:?} must be identical with/without include_system"
+            );
+        }
+    }
+
+    /// (v) the other views' JSON output on this fixture carries no new keys
+    /// — the new `Entry` fields (`origin_kind`/`is_meta`/`is_compact_summary`)
+    /// must not leak into any view that doesn't serialize `Entry` directly.
+    #[test]
+    fn other_views_json_unaffected_by_new_entry_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_noise_fixture(dir.path());
+        for view in [
+            ViewKind::Slice,
+            ViewKind::Grep,
+            ViewKind::Tools,
+            ViewKind::Files,
+            ViewKind::Errors,
+            ViewKind::Stats,
+        ] {
+            let mut req = base_req(view, &path.to_string_lossy());
+            req.json = true;
+            if view == ViewKind::Grep {
+                req.grep = Some("thing".to_string());
+            }
+            let out = transcript::run(dir.path(), &req);
+            assert!(
+                !out.contains("origin_kind")
+                    && !out.contains("is_meta")
+                    && !out.contains("is_compact_summary"),
+                "new Entry field leaked into {view:?} JSON: {out}"
+            );
+        }
+    }
+
+    /// (vi) `--turns` range narrowing changes the hidden counts accordingly
+    /// — counts must reflect only the requested range, not the whole file.
+    #[test]
+    fn prompts_view_turns_range_narrows_hidden_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_prompt_noise_fixture(dir.path());
+
+        // Turns 1..4 cover only the typed human + legacy human + the
+        // task-notification enqueue/delivered pair (turns 1-4 in file
+        // order) — no local_command/compaction_summary/etc noise yet.
+        let mut req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        req.json = true;
+        req.turns = Some((1, Some(4)));
+        let out = transcript::run(dir.path(), &req);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hidden"]["task_notification"], json!(2));
+        assert_eq!(v["hidden"].get("local_command"), None);
+        assert_eq!(v["hidden"].get("compaction_summary"), None);
+        assert_eq!(v["items"].as_array().unwrap().len(), 2, "got: {out}");
+    }
+
     #[test]
     fn prompts_view_returns_only_user_text_with_turn_numbers() {
         let dir = tempfile::tempdir().unwrap();
@@ -1599,6 +1961,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
         )
         .unwrap();

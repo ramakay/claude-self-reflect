@@ -175,6 +175,10 @@ pub struct TranscriptParams {
     /// Reserved for v2 (subagent sidechain inclusion) — rejected with a
     /// clear message in v1
     pub sidechains: Option<bool>,
+    /// prompts view: include non-human user turns (task notifications,
+    /// skill bodies, cross-session messages, local-command echoes,
+    /// compaction summaries) and queued duplicates; default false
+    pub include_system: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -662,7 +666,7 @@ impl CsrServer {
 
     #[tool(
         name = "csr_transcript",
-        description = "Structured facts from a Claude Code session transcript JSONL: stats, prompts, tool calls, touched files, errors, a turn-range/last-N slice, or a text grep — without hand-rolling a jq/Python parser over raw JSONL. Every view emits turn numbers so a follow-up slice can zoom in; large results honestly truncate with a `turns` resume hint instead of silently cutting.",
+        description = "Structured facts from a Claude Code session transcript JSONL: stats, prompts, tool calls, touched files, errors, a turn-range/last-N slice, or a text grep — without hand-rolling a jq/Python parser over raw JSONL. Every view emits turn numbers so a follow-up slice can zoom in; large results honestly truncate with a `turns` resume hint instead of silently cutting. The `prompts` view shows human-typed turns only by default, hiding task notifications, skill bodies, cross-session messages, local-command echoes, compaction summaries, and queued/delivered duplicates behind a `hidden: class=count` header — pass `include_system: true` to see everything, unfiltered.",
         annotations(
             title = "Transcript Query",
             read_only_hint = true,
@@ -689,6 +693,7 @@ impl CsrServer {
             json_mode,
             p.budget_chars,
             p.sidechains.unwrap_or(false),
+            p.include_system.unwrap_or(false),
         );
         // Text-mode output is a hand-built pseudo-XML envelope
         // (`<transcript_slice>…</transcript_slice>`) around verbatim
@@ -1038,6 +1043,68 @@ mod tests {
 
     // ─── adversarial review finding 6: tool_names()/find_tool() must agree
     // with tool_count() and actually resolve csr_transcript ───
+
+    // ─── inbox-B3: `include_system` must deserialize off the wire and
+    // actually change `csr_transcript prompts` behavior, not just sit in
+    // the params struct unused ───
+
+    #[test]
+    fn transcript_params_include_system_deserializes_and_reaches_request() {
+        let json = r#"{"session":"ignored","view":"prompts","include_system":true}"#;
+        let params: TranscriptParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.include_system, Some(true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let proj_dir = dir.path().join("proj");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let session_path = proj_dir.join("sess1.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"user\",\"origin\":{\"kind\":\"task-notification\"},\"message\":{\"role\":\"user\",\"content\":\"<task-notification>done</task-notification>\"}}\n",
+        )
+        .unwrap();
+
+        let default_out = tools::transcript(
+            dir.path(),
+            &session_path.to_string_lossy(),
+            "prompts",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            default_out.contains("hidden: task_notification=1"),
+            "got: {default_out}"
+        );
+        assert!(!default_out.contains("done"));
+
+        let with_system_out = tools::transcript(
+            dir.path(),
+            &session_path.to_string_lossy(),
+            "prompts",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            params.include_system.unwrap_or(false),
+        )
+        .unwrap();
+        assert!(with_system_out.contains("done"), "got: {with_system_out}");
+        assert!(!with_system_out.contains("hidden:"));
+    }
 
     #[test]
     fn tool_names_includes_csr_transcript_and_matches_tool_count() {

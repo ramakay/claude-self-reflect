@@ -2749,6 +2749,7 @@ pub fn transcript(
     json: bool,
     budget_chars: Option<usize>,
     sidechains: bool,
+    include_system: bool,
 ) -> Result<String> {
     use crate::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
 
@@ -2794,6 +2795,7 @@ pub fn transcript(
             .unwrap_or(crate::transcript::DEFAULT_BUDGET_CHARS)
             .min(MCP_TRANSCRIPT_MAX_BUDGET_CHARS),
         sidechains,
+        include_system,
     };
 
     Ok(crate::transcript::run(projects_dir, &req))

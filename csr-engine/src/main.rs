@@ -150,6 +150,12 @@ enum Commands {
         /// clear message in v1, never silently ignored.
         #[arg(long)]
         sidechains: bool,
+
+        /// prompts view: include non-human user turns (task notifications,
+        /// skill bodies, cross-session messages, local-command echoes,
+        /// compaction summaries) and queued duplicates; default false.
+        #[arg(long)]
+        include_system: bool,
     },
     /// Run ratification extraction for specific conversation IDs (one-off,
     /// bypasses the daemon queue ordering)
@@ -910,6 +916,7 @@ async fn run() -> Result<()> {
         json,
         budget_chars,
         sidechains,
+        include_system,
     }) = args.command
     {
         use csr_engine::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
@@ -949,6 +956,7 @@ async fn run() -> Result<()> {
             json,
             budget_chars,
             sidechains,
+            include_system,
         };
         let out = csr_engine::transcript::run(&args.projects_dir, &req);
         print!("{out}");

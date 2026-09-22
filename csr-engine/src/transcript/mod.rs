@@ -105,6 +105,25 @@ pub struct Entry {
     pub text: String,
     pub tool_uses: Vec<ToolUse>,
     pub tool_results: Vec<ToolResult>,
+    /// Top-level `origin.kind` (`"human"`, `"task-notification"`, `"peer"`,
+    /// …), or `attachment.origin.kind` for a queued_command attachment.
+    /// `None` on legacy transcripts that predate the field, and on every
+    /// synthetic entry this module builds itself (queue-operation echoes,
+    /// file-history deltas). Used only by `prompt_noise_class` — kept out of
+    /// every view's JSON output (`skip_serializing_if`) so no existing
+    /// output shape changes (inbox-B3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_kind: Option<String>,
+    /// Top-level `isMeta`, or `attachment.isMeta` for a queued_command
+    /// attachment. Marks skill bodies, local-command caveats, image
+    /// companions, and other harness-authored non-prose user turns.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_meta: bool,
+    /// Top-level `isCompactSummary` — marks the "This session is being
+    /// continued from a previous conversation…" summary Claude Code injects
+    /// as a user turn after `/compact`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_compact_summary: bool,
 }
 
 impl Entry {
@@ -280,6 +299,19 @@ fn build_message_entry(type_str: &str, value: &serde_json::Value) -> Entry {
         .get("isSidechain")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let origin_kind = value
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let is_meta = value
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_compact_summary = value
+        .get("isCompactSummary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut text = String::new();
     let mut tool_uses = Vec::new();
@@ -315,6 +347,9 @@ fn build_message_entry(type_str: &str, value: &serde_json::Value) -> Entry {
         text,
         tool_uses,
         tool_results,
+        origin_kind,
+        is_meta,
+        is_compact_summary,
     }
 }
 
@@ -353,6 +388,9 @@ fn classify_queue_operation(
         text: format!("[queued] {}", strip_control_chars(content)),
         tool_uses: vec![],
         tool_results: vec![],
+        origin_kind: None,
+        is_meta: false,
+        is_compact_summary: false,
     })
 }
 
@@ -392,6 +430,26 @@ fn classify_attachment(
         .get("uuid")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let origin_kind = attachment
+        .get("origin")
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let is_meta = attachment
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || value
+            .get("isMeta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     LineOutcome::Entry(Entry {
         turn: 0,
         role: Role::User,
@@ -404,6 +462,9 @@ fn classify_attachment(
         text: format!("[queued] {}", strip_control_chars(prompt)),
         tool_uses: vec![],
         tool_results: vec![],
+        origin_kind,
+        is_meta,
+        is_compact_summary: false,
     })
 }
 
@@ -448,6 +509,9 @@ fn classify_file_history_delta(value: &serde_json::Value) -> LineOutcome {
             prompt: None,
         }],
         tool_results: vec![],
+        origin_kind: None,
+        is_meta: false,
+        is_compact_summary: false,
     })
 }
 
@@ -599,6 +663,104 @@ pub(crate) fn index_tool_results(entries: &[Entry]) -> HashMap<String, (usize, T
     index
 }
 
+// ─── Prompt-noise classification (inbox-B3) ───
+
+/// Strip every leading `"[queued] "` token (queuing can in principle nest —
+/// mirrors `is_noisy_steer_text`'s normalization) and leading whitespace,
+/// returning the underlying text a noise-class check should match against.
+pub(crate) fn strip_queued_prefix(text: &str) -> &str {
+    const QUEUED_PREFIX: &str = "[queued] ";
+    let mut t = text.trim_start();
+    while let Some(stripped) = t.strip_prefix(QUEUED_PREFIX) {
+        t = stripped.trim_start();
+    }
+    t
+}
+
+/// Extract the text between the first `open`...`close` tag pair in `text`.
+fn extract_tag(text: &str, open: &str, close: &str) -> Option<String> {
+    let start = text.find(open)? + open.len();
+    let rest = &text[start..];
+    let end = rest.find(close)?;
+    Some(rest[..end].to_string())
+}
+
+/// Parse a `<command-name>NAME</command-name>...<command-args>ARGS</command-args>`
+/// slash-command echo (Claude Code's on-disk representation of a typed
+/// `/name args` invocation). `args` is `""` when the tag is present but
+/// empty (e.g. `/compact`) or absent entirely. Returns `None` only when
+/// `<command-name>` itself doesn't parse (malformed/legacy shape).
+pub(crate) fn parse_command_tags(text: &str) -> Option<(String, String)> {
+    let name = extract_tag(text, "<command-name>", "</command-name>")?;
+    let args = extract_tag(text, "<command-args>", "</command-args>").unwrap_or_default();
+    Some((name.trim().to_string(), args.trim().to_string()))
+}
+
+/// Classify a `prompts`-view candidate entry as harness-authored noise, or
+/// `None` for a genuine human-typed turn. Order matters: earlier rules take
+/// priority over later, less-specific ones (inbox-B3 spec §3b). Text
+/// matching is always performed on `strip_queued_prefix(&e.text)` so a
+/// queued copy of a noise line is classified the same as its delivered
+/// twin.
+pub(crate) fn prompt_noise_class(e: &Entry) -> Option<&'static str> {
+    let text = strip_queued_prefix(&e.text);
+
+    if e.is_compact_summary
+        || text.starts_with("This session is being continued from a previous conversation")
+    {
+        return Some("compaction_summary");
+    }
+    if e.origin_kind.as_deref() == Some("task-notification")
+        || text.starts_with("<task-notification>")
+    {
+        return Some("task_notification");
+    }
+    if e.origin_kind.as_deref() == Some("peer")
+        || text.starts_with("Another Claude session sent a message:")
+        || text.starts_with("<cross-session-message")
+    {
+        return Some("cross_session_message");
+    }
+    if text.starts_with("Base directory for this skill:") {
+        return Some("skill_body");
+    }
+    if text.starts_with("<local-command-caveat>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<local-command-stderr>")
+    {
+        return Some("local_command");
+    }
+    if text.starts_with("<command-name>") || text.starts_with("<command-message>") {
+        if let Some((_, args)) = parse_command_tags(text) {
+            return if args.is_empty() {
+                Some("slash_command_no_args")
+            } else {
+                // A typed slash command carrying an ask (e.g.
+                // `/codex:rescue fix the bug`) IS a human prompt —
+                // `render_prompts` renders it as `/name args`.
+                None
+            };
+        }
+    }
+    if text.starts_with("[Request interrupted by user") {
+        return Some("interrupt_marker");
+    }
+    if text.starts_with("[SYSTEM NOTIFICATION") {
+        return Some("task_notification");
+    }
+    if e.is_meta {
+        return Some("meta");
+    }
+    if let Some(k) = e.origin_kind.as_deref() {
+        if k != "human" {
+            // Future-proof: an unknown non-human origin is never shown as
+            // human by default.
+            return Some("other_origin");
+        }
+    }
+    None
+}
+
 // ─── Session resolution ───
 
 /// Resolve a session identifier (substring/exact id match, same rule
@@ -720,6 +882,12 @@ pub struct TranscriptRequest {
     pub json: bool,
     pub budget_chars: usize,
     pub sidechains: bool,
+    /// `prompts` view only: include non-human user turns (task
+    /// notifications, skill bodies, cross-session messages, local-command
+    /// echoes, compaction summaries) and queued duplicates that the
+    /// default (human-only) view hides. `true` reproduces the pre-filter
+    /// output exactly. Default `false`.
+    pub include_system: bool,
 }
 
 impl Default for TranscriptRequest {
@@ -736,6 +904,7 @@ impl Default for TranscriptRequest {
             json: false,
             budget_chars: DEFAULT_BUDGET_CHARS,
             sidechains: false,
+            include_system: false,
         }
     }
 }
