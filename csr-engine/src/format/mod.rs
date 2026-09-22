@@ -62,25 +62,38 @@ pub fn relevance_label(score: f32) -> &'static str {
     }
 }
 
-/// Highest fabricated-probe score measured 2026-08-03 (see [`QUICK_CHECK_FLOOR`]
-/// docs): 8 topics that were never discussed on this machine scored up to 0.605.
-/// A weak-band top score at or above this ceiling has already cleared every
-/// measured fabrication, so wording that says it "may be spurious" or is
-/// "indistinguishable" from a fabricated probe is no longer honest — it is
-/// exactly as separated from the fabrication cluster as the genuine matches are.
-pub const FABRICATED_PROBE_CEILING: f32 = 0.605;
-
-/// Margin (top score minus runner-up score) above which a weak-band top result
-/// is treated as having clearly beaten the rest of the list even though its
-/// absolute score sits below [`FABRICATED_PROBE_CEILING`].
+/// Margin (top score minus a *comparable* runner-up score) above which a
+/// weak-band top result is treated as having clearly beaten the rest of the
+/// list, even though its absolute score is still weakly calibrated.
+///
+/// A prior version of this constant was paired with a
+/// `FABRICATED_PROBE_CEILING` (0.605, measured 2026-08-03) that let a
+/// sufficiently high absolute score alone claim "clears the highest
+/// fabricated-probe score measured on this corpus". That ceiling was
+/// falsified by corpus growth: re-measuring 2026-09-22 found fabricated
+/// probes as high as 0.629 (drifted straight through the weak band into
+/// "partial", where they carry no caveat at all — a separate, still-open
+/// gap tracked by `weak_band_fabricated_probes_still_carry_a_caveat`) and
+/// 0.606 still inside the weak band, both above the 0.605 ceiling. A ceiling
+/// this close to the top of the weak band cannot be re-derived to a value
+/// that is both inside the band and safely above every fabricated score, so
+/// the ceiling-decisive branch was removed rather than patched with a new
+/// magic number (review finding [high] #1). Decisiveness in the weak band is
+/// margin-only now.
 ///
 /// Derived from the 2026-09-22 burst-failure study (`recall_bursts.json`
-/// fixture): among weak-band bursts where the session's own next turn actually
-/// used the rank-1 result, the largest observed margin that had NOT already
-/// cleared the fabrication ceiling was 0.113 (top 0.563 over runner-up 0.450).
-/// The rest of that same population clusters within +/-0.06 of zero, many
-/// negative (rank-1 by rerank, not by raw score). 0.10 sits below the one
-/// real "decisive but sub-ceiling" case and above the noise cluster.
+/// fixture): among weak-band bursts where the session's own next turn
+/// actually used the rank-1 result, the largest observed margin was 0.113
+/// (top 0.563 over runner-up 0.450) — but that runner-up is
+/// `score_fts_candidate`'s synthetic 0.45 floor from a `[keyword] ` fallback
+/// row, not a cosine measurement (review finding [high] #2), so it is not
+/// actually a valid basis for this threshold either. With no confirmed
+/// same-scale decisive case left in the fixture, 0.10 is kept as a
+/// conservative floor above the remaining cosine-vs-cosine margin cluster
+/// (which sits within +/-0.06 of zero, several negative — rank-1 by rerank,
+/// not by raw score) rather than re-derived from a single contaminated data
+/// point. Re-deriving it against real reflect_on_past-path margins (hybrid
+/// rerank, not exact-cosine quick_check) is a follow-up, not done here.
 pub const WEAK_BAND_DECISIVE_MARGIN: f32 = 0.10;
 
 /// A relevance band plus the extra context needed to word a `weak`-band result
@@ -100,33 +113,36 @@ pub struct Relevance {
 
 /// Band a top score into the relevance vocabulary, and — only in the `weak`
 /// band — decide whether the wording should be relative (this result leads
-/// the field by a real margin, or clears the highest measured fabricated
-/// probe) or an honest low-confidence caveat.
+/// the field by a real margin) or an honest low-confidence caveat.
 ///
-/// `runner_up` is the next-ranked result's score, when one exists. `list_len`
-/// is the number of results the caller is choosing among (informs the
-/// "list"/"field" phrasing only — it plays no role in the band or margin
-/// math). `synthetic_top` marks a rank-1 score that did not come from cosine
-/// similarity at all — a keyword-only chunk/reflection fallback score
-/// (`score_fts_candidate`, `FTS_REFLECTION_SCORE`) is a fixed undated floor,
-/// not a measurement on the same scale as [`FABRICATED_PROBE_CEILING`] or
-/// [`WEAK_BAND_DECISIVE_MARGIN`] (both derived from cosine scores). Passing
-/// `true` suppresses the decisive branch entirely, regardless of the
-/// arithmetic — a synthetic score "clearing the ceiling" or "beating the
-/// runner-up by 0.10" is not evidence of anything; it is just where the
-/// constant happens to sit. Never touches score, order, `QUICK_CHECK_FLOOR`,
-/// or the abstention behaviour in [`format_quick_check`] — those are
-/// computed entirely before this function is called.
+/// `runner_up` is the next-ranked result's score, when one exists, *restricted
+/// to a comparable runner-up*: the caller must skip any candidate whose score
+/// did not come from cosine similarity (see `synthetic_top` below) before
+/// passing it here, or pass `None` if no comparable candidate exists. This
+/// function does not itself know which channel `runner_up` came from — it
+/// trusts the caller's filtering. `list_len` is the number of results the
+/// caller is choosing among (informs the "list"/"field" phrasing only — it
+/// plays no role in the band or margin math). `synthetic_top` marks a rank-1
+/// score that did not come from cosine similarity at all — a keyword-only
+/// chunk/reflection fallback score (`score_fts_candidate`,
+/// `FTS_REFLECTION_SCORE`) is a fixed undated floor, not a measurement on the
+/// same scale as [`WEAK_BAND_DECISIVE_MARGIN`] (derived from cosine scores).
+/// Passing `true` suppresses the decisive branch entirely, regardless of the
+/// arithmetic — a synthetic score "beating the runner-up by 0.10" is not
+/// evidence of anything; it is just where the constant happens to sit. Never
+/// touches score, order, `QUICK_CHECK_FLOOR`, or the abstention behaviour in
+/// [`format_quick_check`] — those are computed entirely before this function
+/// is called.
 ///
-/// The decisive branch's wording is split by *why* it fired, so it never
-/// claims more than the arithmetic actually shows:
-/// - Margin alone (`margin >= WEAK_BAND_DECISIVE_MARGIN`, top still below
-///   [`FABRICATED_PROBE_CEILING`]): states the margin, says nothing about
-///   the fabrication ceiling.
-/// - Ceiling alone or combined with a margin: states the ceiling claim;
-///   states the margin too only when `runner_up` is `Some` AND the margin is
-///   positive — a negative margin (rerank moved a lower-raw-score result to
-///   rank 1) or a missing runner-up never renders a "leads by ..." clause.
+/// There is no absolute-score decisive branch — a prior version of this
+/// function had one (top at or above a fabrication ceiling), and it was
+/// removed because the ceiling it depended on was falsified by corpus growth
+/// (see [`WEAK_BAND_DECISIVE_MARGIN`] docs). Decisiveness is margin-only,
+/// gated on [`WEAK_BAND_DECISIVE_MARGIN`], and the margin is only ever
+/// stated when it is positive — a negative margin (rerank moved a
+/// lower-raw-score result to rank 1) or a missing runner-up never renders a
+/// "leads by ..." clause, it falls through to the honest low-confidence
+/// caveat instead.
 pub fn relevance_assessment(
     top: f32,
     runner_up: Option<f32>,
@@ -144,46 +160,24 @@ pub fn relevance_assessment(
 
     let margin = runner_up.map(|second| top - second);
     let field_word = if list_len > 1 { "list" } else { "field" };
-    let above_ceiling = !synthetic_top && top >= FABRICATED_PROBE_CEILING;
-    let decisive_margin = !synthetic_top && margin.is_some_and(|m| m >= WEAK_BAND_DECISIVE_MARGIN);
-    let decisive = above_ceiling || decisive_margin;
+    // WEAK_BAND_DECISIVE_MARGIN is > 0.0, so `m >= WEAK_BAND_DECISIVE_MARGIN`
+    // already implies a positive margin — no separate `m > 0.0` check needed.
+    let decisive = !synthetic_top && margin.is_some_and(|m| m >= WEAK_BAND_DECISIVE_MARGIN);
 
     if decisive {
-        let mut clauses: Vec<String> = Vec::new();
-        // Only claim "leads" when there is something to lead over, and only
-        // when the lead is actually positive (rerank can put a lower raw
-        // score at rank 1, giving a negative margin here).
-        if let Some(m) = margin {
-            if m > 0.0 {
-                clauses.push(format!("leads the {field_word} by a {m:.3} margin"));
-            }
-        }
-        if above_ceiling {
-            clauses.push(format!(
-                "clears the highest fabricated-probe score measured on this corpus ({FABRICATED_PROBE_CEILING:.3}) — the {QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range is weakly calibrated overall, but this result is not in the ambiguous part of it"
-            ));
-        }
-        // Unreachable in practice: `decisive` only fires via `above_ceiling`
-        // (which always pushes a clause) or `decisive_margin` (which
-        // requires margin >= WEAK_BAND_DECISIVE_MARGIN, always > 0, which
-        // always pushes a clause too). Kept as a safe fallback rather than
-        // a panic so a future threshold change can't silently render an
-        // empty sentence.
-        let body = if clauses.is_empty() {
-            format!("leads the {field_word}")
-        } else {
-            clauses.join(", and ")
-        };
+        // `decisive` only fires when `margin` is `Some` and positive, so this
+        // always has a real number to report.
+        let m = margin.expect("decisive requires a margin");
         Relevance {
             band,
             qualifier: Some("leads the field"),
             warning: Some(format!(
-                "weak band by absolute score, but this result {body}. Read the preview to confirm rather than treating the absolute score alone as a verdict."
+                "weak band by absolute score, but this result leads the {field_word} by a {m:.3} margin — absolute cosine similarity is weakly calibrated in the {QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range on this corpus overall, but the margin over the rest of the {field_word} is real. Read the preview to confirm rather than treating the absolute score alone as a verdict."
             )),
         }
     } else {
         let channel_note = if synthetic_top {
-            " — and this score came from a keyword match, not cosine similarity, so the fabrication-ceiling and margin checks above do not apply to it at all"
+            " — and this score came from a keyword match, not cosine similarity, so the margin check above does not apply to it at all"
         } else {
             ""
         };
@@ -417,9 +411,25 @@ pub(crate) fn format_search_results_with_rank_scores(
         let rank1_synthetic = results
             .first()
             .is_some_and(|r| r.chunk.content.starts_with("[keyword] "));
+        // Review finding [high] #2: rank 2 by position is not necessarily a
+        // comparable runner-up. A `[keyword] `-prefixed row is the same
+        // synthetic FTS/keyword-fallback floor as `rank1_synthetic` guards
+        // against for rank 1 — comparing a real cosine top score's margin
+        // against that fixed floor produced false "leads the list by ..."
+        // claims (live receipt: a fabricated probe scoring 0.601 against a
+        // `[keyword] ` rank-2 at 0.405 read as decisive with a 0.196
+        // "margin" that was actually cosine-vs-floor, not cosine-vs-cosine).
+        // Skip synthetic rows and use the first genuinely comparable
+        // (non-`[keyword] `) result instead; if none exists on this page,
+        // there is no comparable runner-up at all.
+        let comparable_runner_up = results
+            .iter()
+            .skip(1)
+            .find(|r| !r.chunk.content.starts_with("[keyword] "))
+            .map(|r| r.score);
         let rank1_assessment = relevance_assessment(
             rank1_score,
-            results.get(1).map(|r| r.score),
+            comparable_runner_up,
             results.len(),
             rank1_synthetic,
         );
@@ -1880,12 +1890,12 @@ mod tests {
         // band: no floor separates them from genuine topics (genuine minimum was
         // 0.468), so they are labelled and warned about rather than suppressed.
         //
-        // Contract change (WP-B, 2026-09-22): none of these four scores clears
-        // FABRICATED_PROBE_CEILING and each is a lone candidate (no runner-up,
-        // so no margin signal either), so relevance_assessment stays in the
-        // non-decisive branch — the caveat text changed from "may be spurious"
-        // to the honest calibration wording, but a caveat still fires on all
-        // four (that is the part this test still guards).
+        // Contract change (WP-B, 2026-09-22): each of these four is a lone
+        // candidate (no runner-up, so no margin signal), so
+        // relevance_assessment stays in the non-decisive branch —
+        // the caveat text changed from "may be spurious" to the honest
+        // calibration wording, but a caveat still fires on all four (that is
+        // the part this test still guards).
         for score in [0.456_f32, 0.461, 0.583, 0.588] {
             let results = vec![quick_result(
                 score,
@@ -1908,44 +1918,43 @@ mod tests {
     }
 
     #[test]
-    fn weak_band_rank1_clearing_fabrication_ceiling_drops_spurious_wording() {
-        // Contract (WP-B): a weak-band top score that clears
-        // FABRICATED_PROBE_CEILING (0.605, the highest fabricated probe
-        // measured) is at least as separated from the fabrication cluster as
-        // any genuine match — "spurious"/"indistinguishable" wording is no
-        // longer honest for it, even though the band is still "weak" (below
-        // WEAK_BAND_TOP=0.62).
-        //
-        // No runner-up exists here, so the wording must NOT claim a "leads
-        // the field by a n/a margin" — there is nothing to lead over. Only
-        // the ceiling claim applies.
-        let results = vec![quick_result(0.61, "clear decisive-ceiling match")];
+    fn weak_band_rank1_high_score_with_no_runner_up_gets_honest_caveat_not_a_ceiling_claim() {
+        // Review finding [high] #1: a prior version of this contract let a
+        // sufficiently high absolute weak-band score alone ("clears
+        // FABRICATED_PROBE_CEILING") claim it was decisive even with no
+        // runner-up to compare against. That ceiling was falsified by
+        // corpus growth (fabricated probes now measure up to 0.629 — see
+        // `WEAK_BAND_DECISIVE_MARGIN` docs) and the branch was removed
+        // entirely. With no runner-up, there is nothing to compute a margin
+        // against, so even a top score close to WEAK_BAND_TOP must fall
+        // through to the honest low-confidence caveat — never "leads" and
+        // never a "clears the highest ..." claim, because that text no
+        // longer exists anywhere in this module.
+        let results = vec![quick_result(0.61, "high weak-band score, no runner-up")];
         let xml = format_quick_check(&results, "probe");
         assert!(xml.contains("<relevance>weak</relevance>"), "got: {xml}");
         assert!(xml.contains("<warning>"), "got: {xml}");
         assert!(!xml.contains("spurious"), "got: {xml}");
         assert!(!xml.contains("indistinguishable"), "got: {xml}");
         assert!(
-            xml.contains("clears the highest fabricated-probe score"),
-            "got: {xml}"
+            !xml.contains("clears the highest"),
+            "the ceiling-decisive branch was removed: got: {xml}"
         );
         assert!(
             !xml.contains("leads"),
             "no runner-up means there is nothing to lead over: got: {xml}"
         );
+        assert!(xml.contains("weakly calibrated"), "got: {xml}");
     }
 
     #[test]
-    fn weak_band_rank1_wide_margin_below_ceiling_drops_spurious_wording() {
-        // Contract (WP-B) part 2: a weak-band top score below the fabrication
-        // ceiling but with a margin >= WEAK_BAND_DECISIVE_MARGIN over the
-        // runner-up is also decisive — it clearly beat the rest of the list,
-        // even though the absolute score alone is weakly calibrated here.
-        //
-        // Top (0.58) sits below FABRICATED_PROBE_CEILING (0.605): the
-        // decisive branch fired on margin alone, so the wording must not
-        // claim it cleared the fabrication ceiling — that claim is only true
-        // when `top >= FABRICATED_PROBE_CEILING`.
+    fn weak_band_rank1_wide_margin_over_a_comparable_runner_up_is_decisive() {
+        // Contract (WP-B): a weak-band top score with a margin >=
+        // WEAK_BAND_DECISIVE_MARGIN over a comparable (cosine) runner-up is
+        // decisive — it clearly beat the rest of the list, even though the
+        // absolute score alone is weakly calibrated here. No absolute-score
+        // ceiling claim exists any more (review finding [high] #1) — this is
+        // margin-only decisiveness.
         let results = vec![
             quick_result(0.58, "clear top match"),
             quick_result(0.30, "distant runner-up"),
@@ -1957,7 +1966,7 @@ mod tests {
         assert!(xml.contains("leads the field"), "got: {xml}");
         assert!(
             !xml.contains("clears the highest"),
-            "margin-only decisive case must not claim the fabrication ceiling: got: {xml}"
+            "the ceiling-decisive branch was removed: got: {xml}"
         );
     }
 
@@ -1966,68 +1975,89 @@ mod tests {
         // WP-B finding [low]: a rank-1 score that came from the keyword/FTS
         // fallback channel (`score_fts_candidate` / `FTS_REFLECTION_SCORE`,
         // fixed undated floors of 0.40/0.45) is not a cosine measurement, so
-        // it must never trigger the "clears the fabrication ceiling" or
-        // "leads by margin" claims even when the raw numbers alone would —
-        // those constants were derived from cosine scores.
-        let non_synthetic = relevance_assessment(0.61, None, 1, false);
+        // it must never trigger the "leads by margin" claim even when the
+        // raw numbers alone would — `WEAK_BAND_DECISIVE_MARGIN` was derived
+        // from cosine scores.
+        let non_synthetic = relevance_assessment(0.55, Some(0.40), 1, false);
         assert!(
             non_synthetic
                 .warning
                 .as_ref()
                 .unwrap()
-                .contains("clears the highest fabricated-probe score"),
+                .contains("leads the field"),
             "control case should be decisive: {:?}",
             non_synthetic.warning
         );
 
-        let synthetic = relevance_assessment(0.61, None, 1, true);
+        let synthetic = relevance_assessment(0.55, Some(0.40), 1, true);
         let warning = synthetic
             .warning
             .expect("weak band always carries a warning");
         assert!(
-            !warning.contains("clears the highest fabricated-probe score"),
-            "synthetic score must not borrow the cosine-derived ceiling claim: {warning}"
-        );
-        assert!(
             !warning.contains("leads"),
-            "synthetic score must not borrow the cosine-derived margin claim: {warning}"
+            "synthetic top score's margin must not be read as decisive: {warning}"
         );
         assert!(
             warning.contains("weakly calibrated"),
             "synthetic score still needs an honest caveat: {warning}"
         );
+    }
 
-        // Same suppression when the raw margin alone would have been decisive.
-        let synthetic_margin = relevance_assessment(0.50, Some(0.30), 1, true);
-        let warning = synthetic_margin
+    #[test]
+    fn relevance_assessment_negative_margin_never_claims_leads() {
+        // Contract (WP-B) part 3: rerank can put a rank-1 result whose RAW
+        // score is below the comparable runner-up's (adjusted score won the
+        // tiebreak). A negative margin can never clear
+        // WEAK_BAND_DECISIVE_MARGIN (a positive threshold), so it always
+        // falls through to the honest low-confidence caveat — the wording
+        // must never say "leads the field by a -0.050 margin".
+        let assessment = relevance_assessment(0.61, Some(0.66), 1, false);
+        let warning = assessment
             .warning
             .expect("weak band always carries a warning");
         assert!(
             !warning.contains("leads"),
-            "synthetic score's margin must not be read as decisive: {warning}"
+            "negative margin must not be worded as a lead: got: {warning}"
         );
+        assert!(warning.contains("weakly calibrated"), "got: {warning}");
     }
 
     #[test]
-    fn weak_band_rank1_negative_margin_never_claims_leads() {
-        // Contract (WP-B) part 3: rerank can put a rank-1 result whose RAW
-        // score is below rank 2's (adjusted score won the tiebreak). If that
-        // rank-1 score still clears FABRICATED_PROBE_CEILING, the ceiling
-        // claim still fires — but the wording must never say "leads the
-        // list by a -0.050 margin".
-        let results = vec![
-            quick_result(0.61, "clears ceiling"),
-            quick_result(0.66, "higher raw runner-up"),
-        ];
-        let xml = format_quick_check(&results, "probe");
-        assert!(xml.contains("<relevance>weak</relevance>"), "got: {xml}");
+    fn relevance_assessment_ignores_a_synthetic_keyword_runner_up_margin() {
+        // Review finding [high] #2, live receipt: a fabricated probe scored
+        // 0.601 with a `[keyword] `-prefixed rank-2 at 0.405 (score_fts_
+        // candidate's synthetic floor, not a cosine measurement) — margin
+        // 0.196, well past WEAK_BAND_DECISIVE_MARGIN. Comparing a real
+        // cosine top score's margin against that fixed floor is comparing
+        // two different scales, so `format_search_results_with_rank_scores`
+        // must skip a `[keyword] ` rank-2 row and use the next comparable
+        // result (or `None`) as the runner-up passed to this function —
+        // exercised end-to-end below. As a direct check on the function
+        // itself: the same (top, runner_up) pair the caller would have
+        // passed pre-fix must still render as decisive when the caller
+        // asserts (honestly) that the runner-up IS comparable — the
+        // contamination is a caller-side filtering bug, not something this
+        // function can detect from the numbers alone.
+        let contaminated_call = relevance_assessment(0.601, Some(0.405), 2, false);
+        let contaminated_warning = contaminated_call.warning.as_ref().unwrap();
         assert!(
-            xml.contains("clears the highest fabricated-probe score"),
-            "got: {xml}"
+            contaminated_warning.contains("leads the field")
+                || contaminated_warning.contains("leads the list"),
+            "the function trusts the caller's runner-up filtering: {contaminated_warning}"
         );
+
+        // The actual fix lives at the call site: end-to-end through
+        // `format_search_results`, a `[keyword] ` rank-2 must never produce
+        // this decisive wording. See
+        // `weak_band_margin_skips_synthetic_keyword_runner_up` in
+        // tests/integration.rs for the full-renderer receipt.
+        let no_comparable_runner_up = relevance_assessment(0.601, None, 2, false);
+        let warning = no_comparable_runner_up
+            .warning
+            .expect("weak band always carries a warning");
         assert!(
-            !xml.contains("leads"),
-            "negative margin must not be worded as a lead: got: {xml}"
+            !warning.contains("leads"),
+            "no comparable runner-up means there is nothing to lead over: {warning}"
         );
     }
 

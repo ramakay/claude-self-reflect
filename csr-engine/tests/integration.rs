@@ -707,9 +707,19 @@ fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
     // the renderer gained a `<caveat>` at all (previously none), and this test
     // asserts the caveat it gained is never worded as a verdict against a hit
     // that the session's own next turn proved correct.
+    // Review finding [high] #1 receipt: the ceiling-decisive branch (and the
+    // "clears the highest fabricated-probe score" wording it produced) was
+    // removed from `relevance_assessment` entirely — it is falsified by
+    // corpus growth (fabricated probes now measure up to 0.629; see
+    // `format::WEAK_BAND_DECISIVE_MARGIN` docs). So this text can no longer
+    // appear for ANY row, not just ones below the old 0.605 constant — the
+    // gate on `row.top < FABRICATED_PROBE_CEILING` that used to scope this
+    // assertion is gone along with the constant.
     let fixture = load_burst_fixture();
     let mut checked = 0;
     let mut caveated_after = 0;
+    let mut decisive_after = 0;
+    let mut low_margin_after = 0;
     for row in &fixture {
         if row.fabricated || row.rank_used != Some(1) || row.rank1_band != "weak" {
             continue;
@@ -727,29 +737,44 @@ fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
             row.top,
             row.runner_up
         );
-        // The false "clears the fabrication ceiling" claim (finding [high]
-        // #1) is the specific failure mode this fixture guards: a rank-1
-        // score below FABRICATED_PROBE_CEILING must never carry the ceiling
-        // clause, whether or not the margin made it decisive.
-        if row.top < format::FABRICATED_PROBE_CEILING {
-            assert!(
-                !xml.contains("clears the highest fabricated-probe score"),
-                "row top={} is below the ceiling and must not claim it cleared one: {xml}",
-                row.top
-            );
-        }
+        assert!(
+            !xml.contains("clears the highest fabricated-probe score"),
+            "row top={}: the ceiling-decisive branch was removed, this text must never appear: {xml}",
+            row.top
+        );
         if xml.contains("<caveat>") {
             caveated_after += 1;
+            if xml.contains("leads the field") || xml.contains("leads the list") {
+                decisive_after += 1;
+            } else {
+                low_margin_after += 1;
+            }
         }
     }
     assert!(
         checked > 0,
         "fixture must contain at least one rank-1-correct weak-band burst to regress against"
     );
+    // Review finding [medium] #3: report this honestly rather than as an
+    // unqualified win. The objective ("stop calling rank-1-correct hits
+    // spurious") is met on the search path, but every one of these bursts
+    // now gains a NEW caveat it never had before (the pre-WP-B search
+    // renderer emitted none at all) — most of them worded as a
+    // low-confidence hedge, not as the positive "leads the field" framing.
+    // Whether an added hedge on a correct hit reduces or increases the 42%
+    // re-query rate this work item was meant to address is unverified here —
+    // it needs the same burst-consumption instrumentation the original study
+    // used, not asserted from this fixture. The weak-band LABEL and header
+    // ("weak relevance") are unchanged by this work item; if the re-query
+    // behaviour traces to the label/header rather than the old "may be
+    // spurious" wording specifically, this fix does not address it — that is
+    // the escalation this receipt is for, not a claim of success.
     println!(
-        "WP-B receipt: rank-1-correct weak-band bursts checked={checked}, \
+        "WP-B receipt (honest, not a success claim): rank-1-correct weak-band bursts checked={checked}, \
          spurious-phrased under old quick_check wording (search path never had it)=0/{checked}, \
-         carry a <caveat> under the new search-path wording={caveated_after}/{checked}"
+         gained a NEW <caveat> under the new search-path wording={caveated_after}/{checked} \
+         ({decisive_after} decisive \"leads\", {low_margin_after} low-margin hedge) — \
+         re-query-rate impact of this NEW caveat is unmeasured; label/header text unchanged"
     );
 }
 
@@ -772,13 +797,23 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
     // Phoenix LiveView") now scores 0.629 — that is corpus growth pushing a
     // fabricated topic's nearest neighbour PAST WEAK_BAND_TOP (0.62)
     // entirely, into the "partial" band, which carries no caveat at all by
-    // design. `FABRICATED_PROBE_CEILING` (0.605) and `WEAK_BAND_TOP` (0.62)
-    // are fixed constants measured 2026-08-03 against a smaller corpus;
-    // they are not recomputed as the corpus grows. That staleness is a
-    // real, live gap in the abstention system, but redefining those
-    // constants is a different, larger work item than this wording-only
-    // fix (spec: "Bands are unchanged") — flagged here via an explicit,
-    // non-silent assertion rather than papered over.
+    // design. `WEAK_BAND_TOP` (0.62) is a fixed constant measured 2026-08-03
+    // against a smaller corpus; it is not recomputed as the corpus grows.
+    // That staleness is a real, live gap in the abstention system, but
+    // redefining the band constants is a different, larger work item than
+    // this wording-only fix (spec: "Bands are unchanged") — flagged here as
+    // a printed receipt (review finding [low]: NOT a hard assertion, since
+    // asserting the drift would turn a known gap into a required invariant
+    // that a future abstention fix would have to break to pass).
+    //
+    // The 0.606 probe (still weak-band, one thousandth above the OLD 0.605
+    // `FABRICATED_PROBE_CEILING` constant) is exactly why that constant and
+    // its decisive branch were removed from `relevance_assessment` (review
+    // finding [high] #1): under the old logic this probe would have rendered
+    // "clears the highest fabricated-probe score measured on this corpus"
+    // for a fabricated topic. The loop below asserts directly that no
+    // still-weak-band fabricated probe ever renders that claim, or a "leads"
+    // claim — not just that a caveat of some kind exists.
     let fixture = load_burst_fixture();
     let fabricated: Vec<_> = fixture.iter().filter(|r| r.fabricated).collect();
     assert_eq!(
@@ -822,6 +857,16 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
             "fabricated probe top={}: got: {xml}",
             row.top
         );
+        // Review finding [high] #1's literal ask: a fabricated probe's
+        // output must never contain the decisive-wording phrases, not just
+        // "some caveat" — checking only for "weakly calibrated" was not
+        // enough, because the (now-removed) ceiling-decisive branch's text
+        // also contained that phrase.
+        assert!(
+            !xml.contains("clears the highest") && !xml.contains("leads"),
+            "fabricated probe top={}: must never read as decisive: {xml}",
+            row.top
+        );
         caveated += 1;
     }
 
@@ -836,20 +881,21 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
         format::WEAK_BAND_DECISIVE_MARGIN
     );
 
-    // Explicit, visible receipt for the drift finding rather than a silently
-    // skipped row: confirm it really is the "partial, no caveat at all" case
-    // this comment describes, so a future re-measurement that moves it back
-    // into the weak band doesn't leave a stale assertion behind.
+    // Review finding [low]: this used to be a hard `assert!(!xml.contains(
+    // "<warning>"))`, which turns a known abstention gap (a fabricated probe
+    // that drifted into "partial" gets zero caveat) into a passing invariant
+    // — a later fix that adds a caveat here would then fail THIS test. Print
+    // the receipt instead of asserting the defective behaviour, so the gap
+    // stays visible without blocking a fix for it.
     for row in &drifted_out_of_weak {
         let results = vec![fixture_chunk("only", row.top)];
         let xml = format::format_quick_check(&results, "fabricated probe");
-        assert!(
-            !xml.contains("<warning>"),
-            "expected this drifted-out-of-weak-band probe (top={}, band={}) to carry NO \
-             caveat under the current bands, confirming the corpus-drift finding — if this \
-             now fails, the drift finding may have self-corrected: {xml}",
+        println!(
+            "WP-B known gap (not asserted): fabricated probe top={} drifted to band={} \
+             (corpus growth past WEAK_BAND_TOP), carries a caveat = {}",
             row.top,
-            row.rank1_band
+            row.rank1_band,
+            xml.contains("<warning>")
         );
     }
 
@@ -864,12 +910,73 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
 }
 
 #[test]
+fn weak_band_margin_skips_synthetic_keyword_runner_up() {
+    // Review finding [high] #2, live receipt: the fabricated probe "the team
+    // decision to rewrite anukriti in Elixir Phoenix LiveView" scored 0.601
+    // against `reflect_on_past` with a `[keyword] `-prefixed rank-2 at 0.405
+    // (that prefix marks `score_fts_candidate`'s synthetic FTS/keyword-
+    // fallback floor, not a cosine measurement — see `mcp::tools`). The raw
+    // margin (0.196) clears `WEAK_BAND_DECISIVE_MARGIN`, but it is comparing
+    // a cosine score to a fixed floor on a different scale, not to another
+    // cosine score — under the pre-fix logic this rendered as decisive
+    // ("leads the list by a 0.196 margin") for a fabricated topic.
+    //
+    // `format_search_results_with_rank_scores` must skip a `[keyword] `
+    // rank-2 row and treat the margin as absent (no further comparable
+    // result exists on this 2-row page), falling back to the honest
+    // low-confidence caveat.
+    let mut rank2 = fixture_chunk("rank2", 0.405);
+    rank2.chunk.content = "[keyword] some fallback match".into();
+    let results = vec![fixture_chunk("rank1", 0.601), rank2];
+    let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
+    assert!(
+        !xml.contains("leads the field") && !xml.contains("leads the list"),
+        "margin against a synthetic [keyword] runner-up must not be read as decisive: {xml}"
+    );
+    assert!(
+        xml.contains("<caveat>"),
+        "weak band must still carry a caveat: {xml}"
+    );
+    assert!(
+        xml.contains("weakly calibrated"),
+        "must fall back to the honest low-margin caveat: {xml}"
+    );
+
+    // Control: the identical (top, runner_up) pair WITHOUT the `[keyword] `
+    // prefix on rank 2 IS decisive — proving the fix is about comparability,
+    // not a blanket disabling of margin-decisive wording in the search
+    // renderer.
+    let comparable_results = vec![fixture_chunk("rank1", 0.601), fixture_chunk("rank2", 0.405)];
+    let xml_comparable = format::format_search_results(
+        &comparable_results,
+        "fixture query",
+        "fixture-project",
+        1,
+        1,
+    );
+    assert!(
+        xml_comparable.contains("leads the field") || xml_comparable.contains("leads the list"),
+        "a genuinely comparable (cosine-vs-cosine) 0.196 margin should still be decisive: {xml_comparable}"
+    );
+}
+
+#[test]
 fn weak_band_ordering_and_scores_are_byte_identical_across_the_wording_change() {
     // CONSTRAINT: the label/banner rewrite must never touch ranking order or
     // the rendered score values. Render a fixed, known-order slice and assert
     // the exact rank/score sequence — this is the "before vs after" proof
     // required by the spec, made concrete as an invariant on the current
     // renderer rather than a diff against deleted code.
+    //
+    // Review finding [low]: this is a formatter smoke test only — it renders
+    // an already-sorted slice through a formatter that never reorders its
+    // input, so it cannot by itself catch a ranking regression introduced
+    // upstream. The actual ordering guarantee for this work item comes from
+    // diff scope: the WP-B changes touch only src/format/mod.rs and its
+    // tests, never src/search/rerank.rs, src/search/mod.rs, or the ranking
+    // code in src/mcp/tools.rs (owned by WP-A) — verifiable with `git diff
+    // --stat` against the pre-WP-B commit. This test's job is narrower: catch
+    // an accidental reorder introduced inside the formatter itself.
     let results = vec![
         fixture_chunk("a", 0.900),
         fixture_chunk("b", 0.700),
