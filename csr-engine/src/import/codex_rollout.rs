@@ -668,7 +668,7 @@ where
             id: super::generate_chunk_id(&metadata.conversation_id, seq),
             conversation_id: metadata.conversation_id.clone(),
             project_name: metadata.project_name.clone(),
-            timestamp: metadata.timestamp.clone(),
+            timestamp: observed_at.clone(),
             content: content[start..end].to_string(),
             message_count: 1,
             summary: metadata.summary.clone(),
@@ -998,6 +998,59 @@ mod tests {
         assert!(tiers.contains(&crate::provenance::TrustTier::UserHistory));
         assert!(tiers.contains(&crate::provenance::TrustTier::TrustedTool));
         assert!(tiers.contains(&crate::provenance::TrustTier::Unknown));
+    }
+
+    #[test]
+    fn rollout_chunks_carry_distinct_per_message_timestamps() {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let parsed = parse_rollout(&source).unwrap().expect("fixture parses");
+        let chunks = rollout_chunks(&parsed);
+        assert!(!chunks.is_empty());
+        let timestamps = chunks
+            .iter()
+            .map(|chunk| chunk.timestamp.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            timestamps.len() >= 3,
+            "expected at least 3 distinct chunk timestamps, got {timestamps:?}"
+        );
+        assert!(
+            !timestamps.iter().all(|ts| ts == &parsed.timestamp),
+            "chunks must not all collapse onto the session-start timestamp {}",
+            parsed.timestamp
+        );
+    }
+
+    #[test]
+    fn imported_rollout_chunks_carry_the_messages_own_timestamp_not_the_session_start() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let target = root.path().join("rollout-copy.jsonl");
+        std::fs::copy(source, &target).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+
+        let stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(stats.files_imported, 1);
+        let ids = storage
+            .get_chunk_ids_for_conversation("codex:modern-fixture")
+            .unwrap();
+        assert!(!ids.is_empty());
+        let chunks = storage.get_chunks_by_ids(&ids).unwrap();
+        let timestamps = chunks
+            .iter()
+            .map(|chunk| chunk.timestamp.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            timestamps.len() > 1,
+            "expected chunks to carry distinct per-message timestamps, got {timestamps:?}"
+        );
+        assert!(
+            !timestamps.iter().all(|ts| ts == "2026-08-06T12:00:00Z"),
+            "chunks must not all collapse onto the session-start timestamp"
+        );
     }
 
     /// The pass used to propagate the first per-file error, so one unreadable
