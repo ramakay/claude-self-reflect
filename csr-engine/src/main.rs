@@ -243,6 +243,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// One-time, idempotent re-stamp of `codex_rollout` chunk timestamps that
+    /// were collapsed onto the session-start time by the pre-fix chunker. No
+    /// re-embedding, no HNSW writes — content-guarded `UPDATE`s only. Safe to
+    /// run repeatedly; a second run is a no-op once the meta marker is set.
+    BackfillCodexTimestamps,
     /// Historical deterministic capture operations.
     Backfill {
         #[command(subcommand)]
@@ -1065,6 +1070,16 @@ async fn run() -> Result<()> {
             dry_run,
         )?;
         print!("{}", stats.format_text(dry_run));
+        return Ok(());
+    }
+
+    if let Some(Commands::BackfillCodexTimestamps) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::codex_rollout::restamp_codex_chunk_timestamps(&eng)?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
         return Ok(());
     }
 

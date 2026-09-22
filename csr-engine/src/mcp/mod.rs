@@ -1,6 +1,7 @@
 pub mod completions;
 pub mod elicitation;
 pub mod resources;
+pub mod stage_probe;
 pub mod tasks;
 pub mod tools;
 

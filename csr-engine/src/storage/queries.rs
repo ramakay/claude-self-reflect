@@ -2749,6 +2749,27 @@ pub fn list_project_names(conn: &Connection, prefix: &str, limit: usize) -> Resu
         .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
+/// `(file_path, conversation_id)` pairs from `import_state` whose
+/// `conversation_id` starts with `prefix` (e.g. `"codex:"`). Unbounded — this
+/// feeds the codex-rollout chunk-timestamp restamp, a single deliberate pass
+/// over the whole adapter's corpus, not a hot-path query.
+pub fn import_state_rows_for_conversation_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<(String, String)>> {
+    let pattern = format!("{}%", escape_like(prefix));
+    let mut stmt = conn.prepare(
+        "SELECT file_path, conversation_id FROM import_state
+         WHERE conversation_id LIKE ?1 ESCAPE '\\'
+         ORDER BY file_path",
+    )?;
+    let rows = stmt.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// List distinct file paths from import_state matching a prefix.
 pub fn list_file_paths(conn: &Connection, prefix: &str, limit: usize) -> Result<Vec<String>> {
     let pattern = format!("%{}%", escape_like(prefix));
@@ -3447,6 +3468,26 @@ pub fn sessions_for_file_in_projects(
     let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+/// Backfill UPDATE: re-stamp one chunk's `timestamp` in place, gated on the
+/// chunk's conversation id AND content still matching what the caller just
+/// re-derived from the source file. The content guard is what makes this
+/// safe against drift — a rollout that changed on disk since the original
+/// import (different content at the same seq) is silently left alone rather
+/// than cross-stamped. Returns whether a row was actually touched.
+pub fn restamp_chunk_timestamp_if_content_matches(
+    conn: &Connection,
+    chunk_id: &str,
+    conversation_id: &str,
+    content: &str,
+    new_timestamp: &str,
+) -> Result<bool> {
+    let updated = conn.execute(
+        "UPDATE chunks SET timestamp = ?1 WHERE id = ?2 AND conversation_id = ?3 AND content = ?4",
+        params![new_timestamp, chunk_id, conversation_id, content],
+    )?;
+    Ok(updated > 0)
 }
 
 /// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.

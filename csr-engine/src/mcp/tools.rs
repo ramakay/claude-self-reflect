@@ -818,6 +818,14 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         active_forgetting,
     );
 
+    {
+        let ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        crate::mcp::stage_probe::record_stage("final_page", &ranked);
+    }
+
     // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
     // limit cut, so telemetry agrees with what the caller actually saw.
     // session_id="mcp" is a sentinel (MCP has no session id). Non-fatal.
@@ -953,6 +961,32 @@ async fn reflect_gather_pass(
     // Enrich chunk results with metadata
     let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
+
+    {
+        let chunk_conv: HashMap<&str, &str> = chunks
+            .iter()
+            .map(|chunk| (chunk.id.as_str(), chunk.conversation_id.as_str()))
+            .collect();
+        let ranked: Vec<(String, String, f32)> = chunk_results
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    chunk_conv
+                        .get(r.id.as_str())
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                    r.score,
+                )
+            })
+            .chain(
+                reflection_results
+                    .iter()
+                    .map(|r| (r.id.clone(), String::new(), r.score)),
+            )
+            .collect();
+        crate::mcp::stage_probe::record_stage("hnsw_fetch", &ranked);
+    }
 
     // v10 dream-verdict validity partition: resolve ONCE, early — one
     // batched query for the whole semantic candidate set (perf requirement)
@@ -1210,6 +1244,19 @@ async fn reflect_gather_pass(
         }
     }
 
+    let enriched_conv: HashMap<String, String> = enriched
+        .iter()
+        .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone()))
+        .collect();
+    {
+        let mut ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+        crate::mcp::stage_probe::record_stage("decay_enriched", &ranked);
+    }
+
     // Provenance-aware re-rank (v9.3): authority + meaning layered on the decayed
     // score. A cached floor at UserHistory or above is boosted; lower-floor
     // authority claims and tool-mechanic build logs are demoted, so a founding decision out-ranks the
@@ -1329,6 +1376,19 @@ async fn reflect_gather_pass(
         .into_iter()
         .map(|c| c.id)
         .collect();
+    {
+        let ranked: Vec<(String, String, f32)> = order
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    enriched_conv.get(id).cloned().unwrap_or_default(),
+                    adjusted_scores.get(id).copied().unwrap_or(0.0),
+                )
+            })
+            .collect();
+        crate::mcp::stage_probe::record_stage("rerank", &ranked);
+    }
     let rerank_rank: HashMap<&str, usize> = order
         .iter()
         .enumerate()
@@ -1366,6 +1426,19 @@ async fn reflect_gather_pass(
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
+    {
+        let ranked: Vec<(String, String, f32)> = final_order
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    enriched_conv.get(id).cloned().unwrap_or_default(),
+                    adjusted_scores.get(id).copied().unwrap_or(0.0),
+                )
+            })
+            .collect();
+        crate::mcp::stage_probe::record_stage("fuse_rrf", &ranked);
+    }
     let rank_of = |id: &str| {
         final_order
             .iter()
@@ -1407,6 +1480,14 @@ async fn reflect_gather_pass(
         })
         .collect();
     format::dedupe_sidechain_origins(&mut enriched, &parent_of);
+
+    {
+        let ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        crate::mcp::stage_probe::record_stage("dedupe", &ranked);
+    }
 
     let ancestry_candidates_used = enriched
         .iter()
@@ -3487,6 +3568,152 @@ mod tests {
             engine.insert_chunk(chunk.id, vector.to_vec());
         }
         (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn stage_probe_records_every_stage_and_final_rank_matches_the_returned_page() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        for i in 0..5 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("stage-probe-{i}"),
+                conversation_id: format!("codex:stage-probe-conv-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("stage probe content {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            // Cosine similarity to the query decreases with i, so the target
+            // (i=2) lands at a known, non-trivial rank.
+            let vector = [1.0 - (i as f32) * 0.1, 0.05, 0.0, 0.0];
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector.to_vec());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let (output, samples) = crate::mcp::stage_probe::scope("codex:stage-probe-conv-2", || {
+            reflect_on_past_with_vec(
+                &storage,
+                &search,
+                &query,
+                "stage probe content",
+                6,
+                0.0,
+                None,
+                0,
+                false,
+                ConsumptionMode::Off,
+                false,
+            )
+        })
+        .await;
+        let output = output.unwrap();
+        assert!(
+            output.contains("stage-probe-2"),
+            "target chunk should be in the returned page: {output}"
+        );
+
+        let stage_names: Vec<&str> = samples.iter().map(|sample| sample.stage).collect();
+        assert_eq!(
+            stage_names,
+            vec![
+                "hnsw_fetch",
+                "decay_enriched",
+                "rerank",
+                "fuse_rrf",
+                "dedupe",
+                "final_page",
+            ],
+            "every documented stage must record exactly once, in pipeline order"
+        );
+        for sample in &samples {
+            assert!(
+                sample.target_rank.is_some(),
+                "target present at every stage with these fixtures: {} had none",
+                sample.stage
+            );
+        }
+        let final_page = samples.last().unwrap();
+        assert_eq!(
+            final_page.target_rank,
+            Some(2),
+            "target is the 3rd-most-similar of 5 chunks, 0-indexed rank 2"
+        );
+    }
+
+    /// Two `scope()` calls interleaved via `tokio::join!` inside the SAME
+    /// task must not cross-contaminate: each records samples only for its
+    /// own target. `LocalKey::scope` sets/restores the task-local value
+    /// around each individual `poll()`, so sibling scoped futures polled in
+    /// turn never see each other's state — the property a naive
+    /// process-global `static` would not have.
+    #[tokio::test]
+    async fn stage_probe_scopes_do_not_cross_contaminate_concurrent_queries() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        for i in 0..3 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("concurrent-{i}"),
+                conversation_id: format!("codex:concurrent-conv-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("concurrent probe content {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            let vector = [1.0 - (i as f32) * 0.1, 0.05, 0.0, 0.0];
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector.to_vec());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let run = |target: &'static str| {
+            let storage = storage.clone();
+            let search = search.clone();
+            async move {
+                crate::mcp::stage_probe::scope(target, || {
+                    reflect_on_past_with_vec(
+                        &storage,
+                        &search,
+                        &query,
+                        "concurrent probe content",
+                        6,
+                        0.0,
+                        None,
+                        0,
+                        false,
+                        ConsumptionMode::Off,
+                        false,
+                    )
+                })
+                .await
+            }
+        };
+        let (first, second) = tokio::join!(
+            run("codex:concurrent-conv-0"),
+            run("codex:concurrent-conv-1")
+        );
+        let (_, first_samples) = first;
+        let (_, second_samples) = second;
+        assert_eq!(
+            first_samples.last().unwrap().target_rank,
+            Some(0),
+            "conv-0 probe must see its own target, not the other task's"
+        );
+        assert_eq!(
+            second_samples.last().unwrap().target_rank,
+            Some(1),
+            "conv-1 probe must see its own target, not the other task's"
+        );
     }
 
     #[test]

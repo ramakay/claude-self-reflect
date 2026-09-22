@@ -1346,6 +1346,35 @@ impl Storage {
         queries::set_chunk_saga_columns(&conn, chunk_id, seq, is_sidechain)
     }
 
+    /// `(file_path, conversation_id)` pairs from `import_state` whose
+    /// `conversation_id` starts with `prefix`.
+    pub fn import_state_rows_for_conversation_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::import_state_rows_for_conversation_prefix(&conn, prefix)
+    }
+
+    /// Re-stamp one chunk's `timestamp` in place, gated on id + conversation_id
+    /// + content still matching. See `queries::restamp_chunk_timestamp_if_content_matches`.
+    pub fn restamp_chunk_timestamp_if_content_matches(
+        &self,
+        chunk_id: &str,
+        conversation_id: &str,
+        content: &str,
+        new_timestamp: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::restamp_chunk_timestamp_if_content_matches(
+            &conn,
+            chunk_id,
+            conversation_id,
+            content,
+            new_timestamp,
+        )
+    }
+
     pub fn list_all_import_state_file_paths(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::list_all_import_state_file_paths(&conn)

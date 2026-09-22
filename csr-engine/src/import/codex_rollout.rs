@@ -242,7 +242,13 @@ where
                 parse_event_message(&value, &mut line_messages, &mut schema_misses)
             }
             Some("message") => {
-                if let Some(message) = canonical_message(&value, timestamp.as_deref()) {
+                // The outer `timestamp` is latched to the FIRST line that had
+                // one (see the `.or_else` above), so by this point it no
+                // longer reflects the current line for any line past the
+                // first. Prefer this line's own timestamp; only fall back to
+                // the latch when the line genuinely has none of its own.
+                let line_ts = string_at(&value, &["timestamp"]).or_else(|| timestamp.clone());
+                if let Some(message) = canonical_message(&value, line_ts.as_deref()) {
                     line_messages.push(message);
                 } else {
                     schema_misses += 1;
@@ -250,11 +256,12 @@ where
             }
             Some("world_state" | "inter_agent_communication_metadata") => {}
             Some(_) => {
+                let line_ts = string_at(&value, &["timestamp"]).or_else(|| timestamp.clone());
                 if let Some(text) = extract_unknown_text(&value) {
                     line_messages.push(unclassified_message(
                         "assistant",
                         &text,
-                        timestamp.as_deref(),
+                        line_ts.as_deref(),
                     ));
                 } else {
                     schema_misses += 1;
@@ -895,6 +902,125 @@ fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutS
     Ok(Some(outcome))
 }
 
+/// Meta key guarding [`restamp_codex_chunk_timestamps`]. Present once the
+/// backfill has run to completion on a database; a second call is then a
+/// no-op (`RestampStats::already_applied`).
+pub const RESTAMP_META_KEY: &str = "codex_rollout_chunk_ts_restamp_v1";
+
+/// Receipt for one run of [`restamp_codex_chunk_timestamps`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RestampStats {
+    /// `import_state` rows with `conversation_id LIKE 'codex:%'` examined.
+    pub conversations_considered: usize,
+    /// Rows whose file no longer exists on disk (capture-on-appearance:
+    /// Codex deletes session files aggressively). Left unchanged, not fixed.
+    pub conversations_missing_file: usize,
+    /// Rows whose file exists but now parses to a different conversation id
+    /// (skipped rather than cross-stamped).
+    pub conversations_id_mismatch: usize,
+    /// Files that produced at least one content-matched, re-stamped chunk.
+    pub conversations_updated: usize,
+    /// Files that exist and parsed, but every re-derived chunk's content
+    /// failed the guard (the on-disk file drifted since the original
+    /// import) — zero chunks touched for that conversation.
+    pub conversations_unmatched: usize,
+    /// Total chunk rows whose `timestamp` was rewritten.
+    pub chunks_updated: usize,
+    /// Total re-derived chunks whose content guard did not match any stored
+    /// row (drifted file content, not a fixable case).
+    pub chunks_unmatched: usize,
+    /// True when the meta marker was already present — no work was done.
+    pub already_applied: bool,
+}
+
+/// One-time, idempotent backfill for the timestamp-collapse bug fixed in
+/// `visit_rollout_message_chunks` (chunk.timestamp now uses `observed_at`
+/// instead of the latched session-start `metadata.timestamp`). The code fix
+/// alone only reaches rollouts that get reimported because their mtime
+/// changes; the ~1,400 already-imported, still-on-disk rollouts in a live
+/// corpus would otherwise carry the stale collapsed timestamp forever.
+///
+/// This re-derives each already-imported conversation's chunks by streaming
+/// the on-disk rollout through the exact same chunker used at import time
+/// (`stream_rollout_chunk_batches` / `visit_rollout_message_chunks`) — no
+/// embedding, no HNSW writes, no delete+reinsert — and issues a
+/// content-guarded `UPDATE chunks SET timestamp=...` per chunk. Chunk ids
+/// are deterministic (`conversation_id` + `seq`), so an unchanged file
+/// reproduces byte-identical chunk ids and content; the content guard is
+/// what makes a drifted file a safe no-op instead of a silent mis-stamp.
+///
+/// Deleted rollouts (capture-on-appearance means many are gone) are left
+/// unchanged and counted in `conversations_missing_file`, never fabricated.
+/// Guarded by [`RESTAMP_META_KEY`] so it runs at most once per database.
+pub fn restamp_codex_chunk_timestamps(engine: &Engine) -> Result<RestampStats> {
+    let storage = engine.storage();
+    if storage.get_meta(RESTAMP_META_KEY)?.is_some() {
+        return Ok(RestampStats {
+            already_applied: true,
+            ..RestampStats::default()
+        });
+    }
+
+    let rows = storage.import_state_rows_for_conversation_prefix("codex:")?;
+    let mut stats = RestampStats::default();
+
+    for (file_path, conversation_id) in rows {
+        stats.conversations_considered += 1;
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            stats.conversations_missing_file += 1;
+            continue;
+        }
+        let Some(metadata) = scan_rollout_metadata(path)? else {
+            // Vanished between the exists() check and open — same bucket as
+            // "missing": nothing to fix, not fabricated.
+            stats.conversations_missing_file += 1;
+            continue;
+        };
+        if metadata.conversation_id != conversation_id {
+            // Filename reused for a different session (rare) — skip rather
+            // than cross-stamp another conversation's chunks.
+            stats.conversations_id_mismatch += 1;
+            continue;
+        }
+
+        let mut updated_here = 0usize;
+        let mut unmatched_here = 0usize;
+        stream_rollout_chunk_batches(
+            path,
+            &metadata,
+            ROLLOUT_EMBED_BATCH_SIZE,
+            |chunks, _evidence| {
+                for chunk in chunks {
+                    let matched = storage.restamp_chunk_timestamp_if_content_matches(
+                        &chunk.id,
+                        &chunk.conversation_id,
+                        &chunk.content,
+                        &chunk.timestamp,
+                    )?;
+                    if matched {
+                        updated_here += 1;
+                    } else {
+                        unmatched_here += 1;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+
+        stats.chunks_updated += updated_here;
+        stats.chunks_unmatched += unmatched_here;
+        if updated_here > 0 {
+            stats.conversations_updated += 1;
+        } else if unmatched_here > 0 {
+            stats.conversations_unmatched += 1;
+        }
+    }
+
+    storage.set_meta(RESTAMP_META_KEY, &chrono::Utc::now().to_rfc3339())?;
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,6 +1148,25 @@ mod tests {
         );
     }
 
+    /// Fixture line 8 is an unknown top-level type (`future_envelope`) that
+    /// carries its own timestamp (12:00:07), arriving well after the
+    /// session-start latch (12:00:00) was already set by line 1. The
+    /// `Some(_)` branch in `visit_rollout_messages_inner` used to pass the
+    /// latched `timestamp.as_deref()` regardless, so this chunk landed on
+    /// 12:00:00 instead of its own line's time.
+    #[test]
+    fn unknown_type_lines_keep_their_own_timestamp_not_the_session_latch() {
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let parsed = parse_rollout(&source).unwrap().expect("fixture parses");
+        let chunks = rollout_chunks(&parsed);
+        let future_envelope = chunks
+            .iter()
+            .find(|chunk| chunk.content.contains("UNKNOWN TEXT RETAINED"))
+            .expect("future_envelope line produces a chunk");
+        assert_eq!(future_envelope.timestamp, "2026-08-06T12:00:07Z");
+    }
+
     #[test]
     fn imported_rollout_chunks_carry_the_messages_own_timestamp_not_the_session_start() {
         let root = tempfile::tempdir().unwrap();
@@ -1051,6 +1196,101 @@ mod tests {
             !timestamps.iter().all(|ts| ts == "2026-08-06T12:00:00Z"),
             "chunks must not all collapse onto the session-start timestamp"
         );
+    }
+
+    #[test]
+    fn restamp_backfill_repairs_collapsed_timestamps_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let target = root.path().join("rollout-copy.jsonl");
+        std::fs::copy(source, &target).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+
+        let import_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(import_stats.files_imported, 1);
+
+        let ids = storage
+            .get_chunk_ids_for_conversation("codex:modern-fixture")
+            .unwrap();
+        assert!(!ids.is_empty());
+        let chunks = storage.get_chunks_by_ids(&ids).unwrap();
+
+        // Simulate the pre-fix bug directly: collapse every chunk's
+        // timestamp onto the session-start time, exactly what the old
+        // `timestamp: metadata.timestamp.clone()` produced. Content is
+        // unchanged, so the content-guarded setter still matches.
+        for chunk in &chunks {
+            let touched = storage
+                .restamp_chunk_timestamp_if_content_matches(
+                    &chunk.id,
+                    &chunk.conversation_id,
+                    &chunk.content,
+                    "2026-08-06T12:00:00Z",
+                )
+                .unwrap();
+            assert!(
+                touched,
+                "setup: content guard should match unchanged content"
+            );
+        }
+        let collapsed = storage.get_chunks_by_ids(&ids).unwrap();
+        let collapsed_timestamps: std::collections::BTreeSet<_> =
+            collapsed.iter().map(|c| c.timestamp.clone()).collect();
+        assert_eq!(
+            collapsed_timestamps.len(),
+            1,
+            "setup: simulated collapse should leave exactly one distinct timestamp"
+        );
+
+        let restamp_stats = restamp_codex_chunk_timestamps(&engine).unwrap();
+        assert!(!restamp_stats.already_applied);
+        assert_eq!(restamp_stats.conversations_considered, 1);
+        assert_eq!(restamp_stats.conversations_updated, 1);
+        assert_eq!(restamp_stats.conversations_missing_file, 0);
+        assert_eq!(restamp_stats.conversations_id_mismatch, 0);
+        assert_eq!(restamp_stats.conversations_unmatched, 0);
+        assert_eq!(restamp_stats.chunks_updated, ids.len());
+        assert_eq!(restamp_stats.chunks_unmatched, 0);
+
+        let repaired = storage.get_chunks_by_ids(&ids).unwrap();
+        let repaired_timestamps: std::collections::BTreeSet<_> =
+            repaired.iter().map(|c| c.timestamp.clone()).collect();
+        assert!(
+            repaired_timestamps.len() > 1,
+            "restamp should restore distinct per-message timestamps, got {repaired_timestamps:?}"
+        );
+
+        // Idempotent: a second run is a no-op guarded by the meta marker.
+        let second = restamp_codex_chunk_timestamps(&engine).unwrap();
+        assert!(second.already_applied);
+        assert_eq!(second.chunks_updated, 0);
+        assert_eq!(second.conversations_considered, 0);
+    }
+
+    #[test]
+    fn restamp_backfill_counts_missing_files_without_fabricating() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let target = root.path().join("rollout-copy.jsonl");
+        std::fs::copy(source, &target).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+
+        let import_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(import_stats.files_imported, 1);
+
+        // Capture-on-appearance: the source rollout is gone by backfill time.
+        std::fs::remove_file(&target).unwrap();
+
+        let stats = restamp_codex_chunk_timestamps(&engine).unwrap();
+        assert!(!stats.already_applied);
+        assert_eq!(stats.conversations_considered, 1);
+        assert_eq!(stats.conversations_missing_file, 1);
+        assert_eq!(stats.conversations_updated, 0);
+        assert_eq!(stats.chunks_updated, 0);
     }
 
     /// The pass used to propagate the first per-file error, so one unreadable
