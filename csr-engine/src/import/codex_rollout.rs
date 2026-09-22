@@ -38,6 +38,7 @@ pub(crate) struct ParsedRollout {
     pub messages: Vec<serde_json::Value>,
     pub schema_misses: usize,
     pub suppression: CsrSuppressionStats,
+    pub harness_context_stripped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,10 @@ struct RolloutMetadata {
 struct RolloutStreamOutcome {
     schema_misses: usize,
     suppression: CsrSuppressionStats,
+    /// Harness-injected content items dropped by `canonical_message` — see
+    /// `CODEX_HARNESS_MARKERS`. Not a schema miss: this is a deliberate,
+    /// successful redaction, counted separately.
+    harness_context_stripped: usize,
     chunks: usize,
 }
 
@@ -65,6 +70,7 @@ pub(crate) struct RolloutImportStats {
     pub schema_misses: usize,
     pub csr_tool_blocks_suppressed: usize,
     pub csr_hook_wrappers_scrubbed: usize,
+    pub harness_context_stripped: usize,
 }
 
 /// Recursively discover changed `rollout-*.jsonl` files. A missing vendor root
@@ -151,6 +157,7 @@ pub(crate) fn parse_rollout(path: &Path) -> Result<Option<ParsedRollout>> {
         messages,
         schema_misses: outcome.schema_misses,
         suppression: outcome.suppression,
+        harness_context_stripped: outcome.harness_context_stripped,
     }))
 }
 
@@ -189,6 +196,7 @@ where
     let mut cwd = None;
     let mut timestamp = None;
     let mut schema_misses = 0usize;
+    let mut harness_context_stripped = 0usize;
     let mut summary = None;
     let mut sanitizer = super::CsrMessageSanitizer::default();
 
@@ -236,7 +244,12 @@ where
                 cwd = cwd.or_else(|| string_at(&value, &["payload", "cwd"]));
             }
             Some("response_item") => {
-                parse_response_item(&value, &mut line_messages, &mut schema_misses);
+                parse_response_item(
+                    &value,
+                    &mut line_messages,
+                    &mut schema_misses,
+                    &mut harness_context_stripped,
+                );
             }
             Some("event_msg") => {
                 parse_event_message(&value, &mut line_messages, &mut schema_misses)
@@ -248,10 +261,10 @@ where
                 // first. Prefer this line's own timestamp; only fall back to
                 // the latch when the line genuinely has none of its own.
                 let line_ts = string_at(&value, &["timestamp"]).or_else(|| timestamp.clone());
-                if let Some(message) = canonical_message(&value, line_ts.as_deref()) {
-                    line_messages.push(message);
-                } else {
-                    schema_misses += 1;
+                match canonical_message(&value, line_ts.as_deref(), &mut harness_context_stripped) {
+                    CanonicalOutcome::Message(message) => line_messages.push(message),
+                    CanonicalOutcome::Stripped => {}
+                    CanonicalOutcome::Missing => schema_misses += 1,
                 }
             }
             Some("world_state" | "inter_agent_communication_metadata") => {}
@@ -335,6 +348,7 @@ where
         RolloutStreamOutcome {
             schema_misses,
             suppression: sanitizer.stats,
+            harness_context_stripped,
             chunks: 0,
         },
     )))
@@ -352,6 +366,7 @@ fn parse_response_item(
     value: &serde_json::Value,
     messages: &mut Vec<serde_json::Value>,
     schema_misses: &mut usize,
+    harness_context_stripped: &mut usize,
 ) {
     let Some(payload) = value.get("payload") else {
         *schema_misses += 1;
@@ -359,13 +374,15 @@ fn parse_response_item(
     };
     let timestamp = value.get("timestamp").and_then(serde_json::Value::as_str);
     match payload.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => match canonical_message(payload, timestamp) {
-            Some(message) => messages.push(message),
-            None if matches!(
-                payload.get("role").and_then(serde_json::Value::as_str),
-                Some("developer" | "system")
-            ) => {}
-            None => *schema_misses += 1,
+        Some("message") => match canonical_message(payload, timestamp, harness_context_stripped) {
+            CanonicalOutcome::Message(message) => messages.push(message),
+            CanonicalOutcome::Stripped => {}
+            CanonicalOutcome::Missing
+                if matches!(
+                    payload.get("role").and_then(serde_json::Value::as_str),
+                    Some("developer" | "system")
+                ) => {}
+            CanonicalOutcome::Missing => *schema_misses += 1,
         },
         Some("agent_message") => {
             if let Some(text) = content_text(payload.get("content")) {
@@ -472,20 +489,128 @@ fn parse_event_message(
     }
 }
 
+/// Harness-injected context markers Codex writes as synthetic user-role
+/// content items ahead of the real user turn (recommended plugins, AGENTS.md
+/// instructions, environment/context dumps, permission grants). Scanned from
+/// the live `~/.codex/sessions` corpus. Only exact, line-anchored tag
+/// prefixes belong here — never anything broad enough to also match real
+/// user prose that happens to mention one of these strings.
+const CODEX_HARNESS_MARKERS: &[&str] = &[
+    "<recommended_plugins>",
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<user_instructions>",
+    "<permissions instructions>",
+    "<codex_internal_context>",
+    "<skills_instructions>",
+];
+
+/// Whether `text` is a Codex harness-injected content item rather than real
+/// user prose, checked as a prefix of the *trimmed* text (never a
+/// substring), so prose that merely mentions one of these tags mid-message
+/// is never stripped.
+fn is_harness_context_item(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    CODEX_HARNESS_MARKERS
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+}
+
+/// Outcome of building a canonical user/assistant message from a raw Codex
+/// envelope. `Stripped` (every content item present was harness-injected) is
+/// deliberately distinct from `Missing` (genuinely no usable text): the
+/// former is a successful redaction and must never increment a schema-miss
+/// counter or emit an empty message.
+enum CanonicalOutcome {
+    Message(serde_json::Value),
+    Stripped,
+    Missing,
+}
+
 fn canonical_message(
     value: &serde_json::Value,
     timestamp: Option<&str>,
-) -> Option<serde_json::Value> {
-    let role = value.get("role")?.as_str()?;
+    harness_context_stripped: &mut usize,
+) -> CanonicalOutcome {
+    let Some(role) = value.get("role").and_then(serde_json::Value::as_str) else {
+        return CanonicalOutcome::Missing;
+    };
     if role != "user" && role != "assistant" {
-        return None;
+        return CanonicalOutcome::Missing;
     }
-    let text = content_text(value.get("content"))?;
+    // Only Codex's own harness injects synthetic context ahead of the real
+    // turn, and it always does so as a user-role message — assistant
+    // content never needs the strip.
+    let content_outcome = if role == "user" {
+        content_text_stripping_harness(value.get("content"), harness_context_stripped)
+    } else {
+        match content_text(value.get("content")) {
+            Some(text) => ContentOutcome::Text(text),
+            None => ContentOutcome::Missing,
+        }
+    };
+    let text = match content_outcome {
+        ContentOutcome::Text(text) => text,
+        ContentOutcome::Stripped => return CanonicalOutcome::Stripped,
+        ContentOutcome::Missing => return CanonicalOutcome::Missing,
+    };
     let mut message = text_message(role, &text, timestamp);
     if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
         message["uuid"] = serde_json::Value::String(id.to_string());
     }
-    Some(message)
+    CanonicalOutcome::Message(message)
+}
+
+/// Outcome of extracting text from a `content` field with harness-item
+/// filtering applied — see `CanonicalOutcome` for why `Stripped` is not
+/// folded into `Missing`.
+enum ContentOutcome {
+    Text(String),
+    Stripped,
+    Missing,
+}
+
+fn content_text_stripping_harness(
+    content: Option<&serde_json::Value>,
+    stripped: &mut usize,
+) -> ContentOutcome {
+    match content {
+        None => ContentOutcome::Missing,
+        Some(serde_json::Value::String(text)) => {
+            if text.is_empty() {
+                ContentOutcome::Missing
+            } else if is_harness_context_item(text) {
+                *stripped += 1;
+                ContentOutcome::Stripped
+            } else {
+                ContentOutcome::Text(text.clone())
+            }
+        }
+        Some(serde_json::Value::Array(items)) => {
+            let mut any_stripped = false;
+            let mut kept = Vec::new();
+            for item in items {
+                let Some(text) = item.get("text").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if is_harness_context_item(text) {
+                    any_stripped = true;
+                    *stripped += 1;
+                } else {
+                    kept.push(text);
+                }
+            }
+            let text = kept.join("\n");
+            if !text.is_empty() {
+                ContentOutcome::Text(text)
+            } else if any_stripped {
+                ContentOutcome::Stripped
+            } else {
+                ContentOutcome::Missing
+            }
+        }
+        Some(_) => ContentOutcome::Missing,
+    }
 }
 
 fn content_text(content: Option<&serde_json::Value>) -> Option<String> {
@@ -808,6 +933,7 @@ pub(crate) fn import_changed_rollouts(engine: &Engine, root: &Path) -> Result<Ro
                 stats.schema_misses += outcome.schema_misses;
                 stats.csr_tool_blocks_suppressed += outcome.suppression.csr_tool_blocks_suppressed;
                 stats.csr_hook_wrappers_scrubbed += outcome.suppression.csr_hook_wrappers_scrubbed;
+                stats.harness_context_stripped += outcome.harness_context_stripped;
                 stats.files_imported += 1;
                 stats.chunks_imported += outcome.chunks;
             }
@@ -892,6 +1018,14 @@ fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutS
         },
     )?;
     storage.bump_aux_counter_by("codex_rollout", outcome.schema_misses)?;
+    // Same convention as the schema-miss counter above (aux `meta` counter,
+    // surfaced next to it in status via `get_aux_counters`), distinctly
+    // namespaced so a redacted-harness-item count is never conflated with a
+    // parse failure.
+    storage.bump_aux_counter_by(
+        "codex_harness_context_stripped",
+        outcome.harness_context_stripped,
+    )?;
     let key = file.path.to_string_lossy();
     storage.upsert_import_state_explicit(
         &key,
@@ -1021,6 +1155,83 @@ pub fn restamp_codex_chunk_timestamps(engine: &Engine) -> Result<RestampStats> {
     Ok(stats)
 }
 
+/// Meta key guarding [`invalidate_polluted_codex_rollouts`]. Present once the
+/// one-shot re-import pass has run to completion on a database.
+pub const HARNESS_STRIP_META_KEY: &str = "codex_harness_strip_v1";
+
+/// Receipt for one run of [`invalidate_polluted_codex_rollouts`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HarnessStripBackfillStats {
+    /// `import_state` rows with `conversation_id LIKE 'codex:%'` examined.
+    pub conversations_considered: usize,
+    /// Of those, how many carry a harness-marker-prefixed `summary` (the
+    /// live-corpus signal for "imported before the WP-A adapter fix").
+    pub conversations_polluted: usize,
+    /// Polluted rows whose `import_state.file_mtime` was cleared so the next
+    /// `import_changed_rollouts` pass re-imports them through the
+    /// marker-stripping adapter.
+    pub conversations_invalidated: usize,
+    /// Polluted rows whose source file no longer exists on disk (capture-on-
+    /// appearance) — left unchanged, not fixable here.
+    pub conversations_missing_file: usize,
+    /// True when the meta marker was already present — no work was done.
+    pub already_applied: bool,
+}
+
+/// One-time, idempotent backfill for rollouts imported before the WP-A
+/// adapter fix (`canonical_message`'s harness-marker stripping): every
+/// already-imported `codex_rollout` conversation whose stored `summary`
+/// starts with a `CODEX_HARNESS_MARKERS` entry is a conversation that was
+/// chunked with the harness boilerplate as its first, second-class-citizen
+/// content. The fix alone only reaches rollouts that get reimported because
+/// their mtime changes; this reaches the rest by clearing their stored
+/// `import_state.file_mtime` (`Storage::invalidate_import_state_mtime`) so
+/// the next `import_changed_rollouts` discovery pass picks them up and
+/// re-runs them through the now-fixed adapter — full delete+reinsert via the
+/// existing `import_rollout` path, not an in-place patch.
+///
+/// Rollouts whose file is gone on disk are left untouched and counted in
+/// `conversations_missing_file`, never fabricated. This function only
+/// invalidates; it does not itself call `import_changed_rollouts` — the
+/// caller does that as a normal follow-up pass.
+/// Guarded by [`HARNESS_STRIP_META_KEY`] so it runs at most once per
+/// database.
+pub fn invalidate_polluted_codex_rollouts(engine: &Engine) -> Result<HarnessStripBackfillStats> {
+    let storage = engine.storage();
+    if storage.get_meta(HARNESS_STRIP_META_KEY)?.is_some() {
+        return Ok(HarnessStripBackfillStats {
+            already_applied: true,
+            ..HarnessStripBackfillStats::default()
+        });
+    }
+
+    let polluted: std::collections::HashSet<String> = storage
+        .codex_conversation_summaries()?
+        .into_iter()
+        .filter(|(_, summary)| summary.as_deref().is_some_and(is_harness_context_item))
+        .map(|(conversation_id, _)| conversation_id)
+        .collect();
+
+    let rows = storage.import_state_rows_for_conversation_prefix("codex:")?;
+    let mut stats = HarnessStripBackfillStats::default();
+    for (file_path, conversation_id) in rows {
+        stats.conversations_considered += 1;
+        if !polluted.contains(&conversation_id) {
+            continue;
+        }
+        stats.conversations_polluted += 1;
+        if !Path::new(&file_path).exists() {
+            stats.conversations_missing_file += 1;
+            continue;
+        }
+        storage.invalidate_import_state_mtime(&file_path)?;
+        stats.conversations_invalidated += 1;
+    }
+
+    storage.set_meta(HARNESS_STRIP_META_KEY, &chrono::Utc::now().to_rfc3339())?;
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,6 +1283,7 @@ mod tests {
     fn codex_response_channels_distinguish_assistant_from_unclassified_payloads() {
         let mut assistant = Vec::new();
         let mut misses = 0;
+        let mut stripped = 0;
         parse_response_item(
             &serde_json::json!({
                 "type":"response_item",
@@ -1079,6 +1291,7 @@ mod tests {
             }),
             &mut assistant,
             &mut misses,
+            &mut stripped,
         );
         assert_eq!(assistant.len(), 1);
         assert!(assistant[0].get("_csr_channel").is_none());
@@ -1091,6 +1304,7 @@ mod tests {
             }),
             &mut unknown,
             &mut misses,
+            &mut stripped,
         );
         assert_eq!(unknown.len(), 1);
         assert_eq!(
@@ -1293,6 +1507,139 @@ mod tests {
         assert_eq!(stats.chunks_updated, 0);
     }
 
+    #[test]
+    fn harness_strip_backfill_invalidates_only_polluted_rows_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let target = root.path().join("rollout-copy.jsonl");
+        std::fs::copy(source, &target).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+
+        let import_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(import_stats.files_imported, 1);
+
+        // Simulate the pre-fix pollution directly, the same way the restamp
+        // tests simulate the pre-fix timestamp bug: stamp the stored
+        // `summary` with harness boilerplate, as if this row had been
+        // imported before the WP-A adapter strip existed.
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE chunks SET summary = ?1 WHERE conversation_id = 'codex:modern-fixture'",
+                    rusqlite::params![
+                        "<recommended_plugins>\nHere is a list of plugins that are available but not installed"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let target_key = target.to_string_lossy().to_string();
+        let original_mtime = storage
+            .get_import_state_mtime(&target_key)
+            .unwrap()
+            .unwrap();
+        assert!(!original_mtime.is_empty());
+
+        let stats = invalidate_polluted_codex_rollouts(&engine).unwrap();
+        assert!(!stats.already_applied);
+        assert_eq!(stats.conversations_considered, 1);
+        assert_eq!(stats.conversations_polluted, 1);
+        assert_eq!(stats.conversations_invalidated, 1);
+        assert_eq!(stats.conversations_missing_file, 0);
+
+        let cleared_mtime = storage
+            .get_import_state_mtime(&target_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cleared_mtime, "",
+            "invalidated row's mtime must no longer match the real file"
+        );
+
+        // The next discovery pass re-imports the invalidated row through the
+        // (already-fixed) adapter, overwriting the simulated pollution.
+        let reimport_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(reimport_stats.files_imported, 1);
+        let ids = storage
+            .get_chunk_ids_for_conversation("codex:modern-fixture")
+            .unwrap();
+        let chunks = storage.get_chunks_by_ids(&ids).unwrap();
+        assert!(
+            chunks.iter().all(|c| !c
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("<recommended_plugins>")),
+            "reimport must clear the simulated pollution: {:?}",
+            chunks.iter().map(|c| &c.summary).collect::<Vec<_>>()
+        );
+
+        // Idempotent: a second backfill run is a no-op guarded by the meta marker.
+        let second = invalidate_polluted_codex_rollouts(&engine).unwrap();
+        assert!(second.already_applied);
+        assert_eq!(second.conversations_considered, 0);
+        assert_eq!(second.conversations_invalidated, 0);
+    }
+
+    #[test]
+    fn harness_strip_backfill_counts_missing_files_without_touching_clean_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        // One polluted row whose file will vanish, one clean row that must be
+        // left completely alone.
+        let polluted_target = root.path().join("rollout-polluted.jsonl");
+        let clean_target = root.path().join("rollout-clean.jsonl");
+        std::fs::copy(&source, &polluted_target).unwrap();
+        std::fs::copy(&source, &clean_target).unwrap();
+        // Distinct conversation ids: the fixture's session_meta id is fixed,
+        // so give the second copy its own id by rewriting the file.
+        let rewritten = std::fs::read_to_string(&source)
+            .unwrap()
+            .replace("modern-fixture", "modern-fixture-clean");
+        std::fs::write(&clean_target, rewritten).unwrap();
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        let import_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(import_stats.files_imported, 2);
+
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE chunks SET summary = ?1 WHERE conversation_id = 'codex:modern-fixture'",
+                    rusqlite::params!["<environment_context>\ncwd: /tmp\n</environment_context>"],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let clean_mtime_before = storage
+            .get_import_state_mtime(&clean_target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+
+        // Capture-on-appearance: the polluted rollout's source file is gone
+        // by backfill time.
+        std::fs::remove_file(&polluted_target).unwrap();
+
+        let stats = invalidate_polluted_codex_rollouts(&engine).unwrap();
+        assert!(!stats.already_applied);
+        assert_eq!(stats.conversations_considered, 2);
+        assert_eq!(stats.conversations_polluted, 1);
+        assert_eq!(stats.conversations_invalidated, 0);
+        assert_eq!(stats.conversations_missing_file, 1);
+
+        // The clean row's mtime must be untouched.
+        let clean_mtime_after = storage
+            .get_import_state_mtime(&clean_target.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(clean_mtime_before, clean_mtime_after);
+    }
+
     /// The pass used to propagate the first per-file error, so one unreadable
     /// or write-locked rollout cost every file behind it until the next
     /// 30-minute daemon cycle.
@@ -1356,6 +1703,184 @@ mod tests {
         assert!(serialized.contains("LEGACY USER REQUEST"));
         assert!(serialized.contains("LEGACY ASSISTANT RESPONSE"));
         assert_eq!(parsed.schema_misses, 0);
+    }
+
+    #[test]
+    #[ignore = "acceptance receipt only: reads the operator's real ~/.codex/sessions corpus, never committed as a running gate"]
+    fn acceptance_receipt_01a0c5df_real_file_strips_cleanly() {
+        let real = std::path::Path::new(
+            "/Users/ramakrishnanannaswamy/.codex/sessions/2026/09/21/rollout-2026-09-21T14-29-18-01a0c5df-904a-7031-b2b8-dc71f64900bf.jsonl",
+        );
+        if !real.exists() {
+            eprintln!("acceptance receipt skipped: fixture file not present on this machine");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rollout-01a0c5df.jsonl");
+        std::fs::copy(real, &target).unwrap();
+
+        let metadata = scan_rollout_metadata(&target).unwrap().unwrap();
+        eprintln!(
+            "RECEIPT 01a0c5df summary (after fix): {:?}",
+            metadata.summary
+        );
+        assert!(
+            metadata
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("dont look at the literature install graphify"),
+            "summary must be the real first user turn, not harness boilerplate: {:?}",
+            metadata.summary
+        );
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        let stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        eprintln!("RECEIPT import stats: {stats:?}");
+        assert_eq!(stats.files_imported, 1);
+
+        let ids = storage
+            .get_chunk_ids_for_conversation("codex:01a0c5df-904a-7031-b2b8-dc71f64900bf")
+            .unwrap();
+        let chunks = storage.get_chunks_by_ids(&ids).unwrap();
+        let boilerplate: Vec<_> = chunks
+            .iter()
+            .filter(|c| {
+                c.summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("<recommended_plugins>")
+            })
+            .collect();
+        eprintln!(
+            "RECEIPT: {} chunks total, {} still boilerplate-summarized",
+            chunks.len(),
+            boilerplate.len()
+        );
+        assert!(
+            boilerplate.is_empty(),
+            "no chunk may carry the boilerplate summary after the fix"
+        );
+    }
+
+    #[test]
+    fn codex_harness_context_items_are_stripped_and_counted() {
+        // First user message is entirely Codex harness boilerplate (three
+        // injected items); second is the real prompt. The harness-only
+        // message must emit no chunk at all — not an empty one — and the
+        // real prompt becomes the conversation's summary.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-harness.jsonl");
+        let session_meta = r#"{"type":"session_meta","payload":{"id":"harness-fixture","cwd":"/tmp/harness-project"}}"#;
+        let injected = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-09-20T10:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "<recommended_plugins>\nHere is a list of plugins that are available but not installed"},
+                    {"type": "input_text", "text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>do the agents thing</INSTRUCTIONS>"},
+                    {"type": "input_text", "text": "<environment_context>\ncwd: /tmp/harness-project\n</environment_context>"}
+                ]
+            }
+        });
+        let real = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-09-20T10:00:05Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "dont look at the literature install graphify"}
+                ]
+            }
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "{session_meta}\n{}\n{}\n",
+                serde_json::to_string(&injected).unwrap(),
+                serde_json::to_string(&real).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_rollout(&path).unwrap().unwrap();
+        let serialized = serde_json::to_string(&parsed.messages).unwrap();
+
+        assert_eq!(
+            parsed.harness_context_stripped, 3,
+            "all 3 injected items in the first message must be counted"
+        );
+        assert!(!serialized.contains("<recommended_plugins>"));
+        assert!(!serialized.contains("AGENTS.md instructions"));
+        assert!(!serialized.contains("<environment_context>"));
+        assert!(serialized.contains("dont look at the literature install graphify"));
+        assert_eq!(
+            parsed.schema_misses, 0,
+            "a fully-stripped message is not a schema miss"
+        );
+
+        let user_messages: Vec<_> = parsed
+            .messages
+            .iter()
+            .filter(|m| m.get("type").and_then(serde_json::Value::as_str) == Some("user"))
+            .collect();
+        assert_eq!(
+            user_messages.len(),
+            1,
+            "the harness-only message must emit nothing at all: {user_messages:?}"
+        );
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        assert_eq!(
+            metadata.summary.as_deref(),
+            Some("dont look at the literature install graphify"),
+            "summary must be the first REAL user message, not the harness boilerplate"
+        );
+    }
+
+    #[test]
+    fn codex_harness_mixed_message_keeps_real_prose() {
+        // One content item is harness-injected, the other is real prose in
+        // the SAME message — only the injected item is dropped.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-mixed.jsonl");
+        let session_meta = r#"{"type":"session_meta","payload":{"id":"mixed-fixture","cwd":"/tmp/mixed-project"}}"#;
+        let mixed = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-09-20T11:00:00Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "<user_instructions>\nsome harness instructions\n</user_instructions>"},
+                    {"type": "input_text", "text": "real prose alongside the injected item"}
+                ]
+            }
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "{session_meta}\n{}\n",
+                serde_json::to_string(&mixed).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let parsed = parse_rollout(&path).unwrap().unwrap();
+        let serialized = serde_json::to_string(&parsed.messages).unwrap();
+
+        assert_eq!(parsed.harness_context_stripped, 1);
+        assert!(!serialized.contains("user_instructions"));
+        assert!(serialized.contains("real prose alongside the injected item"));
+        assert_eq!(
+            parsed.messages.len(),
+            1,
+            "the surviving prose must still emit exactly one message"
+        );
     }
 
     #[test]

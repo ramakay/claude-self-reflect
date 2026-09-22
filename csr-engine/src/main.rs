@@ -248,6 +248,15 @@ enum Commands {
     /// re-embedding, no HNSW writes — content-guarded `UPDATE`s only. Safe to
     /// run repeatedly; a second run is a no-op once the meta marker is set.
     BackfillCodexTimestamps,
+    /// One-time, idempotent invalidation of already-imported `codex_rollout`
+    /// conversations whose stored summary is Codex harness boilerplate
+    /// (`<recommended_plugins>`, `# AGENTS.md instructions`, ...) rather than
+    /// the real first user turn — see the WP-A adapter strip in
+    /// `import::codex_rollout::canonical_message`. Clears their
+    /// `import_state` mtime only; run `setup`/the daemon afterward to
+    /// actually re-import them through the fixed adapter. Safe to run
+    /// repeatedly; a second run is a no-op once the meta marker is set.
+    BackfillCodexHarnessStrip,
     /// Historical deterministic capture operations.
     Backfill {
         #[command(subcommand)]
@@ -1107,6 +1116,16 @@ async fn run() -> Result<()> {
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
         let stats = csr_engine::import::codex_rollout::restamp_codex_chunk_timestamps(&eng)?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
+    if let Some(Commands::BackfillCodexHarnessStrip) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::codex_rollout::invalidate_polluted_codex_rollouts(&eng)?;
         println!("{}", serde_json::to_string_pretty(&stats)?);
         return Ok(());
     }

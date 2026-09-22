@@ -1129,6 +1129,20 @@ impl Storage {
         queries::upsert_import_state_explicit(&conn, file_path, conversation_id, chunks, mtime)
     }
 
+    /// Distinct `(conversation_id, summary)` pairs for every `codex_rollout`
+    /// conversation. See `queries::codex_conversation_summaries`.
+    pub fn codex_conversation_summaries(&self) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::codex_conversation_summaries(&conn)
+    }
+
+    /// Clear a stored import_state mtime so the row is picked up on the next
+    /// discovery pass. See `queries::invalidate_import_state_mtime`.
+    pub fn invalidate_import_state_mtime(&self, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::invalidate_import_state_mtime(&conn, file_path)
+    }
+
     // ─── Session registry queries (multi-source corpus, v9.4) ───
 
     /// (first_ts, last_ts) for one session, if registered. See

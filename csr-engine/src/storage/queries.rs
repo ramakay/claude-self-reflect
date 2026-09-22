@@ -966,9 +966,11 @@ pub fn get_chunks_by_project(
 
 /// Project namespaces in the same family as `project` (per
 /// `cross_project::same_project_family_at_root`), plus `project` itself,
-/// resolved against `projects_root`. Hermetic seam for tests — the production
-/// entry point is `recent_work_family_projects`, which resolves the real
-/// `~/projects` root. Mirrors the pattern in `storage::codegraph::family_projects`.
+/// resolved against `projects_root`. Hermetic seam for tests only — the
+/// production entry point is `recent_work_family_projects`, which goes
+/// through the crate's cached `same_project_family` instead of this
+/// uncached, explicit-root variant (see that function's doc comment).
+/// Mirrors the pattern in `storage::codegraph::family_projects`.
 ///
 /// Known follow-up (tracked, not fixed here): family expansion also pulls in
 /// headless scratchpad/cleanroom/worktree namespaces that share the family
@@ -977,6 +979,7 @@ pub fn get_chunks_by_project(
 /// family, so it is not a regression here; filtering headless probe/narrator
 /// sessions out of recent-work specifically needs its own signal (the same
 /// one used for narrator-child detection) and is out of scope for this fix.
+#[cfg(test)]
 fn recent_work_family_projects_at_root(
     conn: &Connection,
     project: &str,
@@ -992,11 +995,29 @@ fn recent_work_family_projects_at_root(
     Ok(projects)
 }
 
+/// Production entry point. Unlike `recent_work_family_projects_at_root` (the
+/// hermetic test seam, which takes an explicit root and always does an
+/// uncached `is_dir` per candidate), this goes through the crate's shared
+/// `same_project_family` — the same cached predicate every other
+/// family-scoped caller uses (`cached_is_dir`, one filesystem stat per
+/// distinct path for the process lifetime, not one per call).
+///
+/// If there is no resolvable home directory, `same_project_family_at_root`
+/// can't tell an alias from a genuine sibling either way, so this matches
+/// `same_project_family`'s own no-home-dir behavior (no family, exact scope
+/// only) instead of silently joining "projects" onto an empty path and
+/// letting an unrelated CWD directory leak into the family.
 fn recent_work_family_projects(conn: &Connection, project: &str) -> Result<Vec<String>> {
-    let projects_root = dirs::home_dir()
-        .map(|home| home.join("projects"))
-        .unwrap_or_default();
-    recent_work_family_projects_at_root(conn, project, &projects_root)
+    if dirs::home_dir().is_none() {
+        return Ok(vec![project.to_string()]);
+    }
+    let mut projects = list_project_names(conn, "", i64::MAX as usize)?;
+    projects
+        .retain(|candidate| crate::search::cross_project::same_project_family(project, candidate));
+    if !projects.iter().any(|p| p == project) {
+        projects.push(project.to_string());
+    }
+    Ok(projects)
 }
 
 /// Row shape for `get_recent_chunks_in_projects`: the representative (first)
@@ -1040,12 +1061,84 @@ fn within_burst_window(head_ts: &str, candidate_ts: &str) -> bool {
     }
 }
 
+/// Exact count of `codex_rollout` conversations (non-sidechain, in scope)
+/// whose first-chunk timestamp falls within `CODEX_BURST_WINDOW_SECS` of
+/// `head_ts` (inclusive, looking backward only — matching `within_burst_window`
+/// when scanning a descending-timestamp list). Codex chunk timestamps all
+/// carry the rollout's start time (see module docs), so `MIN(timestamp)` per
+/// conversation is exactly the value `within_burst_window` compares against.
+/// Used only as a fallback when the fetched row window ends mid-burst and the
+/// window-based scan in `collapse_codex_bursts` can't see past its own edge.
+/// `Ok(None)` (unparsable `head_ts`) leaves the caller's window-based count
+/// as-is rather than reporting a bogus one.
+fn count_codex_burst_members(
+    conn: &Connection,
+    projects: &[String],
+    head_ts: &str,
+) -> Result<Option<usize>> {
+    if head_ts.parse::<chrono::DateTime<chrono::Utc>>().is_err() {
+        return Ok(None);
+    }
+    // Fetch each in-scope codex conversation's first-chunk timestamp and
+    // filter by *parsed* comparison in Rust, not a SQL string BETWEEN.
+    // Timestamps in this table are RFC3339 text written by different
+    // adapters/call sites that don't agree on a UTC-offset suffix ("Z" vs
+    // "+00:00"): a string BETWEEN against a chrono-formatted bound silently
+    // excludes the exact-equality case whenever the suffixes differ (was
+    // observed undercounting the burst's own head row by one). This set is
+    // bounded by the in-scope project's own codex conversation count, not
+    // the corpus, so an in-memory filter is cheap.
+    let sql = if projects.is_empty() {
+        "SELECT conversation_id, MIN(timestamp) AS first_ts FROM chunks \
+         WHERE source = 'codex_rollout' AND is_sidechain = 0 GROUP BY conversation_id"
+            .to_string()
+    } else {
+        format!(
+            "SELECT conversation_id, MIN(timestamp) AS first_ts FROM chunks \
+             WHERE project_name IN ({}) AND source = 'codex_rollout' AND is_sidechain = 0 \
+             GROUP BY conversation_id",
+            string_placeholders(projects.len()),
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let first_timestamps: Vec<String> = if projects.is_empty() {
+        stmt.query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let qparams: Vec<&dyn rusqlite::ToSql> =
+            projects.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        stmt.query_map(qparams.as_slice(), |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let count = first_timestamps
+        .iter()
+        .filter(|ts| within_burst_window(head_ts, ts))
+        .count();
+    Ok(Some(count))
+}
+
 /// Collapse consecutive `codex_rollout` conversations whose first-chunk
 /// timestamps land within `CODEX_BURST_WINDOW_SECS` of the burst's head row
 /// into a single row annotated with `+N parallel`, honouring `limit` on the
 /// *collapsed* row count. Rows must already be ordered by last-activity
 /// descending, so siblings in a burst are adjacent.
-fn collapse_codex_bursts(rows: Vec<RecentChunkRow>, limit: usize) -> Vec<ConversationChunk> {
+///
+/// `rows` is a bounded fetch window, not the whole corpus. When a burst's
+/// member scan runs all the way to the end of `rows` without hitting a
+/// non-member (i.e. the fetch window itself, not the burst, is what stopped
+/// the scan), the window-based `extra` count is a lower bound, not the true
+/// count — the burst may have more siblings past the window edge. This can
+/// happen even when the collapsed output already satisfies `limit` (a solo
+/// row ahead of an oversized burst fills `limit` before the burst is fully
+/// walked), so the caller's widening retry never gets a chance to fetch a
+/// wider window. Run an exact follow-up count in that case rather than
+/// reporting a partial one.
+fn collapse_codex_bursts(
+    conn: &Connection,
+    projects: &[String],
+    rows: Vec<RecentChunkRow>,
+    limit: usize,
+) -> Result<Vec<ConversationChunk>> {
     const CODEX_SOURCE: &str = "codex_rollout";
     let mut out = Vec::new();
     let mut i = 0;
@@ -1062,6 +1155,11 @@ fn collapse_codex_bursts(rows: Vec<RecentChunkRow>, limit: usize) -> Vec<Convers
                 extra += 1;
                 j += 1;
             }
+            if j == rows.len() {
+                if let Some(exact) = count_codex_burst_members(conn, projects, head_ts)? {
+                    extra = extra.max(exact.saturating_sub(1));
+                }
+            }
             let mut chunk = row.chunk.clone();
             if extra > 0 {
                 chunk.content = format!("[+{extra} parallel] {}", chunk.content);
@@ -1073,56 +1171,88 @@ fn collapse_codex_bursts(rows: Vec<RecentChunkRow>, limit: usize) -> Vec<Convers
             i += 1;
         }
     }
-    out
+    Ok(out)
 }
 
-/// Distinct non-sidechain conversation ids in `projects` (empty = unscoped),
-/// ordered by last-activity (`MAX(timestamp)`) descending, driven entirely by
-/// `idx_chunks_timestamp` rather than a `GROUP BY` scan of the whole table.
+/// Distinct non-sidechain conversation ids, ordered by last-activity
+/// (`MAX(timestamp)`) descending. Dispatches on whether the call is scoped to
+/// a project family (`projects` non-empty) — the two shapes want different
+/// indexes and neither is a good plan for the other:
 ///
-/// Scans `chunks` ordered by `timestamp DESC` and keeps the *first*
-/// occurrence of each conversation id — since the scan is already
-/// descending, that first occurrence is necessarily each conversation's max
-/// timestamp, so this needs no separate aggregation pass. Widens the scan
-/// window (doubling) until at least `target` distinct conversations are
-/// found or the scope is exhausted, so a narrow project scope still reaches
-/// far enough back to fill the window.
+/// - Unscoped (`projects` empty): drives entirely off `idx_chunks_timestamp`
+///   via `recent_conversation_ids_by_activity_unscoped`, widening the window
+///   until enough distinct conversations are found. A `GROUP BY` here would
+///   force a full-table aggregation (553k+ rows on the live DB) for every
+///   call.
+/// - Scoped: a `GROUP BY ... WHERE project_name IN (...)` driven off
+///   `idx_chunks_project` (`recent_conversation_ids_by_activity_scoped`).
+///   This used to also go through the timestamp-index widening scan, which
+///   is fast for the dominant project but forces a full
+///   `idx_chunks_timestamp` walk (doubling on every retry) for any
+///   non-dominant one — measured up to 1.95s cold for a 1-chunk project vs
+///   0.0009s for the old `GROUP BY`/`idx_chunks_project` plan. `GROUP BY`
+///   costs proportional to the project's own row count, not the whole
+///   corpus, and needs no widening loop: the aggregate already found every
+///   matching conversation's true last-activity timestamp in one pass.
 fn recent_conversation_ids_by_activity(
     conn: &Connection,
     projects: &[String],
     target: usize,
 ) -> Result<Vec<(String, String)>> {
+    if projects.is_empty() {
+        recent_conversation_ids_by_activity_unscoped(conn, target)
+    } else {
+        recent_conversation_ids_by_activity_scoped(conn, projects, target)
+    }
+}
+
+/// Scoped branch of `recent_conversation_ids_by_activity`: exact,
+/// single-pass `GROUP BY` over `idx_chunks_project`. See that function's doc
+/// comment for why this and the unscoped branch use different plans.
+fn recent_conversation_ids_by_activity_scoped(
+    conn: &Connection,
+    projects: &[String],
+    target: usize,
+) -> Result<Vec<(String, String)>> {
+    let sql = format!(
+        "SELECT conversation_id, MAX(timestamp) AS last_ts \
+         FROM chunks INDEXED BY idx_chunks_project \
+         WHERE project_name IN ({}) AND is_sidechain = 0 \
+         GROUP BY conversation_id ORDER BY last_ts DESC LIMIT ?{}",
+        string_placeholders(projects.len()),
+        projects.len() + 1,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let target_i64 = target as i64;
+    let mut qparams: Vec<&dyn rusqlite::ToSql> =
+        projects.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    qparams.push(&target_i64);
+    let ids = stmt
+        .query_map(qparams.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// Unscoped branch of `recent_conversation_ids_by_activity`: adaptive
+/// `idx_chunks_timestamp` scan, widening until enough distinct conversations
+/// are found or the table is exhausted. See that function's doc comment.
+fn recent_conversation_ids_by_activity_unscoped(
+    conn: &Connection,
+    target: usize,
+) -> Result<Vec<(String, String)>> {
     let mut window = target.max(64);
     loop {
-        let sql = if projects.is_empty() {
-            "SELECT conversation_id, timestamp FROM chunks INDEXED BY idx_chunks_timestamp \
-             WHERE is_sidechain = 0 ORDER BY timestamp DESC LIMIT ?1"
-                .to_string()
-        } else {
-            format!(
-                "SELECT conversation_id, timestamp FROM chunks INDEXED BY idx_chunks_timestamp \
-                 WHERE project_name IN ({}) AND is_sidechain = 0 \
-                 ORDER BY timestamp DESC LIMIT ?{}",
-                string_placeholders(projects.len()),
-                projects.len() + 1,
-            )
-        };
-        let mut stmt = conn.prepare(&sql)?;
+        let sql = "SELECT conversation_id, timestamp FROM chunks INDEXED BY idx_chunks_timestamp \
+             WHERE is_sidechain = 0 ORDER BY timestamp DESC LIMIT ?1";
+        let mut stmt = conn.prepare(sql)?;
         let window_i64 = window as i64;
-        let raw_rows: Vec<(String, String)> = if projects.is_empty() {
-            stmt.query_map(params![window_i64], |row| {
+        let raw_rows: Vec<(String, String)> = stmt
+            .query_map(params![window_i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        } else {
-            let mut qparams: Vec<&dyn rusqlite::ToSql> =
-                projects.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-            qparams.push(&window_i64);
-            stmt.query_map(qparams.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let fetched = raw_rows.len();
         let mut seen = std::collections::HashSet::with_capacity(target);
@@ -1215,10 +1345,10 @@ fn recent_chunk_rows_for(
 /// stable preview), excludes sidechain conversations, and collapses headless
 /// codex sibling bursts into one row each.
 ///
-/// Both branches scan via `idx_chunks_timestamp` with adaptive window
-/// widening (`recent_conversation_ids_by_activity`) rather than a `GROUP BY`
-/// over the whole table, so an unscoped call on a multi-hundred-thousand-row
-/// table stays cheap instead of forcing a full scan + temp b-tree.
+/// Unscoped calls (`projects` empty) drive off `idx_chunks_timestamp` with
+/// adaptive window widening; scoped calls drive off a `GROUP BY` on
+/// `idx_chunks_project`. See `recent_conversation_ids_by_activity`'s doc
+/// comment for why the two shapes need different plans.
 pub fn get_recent_chunks_in_projects(
     conn: &Connection,
     limit: usize,
@@ -1233,7 +1363,7 @@ pub fn get_recent_chunks_in_projects(
         let ids = recent_conversation_ids_by_activity(conn, projects, target)?;
         let exhausted = ids.len() < target;
         let rows = recent_chunk_rows_for(conn, &ids)?;
-        let collapsed = collapse_codex_bursts(rows, limit);
+        let collapsed = collapse_codex_bursts(conn, projects, rows, limit)?;
         if collapsed.len() >= limit || exhausted {
             return Ok(collapsed);
         }
@@ -1243,7 +1373,7 @@ pub fn get_recent_chunks_in_projects(
     // best effort from the last, widest fetch rather than looping forever.
     let ids = recent_conversation_ids_by_activity(conn, projects, target)?;
     let rows = recent_chunk_rows_for(conn, &ids)?;
-    Ok(collapse_codex_bursts(rows, limit))
+    collapse_codex_bursts(conn, projects, rows, limit)
 }
 
 /// Get recent chunks ordered by last-activity timestamp descending, scoped to
@@ -2064,6 +2194,39 @@ pub fn upsert_import_state_explicit(
     conn.execute(
         "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
         params![file_path, conversation_id, chunks as i64, mtime],
+    )?;
+    Ok(())
+}
+
+/// Distinct `codex_rollout` conversation ids whose stored `summary` starts
+/// with `predicate` on any content it holds (checked by the caller — this
+/// just hands back every distinct `(conversation_id, summary)` pair so the
+/// caller can apply its own marker check without duplicating it in SQL).
+/// `summary` is set once per conversation (from the first classified user
+/// message) and stamped identically onto every chunk, so one row per
+/// conversation is representative.
+pub fn codex_conversation_summaries(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT conversation_id, summary FROM chunks WHERE source = 'codex_rollout'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Force the next `discover_rollouts` pass to re-import `file_path` by
+/// clearing its stored mtime — an empty string can never equal a real
+/// filesystem mtime, so the next scan's `stored_mtime(key) == current_mtime`
+/// check always fails for this row. Leaves `conversation_id`/`chunks_imported`
+/// untouched; `import_rollout`'s delete+reinsert (keyed off the parsed
+/// conversation id, not this row) overwrites them on the next successful
+/// import. A no-op (0 rows affected, not an error) if the row doesn't exist.
+pub fn invalidate_import_state_mtime(conn: &Connection, file_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE import_state SET file_mtime = '' WHERE file_path = ?1",
+        params![file_path],
     )?;
     Ok(())
 }
@@ -5052,11 +5215,19 @@ mod tests {
     }
 
     #[test]
-    fn recent_chunks_limit_still_honoured_when_burst_exceeds_overfetch_window() {
-        // A burst bigger than the default overfetch window (limit*4, max
-        // limit+8) must not eat the whole window and starve `limit` below
-        // its requested count — the widening retry in
-        // get_recent_chunks_in_projects must pull in the solo rows behind it.
+    fn recent_chunks_burst_tail_truncated_by_fetch_window_gets_exact_count() {
+        // Solo rows are newer than the 25-member burst, so limit=4 (3 solos +
+        // 1 collapsed burst row) is already satisfied by the *first* fetch
+        // window (target=16: 3 solo + 13 burst rows) — the widening retry in
+        // get_recent_chunks_in_projects never fires because `collapsed.len()
+        // >= limit` is already true. Before the follow-up-count fix, the
+        // burst's window-based scan stopped at the fetch-window edge (13
+        // members captured of 25) and reported "[+12 parallel]" instead of
+        // the true "[+24 parallel]" — this is the regression this test
+        // guards (finding on queries.rs `collapse_codex_bursts`). Contrast
+        // with `recent_chunks_widening_retry_pulls_solos_behind_head_burst`
+        // below, which puts the burst ahead of the solos so the widening
+        // retry itself is what gets exercised.
         let conn = mem();
         let burst_len = 25;
         for i in 0..burst_len {
@@ -5085,26 +5256,80 @@ mod tests {
         }
 
         let chunks = get_recent_chunks(&conn, 4, Some("proj-bigburst")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
         assert_eq!(
             chunks.len(),
             4,
-            "limit must still be honoured despite an oversized burst filling the first window: {:?}",
-            chunks.iter().map(|c| &c.conversation_id).collect::<Vec<_>>()
+            "limit must still be honoured despite an oversized burst filling the first window: {ids:?}"
         );
         assert!(
             chunks[..3]
                 .iter()
                 .all(|c| c.conversation_id.starts_with("solo-")),
-            "the 3 solo rows (last-activity order) must surface ahead of the collapsed burst: {:?}",
-            chunks
-                .iter()
-                .map(|c| &c.conversation_id)
-                .collect::<Vec<_>>()
+            "the 3 solo rows (last-activity order) must surface ahead of the collapsed burst: {ids:?}"
         );
-        assert!(
-            chunks[3].content.starts_with("[+") && chunks[3].content.contains("parallel]"),
-            "the burst still collapses to a single annotated row for the last slot: {}",
-            chunks[3].content
+        assert_eq!(
+            chunks[3].content, "[+24 parallel] burst member",
+            "the burst must report its exact true size (25 members = +24), not just the 13 \
+             that fit inside the first fetch window"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_widening_retry_pulls_solos_behind_head_burst() {
+        // The burst is *newer* than the solo rows this time, so the first
+        // fetch window (target=16 for limit=4) is entirely burst members and
+        // collapses to a single row (1 < limit=4) — this is what actually
+        // forces get_recent_chunks_in_projects's widening retry to run and
+        // fetch a wider window that reaches the solo rows behind the burst.
+        // (The sibling test above, with solos ahead, satisfies `limit`
+        // before the retry ever fires — it does not exercise this path.)
+        let conn = mem();
+        let burst_len = 25;
+        for i in 0..burst_len {
+            insert_recent(
+                &conn,
+                &format!("codex-big-{i}"),
+                "proj-headburst",
+                &format!("2026-09-20T04:00:00.{:03}Z", i * 30),
+                "burst member",
+                false,
+                "codex_rollout",
+            );
+        }
+        for i in 0..3 {
+            insert_recent(
+                &conn,
+                &format!("solo-{i}"),
+                "proj-headburst",
+                &format!("2026-09-20T03:0{i}:00Z"),
+                "solo conversation",
+                false,
+                "conversation",
+            );
+        }
+
+        let chunks = get_recent_chunks(&conn, 4, Some("proj-headburst")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert_eq!(
+            chunks.len(),
+            4,
+            "limit must be honoured once the widening retry pulls in the solo rows: {ids:?}"
+        );
+        for i in 0..3 {
+            let want = format!("solo-{i}");
+            assert!(
+                ids.contains(&want.as_str()),
+                "solo-{i} must be reached by the widening retry: {ids:?}"
+            );
+        }
+        let burst_row = chunks
+            .iter()
+            .find(|c| c.conversation_id.starts_with("codex-big-"))
+            .expect("the collapsed burst row must still be present");
+        assert_eq!(
+            burst_row.content, "[+24 parallel] burst member",
+            "the full 25-member burst must be counted exactly once the retry fetches it whole"
         );
     }
 }
