@@ -964,38 +964,159 @@ pub fn get_chunks_by_project(
 
 // ─── Temporal queries ───
 
-/// Get recent chunks ordered by timestamp descending.
-/// Returns one representative chunk per unique conversation (the most recent chunk),
-/// ensuring the limit applies to distinct conversations, not raw chunks.
+/// Project namespaces in the same family as `project` (per
+/// `cross_project::same_project_family`), plus `project` itself. Mirrors the
+/// pattern in `storage::codegraph::family_projects`.
+fn recent_work_family_projects(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    let mut projects = list_project_names(conn, "", i64::MAX as usize)?;
+    projects
+        .retain(|candidate| crate::search::cross_project::same_project_family(project, candidate));
+    if !projects.iter().any(|p| p == project) {
+        projects.push(project.to_string());
+    }
+    Ok(projects)
+}
+
+/// Row shape for `get_recent_chunks`: the representative (first) chunk of a
+/// conversation, its source adapter, and the raw first-chunk timestamp (used
+/// only for same-second codex burst detection — display/ordering use
+/// `chunk.timestamp`, which this sets to the conversation's *last-activity*
+/// timestamp, not the first chunk's).
+struct RecentChunkRow {
+    chunk: ConversationChunk,
+    source: String,
+    first_chunk_ts: String,
+}
+
+fn row_to_recent_chunk_row(row: &rusqlite::Row) -> rusqlite::Result<RecentChunkRow> {
+    let chunk = ConversationChunk {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        project_name: row.get(2)?,
+        // Last-activity timestamp (conv.last_ts), not the first chunk's — see
+        // get_recent_chunks doc comment and the format_recent_work display fix.
+        timestamp: row.get(3)?,
+        content: row.get(4)?,
+        message_count: row.get::<_, i64>(5)? as usize,
+        summary: row.get(6)?,
+        author: crate::provenance::Speaker::ToolResult,
+        seq: 0,
+        is_sidechain: row.get::<_, i64>(7)? != 0,
+    };
+    Ok(RecentChunkRow {
+        chunk,
+        source: row.get(8)?,
+        first_chunk_ts: row.get(9)?,
+    })
+}
+
+/// UTC-second bucket of an RFC3339-ish timestamp (`YYYY-MM-DDTHH:MM:SS`),
+/// used to collapse same-second headless codex sibling rollouts.
+fn burst_second(ts: &str) -> &str {
+    if ts.len() >= 19 {
+        &ts[..19]
+    } else {
+        ts
+    }
+}
+
+/// Collapse consecutive `codex_rollout` conversations whose first-chunk
+/// timestamps land in the same UTC second into a single row annotated with
+/// `+N parallel`, honouring `limit` on the *collapsed* row count. Rows must
+/// already be ordered by last-activity descending, so siblings in a burst are
+/// adjacent.
+fn collapse_codex_bursts(rows: Vec<RecentChunkRow>, limit: usize) -> Vec<ConversationChunk> {
+    const CODEX_SOURCE: &str = "codex_rollout";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() && out.len() < limit {
+        let row = &rows[i];
+        if row.source == CODEX_SOURCE {
+            let key = burst_second(&row.first_chunk_ts).to_string();
+            let mut j = i + 1;
+            let mut extra = 0usize;
+            while j < rows.len()
+                && rows[j].source == CODEX_SOURCE
+                && burst_second(&rows[j].first_chunk_ts) == key
+            {
+                extra += 1;
+                j += 1;
+            }
+            let mut chunk = row.chunk.clone();
+            if extra > 0 {
+                chunk.content = format!("[+{extra} parallel] {}", chunk.content);
+            }
+            out.push(chunk);
+            i = j;
+        } else {
+            out.push(row.chunk.clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Get recent chunks ordered by last-activity timestamp descending.
+/// Returns one representative chunk per unique conversation (the first chunk,
+/// for a stable preview), scoped to the project *family* (see
+/// `cross_project::same_project_family`) rather than an exact project-name
+/// match, excluding sidechain conversations, and collapsing same-second
+/// headless codex sibling bursts into one row each.
 pub fn get_recent_chunks(
     conn: &Connection,
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<ConversationChunk>> {
-    // Pick one representative chunk per conversation (first chunk = best summary)
-    // and order by last-activity timestamp.
-    let mut stmt;
-    let rows = if let Some(p) = project.filter(|p| *p != "all") {
-        stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
-             FROM chunks c
-             WHERE c.project_name = ?1
-               AND c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
-             ORDER BY c.timestamp DESC LIMIT ?2",
-        )?;
-        stmt.query_map(params![p, limit as i64], row_to_chunk)?
-    } else {
-        stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
-             FROM chunks c
-             WHERE c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
-             ORDER BY c.timestamp DESC LIMIT ?1",
-        )?;
-        stmt.query_map(params![limit as i64], row_to_chunk)?
+    let projects = match project.filter(|p| *p != "all") {
+        Some(p) => recent_work_family_projects(conn, p)?,
+        None => Vec::new(),
     };
 
-    let chunks: Vec<ConversationChunk> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(chunks)
+    // Overfetch so same-second codex bursts can be collapsed without shrinking
+    // the number of distinct slots returned.
+    let overfetch = limit.saturating_mul(4).max(limit + 8);
+
+    const SELECT: &str =
+        "SELECT c.id, c.conversation_id, c.project_name, conv.last_ts, c.content, \
+         c.message_count, c.summary, c.is_sidechain, c.source, c.timestamp \
+         FROM conv JOIN chunks c ON c.rowid = conv.first_rowid \
+         ORDER BY conv.last_ts DESC";
+
+    let mut stmt;
+    let rows = if projects.is_empty() {
+        stmt = conn.prepare(&format!(
+            "WITH conv AS (
+                SELECT conversation_id, MAX(timestamp) AS last_ts, MIN(rowid) AS first_rowid
+                FROM chunks WHERE is_sidechain = 0
+                GROUP BY conversation_id
+                ORDER BY last_ts DESC LIMIT ?1
+             )
+             {SELECT}"
+        ))?;
+        stmt.query_map(params![overfetch as i64], row_to_recent_chunk_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let sql = format!(
+            "WITH conv AS (
+                SELECT conversation_id, MAX(timestamp) AS last_ts, MIN(rowid) AS first_rowid
+                FROM chunks WHERE project_name IN ({}) AND is_sidechain = 0
+                GROUP BY conversation_id
+                ORDER BY last_ts DESC LIMIT ?{}
+             )
+             {SELECT}",
+            string_placeholders(projects.len()),
+            projects.len() + 1,
+        );
+        stmt = conn.prepare(&sql)?;
+        let overfetch_i64 = overfetch as i64;
+        let mut qparams: Vec<&dyn rusqlite::ToSql> =
+            projects.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        qparams.push(&overfetch_i64);
+        stmt.query_map(qparams.as_slice(), row_to_recent_chunk_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    Ok(collapse_codex_bursts(rows, limit))
 }
 
 /// Get chunks within a time range, optionally filtered by project.
@@ -4485,5 +4606,188 @@ mod tests {
         assert_eq!(got["one"], ["/cc/projects/-f0/one.jsonl"]);
         assert_eq!(got["eight"].len(), 8);
         assert!(got["eight"].windows(2).all(|w| w[0] < w[1]));
+    }
+
+    // ─── get_recent_chunks ───
+
+    fn recent_chunk(
+        conv_id: &str,
+        project: &str,
+        ts: &str,
+        content: &str,
+        is_sidechain: bool,
+    ) -> ConversationChunk {
+        ConversationChunk {
+            id: format!("{conv_id}-c0"),
+            conversation_id: conv_id.into(),
+            project_name: project.into(),
+            timestamp: ts.into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain,
+        }
+    }
+
+    fn insert_recent(
+        conn: &Connection,
+        conv_id: &str,
+        project: &str,
+        ts: &str,
+        content: &str,
+        is_sidechain: bool,
+        source: &str,
+    ) {
+        let chunk = recent_chunk(conv_id, project, ts, content, is_sidechain);
+        insert_chunk_with_source(conn, &chunk, &[0.1, 0.2], source).unwrap();
+    }
+
+    #[test]
+    fn recent_chunks_include_family_namespace_and_exclude_unrelated_sibling() {
+        // `claude-self-reflect` genuinely exists under ~/projects on dev/CI
+        // checkouts (same fixture pair used by
+        // codegraph::query_callers_includes_callers_of_every_family_definition),
+        // so `same_project_family` treats the hyphenated variant as an alias
+        // while a real sibling repo name stays out of family.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "conv-family",
+            "claude-self-reflect-csr-engine",
+            "2026-09-20T10:00:00Z",
+            "family member content",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "conv-sibling",
+            "anukriti-meta-campaigns",
+            "2026-09-20T11:00:00Z",
+            "unrelated sibling content",
+            false,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 10, Some("claude-self-reflect")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            ids.contains(&"conv-family"),
+            "family member must be included: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conv-sibling"),
+            "unrelated sibling must not leak in: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_exclude_sidechains_and_order_by_last_activity() {
+        let conn = mem();
+        // Started earliest but touched most recently -> must rank first.
+        insert_recent(
+            &conn,
+            "conv-old-start",
+            "proj-recent",
+            "2026-09-01T00:00:00Z",
+            "first message",
+            false,
+            "conversation",
+        );
+        conn.execute(
+            "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, is_sidechain, source)
+             VALUES ('conv-old-start-c1', 'conv-old-start', 'proj-recent', '2026-09-20T00:00:00Z', 'later message', 1, 0, 'conversation')",
+            [],
+        )
+        .unwrap();
+        insert_recent(
+            &conn,
+            "conv-newer-start",
+            "proj-recent",
+            "2026-09-10T00:00:00Z",
+            "started later, never touched again",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "agent-sidechain",
+            "proj-recent",
+            "2026-09-21T00:00:00Z",
+            "subagent chatter",
+            true,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 10, Some("proj-recent")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&"agent-sidechain"),
+            "sidechain conversation must be excluded: {ids:?}"
+        );
+        assert_eq!(
+            ids[0], "conv-old-start",
+            "ordering must follow last activity (max timestamp), not first-chunk start: {ids:?}"
+        );
+        // Preview stays the *first* chunk's content even though the display
+        // timestamp is last-activity.
+        let top = &chunks[0];
+        assert_eq!(top.content, "first message");
+        assert_eq!(top.timestamp, "2026-09-20T00:00:00Z");
+    }
+
+    #[test]
+    fn recent_chunks_collapse_same_second_codex_burst_and_count_limit_once() {
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "codex-a",
+            "proj-burst",
+            "2026-09-20T10:00:00Z",
+            "burst member a",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "codex-b",
+            "proj-burst",
+            "2026-09-20T10:00:00.500Z",
+            "burst member b",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "codex-c",
+            "proj-burst",
+            "2026-09-20T10:00:00.900Z",
+            "burst member c",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "solo-later",
+            "proj-burst",
+            "2026-09-20T11:00:00Z",
+            "solo conversation",
+            false,
+            "conversation",
+        );
+
+        // limit=2 must still return both slots: the solo row and the
+        // collapsed burst, not truncate the burst away.
+        let chunks = get_recent_chunks(&conn, 2, Some("proj-burst")).unwrap();
+        assert_eq!(chunks.len(), 2, "collapsed burst must count as one slot");
+        assert_eq!(chunks[0].conversation_id, "solo-later");
+        assert!(
+            chunks[1].content.starts_with("[+2 parallel]"),
+            "burst of 3 same-second codex rows collapses to +2: {}",
+            chunks[1].content
+        );
     }
 }

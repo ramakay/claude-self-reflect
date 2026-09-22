@@ -633,18 +633,26 @@ pub fn format_recent_work(chunks: &[ConversationChunk], group_by: &str) -> Strin
             out.push_str("</recent_work>");
         }
         _ => {
-            // Default: group by conversation
-            let mut convs: std::collections::BTreeMap<String, Vec<&ConversationChunk>> =
-                std::collections::BTreeMap::new();
+            // Default: group by conversation. `chunks` arrives one row per
+            // conversation, already ordered by last-activity descending
+            // (`queries::get_recent_chunks`) — preserve that order instead of
+            // re-sorting by conversation id, which is not chronological.
+            let mut order: Vec<String> = Vec::new();
+            let mut convs: std::collections::HashMap<String, Vec<&ConversationChunk>> =
+                std::collections::HashMap::new();
             for chunk in chunks {
                 convs
                     .entry(chunk.conversation_id.clone())
-                    .or_default()
+                    .or_insert_with(|| {
+                        order.push(chunk.conversation_id.clone());
+                        Vec::new()
+                    })
                     .push(chunk);
             }
 
-            out.push_str(&format!("<recent_work conversations='{}'>\n", convs.len()));
-            for (conv_id, conv_chunks) in convs.iter().rev() {
+            out.push_str(&format!("<recent_work conversations='{}'>\n", order.len()));
+            for conv_id in &order {
+                let conv_chunks = &convs[conv_id];
                 let most_recent = conv_chunks.iter().max_by_key(|c| &c.timestamp).unwrap();
                 let preview = if most_recent.content.chars().count() > PREVIEW_CHARS {
                     format!("{}...", truncate_chars(&most_recent.content, PREVIEW_CHARS))
@@ -1972,5 +1980,25 @@ mod tests {
             1,
         );
         assert!(xml.contains("relevance=\"weak\""), "got: {xml}");
+    }
+
+    #[test]
+    fn format_recent_work_preserves_caller_order_not_conversation_id_order() {
+        // `get_recent_chunks` already orders rows by last-activity descending;
+        // the conversation ids here sort the *opposite* way alphabetically, so
+        // a regression back to keying/re-sorting by conversation id would flip
+        // the output order.
+        let mut newest = make_chunk("a-newest", "aaaa-newest", "newest content");
+        newest.timestamp = "2026-09-20T10:00:00Z".into();
+        let mut oldest = make_chunk("z-oldest", "zzzz-oldest", "oldest content");
+        oldest.timestamp = "2026-09-01T10:00:00Z".into();
+
+        let xml = format_recent_work(&[newest, oldest], "session");
+        let newest_pos = xml.find("aaaa-newest").unwrap();
+        let oldest_pos = xml.find("zzzz-oldest").unwrap();
+        assert!(
+            newest_pos < oldest_pos,
+            "caller order must be preserved, got: {xml}"
+        );
     }
 }
