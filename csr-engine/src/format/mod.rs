@@ -62,6 +62,91 @@ pub fn relevance_label(score: f32) -> &'static str {
     }
 }
 
+/// Highest fabricated-probe score measured 2026-08-03 (see [`QUICK_CHECK_FLOOR`]
+/// docs): 8 topics that were never discussed on this machine scored up to 0.605.
+/// A weak-band top score at or above this ceiling has already cleared every
+/// measured fabrication, so wording that says it "may be spurious" or is
+/// "indistinguishable" from a fabricated probe is no longer honest — it is
+/// exactly as separated from the fabrication cluster as the genuine matches are.
+pub const FABRICATED_PROBE_CEILING: f32 = 0.605;
+
+/// Margin (top score minus runner-up score) above which a weak-band top result
+/// is treated as having clearly beaten the rest of the list even though its
+/// absolute score sits below [`FABRICATED_PROBE_CEILING`].
+///
+/// Derived from the 2026-09-22 burst-failure study (`recall_bursts.json`
+/// fixture): among weak-band bursts where the session's own next turn actually
+/// used the rank-1 result, the largest observed margin that had NOT already
+/// cleared the fabrication ceiling was 0.113 (top 0.563 over runner-up 0.450).
+/// The rest of that same population clusters within +/-0.06 of zero, many
+/// negative (rank-1 by rerank, not by raw score). 0.10 sits below the one
+/// real "decisive but sub-ceiling" case and above the noise cluster.
+pub const WEAK_BAND_DECISIVE_MARGIN: f32 = 0.10;
+
+/// A relevance band plus the extra context needed to word a `weak`-band result
+/// honestly. Bands themselves are unchanged from [`relevance_label`] — this
+/// wraps it, never replaces it, so ordering/score/label-band behaviour for
+/// every existing caller stays byte-identical. Only `weak`-band callers that
+/// opt into this function gain qualifier/warning text; every other band gets
+/// `qualifier: None, warning: None`.
+pub struct Relevance {
+    pub band: &'static str,
+    /// Set only in the `weak` band: which side of the measured fabrication
+    /// overlap this particular top score falls on.
+    pub qualifier: Option<&'static str>,
+    /// Human-readable caveat, set only in the `weak` band.
+    pub warning: Option<String>,
+}
+
+/// Band a top score into the relevance vocabulary, and — only in the `weak`
+/// band — decide whether the wording should be relative (this result leads
+/// the field by a real margin, or clears the highest measured fabricated
+/// probe) or an honest low-confidence caveat.
+///
+/// `runner_up` is the next-ranked result's score, when one exists.  `list_len`
+/// is the number of results the caller is choosing among (informs the
+/// "list"/"field" phrasing only — it plays no role in the band or margin
+/// math). Never touches score, order, `QUICK_CHECK_FLOOR`, or the abstention
+/// behaviour in [`format_quick_check`] — those are computed entirely before
+/// this function is called.
+pub fn relevance_assessment(top: f32, runner_up: Option<f32>, list_len: usize) -> Relevance {
+    let band = relevance_label(top);
+    if band != "weak" {
+        return Relevance {
+            band,
+            qualifier: None,
+            warning: None,
+        };
+    }
+
+    let margin = runner_up.map(|second| top - second);
+    let field_word = if list_len > 1 { "list" } else { "field" };
+    let decisive =
+        top >= FABRICATED_PROBE_CEILING || margin.is_some_and(|m| m >= WEAK_BAND_DECISIVE_MARGIN);
+
+    if decisive {
+        let margin_text = match margin {
+            Some(m) => format!("{:.3}", m),
+            None => "n/a".to_string(),
+        };
+        Relevance {
+            band,
+            qualifier: Some("leads the field"),
+            warning: Some(format!(
+                "weak band by absolute score, but this result leads the {field_word} by a {margin_text} margin and clears the highest fabricated-probe score measured on this corpus ({QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range is weakly calibrated overall — this result is not in the ambiguous part of it). Read the preview to confirm rather than treating the absolute score alone as a verdict."
+            )),
+        }
+    } else {
+        Relevance {
+            band,
+            qualifier: Some("low margin"),
+            warning: Some(format!(
+                "weak match, low margin over the rest of the {field_word} — absolute cosine similarity is weakly calibrated in the {QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range on this corpus (genuine and fabricated-probe scores overlap here). Read the preview to confirm before treating this as evidence the topic came up."
+            )),
+        }
+    }
+}
+
 /// A search result enriched with chunk metadata.
 pub struct EnrichedResult {
     pub score: f32,
@@ -244,16 +329,38 @@ pub(crate) fn format_search_results_with_rank_scores(
             preview.clone()
         };
 
+        // rank-1's own score (which may differ from `top_score`, the max raw
+        // score across the whole page — display order follows the rerank, not
+        // raw score) plus the margin over rank 2, mirroring the discriminating
+        // signal `format_quick_check` already surfaces.
+        let rank1_score = results[0].score;
+        let margin = results.get(1).map(|second| rank1_score - second.score);
+        let margin_attr = match margin {
+            Some(m) => format!("{:.3}", m),
+            None => "n/a".to_string(),
+        };
+
         out.push_str(&format!(
-            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\">\n",
+            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\">\n",
             results.len(),
             relevance,
             top_score,
+            rank1_score,
+            margin_attr,
         ));
         out.push_str(&format!(
             "    <preview>{}</preview>\n",
             xml_escape(&preview_short)
         ));
+        // Rank-1 can be in the weak band even when `relevance` (computed from
+        // the page's max raw score) is not, and vice versa — the caveat is
+        // about what Claude is about to read at the top of the list, so it is
+        // keyed on rank 1 specifically.
+        let rank1_assessment =
+            relevance_assessment(rank1_score, results.get(1).map(|r| r.score), results.len());
+        if let Some(warning) = &rank1_assessment.warning {
+            out.push_str(&format!("    <caveat>{}</caveat>\n", warning));
+        }
         out.push_str("  </summary>\n");
     }
 
@@ -411,28 +518,24 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
         return out;
     };
 
-    let relevance = relevance_label(top.score);
-
     // Cheap discriminating signal: how far the top hit sits above the runner-up.
     // A wide margin says "this beat the field"; a near-zero margin says "this is
-    // indistinguishable from the next candidate" — useful whether or not the top
-    // score itself lands in the weakly-calibrated band. `results` is assumed
-    // sorted descending by score (same assumption `dedupe_results` documents),
-    // so `results[1]` is the runner-up whenever it exists.
+    // close to the next candidate" — useful whether or not the top score itself
+    // lands in the weakly-calibrated band. `results` is assumed sorted
+    // descending by score (same assumption `dedupe_results` documents), so
+    // `results[1]` is the runner-up whenever it exists.
     let margin = results.get(1).map(|second| top.score - second.score);
+    let assessment = relevance_assessment(top.score, results.get(1).map(|r| r.score), 1);
 
     out.push_str("  <found>true</found>\n");
     // The runner-up is fetched only to calculate the margin. Keep the public
     // quick-check surface at one rendered match, as promised by the tool.
     out.push_str("  <count>1</count>\n");
-    out.push_str(&format!("  <relevance>{}</relevance>\n", relevance));
+    out.push_str(&format!("  <relevance>{}</relevance>\n", assessment.band));
     out.push_str("  <collections_with_matches>1</collections_with_matches>\n");
 
-    if relevance == "weak" {
-        out.push_str(&format!(
-            "  <warning>weak match — may be spurious. Absolute cosine similarity is weakly calibrated in the {:.2}-{:.2} range on this corpus: genuine and fabricated-probe scores overlap here and the score alone cannot tell them apart. Check the margin below and read the preview before treating this as evidence the topic came up.</warning>\n",
-            QUICK_CHECK_FLOOR, WEAK_BAND_TOP,
-        ));
+    if let Some(warning) = &assessment.warning {
+        out.push_str(&format!("  <warning>{}</warning>\n", warning));
     }
 
     out.push_str("  <top_result>\n");
@@ -1502,7 +1605,7 @@ mod tests {
 \u{26a1} PERFORMANCE: 8ms (1 collection searched)\n\
 \n\
 <search>\n\
-\x20 <summary count=\"1\" relevance=\"high\" top-score=\"0.900\">\n\
+\x20 <summary count=\"1\" relevance=\"high\" top-score=\"0.900\" rank1-score=\"0.900\" margin=\"n/a\">\n\
 \x20   <preview>hello world</preview>\n\
 \x20 </summary>\n\
 \x20 <meta>\n\
@@ -1699,6 +1802,13 @@ mod tests {
         // The four fabricated probes measured 2026-08-03 all land in the weak
         // band: no floor separates them from genuine topics (genuine minimum was
         // 0.468), so they are labelled and warned about rather than suppressed.
+        //
+        // Contract change (WP-B, 2026-09-22): none of these four scores clears
+        // FABRICATED_PROBE_CEILING and each is a lone candidate (no runner-up,
+        // so no margin signal either), so relevance_assessment stays in the
+        // non-decisive branch — the caveat text changed from "may be spurious"
+        // to the honest calibration wording, but a caveat still fires on all
+        // four (that is the part this test still guards).
         for score in [0.456_f32, 0.461, 0.583, 0.588] {
             let results = vec![quick_result(
                 score,
@@ -1709,10 +1819,49 @@ mod tests {
                 xml.contains("<relevance>weak</relevance>"),
                 "{score}: {xml}"
             );
-            assert!(xml.contains("may be spurious"), "{score}: {xml}");
+            assert!(xml.contains("<warning>"), "{score}: {xml}");
+            assert!(xml.contains("weakly calibrated"), "{score}: {xml}");
+            assert!(
+                !xml.contains("may be spurious"),
+                "{score}: caveat wording changed under the contract: {xml}"
+            );
             assert!(xml.contains("<found>true</found>"), "{score}: {xml}");
             assert!((QUICK_CHECK_FLOOR..WEAK_BAND_TOP).contains(&score));
         }
+    }
+
+    #[test]
+    fn weak_band_rank1_clearing_fabrication_ceiling_drops_spurious_wording() {
+        // Contract (WP-B): a weak-band top score that clears
+        // FABRICATED_PROBE_CEILING (0.605, the highest fabricated probe
+        // measured) is at least as separated from the fabrication cluster as
+        // any genuine match — "spurious"/"indistinguishable" wording is no
+        // longer honest for it, even though the band is still "weak" (below
+        // WEAK_BAND_TOP=0.62).
+        let results = vec![quick_result(0.61, "clear decisive-ceiling match")];
+        let xml = format_quick_check(&results, "probe");
+        assert!(xml.contains("<relevance>weak</relevance>"), "got: {xml}");
+        assert!(xml.contains("<warning>"), "got: {xml}");
+        assert!(!xml.contains("spurious"), "got: {xml}");
+        assert!(!xml.contains("indistinguishable"), "got: {xml}");
+        assert!(xml.contains("leads the field"), "got: {xml}");
+    }
+
+    #[test]
+    fn weak_band_rank1_wide_margin_below_ceiling_drops_spurious_wording() {
+        // Contract (WP-B) part 2: a weak-band top score below the fabrication
+        // ceiling but with a margin >= WEAK_BAND_DECISIVE_MARGIN over the
+        // runner-up is also decisive — it clearly beat the rest of the list,
+        // even though the absolute score alone is weakly calibrated here.
+        let results = vec![
+            quick_result(0.58, "clear top match"),
+            quick_result(0.30, "distant runner-up"),
+        ];
+        let xml = format_quick_check(&results, "probe");
+        assert!(xml.contains("<relevance>weak</relevance>"), "got: {xml}");
+        assert!(!xml.contains("spurious"), "got: {xml}");
+        assert!(!xml.contains("indistinguishable"), "got: {xml}");
+        assert!(xml.contains("leads the field"), "got: {xml}");
     }
 
     #[test]
