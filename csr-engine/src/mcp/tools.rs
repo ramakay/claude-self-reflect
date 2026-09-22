@@ -110,6 +110,121 @@ fn project_scope_multiplier(candidate: &str, scope: &SearchProjectScope) -> f32 
     }
 }
 
+/// Tag `store_reflection` stamps on every explicit memory write so the recall
+/// policy can tell a deliberate memory from the derived narratives (stories,
+/// episodes, extractions) that share the `reflections` table.
+pub const EXPLICIT_MEMORY_TAG: &str = "csr:memory";
+
+/// Synthetic score for a reflection reached only through the keyword channel:
+/// the same undated floor `score_fts_candidate` gives a keyword-only chunk.
+const FTS_REFLECTION_SCORE: f32 = 0.40;
+
+/// Whether a reflection row is an explicit memory write (the `store_reflection`
+/// tool) rather than a pipeline-derived narrative. Rows carrying
+/// [`EXPLICIT_MEMORY_TAG`] are explicit by construction; rows written before the
+/// stamp existed are recognised by shape: a UUID id (every derived writer uses a
+/// `v3_` / `extracted` / `story_` / `heuristic` / `fact_` prefix) with none of
+/// the derived-pipeline tags.
+pub(crate) fn is_explicit_memory(id: &str, tags: &[String]) -> bool {
+    if tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
+        return true;
+    }
+    if !is_uuid(id) {
+        return false;
+    }
+    const DERIVED_TAGS: &[&str] = &[
+        "session_story",
+        "session_episode",
+        "session_briefing",
+        "context_cache",
+    ];
+    !tags
+        .iter()
+        .any(|t| t.starts_with("narrative_") || DERIVED_TAGS.contains(&t.as_str()))
+}
+
+/// Recall standing for a reflection candidate. Explicit memory writes rank with
+/// user-history standing: `search::rerank` gives user-authored chunks a flat
+/// `W_USER` boost, and without equal standing an exact memory match (cosine
+/// 1.0) lost the page to any user chunk above cosine ~0.5 — measured live
+/// 2026-09-22: seven 0.63-cosine user chunks scored 1.13 against the memory's
+/// 1.00. Derived narratives keep their cached provenance floor. This is a
+/// ranking policy only: it never writes `reflections.min_trust`, and the row's
+/// provenance event stays Unknown
+/// (`reflection_tags_cannot_raise_its_observed_event_above_unknown`).
+fn reflection_recall_standing(
+    storage: &Storage,
+    id: &str,
+    tags: &[String],
+) -> crate::provenance::TrustTier {
+    if is_explicit_memory(id, tags) {
+        return crate::provenance::TrustTier::UserHistory;
+    }
+    storage
+        .get_artifact_min_trust(
+            crate::storage::artifact_provenance::ArtifactKind::Reflection,
+            id,
+        )
+        .unwrap_or(crate::provenance::TrustTier::Unknown)
+}
+
+/// Result row for a reflection hit from either channel. `keyword` marks a hit
+/// that arrived through `reflections_fts` rather than the vector index, with
+/// the same `[keyword] ` prefix keyword-only chunks carry.
+fn reflection_result(
+    id: &str,
+    score: f32,
+    content: &str,
+    tags: &[String],
+    timestamp: String,
+    scope: &SearchProjectScope,
+    keyword: bool,
+) -> EnrichedResult {
+    // Determine project from tags: the pipeline writers stamp `project_<name>`;
+    // explicit memories usually carry the bare project name as a plain tag,
+    // which must not read as cross-project (a 0.3x penalty under a scope).
+    let project_name = tags
+        .iter()
+        .find(|t| t.starts_with("project_"))
+        .map(|t| t.trim_start_matches("project_").to_string())
+        .or_else(|| tags.iter().find(|t| scope.is_family(t)).cloned())
+        .unwrap_or_else(|| "unknown".to_string());
+    // Cross-project multiplicative penalty
+    let final_score = score * project_scope_multiplier(&project_name, scope);
+    let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
+        "[episode] "
+    } else if tags.iter().any(|t| t == "session_story") {
+        "[story] "
+    } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
+        "[narrative] "
+    } else {
+        "[reflection] "
+    };
+    let channel_prefix = if keyword { "[keyword] " } else { "" };
+    EnrichedResult {
+        score: final_score,
+        chunk: crate::import::ConversationChunk {
+            id: id.to_string(),
+            conversation_id: id.to_string(),
+            project_name,
+            timestamp,
+            content: format!("{channel_prefix}{tag_prefix}{content}"),
+            message_count: 0,
+            summary: None,
+            // Reflections/episodes are derived narratives, not raw
+            // user-authored chunks — no authority boost from the author
+            // field; explicit memories earn theirs in
+            // `reflection_recall_standing`.
+            author: crate::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        },
+        resolution: None,
+        trust: crate::provenance::TrustTier::Unknown,
+        validity_demoted: false,
+    }
+}
+
 /// Extract a conversation UUID from a query that is (or contains) a
 /// `conv_<uuid>` retrieval handle, or that is a bare UUID. Injection blocks
 /// hand out `csr_reflect_on_past("conv_<id>")` handles — those must resolve
@@ -899,7 +1014,10 @@ async fn reflect_gather_pass(
         .get_retrieval_events_batch(&reflection_ids_for_tad)
         .unwrap_or_default();
 
-    // Enrich reflection results — convert to EnrichedResult using reflection content
+    // Enrich reflection results — convert to EnrichedResult using reflection
+    // content. Tags are kept per id so the rerank below can tell explicit
+    // memory writes from derived narratives (`reflection_recall_standing`).
+    let mut reflection_tags: HashMap<String, Vec<String>> = HashMap::new();
     for r in &reflection_results {
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
@@ -911,43 +1029,16 @@ async fn reflect_gather_pass(
             } else {
                 r.score
             };
-            // Determine project from tags
-            let project_name = tags
-                .iter()
-                .find(|t| t.starts_with("project_"))
-                .map(|t| t.trim_start_matches("project_").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            // Cross-project multiplicative penalty
-            let final_score = decayed_score * project_scope_multiplier(&project_name, scope);
-            let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
-                "[episode] "
-            } else if tags.iter().any(|t| t == "session_story") {
-                "[story] "
-            } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
-                "[narrative] "
-            } else {
-                "[reflection] "
-            };
-            enriched.push(EnrichedResult {
-                score: final_score,
-                chunk: crate::import::ConversationChunk {
-                    id: r.id.clone(),
-                    conversation_id: r.id.clone(),
-                    project_name,
-                    timestamp,
-                    content: format!("{}{}", tag_prefix, content),
-                    message_count: 0,
-                    summary: None,
-                    // Reflections/episodes are derived narratives, not raw
-                    // user-authored chunks — no authority boost.
-                    author: crate::provenance::Speaker::ToolResult,
-                    seq: 0,
-                    is_sidechain: false,
-                },
-                resolution: None,
-                trust: crate::provenance::TrustTier::Unknown,
-                validity_demoted: false,
-            });
+            enriched.push(reflection_result(
+                &r.id,
+                decayed_score,
+                &content,
+                &tags,
+                timestamp,
+                scope,
+                false,
+            ));
+            reflection_tags.insert(r.id.clone(), tags);
         }
     }
 
@@ -960,6 +1051,7 @@ async fn reflect_gather_pass(
         .collect();
 
     let mut fts_order = Vec::new();
+    let mut reflection_fts_hits: Vec<(String, usize, f64)> = Vec::new();
     // Hybrid always supplements semantic retrieval with FTS5. Vector mode
     // skips FTS entirely; FTS mode reaches this block with no semantic hits.
     if search_mode != SearchMode::Vector {
@@ -986,10 +1078,35 @@ async fn reflect_gather_pass(
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.0.id.cmp(&right.0.id))
         });
-        fts_order = fts_hits
-            .iter()
-            .map(|(chunk, _, _)| chunk.id.clone())
-            .collect();
+        // Reflections have their own keyword index (`reflections_fts`). Merge
+        // both families by bm25 into ONE keyword ranking, so a stored memory can
+        // earn a keyword rank in the RRF fusion below instead of always arriving
+        // semantic-only and losing to any chunk present in both lists.
+        reflection_fts_hits = storage
+            .fts5_search_reflections(query, fetch)
+            .unwrap_or_default();
+        fts_window_full |= reflection_fts_hits.len() == fetch;
+        fts_order = {
+            let mut keyword_ranking: Vec<(&str, usize, f64)> = fts_hits
+                .iter()
+                .map(|(chunk, ordinal, bm25)| (chunk.id.as_str(), *ordinal, *bm25))
+                .chain(
+                    reflection_fts_hits
+                        .iter()
+                        .map(|(id, ordinal, bm25)| (id.as_str(), *ordinal, *bm25)),
+                )
+                .collect();
+            keyword_ranking.sort_by(|left, right| {
+                left.2
+                    .total_cmp(&right.2)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.0.cmp(right.0))
+            });
+            keyword_ranking
+                .into_iter()
+                .map(|(id, _, _)| id.to_string())
+                .collect()
+        };
         if !fts_hits.is_empty() {
             window_full |= fts_window_full;
             let existing_ids: HashSet<String> =
@@ -1070,6 +1187,29 @@ async fn reflect_gather_pass(
         }
     }
 
+    // Keyword-only reflections: reached through `reflections_fts` but not the
+    // vector window. No validity partition applies (verdicts bind to chunk ids).
+    if !reflection_fts_hits.is_empty() {
+        let present: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+        for (id, _, _) in &reflection_fts_hits {
+            if present.contains(id) {
+                continue;
+            }
+            if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(id) {
+                enriched.push(reflection_result(
+                    id,
+                    FTS_REFLECTION_SCORE,
+                    &content,
+                    &tags,
+                    timestamp,
+                    scope,
+                    true,
+                ));
+                reflection_tags.insert(id.clone(), tags);
+            }
+        }
+    }
+
     // Provenance-aware re-rank (v9.3): authority + meaning layered on the decayed
     // score. A cached floor at UserHistory or above is boosted; lower-floor
     // authority claims and tool-mechanic build logs are demoted, so a founding decision out-ranks the
@@ -1094,9 +1234,14 @@ async fn reflect_gather_pass(
             cosine: e.score,
             content: e.chunk.content.clone(),
             provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
-            min_trust: storage
-                .get_chunk_min_trust(&e.chunk.id)
-                .unwrap_or(crate::provenance::TrustTier::Unknown),
+            // Reflection ids are not chunk ids: the chunk floor lookup would
+            // read Unknown for every one of them.
+            min_trust: match reflection_tags.get(&e.chunk.id) {
+                Some(tags) => reflection_recall_standing(storage, &e.chunk.id, tags),
+                None => storage
+                    .get_chunk_min_trust(&e.chunk.id)
+                    .unwrap_or(crate::provenance::TrustTier::Unknown),
+            },
             timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();
@@ -1296,7 +1441,13 @@ pub async fn store_reflection(
         tokio::task::spawn_blocking(move || emb.embed_single(&text)).await??
     };
 
-    storage.insert_reflection(&id, content, tags, &embedding)?;
+    // Stamp the explicit-memory marker so recall can rank this row with user
+    // standing (`reflection_recall_standing`) without inferring it from shape.
+    let mut tags: Vec<String> = tags.to_vec();
+    if !tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
+        tags.push(EXPLICIT_MEMORY_TAG.to_string());
+    }
+    storage.insert_reflection(&id, content, &tags, &embedding)?;
 
     {
         let mut idx = search.write().await;
@@ -3336,6 +3487,267 @@ mod tests {
             engine.insert_chunk(chunk.id, vector.to_vec());
         }
         (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[test]
+    fn explicit_memory_is_told_apart_from_derived_reflections() {
+        let uuid = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        assert!(is_explicit_memory(
+            "story_x",
+            &[EXPLICIT_MEMORY_TAG.to_string()]
+        ));
+        assert!(is_explicit_memory(
+            uuid,
+            &["anukriti".into(), "memory-archive".into()]
+        ));
+        assert!(is_explicit_memory(uuid, &[]));
+        assert!(!is_explicit_memory(
+            uuid,
+            &["session_story".into(), "conv_x".into()]
+        ));
+        assert!(!is_explicit_memory(uuid, &["session_episode".into()]));
+        assert!(!is_explicit_memory(
+            uuid,
+            &["session_briefing".into(), "schema_v1".into()]
+        ));
+        assert!(!is_explicit_memory(
+            uuid,
+            &["narrative_extracted_v3".into(), "status_partial".into()]
+        ));
+        assert!(!is_explicit_memory("v3_abc", &["context_cache".into()]));
+        assert!(!is_explicit_memory("extracted_1", &["free".into()]));
+    }
+
+    /// Seven user-authored chunks at cosine 0.63 to the query (the live shape
+    /// measured 2026-09-22: one recap paragraph quoted into many sessions)
+    /// against one reflection at cosine 1.0. Returns the first `<cid>`.
+    async fn memory_vs_user_chunks_first_hit(memory_tags: &[&str]) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        for i in 0..7 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("user-{i}"),
+                conversation_id: format!("conv-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("follower growth recap quoted into session {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            let vector = vec![0.63_f32, 0.776_6, 0.0, 0.0];
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute("UPDATE chunks SET min_trust = 3 WHERE id = ?1", [&chunk.id])?;
+                    Ok(())
+                })
+                .unwrap();
+            engine.insert_chunk(chunk.id, vector);
+        }
+        let memory_id = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        let tags: Vec<String> = memory_tags.iter().map(|t| t.to_string()).collect();
+        storage
+            .insert_reflection(
+                memory_id,
+                "MEMORY-ARCHIVE follower growth tracking May 2026",
+                &tags,
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), query.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "follower growth memory",
+            1,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        out[start..end].to_string()
+    }
+
+    #[tokio::test]
+    async fn exact_explicit_memory_outranks_boosted_user_chunks() {
+        assert_eq!(
+            memory_vs_user_chunks_first_hit(&["anukriti", "memory-archive"]).await,
+            "5eb5aebb-65ab-4fba-9917-86cb83845154"
+        );
+        assert_eq!(
+            memory_vs_user_chunks_first_hit(&["free-form", EXPLICIT_MEMORY_TAG]).await,
+            "5eb5aebb-65ab-4fba-9917-86cb83845154"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_story_keeps_no_standing_against_user_chunks() {
+        // Policy boundary: a pipeline story at cosine 1.0 still yields to
+        // user-authored history, exactly as before this fix.
+        // `<cid>` renders the conversation id: `conv-N` for the user chunks,
+        // the reflection's own id for the memory.
+        let first = memory_vs_user_chunks_first_hit(&["session_story", "conv_x"]).await;
+        assert!(first.starts_with("conv-"), "{first}");
+    }
+
+    #[tokio::test]
+    async fn bare_project_tag_keeps_memory_in_family_under_a_scope() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "anchor".into(),
+            conversation_id: "conv-anchor".into(),
+            project_name: "meta-campaigns".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "campaign roster baseline".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.6, 0.8, 0.0, 0.0]).unwrap();
+        engine.insert_chunk(chunk.id.clone(), vec![0.6, 0.8, 0.0, 0.0]);
+        storage
+            .insert_reflection(
+                "memory-in-family",
+                "MEMORY-ARCHIVE campaign roster",
+                &["meta-campaigns".into(), EXPLICIT_MEMORY_TAG.into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("memory-in-family".into(), query.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "campaign roster memory",
+            2,
+            0.0,
+            Some("meta-campaigns"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out
+            .find("<cid>memory-in-family</cid>")
+            .expect("memory on the page");
+        let block_start = out[..start].rfind("<r rank=").expect("result block");
+        let block = &out[block_start..start];
+        let score: f32 = block
+            .split("<s")
+            .nth(1)
+            .and_then(|s| s.split('>').nth(1))
+            .and_then(|s| s.split("</s").next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("score");
+        assert!(
+            block.contains("<p>meta-campaigns</p>"),
+            "bare project tag must resolve to the scoped project:\n{out}"
+        );
+        assert!(
+            score > 0.9,
+            "no cross-project penalty expected, got {score}:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_channel_reaches_reflections_in_hybrid_mode() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "semantic-only".into(),
+            conversation_id: "conv-s".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "unrelated words entirely".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &query).unwrap();
+        engine.insert_chunk(chunk.id.clone(), query.to_vec());
+        // Memory whose vector is orthogonal to the query: only the keyword
+        // channel can reach it.
+        let memory_id = "memory-keyword-only";
+        let orthogonal = vec![0.0_f32, 0.0, 0.0, 1.0];
+        storage
+            .insert_reflection(
+                memory_id,
+                "MEMORY-ARCHIVE follower growth archived",
+                &[EXPLICIT_MEMORY_TAG.to_string()],
+                &orthogonal,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), orthogonal);
+        let search = Arc::new(RwLock::new(engine));
+        let run = |mode: SearchMode| {
+            let storage = Arc::clone(&storage);
+            let search = Arc::clone(&search);
+            async move {
+                reflect_on_past_with_vec_mode(
+                    &storage,
+                    &search,
+                    &query,
+                    "MEMORY-ARCHIVE follower growth",
+                    5,
+                    0.1,
+                    Some("all"),
+                    0,
+                    false,
+                    ConsumptionMode::Off,
+                    false,
+                    "other",
+                    mode,
+                    RecallRerankMode::Baseline,
+                    false,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let hybrid = run(SearchMode::Hybrid).await;
+        assert!(
+            hybrid.contains("<cid>memory-keyword-only</cid>"),
+            "{hybrid}"
+        );
+        assert!(
+            hybrid.contains("[keyword] [reflection] MEMORY-ARCHIVE"),
+            "keyword-only reflections must carry the keyword marker:\n{hybrid}"
+        );
+        let vector = run(SearchMode::Vector).await;
+        assert!(
+            !vector.contains("<cid>memory-keyword-only</cid>"),
+            "{vector}"
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,32 @@ const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
     END;
 ";
 
+/// Keyword channel for reflections. `csr_reflect_on_past` fuses semantic and
+/// FTS5 ranks (RRF); with only `chunks_fts` on the keyword side a stored
+/// reflection could never earn a keyword rank and lost the fusion to any chunk
+/// present in both lists, even at cosine 1.0 (2026-09-22 probe, three
+/// `memory-archive` rows). A standard FTS5 table keyed by id, not an
+/// external-content one: `INSERT OR REPLACE` on `reflections` never fires the
+/// delete trigger for the row it replaces, so the triggers delete by id first.
+const CREATE_REFLECTIONS_FTS: &str = "
+    CREATE VIRTUAL TABLE IF NOT EXISTS reflections_fts USING fts5(
+        id UNINDEXED,
+        content,
+        tokenize='porter unicode61'
+    );
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_ai AFTER INSERT ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = new.id;
+        INSERT INTO reflections_fts(id, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_ad AFTER DELETE ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = old.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_au AFTER UPDATE OF content ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = old.id;
+        INSERT INTO reflections_fts(id, content) VALUES (new.id, new.content);
+    END;
+";
+
 const DROP_CHUNKS_FTS_TRIGGERS: &str = "
     DROP TRIGGER IF EXISTS chunks_fts_ai;
     DROP TRIGGER IF EXISTS chunks_fts_ad;
@@ -855,6 +881,20 @@ pub fn run(conn: &Connection) -> Result<()> {
         if !already_purged {
             conn.execute_batch("DELETE FROM session_instrumentation;")?;
             crate::storage::queries::set_meta(conn, "steer_noise_filter_v2", "1")?;
+        }
+    }
+
+    // Keyword index over reflections (see `CREATE_REFLECTIONS_FTS`). One-shot
+    // per database: create the table and triggers, then backfill every row
+    // that already exists; the triggers keep it current from then on.
+    {
+        let installed = crate::storage::queries::get_meta(conn, "reflections_fts_v1")?.is_some();
+        if !installed {
+            conn.execute_batch(CREATE_REFLECTIONS_FTS)?;
+            conn.execute_batch(
+                "INSERT INTO reflections_fts(id, content) SELECT id, content FROM reflections;",
+            )?;
+            crate::storage::queries::set_meta(conn, "reflections_fts_v1", "1")?;
         }
     }
 

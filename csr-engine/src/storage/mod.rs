@@ -452,6 +452,16 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// Keyword hits over reflections, `(id, ordinal, bm25)` in bm25 order.
+    pub fn fts5_search_reflections(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, usize, f64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search_reflections(&conn, query, limit)
+    }
+
     // ─── Reflection tag queries ───
 
     pub fn get_reflections_by_tag(

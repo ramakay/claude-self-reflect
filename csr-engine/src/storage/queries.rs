@@ -1049,15 +1049,11 @@ pub fn get_chunk_ids_in_timerange(
 // ─── FTS5 full-text search ───
 
 /// Search chunks using FTS5 full-text search (for file path lookup etc.).
-pub fn fts5_search(
-    conn: &Connection,
-    query: &str,
-    limit: usize,
-    project: Option<&str>,
-) -> Result<Vec<(ConversationChunk, usize, f64)>> {
-    // Sanitize for FTS5: split into OR-joined quoted words
-    // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
-    // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
+/// FTS5 MATCH expression for a free-text query: OR-joined quoted words, so
+/// "Apify runaway cost" becomes '"apify" OR "runaway" OR "cost"' (any word
+/// matches) and hyphens/special characters never parse as FTS5 operators.
+/// `None` when no word survives sanitizing.
+pub fn fts5_match_expr(query: &str) -> Option<String> {
     let words: Vec<String> = query
         .split_whitespace()
         .map(|w| {
@@ -1068,13 +1064,55 @@ pub fn fts5_search(
         .filter(|w| w.len() >= 2)
         .collect();
     if words.is_empty() {
-        return Ok(Vec::new());
+        return None;
     }
-    let fts_query = words
-        .iter()
-        .map(|w| format!("\"{}\"", w))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    Some(
+        words
+            .iter()
+            .map(|w| format!("\"{}\"", w))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// Keyword hits over `reflections_fts`: `(reflection_id, ordinal, bm25)` in
+/// bm25 order (more negative is better), the same shape `fts5_search` returns
+/// for chunks so both lists fuse in one RRF pass.
+pub fn fts5_search_reflections(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(String, usize, f64)>> {
+    let Some(fts_query) = fts5_match_expr(query) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, bm25(reflections_fts)
+         FROM reflections_fts
+         WHERE reflections_fts MATCH ?1
+         ORDER BY rank
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(hits
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (id, bm25))| (id, ordinal, bm25))
+        .collect())
+}
+
+pub fn fts5_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+    let Some(fts_query) = fts5_match_expr(query) else {
+        return Ok(Vec::new());
+    };
 
     let chunks_with_bm25 = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
@@ -3757,6 +3795,76 @@ mod tests {
             seq: 0,
             is_sidechain: false,
         }
+    }
+
+    #[test]
+    fn fts5_search_reflections_returns_bm25_order_with_zero_based_ordinals() {
+        let conn = mem();
+        insert_reflection(&conn, "dense", "needle needle needle", &[], &[0.1; 4]).unwrap();
+        insert_reflection(
+            &conn,
+            "sparse",
+            "needle with several unrelated filler words",
+            &[],
+            &[0.2; 4],
+        )
+        .unwrap();
+        insert_reflection(&conn, "miss", "nothing relevant here", &[], &[0.3; 4]).unwrap();
+
+        let hits = fts5_search_reflections(&conn, "needle", 10).unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "dense");
+        assert_eq!(hits[0].1, 0);
+        assert_eq!(hits[1].0, "sparse");
+        assert_eq!(hits[1].1, 1);
+        assert!(
+            hits[0].2 <= hits[1].2,
+            "bm25 must be ascending (better first)"
+        );
+        assert!(fts5_search_reflections(&conn, "!!", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reflections_fts_follows_replace_and_delete() {
+        // `INSERT OR REPLACE` never fires the delete trigger for the row it
+        // replaces, so the keyword index must be keyed by id, not rowid.
+        let conn = mem();
+        insert_reflection(&conn, "r1", "alpha beta", &[], &[0.1; 4]).unwrap();
+        assert_eq!(
+            fts5_search_reflections(&conn, "alpha", 10).unwrap().len(),
+            1
+        );
+
+        insert_reflection(&conn, "r1", "gamma delta", &[], &[0.1; 4]).unwrap();
+        assert!(fts5_search_reflections(&conn, "alpha", 10)
+            .unwrap()
+            .is_empty());
+        let after = fts5_search_reflections(&conn, "gamma", 10).unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "replacement must not leave a duplicate keyword row"
+        );
+
+        conn.execute(
+            "DELETE FROM reflection_embeddings WHERE reflection_id = 'r1'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM reflections WHERE id = 'r1'", [])
+            .unwrap();
+        assert!(fts5_search_reflections(&conn, "gamma", 10)
+            .unwrap()
+            .is_empty());
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'reflections_fts_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 3);
     }
 
     #[test]
