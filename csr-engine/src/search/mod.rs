@@ -91,6 +91,41 @@ const MAX_LAYER: usize = 16;
 // exact cosine over ≤256 384-dim vectors is well under a millisecond anyway.
 const EXACT_SCAN_THRESHOLD: usize = 256;
 
+/// Cap on how far `search_index` scales its overfetch request past `limit`
+/// to survive tombstoned (blanked-orphan) slots. Bounds worst-case HNSW
+/// query cost when the live share of the index is tiny.
+const TOMBSTONE_OVERFETCH_CAP: usize = 20;
+
+/// Filename of the marker written under the index directory when a foreground
+/// process (`Engine::new` in an MCP server, hook, or CLI query command) finds
+/// the loaded HNSW cache materially tombstoned but defers the full rebuild
+/// instead of blocking its own startup on it. The daemon's compaction loop,
+/// or the explicit `rebuild-index` maintenance command, consumes and clears
+/// this marker.
+pub const NEEDS_COMPACTION_MARKER: &str = "needs_compaction";
+
+/// Write the `needs_compaction` marker for the daemon (or an explicit
+/// maintenance command) to pick up. Best-effort: a failure to write it only
+/// costs a delayed compaction, never correctness, so it is logged and
+/// swallowed rather than propagated.
+pub fn mark_needs_compaction(index_dir: &Path) {
+    if let Err(e) = std::fs::write(index_dir.join(NEEDS_COMPACTION_MARKER), b"") {
+        tracing::warn!(error = %e, "failed to write needs_compaction marker (non-fatal)");
+    }
+}
+
+/// Whether the `needs_compaction` marker is present.
+pub fn needs_compaction(index_dir: &Path) -> bool {
+    index_dir.join(NEEDS_COMPACTION_MARKER).exists()
+}
+
+/// Clear the `needs_compaction` marker after a rebuild has run. Best-effort.
+pub fn clear_needs_compaction(index_dir: &Path) {
+    match std::fs::remove_file(index_dir.join(NEEDS_COMPACTION_MARKER)) {
+        Ok(()) | Err(_) => {}
+    }
+}
+
 const MANIFEST_VERSION: u32 = 2;
 const LEGACY_MANIFEST_VERSION: u32 = 1;
 static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -304,23 +339,50 @@ impl SearchEngine {
         if id_map.len() <= EXACT_SCAN_THRESHOLD {
             return Self::exact_scan(index, id_map, query_vec, limit, min_score, None);
         }
-        let neighbours = index.search(query_vec, limit, EF_SEARCH);
 
-        let mut results: Vec<SearchResult> = neighbours
-            .into_iter()
-            .filter_map(|n| {
-                // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
-                let score = 1.0 - n.distance;
-                if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
-                    Some(SearchResult {
-                        id: id_map[n.d_id].clone(),
-                        score,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Tombstone-aware overfetch. `id_map` slots blanked by
+        // `blank_orphan_chunks`/`blank_orphan_reflections` still occupy a
+        // neighbour position in the HNSW graph (hnsw_rs cannot delete), so a
+        // bare `index.search(query_vec, limit, ..)` can return fewer than
+        // `limit` live results once tombstones are common (negative-drift
+        // cache load, see `SearchEngine::load_from_disk`). Scale the request
+        // by the live/total ratio, capped, and escalate to the full index if
+        // still short — mirrors `search_chunks_filtered`'s adaptive overfetch.
+        let max_elements = id_map.len();
+        let live = id_map.iter().filter(|s| !s.is_empty()).count().max(1);
+        let mut fetch_limit = if live < max_elements {
+            let scale = (max_elements as f64 / live as f64).min(TOMBSTONE_OVERFETCH_CAP as f64);
+            ((limit as f64 * scale).ceil() as usize)
+                .max(limit)
+                .min(max_elements)
+        } else {
+            limit.min(max_elements)
+        };
+
+        let mut results = loop {
+            let neighbours = index.search(query_vec, fetch_limit, EF_SEARCH);
+
+            let found: Vec<SearchResult> = neighbours
+                .into_iter()
+                .filter_map(|n| {
+                    // hnsw_rs DistCosine returns distance = 1.0 - cosine_similarity
+                    let score = 1.0 - n.distance;
+                    if score >= min_score && n.d_id < id_map.len() && !id_map[n.d_id].is_empty() {
+                        Some(SearchResult {
+                            id: id_map[n.d_id].clone(),
+                            score,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if found.len() >= limit || fetch_limit >= max_elements {
+                break found;
+            }
+            fetch_limit = max_elements;
+        };
 
         results.sort_by(|a, b| {
             b.score
@@ -738,31 +800,36 @@ impl SearchEngine {
             return None;
         }
 
-        // Staleness is asymmetric. Chunks and reflections normally only grow, so an
-        // ADDITIVE drift (db > cached) is cheap to reconcile: Engine::new loads this
-        // cache and incrementally inserts the few new rows (~ms) instead of rebuilding
-        // the whole HNSW (~tens of seconds). This avoids cache thrash when several
-        // csr-engine processes import transcripts concurrently.
+        // Staleness in either direction is reconciled by the caller, not here.
+        // Chunks and reflections normally only grow, so an ADDITIVE drift (db >
+        // cached) is cheap: Engine::new loads this cache and incrementally
+        // inserts the few new rows (~ms) instead of rebuilding the whole HNSW
+        // (~tens of seconds). This avoids cache thrash when several csr-engine
+        // processes import transcripts concurrently.
         //
-        // A NEGATIVE drift (db < cached) means rows were deleted, so the cache holds
-        // orphan vectors — fall back to a full rebuild for correctness.
-        if expected_chunks < manifest.chunk_embeddings_expected {
+        // A NEGATIVE drift (db < cached) means rows were deleted since the last
+        // dump, so the cache holds orphan (tombstone) vectors. This used to force
+        // a synchronous full rebuild here, which is the ~7 min cold-start stall a
+        // fresh MCP/hook process cannot afford (Claude Code's CONNECT_TIMEOUT is
+        // 30s). Instead: still return the loaded generation. `Engine::new`
+        // already runs `blank_orphan_chunks`/`blank_orphan_reflections` against
+        // the live DB ids on EVERY cache load (additive or negative) to reconcile
+        // exactly this case, and `search_index`/`search_chunks_filtered` overfetch
+        // past tombstoned slots so search still returns full pages. A full
+        // rebuild only ever runs out-of-band now (daemon consuming the
+        // `needs_compaction` marker, or the explicit `rebuild-index` command) —
+        // see `Engine::new`'s `orphans_material` handling.
+        if expected_chunks < manifest.chunk_embeddings_expected
+            || expected_reflections < manifest.reflection_embeddings_expected
+        {
             tracing::info!(
-                cached = manifest.chunk_embeddings_expected,
-                db = expected_chunks,
-                "index cache stale (chunks removed) — rebuilding"
+                cached_chunks = manifest.chunk_embeddings_expected,
+                db_chunks = expected_chunks,
+                cached_reflections = manifest.reflection_embeddings_expected,
+                db_reflections = expected_reflections,
+                "index cache ahead of DB (rows removed) — loading + reconciling tombstones"
             );
-            return None;
-        }
-        if expected_reflections < manifest.reflection_embeddings_expected {
-            tracing::info!(
-                cached = manifest.reflection_embeddings_expected,
-                db = expected_reflections,
-                "index cache stale (reflections removed) — rebuilding"
-            );
-            return None;
-        }
-        if expected_chunks > manifest.chunk_embeddings_expected
+        } else if expected_chunks > manifest.chunk_embeddings_expected
             || expected_reflections > manifest.reflection_embeddings_expected
         {
             tracing::info!(
@@ -1709,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_allows_additive_drift_rebuilds_on_deletion() {
+    fn test_load_allows_both_additive_and_negative_drift() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         std::fs::write(dir.join("index.lock"), "").unwrap();
@@ -1728,14 +1795,17 @@ mod tests {
             SearchEngine::load_from_disk(dir, 8, 3).is_some(),
             "additive drift must load the cache, not rebuild"
         );
-        // Negative drift (rows deleted) → None so the caller does a clean full rebuild.
+        // Negative drift (rows deleted) → also loads now (WP-D). A synchronous
+        // full rebuild here was the cold-start stall this fix removes;
+        // `Engine::new`'s cached-load branch reconciles the vanished ids via
+        // `blank_orphan_chunks`/`blank_orphan_reflections` instead.
         assert!(
-            SearchEngine::load_from_disk(dir, 4, 1).is_none(),
-            "chunk deletion must force a rebuild"
+            SearchEngine::load_from_disk(dir, 4, 1).is_some(),
+            "chunk deletion must still load the cache, not force an inline rebuild"
         );
         assert!(
-            SearchEngine::load_from_disk(dir, 5, 0).is_none(),
-            "reflection deletion must force a rebuild"
+            SearchEngine::load_from_disk(dir, 5, 0).is_some(),
+            "reflection deletion must still load the cache, not force an inline rebuild"
         );
     }
 
@@ -2408,5 +2478,157 @@ mod tests {
         // mmap-origin point and the point that was inserted heap-side before the dump.
         assert_self_query_correct(&reloaded, &vecs[0], "c0", 3, 0.1);
         assert_self_query_correct(&reloaded, &newv, "c_new", 3, 0.1);
+    }
+
+    // --- WP-D: cold start must not block on a full rebuild for negative drift ---
+
+    #[test]
+    fn load_from_disk_accepts_negative_drift_db_count_below_manifest() {
+        // Simulate rows deleted from the DB since the last dump: the manifest
+        // (and the persisted HNSW graph) describes more chunks than the DB now
+        // has. This used to make `load_from_disk` return `None`, forcing the
+        // caller into a full synchronous rebuild. It must now still return the
+        // loaded generation — reconciliation (blanking the vanished ids) is
+        // `Engine::new`'s job, not this function's.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut writer = SearchEngine::new(10);
+        for i in 0..10 {
+            writer.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        // Manifest says 10 chunks were expected at dump time.
+        writer.dump_to_disk(dir, 10, 0).unwrap();
+
+        // DB now reports only 6 (4 rows deleted) — negative drift.
+        let loaded = SearchEngine::load_from_disk(dir, 6, 0);
+        assert!(
+            loaded.is_some(),
+            "load_from_disk must load a generation on negative drift, not return None \
+             and force the caller into an inline full rebuild"
+        );
+        let loaded = loaded.unwrap();
+        // The raw graph still holds all 10 — reconciliation (blanking the 4
+        // vanished ids) is the caller's job, exercised via `blank_orphan_chunks`
+        // in the `Engine::new` cached-load branch, not here.
+        assert!(loaded.has_chunk("c0"));
+        assert!(loaded.has_chunk("c9"));
+    }
+
+    #[test]
+    fn load_from_disk_accepts_negative_drift_for_reflections_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut writer = SearchEngine::new(10);
+        for i in 0..5 {
+            writer.insert_reflection(format!("r{i}"), distinct_embedding(1000 + i));
+        }
+        writer.dump_to_disk(dir, 0, 5).unwrap();
+
+        // DB now reports only 2 reflections.
+        let loaded = SearchEngine::load_from_disk(dir, 0, 2);
+        assert!(
+            loaded.is_some(),
+            "negative drift on the reflection side must also load, not rebuild inline"
+        );
+    }
+
+    #[test]
+    fn search_over_majority_tombstoned_index_still_returns_a_full_page() {
+        // Once tombstones dominate, a bare `index.search(query, limit, ..)`
+        // request returns mostly-dead neighbour slots and the post-filter
+        // shrinks the result list below `limit` even though plenty of live
+        // points exist elsewhere in the graph. `search_index` must overfetch
+        // past that.
+        let mut engine = SearchEngine::new(400);
+        // 300 points, comfortably above EXACT_SCAN_THRESHOLD so this exercises
+        // the HNSW path, not `exact_scan`.
+        for i in 0..300 {
+            engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        // Tombstone all but the last 20 (>50% tombstoned, matching the spec's
+        // verification scenario).
+        let live_owned: Vec<String> = (280..300).map(|i| format!("c{i}")).collect();
+        let live_ids: std::collections::HashSet<&str> =
+            live_owned.iter().map(|s| s.as_str()).collect();
+        let blanked = engine.blank_orphan_chunks(&live_ids);
+        assert!(
+            blanked >= 200,
+            "expected the majority of points tombstoned, got {blanked}"
+        );
+
+        // A query near c290's own vector, asking for a full page of 10 —
+        // there are 20 live points overall, so 10 must always be reachable.
+        let query = distinct_embedding(290);
+        let hits = engine.search_chunks(&query, 10, -1.0);
+        assert_eq!(
+            hits.len(),
+            10,
+            "search must overfetch past tombstones to still return a full page \
+             of `limit` live results when enough live points exist"
+        );
+        for hit in &hits {
+            assert!(
+                live_ids.contains(hit.id.as_str()),
+                "search returned a tombstoned (blanked) id: {}",
+                hit.id
+            );
+        }
+    }
+
+    #[test]
+    fn needs_compaction_marker_round_trips() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert!(!needs_compaction(dir));
+        mark_needs_compaction(dir);
+        assert!(needs_compaction(dir));
+        clear_needs_compaction(dir);
+        assert!(!needs_compaction(dir));
+        // Clearing an already-absent marker must not error/panic.
+        clear_needs_compaction(dir);
+    }
+
+    #[test]
+    fn negative_drift_loaded_engine_dumps_counts_matching_db_not_forcing_rebuild_on_next_load() {
+        // Full round trip for WP-D interface (5): load with negative drift,
+        // reconcile (as `Engine::new` would via `blank_orphan_chunks`), dump
+        // again with the now-current DB count, and prove the NEXT load sees
+        // zero drift — i.e. reconciliation does not leave the cache
+        // perpetually "behind" so every subsequent process pays the same
+        // negative-drift path forever.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let mut writer = SearchEngine::new(10);
+        for i in 0..10 {
+            writer.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        writer.dump_to_disk(dir, 10, 0).unwrap();
+
+        // "Process B" loads with the DB now at 6 (4 deleted) — negative drift.
+        let mut reader = SearchEngine::load_from_disk(dir, 6, 0).expect("negative-drift load");
+        let remaining: std::collections::HashSet<&str> =
+            ["c0", "c1", "c2", "c3", "c4", "c5"].into_iter().collect();
+        let blanked = reader.blank_orphan_chunks(&remaining);
+        assert_eq!(blanked, 4);
+
+        // Dump with the real (post-reconciliation) DB count.
+        reader.dump_to_disk(dir, 6, 0).unwrap();
+
+        let manifest_raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+        assert_eq!(manifest["chunk_embeddings_expected"].as_u64(), Some(6));
+
+        // The next load, querying the DB at the SAME count (6), must see zero
+        // drift — no more forced negative-drift reconciliation.
+        let reloaded = SearchEngine::load_from_disk(dir, 6, 0).expect("reload after reconcile");
+        assert_eq!(reloaded.chunk_count(), 6);
+        assert!(
+            !reloaded.has_chunk("c9"),
+            "blanked id must not resurrect on reload"
+        );
+        assert!(reloaded.has_chunk("c5"));
     }
 }

@@ -1649,9 +1649,17 @@ fn test_hnsw_stale_index_detection() {
         "additive drift should load the cache (backfill), not rebuild"
     );
 
-    // DB shrank (rows deleted) — must reject so the rebuild drops orphan vectors.
+    // DB shrank (rows deleted, negative drift) — WP-D: loads the cache instead
+    // of rejecting it. A synchronous full rebuild on every negative-drift
+    // cache load was the cold-start stall this fix removes; `Engine::new`'s
+    // cached-load branch reconciles the vanished ids via
+    // `blank_orphan_chunks`/`blank_orphan_reflections`, and `search_index`
+    // overfetches past the resulting tombstones.
     let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
-    assert!(result.is_none(), "deletion should reject the stale cache");
+    assert!(
+        result.is_some(),
+        "negative drift should load the cache, not force an inline rebuild"
+    );
 
     // Exact match should work
     let result = SearchEngine::load_from_disk(&index_dir, 10, 0);

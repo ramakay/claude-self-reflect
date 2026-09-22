@@ -604,6 +604,53 @@ impl Daemon {
         };
         tracing::info!("trained re-ranker nightly loop started");
 
+        // Compaction loop: every ~5 minutes, checks for the `needs_compaction`
+        // marker a foreground process (`Engine::new` in an MCP server, hook, or
+        // CLI query command) leaves when it finds the loaded HNSW cache
+        // materially tombstoned but defers the full rebuild rather than block
+        // its own startup on it (see `Engine::new`'s `orphans_material`
+        // handling). The daemon is where that deferred work actually runs, out
+        // of the request path.
+        let compaction_handle = {
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let index_dir = self.index_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..30 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    if !crate::search::needs_compaction(&index_dir) {
+                        continue;
+                    }
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    tracing::info!("needs_compaction marker found — rebuilding HNSW index");
+                    match engine.rebuild_search_index().await {
+                        Ok((chunks, reflections)) => tracing::info!(
+                            chunks,
+                            reflections,
+                            "compaction rebuild complete, needs_compaction cleared"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "compaction rebuild failed"),
+                    }
+                    drop(permit);
+                }
+            })
+        };
+        tracing::info!("compaction loop started (needs_compaction marker consumer)");
+
         // Journal v4 dream server (locked decision 7: daemon-hosted, always
         // on, stable loopback port, bookmarkable). It binds 127.0.0.1 only
         // and serves read-only routes. `spawn_for_daemon` returns `None`
@@ -663,6 +710,10 @@ impl Daemon {
         // transactionally. Await it so shutdown cannot detach a half-harvested
         // training attempt.
         let _ = trained_rerank_handle.await;
+        // Same index-mutation contract as plans/codex_rollout: a rebuild in
+        // flight swaps `self.search` and dumps it, so a detach could race the
+        // shutdown flush below. Await it fully rather than time it out.
+        let _ = compaction_handle.await;
         // The journal server stops on the same flag (its graceful-shutdown
         // future polls it). Bounded by the shared timeout: an in-flight
         // request only reads, so a detached one cannot corrupt anything.

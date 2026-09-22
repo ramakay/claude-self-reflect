@@ -195,19 +195,22 @@ impl Engine {
                 );
             }
             // hnsw_rs cannot delete. A blanked slot still takes a neighbour
-            // position and search does not over-fetch, so a cache that is
-            // materially tombstones returns short result lists: rebuild it.
+            // position, so a cache that is materially tombstones eventually
+            // wants a full rebuild for compactness. `Engine::new` runs in
+            // foreground processes (MCP serve, hooks, CLI query commands) —
+            // never synchronously here: that used to be the ~minutes-long
+            // stall a fresh MCP handshake cannot afford under Claude Code's
+            // 30s CONNECT_TIMEOUT. `search_index`/`search_chunks_filtered`
+            // already overfetch past tombstoned slots, so this process keeps
+            // serving full-page results with the cache as-is; a
+            // `needs_compaction` marker tells the daemon's compaction loop
+            // (or the explicit `rebuild-index` command) to do the rebuild
+            // out-of-band.
             if orphans_material {
-                tracing::info!("HNSW cache holds purged vectors — rebuilding");
-                let (mut fresh, _, _) = rebuild_search_index_streaming(&storage, RECONCILE_BATCH)?;
-                let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
-                let reflection_count = storage
-                    .count_reflection_embeddings()
-                    .unwrap_or(reflection_count);
-                if let Err(e) = fresh.dump_to_disk(&index_dir, chunk_count, reflection_count) {
-                    tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
-                }
-                search = fresh;
+                tracing::info!(
+                    "HNSW cache holds purged vectors — serving with tombstones, marked needs_compaction"
+                );
+                crate::search::mark_needs_compaction(&index_dir);
             }
             search
         } else {
@@ -231,6 +234,9 @@ impl Engine {
             if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
                 tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
             }
+            // A from-scratch rebuild is compact by construction (no
+            // tombstones), so any pending compaction request is satisfied.
+            crate::search::clear_needs_compaction(&index_dir);
             let t_total = t0.elapsed();
 
             tracing::info!(
@@ -663,6 +669,9 @@ impl Engine {
             rebuild_search_index_streaming(&self.storage, RECONCILE_BATCH)?;
         *self.search.write().await = fresh;
         self.flush_index_checked().await?;
+        // Compact by construction — clears any pending compaction request
+        // (`needs_compaction` marker) a foreground process may have left.
+        crate::search::clear_needs_compaction(&self.index_dir);
         Ok((chunk_count, reflection_count))
     }
 
@@ -964,5 +973,81 @@ mod tests {
         for i in 0..3 {
             assert!(search.has_reflection(&format!("refl-{i}")));
         }
+    }
+
+    // --- WP-D: foreground `Engine::new` must not inline-rebuild on material
+    // orphans; it defers to the `needs_compaction` marker instead. ---
+
+    #[tokio::test]
+    async fn orphans_material_in_foreground_marks_compaction_instead_of_rebuilding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        // Seed 40 chunks directly (bypassing Engine, matching the pattern
+        // other tests here use) so the first `Engine::new` has a real corpus
+        // to build a cache from.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+        }
+
+        // First construction: no cache exists yet, so this is the
+        // out-of-scope "missing manifest still rebuilds" path (interface 4).
+        // It writes a fresh, compact 40-point cache to disk.
+        {
+            let eng = Engine::new(&db_path, &projects_dir).unwrap();
+            assert_eq!(eng.search.read().await.chunk_count(), 40);
+        }
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "a fresh full rebuild must not leave a stale compaction marker"
+        );
+
+        // Delete 30 of 40 rows (75% — comfortably over ORPHAN_REBUILD_DIVISOR's
+        // 1/20 materiality threshold) to simulate the dip: DB count now below
+        // what the cache/manifest describes.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_chunk(&format!("chunk-{i}")).unwrap();
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let eng2 = Engine::new(&db_path, &projects_dir).unwrap();
+        let elapsed = t0.elapsed();
+
+        // The whole point: this must be a cache load + reconciliation, not a
+        // from-scratch rebuild of the remaining 10 points. On a corpus this
+        // tiny both paths are fast in wall-clock terms, so the receipt that
+        // actually matters is behavioural: the marker is set and the engine
+        // is still serving (never panicked/blocked on a rebuild loop).
+        assert!(
+            crate::search::needs_compaction(&index_dir),
+            "material orphans in a foreground Engine::new must set the \
+             needs_compaction marker instead of rebuilding inline"
+        );
+        assert_eq!(
+            eng2.search.read().await.chunk_count(),
+            10,
+            "the 30 deleted ids must be reconciled (blanked) even without an \
+             inline full rebuild"
+        );
+        tracing::debug!(?elapsed, "orphan-reconciliation Engine::new completed");
+
+        // The explicit maintenance path (also what the daemon's compaction
+        // loop calls) consumes and clears the marker, and produces a compact
+        // index with no tombstoned slots left over.
+        let (chunks, _reflections) = eng2.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks, 10);
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "rebuild_search_index must clear the needs_compaction marker it satisfies"
+        );
     }
 }

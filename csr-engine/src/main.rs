@@ -91,6 +91,12 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
     },
+    /// Force a full HNSW index rebuild from SQLite now, in the foreground.
+    /// Explicit maintenance command counterpart to the daemon's
+    /// `needs_compaction`-marker compaction loop — use when no daemon is
+    /// running, or to compact immediately rather than wait for the next
+    /// daemon cycle.
+    RebuildIndex,
     /// Analyze code quality using AST patterns
     Quality {
         /// File path to analyze
@@ -787,6 +793,13 @@ async fn run() -> Result<()> {
             !no_ai,
         );
         return daemon.run().await;
+    }
+
+    if let Some(Commands::RebuildIndex) = args.command {
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let (chunks, reflections) = eng.rebuild_search_index().await?;
+        println!("rebuilt index: {chunks} chunks, {reflections} reflections");
+        return Ok(());
     }
 
     if let Some(Commands::Ratify {
