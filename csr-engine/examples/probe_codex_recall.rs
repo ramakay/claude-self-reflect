@@ -195,6 +195,33 @@ fn detect_contamination(conn: &Connection, target_conv: &str) -> Result<Contamin
     Ok(Contamination { rows, conv_ids })
 }
 
+/// Sessions produced by this wave-2 investigation itself, which quote its
+/// probe queries verbatim (recorded in `docs/`/agent journals: sessions
+/// `51a3c211`, `432ec120` and their workflow sidechains — every one first
+/// seen after this cutoff). Unlike [`detect_contamination`] (which is
+/// target-specific: it also matches on a target's own uuid substring), this
+/// is the CHEAP, target-independent half of the same rule — "exclude
+/// conversations whose first timestamp is after 2026-09-22T14:00Z" — usable
+/// for every sampled conversation in the generalization sweep without a
+/// per-conversation contamination scan.
+const GLOBAL_CONTAMINATION_CUTOFF: &str = "2026-09-22T14:00:00Z";
+
+/// Conversation ids whose earliest chunk postdates
+/// [`GLOBAL_CONTAMINATION_CUTOFF`] — the target-independent half of
+/// contamination, computed once and reused as the `exclude` set for every
+/// sampled conversation's decontaminated brute-force rank.
+fn global_contamination_conv_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id FROM chunks
+         GROUP BY conversation_id
+         HAVING MIN(timestamp) > ?1",
+    )?;
+    let ids = stmt
+        .query_map([GLOBAL_CONTAMINATION_CUTOFF], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    Ok(ids)
+}
+
 /// Mirrors `import::codex_rollout::CODEX_HARNESS_MARKERS` (private to that
 /// module): Codex harness-injected boilerplate (plugin recommendations,
 /// AGENTS.md instructions, environment-context dumps) that can occupy a
@@ -557,6 +584,11 @@ async fn main() -> Result<()> {
     // ── Part 2: generalization — >=N codex + >=N Claude conversations ──
     let codex_sample = build_sample(&conn, "codex_rollout", sample_n, &paraphrases)?;
     let claude_sample = build_sample(&conn, "conversation", sample_n, &paraphrases)?;
+    let global_contamination = global_contamination_conv_ids(&conn)?;
+    println!(
+        "\nglobal contamination set (first_seen > {GLOBAL_CONTAMINATION_CUTOFF}): {} conversation(s)",
+        global_contamination.len()
+    );
     println!(
         "\n--- generalization sample: {} codex, {} claude (seed={SAMPLE_SEED:?}) ---",
         codex_sample.len(),
@@ -579,10 +611,47 @@ async fn main() -> Result<()> {
 
     let mut hit_counts: HashMap<&str, (usize, usize)> = HashMap::new(); // source -> (hits, total)
     let mut miss_stage_counts: HashMap<(&str, String), usize> = HashMap::new();
+    // Decontaminated hit@6, brute-force ground truth (same methodology and
+    // same caveat as the target's own decontaminated number above: measured
+    // outside the live pipeline, which has no exclusion parameter to fork
+    // production code for). `None` when the sampled conversation is itself
+    // in the global contamination set — its own recall can't be scored
+    // meaningfully once its content is what "decontaminated" would exclude.
+    let mut decontam_hit_counts: HashMap<&str, (usize, usize)> = HashMap::new();
 
     for (source_label, sample) in [("codex", &codex_sample), ("claude", &claude_sample)] {
         for conv in sample {
             let conv_query_vec = engine.embeddings().embed_single(&conv.query_text).ok();
+            let decontam_hit = if global_contamination.contains(&conv.conversation_id) {
+                None
+            } else {
+                conv_query_vec.as_deref().map(|qv| {
+                    let bf = brute_force_rank(
+                        &all_rows,
+                        qv,
+                        &conv.conversation_id,
+                        &global_contamination,
+                    );
+                    bf.rank.is_some_and(|r| r < LIMIT)
+                })
+            };
+            match decontam_hit {
+                Some(hit) => {
+                    let entry = decontam_hit_counts.entry(source_label).or_insert((0, 0));
+                    entry.1 += 1;
+                    if hit {
+                        entry.0 += 1;
+                    }
+                    println!(
+                        "  {source_label:<6} {} decontam_hit@6(brute_force)={hit}",
+                        conv.conversation_id
+                    );
+                }
+                None => println!(
+                    "  {source_label:<6} {} decontam_hit@6(brute_force)=n/a (self-contaminated)",
+                    conv.conversation_id
+                ),
+            }
             for (scope_label, project) in [
                 ("scoped", Some(conv.project_name.as_str())),
                 ("unscoped", None),
@@ -668,6 +737,18 @@ async fn main() -> Result<()> {
     println!("\n--- hit@6 summary ---");
     for source in ["codex", "claude"] {
         if let Some((hits, total)) = hit_counts.get(source) {
+            println!(
+                "  {source}: {hits}/{total} = {:.1}%",
+                100.0 * (*hits as f64) / (*total as f64).max(1.0)
+            );
+        }
+    }
+    println!(
+        "\n--- decontaminated hit@6 summary (brute-force ground truth, excludes global \
+         contamination set) ---"
+    );
+    for source in ["codex", "claude"] {
+        if let Some((hits, total)) = decontam_hit_counts.get(source) {
             println!(
                 "  {source}: {hits}/{total} = {:.1}%",
                 100.0 * (*hits as f64) / (*total as f64).max(1.0)

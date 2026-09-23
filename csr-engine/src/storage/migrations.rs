@@ -1942,6 +1942,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_identity_v2(conn)?;
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
+    migrate_strip_memory_tag_from_derived_reflections(conn)?;
 
     finish_chunks_fts_compaction(conn)?;
 
@@ -2188,6 +2189,70 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
           OR NEW.marker IS NOT OLD.marker
         BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END;",
     )?;
+    Ok(())
+}
+
+/// Meta key gating [`migrate_strip_memory_tag_from_derived_reflections`] so it
+/// scans `reflections` once rather than on every startup.
+const STRIP_MEMORY_TAG_FROM_DERIVED_KEY: &str = "strip_csr_memory_tag_from_derived_reflections_v1";
+
+/// One-shot repair for the bug where `store_reflection`'s explicit-memory
+/// stamp (`csr:memory`) leaked onto pipeline-derived reflections (stories,
+/// episodes, briefings, cache rows, `narrative_*` extractions) because they
+/// shared the same insert path. A derived tag on a row means it was never a
+/// deliberate memory write; strip the stamp so `is_explicit_memory` /
+/// `reflection_recall_standing` stop granting it unearned user standing (the
+/// live 2026-09-22 case: reflection `3e4c5285`, tagged `session_story` +
+/// `csr:memory`, scored `adj 0.994 = cos 0.494 + user 0.50`).
+///
+/// Gated by [`STRIP_MEMORY_TAG_FROM_DERIVED_KEY`] so the scan runs once, not
+/// on every `migrations::run`. Also naturally idempotent: a second run (e.g.
+/// after a manual meta-row reset) only ever re-examines rows that still
+/// contain the literal tag string, and stripping an already-stripped tag is a
+/// no-op.
+fn migrate_strip_memory_tag_from_derived_reflections(conn: &Connection) -> Result<()> {
+    let already_done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [STRIP_MEMORY_TAG_FROM_DERIVED_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+    let memory_tag = crate::mcp::tools::EXPLICIT_MEMORY_TAG;
+    let mut stmt =
+        conn.prepare("SELECT id, tags FROM reflections WHERE tags LIKE '%' || ?1 || '%'")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([memory_tag], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut repaired = 0i64;
+    for (id, tags_json) in rows {
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if !crate::mcp::tools::has_derived_reflection_tag(&tags) {
+            continue;
+        }
+        let stripped: Vec<String> = tags.into_iter().filter(|t| t != memory_tag).collect();
+        let stripped_json = serde_json::to_string(&stripped)?;
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = ?2",
+            rusqlite::params![stripped_json, id],
+        )?;
+        repaired += 1;
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![STRIP_MEMORY_TAG_FROM_DERIVED_KEY, repaired.to_string()],
+    )?;
+    if repaired > 0 {
+        tracing::info!(
+            repaired,
+            "migrate_strip_memory_tag_from_derived_reflections: stripped csr:memory from derived rows"
+        );
+    }
     Ok(())
 }
 
@@ -3862,5 +3927,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("No.".into(), "/tmp/child.jsonl".into(), None));
+    }
+
+    #[test]
+    fn strip_memory_tag_from_derived_reflections_repairs_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE reflections (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                tags TEXT DEFAULT '[]',
+                timestamp TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        let story_tags =
+            serde_json::to_string(&["session_story", "project_x", "csr:memory"]).unwrap();
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp)
+             VALUES ('story_1', 'a story', ?1, '2026-01-01T00:00:00Z')",
+            [&story_tags],
+        )
+        .unwrap();
+        let memory_tags = serde_json::to_string(&["anukriti", "csr:memory"]).unwrap();
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp)
+             VALUES ('mem_1', 'a memory', ?1, '2026-01-01T00:00:00Z')",
+            [&memory_tags],
+        )
+        .unwrap();
+
+        migrate_strip_memory_tag_from_derived_reflections(&conn).unwrap();
+
+        let story_after: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='story_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let tags: Vec<String> = serde_json::from_str(&story_after).unwrap();
+        assert!(
+            !tags.iter().any(|t| t == "csr:memory"),
+            "derived row must lose the explicit-memory stamp: {tags:?}"
+        );
+        assert!(tags.iter().any(|t| t == "session_story"), "{tags:?}");
+
+        let memory_after: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='mem_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let memory_tags_after: Vec<String> = serde_json::from_str(&memory_after).unwrap();
+        assert!(
+            memory_tags_after.iter().any(|t| t == "csr:memory"),
+            "an explicit memory (no derived tag) must keep its stamp: {memory_tags_after:?}"
+        );
+
+        // Idempotency: re-adding the tag by hand and re-running must be a
+        // no-op — the meta key gates the scan to once.
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = 'story_1'",
+            [&story_tags],
+        )
+        .unwrap();
+        migrate_strip_memory_tag_from_derived_reflections(&conn).unwrap();
+        let story_after_second: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='story_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            story_after_second, story_tags,
+            "second run is gated by the meta key and must not rescan"
+        );
     }
 }

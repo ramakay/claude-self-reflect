@@ -645,6 +645,62 @@ pub fn rescope_sidechain_conversation(
     Ok(())
 }
 
+/// Rewrite a reflection's cached `project_<old>` tag to `project_<new>` for
+/// every reflection tied to `conversation_id` (via an exact `conv_<id>` tag)
+/// that still carries the old value — the derived-narrative counterpart to
+/// `rescope_sidechain_conversation`'s chunk-row rewrite. Reflections are
+/// looked up by a `LIKE` prefilter (no index on the tags JSON blob) but only
+/// ever mutated on an exact tag match, so a conversation id or project name
+/// that happens to be a substring of another's never causes a false rewrite.
+pub fn repair_reflection_project_tag(
+    conn: &Connection,
+    conversation_id: &str,
+    old_project: &str,
+    new_project: &str,
+) -> Result<usize> {
+    let conv_tag = format!("conv_{conversation_id}");
+    let old_tag = format!("project_{old_project}");
+    let new_tag = format!("project_{new_project}");
+    let mut stmt = conn.prepare(
+        "SELECT id, tags FROM reflections
+         WHERE tags LIKE '%' || ?1 || '%' AND tags LIKE '%' || ?2 || '%'",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![conv_tag, old_tag], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut repaired = 0usize;
+    for (id, tags_json) in rows {
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if !tags.iter().any(|t| t == &conv_tag) {
+            continue; // the LIKE prefilter matched a substring, not the tag itself
+        }
+        let mut changed = false;
+        let rewritten: Vec<String> = tags
+            .into_iter()
+            .map(|t| {
+                if t == old_tag {
+                    changed = true;
+                    new_tag.clone()
+                } else {
+                    t
+                }
+            })
+            .collect();
+        if !changed {
+            continue;
+        }
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&rewritten)?, id],
+        )?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
 /// Delete a whole conversation's chunks + their embeddings, FTS rows, and provenance
 /// edges. Aux-source adapters (plans, tasks, ...) reimport a whole document on content
 /// change, and the document can shrink — overwriting by deterministic chunk id alone
@@ -1496,6 +1552,35 @@ pub fn fts5_search_reflections(
         .enumerate()
         .map(|(ordinal, (id, bm25))| (id, ordinal, bm25))
         .collect())
+}
+
+/// Ids of reflections whose stored content starts with `query` verbatim
+/// (case-insensitive), newest first. An exact-prefix hit is a stronger
+/// keyword signal than an OR-of-terms bm25 match — bm25 compares corpus
+/// statistics across the whole `reflections` table, so a project name that
+/// recurs in many rows (a common shape for a `MEMORY-ARCHIVE <slug>` memory:
+/// the slug also appears in unrelated stories/extractions) can bury the
+/// literal prefix match under rows that merely mention one of its words.
+/// Callers merge this ahead of the OR-of-terms ranking so an exact opening
+/// match always wins the keyword channel, not just competes on bm25.
+pub fn fts5_reflection_prefix_matches(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id FROM reflections WHERE content LIKE ?1 || '%' ORDER BY timestamp DESC LIMIT ?2",
+    )?;
+    let ids = stmt
+        .query_map(params![trimmed, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
 }
 
 pub fn fts5_search(

@@ -119,45 +119,77 @@ pub const EXPLICIT_MEMORY_TAG: &str = "csr:memory";
 /// the same undated floor `score_fts_candidate` gives a keyword-only chunk.
 const FTS_REFLECTION_SCORE: f32 = 0.40;
 
+/// Tags that mark a reflection row as pipeline-derived (a story, episode,
+/// briefing, cache or extraction) rather than a deliberate memory write. A
+/// derived tag always wins over [`EXPLICIT_MEMORY_TAG`]: the summarizer/story
+/// paths route through the same storage helper the MCP `store_reflection`
+/// tool uses, so a derived row can carry both tags, and standing must follow
+/// what the row actually is, not what it happens to be stamped with.
+const DERIVED_REFLECTION_TAGS: &[&str] = &[
+    "session_story",
+    "session_episode",
+    "session_briefing",
+    "context_cache",
+];
+
+pub(crate) fn has_derived_reflection_tag(tags: &[String]) -> bool {
+    tags.iter()
+        .any(|t| t.starts_with("narrative_") || DERIVED_REFLECTION_TAGS.contains(&t.as_str()))
+}
+
 /// Whether a reflection row is an explicit memory write (the `store_reflection`
-/// tool) rather than a pipeline-derived narrative. Rows carrying
-/// [`EXPLICIT_MEMORY_TAG`] are explicit by construction; rows written before the
-/// stamp existed are recognised by shape: a UUID id (every derived writer uses a
-/// `v3_` / `extracted` / `story_` / `heuristic` / `fact_` prefix) with none of
-/// the derived-pipeline tags.
+/// tool) rather than a pipeline-derived narrative. A derived tag
+/// (`session_story`/`session_episode`/`session_briefing`/`context_cache`/
+/// `narrative_*`) always disqualifies a row, even alongside
+/// [`EXPLICIT_MEMORY_TAG`] — see [`has_derived_reflection_tag`]. Absent a
+/// derived tag, rows carrying [`EXPLICIT_MEMORY_TAG`] are explicit by
+/// construction; rows written before the stamp existed are recognised by
+/// shape: a UUID id (every derived writer uses a `v3_` / `extracted` /
+/// `story_` / `heuristic` / `fact_` prefix).
 pub(crate) fn is_explicit_memory(id: &str, tags: &[String]) -> bool {
+    if has_derived_reflection_tag(tags) {
+        return false;
+    }
     if tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
         return true;
     }
-    if !is_uuid(id) {
-        return false;
-    }
-    const DERIVED_TAGS: &[&str] = &[
-        "session_story",
-        "session_episode",
-        "session_briefing",
-        "context_cache",
-    ];
-    !tags
-        .iter()
-        .any(|t| t.starts_with("narrative_") || DERIVED_TAGS.contains(&t.as_str()))
+    is_uuid(id)
 }
 
-/// Recall standing for a reflection candidate. Explicit memory writes rank with
+/// Below this raw (pre-decay, pre-scope) cosine, an explicit memory does not
+/// clear the recall floor and must not be granted UserHistory standing — same
+/// floor `format::QUICK_CHECK_FLOOR` uses to call a match "weak": below it,
+/// cosine similarity on this corpus is not calibrated enough to trust as a
+/// relevance signal, let alone lift with a flat +0.50. Without this gate a
+/// legacy uuid-shaped reflection at cosine 0.12 outranked the actually
+/// relevant chunk for the query — measured live 2026-09-22, project
+/// EnhanceMe: `ca488584` (raw 0.116, adj 0.616) and `54dbda97` (raw 0.114,
+/// adj 0.614) both outranked the target codex chunk at cosine 0.549.
+const EXPLICIT_MEMORY_STANDING_FLOOR: f32 = crate::format::QUICK_CHECK_FLOOR;
+
+/// Recall standing for a reflection candidate. Explicit memory writes that
+/// clear [`EXPLICIT_MEMORY_STANDING_FLOOR`] on raw cosine rank with
 /// user-history standing: `search::rerank` gives user-authored chunks a flat
 /// `W_USER` boost, and without equal standing an exact memory match (cosine
 /// 1.0) lost the page to any user chunk above cosine ~0.5 — measured live
 /// 2026-09-22: seven 0.63-cosine user chunks scored 1.13 against the memory's
-/// 1.00. Derived narratives keep their cached provenance floor. This is a
-/// ranking policy only: it never writes `reflections.min_trust`, and the row's
-/// provenance event stays Unknown
+/// 1.00. Below the floor the boost does not apply — the row keeps its
+/// derived-narrative treatment (cached provenance floor, usually Unknown) —
+/// so a memory that is only weakly (or not at all) related to the query
+/// cannot use a raw cosine as low as `EXPLICIT_MEMORY_STANDING_FLOOR - 1` to
+/// jump above genuinely relevant content. `raw_cosine` is 0.0 for
+/// keyword-only reflection hits (no HNSW cosine exists), which conservatively
+/// keeps them off this boost too — their own keyword channel still surfaces
+/// them (see `fuse_rrf`). This is a ranking policy only: it never writes
+/// `reflections.min_trust`, and the row's provenance event stays Unknown
 /// (`reflection_tags_cannot_raise_its_observed_event_above_unknown`).
 fn reflection_recall_standing(
     storage: &Storage,
     id: &str,
     tags: &[String],
+    raw_cosine: f32,
 ) -> crate::provenance::TrustTier {
-    if is_explicit_memory(id, tags) {
+    if is_explicit_memory(id, tags) && raw_cosine >= EXPLICIT_MEMORY_STANDING_FLOOR {
         return crate::provenance::TrustTier::UserHistory;
     }
     storage
@@ -168,9 +200,43 @@ fn reflection_recall_standing(
         .unwrap_or(crate::provenance::TrustTier::Unknown)
 }
 
+/// Determine a reflection's project from its tags: the pipeline writers stamp
+/// `project_<name>`; explicit memories usually carry the bare project name as
+/// a plain tag, which must not read as cross-project (a penalty, or under an
+/// explicit scope an outright drop — see [`reflection_project_allowed`]).
+/// Falls back to `"unknown"` when no tag identifies a project at all.
+fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> String {
+    tags.iter()
+        .find(|t| t.starts_with("project_"))
+        .map(|t| t.trim_start_matches("project_").to_string())
+        .or_else(|| tags.iter().find(|t| scope.is_family(t)).cloned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Whether a reflection/story resolved to `project_name` may appear at all
+/// under `scope`. Under an explicit project filter (`scope.effective_project`
+/// set), a reflection outside the family — including one that resolved to
+/// `"unknown"` because no tag identified a project — must be dropped from the
+/// candidate set entirely, exactly like chunks: chunk search is already
+/// pre-filtered to family ids before this point
+/// (`search_chunks_filtered`/`get_chunk_ids_for_project` in
+/// `reflect_gather_pass`), so a reflection getting only the softer 0.3x
+/// `project_scope_multiplier` penalty instead of being dropped let
+/// out-of-family stories and unrelated memories sit on the page above
+/// in-family chunks (live 2026-09-22, project EnhanceMe: ranks 5-7 were an
+/// unknown-project memory, an anukriti story, and a `project_subagents`
+/// reflection). With no filter (`scope.effective_project` is `None`, e.g. an
+/// `all`-scope search), every reflection is allowed — the multiplier's soft
+/// current-project boost still applies for those, not this hard gate.
+fn reflection_project_allowed(project_name: &str, scope: &SearchProjectScope) -> bool {
+    scope.effective_project.is_none() || scope.is_family(project_name)
+}
+
 /// Result row for a reflection hit from either channel. `keyword` marks a hit
 /// that arrived through `reflections_fts` rather than the vector index, with
-/// the same `[keyword] ` prefix keyword-only chunks carry.
+/// the same `[keyword] ` prefix keyword-only chunks carry. Callers must check
+/// [`reflection_project_allowed`] before calling this — it always builds a
+/// result row, it does not filter.
 fn reflection_result(
     id: &str,
     score: f32,
@@ -180,16 +246,11 @@ fn reflection_result(
     scope: &SearchProjectScope,
     keyword: bool,
 ) -> EnrichedResult {
-    // Determine project from tags: the pipeline writers stamp `project_<name>`;
-    // explicit memories usually carry the bare project name as a plain tag,
-    // which must not read as cross-project (a 0.3x penalty under a scope).
-    let project_name = tags
-        .iter()
-        .find(|t| t.starts_with("project_"))
-        .map(|t| t.trim_start_matches("project_").to_string())
-        .or_else(|| tags.iter().find(|t| scope.is_family(t)).cloned())
-        .unwrap_or_else(|| "unknown".to_string());
-    // Cross-project multiplicative penalty
+    let project_name = resolve_reflection_project(tags, scope);
+    // Cross-project multiplicative penalty (soft — only reached when
+    // `reflection_project_allowed` has already let this row through, so under
+    // an explicit scope this is always the in-family 1.0 case; the 0.3x arm
+    // still applies to the unscoped/current-project-boost path).
     let final_score = score * project_scope_multiplier(&project_name, scope);
     let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
         "[episode] "
@@ -461,6 +522,29 @@ fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<St
 
     fused_order.sort_by(|left, right| scores[right].total_cmp(&scores[left]));
     fused_order
+}
+
+/// Move every id in `prefix_ids` that also appears in `order` to the front,
+/// in `prefix_ids`' own order, leaving every other id's relative order
+/// untouched. `prefix_ids` is small (a handful of exact-prefix reflection
+/// matches at most) so a linear scan per id is fine.
+fn promote_exact_prefix_reflections(order: Vec<String>, prefix_ids: &[String]) -> Vec<String> {
+    if prefix_ids.is_empty() {
+        return order;
+    }
+    let prefix_set: HashSet<&str> = prefix_ids.iter().map(String::as_str).collect();
+    let mut promoted: Vec<String> = Vec::with_capacity(order.len());
+    for id in prefix_ids {
+        if order.iter().any(|candidate| candidate == id) {
+            promoted.push(id.clone());
+        }
+    }
+    for id in order {
+        if !prefix_set.contains(id.as_str()) {
+            promoted.push(id);
+        }
+    }
+    promoted
 }
 
 /// Everything in `reflect_on_past` after query embedding — the seam the
@@ -1051,9 +1135,18 @@ async fn reflect_gather_pass(
     // Enrich reflection results — convert to EnrichedResult using reflection
     // content. Tags are kept per id so the rerank below can tell explicit
     // memory writes from derived narratives (`reflection_recall_standing`).
+    // Raw (pre-decay, pre-scope) cosine is kept alongside so that function
+    // can gate the flat UserHistory standing by actual relevance instead of
+    // handing it out to every legacy-shaped memory regardless of similarity.
     let mut reflection_tags: HashMap<String, Vec<String>> = HashMap::new();
+    let mut reflection_raw_cosine: HashMap<String, f32> = HashMap::new();
     for r in &reflection_results {
+        reflection_raw_cosine.insert(r.id.clone(), r.score);
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
+            let project_name = resolve_reflection_project(&tags, scope);
+            if !reflection_project_allowed(&project_name, scope) {
+                continue;
+            }
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
                 let events = reflection_tad_events
                     .get(&r.id)
@@ -1086,6 +1179,7 @@ async fn reflect_gather_pass(
 
     let mut fts_order = Vec::new();
     let mut reflection_fts_hits: Vec<(String, usize, f64)> = Vec::new();
+    let mut reflection_prefix_ids: Vec<String> = Vec::new();
     // Hybrid always supplements semantic retrieval with FTS5. Vector mode
     // skips FTS entirely; FTS mode reaches this block with no semantic hits.
     if search_mode != SearchMode::Vector {
@@ -1119,7 +1213,46 @@ async fn reflect_gather_pass(
         reflection_fts_hits = storage
             .fts5_search_reflections(query, fetch)
             .unwrap_or_default();
+        // `reflections_fts` carries no project column (only the tags JSON
+        // does), so the keyword channel is otherwise entirely unscoped —
+        // under an explicit project filter it must drop out-of-family hits
+        // the same way the semantic channel and `fts5_search`'s chunk query
+        // do (`reflection_project_allowed`).
+        if scope.effective_project.is_some() {
+            reflection_fts_hits.retain(|(id, _, _)| {
+                storage
+                    .get_reflection_by_id(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(_, tags, _)| {
+                        reflection_project_allowed(&resolve_reflection_project(&tags, scope), scope)
+                    })
+            });
+        }
         fts_window_full |= reflection_fts_hits.len() == fetch;
+        // Exact-prefix reflections: a memory whose content starts with the
+        // query verbatim is a stronger keyword signal than anything the
+        // OR-of-terms bm25 ranking can express (bm25 compares corpus stats
+        // across `reflections`, so a recurring project-name slug can bury
+        // the literal opener under rows that merely mention one of its
+        // words — live: `MEMORY-ARCHIVE anukriti-meta-campaigns` never
+        // surfaced its 3 memories because 267 rows matched the OR terms).
+        // Prepended ahead of the bm25 merge so it always wins the keyword
+        // channel rather than just competing on bm25 scale.
+        reflection_prefix_ids = storage
+            .fts5_reflection_prefix_matches(query, fetch)
+            .unwrap_or_default();
+        if scope.effective_project.is_some() {
+            reflection_prefix_ids.retain(|id| {
+                storage
+                    .get_reflection_by_id(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|(_, tags, _)| {
+                        reflection_project_allowed(&resolve_reflection_project(&tags, scope), scope)
+                    })
+            });
+        }
         fts_order = {
             let mut keyword_ranking: Vec<(&str, usize, f64)> = fts_hits
                 .iter()
@@ -1136,10 +1269,20 @@ async fn reflect_gather_pass(
                     .then_with(|| left.1.cmp(&right.1))
                     .then_with(|| left.0.cmp(right.0))
             });
-            keyword_ranking
-                .into_iter()
-                .map(|(id, _, _)| id.to_string())
-                .collect()
+            let mut ordered: Vec<String> =
+                Vec::with_capacity(reflection_prefix_ids.len() + keyword_ranking.len());
+            let mut seen: HashSet<String> = HashSet::new();
+            for id in &reflection_prefix_ids {
+                if seen.insert(id.clone()) {
+                    ordered.push(id.clone());
+                }
+            }
+            for (id, _, _) in keyword_ranking {
+                if seen.insert(id.to_string()) {
+                    ordered.push(id.to_string());
+                }
+            }
+            ordered
         };
         if !fts_hits.is_empty() {
             window_full |= fts_window_full;
@@ -1221,12 +1364,18 @@ async fn reflect_gather_pass(
         }
     }
 
-    // Keyword-only reflections: reached through `reflections_fts` but not the
-    // vector window. No validity partition applies (verdicts bind to chunk ids).
-    if !reflection_fts_hits.is_empty() {
+    // Keyword-only reflections: reached through `reflections_fts` or the
+    // exact-prefix channel but not the vector window. No validity partition
+    // applies (verdicts bind to chunk ids).
+    if !reflection_fts_hits.is_empty() || !reflection_prefix_ids.is_empty() {
         let present: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
-        for (id, _, _) in &reflection_fts_hits {
-            if present.contains(id) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let ids = reflection_prefix_ids
+            .iter()
+            .map(String::as_str)
+            .chain(reflection_fts_hits.iter().map(|(id, _, _)| id.as_str()));
+        for id in ids {
+            if present.contains(id) || !seen.insert(id) {
                 continue;
             }
             if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(id) {
@@ -1239,7 +1388,7 @@ async fn reflect_gather_pass(
                     scope,
                     true,
                 ));
-                reflection_tags.insert(id.clone(), tags);
+                reflection_tags.insert(id.to_string(), tags);
             }
         }
     }
@@ -1290,7 +1439,15 @@ async fn reflect_gather_pass(
             // Reflection ids are not chunk ids: the chunk floor lookup would
             // read Unknown for every one of them.
             min_trust: match reflection_tags.get(&e.chunk.id) {
-                Some(tags) => reflection_recall_standing(storage, &e.chunk.id, tags),
+                Some(tags) => reflection_recall_standing(
+                    storage,
+                    &e.chunk.id,
+                    tags,
+                    reflection_raw_cosine
+                        .get(&e.chunk.id)
+                        .copied()
+                        .unwrap_or(0.0),
+                ),
                 None => storage
                     .get_chunk_min_trust(&e.chunk.id)
                     .unwrap_or(crate::provenance::TrustTier::Unknown),
@@ -1462,6 +1619,15 @@ async fn reflect_gather_pass(
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
+    // Exact-prefix reflections win the keyword channel outright (see where
+    // `reflection_prefix_ids` is built) — but RRF alone does not reliably
+    // surface a hit that is present in ONLY the keyword list ahead of items
+    // present (even weakly) in both the semantic AND keyword lists: with
+    // enough double-counted competition, position-only fusion still buries
+    // it. An exact opening match is strong enough evidence to skip fusion
+    // entirely and place it first, the same way an exact `conv_<uuid>`
+    // handle bypasses similarity ranking (`extract_conv_id`).
+    let final_order = promote_exact_prefix_reflections(final_order, &reflection_prefix_ids);
     if let Some(enriched_conv) = enriched_conv.as_ref() {
         let ranked: Vec<(String, String, f32)> = final_order
             .iter()
@@ -1548,8 +1714,12 @@ async fn reflect_gather_pass(
     })
 }
 
-/// Store a reflection with embedding for future search.
-pub async fn store_reflection(
+/// Store a reflection with embedding for future search, with `tags` used
+/// verbatim (no explicit-memory stamp). Shared by the MCP `store_reflection`
+/// tool (which stamps first, see [`store_reflection`]) and every pipeline
+/// writer (stories, episodes, extractions) that must NOT get user standing —
+/// see `reflection_recall_standing` and `is_explicit_memory`.
+pub async fn store_reflection_internal(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
@@ -1564,13 +1734,7 @@ pub async fn store_reflection(
         tokio::task::spawn_blocking(move || emb.embed_single(&text)).await??
     };
 
-    // Stamp the explicit-memory marker so recall can rank this row with user
-    // standing (`reflection_recall_standing`) without inferring it from shape.
-    let mut tags: Vec<String> = tags.to_vec();
-    if !tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
-        tags.push(EXPLICIT_MEMORY_TAG.to_string());
-    }
-    storage.insert_reflection(&id, content, &tags, &embedding)?;
+    storage.insert_reflection(&id, content, tags, &embedding)?;
 
     {
         let mut idx = search.write().await;
@@ -1581,6 +1745,27 @@ pub async fn store_reflection(
         "Reflection stored successfully.\nID: {}\nTags: {:?}",
         id, tags
     ))
+}
+
+/// Store an EXPLICIT memory write for future search: the MCP `store_reflection`
+/// tool's only entry point. Stamps [`EXPLICIT_MEMORY_TAG`] so recall can rank
+/// this row with user standing (`reflection_recall_standing`) without
+/// inferring it from shape. Pipeline writers (stories/episodes/extractions)
+/// must call [`store_reflection_internal`] directly instead — they are not
+/// deliberate memory writes and must not gain user standing by sharing this
+/// stamping path.
+pub async fn store_reflection(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    content: &str,
+    tags: &[String],
+) -> Result<String> {
+    let mut tags: Vec<String> = tags.to_vec();
+    if !tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
+        tags.push(EXPLICIT_MEMORY_TAG.to_string());
+    }
+    store_reflection_internal(storage, embeddings, search, content, &tags).await
 }
 
 /// Record a resolution verdict for one or more chunks.
@@ -3879,6 +4064,72 @@ mod tests {
         assert!(!is_explicit_memory("extracted_1", &["free".into()]));
     }
 
+    /// Regression for the live bug: `store_reflection`'s shared insert path
+    /// stamped `csr:memory` onto every derived narrative it wrote (stories,
+    /// episodes, ...), so a row could carry BOTH the stamp and a derived tag.
+    /// The derived tag must win — a pipeline narrative is never a deliberate
+    /// memory write, whatever it happens to be stamped with.
+    #[test]
+    fn derived_tag_overrides_explicit_memory_stamp() {
+        let uuid = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        assert!(
+            !is_explicit_memory(
+                uuid,
+                &["session_story".into(), EXPLICIT_MEMORY_TAG.to_string()]
+            ),
+            "a stamped session_story must not count as an explicit memory"
+        );
+        assert!(!is_explicit_memory(
+            uuid,
+            &[
+                "narrative_extracted_v3".into(),
+                EXPLICIT_MEMORY_TAG.to_string()
+            ]
+        ));
+    }
+
+    /// The bug this closes: `summarizer.rs` wrote stories through the same
+    /// `store_reflection` helper the MCP tool uses, so every story got the
+    /// `csr:memory` stamp and, via `reflection_recall_standing`, the flat
+    /// `W_USER` boost `derived_story_keeps_no_standing_against_user_chunks`
+    /// exists to forbid. That test only caught it for reflections written
+    /// directly through storage; this one exercises the actual write path a
+    /// story takes (`store_reflection_internal`) and proves it does NOT
+    /// stamp. Revert the split in `store_reflection`/`store_reflection_internal`
+    /// and this fails: the row would carry `csr:memory`.
+    #[tokio::test]
+    async fn summarizer_story_write_path_does_not_stamp_explicit_memory() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = SearchEngine::new(EmbeddingEngine::dimension());
+        let search = Arc::new(RwLock::new(engine));
+        let tags = vec![
+            "session_story".to_string(),
+            "project_test".to_string(),
+            "conv_abc".to_string(),
+        ];
+        let result = store_reflection_internal(
+            &storage,
+            &embeddings,
+            &search,
+            "a synthesized session story",
+            &tags,
+        )
+        .await
+        .unwrap();
+        let id = result
+            .lines()
+            .find_map(|l| l.strip_prefix("ID: "))
+            .expect("id line")
+            .to_string();
+        let (_, stored_tags, _) = storage.get_reflection_by_id(&id).unwrap().unwrap();
+        assert!(
+            !stored_tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG),
+            "the summarizer's write path must not stamp explicit-memory standing: {stored_tags:?}"
+        );
+        assert!(!is_explicit_memory(&id, &stored_tags));
+    }
+
     /// Seven user-authored chunks at cosine 0.63 to the query (the live shape
     /// measured 2026-09-22: one recap paragraph quoted into many sessions)
     /// against one reflection at cosine 1.0. Returns the first `<cid>`.
@@ -3967,6 +4218,89 @@ mod tests {
         assert!(first.starts_with("conv-"), "{first}");
     }
 
+    /// Live 2026-09-22 defect (project EnhanceMe, query "codex blocked
+    /// revival..."): a legacy uuid-shaped reflection at raw cosine ~0.12 to
+    /// the query was still granted UserHistory standing, so `+0.50` lifted it
+    /// (adj 0.616) above the actually relevant chunk (cosine 0.549, no
+    /// boost). `EXPLICIT_MEMORY_STANDING_FLOOR` must gate the boost off for a
+    /// memory this weakly related, so the relevant chunk wins the page.
+    #[tokio::test]
+    async fn weak_similarity_memory_does_not_outrank_relevant_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        // Relevant chunk: cosine 0.55 to the query, no standing of its own.
+        let relevant_cosine = 0.55_f32;
+        let relevant_vector = vec![
+            relevant_cosine,
+            (1.0 - relevant_cosine * relevant_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let chunk = crate::import::ConversationChunk {
+            id: "relevant-chunk".into(),
+            conversation_id: "conv-relevant".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "the codex revival is blocked on the iOS deploy step".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &relevant_vector).unwrap();
+        engine.insert_chunk(chunk.id.clone(), relevant_vector);
+
+        // Legacy uuid-shaped memory: cosine 0.12, well under the floor.
+        let weak_cosine = 0.12_f32;
+        let weak_vector = vec![
+            weak_cosine,
+            (1.0 - weak_cosine * weak_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let memory_id = "ca488584-0000-4000-8000-000000000001";
+        storage
+            .insert_reflection(
+                memory_id,
+                "an unrelated anukriti campaign note",
+                &["anukriti".to_string()],
+                &weak_vector,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), weak_vector);
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival 2026 iOS deploy blocker where stuck",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_eq!(
+            &out[start..end],
+            "conv-relevant",
+            "a cosine-0.12 memory must not outrank a cosine-0.55 relevant chunk:\n{out}"
+        );
+    }
+
     #[tokio::test]
     async fn bare_project_tag_keeps_memory_in_family_under_a_scope() {
         let storage = Arc::new(Storage::open_memory().unwrap());
@@ -4034,6 +4368,86 @@ mod tests {
         assert!(
             score > 0.9,
             "no cross-project penalty expected, got {score}:\n{out}"
+        );
+    }
+
+    /// Spec (b): under an explicit project filter, reflections and stories
+    /// outside the family — including ones that resolve to "unknown" because
+    /// no tag names a project — must be dropped, not merely soft-penalized.
+    /// Live 2026-09-22 defect (project EnhanceMe): an unknown-project memory
+    /// and an anukriti story both out-ranked in-family results. A bare
+    /// project tag that matches the scope still keeps the row in the family.
+    #[tokio::test]
+    async fn explicit_project_scope_drops_out_of_family_and_unknown_reflections() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        // Out-of-family story: tagged to a different project, cosine 1.0.
+        storage
+            .insert_reflection(
+                "story-out-of-family",
+                "MEMORY-ARCHIVE anukriti campaign story",
+                &["session_story".into(), "project_anukriti".into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("story-out-of-family".into(), query.to_vec());
+
+        // Unknown-project explicit memory: no project tag at all, cosine 1.0.
+        storage
+            .insert_reflection(
+                "memory-unknown-project",
+                "MEMORY-ARCHIVE some note with no project tag",
+                &["free-form".into(), EXPLICIT_MEMORY_TAG.into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("memory-unknown-project".into(), query.to_vec());
+
+        // In-family explicit memory via a bare project tag, cosine 1.0.
+        storage
+            .insert_reflection(
+                "memory-in-family",
+                "MEMORY-ARCHIVE EnhanceMe roster note",
+                &["EnhanceMe".into(), EXPLICIT_MEMORY_TAG.into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("memory-in-family".into(), query.to_vec());
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "roster memory",
+            10,
+            0.0,
+            Some("EnhanceMe"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.contains("<cid>memory-in-family</cid>"),
+            "an in-family bare-tag memory must stay on the page:\n{out}"
+        );
+        assert!(
+            !out.contains("<cid>story-out-of-family</cid>"),
+            "an out-of-family story must be dropped under an explicit scope, not just penalized:\n{out}"
+        );
+        assert!(
+            !out.contains("<cid>memory-unknown-project</cid>"),
+            "an unknown-project memory must be dropped under an explicit scope:\n{out}"
         );
     }
 
@@ -4109,6 +4523,91 @@ mod tests {
             !vector.contains("<cid>memory-keyword-only</cid>"),
             "{vector}"
         );
+    }
+
+    /// Spec (e): an exact-prefix reflection must reach page 1 of the keyword
+    /// channel even when a common term in the query also appears in many
+    /// chunks. Live 2026-09-22: `reflections_fts` itself ranked 3
+    /// `MEMORY-ARCHIVE anukriti-meta-campaigns` memories at bm25 8/9/10 of
+    /// 267 matches (the OR-of-terms query rewards any row mentioning
+    /// "anukriti"), and the combined chunk+reflection bm25 merge buried them
+    /// under chunk hits entirely — none of the 3 made the final page.
+    #[tokio::test]
+    async fn exact_prefix_reflection_reaches_page_one_over_many_keyword_matching_chunks() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(256);
+        let query_vec = [1.0_f32, 0.0, 0.0, 0.0];
+        // Chunks sit at cosine 0.4 — weakly relevant, but above min_score, so
+        // they count on both the semantic and keyword channels (the real
+        // shape: generic background chatter that happens to mention the
+        // query terms). The memories are cosine 0.0 (excluded from the
+        // semantic channel entirely by `min_score`) — only the keyword
+        // channel, via the exact-prefix match, can reach them.
+        let chunk_vector = vec![0.4_f32, (1.0_f32 - 0.4 * 0.4).sqrt(), 0.0, 0.0];
+        let orthogonal = vec![0.0_f32, 1.0, 0.0, 0.0];
+        let min_score = 0.3_f32;
+
+        // 200 chunks that all match the OR-of-terms query (mention "x-y-z").
+        for i in 0..200 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("chunk-{i}"),
+                conversation_id: format!("conv-chunk-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("background note about project-x-y-z number {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &chunk_vector).unwrap();
+            engine.insert_chunk(chunk.id, chunk_vector.clone());
+        }
+
+        // 3 memories whose content starts with the query text verbatim.
+        let mut memory_ids = Vec::new();
+        for i in 0..3 {
+            let id = format!("memory-prefix-{i}");
+            storage
+                .insert_reflection(
+                    &id,
+                    &format!("MEMORY-ARCHIVE project-x-y-z memory number {i}"),
+                    &[EXPLICIT_MEMORY_TAG.to_string()],
+                    &orthogonal,
+                )
+                .unwrap();
+            engine.insert_reflection(id.clone(), orthogonal.clone());
+            memory_ids.push(id);
+        }
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query_vec,
+            "MEMORY-ARCHIVE project-x-y-z",
+            5,
+            min_score,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+
+        for id in &memory_ids {
+            assert!(
+                out.contains(&format!("<cid>{id}</cid>")),
+                "exact-prefix memory {id} must reach page 1 over 200 OR-matching chunks:\n{out}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -178,6 +178,34 @@ impl Daemon {
         let _lock = Self::acquire_lock()?;
         tracing::info!("daemon started, acquired lockfile");
 
+        // One-shot, meta-key-gated repair for sidechain conversations whose
+        // chunk row (and derived reflections) are stuck on the daemon-side
+        // rescope target `project_subagents` because their source file was
+        // already gone before file (re)discovery could rescope them. See
+        // `Storage::repair_sidechain_project_misattribution`'s doc comment.
+        // Cheap after the first run (meta key short-circuits), so it runs
+        // unconditionally rather than behind another env-var kill switch.
+        {
+            let storage = self.storage.clone();
+            let projects_dir = self.projects_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                storage.repair_sidechain_project_misattribution(&projects_dir)
+            })
+            .await
+            {
+                Ok(Ok(repaired)) if repaired > 0 => {
+                    tracing::info!(repaired, "repaired sidechain project misattribution")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "sidechain project misattribution repair failed (non-fatal)")
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "sidechain project misattribution repair task panicked (non-fatal)")
+                }
+            }
+        }
+
         // Shared shutdown flag for graceful termination (D-8)
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -210,8 +238,17 @@ impl Daemon {
             let search = self.search.clone();
             let interval = self.config.extraction_interval_secs;
             let shutdown = shutdown.clone();
+            let projects_dir = self.projects_dir.clone();
             tokio::spawn(async move {
-                extraction_loop(storage, embeddings, search, interval, shutdown).await;
+                extraction_loop(
+                    storage,
+                    embeddings,
+                    search,
+                    interval,
+                    shutdown,
+                    projects_dir,
+                )
+                .await;
             })
         };
         tracing::info!("extraction loop started (Layer 2)");
@@ -1168,13 +1205,14 @@ async fn extraction_loop(
     search: Arc<RwLock<SearchEngine>>,
     interval_secs: u64,
     shutdown: Arc<AtomicBool>,
+    projects_dir: PathBuf,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             tracing::info!("extraction loop: shutdown signal received");
             break;
         }
-        if let Err(e) = extraction_loop_inner(&storage, &embeddings, &search).await {
+        if let Err(e) = extraction_loop_inner(&storage, &embeddings, &search, &projects_dir).await {
             tracing::warn!(error = %e, "extraction loop iteration failed (non-fatal)");
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
@@ -1214,6 +1252,7 @@ async fn extraction_loop_inner(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
+    projects_dir: &Path,
 ) -> Result<()> {
     let unenriched = storage.get_unenriched_conversations("extracted_v3", 5)?;
     if unenriched.is_empty() {
@@ -1231,8 +1270,15 @@ async fn extraction_loop_inner(
                 storage.mark_enrichment_unavailable(conv_id, "extracted_v3", "source file missing");
             continue;
         }
-        if let Err(e) =
-            process_v3_extraction(storage, embeddings, search, conv_id, Path::new(file_path)).await
+        if let Err(e) = process_v3_extraction(
+            storage,
+            embeddings,
+            search,
+            conv_id,
+            Path::new(file_path),
+            projects_dir,
+        )
+        .await
         {
             tracing::warn!(conv = %conv_id, error = %e, "V3 extraction failed");
             let _ = storage.mark_enrichment_failed(conv_id, "extracted_v3", &e.to_string());
@@ -1242,13 +1288,23 @@ async fn extraction_loop_inner(
     Ok(())
 }
 
-/// Process V3 extraction for a single conversation.
+/// Process V3 extraction for a single conversation. `projects_dir` derives the
+/// REAL project the same way the importer does
+/// (`import::derive_conversation_attribution`), from `file_path`'s position
+/// under it — not from `chunks.project_name`. For an agent sidechain
+/// transcript (`<project>/<session>/subagents/agent-*.jsonl`) the chunk row's
+/// project is the daemon-side rescope target, `"subagents"`, until
+/// `rescope_sidechain_conversation` runs; that only fires when the file is
+/// (re)discovered, so a conversation whose source file was later deleted can
+/// never get rescoped and this write would otherwise inherit the wrong
+/// project forever (live: 1,201 reflections tagged `project_subagents`).
 async fn process_v3_extraction(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
     conv_id: &str,
     file_path: &Path,
+    projects_dir: &Path,
 ) -> Result<()> {
     let messages = import::parse_jsonl_messages_for_search(file_path)?;
     if messages.is_empty() {
@@ -1276,12 +1332,12 @@ async fn process_v3_extraction(
             result.search_index, sig_json, result.context_cache
         );
 
-        // Add project tag so project-scoped search can filter (Codex H-2 fix)
-        let project = storage
-            .get_project_for_conversation(conv_id)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "unknown".to_string());
+        // Add project tag so project-scoped search can filter (Codex H-2 fix).
+        // Derived from `file_path` the same way the importer attributes a
+        // transcript, not from `chunks.project_name` — see this function's
+        // doc comment for why the chunk row can be permanently wrong for a
+        // sidechain whose source file later disappears.
+        let project = import::derive_conversation_attribution(projects_dir, file_path).project_name;
         let tags = vec![
             "narrative_extracted_v3".to_string(),
             format!("conv_{conv_id}"),
@@ -1308,11 +1364,8 @@ async fn process_v3_extraction(
         // Persist context_cache as linked reflection for error recovery retrieval
         if !result.context_cache.trim().is_empty() {
             let cache_id = format!("v3_cache_{}", conv_id);
-            let project = storage
-                .get_project_for_conversation(conv_id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "unknown".to_string());
+            let project =
+                import::derive_conversation_attribution(projects_dir, file_path).project_name;
             let cache_tags = vec![
                 "context_cache".to_string(),
                 "error_recovery".to_string(),
@@ -1829,6 +1882,7 @@ pub fn spawn_enrichment_loops(
     storage: Arc<Storage>,
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
+    projects_dir: PathBuf,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let initial_delay = resolve_enrich_initial_delay();
@@ -1839,7 +1893,11 @@ pub fn spawn_enrichment_loops(
         let e = embeddings.clone();
         let idx = search.clone();
         let sd = shutdown.clone();
-        tokio::spawn(delayed(initial_delay, extraction_loop(s, e, idx, 60, sd)))
+        let pd = projects_dir.clone();
+        tokio::spawn(delayed(
+            initial_delay,
+            extraction_loop(s, e, idx, 60, sd, pd),
+        ))
     };
 
     // Layer 3: AI narrative (only if API key set)
@@ -2288,7 +2346,7 @@ mod tests {
         let path = external_floor_transcript(dir.path(), "conv-v3");
         let (storage, embeddings, search) = provenance_test_rig();
 
-        process_v3_extraction(&storage, &embeddings, &search, "conv-v3", &path)
+        process_v3_extraction(&storage, &embeddings, &search, "conv-v3", &path, dir.path())
             .await
             .unwrap();
 
@@ -2324,6 +2382,71 @@ mod tests {
         std::fs::write(&missing, "{\"type\":\"user\",\"uuid\":\"x\",\"message\":{\"role\":\"user\",\"content\":\"Please fix the authentication bug in the login flow that causes users to be logged out unexpectedly\"}}\n").unwrap();
         let inputs = import::transcript_inputs_or_unknown(&storage, &path, "conv-v3");
         assert_eq!(inputs.floor(), TrustTier::Unknown);
+    }
+
+    /// Spec (c): a sidechain conversation whose chunk row is stuck on the
+    /// daemon-side rescope target `"subagents"` (source file gone before
+    /// `rescope_sidechain_conversation` could fire — the live 2026-09-22
+    /// state of 592 conversations) must NOT have its V3 extraction inherit
+    /// that wrong project. The project must come from `file_path`'s position
+    /// under `projects_dir`, the same attribution the importer uses.
+    #[tokio::test]
+    async fn v3_extraction_derives_project_from_path_not_the_stale_chunk_row() {
+        let root = tempfile::tempdir().unwrap();
+        let projects_dir = root.path().join("claude_projects");
+        let sidechain_dir = projects_dir
+            .join("-Users-test-projects-anukriti-meta-campaigns")
+            .join("6897846e-0000-4000-8000-000000000000")
+            .join("subagents");
+        std::fs::create_dir_all(&sidechain_dir).unwrap();
+        let conv_id = "agent-aec0a3cf2fe94c998";
+        let path = external_floor_transcript(&sidechain_dir, conv_id);
+
+        let (storage, embeddings, search) = provenance_test_rig();
+        // Simulate the chunk row already stuck on the wrong (rescope-target)
+        // project — the state a source-file-deleted sidechain is left in.
+        storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: format!("{conv_id}-chunk"),
+                    conversation_id: conv_id.to_string(),
+                    project_name: "subagents".to_string(),
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                    content: "stale chunk content".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: crate::provenance::Speaker::User,
+                    seq: 0,
+                    is_sidechain: true,
+                },
+                &vec![0.1_f32; EmbeddingEngine::dimension()],
+            )
+            .unwrap();
+
+        process_v3_extraction(
+            &storage,
+            &embeddings,
+            &search,
+            conv_id,
+            &path,
+            &projects_dir,
+        )
+        .await
+        .unwrap();
+
+        let reflection_id = format!("extracted_v3_{conv_id}");
+        let (_, tags, _) = storage
+            .get_reflection_by_id(&reflection_id)
+            .unwrap()
+            .expect("v3 reflection stored");
+        assert!(
+            tags.iter().any(|t| t == "project_anukriti-meta-campaigns"),
+            "must derive the real project from the path, got {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|t| t == "project_subagents"),
+            "must not inherit the stale chunk-row project, got {tags:?}"
+        );
     }
 
     #[tokio::test]

@@ -37,6 +37,31 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// The `rank` attribute of the `<r rank="N">` block whose `<cid>` or `<id>`
+/// tag equals `id` exactly, or `None` if `id` never appears as one of those
+/// tags anywhere in the rendered output. Unlike `out.contains(id)`, this
+/// cannot be satisfied by `id` merely appearing inside an excerpt or a
+/// `conv_<uuid>` tag on some OTHER result's block.
+fn rank_of_id_in_rendered_output(out: &str, id: &str) -> Option<usize> {
+    let mut current_rank: Option<usize> = None;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("<r rank=\"") {
+            current_rank = rest.split('"').next().and_then(|n| n.parse().ok());
+            continue;
+        }
+        for tag in ["<cid>", "<id>"] {
+            let close = format!("</{}", &tag[1..]);
+            if let Some(rest) = trimmed.strip_prefix(tag) {
+                if rest.strip_suffix(&close) == Some(id) {
+                    return current_rank;
+                }
+            }
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut db = PathBuf::from("/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db");
@@ -211,11 +236,22 @@ async fn main() -> Result<()> {
             Some("all"),
         )
         .await?;
-        let hit = out.contains(id.as_str());
+        // `out.contains(id)` was a false-pass trap: any OTHER result whose
+        // rendered excerpt happens to quote the id string (e.g. as a
+        // `conv_<uuid>` tag, or a memory that mentions another memory's id)
+        // counted as a hit regardless of where the target itself landed.
+        // Live receipt: for a prefix query this printed "id present=true"
+        // while the target wasn't even among the rendered `<cid>` rows. Parse
+        // each `<r rank="N">...<cid>ID</cid>|<id>ID</id>...` block instead
+        // and report the ACTUAL rank the target id landed at, `None` if it
+        // did not make the page at all.
+        let hit_rank = rank_of_id_in_rendered_output(&out, id);
         let head: Vec<&str> = out.lines().take(1).collect();
         println!(
-            "full reflect_on_past(own text, project=all): id present={} | {}",
-            hit,
+            "full reflect_on_past(own text, project=all): rank={} (of the returned page) | {}",
+            hit_rank
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             head.join(" ")
         );
         for line in out
@@ -227,4 +263,61 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact false-pass this replaces: the target id is quoted in a
+    /// `conv_<uuid>` tag on a DIFFERENT result's excerpt while the target
+    /// itself never made the page. `out.contains(id)` reports true; rank
+    /// lookup correctly reports `None`.
+    #[test]
+    fn does_not_false_pass_when_id_only_appears_in_another_results_excerpt() {
+        let out = r#"
+<r rank="1">
+  <s>0.900</s>
+  <excerpt><![CDATA[quotes conv_22ffc13b-0000-4000-8000-000000000000 as a reference]]></excerpt>
+  <cid>b5a982df-0000-4000-8000-000000000000</cid>
+  <id>b5a982df-0000-4000-8000-000000000000</id>
+</r>
+"#;
+        let target = "22ffc13b-0000-4000-8000-000000000000";
+        assert!(out.contains(target), "sanity: substring IS present");
+        assert_eq!(
+            rank_of_id_in_rendered_output(out, target),
+            None,
+            "the id only appears inside another result's excerpt, not as its own tag"
+        );
+    }
+
+    #[test]
+    fn reports_the_actual_rank_the_target_landed_at() {
+        let out = r#"
+<r rank="1">
+  <s>0.900</s>
+  <cid>other-conv</cid>
+  <id>other-id</id>
+</r>
+<r rank="2">
+  <s>0.800</s>
+  <cid>target-conv</cid>
+  <id>target-id</id>
+</r>
+"#;
+        assert_eq!(rank_of_id_in_rendered_output(out, "target-id"), Some(2));
+    }
+
+    #[test]
+    fn self_text_rank_one_holds() {
+        let out = r#"
+<r rank="1">
+  <s>0.995</s>
+  <cid>self-id</cid>
+  <id>self-id</id>
+</r>
+"#;
+        assert_eq!(rank_of_id_in_rendered_output(out, "self-id"), Some(1));
+    }
 }

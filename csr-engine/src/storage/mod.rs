@@ -462,6 +462,12 @@ impl Storage {
         queries::fts5_search_reflections(&conn, query, limit)
     }
 
+    /// See `queries::fts5_reflection_prefix_matches`.
+    pub fn fts5_reflection_prefix_matches(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_reflection_prefix_matches(&conn, query, limit)
+    }
+
     // ─── Reflection tag queries ───
 
     pub fn get_reflections_by_tag(
@@ -973,6 +979,80 @@ impl Storage {
             project_name,
             parent_conversation_id,
         )
+    }
+
+    /// See `queries::repair_reflection_project_tag`.
+    pub fn repair_reflection_project_tag(
+        &self,
+        conversation_id: &str,
+        old_project: &str,
+        new_project: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::repair_reflection_project_tag(&conn, conversation_id, old_project, new_project)
+    }
+
+    /// Meta key gating [`Storage::repair_sidechain_project_misattribution`].
+    const SIDECHAIN_MISATTRIBUTION_REPAIR_KEY: &'static str =
+        "sidechain_project_misattribution_repair_v1";
+
+    /// One-shot repair for the bug where a sidechain conversation's chunk row
+    /// — and every reflection derived from it (`extracted_v3_*`/`v3_cache_*`/
+    /// `story_*`) — stayed permanently tagged with the daemon-side rescope
+    /// target `project_subagents` because its source transcript disappeared
+    /// before `rescope_sidechain_conversation` ever ran (that only fires when
+    /// the file is (re)discovered — see `daemon::process_v3_extraction`'s doc
+    /// comment for the live count: 592 conversations, 2026-09-22). The real
+    /// project is still recoverable for every one of these from
+    /// `import_state.file_path`, using the exact attribution the importer
+    /// applies to a live file (`import::derive_conversation_attribution`).
+    ///
+    /// Gated by [`Self::SIDECHAIN_MISATTRIBUTION_REPAIR_KEY`] so the scan
+    /// runs once, not on every call. A conversation with no recorded (or
+    /// ambiguous) `import_state` path, or one whose path does not resolve
+    /// away from `subagents`/`unknown`, is simply skipped — safe to call
+    /// again (e.g. after clearing the meta row) without double-repairing
+    /// anything `rescope_sidechain_conversation` already fixed.
+    pub fn repair_sidechain_project_misattribution(&self, projects_dir: &Path) -> Result<usize> {
+        if self
+            .get_meta(Self::SIDECHAIN_MISATTRIBUTION_REPAIR_KEY)?
+            .is_some()
+        {
+            return Ok(0);
+        }
+        let broken_ids: Vec<String> = {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT conversation_id FROM chunks WHERE project_name = 'subagents'",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        let mut repaired = 0usize;
+        for conv_id in &broken_ids {
+            let paths = self.import_paths_for_conversations(std::slice::from_ref(conv_id), 1)?;
+            let Some(path) = paths.get(conv_id).and_then(|p| p.first()) else {
+                continue; // no unambiguous recorded path — leave for a later pass
+            };
+            let attribution =
+                crate::import::derive_conversation_attribution(projects_dir, Path::new(path));
+            if attribution.project_name == "subagents" || attribution.project_name == "unknown" {
+                continue; // did not actually resolve to anything better
+            }
+            let Some(parent) = attribution.parent_conversation_id.as_deref() else {
+                continue; // not shaped like a sidechain path after all
+            };
+            self.rescope_sidechain_conversation(conv_id, &attribution.project_name, parent)?;
+            self.repair_reflection_project_tag(conv_id, "subagents", &attribution.project_name)?;
+            repaired += 1;
+        }
+        self.set_meta(
+            Self::SIDECHAIN_MISATTRIBUTION_REPAIR_KEY,
+            &repaired.to_string(),
+        )?;
+        Ok(repaired)
     }
 
     /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
@@ -2608,6 +2688,93 @@ mod tests {
             .unwrap();
         assert_eq!(provenance.author, Speaker::Assistant);
         assert_eq!(provenance.source_conv_id, "parent-session");
+    }
+
+    /// Spec (c): a sidechain conversation whose source file is already gone
+    /// (the live 2026-09-22 state of 592 conversations) can never get
+    /// rescoped through file (re)discovery. The repair must recover the real
+    /// project from the recorded `import_state.file_path` alone — the file
+    /// itself never needs to exist on disk, only the projects_dir prefix
+    /// structure the path encodes.
+    #[test]
+    fn repair_sidechain_project_misattribution_recovers_from_a_gone_file() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+
+        let storage = Storage::open_memory().unwrap();
+        let conv_id = "agent-aec0a3cf2fe94c998";
+        let chunk = ConversationChunk {
+            id: format!("{conv_id}-chunk"),
+            conversation_id: conv_id.to_string(),
+            project_name: "subagents".into(),
+            timestamp: "2026-09-01T00:00:00Z".into(),
+            content: "stale sidechain content".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: true,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+        storage
+            .insert_reflection(
+                &format!("extracted_v3_{conv_id}"),
+                "v3 extraction content",
+                &[
+                    "narrative_extracted_v3".into(),
+                    format!("conv_{conv_id}"),
+                    "project_subagents".into(),
+                ],
+                &[0.0; 4],
+            )
+            .unwrap();
+
+        // The file itself never has to exist — only the recorded path,
+        // matching the shape a real deleted sidechain transcript left behind.
+        let missing_path =
+            "/tmp/does-not-exist/claude_projects/-Users-test-projects-anukriti-meta-campaigns/\
+             6897846e-0000-4000-8000-000000000000/subagents/agent-aec0a3cf2fe94c998.jsonl";
+        storage
+            .upsert_import_state_explicit(missing_path, conv_id, 1, "2026-09-01T00:00:00Z")
+            .unwrap();
+
+        let projects_dir = Path::new("/tmp/does-not-exist/claude_projects");
+        let repaired = storage
+            .repair_sidechain_project_misattribution(projects_dir)
+            .unwrap();
+        assert_eq!(
+            repaired, 1,
+            "must repair exactly the one broken conversation"
+        );
+
+        let (project_name, source): (String, String) = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT project_name, source FROM chunks WHERE id = ?1",
+                [&chunk.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(project_name, "anukriti-meta-campaigns");
+        assert_eq!(source, "sidechain");
+
+        let (_, tags, _) = storage
+            .get_reflection_by_id(&format!("extracted_v3_{conv_id}"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            tags.iter().any(|t| t == "project_anukriti-meta-campaigns"),
+            "reflection tag must be rewritten too: {tags:?}"
+        );
+        assert!(!tags.iter().any(|t| t == "project_subagents"));
+
+        // Idempotent: the meta key gates a second call to a no-op.
+        let second = storage
+            .repair_sidechain_project_misattribution(projects_dir)
+            .unwrap();
+        assert_eq!(second, 0, "second call is gated by the meta key");
     }
 
     #[test]

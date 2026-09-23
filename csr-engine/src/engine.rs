@@ -817,6 +817,7 @@ impl Engine {
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
+            self.projects_dir().to_path_buf(),
         );
 
         let server = CsrServer::new(
