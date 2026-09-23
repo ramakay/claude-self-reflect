@@ -26,6 +26,7 @@ use csr_engine::import::codex_rollout::{
 };
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 const CODEX_HARNESS_MARKERS: &[&str] = &[
@@ -131,7 +132,8 @@ fn main() -> Result<()> {
             break;
         }
         let started = Instant::now();
-        let stats = harness_strip_batch(&engine, batch_size)?;
+        let shutdown = AtomicBool::new(false);
+        let stats = harness_strip_batch(&engine, batch_size, &shutdown)?;
         let wall = started.elapsed().as_secs_f64();
         batches_run += 1;
         total_chunks += stats.chunks_reimported;
