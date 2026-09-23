@@ -236,15 +236,30 @@ fn reflection_recall_standing(
     tags: &[String],
     raw_cosine: f32,
 ) -> crate::provenance::TrustTier {
-    if is_explicit_memory(id, tags) && raw_cosine >= EXPLICIT_MEMORY_STANDING_FLOOR {
-        return crate::provenance::TrustTier::UserHistory;
+    let tier = if is_explicit_memory(id, tags) {
+        crate::provenance::TrustTier::UserHistory
+    } else {
+        storage
+            .get_artifact_min_trust(
+                crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                id,
+            )
+            .unwrap_or(crate::provenance::TrustTier::Unknown)
+    };
+    // The floor gates the flat `W_USER` standing boost regardless of which
+    // branch produced `tier`: a derived reflection's CACHED provenance floor
+    // can independently be `UserHistory` (or higher) without ever going
+    // through the explicit-memory path above, and that cached floor must not
+    // bypass the relevance gate either — see this fn's doc and the
+    // `weak_similarity_cached_user_history_reflection_does_not_outrank_relevant_chunk`
+    // test.
+    if raw_cosine < EXPLICIT_MEMORY_STANDING_FLOOR
+        && tier >= crate::provenance::TrustTier::UserHistory
+    {
+        crate::provenance::TrustTier::Unknown
+    } else {
+        tier
     }
-    storage
-        .get_artifact_min_trust(
-            crate::storage::artifact_provenance::ArtifactKind::Reflection,
-            id,
-        )
-        .unwrap_or(crate::provenance::TrustTier::Unknown)
 }
 
 /// Determine a reflection's project from its tags: the pipeline writers stamp
@@ -253,15 +268,26 @@ fn reflection_recall_standing(
 /// explicit scope an outright drop — see [`reflection_project_allowed`]).
 /// Falls back to `"unknown"` when no tag identifies a project at all.
 fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> String {
+    // Prefer a `project_*` tag that already matches the scope's family: a
+    // memory-file reflection can carry several `project_*` slugs (one per
+    // source memory file) plus a bare family tag, and the *first* one found
+    // is not necessarily the one that keeps the row in scope — see
+    // `reflection_project_allowed`'s doc for the live shape this fixes.
     tags.iter()
-        .find(|t| t.starts_with("project_"))
-        .map(|t| t.trim_start_matches("project_").to_string())
+        .filter_map(|t| t.strip_prefix("project_"))
+        .find(|candidate| scope.is_family(candidate))
+        .map(str::to_string)
+        .or_else(|| {
+            tags.iter()
+                .find(|t| t.starts_with("project_"))
+                .map(|t| t.trim_start_matches("project_").to_string())
+        })
         .or_else(|| tags.iter().find(|t| scope.is_family(t)).cloned())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Whether a reflection/story resolved to `project_name` may appear at all
-/// under `scope`. Under an explicit project filter (`scope.effective_project`
+/// Whether a reflection/story carrying `tags` may appear at all under
+/// `scope`. Under an explicit project filter (`scope.effective_project`
 /// set), a reflection outside the family — including one that resolved to
 /// `"unknown"` because no tag identified a project — must be dropped from the
 /// candidate set entirely, exactly like chunks: chunk search is already
@@ -275,8 +301,22 @@ fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> St
 /// reflection). With no filter (`scope.effective_project` is `None`, e.g. an
 /// `all`-scope search), every reflection is allowed — the multiplier's soft
 /// current-project boost still applies for those, not this hard gate.
-fn reflection_project_allowed(project_name: &str, scope: &SearchProjectScope) -> bool {
-    scope.effective_project.is_none() || scope.is_family(project_name)
+///
+/// Checks EVERY tag (each `project_*` tag with the prefix stripped, plus
+/// every bare tag) against `scope.is_family`, not just whichever single tag
+/// [`resolve_reflection_project`] would pick to *display* — a memory-file
+/// reflection can carry several `project_*` slugs (one per source memory
+/// file) plus a bare family tag, and deciding from only the first `project_*`
+/// tag dropped in-family rows whose first tag happened not to match (live
+/// 2026-09-22: `e97fa3b4`/`5eb5aebb`/`22ffc13b`, each carrying a non-matching
+/// `project_*` slug alongside the matching bare tag `anukriti-meta-campaigns`,
+/// vanished from `project=anukriti-meta-campaigns` scoped search).
+fn reflection_project_allowed(tags: &[String], scope: &SearchProjectScope) -> bool {
+    scope.effective_project.is_none()
+        || tags.iter().any(|tag| {
+            let candidate = tag.strip_prefix("project_").unwrap_or(tag.as_str());
+            scope.is_family(candidate)
+        })
 }
 
 /// Result row for a reflection hit from either channel. `keyword` marks a hit
@@ -1196,8 +1236,7 @@ async fn reflect_gather_pass(
     for r in &reflection_results {
         reflection_raw_cosine.insert(r.id.clone(), r.score);
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
-            let project_name = resolve_reflection_project(&tags, scope);
-            if !reflection_project_allowed(&project_name, scope) {
+            if !reflection_project_allowed(&tags, scope) {
                 continue;
             }
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
@@ -1277,9 +1316,7 @@ async fn reflect_gather_pass(
                     .get_reflection_by_id(id)
                     .ok()
                     .flatten()
-                    .is_some_and(|(_, tags, _)| {
-                        reflection_project_allowed(&resolve_reflection_project(&tags, scope), scope)
-                    })
+                    .is_some_and(|(_, tags, _)| reflection_project_allowed(&tags, scope))
             });
         }
         fts_window_full |= reflection_fts_hits.len() == fetch;
@@ -1301,9 +1338,7 @@ async fn reflect_gather_pass(
                     .get_reflection_by_id(id)
                     .ok()
                     .flatten()
-                    .is_some_and(|(_, tags, _)| {
-                        reflection_project_allowed(&resolve_reflection_project(&tags, scope), scope)
-                    })
+                    .is_some_and(|(_, tags, _)| reflection_project_allowed(&tags, scope))
             });
         }
         fts_order = {
@@ -4383,6 +4418,110 @@ mod tests {
         );
     }
 
+    /// Opus review finding (medium, W3-K): `EXPLICIT_MEMORY_STANDING_FLOOR`
+    /// gated the boost only on the explicit-memory branch of
+    /// `reflection_recall_standing`. A derived reflection (no
+    /// `csr:memory` stamp, not uuid-shaped) whose CACHED provenance floor is
+    /// already `UserHistory` skipped that gate entirely and still got the
+    /// flat `W_USER` boost at any cosine — live receipt: `extracted_v3_*`
+    /// rows scored `cos=0.535 user=+0.50 total=1.035`, the same shape as the
+    /// `ca488584` bug this item was opened for. Same fixture as
+    /// `weak_similarity_memory_does_not_outrank_relevant_chunk`, but the
+    /// weak memory is a derived row with a pre-cached `UserHistory` floor
+    /// instead of an explicit `store_reflection` write.
+    #[tokio::test]
+    async fn weak_similarity_cached_user_history_reflection_does_not_outrank_relevant_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        let relevant_cosine = 0.55_f32;
+        let relevant_vector = vec![
+            relevant_cosine,
+            (1.0 - relevant_cosine * relevant_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let chunk = crate::import::ConversationChunk {
+            id: "relevant-chunk".into(),
+            conversation_id: "conv-relevant".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "the codex revival is blocked on the iOS deploy step".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &relevant_vector).unwrap();
+        engine.insert_chunk(chunk.id.clone(), relevant_vector);
+
+        // Derived reflection: no EXPLICIT_MEMORY_TAG, non-uuid id (so
+        // `is_explicit_memory` is false), cosine 0.12 (well under the
+        // floor), with a cached provenance floor already UserHistory —
+        // the shape `insert_derived_reflection` produces for a row whose
+        // support set includes a user message.
+        let weak_cosine = 0.12_f32;
+        let weak_vector = vec![
+            weak_cosine,
+            (1.0 - weak_cosine * weak_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let derived_id = "extracted_v3_unrelated-conv";
+        storage
+            .insert_reflection(
+                derived_id,
+                "an unrelated extracted narrative",
+                &["narrative_extracted_v3".to_string()],
+                &weak_vector,
+            )
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE reflections SET min_trust = ?1 WHERE id = ?2",
+                    rusqlite::params![
+                        crate::provenance::TrustTier::UserHistory.as_i64(),
+                        derived_id
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        engine.insert_reflection(derived_id.to_string(), weak_vector);
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival 2026 iOS deploy blocker where stuck",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_eq!(
+            &out[start..end],
+            "conv-relevant",
+            "a cosine-0.12 derived reflection with a cached UserHistory floor must not outrank \
+             a cosine-0.55 relevant chunk:\n{out}"
+        );
+    }
+
     #[tokio::test]
     async fn bare_project_tag_keeps_memory_in_family_under_a_scope() {
         let storage = Arc::new(Storage::open_memory().unwrap());
@@ -4530,6 +4669,65 @@ mod tests {
         assert!(
             !out.contains("<cid>memory-unknown-project</cid>"),
             "an unknown-project memory must be dropped under an explicit scope:\n{out}"
+        );
+    }
+
+    /// Opus review finding 1 (W3-K, high): a memory-file reflection carries a
+    /// `project_*` tag that does NOT itself resolve to the scope's family
+    /// (`project_meta_campaigns_setup` vs scope `anukriti-meta-campaigns`)
+    /// alongside the bare family tag every `MEMORY-ARCHIVE` writer also
+    /// stamps (`anukriti-meta-campaigns`). `reflection_project_allowed` must
+    /// accept the row on ANY tag clearing `scope.is_family`, not just the
+    /// first `project_*` tag found — before this fix it read only that first
+    /// tag, resolved to `meta_campaigns_setup`, failed `is_family`, and
+    /// dropped the row outright even though it plainly belongs to the
+    /// family. Live receipt: `e97fa3b4`/`5eb5aebb`/`22ffc13b` all carry this
+    /// exact tag shape and vanished from `project=anukriti-meta-campaigns`
+    /// scoped search.
+    #[tokio::test]
+    async fn family_bare_tag_keeps_memory_file_reflection_in_scope() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(4);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let id = "e97fa3b4-0000-4000-8000-000000000000";
+        let tags = vec![
+            "project_meta_campaigns_setup".to_string(),
+            "anukriti-meta-campaigns".to_string(),
+            EXPLICIT_MEMORY_TAG.to_string(),
+        ];
+        storage
+            .insert_reflection(
+                id,
+                "MEMORY-ARCHIVE anukriti-meta-campaigns paying customers may22",
+                &tags,
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection(id.to_string(), query.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "paying customers memory",
+            5,
+            0.0,
+            Some("anukriti-meta-campaigns"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains(&format!("<cid>{id}</cid>")),
+            "a memory-file reflection with a family bare tag must stay in scope even when its \
+             project_* tag alone would not resolve to the family:\n{out}"
         );
     }
 

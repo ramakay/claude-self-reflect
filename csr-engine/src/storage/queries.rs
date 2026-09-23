@@ -1768,33 +1768,82 @@ pub fn fts5_search_reflections(
         .collect())
 }
 
+/// A prefix shorter than this many characters, or with fewer than this many
+/// whitespace-separated tokens, is not specific enough to promote: a common
+/// single word (`we`, `Session`) matches hundreds of unrelated rows — see
+/// [`fts5_reflection_prefix_matches`]'s doc.
+const MIN_PROMOTABLE_PREFIX_CHARS: usize = 12;
+const MIN_PROMOTABLE_PREFIX_TOKENS: usize = 2;
+
+/// A prefix matching more rows than this is not specific enough to force to
+/// the front of the page either — let bm25/RRF fusion decide instead.
+const MAX_PROMOTED_PREFIX_MATCHES: usize = 3;
+
 /// Ids of reflections whose stored content starts with `query` verbatim
-/// (case-insensitive), newest first. An exact-prefix hit is a stronger
-/// keyword signal than an OR-of-terms bm25 match — bm25 compares corpus
-/// statistics across the whole `reflections` table, so a project name that
-/// recurs in many rows (a common shape for a `MEMORY-ARCHIVE <slug>` memory:
-/// the slug also appears in unrelated stories/extractions) can bury the
-/// literal prefix match under rows that merely mention one of its words.
-/// Callers merge this ahead of the OR-of-terms ranking so an exact opening
-/// match always wins the keyword channel, not just competes on bm25.
+/// (case-insensitive) at a word boundary, newest first. An exact-prefix hit
+/// is a stronger keyword signal than an OR-of-terms bm25 match — bm25
+/// compares corpus statistics across the whole `reflections` table, so a
+/// project name that recurs in many rows (a common shape for a
+/// `MEMORY-ARCHIVE <slug>` memory: the slug also appears in unrelated
+/// stories/extractions) can bury the literal prefix match under rows that
+/// merely mention one of its words. Callers merge this ahead of the
+/// OR-of-terms ranking so an exact opening match always wins the keyword
+/// channel, not just competes on bm25.
+///
+/// Guarded on both ends against over-promotion (Opus review, W3-K spec (e)):
+/// a short or single-token prefix (`we`, `Session`) matches hundreds of
+/// unrelated rows, and even a specific prefix that still matches more than
+/// [`MAX_PROMOTED_PREFIX_MATCHES`] rows is not promoted — both return an
+/// empty list rather than let `promote_exact_prefix_reflections` shove every
+/// hit to the front of the page. LIKE metacharacters (`%`, `_`) in `query`
+/// are escaped so they match literally, and a hit only counts if the
+/// character immediately after the prefix is non-alphanumeric or the
+/// content ends there (a query for "...campaign" must not match
+/// "...campaigns").
 pub fn fts5_reflection_prefix_matches(
     conn: &Connection,
     query: &str,
     limit: usize,
 ) -> Result<Vec<String>> {
     let trimmed = query.trim();
-    if trimmed.is_empty() {
+    if trimmed.chars().count() < MIN_PROMOTABLE_PREFIX_CHARS
+        || trimmed.split_whitespace().count() < MIN_PROMOTABLE_PREFIX_TOKENS
+    {
         return Ok(Vec::new());
     }
+    let escaped = trimmed
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    // Fetch one row past the promotion cap so "exactly at the cap" can be
+    // told apart from "over the cap" without a second COUNT query, and at
+    // least `limit` rows so a legitimately small match set is never cut
+    // short before the boundary filter below runs.
+    let fetch_limit = (MAX_PROMOTED_PREFIX_MATCHES + 1).max(limit);
     let mut stmt = conn.prepare(
-        "SELECT id FROM reflections WHERE content LIKE ?1 || '%' ORDER BY timestamp DESC LIMIT ?2",
+        "SELECT id, content FROM reflections WHERE content LIKE ?1 || '%' ESCAPE '\\' \
+         ORDER BY timestamp DESC LIMIT ?2",
     )?;
-    let ids = stmt
-        .query_map(params![trimmed, limit as i64], |row| {
-            row.get::<_, String>(0)
+    let rows = stmt
+        .query_map(params![escaped, fetch_limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(ids)
+    let prefix_char_len = trimmed.chars().count();
+    let matches: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, content)| {
+            content
+                .chars()
+                .nth(prefix_char_len)
+                .is_none_or(|c| !c.is_alphanumeric())
+        })
+        .map(|(id, _)| id)
+        .collect();
+    if matches.len() > MAX_PROMOTED_PREFIX_MATCHES {
+        return Ok(Vec::new());
+    }
+    Ok(matches.into_iter().take(limit).collect())
 }
 
 pub fn fts5_search(
@@ -4701,6 +4750,176 @@ mod tests {
             "bm25 must be ascending (better first)"
         );
         assert!(fts5_search_reflections(&conn, "!!", 10).unwrap().is_empty());
+    }
+
+    /// Opus review finding (high, W3-K spec (e)): a short or single-token
+    /// prefix matches hundreds of unrelated rows and must not be promoted —
+    /// live receipts: `Session` alone matched 129 reflections, `we` matched
+    /// 5 unrelated stories opening with "We ..."/"we ...". Below the
+    /// specificity floor (min tokens, min chars) the matcher must return
+    /// nothing rather than let `promote_exact_prefix_reflections` shove
+    /// every hit to the front of the page.
+    #[test]
+    fn short_or_single_token_prefix_is_not_promoted() {
+        let conn = mem();
+        for i in 0..5 {
+            insert_reflection(
+                &conn,
+                &format!("session-{i}"),
+                &format!("Session note number {i} about something"),
+                &[],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        assert!(
+            fts5_reflection_prefix_matches(&conn, "Session", 10)
+                .unwrap()
+                .is_empty(),
+            "a single-token 7-char prefix must not promote 5 unrelated rows"
+        );
+        for (i, opener) in ["We integrated manychat", "we are seeing wild swings"]
+            .iter()
+            .enumerate()
+        {
+            insert_reflection(
+                &conn,
+                &format!("we-{i}"),
+                &format!("{opener} across the campaign"),
+                &[],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        assert!(
+            fts5_reflection_prefix_matches(&conn, "we", 10)
+                .unwrap()
+                .is_empty(),
+            "a 2-char prefix must not promote"
+        );
+    }
+
+    /// Same finding: a prefix that clears the specificity floor but still
+    /// matches more than the small promotion cap must not be promoted either
+    /// — let bm25/RRF fusion decide instead of forcing every match to the
+    /// front of the page.
+    #[test]
+    fn specific_prefix_over_the_promotion_cap_is_not_promoted() {
+        let conn = mem();
+        for i in 0..6 {
+            insert_reflection(
+                &conn,
+                &format!("archive-{i}"),
+                &format!("MEMORY-ARCHIVE common project note number {i}"),
+                &[],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        assert!(
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE common project", 10)
+                .unwrap()
+                .is_empty(),
+            "6 matches is over the small promotion cap"
+        );
+    }
+
+    /// The positive case this guard must not break: a specific, multi-token,
+    /// long-enough prefix with a small number of matches is still promoted,
+    /// newest first — the exact shape
+    /// `exact_prefix_reflection_reaches_page_one_over_many_keyword_matching_chunks`
+    /// (mcp::tools) depends on.
+    #[test]
+    fn specific_prefix_within_the_cap_is_promoted_newest_first() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "older",
+            "MEMORY-ARCHIVE project-x-y-z memory number 0",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "newer",
+            "MEMORY-ARCHIVE project-x-y-z memory number 1",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE reflections SET timestamp = '2020-01-01T00:00:00Z' WHERE id = 'older'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE reflections SET timestamp = '2026-01-01T00:00:00Z' WHERE id = 'newer'",
+            [],
+        )
+        .unwrap();
+        let matches =
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE project-x-y-z", 10).unwrap();
+        assert_eq!(matches, vec!["newer".to_string(), "older".to_string()]);
+    }
+
+    /// A prefix containing LIKE metacharacters must not act as a wildcard —
+    /// `%` alone must never match every reflection.
+    #[test]
+    fn like_metacharacters_in_the_prefix_are_escaped() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "literal-percent",
+            "% is a literal opener here for this specific memory note",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "unrelated",
+            "this row has nothing to do with the prefix at all",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        // Below specificity floor by itself, so wrap it to reach the char
+        // minimum while still testing that '%' is escaped rather than
+        // acting as a wildcard: a literal-prefix query starting with '%'
+        // must not match the unrelated row.
+        let matches = fts5_reflection_prefix_matches(&conn, "% is a literal opener", 10).unwrap();
+        assert_eq!(matches, vec!["literal-percent".to_string()]);
+    }
+
+    /// Word-boundary guard: a prefix must not match mid-token. The query is
+    /// a strict string-prefix of `mid-token`'s content ("campaign" is a
+    /// prefix of "campaigns") but stops inside the word, so it must not
+    /// count as a match; `exact` ends exactly at a word boundary (a space)
+    /// and must.
+    #[test]
+    fn prefix_match_requires_a_word_boundary() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "exact",
+            "MEMORY-ARCHIVE anukriti-meta-campaign notes here",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "mid-token",
+            "MEMORY-ARCHIVE anukriti-meta-campaigns notes here",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        let matches =
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE anukriti-meta-campaign", 10)
+                .unwrap();
+        assert_eq!(matches, vec!["exact".to_string()]);
     }
 
     #[test]

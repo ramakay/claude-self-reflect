@@ -261,6 +261,39 @@ pub(crate) fn derive_conversation_attribution(
     derive_conversation_attribution_canonical(&canonical_base, &canonical_file)
 }
 
+/// `derive_conversation_attribution`'s project, falling back to
+/// `storage.get_project_for_conversation` (the chunk row) only when the path
+/// attribution resolves to `"unknown"` — a transcript whose recorded path
+/// sits outside `projects_dir` (a `/private/var/folders` temp path,
+/// `~/.claude/transcripts`, a codex/grok rollout). Both `process_v3_extraction`
+/// (daemon) and `backfill_stories_cli` (summarizer) need this exact fallback
+/// order: the path attribution is authoritative when it resolves to
+/// something real (it correctly rescopes a sidechain transcript once its
+/// source file is rediscovered, which the chunk row's project can be stuck
+/// wrong on forever — see `process_v3_extraction`'s doc), but a bare
+/// `.map(...).or_else(...)` is not enough, because `.map` always produces
+/// `Some("unknown")` and `Option::or_else` never runs on a `Some` — that
+/// exact bug once made `backfill_stories_cli` permanently write
+/// `project_unknown` for every conversation whose import path fell outside
+/// `projects_dir`, which the (b) fix's hard project-scope drop then removed
+/// under any explicit scope.
+pub(crate) fn project_for_conversation_or_attribution(
+    storage: &crate::storage::Storage,
+    projects_dir: &Path,
+    file_path: &Path,
+    conv_id: &str,
+) -> String {
+    let from_path = derive_conversation_attribution(projects_dir, file_path).project_name;
+    if from_path != "unknown" {
+        return from_path;
+    }
+    storage
+        .get_project_for_conversation(conv_id)
+        .ok()
+        .flatten()
+        .unwrap_or(from_path)
+}
+
 pub(crate) fn derive_conversation_attribution_canonical(
     canonical_projects_dir: &Path,
     canonical_file_path: &Path,
@@ -1876,6 +1909,88 @@ mod tests {
             attribution.parent_conversation_id.as_deref(),
             Some("parent-session")
         );
+    }
+
+    /// Opus review finding (low, W3-K spec (c)): a transcript whose recorded
+    /// import path sits outside `projects_dir` (a `/private/var/folders` temp
+    /// path, `~/.claude/transcripts`, a codex/grok rollout) resolves to
+    /// `"unknown"` via `derive_conversation_attribution`. The bug this closes
+    /// is in the CALLERS (`process_v3_extraction`, `backfill_stories_cli`):
+    /// `.map(|path| ...).or_else(...)` never falls back because `.map`
+    /// already yields `Some("unknown")`. `project_for_conversation_or_attribution`
+    /// is the single fallback point both callers now share.
+    #[test]
+    fn project_for_conversation_falls_back_when_path_attribution_is_unknown() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let chunk = ConversationChunk {
+            id: "chunk-1".into(),
+            conversation_id: "conv-outside".into(),
+            project_name: "real-project-from-chunk".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "hello".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        let projects_dir = Path::new("/Users/test/.claude/projects");
+        // A path outside `projects_dir` entirely — `derive_conversation_attribution`
+        // resolves this to "unknown".
+        let outside_path = Path::new("/private/var/folders/xx/tmp-transcript.jsonl");
+        assert_eq!(
+            derive_conversation_attribution(projects_dir, outside_path).project_name,
+            "unknown",
+            "sanity: this path must resolve to unknown for the test to mean anything"
+        );
+
+        let project = project_for_conversation_or_attribution(
+            &storage,
+            projects_dir,
+            outside_path,
+            "conv-outside",
+        );
+        assert_eq!(
+            project, "real-project-from-chunk",
+            "an unknown path attribution must fall back to the chunk row's real project"
+        );
+    }
+
+    /// The positive case the fallback must not break: when the path
+    /// attribution DOES resolve to a real project, it wins even if the chunk
+    /// row disagrees (the chunk row can be stuck on a stale rescope target —
+    /// see `process_v3_extraction`'s doc).
+    #[test]
+    fn project_for_conversation_prefers_path_attribution_when_it_resolves() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let chunk = ConversationChunk {
+            id: "chunk-2".into(),
+            conversation_id: "conv-inside".into(),
+            project_name: "subagents".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "hello".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        let projects_dir = Path::new("/Users/test/.claude/projects");
+        let file_path = projects_dir
+            .join("-Users-test-projects-real-project")
+            .join("session.jsonl");
+
+        let project = project_for_conversation_or_attribution(
+            &storage,
+            projects_dir,
+            &file_path,
+            "conv-inside",
+        );
+        assert_eq!(project, "real-project");
     }
 
     #[cfg(unix)]

@@ -535,15 +535,22 @@ pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Res
         // daemon-side rescope target ("subagents") once its source file is
         // gone, because `rescope_sidechain_conversation` only runs when the
         // file is (re)discovered. Falls back to the chunk row when no
-        // recorded import path resolves (e.g. a synthetic/test conversation).
+        // recorded import path resolves (e.g. a synthetic/test conversation)
+        // OR when the recorded path resolves to "unknown" (a path outside
+        // `projects_dir`) — see `project_for_conversation_or_attribution`'s
+        // doc for why a bare `.map(...).or_else(...)` was not enough.
         let project = engine
             .storage()
             .import_paths_for_conversations(std::slice::from_ref(conv_id), 1)?
             .get(conv_id)
             .and_then(|paths| paths.first())
             .map(|path| {
-                import::derive_conversation_attribution(engine.projects_dir(), Path::new(path))
-                    .project_name
+                import::project_for_conversation_or_attribution(
+                    engine.storage(),
+                    engine.projects_dir(),
+                    Path::new(path),
+                    conv_id,
+                )
             })
             .or_else(|| {
                 engine

@@ -1399,14 +1399,20 @@ async fn extraction_loop_inner(
 
 /// Process V3 extraction for a single conversation. `projects_dir` derives the
 /// REAL project the same way the importer does
-/// (`import::derive_conversation_attribution`), from `file_path`'s position
+/// (`import::project_for_conversation_or_attribution`, built on
+/// `import::derive_conversation_attribution`), from `file_path`'s position
 /// under it — not from `chunks.project_name`. For an agent sidechain
 /// transcript (`<project>/<session>/subagents/agent-*.jsonl`) the chunk row's
 /// project is the daemon-side rescope target, `"subagents"`, until
 /// `rescope_sidechain_conversation` runs; that only fires when the file is
 /// (re)discovered, so a conversation whose source file was later deleted can
 /// never get rescoped and this write would otherwise inherit the wrong
-/// project forever (live: 1,201 reflections tagged `project_subagents`).
+/// project forever (live: 1,201 reflections tagged `project_subagents`). When
+/// `file_path` itself sits outside `projects_dir` (a temp path, a codex/grok
+/// rollout), the path attribution resolves to `"unknown"` and
+/// `project_for_conversation_or_attribution` falls back to the chunk row
+/// instead — an `"unknown"` tag would otherwise be dropped outright by the
+/// (b) hard project-scope gate under any explicit scope.
 async fn process_v3_extraction(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
@@ -1446,7 +1452,12 @@ async fn process_v3_extraction(
         // transcript, not from `chunks.project_name` — see this function's
         // doc comment for why the chunk row can be permanently wrong for a
         // sidechain whose source file later disappears.
-        let project = import::derive_conversation_attribution(projects_dir, file_path).project_name;
+        let project = import::project_for_conversation_or_attribution(
+            storage,
+            projects_dir,
+            file_path,
+            conv_id,
+        );
         let tags = vec![
             "narrative_extracted_v3".to_string(),
             format!("conv_{conv_id}"),
@@ -1473,8 +1484,12 @@ async fn process_v3_extraction(
         // Persist context_cache as linked reflection for error recovery retrieval
         if !result.context_cache.trim().is_empty() {
             let cache_id = format!("v3_cache_{}", conv_id);
-            let project =
-                import::derive_conversation_attribution(projects_dir, file_path).project_name;
+            let project = import::project_for_conversation_or_attribution(
+                storage,
+                projects_dir,
+                file_path,
+                conv_id,
+            );
             let cache_tags = vec![
                 "context_cache".to_string(),
                 "error_recovery".to_string(),
@@ -2613,6 +2628,68 @@ mod tests {
         assert!(
             !tags.iter().any(|t| t == "project_subagents"),
             "must not inherit the stale chunk-row project, got {tags:?}"
+        );
+    }
+
+    /// Opus review finding (low, W3-K spec (c)): when `file_path` sits
+    /// OUTSIDE `projects_dir` entirely (a `/private/var/folders` temp path, a
+    /// codex/grok rollout — 24 such rows live 2026-09-22), path attribution
+    /// resolves to `"unknown"`, not to some other project. Before this fix
+    /// `process_v3_extraction` stamped `project_unknown` unconditionally in
+    /// that case, which the (b) hard project-scope gate then drops outright
+    /// under any explicit scope. It must fall back to the chunk row's real
+    /// project instead — the exact opposite priority from the sidechain case
+    /// above (there the path wins over a stale chunk row; here the chunk row
+    /// wins because the path has nothing usable to offer).
+    #[tokio::test]
+    async fn v3_extraction_falls_back_to_chunk_project_when_path_is_outside_projects_dir() {
+        let projects_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let conv_id = "conv-outside-projects-dir";
+        let path = external_floor_transcript(outside_dir.path(), conv_id);
+
+        let (storage, embeddings, search) = provenance_test_rig();
+        storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: format!("{conv_id}-chunk"),
+                    conversation_id: conv_id.to_string(),
+                    project_name: "real-project-from-chunk".to_string(),
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                    content: "seed chunk content".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: crate::provenance::Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &vec![0.1_f32; EmbeddingEngine::dimension()],
+            )
+            .unwrap();
+
+        process_v3_extraction(
+            &storage,
+            &embeddings,
+            &search,
+            conv_id,
+            &path,
+            projects_dir.path(),
+        )
+        .await
+        .unwrap();
+
+        let reflection_id = format!("extracted_v3_{conv_id}");
+        let (_, tags, _) = storage
+            .get_reflection_by_id(&reflection_id)
+            .unwrap()
+            .expect("v3 reflection stored");
+        assert!(
+            tags.iter().any(|t| t == "project_real-project-from-chunk"),
+            "an unresolvable path attribution must fall back to the chunk row, got {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|t| t == "project_unknown"),
+            "must not stamp project_unknown when the chunk row has a real project, got {tags:?}"
         );
     }
 
