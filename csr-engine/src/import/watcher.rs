@@ -45,6 +45,126 @@ fn flush_is_due(last_flush: Option<Instant>, now: Instant) -> bool {
     }
 }
 
+/// Backoff schedule (seconds) for a file whose import keeps failing with
+/// `database is locked`/`database is busy`. Index is `attempts - 1`; once
+/// `attempts` exceeds this schedule's length the file is dropped with a WARN
+/// instead of retried again — a session's final append must eventually be
+/// declared lost rather than retried forever against a database another
+/// process holds indefinitely.
+const BUSY_RETRY_BACKOFF_SECS: [u64; 5] = [5, 15, 45, 120, 300];
+
+/// Meta counter keys surfaced by `csr-engine status`. See `Storage::bump_meta_counter_by`.
+pub(crate) const BUSY_RETRIES_COUNTER: &str = "watcher_import_busy_retries";
+pub(crate) const BUSY_GAVE_UP_COUNTER: &str = "watcher_import_busy_gave_up";
+
+/// Per-file retry bookkeeping for the watcher's busy-import backoff.
+#[derive(Debug, Clone)]
+pub(crate) struct RetryState {
+    /// Number of busy failures seen for this path so far.
+    attempts: u32,
+    /// When this path becomes due for its next retry attempt.
+    next_at: Instant,
+}
+
+/// Outcome of one `process_batch` pass, for the caller to persist counters
+/// and log — kept structured rather than side-effecting so the function stays
+/// unit-testable without a `Storage`.
+#[derive(Debug, Default)]
+pub(crate) struct BatchOutcome {
+    /// Paths that imported successfully this pass (including ones that had
+    /// previously been retried).
+    pub imported: Vec<PathBuf>,
+    /// Busy-failure count observed this pass (may exceed `imported.len()` +
+    /// `gave_up.len()` since a path can fail more than once across the whole
+    /// retry lifetime, just not within a single pass).
+    pub busy_retries: u64,
+    /// Paths that exhausted `BUSY_RETRY_BACKOFF_SECS` and were dropped.
+    pub gave_up: Vec<PathBuf>,
+}
+
+/// Import every path in `paths` via `import`, applying the busy-retry
+/// backoff policy to `retry_map`. A path that fails with
+/// `scrub::is_database_busy` is requeued with exponential backoff (see
+/// `BUSY_RETRY_BACKOFF_SECS`) instead of being dropped on first failure — the
+/// bug this closes: a sidechain's last append hitting `SQLITE_BUSY` used to
+/// be gone for good, because no later notify event would ever re-trigger it.
+/// Any other error keeps the previous log-and-drop behaviour.
+///
+/// `import` is injected so this is testable without spinning up a real
+/// `Storage`/`EmbeddingEngine`/`SearchEngine` — the production caller passes
+/// `|path| self.import_file(&path)`.
+pub(crate) async fn process_batch<F, Fut>(
+    paths: impl IntoIterator<Item = PathBuf>,
+    mut import: F,
+    retry_map: &mut HashMap<PathBuf, RetryState>,
+) -> BatchOutcome
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut outcome = BatchOutcome::default();
+    for path in paths {
+        match import(path.clone()).await {
+            Ok(()) => {
+                retry_map.remove(&path);
+                outcome.imported.push(path);
+            }
+            Err(e) if crate::import::scrub::is_database_busy(&e) => {
+                outcome.busy_retries += 1;
+                let entry = retry_map.entry(path.clone()).or_insert(RetryState {
+                    attempts: 0,
+                    next_at: Instant::now(),
+                });
+                entry.attempts += 1;
+                if entry.attempts as usize > BUSY_RETRY_BACKOFF_SECS.len() {
+                    tracing::warn!(
+                        file = %path.display(),
+                        attempts = entry.attempts,
+                        "giving up on busy import after max retries"
+                    );
+                    retry_map.remove(&path);
+                    outcome.gave_up.push(path);
+                } else {
+                    let backoff = BUSY_RETRY_BACKOFF_SECS[entry.attempts as usize - 1];
+                    entry.next_at = Instant::now() + Duration::from_secs(backoff);
+                    tracing::debug!(
+                        file = %path.display(),
+                        attempts = entry.attempts,
+                        backoff_secs = backoff,
+                        "requeueing import after database busy"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "failed to import file"
+                );
+                retry_map.remove(&path);
+            }
+        }
+    }
+    outcome
+}
+
+/// The earliest `next_at` across every path still pending retry, or `None`
+/// when nothing is queued — the watcher loop's `tokio::select!` sleeps until
+/// this so a due retry runs even without a fresh notify event.
+fn earliest_retry(retry_map: &HashMap<PathBuf, RetryState>) -> Option<Instant> {
+    retry_map.values().map(|state| state.next_at).min()
+}
+
+/// Sleep until `deadline`, or block forever when `None` — lets the watcher's
+/// `tokio::select!` treat "no retries pending" and "waiting for a real
+/// retry" uniformly against the same branch.
+async fn sleep_until_or_pending(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Watches the Claude projects directory for new JSONL files and auto-imports them.
 pub struct FileWatcher {
     projects_dir: PathBuf,
@@ -121,37 +241,57 @@ impl FileWatcher {
 
         // Debounce loop: collect changed files over DEBOUNCE_SECS, then process
         let mut last_flush: Option<Instant> = None;
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
         loop {
             let mut pending: HashSet<PathBuf> = HashSet::new();
 
-            // Wait for the first event
-            match rx.recv().await {
-                Some(path) => {
-                    pending.insert(path);
+            // Wait for the first event OR the earliest due busy-retry — a
+            // retry must run even when no new notify event ever arrives
+            // (the case that used to lose a session's last append for good).
+            let retry_deadline = earliest_retry(&retry_map);
+            tokio::select! {
+                received = rx.recv() => {
+                    match received {
+                        Some(path) => {
+                            pending.insert(path);
+
+                            // Collect more events within the debounce window
+                            let deadline = tokio::time::Instant::now()
+                                + tokio::time::Duration::from_secs(DEBOUNCE_SECS);
+                            loop {
+                                let timeout = tokio::time::timeout_at(deadline, rx.recv());
+                                match timeout.await {
+                                    Ok(Some(path)) => {
+                                        pending.insert(path);
+                                    }
+                                    Ok(None) => {
+                                        // Channel closed
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        // Timeout — debounce window expired
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::info!("file watcher channel closed, stopping");
+                            break;
+                        }
+                    }
                 }
-                None => {
-                    tracing::info!("file watcher channel closed, stopping");
-                    break;
+                _ = sleep_until_or_pending(retry_deadline) => {
+                    // Woken purely to service a due retry — merged in below.
                 }
             }
 
-            // Collect more events within the debounce window
-            let deadline =
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(DEBOUNCE_SECS);
-            loop {
-                let timeout = tokio::time::timeout_at(deadline, rx.recv());
-                match timeout.await {
-                    Ok(Some(path)) => {
-                        pending.insert(path);
-                    }
-                    Ok(None) => {
-                        // Channel closed
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout — debounce window expired
-                        break;
-                    }
+            // Merge in any busy-retry paths that are due now, whether or not
+            // a fresh event also arrived this iteration.
+            let now_instant = Instant::now();
+            for (path, state) in &retry_map {
+                if state.next_at <= now_instant {
+                    pending.insert(path.clone());
                 }
             }
 
@@ -162,13 +302,26 @@ impl FileWatcher {
                     None => None,
                 };
                 tracing::info!(count = pending.len(), "processing new/modified JSONL files");
-                for file_path in &pending {
-                    if let Err(e) = self.import_file(file_path).await {
-                        tracing::warn!(
-                            file = %file_path.display(),
-                            error = %e,
-                            "failed to import file"
-                        );
+                let outcome = process_batch(
+                    pending.iter().cloned(),
+                    |path| async move { self.import_file(&path).await },
+                    &mut retry_map,
+                )
+                .await;
+                if outcome.busy_retries > 0 {
+                    if let Err(e) = self
+                        .storage
+                        .bump_meta_counter_by(BUSY_RETRIES_COUNTER, outcome.busy_retries)
+                    {
+                        tracing::warn!(error = %e, "failed to persist watcher busy-retry counter");
+                    }
+                }
+                if !outcome.gave_up.is_empty() {
+                    if let Err(e) = self
+                        .storage
+                        .bump_meta_counter_by(BUSY_GAVE_UP_COUNTER, outcome.gave_up.len() as u64)
+                    {
+                        tracing::warn!(error = %e, "failed to persist watcher busy-gave-up counter");
                     }
                 }
 
@@ -512,5 +665,117 @@ mod tests {
         let mut parsed = chunk("a", "hello");
         parsed.is_sidechain = true;
         assert!(needs_reindex(&parsed, Some(&stored)));
+    }
+
+    /// Matches `import::scrub`'s own busy-error test fixture exactly, so a
+    /// future change to what counts as "busy" can't silently drift between
+    /// the two call sites.
+    fn busy_error() -> anyhow::Error {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        ))
+    }
+
+    /// The bug this item closes: an import that fails with `SQLITE_BUSY` on
+    /// a session's last write used to be dropped for good, because no later
+    /// notify event would ever re-trigger it. Simulates three watcher passes
+    /// (busy, busy, ok) over the same path and asserts the file eventually
+    /// imports with exactly two recorded busy retries and an empty retry map.
+    ///
+    /// Deleting the requeue branch in `process_batch` (treating a busy error
+    /// like any other and dropping the path on first failure) makes this
+    /// fail: the third pass never runs because nothing re-adds the path to
+    /// `pending`, so `imported` stays empty.
+    #[tokio::test]
+    async fn busy_import_is_retried_then_succeeds() {
+        let path = PathBuf::from("/tmp/csr-watcher-test/conv.jsonl");
+        let calls = std::cell::Cell::new(0u32);
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+        let mut total_busy_retries = 0u64;
+        let mut imported = false;
+
+        for _pass in 0..3 {
+            let outcome = process_batch(
+                [path.clone()],
+                |_p| {
+                    let n = calls.get();
+                    calls.set(n + 1);
+                    async move {
+                        if n < 2 {
+                            Err(busy_error())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                &mut retry_map,
+            )
+            .await;
+            total_busy_retries += outcome.busy_retries;
+            if outcome.imported.contains(&path) {
+                imported = true;
+                break;
+            }
+        }
+
+        assert!(imported, "file must eventually import once busy clears");
+        assert_eq!(total_busy_retries, 2);
+        assert!(
+            retry_map.is_empty(),
+            "successful import must clear the retry entry"
+        );
+    }
+
+    /// A non-busy error (e.g. malformed JSONL) keeps the original
+    /// log-and-drop behaviour: no retry entry, no further attempts.
+    #[tokio::test]
+    async fn non_busy_error_is_not_retried() {
+        let path = PathBuf::from("/tmp/csr-watcher-test/broken.jsonl");
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+
+        let outcome = process_batch(
+            [path.clone()],
+            |_p| async move { Err(anyhow::anyhow!("malformed jsonl")) },
+            &mut retry_map,
+        )
+        .await;
+
+        assert!(outcome.imported.is_empty());
+        assert_eq!(outcome.busy_retries, 0);
+        assert!(outcome.gave_up.is_empty());
+        assert!(retry_map.is_empty());
+    }
+
+    /// After exhausting `BUSY_RETRY_BACKOFF_SECS`, the path is dropped
+    /// (WARN + gave_up) rather than retried forever.
+    #[tokio::test]
+    async fn busy_import_gives_up_after_max_retries() {
+        let path = PathBuf::from("/tmp/csr-watcher-test/stuck.jsonl");
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+
+        for attempt in 1..=BUSY_RETRY_BACKOFF_SECS.len() {
+            let outcome = process_batch(
+                [path.clone()],
+                |_p| async move { Err(busy_error()) },
+                &mut retry_map,
+            )
+            .await;
+            assert_eq!(outcome.busy_retries, 1);
+            assert!(
+                outcome.gave_up.is_empty(),
+                "attempt {attempt} gave up early"
+            );
+        }
+
+        // One more failure exceeds the schedule: give up.
+        let outcome = process_batch(
+            [path.clone()],
+            |_p| async move { Err(busy_error()) },
+            &mut retry_map,
+        )
+        .await;
+        assert_eq!(outcome.gave_up, vec![path.clone()]);
+        assert!(retry_map.is_empty());
     }
 }

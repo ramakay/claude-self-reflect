@@ -64,6 +64,28 @@ pub struct StatusReport {
     /// Codex-rollout timestamp restamp + harness-strip re-import receipts.
     /// See [`CodexBackfillStatus`].
     pub codex_backfill: CodexBackfillStatus,
+    /// Watcher busy-retry backoff + daemon catch-up sweep receipts (gap-G1).
+    /// See [`ImportWatcherStatus`].
+    pub import_watcher: ImportWatcherStatus,
+}
+
+/// Receipts for the watcher's `database is locked` retry backoff
+/// (`import::watcher::process_batch`) and the daemon's idle-gated
+/// reconciliation sweep (`import::catchup::catchup_sweep`). Every field is
+/// `None` — reported as unknown, not zero — until the corresponding
+/// mechanism has actually run at least once; a real zero and "never ran" are
+/// different facts and collapsing them hid gap-G1 in the first place.
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImportWatcherStatus {
+    /// Cumulative busy-retry attempts across every watcher batch
+    /// (`watcher::BUSY_RETRIES_COUNTER`).
+    pub watcher_import_busy_retries: Option<i64>,
+    /// Cumulative files the watcher gave up on after exhausting the backoff
+    /// schedule (`watcher::BUSY_GAVE_UP_COUNTER`).
+    pub watcher_import_busy_gave_up: Option<i64>,
+    /// Cumulative files the daemon's catch-up sweep re-imported
+    /// (`catchup::CATCHUP_REIMPORTED_COUNTER`).
+    pub import_catchup_reimported: Option<i64>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -719,6 +741,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             backfill: BackfillStatus::default(),
             dreaming,
             codex_backfill: CodexBackfillStatus::default(),
+            import_watcher: ImportWatcherStatus::default(),
         });
     }
 
@@ -818,6 +841,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let trained_rerank = gather_trained_rerank(&storage);
     let backfill = gather_backfill(&storage);
     let codex_backfill = gather_codex_backfill(&storage);
+    let import_watcher = gather_import_watcher(&storage);
 
     Ok(StatusReport {
         mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
@@ -848,12 +872,30 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         backfill,
         dreaming,
         codex_backfill,
+        import_watcher,
     })
 }
 
 /// Assemble the codex-rollout backfill status block. Fail-soft to defaults
 /// on any read/parse error — a malformed or absent progress-meta JSON value
 /// must never break `csr-engine status`.
+fn gather_import_watcher(storage: &Storage) -> ImportWatcherStatus {
+    use crate::import::catchup::CATCHUP_REIMPORTED_COUNTER;
+    use crate::import::watcher::{BUSY_GAVE_UP_COUNTER, BUSY_RETRIES_COUNTER};
+
+    ImportWatcherStatus {
+        watcher_import_busy_retries: storage
+            .get_meta_counter(BUSY_RETRIES_COUNTER)
+            .unwrap_or(None),
+        watcher_import_busy_gave_up: storage
+            .get_meta_counter(BUSY_GAVE_UP_COUNTER)
+            .unwrap_or(None),
+        import_catchup_reimported: storage
+            .get_meta_counter(CATCHUP_REIMPORTED_COUNTER)
+            .unwrap_or(None),
+    }
+}
+
 fn gather_codex_backfill(storage: &Storage) -> CodexBackfillStatus {
     use crate::import::codex_rollout::{
         HarnessStripProgress, RestampProgress, HARNESS_STRIP_V2_META_KEY,
@@ -1893,6 +1935,7 @@ mod tests {
             backfill: BackfillStatus::default(),
             dreaming: None,
             codex_backfill: CodexBackfillStatus::default(),
+            import_watcher: ImportWatcherStatus::default(),
         }
     }
 

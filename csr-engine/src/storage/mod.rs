@@ -799,6 +799,29 @@ impl Storage {
         Ok(out)
     }
 
+    /// Read an arbitrary meta-stored counter, or `None` when the key was
+    /// never written. Unlike `get_csr_tool_blocks_suppressed`'s `.unwrap_or(0)`
+    /// convention, callers that must distinguish "never ran" from "ran and
+    /// found zero" (e.g. `csr-engine status`'s watcher/catch-up counters)
+    /// need the absence signal preserved, not collapsed into a real zero.
+    pub fn get_meta_counter(&self, key: &str) -> Result<Option<i64>> {
+        Ok(self.get_meta(key)?.and_then(|v| v.parse::<i64>().ok()))
+    }
+
+    /// Increment an arbitrary meta-stored counter by `count`, holding the
+    /// connection lock across the read-modify-write so two same-process
+    /// callers can never race the meta table (mirrors `bump_aux_counter_by`).
+    pub fn bump_meta_counter_by(&self, key: &str, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let current: i64 = queries::get_meta(&conn, key)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        queries::set_meta(&conn, key, &(current + count as i64).to_string())
+    }
+
     pub fn get_csr_tool_blocks_suppressed(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let split_value = queries::get_meta(&conn, "csr_tool_blocks_suppressed")?;
@@ -1529,6 +1552,13 @@ impl Storage {
     pub fn list_all_import_state_file_paths(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::list_all_import_state_file_paths(&conn)
+    }
+
+    /// `(file_path, file_mtime)` for every `import_state` row with a recorded
+    /// mtime. See `queries::list_import_state_entries`.
+    pub fn list_import_state_entries(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_import_state_entries(&conn)
     }
 
     pub fn ground_truth_sessions_for_target(

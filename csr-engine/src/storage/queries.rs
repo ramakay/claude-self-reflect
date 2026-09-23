@@ -4280,6 +4280,21 @@ pub fn list_all_import_state_file_paths(conn: &Connection) -> Result<Vec<String>
         .map_err(Into::into)
 }
 
+/// `(file_path, file_mtime)` for every `import_state` row with a recorded
+/// mtime — the reconciliation set `import::catchup::catchup_sweep` diffs
+/// against the live filesystem. Rows with a NULL `file_mtime` (synthetic
+/// aux-source paths that predate a real filesystem file) are excluded: they
+/// have no on-disk mtime to compare against and are not this sweep's concern.
+pub fn list_import_state_entries(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT file_path, file_mtime FROM import_state WHERE file_mtime IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 /// Distinct sessions that touched files matching a path suffix (hook-observed edits) —
 /// ground truth for the provenance eval (`eval --provenance`). Lifted from the Phase 0
 /// spike's `ground_truth`. Empty target -> empty set (judged-only queries have no GT).

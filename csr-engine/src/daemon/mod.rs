@@ -1,6 +1,6 @@
 //! Daemon module — background processing for progressive enrichment.
 //!
-//! Runs eight background tasks:
+//! Runs nine background tasks:
 //! 1. File watcher (existing) — auto-import new JSONL files
 //! 2. Extraction loop (Layer 2) — V3 extraction on imported conversations
 //! 3. Narrator loop (Layer 3) — AI batch narrative generation (if API key set)
@@ -10,6 +10,11 @@
 //! 6. Release-ancestry loop — precomputes deterministic TAD v2 episode labels
 //! 7. Memory registry loop — periodic metadata-only scan of native memory files (`~/.claude/projects/*/memory/*.md`) into `memory_registry`; never embeds or injects memory content
 //! 8. Provenance backfill loop — one idle-gated structural batch at a time
+//! 9. Import catch-up sweep — reconciles `import_state.file_mtime` against
+//!    the live filesystem once at startup and every 30 minutes, recovering
+//!    files whose watcher import failed with `database is locked` on their
+//!    last write and never got a later notify event to retry against
+//!    (`import::catchup::catchup_sweep`)
 
 pub mod consolidation;
 pub mod dream_cadence;
@@ -980,6 +985,21 @@ impl Daemon {
         };
         tracing::info!("release-ancestry refresh loop started (TAD v2)");
 
+        // Import catch-up sweep: reconciles import_state against the live
+        // filesystem once at startup and every 30 minutes. Cloned before
+        // `compaction_engine` is moved into the compaction loop below.
+        let catchup_handle = {
+            let storage = self.storage.clone();
+            let projects_dir = self.projects_dir.clone();
+            let engine = compaction_engine.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                catchup_loop(storage, projects_dir, engine, heavy_work, shutdown).await;
+            })
+        };
+        tracing::info!("import catch-up sweep loop started");
+
         // Trained re-ranker: deterministic nightly label harvest, fit, and
         // chronological gate. It shares the single heavy-work permit and does
         // not invoke the narrative/LLM path.
@@ -1067,6 +1087,12 @@ impl Daemon {
         let _ = plans_handle.await;
         // Same index-mutation contract as plans: never detach an in-flight import.
         let _ = codex_rollout_handle.await;
+        // Same index-mutation contract as plans/codex_rollout: a reimport
+        // writes chunks into the HNSW index via `Engine::import_file`, so a
+        // timeout here could let the loop mutate the index after
+        // `dump_to_disk` below already read its state. The loop itself
+        // checks shutdown between files, so this is bounded.
+        let _ = catchup_handle.await;
         // The harness-strip batch reimports through the same delete+reinsert
         // path as plans/codex_rollout above (HNSW tombstone-then-reinsert) —
         // never detach an in-flight batch.
@@ -1371,6 +1397,96 @@ async fn ancestry_refresh_loop(
         // Shutdown-aware one-hour delay, matching the daemon's existing
         // ten-second polling convention.
         for _ in 0..360 {
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
+}
+
+/// Runs `import::catchup::catchup_sweep` once immediately, then every 30
+/// minutes. Each stale file's actual reimport acquires its own `heavy_work`
+/// permit rather than holding one across the whole scan — a large sweep
+/// (thousands of untouched-but-recent files) must not starve the live
+/// watcher for the entire pass, the same discipline `ancestry_refresh_loop`
+/// uses per-repository above.
+async fn catchup_loop(
+    storage: Arc<Storage>,
+    projects_dir: PathBuf,
+    engine: Arc<crate::engine::Engine>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        let sweep_engine = engine.clone();
+        let sweep_heavy_work = heavy_work.clone();
+        let sweep_shutdown = shutdown.clone();
+        let result = crate::import::catchup::catchup_sweep(
+            &storage,
+            &projects_dir,
+            now,
+            move |path, project_name| {
+                let engine = sweep_engine.clone();
+                let heavy_work = sweep_heavy_work.clone();
+                let shutdown = sweep_shutdown.clone();
+                async move {
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work, &shutdown).await
+                    else {
+                        return Err(anyhow::anyhow!(
+                            "daemon shutting down before catch-up import"
+                        ));
+                    };
+                    let result = engine.import_file(&path, &project_name).await.map(|_| ());
+                    drop(permit);
+                    result
+                }
+            },
+        )
+        .await;
+
+        match result {
+            Ok(summary) => {
+                tracing::info!(
+                    scanned = summary.scanned,
+                    stale = summary.stale,
+                    reimported = summary.reimported,
+                    skipped = summary.skipped,
+                    failed = summary.failed,
+                    "import catch-up sweep completed"
+                );
+                if let Err(e) = storage.set_meta(
+                    crate::import::catchup::CATCHUP_LAST_META_KEY,
+                    &summary.to_meta_json(now),
+                ) {
+                    tracing::warn!(error = %e, "failed to persist import_catchup_last");
+                }
+                if summary.reimported > 0 {
+                    if let Err(e) = storage.bump_meta_counter_by(
+                        crate::import::catchup::CATCHUP_REIMPORTED_COUNTER,
+                        summary.reimported as u64,
+                    ) {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to persist import_catchup_reimported counter"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "import catch-up sweep failed (non-fatal)");
+            }
+        }
+
+        // Shutdown-aware 30-minute delay, matching the daemon's existing
+        // ten-second polling convention (see `ancestry_refresh_loop`).
+        for _ in 0..180 {
             if shutdown.load(Ordering::SeqCst) {
                 return;
             }
