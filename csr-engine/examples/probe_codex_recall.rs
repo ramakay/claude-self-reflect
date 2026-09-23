@@ -55,6 +55,39 @@
 //!   supersedes, mechanic, scaffold, poison, primacy) for the target's best
 //!   chunk and every chunk now ranked above it.
 //! - `fuse_rrf` prints the target's FTS-side rank alongside its fused rank.
+//!
+//! # gap-G4-codex-fetch-stage-recall fix notes (third pass)
+//!
+//! W3-K found 24 of 28 codex misses land in `hnsw_fetch (semantic_miss,
+//! outside window)` with no owning item, and flagged every sampled query as
+//! a self-text proxy with no paraphrase set ever exercised. This pass:
+//! - Replaces the seq=0-`starts_with` harness-boilerplate check with a
+//!   running open/close tag-*depth* scan (mirrors
+//!   `storage::queries::pick_preview_index`'s logic, private to that
+//!   module) — a continuation chunk mid-span (e.g. a plugin-list row, an
+//!   AGENTS.md body paragraph) is now skipped along with the chunk that
+//!   opened the span, not just chunks that themselves start with a marker.
+//! - Adds `classify_semantic_miss` (pure fn, table-tested): every
+//!   `hnsw_fetch` semantic_miss is bucketed `harness_polluted` /
+//!   `burst_sibling` / `template_sibling` / `contaminated` / `genuine`,
+//!   printed as a histogram for both the contaminated and decontaminated
+//!   corpus. On the pre-strip live-shaped clone this sample lands
+//!   `harness_polluted` dominant for codex, `burst_sibling=0` — burst
+//!   collapse (spec 2d) would not move the number, so it was NOT added; no
+//!   rerank/trust weight was touched either.
+//! - Adds `examples/data/codex_recall_paraphrases.json` (spec 2b) and wires
+//!   an 8-gram leak guard (`shares_long_ngram`) that rejects any entry that
+//!   copies verbatim text from its own target chunk.
+//! - Collapses brute-force ground truth to one row per CONVERSATION (not
+//!   per chunk) before ranking/classifying — a rollout holding several
+//!   near-duplicate chunks no longer occupies several of the top slots.
+//! - `unscoped` now passes `project=Some("all")` explicitly instead of
+//!   `None` (W3-S LOW), and every row prints the resolved scope label.
+//! - Decontamination for the generalization sweep now excludes, per query,
+//!   any conversation whose content contains that query's own text (on top
+//!   of the existing global postdate-cutoff set).
+//! - Claude's "must not drop" baseline is reported split by templated
+//!   (>=20 identical first-120-char siblings) vs non-templated.
 
 use anyhow::Result;
 use csr_engine::engine::Engine;
@@ -157,6 +190,290 @@ fn brute_force_rank(
     }
 }
 
+/// Opus review finding (medium, W3-K second pass): `brute_force_rank` above
+/// ranks raw CHUNKS, so one conversation holding several near-duplicate
+/// chunks (harness dumps repeated within a rollout are common) can occupy
+/// several of the top slots and push the target's rank down without any
+/// other CONVERSATION actually outranking it — the real pipeline dedupes by
+/// conversation before its page cut, so this collapses the chunk-level score
+/// list to the max cosine per conversation first. Used for hit@6 counting
+/// and for the classifier's "rows ranked above the target" (never for the
+/// `ann_recall_miss` vs `semantic_miss` split against the HNSW fetch window,
+/// which stays chunk-level — see `brute_force_rank`'s own doc).
+fn collapse_best_per_conversation(rows: &[EmbeddingRow], query_vec: &[f32]) -> Vec<(f32, String)> {
+    let mut best: HashMap<&str, f32> = HashMap::new();
+    for row in rows {
+        let score = cosine(query_vec, &row.vector);
+        best.entry(row.conversation_id.as_str())
+            .and_modify(|s| {
+                if score > *s {
+                    *s = score;
+                }
+            })
+            .or_insert(score);
+    }
+    let mut scored: Vec<(f32, String)> =
+        best.into_iter().map(|(k, v)| (v, k.to_string())).collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored
+}
+
+/// Conversation-level rank of `target_conv` in a `collapse_best_per_conversation`
+/// list, excluding any conversation in `exclude`.
+fn brute_force_rank_conv(
+    scored: &[(f32, String)],
+    target_conv: &str,
+    exclude: &HashSet<String>,
+) -> BruteForce {
+    let filtered: Vec<&(f32, String)> = scored
+        .iter()
+        .filter(|(_, conv)| !exclude.contains(conv))
+        .collect();
+    let rank = filtered.iter().position(|(_, conv)| conv == target_conv);
+    BruteForce {
+        total: filtered.len(),
+        rank,
+        score: rank.map(|r| filtered[r].0),
+    }
+}
+
+/// Mirrors `storage::queries::{codex_spawn_time_from_id, within_burst_window,
+/// CODEX_BURST_WINDOW_SECS}` (private to that module). Best-effort spawn
+/// time embedded in a UUIDv7-shaped Codex conversation id's first 48 bits
+/// (big-endian Unix milliseconds), `None` for a legacy/malformed id.
+fn codex_spawn_time_from_id(conversation_id: &str) -> Option<String> {
+    let uuid_part = conversation_id.strip_prefix("codex:")?;
+    let hex: String = uuid_part.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if hex.as_bytes()[12] != b'7' {
+        return None;
+    }
+    let ms = u64::from_str_radix(&hex[..12], 16).ok()?;
+    let secs = (ms / 1000) as i64;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
+}
+
+const CODEX_BURST_WINDOW_SECS: i64 = 10;
+
+fn burst_key_ts(conversation_id: &str, first_chunk_ts: &str) -> String {
+    codex_spawn_time_from_id(conversation_id).unwrap_or_else(|| first_chunk_ts.to_string())
+}
+
+fn within_burst_window(head_ts: &str, candidate_ts: &str) -> bool {
+    match (
+        head_ts.parse::<chrono::DateTime<chrono::Utc>>(),
+        candidate_ts.parse::<chrono::DateTime<chrono::Utc>>(),
+    ) {
+        (Ok(head), Ok(candidate)) => {
+            (head - candidate).num_seconds().abs() <= CODEX_BURST_WINDOW_SECS
+        }
+        _ => head_ts.get(..19) == candidate_ts.get(..19),
+    }
+}
+
+/// Classification of an `hnsw_fetch (semantic_miss, ...)` — why the target
+/// conversation didn't rank in the top window even under brute-force ground
+/// truth. Spec 2(a), hardened per the Opus review's harness-first-priority
+/// finding (high): a query built from harness boilerplate must never be
+/// scored as a "same-text sibling" problem, since fixing THAT class means
+/// search-side burst collapse, which does nothing for a query that is
+/// boilerplate to begin with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MissClass {
+    /// The query text itself (or the target's own proxy chunk) sits inside
+    /// an open Codex harness tag span — the query was never a real user
+    /// message to begin with.
+    HarnessPolluted,
+    /// A conversation ranked above the target has near-identical text AND
+    /// spawned within `CODEX_BURST_WINDOW_SECS` of it — a parallel
+    /// `codex_exec` burst sibling. Candidate for search-side burst collapse.
+    BurstSibling,
+    /// A conversation ranked above the target has near-identical text but
+    /// was NOT spawned within the burst window (e.g. the same template
+    /// reused weeks apart) — burst collapse would not fix this.
+    TemplateSibling,
+    /// A conversation ranked above the target is in the contamination set
+    /// (postdates the global cutoff, or quotes the query text).
+    Contaminated,
+    /// None of the above explain the miss — a genuine embedding-recall gap.
+    Genuine,
+}
+
+impl std::fmt::Display for MissClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            MissClass::HarnessPolluted => "harness_polluted",
+            MissClass::BurstSibling => "burst_sibling",
+            MissClass::TemplateSibling => "template_sibling",
+            MissClass::Contaminated => "contaminated",
+            MissClass::Genuine => "genuine",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Cosine similarity at/above this counts two conversations' proxy content as
+/// "the same text" for sibling classification — high enough that ordinary
+/// topical similarity can't cross it, only a near-duplicate can.
+const SIBLING_COSINE_THRESHOLD: f32 = 0.97;
+
+struct MissTarget {
+    burst_key_ts: String,
+    harness_polluted: bool,
+}
+
+struct SiblingRow {
+    cosine: f32,
+    burst_key_ts: String,
+    identical_text: bool,
+    contaminated: bool,
+}
+
+/// Pure classifier: given the target and the brute-force conversation rows
+/// ranked above it (already deduped per conversation — see
+/// `collapse_best_per_conversation`), decide which of [`MissClass`]'s five
+/// buckets explains the miss. Priority order matches the Opus review's
+/// harness-first finding: a harness-polluted query is classified as such
+/// regardless of what's ranked above it (checking siblings first would
+/// misclassify it as `same_text_sibling`, which points at the wrong fix).
+fn classify_semantic_miss(target: &MissTarget, rows_above: &[SiblingRow]) -> MissClass {
+    if target.harness_polluted {
+        return MissClass::HarnessPolluted;
+    }
+    let mut has_burst = false;
+    let mut has_template = false;
+    let mut has_contaminated = false;
+    for row in rows_above {
+        let is_sibling = row.cosine >= SIBLING_COSINE_THRESHOLD || row.identical_text;
+        if is_sibling {
+            if within_burst_window(&target.burst_key_ts, &row.burst_key_ts) {
+                has_burst = true;
+            } else {
+                has_template = true;
+            }
+        }
+        if row.contaminated {
+            has_contaminated = true;
+        }
+    }
+    if has_burst {
+        MissClass::BurstSibling
+    } else if has_template {
+        MissClass::TemplateSibling
+    } else if has_contaminated {
+        MissClass::Contaminated
+    } else {
+        MissClass::Genuine
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn target(harness_polluted: bool) -> MissTarget {
+        MissTarget {
+            burst_key_ts: "2026-09-20T10:00:00Z".to_string(),
+            harness_polluted,
+        }
+    }
+
+    #[test]
+    fn harness_polluted_wins_even_with_a_sibling_above() {
+        let t = target(true);
+        let rows = [SiblingRow {
+            cosine: 0.99,
+            burst_key_ts: "2026-09-20T10:00:05Z".to_string(),
+            identical_text: true,
+            contaminated: false,
+        }];
+        assert_eq!(
+            classify_semantic_miss(&t, &rows),
+            MissClass::HarnessPolluted
+        );
+    }
+
+    #[test]
+    fn burst_sibling_within_window() {
+        let t = target(false);
+        let rows = [SiblingRow {
+            cosine: 0.98,
+            burst_key_ts: "2026-09-20T10:00:08Z".to_string(), // 8s away, within 10s window
+            identical_text: false,
+            contaminated: false,
+        }];
+        assert_eq!(classify_semantic_miss(&t, &rows), MissClass::BurstSibling);
+    }
+
+    #[test]
+    fn template_sibling_outside_window() {
+        let t = target(false);
+        let rows = [SiblingRow {
+            cosine: 0.0,
+            burst_key_ts: "2026-08-05T10:00:00Z".to_string(), // days away
+            identical_text: true,
+            contaminated: false,
+        }];
+        assert_eq!(
+            classify_semantic_miss(&t, &rows),
+            MissClass::TemplateSibling
+        );
+    }
+
+    #[test]
+    fn contaminated_when_no_sibling_but_a_contaminated_row_above() {
+        let t = target(false);
+        let rows = [SiblingRow {
+            cosine: 0.4,
+            burst_key_ts: "2026-09-22T15:00:00Z".to_string(),
+            identical_text: false,
+            contaminated: true,
+        }];
+        assert_eq!(classify_semantic_miss(&t, &rows), MissClass::Contaminated);
+    }
+
+    #[test]
+    fn genuine_when_nothing_above_explains_it() {
+        let t = target(false);
+        let rows = [SiblingRow {
+            cosine: 0.3,
+            burst_key_ts: "2026-09-01T00:00:00Z".to_string(),
+            identical_text: false,
+            contaminated: false,
+        }];
+        assert_eq!(classify_semantic_miss(&t, &rows), MissClass::Genuine);
+    }
+
+    #[test]
+    fn genuine_when_no_rows_above() {
+        let t = target(false);
+        assert_eq!(classify_semantic_miss(&t, &[]), MissClass::Genuine);
+    }
+
+    #[test]
+    fn burst_beats_template_when_both_present() {
+        let t = target(false);
+        let rows = [
+            SiblingRow {
+                cosine: 0.0,
+                burst_key_ts: "2026-08-05T10:00:00Z".to_string(),
+                identical_text: true,
+                contaminated: false,
+            },
+            SiblingRow {
+                cosine: 0.98,
+                burst_key_ts: "2026-09-20T10:00:02Z".to_string(),
+                identical_text: false,
+                contaminated: false,
+            },
+        ];
+        assert_eq!(classify_semantic_miss(&t, &rows), MissClass::BurstSibling);
+    }
+}
+
 /// Conversations that could only be ABOUT the target investigation, not a
 /// genuine pre-existing corpus hit: their content quotes the target's own
 /// uuid, or they first appear after the target conversation's own last
@@ -222,6 +539,65 @@ fn global_contamination_conv_ids(conn: &Connection) -> Result<HashSet<String>> {
     Ok(ids)
 }
 
+/// Opus review finding (medium, W3-K second pass): the shared-context rule
+/// is "postdates the cutoff OR quotes the query text" — both halves.
+/// [`global_contamination_conv_ids`] is the cheap, query-independent cutoff
+/// half; this is the per-query content-match half, run once per sampled
+/// query on top of it. Matches on a normalized 80-char slice of the query
+/// text (not the whole query), so a long query still catches a conversation
+/// that quotes only a fragment of it.
+fn query_contamination_conv_ids(
+    conn: &Connection,
+    query_text: &str,
+    exclude_self: &str,
+) -> Result<HashSet<String>> {
+    let slice: String = query_text.chars().take(80).collect();
+    if slice.trim().chars().count() < 8 {
+        // Too short to be a meaningful substring match — a short slice would
+        // hit nearly every conversation and over-exclude rather than never
+        // excluding, so skip instead.
+        return Ok(HashSet::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT conversation_id FROM chunks
+         WHERE conversation_id != ?2 AND content LIKE '%' || ?1 || '%'",
+    )?;
+    let ids = stmt
+        .query_map((&slice, exclude_self), |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Per-conversation `(first_seen_timestamp, content_norm)` across BOTH main
+/// sources (`codex_rollout`, `conversation`) — the corpus-wide metadata the
+/// classifier needs for every sibling ranked above a miss, not just the
+/// sampled conversations. `content_norm` mirrors `SampleConv::content_norm`
+/// (the depth-aware first-real-chunk proxy), so an identical-text sibling
+/// check is comparing the same normalization on both sides.
+fn build_conv_meta(conn: &Connection) -> Result<HashMap<String, (String, String)>> {
+    let mut first_ts: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, MIN(timestamp) FROM chunks GROUP BY conversation_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (conv, ts) = row?;
+            first_ts.insert(conv, ts);
+        }
+    }
+    let mut meta: HashMap<String, (String, String)> = HashMap::new();
+    for source in ["codex_rollout", "conversation"] {
+        for (conv, _project, content, _harness_polluted) in first_chunks_for_source(conn, source)? {
+            let ts = first_ts.get(&conv).cloned().unwrap_or_default();
+            meta.insert(conv, (ts, self_text_proxy(&content)));
+        }
+    }
+    Ok(meta)
+}
+
 /// Mirrors `import::codex_rollout::CODEX_HARNESS_MARKERS` (private to that
 /// module): Codex harness-injected boilerplate (plugin recommendations,
 /// AGENTS.md instructions, environment-context dumps) that can occupy a
@@ -244,23 +620,72 @@ const CODEX_HARNESS_MARKERS: &[&str] = &[
     "<skills_instructions>",
 ];
 
-fn is_harness_boilerplate(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    CODEX_HARNESS_MARKERS
+/// Mirrors `storage::queries::CODEX_HARNESS_TAG_PAIRS` (private to that
+/// module, so this probe — a separate `examples/` binary that only sees the
+/// crate's public API — cannot import it directly). Open/close tag pairs for
+/// the harness blocks `CODEX_HARNESS_MARKERS` above can open.
+const CODEX_HARNESS_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<recommended_plugins>", "</recommended_plugins>"),
+    ("<INSTRUCTIONS>", "</INSTRUCTIONS>"),
+    ("<environment_context>", "</environment_context>"),
+    ("<user_instructions>", "</user_instructions>"),
+    ("<permissions instructions>", "</permissions instructions>"),
+    ("<codex_internal_context>", "</codex_internal_context>"),
+    ("<skills_instructions>", "</skills_instructions>"),
+];
+
+/// Mirrors `storage::queries::harness_tag_depth_delta` (private). Net
+/// harness-tag depth contributed by one chunk: total opens minus total
+/// closes across every pair in `CODEX_HARNESS_TAG_PAIRS`.
+fn harness_tag_depth_delta(content: &str) -> i32 {
+    CODEX_HARNESS_TAG_PAIRS
         .iter()
-        .any(|marker| trimmed.starts_with(marker))
+        .map(|(open, close)| {
+            content.matches(open).count() as i32 - content.matches(close).count() as i32
+        })
+        .sum()
 }
 
-/// One row per `conversation_id` for `source`: its project name and its
-/// earliest NON-boilerplate chunk's content (seq then rowid order), used as
-/// the self-text proxy query when no hand-authored paraphrase is supplied.
-/// Falls back to the literal first chunk only when every chunk in the
-/// conversation is harness boilerplate (so the sample never silently drops a
-/// conversation).
+/// Opus review finding (high, W3-K second pass): `starts_with(marker)` only
+/// catches a chunk that OPENS a harness block, not a continuation chunk
+/// sitting in the middle of one — real examples include a plugin-list
+/// continuation chunk starting `"Monday.com (monday-com@openai-curated-...)"`
+/// and an AGENTS.md body chunk starting `"- Setup: \`npm run setup\`..."`,
+/// neither of which starts with any marker yet both are harness boilerplate.
+/// This tracks a running open/close *depth* across `chunks` (already ordered
+/// by seq/rowid) the same way `storage::queries::pick_preview_index` does,
+/// so a still-open span is skipped in full, not just its opening chunk.
+/// Returns the index of the first real (non-boilerplate, depth==0) chunk, or
+/// `None` if every chunk in the window is inside a harness span (an
+/// entirely-boilerplate conversation).
+fn first_real_chunk_index(chunks: &[&str]) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, content) in chunks.iter().enumerate() {
+        let trimmed = content.trim_start();
+        let opens_here = CODEX_HARNESS_MARKERS
+            .iter()
+            .any(|marker| trimmed.starts_with(marker));
+        if depth > 0 || opens_here {
+            depth = (depth + harness_tag_depth_delta(content)).max(0);
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// One row per `conversation_id` for `source`: its project name, its
+/// earliest NON-boilerplate chunk's content (depth-tracked span skip, see
+/// [`first_real_chunk_index`]) used as the self-text proxy query when no
+/// hand-authored paraphrase is supplied, and whether the conversation is
+/// entirely harness boilerplate (no real chunk found in the fetched window —
+/// the query text itself would then be harness-polluted, not a genuine
+/// sample). Falls back to the literal first chunk in that case, so the
+/// sample never silently drops a conversation.
 fn first_chunks_for_source(
     conn: &Connection,
     source: &str,
-) -> Result<Vec<(String, String, String)>> {
+) -> Result<Vec<(String, String, String, bool)>> {
     let mut stmt = conn.prepare(
         "SELECT conversation_id, project_name, content FROM chunks
          WHERE source = ?1
@@ -275,22 +700,22 @@ fn first_chunks_for_source(
     })?;
     let all: Vec<(String, String, String)> = rows.collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let mut first_real: HashMap<String, (String, String)> = HashMap::new(); // conv -> (project, content)
-    let mut first_any: HashMap<String, (String, String)> = HashMap::new();
+    // Group by conversation, preserving seq/rowid order within each group.
+    let mut by_conv: Vec<(String, String, Vec<String>)> = Vec::new(); // (conv, project, [content...])
     for (conv, project, content) in all {
-        first_any
-            .entry(conv.clone())
-            .or_insert_with(|| (project.clone(), content.clone()));
-        if !is_harness_boilerplate(&content) {
-            first_real.entry(conv).or_insert((project, content));
+        match by_conv.last_mut() {
+            Some((last_conv, _, contents)) if *last_conv == conv => contents.push(content),
+            _ => by_conv.push((conv, project, vec![content])),
         }
     }
-    let mut out: Vec<(String, String, String)> = Vec::with_capacity(first_any.len());
-    for (conv, (any_project, any_content)) in first_any {
-        let (project, content) = first_real
-            .remove(&conv)
-            .unwrap_or((any_project, any_content));
-        out.push((conv, project, content));
+
+    let mut out: Vec<(String, String, String, bool)> = Vec::with_capacity(by_conv.len());
+    for (conv, project, contents) in by_conv {
+        let refs: Vec<&str> = contents.iter().map(String::as_str).collect();
+        match first_real_chunk_index(&refs) {
+            Some(idx) => out.push((conv, project, contents[idx].clone(), false)),
+            None => out.push((conv, project, contents[0].clone(), true)),
+        }
     }
     Ok(out)
 }
@@ -312,6 +737,32 @@ struct SampleConv {
     project_name: String,
     query_text: String,
     query_source: &'static str,
+    /// True when [`first_real_chunk_index`] found no real chunk at all for
+    /// this conversation — its self-text-proxy query is itself harness
+    /// boilerplate (query-side harness pollution, Opus review high finding).
+    /// Always `false` for a hand-authored `paraphrase` row.
+    harness_polluted: bool,
+    /// Normalized proxy of the conversation's own first real chunk (built
+    /// the same way regardless of `query_source`) — used by the classifier
+    /// to detect a sibling whose own first-chunk text is (near-)identical to
+    /// this conversation's, independent of which query text was sent.
+    content_norm: String,
+}
+
+/// Spec 2(b) guard: a paraphrase must not leak verbatim text from the
+/// target's own chunk — true when `a` and `b` share an identical run of `n`
+/// consecutive whitespace-separated tokens.
+fn shares_long_ngram(a: &str, b: &str, n: usize) -> bool {
+    let a_tokens: Vec<&str> = a.split_whitespace().collect();
+    if a_tokens.len() < n {
+        return false;
+    }
+    let b_tokens: Vec<&str> = b.split_whitespace().collect();
+    if b_tokens.len() < n {
+        return false;
+    }
+    let b_ngrams: HashSet<&[&str]> = b_tokens.windows(n).collect();
+    a_tokens.windows(n).any(|w| b_ngrams.contains(w))
 }
 
 fn build_sample(
@@ -325,24 +776,41 @@ fn build_sample(
     Ok(rows
         .into_iter()
         .take(n)
-        .map(|(conversation_id, project_name, content)| {
-            if let Some(paraphrase) = paraphrases.get(&conversation_id) {
-                SampleConv {
-                    conversation_id,
-                    project_name,
-                    query_text: paraphrase.clone(),
-                    query_source: "paraphrase",
+        .map(
+            |(conversation_id, project_name, content, harness_polluted)| {
+                let content_norm = self_text_proxy(&content);
+                let paraphrase = paraphrases.get(&conversation_id).filter(|p| {
+                    if shares_long_ngram(p, &content, 8) {
+                        eprintln!(
+                            "WARN: paraphrase for {conversation_id} shares an 8-gram with its own \
+                         chunk — rejected, falling back to self-text-proxy"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if let Some(paraphrase) = paraphrase {
+                    SampleConv {
+                        conversation_id,
+                        project_name,
+                        query_text: paraphrase.clone(),
+                        query_source: "paraphrase",
+                        harness_polluted: false,
+                        content_norm,
+                    }
+                } else {
+                    SampleConv {
+                        conversation_id,
+                        project_name,
+                        query_text: content_norm.clone(),
+                        query_source: "self-text-proxy",
+                        harness_polluted,
+                        content_norm,
+                    }
                 }
-            } else {
-                let query_text = self_text_proxy(&content);
-                SampleConv {
-                    conversation_id,
-                    project_name,
-                    query_text,
-                    query_source: "self-text-proxy",
-                }
-            }
-        })
+            },
+        )
         .collect())
 }
 
@@ -549,7 +1017,7 @@ async fn main() -> Result<()> {
 
     for (label, project) in [
         ("project=EnhanceMe", Some(TARGET_PROJECT)),
-        ("project=all", None),
+        ("project=all", Some("all")),
     ] {
         let (result, samples) = stage_probe::scope(TARGET_CONVERSATION_ID, || {
             csr_engine::mcp::tools::reflect_on_past(
@@ -589,6 +1057,27 @@ async fn main() -> Result<()> {
         "\nglobal contamination set (first_seen > {GLOBAL_CONTAMINATION_CUTOFF}): {} conversation(s)",
         global_contamination.len()
     );
+    let conv_meta = build_conv_meta(&conn)?;
+    println!(
+        "conversation metadata (first_ts + content_norm) built for {} conversations",
+        conv_meta.len()
+    );
+
+    // Opus review finding (low): the claude baseline that "must not drop" is
+    // itself dominated by templated first chunks (narrator/summary
+    // boilerplate, `<local-command-caveat>` echoes). Group by a normalized
+    // first-120-char prefix; 20+ identical members marks the group
+    // templated — reported per conversation below so the claude hit@6 split
+    // is visible, and so paraphrase authoring can prefer non-templated ids.
+    let mut claude_template_groups: HashMap<String, usize> = HashMap::new();
+    for (_, (_, content_norm)) in conv_meta.iter().filter(|(id, _)| !id.starts_with("codex:")) {
+        let prefix: String = content_norm.chars().take(120).collect();
+        *claude_template_groups.entry(prefix).or_insert(0) += 1;
+    }
+    let is_templated = |content_norm: &str| -> bool {
+        let prefix: String = content_norm.chars().take(120).collect();
+        claude_template_groups.get(&prefix).copied().unwrap_or(0) >= 20
+    };
     println!(
         "\n--- generalization sample: {} codex, {} claude (seed={SAMPLE_SEED:?}) ---",
         codex_sample.len(),
@@ -630,20 +1119,49 @@ async fn main() -> Result<()> {
     /// or the scoped call errored.
     const PIPELINE_DECONTAM_OVERFETCH: usize = LIMIT * 5;
     let mut pipeline_decontam_hit_counts: HashMap<&str, (usize, usize)> = HashMap::new();
+    // Spec 2(a): histogram of `hnsw_fetch (semantic_miss, ...)` classes, kept
+    // separately for the contaminated (full corpus) and decontaminated
+    // (global cutoff + per-query content match) runs — a class that
+    // disappears going from contaminated to decontaminated tells us the
+    // contamination set was crowding the target out; one that persists is a
+    // real recall problem the decontamination can't paper over.
+    let mut miss_class_contam: HashMap<(&str, MissClass), usize> = HashMap::new();
+    let mut miss_class_decontam: HashMap<(&str, MissClass), usize> = HashMap::new();
+    // Claude "must not drop" baseline split by templated vs non-templated
+    // first chunk (Opus review low finding).
+    let mut claude_hit_by_template: HashMap<bool, (usize, usize)> = HashMap::new(); // is_templated -> (hits, total)
 
     for (source_label, sample) in [("codex", &codex_sample), ("claude", &claude_sample)] {
         for conv in sample {
             let conv_query_vec = engine.embeddings().embed_single(&conv.query_text).ok();
+
+            // Opus review finding (medium): decontamination is "postdates the
+            // cutoff OR quotes the query text" — both halves, per query.
+            let query_contam =
+                query_contamination_conv_ids(&conn, &conv.query_text, &conv.conversation_id)?;
+            if !query_contam.is_empty() {
+                println!(
+                    "  {source_label:<6} {} query-contamination: {} conversation(s) additionally excluded (quote this query)",
+                    conv.conversation_id,
+                    query_contam.len()
+                );
+            }
+            let decontam_exclude: HashSet<String> =
+                global_contamination.union(&query_contam).cloned().collect();
+
+            // Opus review finding (medium): rank/dedupe by CONVERSATION, not
+            // chunk, before deciding hit@6 or classifying a miss — a
+            // conversation holding several near-duplicate chunks otherwise
+            // gets counted several times against the target.
+            let scored = conv_query_vec
+                .as_deref()
+                .map(|qv| collapse_best_per_conversation(&all_rows, qv));
+
             let decontam_hit = if global_contamination.contains(&conv.conversation_id) {
                 None
             } else {
-                conv_query_vec.as_deref().map(|qv| {
-                    let bf = brute_force_rank(
-                        &all_rows,
-                        qv,
-                        &conv.conversation_id,
-                        &global_contamination,
-                    );
+                scored.as_ref().map(|s| {
+                    let bf = brute_force_rank_conv(s, &conv.conversation_id, &decontam_exclude);
                     bf.rank.is_some_and(|r| r < LIMIT)
                 })
             };
@@ -655,7 +1173,7 @@ async fn main() -> Result<()> {
                         entry.0 += 1;
                     }
                     println!(
-                        "  {source_label:<6} {} decontam_hit@6(brute_force)={hit}",
+                        "  {source_label:<6} {} decontam_hit@6(brute_force, per-conversation)={hit}",
                         conv.conversation_id
                     );
                 }
@@ -715,9 +1233,22 @@ async fn main() -> Result<()> {
                 ),
             }
 
-            for (scope_label, project) in [
-                ("scoped", Some(conv.project_name.as_str())),
-                ("unscoped", None),
+            // Opus review finding (medium, W3-S LOW): pass `Some("all")`, not
+            // `None`, for the "unscoped" arm — `None` resolves through
+            // `SearchProjectScope::resolve_with`'s env-derived
+            // `default_scope_project` fallback (`MCP_CLIENT_CWD` /
+            // `CLAUDE_PROJECT_DIR`), which silently re-scopes "unscoped" runs
+            // to whatever project this Bash session happens to be in.
+            // `resolve_with` maps a case-insensitive `"all"` request straight
+            // to `scope_label = "all"` unconditionally, bypassing the env
+            // fallback entirely — printed below so the receipt proves it.
+            for (scope_label, project, resolved_scope_label) in [
+                (
+                    "scoped",
+                    Some(conv.project_name.as_str()),
+                    conv.project_name.as_str(),
+                ),
+                ("unscoped", Some("all"), "all"),
             ] {
                 let (result, samples) = stage_probe::scope(&conv.conversation_id, || {
                     csr_engine::mcp::tools::reflect_on_past(
@@ -743,6 +1274,14 @@ async fn main() -> Result<()> {
                     .is_some_and(|sample| sample.target_rank.is_some());
                 let entry = hit_counts.entry(source_label).or_insert((0, 0));
                 entry.1 += 1;
+                if source_label == "claude" && scope_label == "scoped" {
+                    let templated = is_templated(&conv.content_norm);
+                    let entry = claude_hit_by_template.entry(templated).or_insert((0, 0));
+                    entry.1 += 1;
+                    if final_hit {
+                        entry.0 += 1;
+                    }
+                }
                 let mut stage_label = String::new();
                 if final_hit {
                     entry.0 += 1;
@@ -753,7 +1292,9 @@ async fn main() -> Result<()> {
                     // budget — HNSW's approximation missed it) versus
                     // semantic-miss (brute force agrees nothing that close
                     // existed within budget) using the ground truth loaded
-                    // once at startup.
+                    // once at startup. Chunk-level on purpose (see
+                    // `brute_force_rank`'s doc) — this comparison is against
+                    // the HNSW fetch window, which is also chunk-level.
                     let classified = if stage == "hnsw_fetch" {
                         if let (Some(hnsw_sample), Some(qv)) = (
                             samples.iter().find(|s| s.stage == "hnsw_fetch"),
@@ -779,11 +1320,71 @@ async fn main() -> Result<()> {
                     };
                     stage_label = classified.clone();
                     *miss_stage_counts
-                        .entry((source_label, classified))
+                        .entry((source_label, classified.clone()))
                         .or_insert(0) += 1;
+
+                    // Spec 2(a): classify every semantic_miss (not the
+                    // ann_recall_miss ones — those are an HNSW approximation
+                    // problem, not a query/corpus content problem). Only
+                    // meaningful once, so restrict to the "scoped" arm.
+                    if scope_label == "scoped"
+                        && classified.starts_with("hnsw_fetch (semantic_miss")
+                    {
+                        if let Some(scored) = &scored {
+                            let target_ts = conv_meta
+                                .get(&conv.conversation_id)
+                                .map(|(ts, _)| ts.as_str())
+                                .unwrap_or("");
+                            let target_burst_ts = burst_key_ts(&conv.conversation_id, target_ts);
+                            let target = MissTarget {
+                                burst_key_ts: target_burst_ts,
+                                harness_polluted: conv.harness_polluted,
+                            };
+                            let to_rows = |exclude: &HashSet<String>| -> Vec<SiblingRow> {
+                                let filtered: Vec<&(f32, String)> = scored
+                                    .iter()
+                                    .filter(|(_, c)| !exclude.contains(c))
+                                    .collect();
+                                let rank = filtered
+                                    .iter()
+                                    .position(|(_, c)| c == &conv.conversation_id)
+                                    .unwrap_or(filtered.len());
+                                filtered[..rank]
+                                    .iter()
+                                    .map(|(score, sibling_id)| {
+                                        let (sibling_ts, sibling_content) =
+                                            conv_meta.get(sibling_id).cloned().unwrap_or_default();
+                                        SiblingRow {
+                                            cosine: *score,
+                                            burst_key_ts: burst_key_ts(sibling_id, &sibling_ts),
+                                            identical_text: sibling_content == conv.content_norm,
+                                            contaminated: decontam_exclude.contains(sibling_id),
+                                        }
+                                    })
+                                    .collect()
+                            };
+                            let rows_above_contam = to_rows(&HashSet::new());
+                            let class_contam = classify_semantic_miss(&target, &rows_above_contam);
+                            *miss_class_contam
+                                .entry((source_label, class_contam))
+                                .or_insert(0) += 1;
+
+                            let rows_above_decontam = to_rows(&decontam_exclude);
+                            let class_decontam =
+                                classify_semantic_miss(&target, &rows_above_decontam);
+                            *miss_class_decontam
+                                .entry((source_label, class_decontam))
+                                .or_insert(0) += 1;
+
+                            println!(
+                                "  {source_label:<6} {} miss_class contaminated={class_contam} decontaminated={class_decontam}",
+                                conv.conversation_id
+                            );
+                        }
+                    }
                 }
                 println!(
-                    "  {source_label:<6} {} [{scope_label:<8} q={:<16}] hit@6={} losing_stage={}",
+                    "  {source_label:<6} {} [{scope_label:<8} scope={resolved_scope_label:<12} q={:<16}] hit@6={} losing_stage={}",
                     conv.conversation_id,
                     conv.query_source,
                     final_hit,
@@ -836,6 +1437,50 @@ async fn main() -> Result<()> {
     for ((source, stage), count) in miss_rows {
         println!("  {source:<6} {stage:<40} {count}");
     }
+
+    println!(
+        "\n--- claude hit@6, templated vs non-templated first chunk (>=20 identical \
+         first-120-char siblings = templated) ---"
+    );
+    for templated in [true, false] {
+        if let Some((hits, total)) = claude_hit_by_template.get(&templated) {
+            println!(
+                "  templated={templated:<5} {hits}/{total} = {:.1}%",
+                100.0 * (*hits as f64) / (*total as f64).max(1.0)
+            );
+        }
+    }
+
+    println!("\n--- semantic_miss class histogram (spec 2a) ---");
+    println!("  [contaminated run — full corpus, no exclusion]");
+    let mut contam_rows: Vec<_> = miss_class_contam.into_iter().collect();
+    contam_rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+    for ((source, class), count) in &contam_rows {
+        println!("    {source:<6} {class:<18} {count}");
+    }
+    println!("  [decontaminated run — global cutoff + per-query content match excluded]");
+    let mut decontam_rows: Vec<_> = miss_class_decontam.into_iter().collect();
+    decontam_rows.sort_by_key(|a| std::cmp::Reverse(a.1));
+    for ((source, class), count) in &decontam_rows {
+        println!("    {source:<6} {class:<18} {count}");
+    }
+    let dominant = |rows: &[((&str, MissClass), usize)], class: MissClass| -> usize {
+        rows.iter()
+            .filter(|((_, c), _)| *c == class)
+            .map(|(_, n)| *n)
+            .sum()
+    };
+    let total_decontam_misses: usize = decontam_rows.iter().map(|(_, n)| *n).sum();
+    println!(
+        "  spec 2(d) gate — decontaminated: burst_sibling={} template_sibling={} \
+         harness_polluted={} contaminated={} genuine={} (total classified misses={})",
+        dominant(&decontam_rows, MissClass::BurstSibling),
+        dominant(&decontam_rows, MissClass::TemplateSibling),
+        dominant(&decontam_rows, MissClass::HarnessPolluted),
+        dominant(&decontam_rows, MissClass::Contaminated),
+        dominant(&decontam_rows, MissClass::Genuine),
+        total_decontam_misses,
+    );
 
     Ok(())
 }
