@@ -777,7 +777,6 @@ impl SearchEngine {
             .map_err(|e| anyhow::anyhow!("failed to acquire index lock for dump: {}", e))?;
 
         // Snapshot whatever manifest is on disk BEFORE this call writes
-        // Snapshot whatever manifest is on disk BEFORE this call writes
         // anything, while still holding the exclusive lock — no other
         // process's dump_to_disk can be mid-write concurrently, so this is a
         // consistent read of "whatever the last writer actually published".
@@ -883,6 +882,27 @@ impl SearchEngine {
             default_reflection_basename()
         };
 
+        // Compaction generation to publish. `!self.manifest_backed` means
+        // this engine came from `SearchEngine::new` and was populated
+        // directly from SQLite by `rebuild_search_index`/
+        // `rebuild_search_index_streaming` (or `Engine::new`'s cache-miss
+        // path) — a genuine compaction/full rebuild — so its first publish
+        // always claims a strictly newer generation than whatever (if
+        // anything) is on disk, guaranteeing any manifest-backed engine
+        // still holding an older epoch loses the `stale_generation` race
+        // above on ITS next dump. A `stale_generation` dump adopts the
+        // newer on-disk epoch it just deferred to, rather than
+        // republishing under its own stale one. Otherwise (a normal,
+        // non-stale, manifest-backed update) nothing compacted
+        // concurrently, so the epoch carries forward unchanged.
+        let new_epoch = if !self.manifest_backed {
+            on_disk_epoch.wrapping_add(1)
+        } else if stale_generation {
+            on_disk_epoch
+        } else {
+            on_disk_epoch.max(self.epoch)
+        };
+
         // Chunk side of the manifest: from memory if we just dumped it (now
         // provably matching what's on disk), OR if this engine isn't
         // manifest-backed (a rebuild is authoritative for both sides —
@@ -926,27 +946,6 @@ impl SearchEngine {
                     self.active_reflection_count,
                 )
             };
-
-        // Compaction generation to publish. `!self.manifest_backed` means
-        // this engine came from `SearchEngine::new` and was populated
-        // directly from SQLite by `rebuild_search_index`/
-        // `rebuild_search_index_streaming` (or `Engine::new`'s cache-miss
-        // path) — a genuine compaction/full rebuild — so its first publish
-        // always claims a strictly newer generation than whatever (if
-        // anything) is on disk, guaranteeing any manifest-backed engine
-        // still holding an older epoch loses the `stale_generation` race
-        // above on ITS next dump. A `stale_generation` dump adopts the
-        // newer on-disk epoch it just deferred to, rather than
-        // republishing under its own stale one. Otherwise (a normal,
-        // non-stale, manifest-backed update) nothing compacted
-        // concurrently, so the epoch carries forward unchanged.
-        let new_epoch = if !self.manifest_backed {
-            on_disk_epoch.wrapping_add(1)
-        } else if stale_generation {
-            on_disk_epoch
-        } else {
-            on_disk_epoch.max(self.epoch)
-        };
 
         // Write manifest atomically (tmp + rename)
         let manifest = IndexManifest {
