@@ -61,6 +61,9 @@ pub struct StatusReport {
     /// See `gather_backfill`.
     pub backfill: BackfillStatus,
     pub dreaming: Option<DreamingView>,
+    /// Codex-rollout timestamp restamp + harness-strip re-import receipts.
+    /// See [`CodexBackfillStatus`].
+    pub codex_backfill: CodexBackfillStatus,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -550,6 +553,65 @@ pub struct MemoryRegistryStatus {
     pub schema_misses: i64,
 }
 
+/// Codex-rollout chunk-timestamp restamp (`crate::import::codex_rollout::
+/// restamp_codex_chunk_timestamps`) — versioned, bounded-retry one-shot.
+/// Read from `RESTAMP_META_KEY` / `RESTAMP_PROGRESS_META_KEY`; see that
+/// function's doc for what each count means. Harness-polluted conversations
+/// are skipped by design (see `conversations_skipped_polluted`) — that
+/// pollution is [`CodexHarnessStripStatus`]'s job, not this restamp's.
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct CodexRestampStatus {
+    /// `RESTAMP_META_KEY` is set: a pass has left zero unmatched
+    /// conversations/chunks. Never un-set once true.
+    pub done: bool,
+    /// This attempt count is bounded by `RESTAMP_MAX_ATTEMPTS`.
+    pub attempts: usize,
+    /// `RESTAMP_MAX_ATTEMPTS` reached with `done` still `false` — the
+    /// daemon has stopped retrying a permanently drifted file, but the
+    /// corpus is not considered clean.
+    pub attempts_exhausted: bool,
+    pub conversations_considered: usize,
+    pub conversations_updated: usize,
+    pub conversations_unmatched: usize,
+    pub conversations_missing_file: usize,
+    pub conversations_skipped_polluted: usize,
+    pub chunks_updated: usize,
+    pub chunks_unmatched: usize,
+}
+
+/// Daemon-owned codex harness-strip re-import
+/// (`crate::import::codex_rollout::harness_strip_batch`) — idle-gated,
+/// batched, resumable, keyed `codex_harness_strip_v2`. Read from
+/// `HARNESS_STRIP_V2_META_KEY` / `HARNESS_STRIP_V2_PROGRESS_META_KEY`.
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct CodexHarnessStripStatus {
+    /// `HARNESS_STRIP_V2_META_KEY` is set: zero file-having polluted
+    /// conversations remain. Conversations whose source file is gone stay
+    /// polluted forever and never block this.
+    pub done: bool,
+    /// File-having polluted conversations left to reimport, as of the most
+    /// recent batch. `0` once `done`.
+    pub polluted_remaining: usize,
+    pub reimported: usize,
+    pub missing_file: usize,
+    pub failed: usize,
+    pub last_batch_at: Option<String>,
+    pub last_batch_chunks: usize,
+    pub last_batch_secs: f64,
+    /// `last_batch_chunks / last_batch_secs` from the most recent batch —
+    /// `None` before any batch has run, or when that batch's timing was too
+    /// small to divide by meaningfully.
+    pub throughput_chunks_per_sec: Option<f64>,
+}
+
+/// Combined codex-rollout backfill status block — see
+/// [`CodexRestampStatus`] and [`CodexHarnessStripStatus`].
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct CodexBackfillStatus {
+    pub restamp: CodexRestampStatus,
+    pub harness_strip: CodexHarnessStripStatus,
+}
+
 #[derive(Serialize, Default)]
 pub struct EnrichmentBreakdown {
     pub heuristic_completed: usize,
@@ -651,6 +713,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
             dreaming,
+            codex_backfill: CodexBackfillStatus::default(),
         });
     }
 
@@ -749,6 +812,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let memory_registry = gather_memory_registry(&storage);
     let trained_rerank = gather_trained_rerank(&storage);
     let backfill = gather_backfill(&storage);
+    let codex_backfill = gather_codex_backfill(&storage);
 
     Ok(StatusReport {
         mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
@@ -778,7 +842,80 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         trained_rerank,
         backfill,
         dreaming,
+        codex_backfill,
     })
+}
+
+/// Assemble the codex-rollout backfill status block. Fail-soft to defaults
+/// on any read/parse error — a malformed or absent progress-meta JSON value
+/// must never break `csr-engine status`.
+fn gather_codex_backfill(storage: &Storage) -> CodexBackfillStatus {
+    use crate::import::codex_rollout::{
+        HarnessStripProgress, RestampProgress, HARNESS_STRIP_V2_META_KEY,
+        HARNESS_STRIP_V2_PROGRESS_META_KEY, RESTAMP_META_KEY, RESTAMP_PROGRESS_META_KEY,
+    };
+
+    let restamp_done = storage.get_meta(RESTAMP_META_KEY).unwrap_or(None).is_some();
+    let restamp_progress: RestampProgress = storage
+        .get_meta(RESTAMP_PROGRESS_META_KEY)
+        .unwrap_or(None)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let restamp = CodexRestampStatus {
+        done: restamp_done,
+        attempts: restamp_progress.attempts,
+        attempts_exhausted: !restamp_done
+            && restamp_progress.attempts >= crate::import::codex_rollout::RESTAMP_MAX_ATTEMPTS,
+        conversations_considered: restamp_progress.conversations_considered,
+        conversations_updated: restamp_progress.conversations_updated,
+        conversations_unmatched: restamp_progress.conversations_unmatched,
+        conversations_missing_file: restamp_progress.conversations_missing_file,
+        conversations_skipped_polluted: restamp_progress.conversations_skipped_polluted,
+        chunks_updated: restamp_progress.chunks_updated,
+        chunks_unmatched: restamp_progress.chunks_unmatched,
+    };
+
+    let harness_strip_done = storage
+        .get_meta(HARNESS_STRIP_V2_META_KEY)
+        .unwrap_or(None)
+        .is_some();
+    let harness_progress: HarnessStripProgress = storage
+        .get_meta(HARNESS_STRIP_V2_PROGRESS_META_KEY)
+        .unwrap_or(None)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let throughput_chunks_per_sec = if harness_progress.last_batch_secs > 0.001 {
+        Some(harness_progress.last_batch_chunks as f64 / harness_progress.last_batch_secs)
+    } else {
+        None
+    };
+    // Live count of file-having polluted conversations remaining — cheap
+    // (bounded by the codex corpus, not the whole DB) and matches every
+    // other status block's convention of a fresh read rather than a stale
+    // cached count. `0` once `done` without paying for the query.
+    let polluted_remaining = if harness_strip_done {
+        0
+    } else {
+        crate::import::codex_rollout::polluted_codex_rows_by_file_presence(storage)
+            .map(|(with_file, _missing)| with_file.len())
+            .unwrap_or(0)
+    };
+    let harness_strip = CodexHarnessStripStatus {
+        done: harness_strip_done,
+        polluted_remaining,
+        reimported: harness_progress.reimported_total,
+        missing_file: harness_progress.missing_file_total,
+        failed: harness_progress.failed_total,
+        last_batch_at: harness_progress.last_batch_at,
+        last_batch_chunks: harness_progress.last_batch_chunks,
+        last_batch_secs: harness_progress.last_batch_secs,
+        throughput_chunks_per_sec,
+    };
+
+    CodexBackfillStatus {
+        restamp,
+        harness_strip,
+    }
 }
 
 fn empty_trained_rerank_status() -> TrainedRerankStatus {
@@ -1748,6 +1885,7 @@ mod tests {
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
             dreaming: None,
+            codex_backfill: CodexBackfillStatus::default(),
         }
     }
 
@@ -2070,6 +2208,88 @@ mod tests {
         assert_eq!(report.chunks, 0);
         assert!(report.healthy); // empty DB passes integrity check
         assert_eq!(report.import_percent, 0.0);
+        assert!(!report.codex_backfill.restamp.done);
+        assert!(!report.codex_backfill.harness_strip.done);
+    }
+
+    #[test]
+    fn status_surfaces_codex_backfill_receipts() {
+        use crate::import::codex_rollout::{
+            HarnessStripProgress, RestampProgress, HARNESS_STRIP_V2_META_KEY,
+            HARNESS_STRIP_V2_PROGRESS_META_KEY, RESTAMP_PROGRESS_META_KEY,
+        };
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        let restamp_progress = RestampProgress {
+            attempts: 3,
+            conversations_considered: 10,
+            conversations_updated: 7,
+            conversations_unmatched: 1,
+            conversations_missing_file: 0,
+            conversations_skipped_polluted: 2,
+            chunks_updated: 500,
+            chunks_unmatched: 4,
+        };
+        storage
+            .set_meta(
+                RESTAMP_PROGRESS_META_KEY,
+                &serde_json::to_string(&restamp_progress).unwrap(),
+            )
+            .unwrap();
+        // RESTAMP_META_KEY is deliberately left unset — this pass is not done.
+
+        let harness_progress = HarnessStripProgress {
+            reimported_total: 25,
+            missing_file_total: 1,
+            failed_total: 0,
+            last_batch_at: Some("2026-09-22T00:00:00Z".to_string()),
+            last_batch_chunks: 500,
+            last_batch_secs: 2.5,
+        };
+        storage
+            .set_meta(
+                HARNESS_STRIP_V2_PROGRESS_META_KEY,
+                &serde_json::to_string(&harness_progress).unwrap(),
+            )
+            .unwrap();
+        storage
+            .set_meta(HARNESS_STRIP_V2_META_KEY, "2026-09-22T00:00:00Z")
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+
+        assert!(!report.codex_backfill.restamp.done);
+        assert!(!report.codex_backfill.restamp.attempts_exhausted);
+        assert_eq!(report.codex_backfill.restamp.attempts, 3);
+        assert_eq!(report.codex_backfill.restamp.conversations_considered, 10);
+        assert_eq!(report.codex_backfill.restamp.conversations_unmatched, 1);
+        assert_eq!(
+            report.codex_backfill.restamp.conversations_skipped_polluted,
+            2
+        );
+        assert_eq!(report.codex_backfill.restamp.chunks_unmatched, 4);
+
+        assert!(report.codex_backfill.harness_strip.done);
+        assert_eq!(
+            report.codex_backfill.harness_strip.polluted_remaining, 0,
+            "done must report zero remaining without paying for the live query"
+        );
+        assert_eq!(report.codex_backfill.harness_strip.reimported, 25);
+        assert_eq!(report.codex_backfill.harness_strip.missing_file, 1);
+        assert_eq!(
+            report
+                .codex_backfill
+                .harness_strip
+                .throughput_chunks_per_sec,
+            Some(200.0)
+        );
     }
 
     #[test]

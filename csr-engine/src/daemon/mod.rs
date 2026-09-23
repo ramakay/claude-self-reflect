@@ -526,43 +526,161 @@ impl Daemon {
         // switch off needs a daemon restart, nothing else.
         if codex_import_disabled() {
             tracing::info!("Codex rollout import disabled via CSR_NO_CODEX_IMPORT");
-        } else {
-            // One-time, meta-guarded backfill for Codex rollouts imported
-            // before the chunk-timestamp-collapse fix — runs once at daemon
-            // startup under this same (fixed-chunker) binary, so it never
-            // races an older daemon's re-imports. No-op after the first
-            // successful run (single meta lookup) — safe to attempt on
-            // every daemon start, not just the first.
-            let restamp_storage = self.storage.clone();
+        }
+
+        // Meta-guarded, bounded-retry backfill for Codex rollouts imported
+        // before the chunk-timestamp-collapse fix. Runs on the same cadence
+        // as the codex-rollout import loop below (immediately, then every 30
+        // minutes) instead of once at startup: a pass left with genuine
+        // (non-harness-polluted) content drift is retried on a later tick,
+        // up to `RESTAMP_MAX_ATTEMPTS`, rather than freezing forever the way
+        // the old one-shot's unconditional `set_meta` did. Harness-polluted
+        // conversations are skipped here, not retried — that is the
+        // `codex_harness_strip_handle` job below's responsibility.
+        let codex_restamp_handle = {
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
             let heavy_work = heavy_work.clone();
             tokio::spawn(async move {
-                let Ok(permit) = heavy_work.acquire_owned().await else {
-                    return;
-                };
-                let result = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    crate::import::codex_rollout::restamp_codex_chunk_timestamps(&restamp_storage)
-                })
-                .await;
-                match result {
-                    Ok(Ok(stats)) if !stats.already_applied => tracing::info!(
-                        conversations_considered = stats.conversations_considered,
-                        conversations_updated = stats.conversations_updated,
-                        conversations_missing_file = stats.conversations_missing_file,
-                        conversations_unmatched = stats.conversations_unmatched,
-                        chunks_updated = stats.chunks_updated,
-                        "Codex rollout chunk-timestamp backfill completed"
-                    ),
-                    Ok(Ok(_)) => {} // already_applied
-                    Ok(Err(error)) => {
-                        tracing::warn!(%error, "Codex rollout chunk-timestamp backfill failed")
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "Codex rollout chunk-timestamp backfill panicked")
+                    if codex_import_disabled() {
+                        for _ in 0..180 {
+                            if shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        }
+                        continue;
+                    }
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let restamp_storage = storage.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        crate::import::codex_rollout::restamp_codex_chunk_timestamps(
+                            &restamp_storage,
+                        )
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(stats)) if stats.already_applied || stats.attempts_exhausted => {}
+                        Ok(Ok(stats)) => tracing::info!(
+                            conversations_considered = stats.conversations_considered,
+                            conversations_updated = stats.conversations_updated,
+                            conversations_missing_file = stats.conversations_missing_file,
+                            conversations_unmatched = stats.conversations_unmatched,
+                            conversations_skipped_polluted = stats.conversations_skipped_polluted,
+                            chunks_updated = stats.chunks_updated,
+                            attempts = stats.attempts,
+                            "Codex rollout chunk-timestamp backfill pass completed"
+                        ),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Codex rollout chunk-timestamp backfill failed")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Codex rollout chunk-timestamp backfill panicked")
+                        }
+                    }
+                    for _ in 0..180 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                     }
                 }
-            });
-        }
+            })
+        };
+
+        // Daemon-owned harness-strip job: reimports codex rollouts still
+        // carrying pre-strip harness-marker content, in small (`HARNESS_
+        // STRIP_V2_BATCH_SIZE`) idle-gated batches, one `heavy_work` permit
+        // per batch rather than one held for a multi-hour, corpus-wide pass.
+        // No cursor: `harness_strip_batch` requeries "still polluted" on
+        // every call, so an interrupted run just leaves more for the next
+        // tick — a restart resumes for free. See that function's doc for the
+        // completion contract (`polluted_remaining == 0`, files-having only).
+        let codex_harness_strip_handle = {
+            let engine = Arc::new(crate::engine::Engine::from_parts(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+            ));
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..30 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    if codex_import_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
+                        )
+                    {
+                        continue;
+                    }
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    if codex_import_disabled()
+                        || !dream_cadence::is_idle(
+                            dream_cadence::last_activity_at(&storage),
+                            chrono::Utc::now(),
+                            dream_cadence::idle_secs(),
+                        )
+                    {
+                        drop(permit);
+                        continue;
+                    }
+                    let batch_engine = engine.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        crate::import::codex_rollout::harness_strip_batch(
+                            &batch_engine,
+                            crate::import::codex_rollout::HARNESS_STRIP_V2_BATCH_SIZE,
+                        )
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(stats)) if stats.already_applied => {}
+                        Ok(Ok(stats)) => tracing::info!(
+                            polluted_considered = stats.polluted_considered,
+                            reimported = stats.reimported,
+                            missing_file = stats.missing_file,
+                            failed = stats.failed,
+                            chunks_reimported = stats.chunks_reimported,
+                            polluted_remaining = stats.polluted_remaining,
+                            batch_secs = stats.batch_secs,
+                            done = stats.done,
+                            "Codex harness-strip batch completed"
+                        ),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Codex harness-strip batch failed")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Codex harness-strip batch panicked")
+                        }
+                    }
+                }
+            })
+        };
         let codex_rollout_handle = {
             let engine = Arc::new(crate::engine::Engine::from_parts(
                 self.storage.clone(),
@@ -763,6 +881,14 @@ impl Daemon {
         let _ = plans_handle.await;
         // Same index-mutation contract as plans: never detach an in-flight import.
         let _ = codex_rollout_handle.await;
+        // The harness-strip batch reimports through the same delete+reinsert
+        // path as plans/codex_rollout above (HNSW tombstone-then-reinsert) —
+        // never detach an in-flight batch.
+        let _ = codex_harness_strip_handle.await;
+        // The restamp loop only issues content-guarded `UPDATE chunks SET
+        // timestamp=...` inside one transaction per conversation — no HNSW
+        // mutation — so a timeout here cannot corrupt the search index.
+        let _ = tokio::time::timeout(timeout, codex_restamp_handle).await;
         // Memory registry only upserts its own SQLite table transactionally —
         // no HNSW mutation — so a timeout here cannot corrupt the search index.
         let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
