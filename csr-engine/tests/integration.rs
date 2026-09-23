@@ -2432,6 +2432,79 @@ lands in chunks or chunks_fts.
     );
 }
 
+// ─── WP-D low: `rebuild-index` must fail loudly on a persistence failure ───
+
+// Reviewer finding (WP-D low, `RebuildIndex`'s freshly-rebuilt branch,
+// `main.rs`): `Engine::new`'s cache-miss path only WARNS on a failed
+// `dump_to_disk` — it must, foreground processes cannot block startup on
+// persistence. Without a follow-up `flush_index_checked().await?` in the
+// `rebuild-index` command, that non-fatal warning is the only trace: the
+// command still prints "rebuilt index" and exits 0 while the on-disk cache
+// is stale or absent. This drives the actual compiled binary (not the
+// library) with an index directory that cannot be created — a regular file
+// where the directory should be, standing in for ENOSPC — and asserts a
+// non-zero exit with no false "rebuilt index" success line.
+#[test]
+fn rebuild_index_command_fails_loudly_when_the_index_directory_cannot_be_created() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_dir = tmp.path().join("db_dir");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let db_path = db_dir.join("test.db");
+
+    // Seed one real chunk BEFORE the index directory is sabotaged below, so
+    // the freshly-rebuilt index actually has content to dump (an empty
+    // index is never marked dirty, so `flush_index_checked` would be a
+    // silent no-op either way — that would not exercise the fix at all).
+    {
+        let storage = Storage::open(&db_path).unwrap();
+        let chunk = ConversationChunk {
+            id: "chunk-0".into(),
+            conversation_id: "conv".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-09-22T00:00:00Z".into(),
+            content: "x".into(),
+            message_count: 1,
+            summary: None,
+            author: csr_engine::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let embedding: Vec<f32> = vec![0.1; 384];
+        storage.insert_chunk(&chunk, &embedding).unwrap();
+    }
+
+    // `Engine::new` derives `index_dir` as `db_path.parent().join("index")`
+    // — put a REGULAR FILE there so `create_dir_all` inside `dump_to_disk`
+    // fails (not a directory), instead of an actual directory.
+    std::fs::write(db_dir.join("index"), b"not a directory").unwrap();
+
+    let projects_dir = tmp.path().join("projects");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .arg("--db-path")
+        .arg(&db_path)
+        .arg("--projects-dir")
+        .arg(&projects_dir)
+        .arg("rebuild-index")
+        .output()
+        .expect("failed to run the csr-engine binary");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "rebuild-index must exit non-zero when the index directory cannot \
+         be created; status={:?} stdout={stdout} stderr={stderr}",
+        output.status
+    );
+    assert!(
+        !stdout.contains("rebuilt index"),
+        "must never print the success line when the flush failed; \
+         stdout={stdout} stderr={stderr}"
+    );
+}
+
 // ─── v9.4 code property graph: LIVE round-trip (gate) ───
 
 mod codegraph_roundtrip {

@@ -599,7 +599,6 @@ fn main() -> Result<()> {
         .worker_threads(workers)
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run());
     // `run()` can return while a `spawn_blocking` task the daemon's
     // compaction loop started (inside `Engine::rebuild_search_index`) is
     // still streaming an HNSW rebuild on the blocking pool — shutdown
@@ -609,14 +608,21 @@ fn main() -> Result<()> {
     // implicitly, and dropping a `Runtime` blocks the dropping thread until
     // every spawned blocking task returns (tokio 1.53.1
     // `src/runtime/runtime.rs`, `src/task/blocking.rs`) — minutes, on the
-    // real corpus, well past whatever asked this process to stop (SIGTERM,
-    // an installer upgrade). `shutdown_timeout` bounds that wait instead of
-    // blocking indefinitely: the abandoned closure only builds an in-memory
-    // `SearchEngine` nothing will read once this process exits, so leaving
-    // its thread running past the timeout — until the OS reclaims it on
-    // process exit — is safe.
-    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-    result
+    // real corpus, well past whatever asked this process to stop. That
+    // includes SIGTERM (`launchctl bootout`, the installer's stop step) —
+    // `Daemon::run` waits on `daemon::wait_for_termination_signal`, which
+    // races SIGINT against an installed SIGTERM handler, specifically so
+    // SIGTERM reaches `run()`'s return here instead of killing the process
+    // at the OS's default disposition before any Rust code (including this
+    // bound) ever runs. `csr_engine::runtime::run_to_completion` bounds
+    // that wait with `shutdown_timeout` instead of blocking indefinitely:
+    // the abandoned closure only builds an in-memory `SearchEngine` nothing
+    // will read once this process exits, so leaving its thread running past
+    // the timeout — until the OS reclaims it on process exit — is safe.
+    // Extracted into `runtime::run_to_completion` (not inlined here) so the
+    // shutdown-bounding behaviour has a test that calls the exact function
+    // `main` calls — see `runtime::tests::run_to_completion_bounds_the_wait_for_an_abandoned_blocking_task`.
+    csr_engine::runtime::run_to_completion(runtime, run(), std::time::Duration::from_secs(5))
 }
 
 async fn run() -> Result<()> {

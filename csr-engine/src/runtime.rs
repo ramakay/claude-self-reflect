@@ -91,6 +91,35 @@ pub fn release_freed_pages() {
 #[cfg(not(target_os = "macos"))]
 pub fn release_freed_pages() {}
 
+/// Drive `fut` to completion on `runtime`, then shut the runtime down with a
+/// bounded wait, and return `fut`'s output. This is `main`'s entire runtime
+/// lifecycle — extracted so it is unit-testable (`main` itself is not
+/// exercised by `cargo test --lib`) and so the shutdown-bounding fix has a
+/// test that actually calls the function `main` calls, not just a
+/// `tokio::runtime::Runtime` a test built and drove itself.
+///
+/// WP-D high finding: dropping a `tokio::runtime::Runtime` blocks the
+/// dropping thread until every task on its blocking pool returns (tokio
+/// 1.53.1 `src/runtime/runtime.rs`, `src/task/blocking.rs`). `fut` (`main`'s
+/// `run()`) can return while the daemon's compaction loop has abandoned
+/// *awaiting* (not cancelled) a `spawn_blocking` streaming HNSW rebuild — a
+/// bare `runtime.block_on(fut)` followed by an implicit drop would then hang
+/// for however long that rebuild takes (minutes on the real corpus, well
+/// past whatever asked this process to stop — SIGTERM, an installer
+/// upgrade). `shutdown_timeout` bounds that wait instead: the abandoned
+/// closure only builds an in-memory `SearchEngine` nothing will read once
+/// this process exits, so leaving its thread running past the timeout —
+/// until the OS reclaims it on process exit — is safe.
+pub fn run_to_completion<F: std::future::Future>(
+    runtime: tokio::runtime::Runtime,
+    fut: F,
+    timeout: std::time::Duration,
+) -> F::Output {
+    let result = runtime.block_on(fut);
+    runtime.shutdown_timeout(timeout);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +267,55 @@ mod tests {
             "shutdown_timeout must bound the wait for the abandoned blocking \
              task instead of blocking for its full remaining duration \
              (~5s here, minutes on the real corpus); elapsed={elapsed:?}"
+        );
+    }
+
+    // Reviewer-found gap (WP-D high, second pass): the test above only
+    // exercises `tokio::runtime::Runtime::shutdown_timeout` on a runtime the
+    // test built and drove itself — it never touches `main`, so deleting
+    // `runtime.shutdown_timeout(...)` from `main.rs` (reverting to a plain
+    // `block_on` + implicit drop, the original bug) does not fail it. This
+    // test instead calls `run_to_completion` — the exact function `main`
+    // calls — with a future that spawns a 5s blocking task and abandons it,
+    // and asserts the call returns in well under that 5s. Reverting
+    // `run_to_completion` to a plain `let r = runtime.block_on(fut); r`
+    // (dropping `runtime` implicitly, no `shutdown_timeout` call) fails
+    // this test: dropping the `Runtime` blocks until the abandoned
+    // `spawn_blocking` closure finishes, so `elapsed` would be ~5s.
+    #[test]
+    fn run_to_completion_bounds_the_wait_for_an_abandoned_blocking_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let t0 = std::time::Instant::now();
+        let result = run_to_completion(
+            runtime,
+            async {
+                // Simulate the daemon's abandoned compaction rebuild: a
+                // long-running blocking closure with no cancellation point,
+                // started but never awaited before the future completes.
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                42
+            },
+            std::time::Duration::from_millis(200),
+        );
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            result, 42,
+            "run_to_completion must still return the future's output"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "run_to_completion must bound the shutdown wait for the \
+             abandoned blocking task instead of blocking for its full \
+             remaining duration (~5s here); elapsed={elapsed:?}"
         );
     }
 }

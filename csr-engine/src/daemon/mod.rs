@@ -114,6 +114,32 @@ impl Daemon {
         }
     }
 
+    /// Build an `Engine` over this daemon's real storage/embeddings/search
+    /// Arcs and its REAL `index_dir` (next to the database, independent of
+    /// `projects_dir` — e.g. `~/.claude-self-reflect/index` vs
+    /// `~/.claude/projects`). `Engine::from_parts` derives `index_dir` as
+    /// `projects_dir.join("index")`, which resolves to the wrong place for
+    /// the daemon; only `from_parts_with_index_dir` is correct here.
+    ///
+    /// The compaction loop is the caller that matters: its
+    /// `rebuild_search_index`/`dump_to_disk`/`clear_needs_compaction` must
+    /// all act on the same directory the `needs_compaction` marker check
+    /// reads, or the daemon silently compacts into a directory nothing else
+    /// looks at (WP-D low #5 — the Critical #1 bug this method exists to
+    /// make impossible to reintroduce by construction: a caller cannot spell
+    /// the wrong-directory `from_parts` call without going out of its way to
+    /// bypass this method). Every daemon loop that needs an `Engine` should
+    /// route through this rather than calling `Engine::from_parts*` inline.
+    fn compaction_engine(&self) -> crate::engine::Engine {
+        crate::engine::Engine::from_parts_with_index_dir(
+            self.storage.clone(),
+            self.embeddings.clone(),
+            self.search.clone(),
+            self.projects_dir.clone(),
+            self.index_dir.clone(),
+        )
+    }
+
     /// Acquire a lockfile to prevent multiple daemon instances.
     /// Uses OS-level advisory locking (flock) via the fs2 crate.
     pub fn acquire_lock() -> Result<std::fs::File> {
@@ -158,6 +184,12 @@ impl Daemon {
         // Shared one-owner permit for watcher batches, plan imports, and
         // dream cycles. Owned permits provide RAII release on every exit.
         let heavy_work = Arc::new(Semaphore::new(1));
+
+        // Built up front (before `self.api_client` is moved out of `self`
+        // below, which would otherwise make any later `&self` method call
+        // a partial-move borrow error) — the compaction loop's `Engine`
+        // over this daemon's real index_dir. See `Self::compaction_engine`.
+        let compaction_engine = Arc::new(self.compaction_engine());
 
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
@@ -389,9 +421,16 @@ impl Daemon {
                     }
                     let s = storage.clone();
                     let projects_root = projects_root.clone();
-                    let permit = match heavy_work.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => return,
+                    // WP-D low: recheck shutdown at the acquire/handoff
+                    // boundary, not just before the wait — a compaction
+                    // holding this permit for ~11 min can release it right
+                    // as SIGINT arrives, and this loop must not then start a
+                    // fresh scan shutdown is already trying to end.
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
                     };
                     let _ = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
@@ -544,9 +583,22 @@ impl Daemon {
                         dirs::home_dir().map(|home| home.join(".codex/sessions"))
                     };
                     if let Some(root) = codex_root.filter(|root| root.exists()) {
-                        let permit = match heavy_work.clone().acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => return,
+                        // WP-D low: recheck shutdown at the acquire/handoff
+                        // boundary. A compaction can hold `heavy_work` for
+                        // ~11 min and release it exactly as SIGINT abandons
+                        // that rebuild (`compact_if_marked`'s `select!`) —
+                        // without this recheck, this loop would then pick
+                        // up the freed permit and run a full
+                        // `import_changed_rollouts` pass (which takes no
+                        // shutdown flag of its own) that the daemon's
+                        // shutdown sequence awaits with no timeout.
+                        let Some(permit) = acquire_heavy_work_unless_shutdown(
+                            heavy_work.clone(),
+                            shutdown.as_ref(),
+                        )
+                        .await
+                        else {
+                            return;
                         };
                         let adapter_engine = engine.clone();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -648,21 +700,15 @@ impl Daemon {
         // handling). The daemon is where that deferred work actually runs, out
         // of the request path.
         let compaction_handle = {
-            // The daemon's real index directory (`self.index_dir`, next to
-            // the database) is independent of `self.projects_dir`
-            // (`~/.claude/projects`). `Engine::from_parts` derives
-            // `index_dir` as `projects_dir.join("index")`, which resolves
-            // to the wrong place here — use the explicit-index-dir
-            // constructor so this engine's `rebuild_search_index`/
-            // `dump_to_disk`/`clear_needs_compaction` all act on the same
-            // directory the marker check below reads.
-            let engine = Arc::new(crate::engine::Engine::from_parts_with_index_dir(
-                self.storage.clone(),
-                self.embeddings.clone(),
-                self.search.clone(),
-                self.projects_dir.clone(),
-                self.index_dir.clone(),
-            ));
+            // Built up front via `Self::compaction_engine`, over the
+            // daemon's real index directory (`self.index_dir`, next to the
+            // database) — independent of `self.projects_dir`
+            // (`~/.claude/projects`) — so this engine's
+            // `rebuild_search_index`/`dump_to_disk`/`clear_needs_compaction`
+            // all act on the same directory the marker check below reads.
+            // See that method's doc for why a plain `Engine::from_parts`
+            // here is the WP-D low #5 bug.
+            let engine = compaction_engine;
             let index_dir = self.index_dir.clone();
             let shutdown = shutdown.clone();
             let heavy_work = heavy_work.clone();
@@ -694,7 +740,7 @@ impl Daemon {
         }
 
         // Wait for Ctrl+C
-        tokio::signal::ctrl_c().await?;
+        wait_for_termination_signal().await?;
         tracing::info!("shutting down daemon gracefully");
 
         // Signal all loops to stop
@@ -770,6 +816,38 @@ impl Daemon {
         tracing::info!("daemon stopped");
         Ok(())
     }
+}
+
+/// Wait for a termination signal: Ctrl+C (SIGINT — an interactive
+/// `csr-engine daemon` run) OR SIGTERM (what `launchctl bootout` and the
+/// installer's stop step actually send).
+///
+/// WP-D low: a bare `tokio::signal::ctrl_c().await` only ever resolves on
+/// SIGINT. SIGTERM is left at the process's default disposition —
+/// immediate termination, no Rust code runs at all — which skips the ENTIRE
+/// graceful shutdown sequence in `Daemon::run` below this call (setting the
+/// shutdown flag, joining every loop, flushing the HNSW index). A previous
+/// comment in `main.rs` claimed SIGTERM was already one of the paths
+/// `runtime::run_to_completion`'s bounded wait covers; that was never true
+/// while the daemon itself died to SIGTERM before `run()` could even
+/// return. Calling `tokio::signal::unix::signal` installs a handler that
+/// intercepts SIGTERM for the rest of this process's life instead of the OS
+/// default — racing it against `ctrl_c()` makes either signal run the same
+/// graceful path.
+#[cfg(unix)]
+async fn wait_for_termination_signal() -> Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+        _ = sigterm.recv() => Ok(()),
+    }
+}
+
+/// No SIGTERM-specific handling exists on non-unix targets; Ctrl+C is the
+/// only termination signal Windows Ctrl handlers map onto via `ctrl_c()`.
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() -> Result<()> {
+    tokio::signal::ctrl_c().await.map_err(Into::into)
 }
 
 /// Resolves once the shutdown flag is set. Used to race a bounded-duration
@@ -1888,6 +1966,89 @@ mod tests {
 
         // A second call with no marker present must be a no-op.
         assert!(!compact_if_marked(&engine, &index_dir, &heavy_work, &shutdown).await);
+    }
+
+    // --- WP-D low #5, second pass: the test above builds its Engine
+    // directly with `from_parts_with_index_dir` and never exercises
+    // `Daemon::run`'s OWN construction — reverting `Daemon::run`'s
+    // compaction-loop construction back to the wrong-directory
+    // `Engine::from_parts` (the original Critical #1 bug) left every
+    // existing daemon test green. This test goes through `Daemon::new` and
+    // the (now-extracted) `Daemon::compaction_engine` method instead, with
+    // `projects_dir != index_dir.parent()` (mirrors the real daemon:
+    // `~/.claude/projects` vs `~/.claude-self-reflect/index`), and asserts
+    // the constructed engine's `index_dir()` is the daemon's real one. ---
+
+    #[tokio::test]
+    async fn daemons_compaction_engine_uses_the_daemons_real_index_dir_not_projects_dir_join_index()
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let projects_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("real_index");
+        std::fs::create_dir_all(&index_dir).unwrap();
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(64)));
+
+        let daemon = Daemon::new(
+            storage,
+            embeddings,
+            search,
+            projects_dir.clone(),
+            index_dir.clone(),
+            DaemonConfig::default(),
+            false,
+        );
+
+        let engine = daemon.compaction_engine();
+        assert_eq!(
+            engine.index_dir(),
+            index_dir.as_path(),
+            "Daemon::compaction_engine must build over the daemon's real \
+             index_dir, not projects_dir.join(\"index\") — reverting to \
+             `Engine::from_parts(storage, embeddings, search, projects_dir)` \
+             (the original Critical #1 bug) must fail this assertion"
+        );
+        assert_ne!(
+            engine.index_dir(),
+            projects_dir.join("index").as_path(),
+            "sanity: projects_dir/index must not be the real index_dir in this rig"
+        );
+    }
+
+    // --- WP-D low: `Daemon::run` must also stop on SIGTERM, not only
+    // SIGINT (`ctrl_c`) — `launchctl bootout` and the installer's stop step
+    // send SIGTERM, which the OS's default disposition kills the process
+    // on immediately (no Rust code runs, no graceful shutdown/flush). ---
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_termination_signal_resolves_on_sigterm_not_just_sigint() {
+        // Installing tokio's SIGTERM handler (inside the function under
+        // test) intercepts SIGTERM for the rest of THIS test process's
+        // life instead of the OS default (terminate) — so raising it below
+        // is safe and does not kill the test binary.
+        let handle = tokio::spawn(wait_for_termination_signal());
+        // Give the handler a moment to install before raising.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // SAFETY: `raise` with a valid signal number sends SIGTERM to this
+        // process; the installed tokio handler above intercepts it.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect(
+                "wait_for_termination_signal must resolve on SIGTERM, not hang \
+                 waiting on SIGINT alone",
+            )
+            .expect("task must not panic");
+        assert!(
+            result.is_ok(),
+            "SIGTERM must resolve as a clean shutdown signal"
+        );
     }
 
     #[tokio::test]

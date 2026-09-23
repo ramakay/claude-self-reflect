@@ -78,6 +78,22 @@ pub struct SearchEngine {
     /// forcing a full rebuild on every single startup). See `dump_to_disk`'s
     /// doc comment for the full reasoning.
     manifest_backed: bool,
+    /// Compaction generation this engine last loaded (`load_from_disk`) or
+    /// published (`dump_to_disk`) — mirrors `IndexManifest::epoch`.
+    ///
+    /// `manifest_backed` plus the per-side dirty flags stop a long-lived
+    /// engine from republishing a side it never touched, but they say
+    /// nothing about a side the engine DID genuinely touch (a real
+    /// `insert_chunk`/`insert_reflection`, not just startup reconciliation)
+    /// after loading — if a concurrent compaction (a different process's
+    /// `rebuild_search_index`) replaced that exact side on disk with a
+    /// smaller, tombstone-free generation in the meantime, dirty-flag logic
+    /// alone still says "publish it, it's genuinely dirty", republishing
+    /// this engine's larger, pre-compaction graph over the newer one.
+    /// `epoch` closes that gap: `dump_to_disk` refuses to publish EITHER
+    /// side from memory (dirty or not) when the on-disk manifest's epoch is
+    /// newer than this value — see `dump_to_disk`'s stale-generation guard.
+    epoch: u64,
 }
 
 // HNSW parameters
@@ -184,6 +200,22 @@ struct IndexManifest {
     chunk_basename: String,
     #[serde(default = "default_reflection_basename")]
     reflection_basename: String,
+    /// Compaction generation counter. Bumped by `dump_to_disk` every time an
+    /// engine that was NOT `manifest_backed` at call time (i.e. built fresh
+    /// from SQLite by `rebuild_search_index`/`rebuild_search_index_streaming`
+    /// — a real compaction, not an incremental update) publishes. `#[serde(
+    /// default)]` so a pre-epoch manifest on disk (written before this field
+    /// existed) reads as generation 0, which is always `<=` any freshly
+    /// bumped generation — so an old manifest never falsely looks newer than
+    /// a process that has never seen an epoch field at all.
+    ///
+    /// See `dump_to_disk`'s stale-generation guard (WP-D medium: the
+    /// dirty-flag-only ping-pong fix only covered reconciliation-only
+    /// dirtiness; a long-lived engine's own genuine new content on the side
+    /// that a concurrent compaction just replaced was still published from
+    /// memory, silently reverting the compaction).
+    #[serde(default)]
+    epoch: u64,
 }
 
 fn default_chunk_basename() -> String {
@@ -219,6 +251,7 @@ impl SearchEngine {
             chunk_dirty: false,
             reflection_dirty: false,
             manifest_backed: false,
+            epoch: 0,
         }
     }
 
@@ -766,6 +799,39 @@ impl SearchEngine {
                 .filter(|m| m.version == MANIFEST_VERSION);
         let force_full = existing_manifest.is_none();
 
+        // WP-D medium (compaction epoch guard): `manifest_backed` plus the
+        // per-side dirty flags stop a long-lived engine from republishing a
+        // side it never touched, but they don't cover a side the engine DID
+        // genuinely touch (a real `insert_chunk`/`insert_reflection`, not
+        // just startup reconciliation — see `clear_reconciliation_dirty`)
+        // after loading, if a CONCURRENT compaction (a different process's
+        // `rebuild_search_index`, which always starts from a non-manifest-
+        // backed `SearchEngine::new` and so always bumps the epoch below)
+        // replaced that exact side on disk with a newer, smaller,
+        // tombstone-free generation in the meantime. Dirty-flag logic alone
+        // still says "publish it, it's genuinely dirty" and republishes
+        // this engine's larger, pre-compaction graph over the newer one —
+        // reviving the tombstones the compaction just removed. `epoch`
+        // closes that gap: read under the same `index.lock` this whole
+        // function already holds, so this is a consistent comparison
+        // against whatever the last writer actually published. Held ACROSS
+        // both sides — a compaction is a single atomic swap of the whole
+        // manifest, so a stale engine must not publish EITHER side from
+        // memory, not just the one whose dirty flag happens to be set.
+        let on_disk_epoch = existing_manifest.as_ref().map(|m| m.epoch).unwrap_or(0);
+        let stale_generation =
+            self.manifest_backed && existing_manifest.is_some() && on_disk_epoch > self.epoch;
+        if stale_generation {
+            tracing::warn!(
+                on_disk_epoch,
+                engine_epoch = self.epoch,
+                "on-disk index generation is newer than this engine's — refusing to \
+                 publish from memory this call; carrying the newer generation forward. \
+                 Any genuine new content already in SQLite is picked up by the next load's \
+                 additive backfill."
+            );
+        }
+
         // Dump a side to a NEW generation only when it actually changed (skip empty
         // indices — the generation dump fails on empty; skip untouched indices —
         // nothing changed since the generation on disk was last written, so
@@ -789,7 +855,7 @@ impl SearchEngine {
         // names the guarded condition once so the manifest logic below can ask "did we
         // really just write this side" without repeating it.
         let chunk_actually_dumped =
-            (self.chunk_dirty || force_full) && !self.chunk_id_map.is_empty();
+            !stale_generation && (self.chunk_dirty || force_full) && !self.chunk_id_map.is_empty();
         let chunk_basename = if chunk_actually_dumped {
             dump_hnsw_generation(&self.chunk_index, dir, "chunks")
                 .map_err(|e| anyhow::anyhow!("chunk index dump failed: {}", e))?
@@ -802,8 +868,9 @@ impl SearchEngine {
             default_chunk_basename()
         };
 
-        let reflection_actually_dumped =
-            (self.reflection_dirty || force_full) && !self.reflection_id_map.is_empty();
+        let reflection_actually_dumped = !stale_generation
+            && (self.reflection_dirty || force_full)
+            && !self.reflection_id_map.is_empty();
         let reflection_basename = if reflection_actually_dumped {
             dump_hnsw_generation(&self.reflection_index, dir, "reflections")
                 .map_err(|e| anyhow::anyhow!("reflection index dump failed: {}", e))?
@@ -860,6 +927,27 @@ impl SearchEngine {
                 )
             };
 
+        // Compaction generation to publish. `!self.manifest_backed` means
+        // this engine came from `SearchEngine::new` and was populated
+        // directly from SQLite by `rebuild_search_index`/
+        // `rebuild_search_index_streaming` (or `Engine::new`'s cache-miss
+        // path) — a genuine compaction/full rebuild — so its first publish
+        // always claims a strictly newer generation than whatever (if
+        // anything) is on disk, guaranteeing any manifest-backed engine
+        // still holding an older epoch loses the `stale_generation` race
+        // above on ITS next dump. A `stale_generation` dump adopts the
+        // newer on-disk epoch it just deferred to, rather than
+        // republishing under its own stale one. Otherwise (a normal,
+        // non-stale, manifest-backed update) nothing compacted
+        // concurrently, so the epoch carries forward unchanged.
+        let new_epoch = if !self.manifest_backed {
+            on_disk_epoch.wrapping_add(1)
+        } else if stale_generation {
+            on_disk_epoch
+        } else {
+            on_disk_epoch.max(self.epoch)
+        };
+
         // Write manifest atomically (tmp + rename)
         let manifest = IndexManifest {
             version: MANIFEST_VERSION,
@@ -871,6 +959,7 @@ impl SearchEngine {
             active_reflection_count,
             chunk_basename,
             reflection_basename,
+            epoch: new_epoch,
         };
 
         write_manifest_atomically(dir, &manifest)?;
@@ -881,6 +970,7 @@ impl SearchEngine {
         // Lock is released when lock_file is dropped
         self.chunk_dirty = false;
         self.reflection_dirty = false;
+        self.epoch = new_epoch;
         // The manifest we just published (`std::fs::rename` above already
         // succeeded — this line only runs on that success path, never on an
         // early `?` return) now describes this engine's in-memory maps for
@@ -890,6 +980,13 @@ impl SearchEngine {
         // `force_full` above) — so after this write, `self.chunk_id_map`/
         // `self.reflection_id_map` are exactly what the manifest on disk
         // says, regardless of whether this engine started out manifest-backed.
+        // EXCEPT under `stale_generation`: there, the manifest we just wrote
+        // describes the on-disk generation we deferred to, not this
+        // engine's own in-memory maps, which still hold whatever this
+        // process actually inserted/removed — deliberately left as-is (not
+        // reset from the manifest) so this process keeps serving its own
+        // superset of content until the epoch race resolves; SQLite is the
+        // durable record, and the next fresh load reconciles everything.
         // A rebuilt (`SearchEngine::new`) engine that has never dumped is
         // NOT yet in this state — that's `manifest_only_carries_forward_on_a_manifest_backed_engine`
         // — but one that just published successfully is, from this point on,
@@ -1086,6 +1183,7 @@ impl SearchEngine {
             chunk_dirty: false,
             reflection_dirty: false,
             manifest_backed: true,
+            epoch: manifest.epoch,
         })
     }
 }
@@ -2017,6 +2115,7 @@ mod tests {
             active_reflection_count: 0,
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
+            epoch: 0,
         };
         std::fs::write(
             dir.join("manifest.json"),
@@ -2226,6 +2325,7 @@ mod tests {
             active_reflection_count: 0,
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
+            epoch: 0,
         };
 
         write_manifest_atomically(dir, &manifest).unwrap();
