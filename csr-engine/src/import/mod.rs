@@ -2,6 +2,7 @@ pub mod backfill;
 pub mod codex_rollout;
 pub mod coedit_backfill;
 pub mod dream_marker;
+pub mod entrypoint_backfill;
 pub mod memory_registry;
 pub mod plans;
 pub mod provenance_backfill;
@@ -105,6 +106,13 @@ pub(crate) struct ParsedConversation {
     pub chunks: Vec<ConversationChunk>,
     pub suppression: CsrSuppressionStats,
     pub evidence: HashMap<String, crate::provenance::ChunkEvidence>,
+    /// The transcript's own `"entrypoint"` field (`cli`, `sdk-cli`, `sdk-*`,
+    /// `claude-desktop`, ...), read verbatim off the first JSONL line that
+    /// carries one. `None` when no line in the file has the field (older
+    /// transcripts, or a non-Claude-Code source) — callers must treat that as
+    /// "unknown", never as a headless signal. See
+    /// `storage::queries::is_headless_entrypoint`.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,6 +587,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
     let mut first_user_message: Option<String> = None;
     let mut agent_prompt_checked = false;
     let mut csr_sanitizer = CsrMessageSanitizer::default();
+    let mut entrypoint: Option<String> = None;
 
     loop {
         let line_start = byte_offset;
@@ -600,6 +609,18 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // The harness stamps `"entrypoint"` on most record types (user,
+        // assistant, system, attachment, ...), not only the ones this loop
+        // keeps as messages below — capture it off the first line that has
+        // it, before the type filter below would `continue` past it.
+        if entrypoint.is_none() {
+            if let Some(ep) = parsed.get("entrypoint").and_then(|v| v.as_str()) {
+                if !ep.is_empty() {
+                    entrypoint = Some(ep.to_string());
+                }
+            }
+        }
 
         // Extract message type
         let msg_type = parsed
@@ -638,6 +659,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
                         chunks: Vec::new(),
                         suppression: csr_sanitizer.stats,
                         evidence: HashMap::new(),
+                        entrypoint,
                     });
                 }
             }
@@ -772,6 +794,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
             chunks: Vec::new(),
             suppression: csr_sanitizer.stats,
             evidence: HashMap::new(),
+            entrypoint,
         });
     }
 
@@ -787,6 +810,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
                 chunks: Vec::new(),
                 suppression: csr_sanitizer.stats,
                 evidence: HashMap::new(),
+                entrypoint,
             });
         }
     }
@@ -836,6 +860,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
         chunks,
         suppression: csr_sanitizer.stats,
         evidence,
+        entrypoint,
     })
 }
 

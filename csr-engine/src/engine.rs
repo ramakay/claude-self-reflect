@@ -451,7 +451,12 @@ impl Engine {
             chunks,
             suppression,
             evidence,
+            entrypoint,
         } = parsed;
+        if let Some(ep) = entrypoint.as_deref() {
+            self.storage
+                .set_conversation_entrypoint(&conversation_id, ep)?;
+        }
         if chunks.is_empty() {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent

@@ -484,6 +484,20 @@ pub fn run(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_chunk_provenance_author ON chunk_provenance(author);
 
+        -- W3-B1 review#2 (HIGH): the transcript's own `entrypoint` field
+        -- (`cli`, `sdk-cli`, `sdk-*`, `claude-desktop`, ...), recorded once
+        -- per conversation at import time. Replaces
+        -- `session_registry`-absence as the headless signal for
+        -- `queries::filter_unregistered_conversation_rows` — registry
+        -- absence only ever meant \"never typed a prompt through
+        -- history.jsonl\", which is also true of a real interactive session
+        -- history.jsonl never recorded. Missing here (never populated, or
+        -- pre-dates this column) means \"unknown\", not \"headless\".
+        CREATE TABLE IF NOT EXISTS conversation_entrypoint (
+            conversation_id TEXT PRIMARY KEY,
+            entrypoint      TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS derivation_ledger (
             id           TEXT NOT NULL,
             content      TEXT NOT NULL,

@@ -268,7 +268,11 @@ impl FileWatcher {
             chunks,
             suppression,
             evidence,
+            entrypoint,
         } = parsed;
+        if let Some(ep) = entrypoint.as_deref() {
+            self.storage.set_conversation_entrypoint(&conv_id, ep)?;
+        }
         if chunks.is_empty() {
             // Record the skip so this file isn't re-parsed every watcher pass
             // and import_percent counts it as processed.

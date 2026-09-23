@@ -966,6 +966,34 @@ impl Storage {
         queries::get_chunk_source(&conn, id)
     }
 
+    /// See `queries::set_conversation_entrypoint`.
+    pub fn set_conversation_entrypoint(
+        &self,
+        conversation_id: &str,
+        entrypoint: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_conversation_entrypoint(&conn, conversation_id, entrypoint)
+    }
+
+    /// The recorded `conversation_entrypoint` value for one conversation, or
+    /// `None` when never recorded — test/inspection helper; the hot filter
+    /// path uses the batched `queries::conversation_entrypoints` instead.
+    pub fn get_conversation_entrypoint(&self, conversation_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_conversation_entrypoint(&conn, conversation_id)
+    }
+
+    /// See `queries::pending_entrypoint_backfill_batch`.
+    pub fn pending_entrypoint_backfill_batch(
+        &self,
+        after_file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::pending_entrypoint_backfill_batch(&conn, after_file_path, limit)
+    }
+
     pub fn rescope_sidechain_conversation(
         &self,
         conversation_id: &str,

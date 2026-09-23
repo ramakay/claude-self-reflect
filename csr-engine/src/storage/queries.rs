@@ -1392,10 +1392,13 @@ fn recent_conversation_ids_by_activity_unscoped(
 
 /// How many of a conversation's earliest-by-rowid chunks are considered as
 /// preview candidates in `recent_chunk_rows_for`. Bounded so the query stays
-/// cheap regardless of conversation size — a real human/assistant turn
-/// almost always shows up within the first few chunks even behind a harness
-/// wrapper or two.
-const PREVIEW_CANDIDATE_WINDOW: i64 = 8;
+/// cheap regardless of conversation size. Raised from 8 (W3-B1 review#2,
+/// MEDIUM): a still-polluted Codex rollout's harness block routinely spans
+/// well past 8 stored chunks (CSR's chunker has no idea the source text was
+/// boilerplate, so it keeps splitting it at its normal char budget) — a live
+/// case measured the real prompt landing at seq 12. 32 covers that with
+/// margin while staying a small, bounded `rowid <` range.
+const PREVIEW_CANDIDATE_WINDOW: i64 = 32;
 
 /// True when `content` is harness/plumbing noise that must never win as a
 /// conversation's recent-work preview, even when it is the technically
@@ -1416,20 +1419,106 @@ fn is_noisy_preview(source: &str, content: &str) -> bool {
         || content.starts_with("<command-name>")
 }
 
+/// Open/close tag pairs for the harness blocks `import::codex_rollout`'s
+/// (private) `CODEX_HARNESS_MARKERS` can open, observed on real rollouts.
+/// Used to track a running *nesting depth* across a Codex rollout's harness
+/// preamble rather than a plain "have we seen any closing tag yet" flag: on
+/// the live corpus, multiple blocks are packed back-to-back inside ONE
+/// original message with no chunk-boundary alignment — a live case has
+/// `<recommended_plugins>`'s closing tag and the *next* block's
+/// (`<INSTRUCTIONS>`, the body of "# AGENTS.md instructions") opening tag
+/// landing in the very same stored chunk. A "first closing tag ends the
+/// span" rule reopens the pick right there, on that next block's own
+/// boilerplate body, instead of staying closed until IT closes too. Net
+/// depth (total opens minus total closes, accumulated chunk by chunk) stays
+/// open across exactly that case, however many blocks are chained.
+const CODEX_HARNESS_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<recommended_plugins>", "</recommended_plugins>"),
+    ("<INSTRUCTIONS>", "</INSTRUCTIONS>"),
+    ("<environment_context>", "</environment_context>"),
+    ("<user_instructions>", "</user_instructions>"),
+    ("<permissions instructions>", "</permissions instructions>"),
+    ("<codex_internal_context>", "</codex_internal_context>"),
+    ("<skills_instructions>", "</skills_instructions>"),
+];
+
+/// Net harness-tag depth contributed by one chunk's content: total opening
+/// occurrences minus total closing occurrences, summed across every pair in
+/// `CODEX_HARNESS_TAG_PAIRS`. Can be negative (a chunk holding only a
+/// closing tag with no open of its own — the common case for the chunk that
+/// finally ends a multi-chunk span).
+fn harness_tag_depth_delta(content: &str) -> i32 {
+    CODEX_HARNESS_TAG_PAIRS
+        .iter()
+        .map(|(open, close)| {
+            content.matches(open).count() as i32 - content.matches(close).count() as i32
+        })
+        .sum()
+}
+
+/// Index of the first candidate in `candidates` (ordered ascending by rowid,
+/// i.e. import order) that is a real recent-work preview — skipping not just
+/// individually-noisy chunks (`is_noisy_preview`) but a whole open Codex
+/// harness span once one starts, tracked as a running tag-nesting `depth`
+/// (see `harness_tag_depth_delta`) so a span that closes one block and opens
+/// the next within the same chunk stays open, not reset. Falls back to `0`
+/// (the group's true first chunk) when every candidate in the window is
+/// noise/span, so a preview is never lost outright.
+fn pick_preview_index(candidates: &[(ConversationChunk, String, String)]) -> usize {
+    let mut depth: i32 = 0;
+    for (i, (chunk, source, _)) in candidates.iter().enumerate() {
+        let is_codex = source == "codex_rollout";
+        let opens_here =
+            is_codex && crate::import::codex_rollout::is_harness_context_item(&chunk.content);
+        if depth > 0 || opens_here {
+            if is_codex {
+                depth = (depth + harness_tag_depth_delta(&chunk.content)).max(0);
+            }
+            continue;
+        }
+        if is_noisy_preview(source, &chunk.content) {
+            continue;
+        }
+        return i;
+    }
+    0
+}
+
 /// Resolve each conversation's representative chunk plus its source
 /// adapter, keyed off already-resolved `(conversation_id,
 /// last_activity_timestamp)` pairs. One bounded `IN (...)` query rather than
 /// a point query per id; ordering of the input pairs is preserved on output.
 ///
-/// The representative chunk is the first (by rowid, i.e. the conversation's
-/// true first chunk) among the first `PREVIEW_CANDIDATE_WINDOW` chunks that
-/// isn't `is_noisy_preview` — not simply `MIN(rowid)` — so a harness-marker-
-/// polluted Codex rollout or a Claude session that opens with `/login`
-/// previews its first real content instead of boilerplate. Falls back to
-/// the group's very first chunk when every candidate in the window is
-/// noise, so a preview is never lost outright. `first_chunk_ts` (used only
-/// for headless codex burst detection) always stays the conversation's true
-/// first-chunk timestamp regardless of which chunk wins as the preview.
+/// The representative chunk is the first (by `seq`, i.e. the conversation's
+/// true message order — see the `ROW_NUMBER()` window below) among the
+/// first `PREVIEW_CANDIDATE_WINDOW` chunks that isn't `is_noisy_preview` —
+/// not simply the earliest chunk — so a harness-marker-polluted Codex
+/// rollout or a Claude session that opens with `/login` previews its first
+/// real content instead of boilerplate. Falls back to the group's very
+/// first chunk when every candidate in the window is noise, so a preview is
+/// never lost outright. `first_chunk_ts` (used only for headless codex
+/// burst detection) always stays the conversation's true first-chunk
+/// timestamp regardless of which chunk wins as the preview.
+///
+/// W3-B1 review#2 (LOW): bounds by `seq < N`, not a `rowid <` range.
+/// `rowid` is insertion order, not conversation order — the watcher imports
+/// incrementally and interleaves conversations, so two chunks of the *same*
+/// conversation can land dozens of rows apart, and a `rowid <` window sized
+/// for contiguous rowids can end up holding a single chunk of a session that
+/// legitimately has more. `seq` (written on every insert — see
+/// `insert_chunk_with_source`) is the session's own message order and has
+/// none of that interleaving; every conversation's true first chunk is
+/// always `seq = 0` (`push_chunk` in `import/mod.rs` assigns it as the
+/// chunk's own index within a full from-scratch re-parse of the file, never
+/// a running total across incremental passes), so — unlike `rowid`, whose
+/// per-conversation minimum genuinely varies and has to be looked up — the
+/// bound is the plain literal `?`, no correlated subquery needed on that
+/// branch. The `rowid` branch (and its `MIN(rowid)` lookup) stays only as
+/// the fallback for the sliver of rows written before the nullable `seq`
+/// column existed and were never backfilled (see that migration's comment);
+/// per-row short-circuit evaluation means the subquery only ever runs for
+/// those legacy rows, so this keeps the original query's performance
+/// characteristics for every row that already has `seq`.
 fn recent_chunk_rows_for(
     conn: &Connection,
     ids: &[(String, String)],
@@ -1443,16 +1532,21 @@ fn recent_chunk_rows_for(
                 c.summary, c.is_sidechain, c.source, c.timestamp \
          FROM chunks c \
          WHERE c.conversation_id IN ({placeholders}) \
-           AND c.rowid < (SELECT MIN(rowid) FROM chunks INDEXED BY idx_chunks_conversation \
-                           WHERE conversation_id = c.conversation_id) + ?{} \
-         ORDER BY c.conversation_id, c.rowid",
+           AND ( \
+                 (c.seq IS NOT NULL AND c.seq < ?{}) \
+              OR (c.seq IS NULL AND c.rowid < (SELECT MIN(rowid) FROM chunks INDEXED BY idx_chunks_conversation \
+                                                 WHERE conversation_id = c.conversation_id) + ?{}) \
+           ) \
+         ORDER BY c.conversation_id, COALESCE(c.seq, c.rowid)",
         ids.len() + 1,
+        ids.len() + 2,
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut qparams: Vec<&dyn rusqlite::ToSql> = ids
         .iter()
         .map(|(id, _)| id as &dyn rusqlite::ToSql)
         .collect();
+    qparams.push(&PREVIEW_CANDIDATE_WINDOW);
     qparams.push(&PREVIEW_CANDIDATE_WINDOW);
     let candidate_rows = stmt
         .query_map(qparams.as_slice(), |row| {
@@ -1489,10 +1583,7 @@ fn recent_chunk_rows_for(
             continue;
         };
         let first_chunk_ts = candidates[0].2.clone();
-        let pick = candidates
-            .iter()
-            .position(|(chunk, source, _)| !is_noisy_preview(source, &chunk.content))
-            .unwrap_or(0);
+        let pick = pick_preview_index(&candidates);
         let (mut chunk, source, _) = candidates.swap_remove(pick);
         chunk.timestamp = last_ts.clone();
         out.push(RecentChunkRow {
@@ -1504,87 +1595,138 @@ fn recent_chunk_rows_for(
     Ok(out)
 }
 
-/// Registry ids among `candidates` present in `session_registry` — the
-/// interactive-session spine built from `history.jsonl`. Distinct from
-/// `known_session_ids` (which also matches on bare `chunks.conversation_id`
-/// presence and so would trivially "know" every headless conversation too,
-/// defeating the point of this check).
-fn session_registry_member_ids(
+/// Entrypoint values (`sdk-cli`, `sdk-headless`, any other `sdk-*` variant)
+/// that are a *positive* signal a conversation was never driven by a typed
+/// prompt — the harness only ever stamps these on a headless `claude -p`
+/// (SDK) invocation, never on an interactive session. `cli` and
+/// `claude-desktop` (and anything else) are real, human-facing entrypoints
+/// and must never be treated as headless here.
+fn is_headless_entrypoint(entrypoint: &str) -> bool {
+    entrypoint.starts_with("sdk-")
+}
+
+/// `conversation_id -> entrypoint` for every id in `candidates` that has a
+/// row in `conversation_entrypoint` (see that table's migration comment).
+/// Ids absent from the map are "unknown", not "headless" — callers must
+/// fail open on absence, never treat it as the positive signal.
+fn conversation_entrypoints(
     conn: &Connection,
     candidates: &[String],
-) -> Result<std::collections::HashSet<String>> {
-    use std::collections::HashSet;
+) -> Result<HashMap<String, String>> {
     if candidates.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(HashMap::new());
     }
     // Batched ≤500 candidates per statement — see `known_session_ids`'s doc
     // for why (SQLITE_MAX_VARIABLE_NUMBER on large transcript dirs).
     const BATCH: usize = 500;
-    let mut out = HashSet::new();
+    let mut out = HashMap::new();
     for batch in candidates.chunks(BATCH) {
         let placeholders = string_placeholders(batch.len());
-        let sql =
-            format!("SELECT session_id FROM session_registry WHERE session_id IN ({placeholders})");
+        let sql = format!(
+            "SELECT conversation_id, entrypoint FROM conversation_entrypoint \
+             WHERE conversation_id IN ({placeholders})"
+        );
         let mut stmt = conn.prepare(&sql)?;
         let qparams: Vec<&dyn rusqlite::ToSql> =
             batch.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(qparams.as_slice(), |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(qparams.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
         for row in rows {
-            out.insert(row?);
+            let (id, ep) = row?;
+            out.insert(id, ep);
         }
     }
     Ok(out)
 }
 
-/// Latest `last_ts` across all of `session_registry`, or `None` when the
-/// registry is empty (never seeded — e.g. before the first daemon
-/// `history.jsonl` scan). `None` is the fail-open signal for
-/// `filter_unregistered_conversation_rows`: an empty registry must never be
-/// read as "nothing is a real session".
-fn session_registry_max_last_ts(conn: &Connection) -> Result<Option<String>> {
-    conn.query_row("SELECT MAX(last_ts) FROM session_registry", [], |row| {
-        row.get::<_, Option<String>>(0)
-    })
-    .map_err(|e| anyhow::anyhow!("{}", e))
+/// Persist (or overwrite) `conversation_id`'s transcript `entrypoint`. Called
+/// once per import (live watcher + batch importer) right after parsing —
+/// see `import::ParsedConversation::entrypoint`'s doc comment for where the
+/// value comes from.
+pub fn set_conversation_entrypoint(
+    conn: &Connection,
+    conversation_id: &str,
+    entrypoint: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO conversation_entrypoint (conversation_id, entrypoint) VALUES (?1, ?2)
+         ON CONFLICT(conversation_id) DO UPDATE SET entrypoint = excluded.entrypoint",
+        params![conversation_id, entrypoint],
+    )?;
+    Ok(())
 }
 
-/// True when `candidate_ts` is later than `bound_ts`. Falls back to `true`
-/// (treat as later, i.e. trust the row) whenever either timestamp fails to
-/// parse as RFC3339 — an unparsable timestamp must never be the reason a
-/// live conversation gets hidden from recent work.
-fn ts_later_than(candidate_ts: &str, bound_ts: &str) -> bool {
-    match (
-        candidate_ts.parse::<chrono::DateTime<chrono::Utc>>(),
-        bound_ts.parse::<chrono::DateTime<chrono::Utc>>(),
-    ) {
-        (Ok(candidate), Ok(bound)) => candidate > bound,
-        _ => true,
-    }
+/// The recorded `conversation_entrypoint` value for one conversation, or
+/// `None` when never recorded.
+pub fn get_conversation_entrypoint(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT entrypoint FROM conversation_entrypoint WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
-/// Drop `source = 'conversation'` rows whose conversation id is not a known
-/// interactive session per `session_registry` — the signal that separates a
-/// real, human-typed Claude Code session from a headless `claude -p` probe,
-/// narrator, or eval-question child (none of those are ever driven by a
-/// typed prompt, so none of them are ever registered in `history.jsonl`).
+/// Batch of `(file_path, conversation_id)` pairs from `import_state` that
+/// have never had a `conversation_entrypoint` row recorded, ordered by
+/// `file_path` past `after_file_path` (exclusive) — the resumable-cursor
+/// shape `import::entrypoint_backfill` walks in bounded batches. A `LEFT
+/// JOIN ... WHERE entrypoint IS NULL` rather than a `NOT IN` subquery so a
+/// growing `conversation_entrypoint` table never turns this into a
+/// correlated-subquery-per-row scan.
+pub fn pending_entrypoint_backfill_batch(
+    conn: &Connection,
+    after_file_path: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.file_path, i.conversation_id
+         FROM import_state i
+         LEFT JOIN conversation_entrypoint e ON e.conversation_id = i.conversation_id
+         WHERE e.conversation_id IS NULL
+           AND i.conversation_id IS NOT NULL
+           AND i.file_path > ?1
+         ORDER BY i.file_path
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![after_file_path, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Drop `source = 'conversation'` rows that carry a *positive* headless
+/// signal — never rows that merely lack one. Two signals, checked in order:
+///
+/// 1. `conversation_entrypoint` (recorded at import from the transcript's
+///    own `"entrypoint"` field): `is_headless_entrypoint` on it is
+///    conclusive either way — a real `cli`/`claude-desktop` entrypoint keeps
+///    the row even when the conversation is missing from `session_registry`
+///    entirely, and an `sdk-*` entrypoint drops it even when the row is
+///    otherwise indistinguishable from a real session.
+/// 2. When no entrypoint was ever recorded (pre-dates this column, or the
+///    file no longer exists for a backfill to read), fall back to
+///    `provenance::is_csr_emission` on the row's own preview content — CSR's
+///    own formatter output/headers echoed back is excluded on that basis
+///    alone, exactly as it would be for any other extraction path.
+///
+/// Anything left is unknown, not headless, and is kept — the previous
+/// mechanism (treating absence from `session_registry`, which is built from
+/// `history.jsonl` and does not record every interactive session, as proof
+/// of headlessness) hid real sessions whenever the registry missed them.
 /// Every other source (`codex_rollout`, `plan`, ...) has its own provenance
 /// and is left untouched here.
-///
-/// Fails open in two cases, both erring toward never hiding a real session:
-/// the registry is empty (never seeded, e.g. a fresh install before the
-/// first daemon `history.jsonl` scan), or the conversation's own
-/// first-chunk timestamp is newer than the registry's own horizon (a
-/// session so new the registry's periodic refresh hasn't caught up to it
-/// yet — a lagging 10-minute refresh must never hide a session that is
-/// genuinely live right now).
 fn filter_unregistered_conversation_rows(
     conn: &Connection,
     rows: Vec<RecentChunkRow>,
 ) -> Result<Vec<RecentChunkRow>> {
     const CONVERSATION_SOURCE: &str = "conversation";
-    let Some(registry_horizon) = session_registry_max_last_ts(conn)? else {
-        return Ok(rows);
-    };
     let candidates: Vec<String> = rows
         .iter()
         .filter(|row| row.source == CONVERSATION_SOURCE)
@@ -1593,13 +1735,17 @@ fn filter_unregistered_conversation_rows(
     if candidates.is_empty() {
         return Ok(rows);
     }
-    let registered = session_registry_member_ids(conn, &candidates)?;
+    let entrypoints = conversation_entrypoints(conn, &candidates)?;
     Ok(rows
         .into_iter()
         .filter(|row| {
-            row.source != CONVERSATION_SOURCE
-                || registered.contains(&row.chunk.conversation_id)
-                || ts_later_than(&row.first_chunk_ts, &registry_horizon)
+            if row.source != CONVERSATION_SOURCE {
+                return true;
+            }
+            match entrypoints.get(&row.chunk.conversation_id) {
+                Some(ep) => !is_headless_entrypoint(ep),
+                None => !crate::extraction::provenance::is_csr_emission(&row.chunk.content),
+            }
         })
         .collect())
 }
@@ -5984,11 +6130,14 @@ mod tests {
     }
 
     #[test]
-    fn recent_chunks_exclude_unregistered_headless_probe_conversation() {
-        // W3-B1 review#2 finding: a headless `claude -p` probe conversation
-        // (never driven by a typed prompt, so it never lands in
-        // `history.jsonl`/`session_registry`) must not take a recent-work
-        // slot alongside real interactive sessions.
+    fn recent_chunks_exclude_headless_sdk_cli_entrypoint_conversation() {
+        // W3-B1 review#2 (HIGH), 2nd pass: exclusion must be driven by a
+        // *positive* headless signal (the transcript's own `entrypoint`),
+        // never by absence from `session_registry` — the old mechanism hid
+        // real sessions `history.jsonl` never happened to record. A
+        // registered interactive session, an unregistered-but-real
+        // `entrypoint=cli` session, and a `entrypoint=sdk-cli` headless probe
+        // all coexist here; only the `sdk-cli` one is dropped.
         let conn = mem();
         insert_registered_session(
             &conn,
@@ -6006,76 +6155,71 @@ mod tests {
             false,
             "conversation",
         );
+        set_conversation_entrypoint(&conn, "interactive-a", "cli").unwrap();
+
         insert_recent(
             &conn,
             "probe-b",
             "proj-registry",
-            // Inside the registry's own covered window (<= its last_ts), so
-            // the newer-than-horizon fail-open never fires — this is the
-            // steady-state case, not a registry-lag race.
             "2026-09-20T09:03:00Z",
             "Reply with exactly the word PROBE-DONE",
             false,
             "conversation",
         );
+        set_conversation_entrypoint(&conn, "probe-b", "sdk-cli").unwrap();
 
         let chunks = get_recent_chunks(&conn, 6, Some("proj-registry")).unwrap();
         let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
 
         assert!(
             ids.contains(&"interactive-a"),
-            "the registered interactive session must still surface: {ids:?}"
+            "a real cli-entrypoint session must still surface: {ids:?}"
         );
         assert!(
             !ids.contains(&"probe-b"),
-            "an unregistered headless probe conversation must be excluded: {ids:?}"
+            "a sdk-cli-entrypoint headless probe conversation must be excluded: {ids:?}"
         );
     }
 
     #[test]
-    fn recent_chunks_fail_open_when_conversation_is_newer_than_registry_horizon() {
-        // A session so new the registry's periodic refresh hasn't caught up
-        // to it yet must never be hidden — the registry lagging is not
-        // evidence the session is headless.
+    fn recent_chunks_surface_unregistered_cli_entrypoint_despite_nonempty_registry() {
+        // W3-B1 review#2 (HIGH): the exact regression the reviewer found live
+        // — `entrypoint=cli`, but `history.jsonl`/`session_registry` never
+        // recorded it (six real whats-next sessions did this). A non-empty
+        // registry (containing an unrelated session) must not make this one
+        // read as headless.
         let conn = mem();
         insert_registered_session(
             &conn,
-            "interactive-a",
+            "some-other-registered-session",
             "proj-registry-lag",
             "2026-09-20T09:00:00Z",
             "2026-09-20T09:05:00Z",
         );
         insert_recent(
             &conn,
-            "interactive-a",
-            "proj-registry-lag",
-            "2026-09-20T09:05:00Z",
-            "real user prompt",
-            false,
-            "conversation",
-        );
-        insert_recent(
-            &conn,
             "brand-new-live",
             "proj-registry-lag",
             "2026-09-20T12:00:00Z",
-            "a session started after the registry's last refresh",
+            "What directory are you operating on",
             false,
             "conversation",
         );
+        set_conversation_entrypoint(&conn, "brand-new-live", "cli").unwrap();
 
         let chunks = get_recent_chunks(&conn, 6, Some("proj-registry-lag")).unwrap();
         let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
         assert!(
             ids.contains(&"brand-new-live"),
-            "a conversation newer than the registry's own horizon must fail open: {ids:?}"
+            "an unregistered real cli-entrypoint session must surface despite a non-empty registry: {ids:?}"
         );
     }
 
     #[test]
-    fn recent_chunks_fail_open_when_registry_is_empty() {
-        // A fresh install (registry never seeded) must not hide every
-        // interactive session on the machine.
+    fn recent_chunks_fail_open_when_entrypoint_unknown() {
+        // No `conversation_entrypoint` row at all (pre-dates the column, or
+        // the source file is gone) must never be read as headless — only an
+        // explicit `sdk-*` value is a headless signal.
         let conn = mem();
         insert_recent(
             &conn,
@@ -6091,7 +6235,44 @@ mod tests {
         let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
         assert!(
             ids.contains(&"conv-a"),
-            "an empty (never-seeded) session_registry must fail open, not hide every session: {ids:?}"
+            "a conversation with no recorded entrypoint must fail open, not be hidden: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_exclude_csr_emission_when_entrypoint_unknown() {
+        // W3-B1 review#2 (HIGH): the fallback net for rows with no recorded
+        // entrypoint at all — CSR's own emission echoed back must still be
+        // excluded on that basis, exactly as before.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "narrator-echo",
+            "proj-emission",
+            "2026-09-20T09:00:00Z",
+            "You are CSR Episode Analyst reviewing a transcript",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "conv-real",
+            "proj-emission",
+            "2026-09-20T09:01:00Z",
+            "real user prompt",
+            false,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-emission")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"narrator-echo"),
+            "a CSR-emission preview with no entrypoint recorded must still be excluded: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"conv-real"),
+            "a real session in the same batch must still surface: {ids:?}"
         );
     }
 
@@ -6189,7 +6370,8 @@ mod tests {
                 conversation_id: "codex-polluted".into(),
                 project_name: "proj-preview".into(),
                 timestamp: "2026-09-20T09:00:00Z".into(),
-                content: "<recommended_plugins>\nHere is a list of plugins".into(),
+                content: "<recommended_plugins>\nHere is a list of plugins\n</recommended_plugins>"
+                    .into(),
                 message_count: 1,
                 summary: None,
                 author: Speaker::ToolResult,
@@ -6227,6 +6409,131 @@ mod tests {
         assert_eq!(
             top.content, "real user request about the recall bug",
             "the preview must skip the harness-boilerplate first chunk: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_skips_multi_chunk_codex_harness_span() {
+        // W3-B1 review#2 (MEDIUM), 2nd pass: the real `codex:01a0c5df` shape —
+        // only chunk 0 starts with a harness marker, but the injected block
+        // (CSR's chunker re-splits it at a flat char budget with no idea it
+        // was boilerplate) continues, unmarked, across several more chunks
+        // before its closing tag turns up, and only THEN does the real user
+        // prompt begin. A per-chunk-only noisy check (the old behaviour)
+        // picks the first unmarked continuation chunk — pure boilerplate —
+        // as the preview, exactly as it did live.
+        let conn = mem();
+        let mut rows: Vec<(String, usize, String)> = vec![(
+            "harness-span-c0".to_string(),
+            0,
+            "<recommended_plugins>\nHere is a list of plugins, continued below".to_string(),
+        )];
+        for seq in 1..11usize {
+            rows.push((
+                format!("harness-span-c{seq}"),
+                seq,
+                format!("- Consensus (app-{seq:x}…@openai-curated-remote) plugin entry"),
+            ));
+        }
+        rows.push((
+            "harness-span-c11".to_string(),
+            11,
+            "...the rest of the plugin list </recommended_plugins>".to_string(),
+        ));
+        rows.push((
+            "harness-span-c12".to_string(),
+            12,
+            "dont look at the literature install graphify".to_string(),
+        ));
+
+        for (id, seq, content) in &rows {
+            insert_chunk_with_source(
+                &conn,
+                &ConversationChunk {
+                    id: id.clone(),
+                    conversation_id: "harness-span".into(),
+                    project_name: "proj-preview".into(),
+                    timestamp: format!("2026-09-20T09:00:{seq:02}Z"),
+                    content: content.clone(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::ToolResult,
+                    seq: *seq,
+                    is_sidechain: false,
+                },
+                &[0.1, 0.2],
+                "codex_rollout",
+            )
+            .unwrap();
+        }
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "harness-span")
+            .expect("the polluted conversation must still surface");
+        assert_eq!(
+            top.content, "dont look at the literature install graphify",
+            "the preview must skip the whole multi-chunk harness span, not just chunk 0: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_survives_harness_block_closing_and_opening_in_same_chunk() {
+        // W3-B1 review#2 (MEDIUM), 3rd pass: the exact live `codex:01a0c5df`
+        // shape (verified on a clone of the production DB). Multiple harness
+        // blocks are packed back-to-back inside ONE original message with no
+        // chunk-boundary alignment: `</recommended_plugins>` (closing block
+        // A) and `<INSTRUCTIONS>` (opening block B, the "# AGENTS.md
+        // instructions" body) land in the very same stored chunk. A "first
+        // closing tag ends the span" rule reopens picking right there — on
+        // block B's own boilerplate body (which is CLAUDE.md content quoted
+        // as agent instructions, live) — instead of staying closed until
+        // block B's own `</INSTRUCTIONS>` shows up several chunks later.
+        let conn = mem();
+        let rows: Vec<(&str, usize, &str)> = vec![
+            ("c0", 0, "<recommended_plugins>\nplugin list starts here"),
+            ("c1", 1, "more plugins, no marker of its own"),
+            (
+                "c2",
+                2,
+                "</recommended_plugins>\n# AGENTS.md instructions\n<INSTRUCTIONS>\nCore prefs",
+            ),
+            ("c3", 3, "more instructions body, no marker of its own"),
+            ("c4", 4, "closing soon </INSTRUCTIONS>"),
+            ("c5", 5, "the real first prompt of the session"),
+        ];
+        for (id, seq, content) in &rows {
+            insert_chunk_with_source(
+                &conn,
+                &ConversationChunk {
+                    id: format!("same-chunk-{id}"),
+                    conversation_id: "same-chunk-span".into(),
+                    project_name: "proj-preview".into(),
+                    timestamp: format!("2026-09-20T09:00:{seq:02}Z"),
+                    content: content.to_string(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::ToolResult,
+                    seq: *seq,
+                    is_sidechain: false,
+                },
+                &[0.1, 0.2],
+                "codex_rollout",
+            )
+            .unwrap();
+        }
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "same-chunk-span")
+            .expect("the polluted conversation must still surface");
+        assert_eq!(
+            top.content, "the real first prompt of the session",
+            "closing one block and opening the next in the same chunk must not reopen picking early: {}",
             top.content
         );
     }
@@ -6293,6 +6600,94 @@ mod tests {
         assert_eq!(
             top.content, "/login",
             "the preview must skip the local-command-caveat wrapper: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_survives_noncontiguous_rowids_between_own_chunks() {
+        // W3-B1 review#2 (LOW): the live-DB `d8fe3a96`/`356b2649` case — the
+        // watcher imports incrementally and interleaves conversations, so a
+        // session's own chunk 1 can land dozens of rowids after its chunk 0
+        // once other conversations' chunks are inserted in between. A
+        // `rowid <` range window sized for *contiguous* rowids then holds
+        // only chunk 0 (the caveat) and never even sees chunk 1, no matter
+        // how large the window is raised. Ranking by `seq` instead must
+        // still find chunk 1 regardless of how many unrelated rows separate
+        // the two by rowid.
+        let conn = mem();
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "conv-gap-c0".into(),
+                conversation_id: "conv-gap".into(),
+                project_name: "proj-preview-gap".into(),
+                timestamp: "2026-09-20T09:00:00Z".into(),
+                content: "<local-command-caveat>Caveat: The messages below were generated \
+                          by the user while running local commands. DO NOT respond\
+                          </local-command-caveat>"
+                    .into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "conversation",
+        )
+        .unwrap();
+        // 40 unrelated chunks from a different, unrelated conversation land
+        // in between by rowid — more than any realistic `rowid <` window,
+        // reproducing the live gap (21 rows) at a size that would defeat
+        // even the review's own suggested "raise the window" band-aid.
+        for i in 0..40 {
+            insert_chunk_with_source(
+                &conn,
+                &ConversationChunk {
+                    id: format!("filler-{i}"),
+                    conversation_id: "filler-conv".into(),
+                    project_name: "proj-preview-gap".into(),
+                    timestamp: format!("2026-09-20T08:{:02}:00Z", i % 60),
+                    content: "unrelated filler content".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::ToolResult,
+                    seq: i as usize,
+                    is_sidechain: false,
+                },
+                &[0.1, 0.2],
+                "conversation",
+            )
+            .unwrap();
+        }
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "conv-gap-c1".into(),
+                conversation_id: "conv-gap".into(),
+                project_name: "proj-preview-gap".into(),
+                timestamp: "2026-09-20T09:00:01Z".into(),
+                content: "the real first prompt of the session".into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 1,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "conversation",
+        )
+        .unwrap();
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview-gap")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "conv-gap")
+            .expect("the session must still surface");
+        assert_eq!(
+            top.content, "the real first prompt of the session",
+            "the preview must find chunk 1 by seq despite a large rowid gap: {}",
             top.content
         );
     }

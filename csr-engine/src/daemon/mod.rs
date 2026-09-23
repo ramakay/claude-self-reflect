@@ -585,6 +585,75 @@ impl Daemon {
             })
         };
 
+        // W3-B1 review#2 (HIGH): backfill `conversation_entrypoint` for
+        // conversations imported before that column existed, one bounded
+        // batch per idle window, same shape as `provenance_backfill_handle`
+        // just above. Stops entirely once `entrypoint_backfill::DONE_META_KEY`
+        // is set (checked inside the batch call itself, so a done daemon
+        // just spins on the outer 5-minute sleep with no work).
+        const ENTRYPOINT_BACKFILL_BATCH_SIZE: usize = 500;
+        let entrypoint_backfill_handle = {
+            let storage = self.storage.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                loop {
+                    for _ in 0..30 {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let storage = storage.clone();
+                    let done = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::import::entrypoint_backfill::backfill_conversation_entrypoints_batch(
+                            &storage,
+                            ENTRYPOINT_BACKFILL_BATCH_SIZE,
+                        ) {
+                            Ok(stats) => {
+                                if stats.scanned > 0 {
+                                    tracing::info!(
+                                        scanned = stats.scanned,
+                                        recorded = stats.recorded,
+                                        missing_or_unknown = stats.missing_or_unknown,
+                                        done = stats.done,
+                                        "conversation entrypoint backfill batch completed"
+                                    );
+                                }
+                                stats.done
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "conversation entrypoint backfill failed");
+                                false
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if done {
+                        // Sleep out the rest of this task's life at the same
+                        // 5-minute cadence instead of busy-looping on a
+                        // meta-key check every tick.
+                        loop {
+                            for _ in 0..30 {
+                                if shutdown.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
         // Optional Codex rollout loop. It runs once immediately and then every
         // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
         // directory is re-checked each cycle so a later installation is detected.
@@ -1010,6 +1079,9 @@ impl Daemon {
         // no HNSW mutation — so a timeout here cannot corrupt the search index.
         let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
         let _ = tokio::time::timeout(timeout, provenance_backfill_handle).await;
+        // Same shape as the provenance backfill above: single-statement
+        // upserts into `conversation_entrypoint`, no HNSW mutation.
+        let _ = tokio::time::timeout(timeout, entrypoint_backfill_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         // The dream loop's tick awaits its `spawn_blocking` cycle directly
         // (see `dream_cadence::tick`) and checks the shutdown flag between
