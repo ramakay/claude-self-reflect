@@ -38,10 +38,19 @@ struct SearchProjectScope {
 }
 
 impl SearchProjectScope {
+    /// `current_project` (from `cross_project::resolve_current_project`,
+    /// `MCP_CLIENT_CWD` only) feeds *only* the `project="all"` family boost —
+    /// changing its source would silently change ranking for every explicit
+    /// `project="all"` call, which is out of scope here. `default_scope_project`
+    /// (from `cross_project::resolve_client_dir` + `resolve_project_from_cwd`,
+    /// `MCP_CLIENT_CWD` then `CLAUDE_PROJECT_DIR`) is what an *omitted* project
+    /// resolves to — see module docs on why `MCP_CLIENT_CWD` alone left every
+    /// Claude Code stdio search unscoped.
     fn resolve_with(
         storage: &Storage,
         requested_project: Option<&str>,
         current_project: Option<&str>,
+        default_scope_project: Option<&str>,
         projects_root_override: Option<&Path>,
     ) -> Result<Self> {
         let (effective_project, scope_label, current_project_for_all_scope) =
@@ -52,7 +61,7 @@ impl SearchProjectScope {
                 Some(project) if !project.is_empty() => {
                     (Some(project.to_string()), project.to_string(), None)
                 }
-                _ => match current_project {
+                _ => match default_scope_project {
                     Some(project) => (Some(project.to_string()), project.to_string(), None),
                     None => (None, "all".to_string(), None),
                 },
@@ -108,6 +117,44 @@ fn project_scope_multiplier(candidate: &str, scope: &SearchProjectScope) -> f32 
     } else {
         1.0
     }
+}
+
+/// Chunk ids for every project in `project`'s family (itself plus any
+/// `<project>-<suffix>` alias directory, see `cross_project::same_project_family`).
+///
+/// `csr_reflect_on_past`/`csr_get_more` widen an explicit-or-defaulted project
+/// scope to the family via [`SearchProjectScope`]; `csr_search_insights` and
+/// `csr_search_by_concept` used to filter on an exact label match instead, so
+/// a family alias (e.g. `claude-self-reflect-csr-engine` under project
+/// `claude-self-reflect`) silently lost its chunks in those two tools while
+/// keeping them in `csr_reflect_on_past`. `csr_quick_check` already widened
+/// this way inline; this is that same logic, shared.
+fn family_chunk_ids(storage: &Storage, project: &str) -> Result<HashSet<String>> {
+    family_chunk_ids_at_root(storage, project, None)
+}
+
+/// [`family_chunk_ids`] with an injectable projects-root — the seam tests use
+/// (a tempdir) so alias resolution never depends on this machine's real
+/// `$HOME/projects` layout. `None` uses the real home directory, exactly like
+/// `family_chunk_ids`/`cross_project::same_project_family`.
+fn family_chunk_ids_at_root(
+    storage: &Storage,
+    project: &str,
+    projects_root_override: Option<&Path>,
+) -> Result<HashSet<String>> {
+    let family_projects = storage
+        .list_project_names("", i64::MAX as usize)?
+        .into_iter()
+        .filter(|candidate| match projects_root_override {
+            Some(root) => cross_project::same_project_family_at_root(project, candidate, root),
+            None => cross_project::same_project_family(project, candidate),
+        });
+    let mut ids = HashSet::new();
+    for family_project in family_projects {
+        ids.extend(storage.get_chunk_ids_for_project(&family_project)?);
+    }
+    ids.extend(storage.get_chunk_ids_for_project(project)?);
+    Ok(ids)
 }
 
 /// Tag `store_reflection` stamps on every explicit memory write so the recall
@@ -644,8 +691,14 @@ pub(crate) async fn reflect_on_past_with_vec_mode(
     record_retrievals: bool,
 ) -> Result<String> {
     let current_project = cross_project::resolve_current_project();
-    let scope =
-        SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
+    let default_scope_project = cross_project::resolve_default_scope_project();
+    let scope = SearchProjectScope::resolve_with(
+        storage,
+        project,
+        current_project.as_deref(),
+        default_scope_project.as_deref(),
+        None,
+    )?;
     reflect_on_past_with_vec_in_scope_mode(
         storage,
         search,
@@ -721,7 +774,7 @@ pub(crate) async fn reflect_for_bench_with_vec(
     fetch: usize,
     mode: SearchMode,
 ) -> Result<Vec<BenchHit>> {
-    let scope = SearchProjectScope::resolve_with(storage, Some("csr-bench"), None, None)?;
+    let scope = SearchProjectScope::resolve_with(storage, Some("csr-bench"), None, None, None)?;
     let mut candidate_fetch = fetch.saturating_mul(4).max(20);
     let mut previous_candidates = HashSet::new();
     loop {
@@ -1832,14 +1885,7 @@ async fn quick_check_with_vec(
 ) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(project);
     let results = if let Some(ref project) = effective_project {
-        let family_projects = storage
-            .list_project_names("", i64::MAX as usize)?
-            .into_iter()
-            .filter(|candidate| cross_project::same_project_family(project, candidate));
-        let mut ids = HashSet::new();
-        for family_project in family_projects {
-            ids.extend(storage.get_chunk_ids_for_project(&family_project)?);
-        }
+        let ids = family_chunk_ids(storage, project)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(query_vec, 2, min_score, &ids)
     } else {
@@ -1878,11 +1924,25 @@ pub async fn search_insights(
     query: &str,
     project: Option<&str>,
 ) -> Result<String> {
+    search_insights_at_root(storage, embeddings, search, query, project, None).await
+}
+
+/// [`search_insights`] with an injectable projects-root — the seam a test
+/// uses to exercise family-alias widening (`family_chunk_ids_at_root`)
+/// without depending on this machine's real `$HOME/projects` layout.
+async fn search_insights_at_root(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    project: Option<&str>,
+    projects_root_override: Option<&Path>,
+) -> Result<String> {
     let (effective_project, _) = cross_project::normalize_project_scope(project);
     let query_vec = embed_query(embeddings, query).await?;
 
     let results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+        let ids = family_chunk_ids_at_root(storage, p, projects_root_override)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(&query_vec, 10, 0.0, &ids)
     } else {
@@ -2500,13 +2560,29 @@ pub async fn search_by_concept(
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
+    search_by_concept_at_root(storage, embeddings, search, concept, limit, project, None).await
+}
+
+/// [`search_by_concept`] with an injectable projects-root — same seam as
+/// [`search_insights_at_root`], for the same hermetic-alias-widening test
+/// reason.
+#[allow(clippy::too_many_arguments)]
+async fn search_by_concept_at_root(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    concept: &str,
+    limit: usize,
+    project: Option<&str>,
+    projects_root_override: Option<&Path>,
+) -> Result<String> {
     let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
     let query_vec = embed_query(embeddings, concept).await?;
 
     // Overfetch + partition over the full candidate set + single adaptive
     // refetch + truncate — see `fetch_enrich_partition_adaptive`.
     let enriched = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+        let ids = family_chunk_ids_at_root(storage, p, projects_root_override)?;
         let idx = search.read().await;
         fetch_enrich_partition_adaptive(
             storage,
@@ -2644,8 +2720,14 @@ async fn get_more_results_with_vec_active(
     // page two (raw order) while the chunk it displaced was skipped
     // entirely (certified live with a 0.89-family / 0.90-other pair).
     let current_project = cross_project::resolve_current_project();
-    let scope =
-        SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
+    let default_scope_project = cross_project::resolve_default_scope_project();
+    let scope = SearchProjectScope::resolve_with(
+        storage,
+        project,
+        current_project.as_deref(),
+        default_scope_project.as_deref(),
+        None,
+    )?;
     get_more_results_in_scope(
         storage,
         search,
@@ -4836,11 +4918,13 @@ mod tests {
         }
         let search = Arc::new(RwLock::new(engine));
         let without_current =
-            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some(&projects)).unwrap();
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, None, Some(&projects))
+                .unwrap();
         let with_current = SearchProjectScope::resolve_with(
             &storage,
             Some("all"),
             resolved_current.as_deref(),
+            None,
             Some(&projects),
         )
         .unwrap();
@@ -4895,6 +4979,170 @@ mod tests {
         assert!(
             boosted.find("alias-result").unwrap() < boosted.find("other-result").unwrap(),
             "boosted all-scope order:\n{boosted}"
+        );
+    }
+
+    // W3-S: default scope (project omitted) falls back to `CLAUDE_PROJECT_DIR`
+    // via `default_scope_project`, not just `MCP_CLIENT_CWD` (`current_project`).
+    // These exercise `SearchProjectScope::resolve_with` directly with injected
+    // values — no env var manipulation, so no race with other lib tests.
+
+    #[test]
+    fn default_scope_project_resolves_to_the_client_dirs_family_when_project_omitted() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope = SearchProjectScope::resolve_with(&storage, None, None, Some("EnhanceMe"), None)
+            .unwrap();
+        assert_eq!(scope.effective_project.as_deref(), Some("EnhanceMe"));
+        assert_eq!(scope.scope_label, "EnhanceMe");
+        assert!(scope.family_projects.contains("EnhanceMe"));
+    }
+
+    #[test]
+    fn explicit_all_scope_ignores_default_scope_project() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some("EnhanceMe"), None)
+                .unwrap();
+        assert_eq!(scope.effective_project, None);
+        assert_eq!(scope.scope_label, "all");
+    }
+
+    /// W3-S finding 3 receipt: putting the `CLAUDE_PROJECT_DIR` fallback in
+    /// `default_scope_project` (used only when `project` is omitted) rather
+    /// than in `current_project` (used for the `project="all"` same-family
+    /// boost) means an explicit `project="all"` call resolves to the exact
+    /// same candidate set with or without a client directory present.
+    /// Threading the fallback through `current_project` instead would make
+    /// this diverge: `with_client_dir.family_projects` would gain the
+    /// `EnhanceMe` family and its ranking boost would newly apply, changing
+    /// output for every Claude Code session that ever calls `project="all"`.
+    #[test]
+    fn explicit_all_scope_is_identical_with_and_without_a_client_dir() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let projects_root = tempfile::tempdir().unwrap();
+        let without_client_dir = SearchProjectScope::resolve_with(
+            &storage,
+            Some("all"),
+            None,
+            None,
+            Some(projects_root.path()),
+        )
+        .unwrap();
+        let with_client_dir = SearchProjectScope::resolve_with(
+            &storage,
+            Some("all"),
+            None,
+            Some("EnhanceMe"),
+            Some(projects_root.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            without_client_dir.effective_project,
+            with_client_dir.effective_project
+        );
+        assert_eq!(without_client_dir.scope_label, with_client_dir.scope_label);
+        assert_eq!(
+            without_client_dir.current_project_for_all_scope,
+            with_client_dir.current_project_for_all_scope
+        );
+        assert_eq!(
+            without_client_dir.family_projects,
+            with_client_dir.family_projects
+        );
+        assert!(
+            !with_client_dir.family_projects.contains("EnhanceMe"),
+            "the default-scope-only fallback must not leak into project=\"all\": {:?}",
+            with_client_dir.family_projects
+        );
+    }
+
+    #[test]
+    fn no_default_scope_project_and_no_explicit_project_is_all() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope = SearchProjectScope::resolve_with(&storage, None, None, None, None).unwrap();
+        assert_eq!(scope.effective_project, None);
+        assert_eq!(scope.scope_label, "all");
+    }
+
+    #[tokio::test]
+    async fn defaulted_scope_excludes_a_higher_ranked_out_of_family_chunk() {
+        // The spec's receipt: with `project` omitted and `CLAUDE_PROJECT_DIR`
+        // resolving to `EnhanceMe`, an EnhanceMe-family chunk is returned and
+        // a higher-scoring out-of-family chunk is not — even though an
+        // unscoped ("all") search would put the out-of-family chunk first.
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mk = |id: &str, project: &str, content: &str| crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: project.into(),
+            timestamp: "2099-01-01T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let rows = [
+            (
+                mk(
+                    "chunk-in-family",
+                    "EnhanceMe",
+                    "codex blocked revival deploy blocker",
+                ),
+                vec![0.80f32, 0.6, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-out-of-family",
+                    "some-other-project",
+                    "codex blocked revival deploy blocker, ranked higher",
+                ),
+                vec![1.0f32, 0.0, 0.0, 0.0],
+            ),
+        ];
+        let mut engine = SearchEngine::new(8);
+        for (chunk, vector) in &rows {
+            storage.insert_chunk(chunk, vector).unwrap();
+            engine.insert_chunk(chunk.id.clone(), vector.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+        // Explicit tempdir root so family resolution never touches this
+        // machine's real `$HOME/projects` layout.
+        let projects_root = tempfile::tempdir().unwrap();
+        let scope = SearchProjectScope::resolve_with(
+            &storage,
+            None,
+            None,
+            Some("EnhanceMe"),
+            Some(projects_root.path()),
+        )
+        .unwrap();
+        let query = [1.0f32, 0.0, 0.0, 0.0];
+
+        let output = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival deploy blocker",
+            8,
+            0.1,
+            &scope,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output.contains("chunk-in-family") || output.contains("EnhanceMe"),
+            "expected the in-family chunk in defaulted-scope output:\n{output}"
+        );
+        assert!(
+            !output.contains("chunk-out-of-family") && !output.contains("ranked higher"),
+            "out-of-family chunk leaked into defaulted-scope output:\n{output}"
         );
     }
 
@@ -7651,7 +7899,7 @@ mod tests {
         }
         let search = Arc::new(RwLock::new(engine));
         let scope =
-            SearchProjectScope::resolve_with(&storage, Some("all"), Some("alpha-proj"), None)
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("alpha-proj"), None, None)
                 .unwrap();
         let q = [1.0f32, 0.0, 0.0, 0.0];
 
@@ -8162,6 +8410,130 @@ mod tests {
         assert!(
             rendered.contains("graph walks=1 accepted=1 surfaced=1"),
             "walked, accepted, and surfaced must be separate rendered counters:\n{rendered}"
+        );
+    }
+
+    /// W3-S finding 2: `csr_search_insights` used to filter on an exact
+    /// project-label match (`get_chunk_ids_for_project`), unlike
+    /// `csr_reflect_on_past`/`csr_quick_check` which widen to the project
+    /// family. A session under `claude-self-reflect` would silently lose its
+    /// `claude-self-reflect-csr-engine` chunks here while keeping them in
+    /// `csr_reflect_on_past`. Tempdir projects root (only the base project
+    /// dir present) keeps alias resolution off this machine's real `$HOME`.
+    /// Revert `family_chunk_ids_at_root` back to an exact-match id set and
+    /// this fails: `total_matches` drops from 2 to 1.
+    #[tokio::test]
+    async fn search_insights_widens_to_the_project_family() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "codex blocked revival deploy blocker";
+        let query_vec = embeddings.embed_single(query).unwrap();
+
+        let projects_root = tempfile::tempdir().unwrap();
+        let base_project = "acme-base";
+        let alias_project = "acme-base-csr-engine";
+        std::fs::create_dir_all(projects_root.path().join(base_project)).unwrap();
+        // alias_project's directory is deliberately absent: that's what makes
+        // it an alias rather than a genuine sibling repo.
+
+        let rows = [
+            ("base-chunk", base_project),
+            ("alias-chunk", alias_project),
+            ("unrelated-chunk", "unrelated-project"),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (id, project) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: project.into(),
+                timestamp: "2026-08-01T00:00:00Z".into(),
+                content: "codex blocked revival deploy blocker".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &query_vec).unwrap();
+            engine.insert_chunk(chunk.id, query_vec.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let xml = search_insights_at_root(
+            &storage,
+            &embeddings,
+            &search,
+            query,
+            Some(base_project),
+            Some(projects_root.path()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            xml.contains("<total_matches>2</total_matches>"),
+            "expected the base project plus its alias, not the unrelated project:\n{xml}"
+        );
+    }
+
+    /// Same finding as `search_insights_widens_to_the_project_family`, for
+    /// `csr_search_by_concept`.
+    #[tokio::test]
+    async fn search_by_concept_widens_to_the_project_family() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "codex blocked revival deploy blocker";
+        let query_vec = embeddings.embed_single(query).unwrap();
+
+        let projects_root = tempfile::tempdir().unwrap();
+        let base_project = "acme-base";
+        let alias_project = "acme-base-csr-engine";
+        std::fs::create_dir_all(projects_root.path().join(base_project)).unwrap();
+
+        let rows = [
+            ("base-chunk", base_project),
+            ("alias-chunk", alias_project),
+            ("unrelated-chunk", "unrelated-project"),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (id, project) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: project.into(),
+                timestamp: "2026-08-01T00:00:00Z".into(),
+                content: "codex blocked revival deploy blocker".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &query_vec).unwrap();
+            engine.insert_chunk(chunk.id, query_vec.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let xml = search_by_concept_at_root(
+            &storage,
+            &embeddings,
+            &search,
+            query,
+            10,
+            Some(base_project),
+            Some(projects_root.path()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            xml.contains("alias-chunk"),
+            "family alias chunk missing from search_by_concept output:\n{xml}"
+        );
+        assert!(
+            !xml.contains("unrelated-chunk"),
+            "unrelated-project chunk leaked into search_by_concept output:\n{xml}"
         );
     }
 

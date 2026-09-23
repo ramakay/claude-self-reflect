@@ -169,32 +169,80 @@ pub fn resolve_project_from_cwd(cwd: &str) -> Option<String> {
 /// MCP tools. We extract the project name using `resolve_project_from_cwd`.
 ///
 /// Returns `None` if the env var is not set.
+///
+/// Kept as `MCP_CLIENT_CWD`-only on purpose: this feeds the `project="all"`
+/// same-family ranking boost (`CURRENT_PROJECT_ALL_SCOPE_BOOST` in
+/// `mcp::tools`), and widening its source to `CLAUDE_PROJECT_DIR` would
+/// silently change ranking for every explicit `project="all"` call from
+/// Claude Code. Callers that need a default scope for an *omitted* project
+/// should use [`resolve_client_dir`] / [`resolve_default_scope_project`]
+/// instead — see their docs for why this function alone left every Claude
+/// Code stdio search unscoped.
 pub fn resolve_current_project() -> Option<String> {
     let cwd = std::env::var("MCP_CLIENT_CWD").ok()?;
     resolve_project_from_cwd(&cwd)
 }
 
+/// Resolve the MCP client's working directory: `MCP_CLIENT_CWD` first (what
+/// a spec-following MCP client sets), falling back to `CLAUDE_PROJECT_DIR`.
+///
+/// Claude Code's stdio MCP transport never sets `MCP_CLIENT_CWD` — verified
+/// live against running `csr-engine` server processes launched by Claude
+/// Code, which had `CLAUDE_PROJECT_DIR` set and no `MCP_CLIENT_CWD` at all —
+/// so [`resolve_current_project`] alone always resolved to `None` there and
+/// every unscoped search ran as `project=all`. Claude Code does set
+/// `CLAUDE_PROJECT_DIR` on every MCP server process it spawns. An empty
+/// value from either variable (`VAR=`) is treated as absent so a blank
+/// export can't silently opt a session into a bogus scope.
+pub fn resolve_client_dir() -> Option<String> {
+    std::env::var("MCP_CLIENT_CWD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var("CLAUDE_PROJECT_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+}
+
+/// The project an *omitted* `project` argument should default to: the
+/// project family of [`resolve_client_dir`]. `None` when neither env var is
+/// set (or set to an empty string), or when the resolved directory does not
+/// look like a project path — the caller then falls back to `project=all`,
+/// exactly as before this fallback existed.
+pub fn resolve_default_scope_project() -> Option<String> {
+    resolve_client_dir().and_then(|dir| resolve_project_from_cwd(&dir))
+}
+
 /// Normalize a project scope parameter.
 ///
-/// - `None` → auto-detect from `MCP_CLIENT_CWD`
+/// - `None` → the client's default scope (see [`resolve_default_scope_project`])
 /// - `Some("all")` (any case) → `None` (search all projects)
 /// - `Some(name)` → `Some(name)` (specific project)
 ///
 /// Returns `(effective_project, scope_label)` where scope_label is for display.
 pub fn normalize_project_scope(project: Option<&str>) -> (Option<String>, String) {
+    normalize_project_scope_with(project, resolve_client_dir().as_deref())
+}
+
+/// Same as [`normalize_project_scope`] with the client directory passed in
+/// explicitly — the seam tests use so the result doesn't depend on process
+/// env vars, which race with every other test in this binary running in the
+/// same process.
+pub fn normalize_project_scope_with(
+    project: Option<&str>,
+    client_dir: Option<&str>,
+) -> (Option<String>, String) {
     match project {
         Some(p) if p.eq_ignore_ascii_case("all") => (None, "all".to_string()),
         Some(p) if !p.is_empty() => (Some(p.to_string()), p.to_string()),
-        _ => {
-            // Auto-detect from environment
-            match resolve_current_project() {
-                Some(p) => {
-                    let label = p.clone();
-                    (Some(p), label)
-                }
-                None => (None, "all".to_string()),
+        _ => match client_dir.and_then(resolve_project_from_cwd) {
+            Some(p) => {
+                let label = p.clone();
+                (Some(p), label)
             }
-        }
+            None => (None, "all".to_string()),
+        },
     }
 }
 
@@ -314,6 +362,51 @@ mod tests {
                 "all"
             }
         );
+    }
+
+    // `normalize_project_scope_with` takes the client directory as a plain
+    // argument instead of reading `MCP_CLIENT_CWD`/`CLAUDE_PROJECT_DIR`
+    // directly, so these are hermetic: no `std::env::set_var`, no race with
+    // whatever order the test binary happens to run in.
+
+    #[test]
+    fn omitted_project_defaults_to_the_client_dirs_project() {
+        let (project, label) =
+            normalize_project_scope_with(None, Some("/Users/name/projects/EnhanceMe"));
+        assert_eq!(project, Some("EnhanceMe".to_string()));
+        assert_eq!(label, "EnhanceMe");
+    }
+
+    #[test]
+    fn explicit_all_stays_global_even_with_a_client_dir() {
+        let (project, label) =
+            normalize_project_scope_with(Some("all"), Some("/Users/name/projects/EnhanceMe"));
+        assert!(project.is_none());
+        assert_eq!(label, "all");
+    }
+
+    #[test]
+    fn no_client_dir_and_no_project_is_all() {
+        let (project, label) = normalize_project_scope_with(None, None);
+        assert!(project.is_none());
+        assert_eq!(label, "all");
+    }
+
+    #[test]
+    fn empty_client_dir_string_is_treated_as_absent() {
+        let (project, label) = normalize_project_scope_with(None, Some(""));
+        assert!(project.is_none());
+        assert_eq!(label, "all");
+    }
+
+    #[test]
+    fn explicit_project_wins_over_client_dir() {
+        let (project, label) = normalize_project_scope_with(
+            Some("other-project"),
+            Some("/Users/name/projects/EnhanceMe"),
+        );
+        assert_eq!(project, Some("other-project".to_string()));
+        assert_eq!(label, "other-project");
     }
 
     // Pure function tests — no env var manipulation needed
