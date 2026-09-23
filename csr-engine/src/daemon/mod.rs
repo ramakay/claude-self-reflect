@@ -208,9 +208,64 @@ impl Daemon {
     }
 
     /// Run the daemon: file watcher + extraction loop + narrator loop.
-    pub async fn run(self) -> Result<()> {
+    ///
+    /// Returns the process exit code the caller (`main.rs`) should use:
+    /// `0` on an ordinary Ctrl+C/SIGTERM shutdown, or
+    /// [`crate::binary_identity::DAEMON_REPLACED_EXIT_CODE`] when this
+    /// process detected that the binary on disk was replaced underneath it
+    /// (gap-G2) — the daemon's plist sets `KeepAlive.SuccessfulExit=false`,
+    /// so any non-zero exit gets launchd to restart it from the new image.
+    ///
+    /// `startup_identity` is this process's own exe identity, captured by
+    /// `main()` as the literal first thing it does — NOT re-captured here.
+    /// By the time `run()` starts, `Engine::new()` (storage open, HNSW
+    /// load/rebuild, embeddings warm) has already run, which can take
+    /// seconds on a large corpus; capturing identity this late would widen
+    /// the window in which a replacement landing during this process's own
+    /// startup goes permanently invisible (it would record the NEW file's
+    /// identity as its own baseline). See `binary_identity::ReplacementWatch::new`.
+    pub async fn run(
+        self,
+        startup_identity: Option<crate::binary_identity::FileIdentity>,
+    ) -> Result<i32> {
         let _lock = Self::acquire_lock()?;
         tracing::info!("daemon started, acquired lockfile");
+
+        // gap-G2: a run-registry record so `status` can see this process
+        // even from another `csr-engine` invocation. Best-effort — a
+        // missing state dir must never stop the daemon from starting.
+        let own_identity = startup_identity;
+        let own_exe_path = std::env::current_exe().ok();
+        let run_record_path = own_identity
+            .zip(crate::binary_identity::default_run_dir())
+            .and_then(|(identity, run_dir)| {
+                crate::binary_identity::write_run_record(&run_dir, "daemon", identity)
+            });
+
+        // Spawned here, immediately, rather than only awaited in the final
+        // `select!` near the end of this function: everything between here
+        // and that `select!` (the sidechain repair task below, then ~20
+        // `tokio::spawn`s for the enrichment/compaction/journal loops) is
+        // real wall-clock setup time. Spawning the poll now lets it start
+        // ticking concurrently with that setup instead of only after it.
+        //
+        // 30s/3s rather than the spec's illustrative "every 60s": measured
+        // (scratch-HOME smoke test, this machine) the graceful teardown
+        // below — unrelated to this change, the SAME path a plain SIGTERM
+        // takes — already costs ~15s on its own (the ratification loop's
+        // shutdown check only runs once per `CSR_RATIFICATION_INTERVAL_SECS`,
+        // default 20s, between its own `tokio::time::sleep`s). A 60s+5s
+        // detection budget on top of that pre-existing teardown cost blows
+        // past the 70s acceptance bound; 30s+3s leaves headroom for both.
+        let replacement_watch_handle =
+            own_identity.zip(own_exe_path.clone()).map(|(start, path)| {
+                tokio::spawn(crate::binary_identity::wait_for_binary_replacement(
+                    start,
+                    path,
+                    tokio::time::Duration::from_secs(30),
+                    tokio::time::Duration::from_secs(3),
+                ))
+            });
 
         // One-shot, meta-key-gated repair for sidechain conversations whose
         // chunk row (and derived reflections) are stuck on the daemon-side
@@ -1063,8 +1118,27 @@ impl Daemon {
             tracing::info!("journal server started (v10.1 journal v4)");
         }
 
-        // Wait for Ctrl+C
-        wait_for_termination_signal().await?;
+        // Wait for Ctrl+C/SIGTERM, OR for the binary on disk to be replaced
+        // (gap-G2, watched by `replacement_watch_handle` spawned above) —
+        // whichever comes first. The replacement watch is only armed when
+        // this process's own identity was captured at start; without it,
+        // fall back to the plain signal wait.
+        let mut exit_code = 0i32;
+        match replacement_watch_handle {
+            Some(mut handle) => {
+                tokio::select! {
+                    result = wait_for_termination_signal() => {
+                        handle.abort();
+                        result?
+                    }
+                    _ = &mut handle => {
+                        tracing::info!("binary replaced, exiting for launchd restart");
+                        exit_code = crate::binary_identity::DAEMON_REPLACED_EXIT_CODE;
+                    }
+                }
+            }
+            None => wait_for_termination_signal().await?,
+        }
         tracing::info!("shutting down daemon gracefully");
 
         // Signal all loops to stop
@@ -1154,8 +1228,12 @@ impl Daemon {
             }
         }
 
+        if let Some(path) = run_record_path {
+            crate::binary_identity::remove_run_record(&path);
+        }
+
         tracing::info!("daemon stopped");
-        Ok(())
+        Ok(exit_code)
     }
 }
 

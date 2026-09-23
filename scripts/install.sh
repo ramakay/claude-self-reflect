@@ -116,10 +116,43 @@ download_and_install() {
         err "Binary not found in archive"
     fi
 
-    cp "$BINARY_PATH" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    # Stage to a temp file in the SAME directory as the destination, then
+    # rename it over the destination. `mv -f` within one filesystem is an
+    # atomic rename (POSIX), which gives a NEW inode at the final path and
+    # never touches the bytes any already-running `csr-engine` process has
+    # mapped — a live daemon or MCP server keeps serving its old image
+    # cleanly instead of racing a partially-overwritten Mach-O/ELF it could
+    # page-fault into mid-read. It is also what makes gap-G2's replacement
+    # detection observable: `exe_replaced` compares dev+ino+len+mtime+ctime,
+    # and only a fresh inode (or a real content change) trips it — a
+    # straight `cp` onto the existing path can reuse the same inode and
+    # would otherwise go undetected.
+    STAGED="${INSTALL_DIR}/.${BINARY_NAME}.new.$$"
+    cp "$BINARY_PATH" "$STAGED"
+    chmod +x "$STAGED"
+    mv -f "$STAGED" "${INSTALL_DIR}/${BINARY_NAME}"
 
     ok "Installed" "${INSTALL_DIR}/${BINARY_NAME}"
+}
+
+# --- Report stale processes + restart the daemon (gap-G2 spec 2e) ---
+
+report_stale_and_kickstart() {
+    STATUS_JSON="$("${INSTALL_DIR}/${BINARY_NAME}" status 2>/dev/null || true)"
+    if [ -n "$STATUS_JSON" ]; then
+        STALE_COUNT="$(printf '%s' "$STATUS_JSON" | grep -c '"pid":' 2>/dev/null || echo 0)"
+        if [ "$STALE_COUNT" -gt 0 ] 2>/dev/null; then
+            warn "$STALE_COUNT process(es) are still running the previous csr-engine build:"
+            printf '%s\n' "$STATUS_JSON" | grep -A3 '"stale_processes"' >&2 || true
+            printf '  Restart Claude Code sessions (and any other MCP host) using csr-engine to pick up this build.\n' >&2
+        fi
+    fi
+
+    DAEMON_LABEL="com.ramakay.csr-engine.daemon"
+    if command -v launchctl >/dev/null 2>&1 && launchctl print "gui/$(id -u)/${DAEMON_LABEL}" >/dev/null 2>&1; then
+        info "Restarting" "daemon (${DAEMON_LABEL}) to pick up the new build..."
+        launchctl kickstart -k "gui/$(id -u)/${DAEMON_LABEL}" 2>/dev/null || warn "launchctl kickstart failed; restart the daemon manually."
+    fi
 }
 
 # --- Ensure PATH ---
@@ -183,6 +216,7 @@ Build from source instead:
     get_latest_version
     download_and_install
     verify
+    report_stale_and_kickstart
     check_path
 
     # Setup writes hooks into ~/.claude/settings.json, registers the MCP

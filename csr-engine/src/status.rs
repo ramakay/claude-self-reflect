@@ -38,11 +38,18 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub db_path: String,
     pub healthy: bool,
-    /// True when the most recently started MCP server recorded a different
-    /// build than the binary now on disk. One stamp for all sessions (see
-    /// `binary_stamp`), so it says nothing about any particular session and is
-    /// kept out of the statusline.
+    /// True when any live `mcp_stdio` process in [`stale_processes`] is
+    /// running a superseded binary. Derived from the run registry (one
+    /// record per process — see `binary_identity`), not a single
+    /// last-writer-wins stamp, so it reflects every live session rather
+    /// than only the most recently started one. Says nothing about any
+    /// particular session, so it stays out of the statusline.
     pub mcp_binary_stale: bool,
+    /// Every live process (`csr-engine daemon` or an `mcp_stdio` server)
+    /// whose recorded exe identity differs from the binary on disk right
+    /// now — i.e. still running a build an install has since superseded.
+    /// See `binary_identity::stale_processes`.
+    pub stale_processes: Vec<crate::binary_identity::StaleProcess>,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
     /// Native memory-file spine (`~/.claude/projects/*/memory/*.md`) — metadata
@@ -698,6 +705,28 @@ pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<Statu
     gather_status(db_path, projects_dir, false)
 }
 
+/// Every live process (daemon or MCP stdio server) whose recorded exe
+/// identity differs from the binary on disk right now. Best-effort: an
+/// unreadable current identity (can't resolve `current_exe`) or a missing
+/// run dir (nothing has ever registered) both report no stale processes
+/// rather than erroring the whole status gather.
+fn gather_stale_processes() -> Vec<crate::binary_identity::StaleProcess> {
+    let (Some(current), Some(run_dir)) = (
+        crate::binary_identity::current_exe_identity(),
+        crate::binary_identity::default_run_dir(),
+    ) else {
+        return Vec::new();
+    };
+    crate::binary_identity::stale_processes(&run_dir, &current)
+}
+
+/// True when any live MCP stdio server is running a superseded binary (gap-G2
+/// review finding 5: derive this from the multi-process registry, not the
+/// retired single last-writer-wins stamp).
+fn mcp_binary_stale_from(stale: &[crate::binary_identity::StaleProcess]) -> bool {
+    stale.iter().any(|p| p.role == "mcp_stdio")
+}
+
 /// Gather status data from SQLite and disk.
 fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
     let now = chrono::Utc::now();
@@ -706,11 +735,14 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     });
     // Count total JSONL files on disk
     let total_jsonl = count_jsonl_files(projects_dir);
+    let stale_processes = gather_stale_processes();
+    let mcp_binary_stale = mcp_binary_stale_from(&stale_processes);
 
     // If DB doesn't exist yet, return empty report
     if !db_path.exists() {
         return Ok(StatusReport {
-            mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
+            mcp_binary_stale,
+            stale_processes,
             conversations: 0,
             projects: 0,
             chunks: 0,
@@ -844,7 +876,8 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let import_watcher = gather_import_watcher(&storage);
 
     Ok(StatusReport {
-        mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
+        mcp_binary_stale,
+        stale_processes,
         conversations,
         projects,
         chunks,
@@ -1908,6 +1941,7 @@ mod tests {
     fn base_report() -> StatusReport {
         StatusReport {
             mcp_binary_stale: false,
+            stale_processes: Vec::new(),
             conversations: 909,
             projects: 3,
             chunks: 5000,

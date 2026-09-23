@@ -237,16 +237,30 @@ pub struct CsrServer {
     index_dir: PathBuf,
     db_path: String,
     task_manager: TaskManager,
+    /// Detects that the binary on disk has diverged from this process's own
+    /// image (gap-G2). Shared across `Clone`s of this server (the task-tool
+    /// path clones `self`) so the "check at most every 30s" cadence is
+    /// process-wide, not per-clone.
+    binary_watch: Arc<crate::binary_identity::ReplacementWatch>,
 }
+
+/// How often `call_tool` re-stats the on-disk binary. Cheap between checks
+/// (an atomic bool read), so this only bounds `stat` syscall frequency.
+const BINARY_REPLACEMENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tool_router]
 impl CsrServer {
+    /// `startup_identity` should be captured as early in process startup as
+    /// possible (main.rs does this before `Engine::new()` runs) — see
+    /// `binary_identity::ReplacementWatch::new`'s doc for why capturing it
+    /// here, after construction, would be too late.
     pub fn new(
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
         index_dir: PathBuf,
+        startup_identity: Option<crate::binary_identity::FileIdentity>,
     ) -> Self {
         // Derive db_path from index_dir (sibling: index_dir/../csr-engine.db)
         let db_path = index_dir
@@ -263,6 +277,9 @@ impl CsrServer {
             index_dir,
             db_path,
             task_manager: TaskManager::new(),
+            binary_watch: Arc::new(crate::binary_identity::ReplacementWatch::new(
+                startup_identity,
+            )),
         }
     }
 
@@ -296,7 +313,18 @@ impl CsrServer {
     }
 
     /// Flush the HNSW index to disk if dirty.
+    ///
+    /// A no-op once the on-disk binary has been replaced underneath this
+    /// process (gap-G2): index writes belong to the current image, and a
+    /// superseded process dumping over it would rewrite `manifest.json`
+    /// without whatever fields the current build's format has grown (the
+    /// live case that triggered this: the epoch field the W3-D
+    /// compaction-epoch guard needs). Searching from the stale in-memory
+    /// index keeps working — only persistence stops.
     async fn flush_index(&self) {
+        if self.binary_watch.is_replaced() {
+            return;
+        }
         let mut idx = self.search.write().await;
         if idx.is_dirty() {
             let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
@@ -909,8 +937,16 @@ impl ServerHandler for CsrServer {
             .client_capabilities()
             .is_some_and(|capabilities| capabilities.supports_tasks());
 
+        // gap-G2 spec 2c: check at most once per interval, regardless of
+        // how often tools are called; cheap (an atomic read) on every call
+        // that doesn't land on the boundary.
+        let binary_notice = self
+            .binary_watch
+            .check_notice(BINARY_REPLACEMENT_CHECK_INTERVAL);
+
         if tasks::is_taskable(request.name.as_ref()) && client_supports_tasks {
             let server = self.clone();
+            let notice = binary_notice.clone();
             let task_options = TaskOptions::default()
                 .with_ttl_ms(30_000)
                 .with_poll_interval_ms(500)
@@ -922,7 +958,9 @@ impl ServerHandler for CsrServer {
                     tokio::select! {
                         _ = task_context.cancelled() => Err(TaskExit::Cancelled),
                         result = tool_router.call(tool_call) => match result {
-                            Ok(CallToolResponse::Complete(result)) => Ok(result),
+                            Ok(CallToolResponse::Complete(result)) => Ok(
+                                crate::binary_identity::append_binary_replaced_notice(result, notice),
+                            ),
                             Ok(_) => Err(TaskExit::Error(rmcp::ErrorData::internal_error(
                                 "Tool returned an unsupported response while executing as a task",
                                 None,
@@ -936,7 +974,13 @@ impl ServerHandler for CsrServer {
         }
 
         let tool_call = ToolCallContext::new(self, request, context);
-        Self::tool_router().call(tool_call).await
+        let response = Self::tool_router().call(tool_call).await?;
+        Ok(match response {
+            CallToolResponse::Complete(result) => CallToolResponse::Complete(
+                crate::binary_identity::append_binary_replaced_notice(result, binary_notice),
+            ),
+            other => other,
+        })
     }
 
     async fn get_task(

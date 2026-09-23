@@ -816,7 +816,18 @@ impl Engine {
     /// lands on stderr rather than corrupting the protocol stream. `None`
     /// (claim failed, or non-unix) falls back to the unmodified stdio
     /// transport — the pre-existing behaviour.
-    pub async fn serve_mcp(self, stdout: Option<crate::hooks::ClaimedStdout>) -> Result<()> {
+    ///
+    /// `startup_identity` is this process's own exe identity, captured by
+    /// `main()` before `Engine::new()` ran (storage open, HNSW load/rebuild,
+    /// embeddings warm — seconds on a large corpus). Capturing it any later,
+    /// here, would widen the window in which a replacement landing during
+    /// this process's own startup goes permanently invisible to it (see
+    /// `binary_identity::ReplacementWatch::new`'s doc).
+    pub async fn serve_mcp(
+        self,
+        stdout: Option<crate::hooks::ClaimedStdout>,
+        startup_identity: Option<crate::binary_identity::FileIdentity>,
+    ) -> Result<()> {
         // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
         let enrichment_handles = crate::daemon::spawn_enrichment_loops(
             self.storage.clone(),
@@ -831,10 +842,17 @@ impl Engine {
             self.search,
             self.projects_dir,
             self.index_dir,
+            startup_identity,
         );
-        // Record which build is serving, so `status` can tell the user when a
-        // newer binary was installed underneath this connection.
-        crate::binary_stamp::record_serving_binary();
+        // Record this process in the run registry so `status` can tell any
+        // session when a newer binary was installed underneath its live
+        // MCP connection (gap-G2: one record per process, not a single
+        // last-writer-wins stamp — see `binary_identity`).
+        let run_record_path = startup_identity
+            .zip(crate::binary_identity::default_run_dir())
+            .and_then(|(identity, run_dir)| {
+                crate::binary_identity::write_run_record(&run_dir, "mcp_stdio", identity)
+            });
         #[cfg(unix)]
         let service = match stdout {
             Some(claimed) => {
@@ -854,6 +872,9 @@ impl Engine {
         // Clean up enrichment loops on MCP server exit
         for handle in enrichment_handles {
             handle.abort();
+        }
+        if let Some(path) = run_record_path {
+            crate::binary_identity::remove_run_record(&path);
         }
 
         Ok(())

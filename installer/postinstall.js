@@ -24,6 +24,7 @@ import {
   mkdtempSync,
   rmSync,
   copyFileSync,
+  renameSync,
   lstatSync,
 } from 'fs';
 import { dirname, join, resolve } from 'path';
@@ -215,6 +216,49 @@ function runOrExplainActivation(binaryPath) {
   }
 }
 
+// --- Stale-process report + daemon restart (gap-G2 spec 2e) ---
+
+const DAEMON_LABEL = 'com.ramakay.csr-engine.daemon';
+
+function reportStaleAndKickstart(binaryPath) {
+  try {
+    const statusJson = execFileSync(binaryPath, ['status'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 10000,
+    });
+    const status = JSON.parse(statusJson);
+    const stale = Array.isArray(status.stale_processes) ? status.stale_processes : [];
+    if (stale.length > 0) {
+      console.log(`\n  \x1b[1;33m${stale.length} process(es) are still running the previous csr-engine build:\x1b[0m`);
+      for (const p of stale) {
+        console.log(`    pid ${p.pid} (${p.role}, started ${p.started_at}${p.parent ? `, parent ${p.parent}` : ''})`);
+      }
+      console.log('  Restart Claude Code sessions (and any other MCP host) using csr-engine to pick up this build.');
+    }
+  } catch {
+    // status is best-effort here — a fresh install with no prior run
+    // registry, or a status failure, must not fail the install.
+  }
+
+  if (platform() !== 'darwin') return;
+  try {
+    execFileSync('launchctl', ['print', `gui/${process.getuid()}/${DAEMON_LABEL}`], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+  } catch {
+    return; // daemon label not loaded — nothing to restart
+  }
+  try {
+    console.log(`  Restarting daemon (${DAEMON_LABEL}) to pick up the new build...`);
+    execFileSync('launchctl', ['kickstart', '-k', `gui/${process.getuid()}/${DAEMON_LABEL}`], {
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+  } catch {
+    console.log('  launchctl kickstart failed; restart the daemon manually.');
+  }
+}
+
 // --- Existing installation detection ---
 
 function findExistingBinary() {
@@ -325,13 +369,27 @@ async function main() {
       throw new Error('Archive entry csr-engine is not a regular file');
     }
 
+    // Stage to a temp file in the SAME directory as the destination, then
+    // rename it over the destination. A rename within one filesystem is
+    // atomic (POSIX / NTFS) and gives the final path a NEW inode, so any
+    // already-running `csr-engine` process (a daemon, an MCP stdio server)
+    // keeps its old image mapped cleanly instead of racing a
+    // partially-overwritten file it could page-fault into mid-read.
+    // `copyFileSync` straight onto `destPath` can keep the same inode on
+    // some filesystems, which the gap-G2 replacement detector (dev+ino+
+    // len+mtime+ctime) is designed to also catch as a fallback — but the
+    // rename is what makes that detection unambiguous and avoids the
+    // page-in risk in the first place.
     const destPath = join(INSTALL_DIR, BINARY_NAME);
-    copyFileSync(binaryPath, destPath);
-    chmodSync(destPath, 0o755);
+    const stagedPath = join(INSTALL_DIR, `.${BINARY_NAME}.new.${process.pid}`);
+    copyFileSync(binaryPath, stagedPath);
+    chmodSync(stagedPath, 0o755);
+    renameSync(stagedPath, destPath);
 
     console.log(`  \x1b[1;32mInstalled:\x1b[0m ${destPath}`);
 
     runOrExplainActivation(destPath);
+    reportStaleAndKickstart(destPath);
 
     if (pythonSignals.length > 0) {
       console.log('  Old Python stack can be cleaned up:');

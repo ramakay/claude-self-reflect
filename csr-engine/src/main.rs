@@ -591,6 +591,17 @@ fn default_projects_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Captured as the literal first thing this process does, before ANY
+    // other work — `Engine::new()` alone (storage open, HNSW load/rebuild,
+    // embeddings warm) can take seconds on a large corpus, and macOS
+    // codesign/Gatekeeper verification on a freshly installed binary's
+    // first launch adds more before even that. Capturing identity any
+    // later widens the window in which a binary replacement landing during
+    // this process's own startup goes permanently invisible to it: it
+    // would record the NEW file's identity as its own baseline and could
+    // never see itself as replaced (gap-G2; caught by a scratch-HOME smoke
+    // test where the replace happened to land in exactly that window).
+    let startup_identity = csr_engine::binary_identity::current_exe_identity();
     // Raise the open-file ceiling before any index load so a low soft RLIMIT_NOFILE
     // cannot turn a transient EMFILE inside hnsw_rs's mmap load into a process exit.
     csr_engine::runtime::raise_fd_limit();
@@ -622,10 +633,14 @@ fn main() -> Result<()> {
     // Extracted into `runtime::run_to_completion` (not inlined here) so the
     // shutdown-bounding behaviour has a test that calls the exact function
     // `main` calls — see `runtime::tests::run_to_completion_bounds_the_wait_for_an_abandoned_blocking_task`.
-    csr_engine::runtime::run_to_completion(runtime, run(), std::time::Duration::from_secs(5))
+    csr_engine::runtime::run_to_completion(
+        runtime,
+        run(startup_identity),
+        std::time::Duration::from_secs(5),
+    )
 }
 
-async fn run() -> Result<()> {
+async fn run(startup_identity: Option<csr_engine::binary_identity::FileIdentity>) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -835,7 +850,24 @@ async fn run() -> Result<()> {
             config,
             !no_ai,
         );
-        return daemon.run().await;
+        let exit_code = daemon.run(startup_identity).await?;
+        if exit_code != 0 {
+            // Skips `runtime::run_to_completion`'s bounded shutdown wait
+            // (see that function's doc comment) — deliberately: the
+            // daemon's own `run()` already completed its full graceful
+            // teardown (shutdown flag, joined loops, bounded flush) before
+            // returning this code, so nothing meaningful is left running
+            // except the same kind of abandoned-blocking-task case that
+            // wait already tolerates. Exiting immediately here, rather
+            // than threading the code back through `Result<()>`, is what
+            // makes it observable to launchd: this process's `Result` flows
+            // through `run_to_completion` -> `fn main() -> Result<()>`,
+            // which anyhow always maps to exit code 1 on `Err` and 0 on
+            // `Ok(())` — there is no path for a specific non-zero success
+            // code other than exiting directly.
+            std::process::exit(exit_code);
+        }
+        return Ok(());
     }
 
     if let Some(Commands::RebuildIndex) = args.command {
@@ -1551,7 +1583,7 @@ async fn run() -> Result<()> {
     };
 
     if should_serve {
-        eng.serve_mcp(jsonrpc_stdout).await?;
+        eng.serve_mcp(jsonrpc_stdout, startup_identity).await?;
     } else if args.watch {
         // If watching (with or without import), keep the process alive
         tracing::info!("watching for new conversations. Press Ctrl+C to stop.");
