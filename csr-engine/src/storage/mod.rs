@@ -1216,6 +1216,17 @@ impl Storage {
         queries::codex_conversation_summaries(&conn)
     }
 
+    /// Distinct `codex_rollout` conversation ids with a harness-marker chunk
+    /// anywhere, not just in `summary`. See
+    /// `queries::codex_conversations_with_harness_content`.
+    pub fn codex_conversations_with_harness_content(
+        &self,
+        markers: &[&str],
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::codex_conversations_with_harness_content(&conn, markers)
+    }
+
     /// Clear a stored import_state mtime so the row is picked up on the next
     /// discovery pass. See `queries::invalidate_import_state_mtime`.
     pub fn invalidate_import_state_mtime(&self, file_path: &str) -> Result<()> {

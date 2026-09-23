@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -1096,6 +1097,12 @@ pub struct RestampProgress {
     pub conversations_unmatched: usize,
     pub conversations_missing_file: usize,
     pub conversations_skipped_polluted: usize,
+    /// Added after `_v2` first shipped — `#[serde(default)]` so an
+    /// already-persisted progress blob from before this field existed still
+    /// deserializes (as `0`) instead of getting dropped wholesale by the
+    /// `.ok()` fallback in every reader.
+    #[serde(default)]
+    pub conversations_pending_import: usize,
     pub chunks_updated: usize,
     pub chunks_unmatched: usize,
 }
@@ -1126,6 +1133,17 @@ pub struct RestampStats {
     /// is what lets a corpus with outstanding harness pollution still reach
     /// a clean, done-marked restamp for everything else.
     pub conversations_skipped_polluted: usize,
+    /// Rows skipped because the on-disk file's mtime no longer matches the
+    /// `import_state` row this restamp is comparing against
+    /// ([`Storage::is_file_imported`] returned `false` for a reason other
+    /// than "no row") — the file changed since it was last imported. This is
+    /// transient drift, not a fixable defect here: an ordinary
+    /// `import_changed_rollouts` pass will pick the new mtime up and
+    /// re-derive fresh content on its own next tick. Counting it as
+    /// `conversations_unmatched` instead (the pre-fix behavior) burned a
+    /// restamp attempt on every single conversation that merely grew between
+    /// listing and re-derivation — see the W3-R review finding this closes.
+    pub conversations_pending_import: usize,
     /// Total chunk rows whose `timestamp` was rewritten.
     pub chunks_updated: usize,
     /// Total re-derived chunks whose content guard did not match any stored
@@ -1216,6 +1234,20 @@ pub fn restamp_codex_chunk_timestamps(storage: &Storage) -> Result<RestampStats>
             stats.conversations_missing_file += 1;
             continue;
         }
+        if !storage.is_file_imported(path).unwrap_or(false) {
+            // The file changed since it was last imported (grew, or was
+            // rewritten) — comparing its current content against the stale
+            // `import_state` row would produce a spurious content mismatch
+            // that has nothing to do with harness pollution or genuine
+            // drift. An ordinary `import_changed_rollouts` pass already
+            // picks up the new mtime on its own next tick, so this is left
+            // for that path rather than counted toward `conversations_
+            // unmatched` (which would otherwise burn a restamp attempt on
+            // every conversation that merely grew between listing and
+            // re-derivation).
+            stats.conversations_pending_import += 1;
+            continue;
+        }
         let Some(metadata) = scan_rollout_metadata(path)? else {
             // Vanished between the exists() check and open — same bucket as
             // "missing": nothing to fix, not fabricated.
@@ -1273,6 +1305,7 @@ pub fn restamp_codex_chunk_timestamps(storage: &Storage) -> Result<RestampStats>
         conversations_unmatched: stats.conversations_unmatched,
         conversations_missing_file: stats.conversations_missing_file,
         conversations_skipped_polluted: stats.conversations_skipped_polluted,
+        conversations_pending_import: stats.conversations_pending_import,
         chunks_updated: stats.chunks_updated,
         chunks_unmatched: stats.chunks_unmatched,
     };
@@ -1355,21 +1388,32 @@ pub fn backfill_codex_subagent_sidechain(
     Ok(stats)
 }
 
-/// Distinct `codex_rollout` conversation ids whose stored `summary` still
-/// starts with a [`CODEX_HARNESS_MARKERS`] entry — the live signal for "this
-/// conversation was imported (or last reimported) before the harness-marker
-/// strip and its stored chunk content is still the pre-strip text". Shared
-/// by [`invalidate_polluted_codex_rollouts`] (CLI, mtime-invalidate only),
-/// the daemon-owned [`harness_strip_batch`] (reimports directly), and
+/// Distinct `codex_rollout` conversation ids that still carry pre-strip
+/// harness-marker content — the live signal for "this conversation was
+/// imported (or last reimported) before the harness-marker strip and its
+/// stored chunk content is still the pre-strip text". Shared by
+/// [`invalidate_polluted_codex_rollouts`] (CLI, mtime-invalidate only), the
+/// daemon-owned [`harness_strip_batch`] (reimports directly), and
 /// [`restamp_codex_chunk_timestamps`] (skips them rather than mis-flagging
 /// them as drifted).
+///
+/// Checked two ways, unioned:
+/// - `summary` (the first stored chunk's content) — cheap, catches the
+///   common case where the harness block is the conversation's opening turn.
+/// - *any* stored chunk's content — a resumed or multi-turn session can have
+///   a real, non-harness first user message but still carry a harness block
+///   re-injected on a later turn (Codex re-injects `<recommended_plugins>` /
+///   `<environment_context>` etc. on each resume). A `summary`-only scan is
+///   permanently blind to that row: see the W3-R review finding this closes.
 fn polluted_codex_conversation_ids(storage: &Storage) -> Result<std::collections::HashSet<String>> {
-    Ok(storage
+    let mut ids: std::collections::HashSet<String> = storage
         .codex_conversation_summaries()?
         .into_iter()
         .filter(|(_, summary)| summary.as_deref().is_some_and(is_harness_context_item))
         .map(|(conversation_id, _)| conversation_id)
-        .collect())
+        .collect();
+    ids.extend(storage.codex_conversations_with_harness_content(CODEX_HARNESS_MARKERS)?);
+    Ok(ids)
 }
 
 /// Meta key guarding [`invalidate_polluted_codex_rollouts`]. Present once the
@@ -1477,6 +1521,15 @@ pub struct HarnessStripProgress {
     pub last_batch_at: Option<String>,
     pub last_batch_chunks: usize,
     pub last_batch_secs: f64,
+    /// File-having polluted conversations remaining as of the most recent
+    /// batch (mirrors [`HarnessStripBatchStats::polluted_remaining`]).
+    /// Persisted here so `csr-engine status` — including the `--compact`
+    /// statusline refresh, which shells out on a tight interval — can report
+    /// this without running its own live
+    /// `polluted_codex_rows_by_file_presence` scan on every call. `None`
+    /// before the very first batch has run: genuinely unknown, not zero.
+    #[serde(default)]
+    pub polluted_remaining: Option<usize>,
 }
 
 /// Receipt for one [`harness_strip_batch`] call.
@@ -1556,7 +1609,21 @@ pub(crate) fn polluted_codex_rows_by_file_presence(
 /// only when the file-having polluted count reaches 0 — conversations whose
 /// file is gone stay polluted forever and never block completion (mirrors
 /// every other backfill's `conversations_missing_file` convention).
-pub fn harness_strip_batch(engine: &Engine, batch_size: usize) -> Result<HarnessStripBatchStats> {
+///
+/// `shutdown` is checked between conversations (never mid-conversation, so a
+/// single `import_rollout` always finishes its own delete+reinsert
+/// transaction cleanly) — the daemon's shutdown sequence awaits this
+/// function with no timeout, and the largest real codex conversations run
+/// tens of seconds each, comfortably past `launchctl`'s default
+/// `ExitTimeOut`. Breaking early here just leaves the remainder polluted for
+/// the next batch to pick up (this job is already fully resumable with no
+/// separate cursor), instead of risking a SIGKILL mid-batch that leaves the
+/// DB holding chunks the on-disk HNSW index doesn't.
+pub fn harness_strip_batch(
+    engine: &Engine,
+    batch_size: usize,
+    shutdown: &AtomicBool,
+) -> Result<HarnessStripBatchStats> {
     anyhow::ensure!(batch_size > 0, "harness-strip batch size must be positive");
     let storage = engine.storage();
     if storage.get_meta(HARNESS_STRIP_V2_META_KEY)?.is_some() {
@@ -1574,6 +1641,9 @@ pub fn harness_strip_batch(engine: &Engine, batch_size: usize) -> Result<Harness
     };
 
     for (path, _conversation_id) in candidates.into_iter().take(batch_size) {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         let Some(mtime) = file_mtime(&path) else {
             // Vanished between the listing above and now — same bucket as
             // "missing", not fabricated, retried next batch if it reappears.
@@ -1612,6 +1682,7 @@ pub fn harness_strip_batch(engine: &Engine, batch_size: usize) -> Result<Harness
     progress.last_batch_at = Some(chrono::Utc::now().to_rfc3339());
     progress.last_batch_chunks = stats.chunks_reimported;
     progress.last_batch_secs = stats.batch_secs;
+    progress.polluted_remaining = Some(stats.polluted_remaining);
     storage.set_meta(
         HARNESS_STRIP_V2_PROGRESS_META_KEY,
         &serde_json::to_string(&progress)?,
@@ -2192,6 +2263,60 @@ mod tests {
         assert!(storage.get_meta(RESTAMP_META_KEY).unwrap().is_none());
     }
 
+    /// W3-R high review finding ("the same trap catches transient drift"):
+    /// a codex rollout that grew on disk since it was last imported (new
+    /// mtime, new tail content) must never be treated the same as a
+    /// permanently drifted file. Pre-fix, the new tail message's re-derived
+    /// chunk has no matching stored row (it was never imported), so it
+    /// lands in `chunks_unmatched` and blocks the done key forever — a
+    /// normal `import_changed_rollouts` pass would pick the new mtime up on
+    /// its own the very next tick, so this is not this restamp's problem to
+    /// solve, and definitely not an attempt-burning one. Must fail at HEAD
+    /// (pre-fix: no mtime check before content re-derivation).
+    #[test]
+    fn restamp_treats_a_stale_mtime_as_pending_import_not_unmatched() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let target = root.path().join("rollout-copy.jsonl");
+        std::fs::copy(&source, &target).unwrap();
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        import_changed_rollouts(&engine, root.path()).unwrap();
+
+        // The file grows after this import (a real, in-flight session
+        // write) — its mtime and tail content both move on, but nothing has
+        // reimported it yet.
+        let extra_line = r#"{"timestamp":"2026-08-06T12:10:00Z","type":"response_item","payload":{"type":"message","id":"grew-1","role":"user","content":[{"type":"input_text","text":"a later message the stored chunks do not know about yet"}]}}"#;
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&target)
+                .unwrap();
+            writeln!(file, "{extra_line}").unwrap();
+        }
+
+        let stats = restamp_codex_chunk_timestamps(&storage).unwrap();
+        assert_eq!(
+            stats.conversations_pending_import, 1,
+            "a file that changed since the last import must be skipped as pending, not scanned"
+        );
+        assert_eq!(
+            stats.conversations_unmatched, 0,
+            "transient mtime drift must never be counted as an unmatched conversation"
+        );
+        assert_eq!(
+            stats.chunks_unmatched, 0,
+            "transient mtime drift must never burn a restamp attempt via chunks_unmatched"
+        );
+        assert!(
+            storage.get_meta(RESTAMP_META_KEY).unwrap().is_some(),
+            "nothing genuinely unmatched or polluted remains, so this must still reach done"
+        );
+    }
+
     /// Retries are bounded: past `RESTAMP_MAX_ATTEMPTS` the function stops
     /// re-scanning the whole corpus on every daemon tick, but still never
     /// claims the done key for a file that will never start matching.
@@ -2280,7 +2405,7 @@ mod tests {
                 .unwrap();
         }
 
-        let batch1 = harness_strip_batch(&engine, 1).unwrap();
+        let batch1 = harness_strip_batch(&engine, 1, &AtomicBool::new(false)).unwrap();
         assert!(!batch1.already_applied);
         assert_eq!(batch1.polluted_considered, 3);
         assert_eq!(batch1.reimported, 1);
@@ -2291,14 +2416,14 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let batch2 = harness_strip_batch(&engine, 1).unwrap();
+        let batch2 = harness_strip_batch(&engine, 1, &AtomicBool::new(false)).unwrap();
         assert_eq!(batch2.polluted_considered, 2);
         assert_eq!(batch2.reimported, 1);
         assert_eq!(batch2.polluted_remaining, 1);
         assert!(!batch2.done);
 
         // A batch larger than the remaining backlog drains it completely.
-        let batch3 = harness_strip_batch(&engine, 10).unwrap();
+        let batch3 = harness_strip_batch(&engine, 10, &AtomicBool::new(false)).unwrap();
         assert_eq!(batch3.reimported, 1);
         assert_eq!(batch3.polluted_remaining, 0);
         assert!(batch3.done);
@@ -2307,7 +2432,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        let batch4 = harness_strip_batch(&engine, 10).unwrap();
+        let batch4 = harness_strip_batch(&engine, 10, &AtomicBool::new(false)).unwrap();
         assert!(batch4.already_applied);
 
         // Acceptance: no chunk of any of the three conversations still
@@ -2382,7 +2507,7 @@ mod tests {
         }
         std::fs::remove_file(&gone).unwrap();
 
-        let batch = harness_strip_batch(&engine, 10).unwrap();
+        let batch = harness_strip_batch(&engine, 10, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             batch.polluted_considered, 1,
             "the missing-file row is excluded up front"
@@ -2475,7 +2600,7 @@ mod tests {
         // The harness-strip batch reimports it directly, which both strips
         // the marker and re-stamps correct per-message timestamps as a side
         // effect of the normal import path.
-        let strip = harness_strip_batch(&engine, 10).unwrap();
+        let strip = harness_strip_batch(&engine, 10, &AtomicBool::new(false)).unwrap();
         assert_eq!(strip.reimported, 1);
         assert!(strip.done);
 
@@ -2496,6 +2621,181 @@ mod tests {
             repaired_timestamps.len() > 1,
             "reimport must restore distinct per-message timestamps, got {repaired_timestamps:?}"
         );
+    }
+
+    /// W3-R high review finding: pollution used to be detected only from a
+    /// conversation's cached `summary` (the first stored chunk's content). A
+    /// resumed or multi-turn Codex session can have a real, non-harness
+    /// first user message but still carry a harness-injected block
+    /// (`<recommended_plugins>` / `<environment_context>` / etc.) re-injected
+    /// on a *later* turn — imported before the harness-stripping fix
+    /// existed, that block is still sitting untouched in stored content.
+    /// `summary`-only detection never sees it: the restamp can never reach
+    /// `chunks_unmatched == 0` for that row (content mismatch forever), and
+    /// `harness_strip_batch` never queues it for reimport (it's not in the
+    /// polluted set), so it shows a harness preview forever too. Content-
+    /// based detection (any chunk, not just the first) must catch it. Must
+    /// fail at HEAD (pre-fix, `polluted_codex_conversation_ids` summary-only).
+    #[test]
+    fn polluted_conversation_ids_detects_a_harness_marker_injected_after_a_real_first_message() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-resumed.jsonl");
+        let lines = [
+            r#"{"timestamp":"2026-07-19T09:00:00Z","type":"session_meta","payload":{"id":"resumed-fixture","timestamp":"2026-07-19T09:00:00Z","cwd":"/workspace/resumed-project","source":"synthetic"}}"#,
+            r#"{"timestamp":"2026-07-19T09:00:01Z","type":"response_item","payload":{"type":"message","id":"user-1","role":"user","content":[{"type":"input_text","text":"real user request to start the session"}]}}"#,
+            r#"{"timestamp":"2026-07-19T09:00:02Z","type":"response_item","payload":{"type":"message","id":"assistant-1","role":"assistant","content":[{"type":"output_text","text":"real assistant response"}]}}"#,
+            r#"{"timestamp":"2026-07-19T09:05:01Z","type":"response_item","payload":{"type":"message","id":"user-2","role":"user","content":[{"type":"input_text","text":"real follow-up request after resume"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        let import_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(import_stats.files_imported, 1);
+
+        // The now-fixed adapter would strip a genuine `<recommended_plugins>`
+        // item at import time, so simulate a conversation imported *before*
+        // that fix existed: restore a harness block directly onto the third
+        // (resumed-turn) stored chunk, while leaving `summary` (built from
+        // the first, real, chunk) untouched. This is the crux of the
+        // finding: the conversation's opening turn is real prose.
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE chunks SET content = ?1
+                     WHERE conversation_id = 'codex:resumed-fixture' AND seq = 2",
+                    rusqlite::params![
+                        "<recommended_plugins>\nHere is a list of plugins that are available but not installed"
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let (_, summary) = storage
+            .codex_conversation_summaries()
+            .unwrap()
+            .into_iter()
+            .find(|(id, _)| id == "codex:resumed-fixture")
+            .expect("conversation must be present");
+        assert!(
+            summary
+                .as_deref()
+                .is_some_and(|s| !is_harness_context_item(s)),
+            "setup: summary must stay real prose — this is exactly what \
+             summary-only detection misses"
+        );
+
+        let polluted = polluted_codex_conversation_ids(&storage).unwrap();
+        assert!(
+            polluted.contains("codex:resumed-fixture"),
+            "content-based detection must flag the later harness chunk even \
+             though summary is real prose"
+        );
+
+        let harness_strip = harness_strip_batch(&engine, 10, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            harness_strip.reimported, 1,
+            "harness_strip_batch must queue and reimport a conversation \
+             flagged only by content, not summary"
+        );
+        assert!(harness_strip.done);
+
+        let ids = storage
+            .get_chunk_ids_for_conversation("codex:resumed-fixture")
+            .unwrap();
+        let repaired = storage.get_chunks_by_ids(&ids).unwrap();
+        assert!(
+            repaired
+                .iter()
+                .all(|c| !c.content.trim_start().starts_with("<recommended_plugins>")),
+            "harness marker must be gone: {:?}",
+            repaired.iter().map(|c| &c.content).collect::<Vec<_>>()
+        );
+
+        // The restamp must also reach done for this conversation now that
+        // the harness-strip job has reimported it.
+        let restamp = restamp_codex_chunk_timestamps(&storage).unwrap();
+        assert_eq!(restamp.conversations_unmatched, 0);
+        assert!(storage.get_meta(RESTAMP_META_KEY).unwrap().is_some());
+    }
+
+    /// W3-R low review finding: `harness_strip_batch` used to ignore the
+    /// daemon's shutdown flag between conversations entirely, and the
+    /// daemon's shutdown sequence awaits it with no timeout — a launchctl
+    /// stop (default 20s `ExitTimeOut`) could SIGKILL mid-batch. Must break
+    /// between conversations (never mid-conversation) once shutdown is
+    /// requested, leaving the remainder polluted for the next batch to pick
+    /// up. Must fail at HEAD (pre-fix, no shutdown check in the loop).
+    #[test]
+    fn harness_strip_batch_stops_between_conversations_on_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
+        let raw = std::fs::read_to_string(&source).unwrap();
+        let mut conversation_ids = Vec::new();
+        for n in 0..3 {
+            let id = format!("shutdown-fixture-{n}");
+            std::fs::write(
+                root.path().join(format!("rollout-{n}.jsonl")),
+                raw.replace("modern-fixture", &id),
+            )
+            .unwrap();
+            conversation_ids.push(format!("codex:{id}"));
+        }
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = test_engine(storage.clone(), root.path());
+        let import_stats = import_changed_rollouts(&engine, root.path()).unwrap();
+        assert_eq!(import_stats.files_imported, 3);
+
+        for conversation_id in &conversation_ids {
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET summary = ?1 WHERE conversation_id = ?2",
+                        rusqlite::params![
+                            "<recommended_plugins>\nHere is a list of plugins that are available but not installed",
+                            conversation_id,
+                        ],
+                    )?;
+                    conn.execute(
+                        "UPDATE chunks SET content = ?1 || content WHERE conversation_id = ?2 AND seq = 0",
+                        rusqlite::params![
+                            "<recommended_plugins>\nHere is a list of plugins that are available but not installed\n",
+                            conversation_id,
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        // Already shut down before the batch even starts: not one
+        // conversation should be reimported, and the polluted count must be
+        // untouched.
+        let shutdown = AtomicBool::new(true);
+        let batch = harness_strip_batch(&engine, 10, &shutdown).unwrap();
+        assert_eq!(
+            batch.reimported, 0,
+            "must not reimport any conversation once shutdown is requested"
+        );
+        assert_eq!(batch.polluted_considered, 3);
+        assert_eq!(
+            batch.polluted_remaining, 3,
+            "nothing was reimported, so nothing should have cleared"
+        );
+        assert!(!batch.done);
+        assert!(storage
+            .get_meta(HARNESS_STRIP_V2_META_KEY)
+            .unwrap()
+            .is_none());
+
+        // A later, non-shutdown call resumes and drains the backlog — this
+        // is the resumability the job's doc comment promises.
+        let resumed = harness_strip_batch(&engine, 10, &AtomicBool::new(false)).unwrap();
+        assert_eq!(resumed.reimported, 3);
+        assert!(resumed.done);
     }
 
     /// The pass used to propagate the first per-file error, so one unreadable

@@ -2515,6 +2515,46 @@ pub fn codex_conversation_summaries(conn: &Connection) -> Result<Vec<(String, Op
         .map_err(Into::into)
 }
 
+/// Distinct `codex_rollout` conversation ids where *any* stored chunk's
+/// `content` (not just the conversation's cached `summary`, which is only
+/// ever the first chunk's content) starts with one of `markers`. A resumed
+/// or multi-turn Codex session can have a real, non-harness first user
+/// message but still carry a harness-injected block
+/// (`<recommended_plugins>`/`<environment_context>`/etc.) re-injected on a
+/// later turn — a `summary`-only scan is blind to that row entirely. One
+/// full pass over the same `chunks` slice `codex_conversation_summaries`
+/// already scans (`source = 'codex_rollout'`), so this costs the same order
+/// of work. `markers` is caller-supplied (not hardcoded here) so this
+/// storage-layer helper stays independent of `CODEX_HARNESS_MARKERS`'s
+/// definition in the import layer.
+pub fn codex_conversations_with_harness_content(
+    conn: &Connection,
+    markers: &[&str],
+) -> Result<Vec<String>> {
+    if markers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let clause = markers
+        .iter()
+        .map(|_| "content LIKE ? ESCAPE '\\'")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!(
+        "SELECT DISTINCT conversation_id FROM chunks
+         WHERE source = 'codex_rollout' AND ({clause})"
+    );
+    let patterns: Vec<String> = markers
+        .iter()
+        .map(|marker| format!("{}%", escape_like(marker)))
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(patterns.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// Force the next `discover_rollouts` pass to re-import `file_path` by
 /// clearing its stored mtime — an empty string can never equal a real
 /// filesystem mtime, so the next scan's `stored_mtime(key) == current_mtime`

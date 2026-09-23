@@ -44,6 +44,35 @@ pub fn codex_import_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Conservative poll cadence for `codex_harness_strip_handle`'s loop: not
+/// idle, nothing to do, the batch just drained the backlog, or the run
+/// errored/panicked. Same order as every other daemon loop's idle-poll here.
+const HARNESS_STRIP_BUSY_POLL_SECS: u64 = 300;
+
+/// Short poll cadence applied only right after a batch that made progress
+/// and left more polluted conversations behind. Without this, the loop used
+/// to sleep the full `HARNESS_STRIP_BUSY_POLL_SECS` before *every single*
+/// batch regardless of backlog size, making the real drain time for ~1,327
+/// live-corpus rollouts (54 batches of 25) ~54 * (300s + ~75s compute) ≈
+/// 5.6h of continuous *idle* time — likely days of wall clock, not the
+/// ~57min pure-compute projection this job was shipped with. See the W3-R
+/// review finding this closes.
+const HARNESS_STRIP_DRAIN_POLL_SECS: u64 = 30;
+
+/// Decide how long `codex_harness_strip_handle` should wait before its next
+/// tick, given the just-finished batch's outcome (`None` when the run itself
+/// errored or panicked before producing a stats value). Pulled out of the
+/// loop as a pure function so the cadence policy has direct unit coverage
+/// independent of the daemon's full async plumbing.
+fn harness_strip_next_wait_secs(
+    stats: Option<&crate::import::codex_rollout::HarnessStripBatchStats>,
+) -> u64 {
+    match stats {
+        Some(stats) if !stats.already_applied && !stats.done => HARNESS_STRIP_DRAIN_POLL_SECS,
+        _ => HARNESS_STRIP_BUSY_POLL_SECS,
+    }
+}
+
 /// `CSR_NO_MEMORY_REGISTRY` kill switch — same "1"/"true" (case-insensitive) idiom
 /// as `crate::daemon::dream_cadence::dreaming_disabled`.
 pub fn memory_registry_disabled() -> bool {
@@ -692,8 +721,10 @@ impl Daemon {
             let shutdown = shutdown.clone();
             let heavy_work = heavy_work.clone();
             tokio::spawn(async move {
+                let mut wait_secs = HARNESS_STRIP_BUSY_POLL_SECS;
                 loop {
-                    for _ in 0..30 {
+                    let ticks = (wait_secs / 10).max(1);
+                    for _ in 0..ticks {
                         if shutdown.load(Ordering::SeqCst) {
                             return;
                         }
@@ -706,6 +737,7 @@ impl Daemon {
                             dream_cadence::idle_secs(),
                         )
                     {
+                        wait_secs = HARNESS_STRIP_BUSY_POLL_SECS;
                         continue;
                     }
                     let Some(permit) =
@@ -722,30 +754,40 @@ impl Daemon {
                         )
                     {
                         drop(permit);
+                        wait_secs = HARNESS_STRIP_BUSY_POLL_SECS;
                         continue;
                     }
                     let batch_engine = engine.clone();
+                    let batch_shutdown = shutdown.clone();
                     let result = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
                         crate::import::codex_rollout::harness_strip_batch(
                             &batch_engine,
                             crate::import::codex_rollout::HARNESS_STRIP_V2_BATCH_SIZE,
+                            batch_shutdown.as_ref(),
                         )
                     })
                     .await;
-                    match result {
-                        Ok(Ok(stats)) if stats.already_applied => {}
-                        Ok(Ok(stats)) => tracing::info!(
-                            polluted_considered = stats.polluted_considered,
-                            reimported = stats.reimported,
-                            missing_file = stats.missing_file,
-                            failed = stats.failed,
-                            chunks_reimported = stats.chunks_reimported,
-                            polluted_remaining = stats.polluted_remaining,
-                            batch_secs = stats.batch_secs,
-                            done = stats.done,
-                            "Codex harness-strip batch completed"
-                        ),
+                    if let Ok(Ok(stats)) = &result {
+                        if !stats.already_applied {
+                            tracing::info!(
+                                polluted_considered = stats.polluted_considered,
+                                reimported = stats.reimported,
+                                missing_file = stats.missing_file,
+                                failed = stats.failed,
+                                chunks_reimported = stats.chunks_reimported,
+                                polluted_remaining = stats.polluted_remaining,
+                                batch_secs = stats.batch_secs,
+                                done = stats.done,
+                                "Codex harness-strip batch completed"
+                            );
+                        }
+                    }
+                    wait_secs = harness_strip_next_wait_secs(
+                        result.as_ref().ok().and_then(|inner| inner.as_ref().ok()),
+                    );
+                    match &result {
+                        Ok(Ok(_)) => {}
                         Ok(Err(error)) => {
                             tracing::warn!(%error, "Codex harness-strip batch failed")
                         }
@@ -2009,6 +2051,64 @@ pub fn prompt_hash(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W3-R medium review finding: the harness-strip daemon loop used to
+    /// sleep `HARNESS_STRIP_BUSY_POLL_SECS` (300s) before *every* batch
+    /// regardless of whether there was still a backlog to drain, making the
+    /// real wall-time projection for the live corpus's ~1,327 rollouts a
+    /// matter of days of idle time, not the ~57min pure-compute figure the
+    /// job shipped with. A batch that made progress and left work behind
+    /// must get the short poll instead.
+    #[test]
+    fn harness_strip_next_wait_secs_drains_fast_after_progress() {
+        use crate::import::codex_rollout::HarnessStripBatchStats;
+        let stats = HarnessStripBatchStats {
+            reimported: 1,
+            done: false,
+            already_applied: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            harness_strip_next_wait_secs(Some(&stats)),
+            HARNESS_STRIP_DRAIN_POLL_SECS
+        );
+    }
+
+    #[test]
+    fn harness_strip_next_wait_secs_is_busy_once_done() {
+        use crate::import::codex_rollout::HarnessStripBatchStats;
+        let stats = HarnessStripBatchStats {
+            reimported: 1,
+            done: true,
+            already_applied: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            harness_strip_next_wait_secs(Some(&stats)),
+            HARNESS_STRIP_BUSY_POLL_SECS
+        );
+    }
+
+    #[test]
+    fn harness_strip_next_wait_secs_is_busy_when_already_applied() {
+        use crate::import::codex_rollout::HarnessStripBatchStats;
+        let stats = HarnessStripBatchStats {
+            already_applied: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            harness_strip_next_wait_secs(Some(&stats)),
+            HARNESS_STRIP_BUSY_POLL_SECS
+        );
+    }
+
+    #[test]
+    fn harness_strip_next_wait_secs_is_busy_on_error_or_panic() {
+        assert_eq!(
+            harness_strip_next_wait_secs(None),
+            HARNESS_STRIP_BUSY_POLL_SECS
+        );
+    }
 
     #[test]
     fn memory_registry_kill_switch_env() {

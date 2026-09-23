@@ -575,6 +575,7 @@ pub struct CodexRestampStatus {
     pub conversations_unmatched: usize,
     pub conversations_missing_file: usize,
     pub conversations_skipped_polluted: usize,
+    pub conversations_pending_import: usize,
     pub chunks_updated: usize,
     pub chunks_unmatched: usize,
 }
@@ -590,8 +591,12 @@ pub struct CodexHarnessStripStatus {
     /// polluted forever and never block this.
     pub done: bool,
     /// File-having polluted conversations left to reimport, as of the most
-    /// recent batch. `0` once `done`.
-    pub polluted_remaining: usize,
+    /// recent batch. `Some(0)` once `done`; `None` when no batch has run yet
+    /// (genuinely unknown — never fabricated as zero). Read straight from
+    /// the persisted [`crate::import::codex_rollout::HarnessStripProgress`]
+    /// — never a live query, so this never adds cost to `csr-engine status`
+    /// (including the `--compact` statusline refresh).
+    pub polluted_remaining: Option<usize>,
     pub reimported: usize,
     pub missing_file: usize,
     pub failed: usize,
@@ -871,6 +876,7 @@ fn gather_codex_backfill(storage: &Storage) -> CodexBackfillStatus {
         conversations_unmatched: restamp_progress.conversations_unmatched,
         conversations_missing_file: restamp_progress.conversations_missing_file,
         conversations_skipped_polluted: restamp_progress.conversations_skipped_polluted,
+        conversations_pending_import: restamp_progress.conversations_pending_import,
         chunks_updated: restamp_progress.chunks_updated,
         chunks_unmatched: restamp_progress.chunks_unmatched,
     };
@@ -889,16 +895,17 @@ fn gather_codex_backfill(storage: &Storage) -> CodexBackfillStatus {
     } else {
         None
     };
-    // Live count of file-having polluted conversations remaining — cheap
-    // (bounded by the codex corpus, not the whole DB) and matches every
-    // other status block's convention of a fresh read rather than a stale
-    // cached count. `0` once `done` without paying for the query.
+    // Persisted count from the most recent batch — never a live query here.
+    // `polluted_codex_rows_by_file_presence` is a full `chunks` scan; running
+    // it on every `csr-engine status` call (the `--compact` statusline
+    // refresh shells out on a tight interval) cost 2x+ the warm status
+    // latency for a value the compact line doesn't even print. `Some(0)`
+    // once `done`, `None` (unknown, not fabricated as zero) before the first
+    // batch has ever run.
     let polluted_remaining = if harness_strip_done {
-        0
+        Some(0)
     } else {
-        crate::import::codex_rollout::polluted_codex_rows_by_file_presence(storage)
-            .map(|(with_file, _missing)| with_file.len())
-            .unwrap_or(0)
+        harness_progress.polluted_remaining
     };
     let harness_strip = CodexHarnessStripStatus {
         done: harness_strip_done,
@@ -2233,6 +2240,7 @@ mod tests {
             conversations_unmatched: 1,
             conversations_missing_file: 0,
             conversations_skipped_polluted: 2,
+            conversations_pending_import: 0,
             chunks_updated: 500,
             chunks_unmatched: 4,
         };
@@ -2251,6 +2259,7 @@ mod tests {
             last_batch_at: Some("2026-09-22T00:00:00Z".to_string()),
             last_batch_chunks: 500,
             last_batch_secs: 2.5,
+            polluted_remaining: Some(0),
         };
         storage
             .set_meta(
@@ -2278,8 +2287,9 @@ mod tests {
 
         assert!(report.codex_backfill.harness_strip.done);
         assert_eq!(
-            report.codex_backfill.harness_strip.polluted_remaining, 0,
-            "done must report zero remaining without paying for the live query"
+            report.codex_backfill.harness_strip.polluted_remaining,
+            Some(0),
+            "done must report zero remaining without paying for a live query"
         );
         assert_eq!(report.codex_backfill.harness_strip.reimported, 25);
         assert_eq!(report.codex_backfill.harness_strip.missing_file, 1);
@@ -2290,6 +2300,75 @@ mod tests {
                 .throughput_chunks_per_sec,
             Some(200.0)
         );
+    }
+
+    /// W3-R medium finding: `gather_codex_backfill` used to run a live
+    /// `SELECT DISTINCT conversation_id, summary FROM chunks WHERE
+    /// source='codex_rollout'` on every `csr-engine status` call (including
+    /// the tight-interval `--compact` statusline refresh) until the
+    /// harness-strip done key was written — a cost that can persist for
+    /// days on a live corpus. It must instead read the value the daemon's
+    /// last batch already persisted. Proven here by seeding a DB with zero
+    /// polluted codex chunks (a live query would find 0) but a persisted
+    /// `polluted_remaining: Some(42)` from a prior batch — status must
+    /// report the persisted 42, not a freshly recomputed 0.
+    #[test]
+    fn codex_backfill_polluted_remaining_reads_persisted_progress_not_a_live_query() {
+        use crate::import::codex_rollout::{
+            HarnessStripProgress, HARNESS_STRIP_V2_PROGRESS_META_KEY,
+        };
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        // No codex chunks in this DB at all — a live re-scan would find 0
+        // polluted conversations. The persisted progress says otherwise.
+        let harness_progress = HarnessStripProgress {
+            reimported_total: 3,
+            missing_file_total: 0,
+            failed_total: 0,
+            last_batch_at: Some("2026-09-22T00:00:00Z".to_string()),
+            last_batch_chunks: 10,
+            last_batch_secs: 0.1,
+            polluted_remaining: Some(42),
+        };
+        storage
+            .set_meta(
+                HARNESS_STRIP_V2_PROGRESS_META_KEY,
+                &serde_json::to_string(&harness_progress).unwrap(),
+            )
+            .unwrap();
+        // HARNESS_STRIP_V2_META_KEY deliberately left unset — not done.
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert!(!report.codex_backfill.harness_strip.done);
+        assert_eq!(
+            report.codex_backfill.harness_strip.polluted_remaining,
+            Some(42),
+            "must report the daemon's last persisted count, not a fresh live-query 0"
+        );
+    }
+
+    /// Before the harness-strip job has ever run a batch, `polluted_remaining`
+    /// must read as unknown (`None`), never fabricated as `0` — a `0` would
+    /// misread as "nothing to fix" for a corpus that has never been scanned.
+    #[test]
+    fn codex_backfill_polluted_remaining_is_none_before_any_batch_has_run() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let _storage = Storage::open(&db_path).unwrap();
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert!(!report.codex_backfill.harness_strip.done);
+        assert_eq!(report.codex_backfill.harness_strip.polluted_remaining, None);
     }
 
     #[test]
