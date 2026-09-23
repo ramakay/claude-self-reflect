@@ -11,10 +11,10 @@
 //! 7. Memory registry loop — periodic metadata-only scan of native memory files (`~/.claude/projects/*/memory/*.md`) into `memory_registry`; never embeds or injects memory content
 //! 8. Provenance backfill loop — one idle-gated structural batch at a time
 //! 9. Import catch-up sweep — reconciles `import_state.file_mtime` against
-//!    the live filesystem once at startup and every 30 minutes, recovering
-//!    files whose watcher import failed with `database is locked` on their
-//!    last write and never got a later notify event to retry against
-//!    (`import::catchup::catchup_sweep`)
+//!    the live filesystem once the daemon is idle (then every 30 minutes,
+//!    also idle-gated), recovering files whose watcher import failed with
+//!    `database is locked` on their last write and never got a later notify
+//!    event to retry against (`import::catchup::catchup_sweep`)
 
 pub mod consolidation;
 pub mod dream_cadence;
@@ -1483,12 +1483,50 @@ async fn ancestry_refresh_loop(
     }
 }
 
-/// Runs `import::catchup::catchup_sweep` once immediately, then every 30
-/// minutes. Each stale file's actual reimport acquires its own `heavy_work`
-/// permit rather than holding one across the whole scan — a large sweep
-/// (thousands of untouched-but-recent files) must not starve the live
-/// watcher for the entire pass, the same discipline `ancestry_refresh_loop`
-/// uses per-repository above.
+/// Blocks until the daemon is idle (per `dream_cadence::is_idle`) or
+/// shutdown is requested. Returns `false` on shutdown (caller should stop),
+/// `true` once idle. Polls on the same ten-second cadence as the rest of
+/// this file's shutdown-aware loops.
+async fn wait_until_idle_or_shutdown(storage: &Storage, shutdown: &AtomicBool) -> bool {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        if dream_cadence::is_idle(
+            dream_cadence::last_activity_at(storage),
+            chrono::Utc::now(),
+            dream_cadence::idle_secs(),
+        ) {
+            return true;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    }
+}
+
+/// Runs `import::catchup::catchup_sweep` once the daemon is idle, then every
+/// 30 minutes (also idle-gated). Each stale file's actual reimport acquires
+/// its own `heavy_work` permit rather than holding one across the whole scan
+/// — a large sweep (thousands of untouched-but-recent files) must not starve
+/// the live watcher for the entire pass, the same discipline
+/// `ancestry_refresh_loop` uses per-repository above.
+///
+/// Idle-gated the same way `provenance_backfill_handle` is (two-phase check:
+/// once before the pass starts, once more per file after the permit is
+/// acquired): unlike that loop's small fixed batches, this sweep can touch
+/// thousands of files in one pass on the live corpus (dry run: 22k scanned,
+/// 522 stale), so if it started unconditionally at daemon startup or on
+/// every 30-minute tick it would compete with an active user for
+/// `heavy_work` for the whole first pass. The per-file re-check means an
+/// activity resumption mid-sweep defers every remaining file in that pass
+/// (see `import::catchup::DEFERRED_NOT_IDLE`) rather than running to
+/// completion regardless of load; deferred files stay stale and are picked
+/// up by the next sweep.
+///
+/// Reimports go through `import::watcher::import_file_content_diff` — the
+/// same content-diffing path the live watcher uses — not
+/// `Engine::import_file`'s count-incremental path, which would silently
+/// stamp a busy-dropped tail as reimported without ever re-embedding it (see
+/// that function's docs).
 async fn catchup_loop(
     storage: Arc<Storage>,
     projects_dir: PathBuf,
@@ -1500,6 +1538,9 @@ async fn catchup_loop(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
+        if !wait_until_idle_or_shutdown(&storage, &shutdown).await {
+            return;
+        }
 
         let now = chrono::Utc::now();
         let sweep_engine = engine.clone();
@@ -1509,11 +1550,18 @@ async fn catchup_loop(
             &storage,
             &projects_dir,
             now,
-            move |path, project_name| {
+            move |path, _project_name| {
                 let engine = sweep_engine.clone();
                 let heavy_work = sweep_heavy_work.clone();
                 let shutdown = sweep_shutdown.clone();
                 async move {
+                    if !dream_cadence::is_idle(
+                        dream_cadence::last_activity_at(engine.storage()),
+                        chrono::Utc::now(),
+                        dream_cadence::idle_secs(),
+                    ) {
+                        return Err(anyhow::anyhow!(crate::import::catchup::DEFERRED_NOT_IDLE));
+                    }
                     let Some(permit) =
                         acquire_heavy_work_unless_shutdown(heavy_work, &shutdown).await
                     else {
@@ -1521,7 +1569,24 @@ async fn catchup_loop(
                             "daemon shutting down before catch-up import"
                         ));
                     };
-                    let result = engine.import_file(&path, &project_name).await.map(|_| ());
+                    // Re-check after the (possibly long) wait for a permit —
+                    // activity may have resumed while we were queued.
+                    if !dream_cadence::is_idle(
+                        dream_cadence::last_activity_at(engine.storage()),
+                        chrono::Utc::now(),
+                        dream_cadence::idle_secs(),
+                    ) {
+                        drop(permit);
+                        return Err(anyhow::anyhow!(crate::import::catchup::DEFERRED_NOT_IDLE));
+                    }
+                    let result = crate::import::watcher::import_file_content_diff(
+                        engine.storage(),
+                        engine.embeddings(),
+                        engine.search(),
+                        engine.projects_dir(),
+                        &path,
+                    )
+                    .await;
                     drop(permit);
                     result
                 }
@@ -1537,6 +1602,7 @@ async fn catchup_loop(
                     reimported = summary.reimported,
                     skipped = summary.skipped,
                     failed = summary.failed,
+                    deferred = summary.deferred,
                     "import catch-up sweep completed"
                 );
                 if let Err(e) = storage.set_meta(
@@ -2407,6 +2473,53 @@ mod tests {
         std::env::set_var("CSR_NO_MEMORY_REGISTRY", "0");
         assert!(!memory_registry_disabled());
         std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
+    }
+
+    /// Opus review, medium finding on gap-G1: `catchup_loop` must not run
+    /// its sweep unconditionally at startup and on every 30-minute tick —
+    /// `wait_until_idle_or_shutdown` is the gate. Already-idle storage (a
+    /// far-past seeded `import_state.file_mtime`, well past the default
+    /// 30-minute idle threshold) must return `true` on the very first check,
+    /// with no polling wait.
+    #[tokio::test]
+    async fn wait_until_idle_or_shutdown_returns_true_when_already_idle() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .upsert_import_state_explicit(
+                "/tmp/does-not-matter.jsonl",
+                "conv",
+                1,
+                "2020-01-01T00:00:00Z",
+            )
+            .unwrap();
+        let shutdown = AtomicBool::new(false);
+
+        let idle = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            wait_until_idle_or_shutdown(&storage, &shutdown),
+        )
+        .await
+        .expect("must not block polling when already idle");
+        assert!(idle);
+    }
+
+    /// Companion to the above: shutdown must win even when the daemon would
+    /// never otherwise go idle (no activity rows at all — `last_activity_at`
+    /// returns `None`, which `dream_cadence::is_idle` deliberately never
+    /// treats as idle). Without the shutdown check this would hang the test
+    /// (and, in production, block the daemon from ever stopping the loop).
+    #[tokio::test]
+    async fn wait_until_idle_or_shutdown_returns_false_on_shutdown() {
+        let storage = Storage::open_memory().unwrap();
+        let shutdown = AtomicBool::new(true);
+
+        let idle = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            wait_until_idle_or_shutdown(&storage, &shutdown),
+        )
+        .await
+        .expect("must not block polling when shutdown is already set");
+        assert!(!idle);
     }
 
     #[test]
