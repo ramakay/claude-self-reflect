@@ -1223,6 +1223,13 @@ impl Storage {
         queries::invalidate_import_state_mtime(&conn, file_path)
     }
 
+    /// Flip every stored chunk of `conversation_id` to `is_sidechain = 1`.
+    /// See `queries::mark_conversation_chunks_sidechain`.
+    pub fn mark_conversation_chunks_sidechain(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_conversation_chunks_sidechain(&conn, conversation_id)
+    }
+
     // ─── Session registry queries (multi-source corpus, v9.4) ───
 
     /// (first_ts, last_ts) for one session, if registered. See

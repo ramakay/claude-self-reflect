@@ -40,6 +40,7 @@ pub(crate) struct ParsedRollout {
     pub schema_misses: usize,
     pub suppression: CsrSuppressionStats,
     pub harness_context_stripped: usize,
+    pub is_subagent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,16 @@ struct RolloutMetadata {
     project_name: String,
     timestamp: String,
     summary: Option<String>,
+    /// True when `session_meta.payload.source` carries a `subagent` key —
+    /// this rollout is a `thread_spawn` (or other) subagent child, not a
+    /// top-level session a person typed into. Stored top-level like every
+    /// other codex_rollout conversation (Codex has no separate sidechain
+    /// file layout the way Claude Code does), so this is the only signal
+    /// that distinguishes it. Threaded into every chunk's `is_sidechain` so
+    /// the existing Claude-side sidechain exclusion in `get_recent_chunks`
+    /// applies here too, instead of a spawned child taking its own
+    /// recent-work slot next to its parent.
+    is_subagent: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +170,7 @@ pub(crate) fn parse_rollout(path: &Path) -> Result<Option<ParsedRollout>> {
         schema_misses: outcome.schema_misses,
         suppression: outcome.suppression,
         harness_context_stripped: outcome.harness_context_stripped,
+        is_subagent: metadata.is_subagent,
     }))
 }
 
@@ -199,6 +211,7 @@ where
     let mut schema_misses = 0usize;
     let mut harness_context_stripped = 0usize;
     let mut summary = None;
+    let mut is_subagent = false;
     let mut sanitizer = super::CsrMessageSanitizer::default();
 
     let mut reader = BufReader::new(file);
@@ -240,6 +253,11 @@ where
                     .or_else(|| string_at(payload, &["session_id"]));
                 cwd = cwd.or_else(|| string_at(payload, &["cwd"]));
                 timestamp = timestamp.or_else(|| string_at(payload, &["timestamp"]));
+                is_subagent = is_subagent
+                    || payload
+                        .get("source")
+                        .and_then(|source| source.get("subagent"))
+                        .is_some();
             }
             Some("turn_context") => {
                 cwd = cwd.or_else(|| string_at(&value, &["payload", "cwd"]));
@@ -345,6 +363,7 @@ where
                 .or_else(|| file_mtime(path))
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
             summary,
+            is_subagent,
         },
         RolloutStreamOutcome {
             schema_misses,
@@ -509,8 +528,10 @@ const CODEX_HARNESS_MARKERS: &[&str] = &[
 /// Whether `text` is a Codex harness-injected content item rather than real
 /// user prose, checked as a prefix of the *trimmed* text (never a
 /// substring), so prose that merely mentions one of these tags mid-message
-/// is never stripped.
-fn is_harness_context_item(text: &str) -> bool {
+/// is never stripped. `pub(crate)` so `storage::queries`'s recent-work
+/// preview picker can skip a harness-boilerplate chunk 0 the same way the
+/// harness-strip backfill does.
+pub(crate) fn is_harness_context_item(text: &str) -> bool {
     let trimmed = text.trim_start();
     CODEX_HARNESS_MARKERS
         .iter()
@@ -807,7 +828,7 @@ where
             summary: metadata.summary.clone(),
             author,
             seq,
-            is_sidechain: false,
+            is_sidechain: metadata.is_subagent,
         };
         let mut evidence = std::collections::HashMap::new();
         super::attach_chunk_evidence(
@@ -837,6 +858,7 @@ fn rollout_chunks(parsed: &ParsedRollout) -> Vec<ConversationChunk> {
             .find(|message| message.get("type").and_then(serde_json::Value::as_str) == Some("user"))
             .map(super::extract_message_text)
             .filter(|text| !text.is_empty()),
+        is_subagent: parsed.is_subagent,
     };
     let mut chunks = Vec::new();
     let mut next_seq = 0;
@@ -1261,6 +1283,75 @@ pub fn restamp_codex_chunk_timestamps(storage: &Storage) -> Result<RestampStats>
     if stats.conversations_unmatched == 0 && stats.chunks_unmatched == 0 {
         storage.set_meta(RESTAMP_META_KEY, &chrono::Utc::now().to_rfc3339())?;
     }
+    Ok(stats)
+}
+
+/// Meta key guarding [`backfill_codex_subagent_sidechain`]. Present once the
+/// one-shot pass has run to completion on a database.
+pub const SUBAGENT_SIDECHAIN_META_KEY: &str = "codex_subagent_sidechain_backfill_v1";
+
+/// Receipt for [`backfill_codex_subagent_sidechain`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SubagentSidechainBackfillStats {
+    /// `import_state` rows with `conversation_id LIKE 'codex:%'` examined.
+    pub conversations_considered: usize,
+    /// Of those, how many rollouts carry a `session_meta.payload.source.subagent`
+    /// key (a `thread_spawn` or other subagent child).
+    pub conversations_subagent: usize,
+    /// Subagent rows whose source file no longer exists on disk — left
+    /// unchanged, not fixable here.
+    pub conversations_missing_file: usize,
+    /// Stored chunk rows flipped to `is_sidechain = 1` across every subagent
+    /// conversation found.
+    pub chunks_updated: usize,
+    /// True when the meta marker was already present — no work was done.
+    pub already_applied: bool,
+}
+
+/// One-time, meta-guarded backfill: for every already-imported `codex:`
+/// conversation whose rollout file's `session_meta.payload.source` carries a
+/// `subagent` key, mark its stored chunks `is_sidechain = 1` so the existing
+/// Claude-side sidechain exclusion in `get_recent_chunks` applies to it too
+/// — a `thread_spawn` child otherwise took its own recent-work slot right
+/// next to its parent (see `RolloutMetadata::is_subagent`'s doc).
+///
+/// The forward-fix alone (`visit_rollout_message_chunks` now reads
+/// `metadata.is_subagent`) only reaches rollouts that get reimported; this
+/// reaches the rest with a direct `UPDATE` — no reimport needed, since
+/// content and embeddings are unaffected by this flag.
+pub fn backfill_codex_subagent_sidechain(
+    storage: &Storage,
+) -> Result<SubagentSidechainBackfillStats> {
+    if storage.get_meta(SUBAGENT_SIDECHAIN_META_KEY)?.is_some() {
+        return Ok(SubagentSidechainBackfillStats {
+            already_applied: true,
+            ..SubagentSidechainBackfillStats::default()
+        });
+    }
+
+    let rows = storage.import_state_rows_for_conversation_prefix("codex:")?;
+    let mut stats = SubagentSidechainBackfillStats::default();
+    for (file_path, conversation_id) in rows {
+        stats.conversations_considered += 1;
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            stats.conversations_missing_file += 1;
+            continue;
+        }
+        let Some(metadata) = scan_rollout_metadata(path)? else {
+            stats.conversations_missing_file += 1;
+            continue;
+        };
+        if metadata.conversation_id != conversation_id || !metadata.is_subagent {
+            continue;
+        }
+        stats.conversations_subagent += 1;
+        stats.chunks_updated += storage.mark_conversation_chunks_sidechain(&conversation_id)?;
+    }
+    storage.set_meta(
+        SUBAGENT_SIDECHAIN_META_KEY,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
     Ok(stats)
 }
 
@@ -2606,6 +2697,113 @@ mod tests {
             metadata.summary.as_deref(),
             Some("dont look at the literature install graphify"),
             "summary must be the first REAL user message, not the harness boilerplate"
+        );
+    }
+
+    fn write_rollout_fixture(path: &Path, session_meta: &serde_json::Value) {
+        let real = serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-09-20T10:00:05Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "real subagent prose"}
+                ]
+            }
+        });
+        std::fs::write(
+            path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(session_meta).unwrap(),
+                serde_json::to_string(&real).unwrap(),
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_session_meta_subagent_source_sets_is_subagent() {
+        // W3-B1 review#2 finding: a `thread_spawn` child rollout's
+        // `session_meta.payload.source` carries a `subagent` key. That must
+        // flow through to `RolloutMetadata::is_subagent`, not stay
+        // hard-coded false.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-subagent.jsonl");
+        let session_meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "01a0c5e1-904a-7031-b2b8-dc71f64900bf",
+                "cwd": "/tmp/subagent-project",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": "01a0c5df-904a-7031-b2b8-dc71f64900bf"
+                        }
+                    }
+                }
+            }
+        });
+        write_rollout_fixture(&path, &session_meta);
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        assert!(
+            metadata.is_subagent,
+            "a session_meta with a `source.subagent` key must set is_subagent"
+        );
+    }
+
+    #[test]
+    fn codex_session_meta_without_subagent_source_leaves_is_subagent_false() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-top-level.jsonl");
+        let session_meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "01a0c5df-904a-7031-b2b8-dc71f64900bf",
+                "cwd": "/tmp/subagent-project"
+            }
+        });
+        write_rollout_fixture(&path, &session_meta);
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        assert!(
+            !metadata.is_subagent,
+            "a top-level session_meta with no `source.subagent` key must not be flagged"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_rollout_chunks_are_marked_sidechain() {
+        // The chunk-level effect of `is_subagent`: every chunk built from a
+        // subagent rollout must carry `is_sidechain = true`, not the
+        // previously hard-coded `false` — otherwise the Claude-side
+        // sidechain exclusion in `get_recent_chunks` never applies to it and
+        // a `thread_spawn` child takes its own recent-work slot next to its
+        // parent.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout-subagent-chunks.jsonl");
+        let session_meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": "01a0c5e1-904a-7031-b2b8-dc71f64900bf",
+                "cwd": "/tmp/subagent-project",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent-id"}}}
+            }
+        });
+        write_rollout_fixture(&path, &session_meta);
+
+        let parsed = parse_rollout(&path).unwrap().unwrap();
+        assert!(parsed.is_subagent);
+        let chunks = rollout_chunks(&parsed);
+        assert!(
+            !chunks.is_empty(),
+            "fixture must produce at least one chunk"
+        );
+        assert!(
+            chunks.iter().all(|c| c.is_sidechain),
+            "every chunk of a subagent rollout must be marked is_sidechain: {chunks:?}"
         );
     }
 

@@ -625,6 +625,44 @@ impl Daemon {
                             tracing::warn!(%error, "Codex rollout chunk-timestamp backfill panicked")
                         }
                     }
+
+                    // Meta-gated one-shot: flips subagent (`thread_spawn`)
+                    // rollouts to `is_sidechain = 1` so they stop taking
+                    // their own recent-work slot next to their parent. Runs
+                    // on this same 30-minute cadence purely because it's
+                    // meta-gated and cheap to check — after the one real
+                    // pass it's a single no-op meta lookup per tick.
+                    let Some(sidechain_permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let sidechain_storage = storage.clone();
+                    let sidechain_result = tokio::task::spawn_blocking(move || {
+                        let _permit = sidechain_permit;
+                        crate::import::codex_rollout::backfill_codex_subagent_sidechain(
+                            &sidechain_storage,
+                        )
+                    })
+                    .await;
+                    match sidechain_result {
+                        Ok(Ok(stats)) if stats.already_applied => {}
+                        Ok(Ok(stats)) => tracing::info!(
+                            conversations_considered = stats.conversations_considered,
+                            conversations_subagent = stats.conversations_subagent,
+                            conversations_missing_file = stats.conversations_missing_file,
+                            chunks_updated = stats.chunks_updated,
+                            "Codex subagent sidechain backfill pass completed"
+                        ),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Codex subagent sidechain backfill failed")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "Codex subagent sidechain backfill panicked")
+                        }
+                    }
+
                     for _ in 0..180 {
                         if shutdown.load(Ordering::SeqCst) {
                             return;

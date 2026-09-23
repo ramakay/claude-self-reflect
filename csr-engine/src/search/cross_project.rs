@@ -46,6 +46,22 @@ pub(crate) fn same_project_family_at_root(
     same_project_family_at_root_with(current, candidate, projects_root, |path| path.is_dir())
 }
 
+/// Cached-`is_dir`, explicit-root variant: same alias semantics and the same
+/// process-lifetime `cached_is_dir` memo as `same_project_family`, but the
+/// projects root is caller-supplied instead of always `dirs::home_dir()`.
+/// Lets a caller like `storage::queries::recent_work_family_projects` inject
+/// its own resolved home directory (or `None`) so its no-resolvable-home
+/// branch can be tested deterministically without depending on this
+/// machine's real `$HOME`, while production keeps the exact same cached
+/// filesystem-stat behavior as `same_project_family`.
+pub(crate) fn same_project_family_at_cached_root(
+    current: &str,
+    candidate: &str,
+    projects_root: &Path,
+) -> bool {
+    same_project_family_at_root_with(current, candidate, projects_root, cached_is_dir)
+}
+
 /// Whether two stored project namespaces identify the same on-disk project.
 ///
 /// A hyphenated namespace is an alias only when the shorter project directory
@@ -58,7 +74,7 @@ pub fn same_project_family(current: &str, candidate: &str) -> bool {
     let Some(projects_root) = dirs::home_dir().map(|home| home.join("projects")) else {
         return false;
     };
-    same_project_family_at_root_with(current, candidate, &projects_root, cached_is_dir)
+    same_project_family_at_cached_root(current, candidate, &projects_root)
 }
 
 /// Encode a path the way Claude Code names its `~/.claude/projects` folders.

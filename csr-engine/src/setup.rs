@@ -70,6 +70,7 @@ pub async fn handle(
         eprintln!("  Codex rollout import skipped (CSR_NO_CODEX_IMPORT is set)");
     } else if let Some(codex_root) = dirs::home_dir().map(|home| home.join(".codex/sessions")) {
         if codex_root.exists() {
+            let harness_strip_root = codex_root.clone();
             let adapter_engine = eng.clone();
             let stats = tokio::task::spawn_blocking(move || {
                 crate::import::codex_rollout::import_changed_rollouts(&adapter_engine, &codex_root)
@@ -103,6 +104,77 @@ pub async fn handle(
                 Ok(Ok(_)) => {} // already_applied — silent, nothing to report
                 Ok(Err(e)) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
                 Err(e) => eprintln!("  Warning: Codex timestamp backfill failed: {e}"),
+            }
+
+            // One-time, meta-guarded backfill for rollouts imported before the
+            // harness-marker-stripping adapter fix: invalidate their stored
+            // mtime so the `import_changed_rollouts` pass just above (this
+            // same run doesn't re-run it, so do it explicitly here) picks
+            // them up through the fixed adapter. Daemon-owned installs get
+            // the stronger, self-resuming `harness_strip_batch` path instead
+            // (`daemon::mod`); this covers a one-shot `setup` run that never
+            // starts the daemon at all.
+            let strip_engine = eng.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::invalidate_polluted_codex_rollouts(&strip_engine)
+            })
+            .await
+            {
+                Ok(Ok(strip_stats)) if !strip_stats.already_applied => {
+                    if strip_stats.conversations_invalidated > 0 {
+                        eprintln!(
+                            "  Flagged {} harness-polluted Codex rollouts for re-import",
+                            strip_stats.conversations_invalidated
+                        );
+                        let reimport_engine = eng.clone();
+                        let reimport_root = harness_strip_root.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            crate::import::codex_rollout::import_changed_rollouts(
+                                &reimport_engine,
+                                &reimport_root,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(reimport_stats)) => eprintln!(
+                                "  Re-imported {} Codex rollout chunks across {} files (harness strip)",
+                                reimport_stats.chunks_imported, reimport_stats.files_imported
+                            ),
+                            Ok(Err(e)) => {
+                                eprintln!("  Warning: Codex harness-strip re-import failed: {e}")
+                            }
+                            Err(e) => {
+                                eprintln!("  Warning: Codex harness-strip re-import failed: {e}")
+                            }
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {} // already_applied — silent, nothing to report
+                Ok(Err(e)) => eprintln!("  Warning: Codex harness-strip backfill failed: {e}"),
+                Err(e) => eprintln!("  Warning: Codex harness-strip backfill failed: {e}"),
+            }
+
+            // One-time, meta-guarded backfill: flip already-imported Codex
+            // subagent (`thread_spawn`) rollouts to `is_sidechain = 1` so
+            // they don't take their own recent-work slot next to their
+            // parent (see `RolloutMetadata::is_subagent`'s doc).
+            let sidechain_storage = eng.storage().clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::import::codex_rollout::backfill_codex_subagent_sidechain(&sidechain_storage)
+            })
+            .await
+            {
+                Ok(Ok(sidechain_stats)) if !sidechain_stats.already_applied => {
+                    if sidechain_stats.conversations_subagent > 0 {
+                        eprintln!(
+                            "  Marked {} Codex subagent rollouts as sidechains ({} chunks)",
+                            sidechain_stats.conversations_subagent, sidechain_stats.chunks_updated
+                        );
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("  Warning: Codex subagent sidechain backfill failed: {e}"),
+                Err(e) => eprintln!("  Warning: Codex subagent sidechain backfill failed: {e}"),
             }
         }
     }
