@@ -105,6 +105,50 @@ impl SearchProjectScope {
     }
 }
 
+/// Resolve a [`SearchProjectScope`] from the process environment: the single
+/// call point `reflect_on_past_with_vec_mode` and
+/// `get_more_results_with_vec_active` both use, so the two can't drift apart
+/// the way they did when each called `cross_project::resolve_default_scope_project()`
+/// independently (W3-S finding 3).
+fn resolve_search_scope(storage: &Storage, project: Option<&str>) -> Result<SearchProjectScope> {
+    resolve_search_scope_with(
+        storage,
+        project,
+        cross_project::resolve_current_project().as_deref(),
+        cross_project::resolve_client_dir().as_deref(),
+        None,
+    )
+}
+
+/// [`resolve_search_scope`] with the environment-derived values (and the
+/// projects root) passed in explicitly — the seam a test uses to pin the
+/// wiring without env var mutation/races or dependence on this machine's
+/// real `$HOME/projects` layout.
+fn resolve_search_scope_with(
+    storage: &Storage,
+    project: Option<&str>,
+    current_project: Option<&str>,
+    client_dir: Option<&str>,
+    projects_root_override: Option<&Path>,
+) -> Result<SearchProjectScope> {
+    let known_projects = storage.list_project_names("", i64::MAX as usize)?;
+    let default_scope_project = client_dir.and_then(|dir| match projects_root_override {
+        Some(root) => cross_project::resolve_verified_default_scope_project_at_root(
+            dir,
+            &known_projects,
+            root,
+        ),
+        None => cross_project::resolve_verified_default_scope_project(dir, &known_projects),
+    });
+    SearchProjectScope::resolve_with(
+        storage,
+        project,
+        current_project,
+        default_scope_project.as_deref(),
+        projects_root_override,
+    )
+}
+
 fn project_scope_multiplier(candidate: &str, scope: &SearchProjectScope) -> f32 {
     if scope.effective_project.is_some() {
         if scope.is_family(candidate) {
@@ -730,15 +774,7 @@ pub(crate) async fn reflect_on_past_with_vec_mode(
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<String> {
-    let current_project = cross_project::resolve_current_project();
-    let default_scope_project = cross_project::resolve_default_scope_project();
-    let scope = SearchProjectScope::resolve_with(
-        storage,
-        project,
-        current_project.as_deref(),
-        default_scope_project.as_deref(),
-        None,
-    )?;
+    let scope = resolve_search_scope(storage, project)?;
     reflect_on_past_with_vec_in_scope_mode(
         storage,
         search,
@@ -1918,7 +1954,7 @@ async fn quick_check_with_vec(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (effective_project, _) = cross_project::normalize_project_scope(storage, project)?;
     let results = if let Some(ref project) = effective_project {
         let ids = family_chunk_ids(storage, project)?;
         let idx = search.read().await;
@@ -1973,7 +2009,8 @@ async fn search_insights_at_root(
     project: Option<&str>,
     projects_root_override: Option<&Path>,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (effective_project, _) =
+        cross_project::normalize_project_scope_at_root(storage, project, projects_root_override)?;
     let query_vec = embed_query(embeddings, query).await?;
 
     let results = if let Some(ref p) = effective_project {
@@ -2106,8 +2143,22 @@ pub async fn search_by_file(
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
-    let proj = effective_project.unwrap_or_default();
+    // The code-graph ledger (`code_nodes`/`code_evolution`/
+    // `code_graph_file_state`) filters by an exact `project` match — no
+    // family-alias widening like `family_chunk_ids` gives the chunk search
+    // tools. Defaulting an *omitted* project to the caller's
+    // `CLAUDE_PROJECT_DIR` family name the way those tools do would narrow
+    // this ledger down to just that one project name and silently drop
+    // everything filed under a family alias (e.g. `claude-self-reflect`'s
+    // `claude-self-reflect-csr-engine` code nodes) — strictly worse than
+    // before this tool was scoped at all, since an omitted project used to
+    // run fully unscoped. Only an *explicit, specific* project narrows the
+    // ledger; omitted or `"all"` stays global, exactly as before the
+    // CLAUDE_PROJECT_DIR default-scope fallback existed.
+    let proj = match project {
+        Some(p) if !p.is_empty() && !p.eq_ignore_ascii_case("all") => p.to_string(),
+        _ => String::new(),
+    };
 
     let mut ledger = storage.code_file_ledger(&proj, file_path)?;
     if !ledger.symbols.is_empty() || !ledger.timeline.is_empty() {
@@ -2380,7 +2431,7 @@ pub async fn why(
     project: Option<&str>,
     cfg: &crate::search::reinstatement::ReinstateConfig,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (effective_project, _) = cross_project::normalize_project_scope(storage, project)?;
 
     let reinstatement = crate::search::reinstatement::reinstate(
         storage,
@@ -2611,7 +2662,8 @@ async fn search_by_concept_at_root(
     project: Option<&str>,
     projects_root_override: Option<&Path>,
 ) -> Result<String> {
-    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
+    let (effective_project, scope_label) =
+        cross_project::normalize_project_scope_at_root(storage, project, projects_root_override)?;
     let query_vec = embed_query(embeddings, concept).await?;
 
     // Overfetch + partition over the full candidate set + single adaptive
@@ -2754,15 +2806,7 @@ async fn get_more_results_with_vec_active(
     // boost-adjusted — a family chunk boosted onto page one reappeared on
     // page two (raw order) while the chunk it displaced was skipped
     // entirely (certified live with a 0.89-family / 0.90-other pair).
-    let current_project = cross_project::resolve_current_project();
-    let default_scope_project = cross_project::resolve_default_scope_project();
-    let scope = SearchProjectScope::resolve_with(
-        storage,
-        project,
-        current_project.as_deref(),
-        default_scope_project.as_deref(),
-        None,
-    )?;
+    let scope = resolve_search_scope(storage, project)?;
     get_more_results_in_scope(
         storage,
         search,
@@ -5260,6 +5304,105 @@ mod tests {
         let scope = SearchProjectScope::resolve_with(&storage, None, None, None, None).unwrap();
         assert_eq!(scope.effective_project, None);
         assert_eq!(scope.scope_label, "all");
+    }
+
+    /// W3-S finding 1 receipt: `CLAUDE_PROJECT_DIR=/private/tmp/csr-s1-proof`
+    /// (no `projects` path component) is imported by Claude Code as
+    /// `-private-tmp-csr-s1-proof` — its own dash-encoding of the full path —
+    /// not the last-path-component heuristic `resolve_project_from_cwd`
+    /// alone would give (`csr-s1-proof`). `resolve_search_scope_with` is the
+    /// single function both `reflect_on_past_with_vec_mode` and
+    /// `get_more_results_with_vec_active` call to resolve an omitted
+    /// project; this pins that it resolves to the *stored* name, not the
+    /// unverified heuristic one.
+    #[test]
+    fn resolve_search_scope_matches_the_importers_encoding_outside_projects_root() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let stored_project = "-private-tmp-csr-s1-proof";
+        let chunk = crate::import::ConversationChunk {
+            id: "seed".into(),
+            conversation_id: "conv-seed".into(),
+            project_name: stored_project.into(),
+            timestamp: "2026-09-18T00:00:00Z".into(),
+            content: "seed row so list_project_names knows this project".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage
+            .insert_chunk(&chunk, &[1.0f32, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let scope = resolve_search_scope_with(
+            &storage,
+            None,
+            None,
+            Some("/private/tmp/csr-s1-proof"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(scope.effective_project.as_deref(), Some(stored_project));
+        assert_eq!(scope.scope_label, stored_project);
+    }
+
+    /// Same receipt end to end through `reflect_on_past_with_vec_in_scope`:
+    /// a chunk stored under the importer-encoded project name is returned
+    /// when `project` is omitted and the client dir sits outside
+    /// `~/projects`. Before W3-S finding 1's fix, `default_scope_project`
+    /// resolved to `csr-s1-proof` (matches nothing) and this search returned
+    /// zero results.
+    #[tokio::test]
+    async fn defaulted_scope_outside_projects_root_returns_the_stored_project_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let stored_project = "-private-tmp-csr-s1-proof";
+        let chunk = crate::import::ConversationChunk {
+            id: "chunk-outside-projects-root".into(),
+            conversation_id: "conv-1".into(),
+            project_name: stored_project.into(),
+            timestamp: "2026-09-18T00:00:00Z".into(),
+            content: "rename the function foo to bar in a Python file".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let vector = vec![1.0f32, 0.0, 0.0, 0.0];
+        storage.insert_chunk(&chunk, &vector).unwrap();
+        let mut engine = SearchEngine::new(vector.len());
+        engine.insert_chunk(chunk.id.clone(), vector.clone());
+        let search = Arc::new(RwLock::new(engine));
+
+        let scope = resolve_search_scope_with(
+            &storage,
+            None,
+            None,
+            Some("/private/tmp/csr-s1-proof"),
+            None,
+        )
+        .unwrap();
+
+        let output = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &vector,
+            "rename the function foo to bar in a Python file",
+            8,
+            0.1,
+            &scope,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.contains("chunk-outside-projects-root"),
+            "expected the stored-project chunk in defaulted-scope output:\n{output}"
+        );
     }
 
     #[tokio::test]
@@ -8732,6 +8875,68 @@ mod tests {
         assert!(
             !xml.contains("unrelated-chunk"),
             "unrelated-project chunk leaked into search_by_concept output:\n{xml}"
+        );
+    }
+
+    /// W3-S finding 2: the code-graph ledger (`code_nodes`/`code_evolution`)
+    /// filters by an EXACT `project` match with no family-alias widening.
+    /// Before `project` defaulting existed, an omitted project meant `""`
+    /// (fully unscoped) — every project's nodes were visible. If an omitted
+    /// project were instead defaulted to a specific project name the way the
+    /// chunk-search tools now default (`resolve_search_scope`), this ledger
+    /// would silently narrow to just that literal name and drop every node
+    /// filed under a family alias. `search_by_file` deliberately does not
+    /// default an omitted/`"all"` project at all — it stays `""` — so this
+    /// pins that invariant: a node filed under an entirely different project
+    /// than any plausible default is still visible when `project` is
+    /// omitted.
+    #[tokio::test]
+    async fn search_by_file_omitted_project_is_not_narrowed_to_a_default_scope() {
+        use crate::storage::codegraph::NodeRow;
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        // Neither "claude-self-reflect" nor any of its aliases: stands in
+        // for "whatever project a CLAUDE_PROJECT_DIR default-scope
+        // resolution would have produced, which must not gate this ledger".
+        let stored_project = "claude-self-reflect-csr-engine";
+        storage
+            .upsert_code_node(&NodeRow {
+                id: "node-correlate-fts-hit".into(),
+                project: stored_project.into(),
+                file: "src/import/plans.rs".into(),
+                kind: "function".into(),
+                name: "correlate_fts_hit".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+
+        let xml = search_by_file(&storage, "src/import/plans.rs", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            xml.contains("correlate_fts_hit"),
+            "omitted project must not be narrowed to a default scope that \
+             can never match a family alias's exact project name:\n{xml}"
+        );
+
+        // "all" must behave identically to omitted.
+        let xml_all = search_by_file(&storage, "src/import/plans.rs", 10, Some("all"))
+            .await
+            .unwrap();
+        assert!(xml_all.contains("correlate_fts_hit"), "{xml_all}");
+
+        // An explicit, unrelated project still narrows exactly, unaffected.
+        let xml_explicit = search_by_file(
+            &storage,
+            "src/import/plans.rs",
+            10,
+            Some("some-other-project"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !xml_explicit.contains("correlate_fts_hit"),
+            "an explicit, non-matching project must still narrow the ledger:\n{xml_explicit}"
         );
     }
 

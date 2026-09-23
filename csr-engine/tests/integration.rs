@@ -1447,22 +1447,26 @@ fn test_temporal_iso_date() {
 
 #[test]
 fn test_cross_project_scope_all() {
-    let (project, label) = cross_project::normalize_project_scope(Some("all"));
+    let storage = Storage::open_memory().unwrap();
+    let (project, label) = cross_project::normalize_project_scope(&storage, Some("all")).unwrap();
     assert!(project.is_none());
     assert_eq!(label, "all");
 }
 
 #[test]
 fn test_cross_project_scope_all_case_insensitive() {
-    let (project, _) = cross_project::normalize_project_scope(Some("ALL"));
+    let storage = Storage::open_memory().unwrap();
+    let (project, _) = cross_project::normalize_project_scope(&storage, Some("ALL")).unwrap();
     assert!(project.is_none());
-    let (project, _) = cross_project::normalize_project_scope(Some("All"));
+    let (project, _) = cross_project::normalize_project_scope(&storage, Some("All")).unwrap();
     assert!(project.is_none());
 }
 
 #[test]
 fn test_cross_project_scope_specific() {
-    let (project, label) = cross_project::normalize_project_scope(Some("my-project"));
+    let storage = Storage::open_memory().unwrap();
+    let (project, label) =
+        cross_project::normalize_project_scope(&storage, Some("my-project")).unwrap();
     assert_eq!(project, Some("my-project".to_string()));
     assert_eq!(label, "my-project");
 }
