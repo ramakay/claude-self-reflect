@@ -226,12 +226,33 @@ pub fn relevance_assessment(
         } else {
             ""
         };
-        Relevance {
-            band,
-            qualifier: Some("low margin"),
-            warning: Some(format!(
-                "weak match, low margin over the rest of the {field_word} — absolute cosine similarity is weakly calibrated in the {QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range on this corpus (genuine and fabricated-probe scores overlap here){channel_note}. Read the preview to confirm before treating this as evidence the topic came up."
-            )),
+        // Review finding [low] (W3-W): `margin_validated_for_path=false`
+        // forces this branch regardless of the arithmetic (see the flag's
+        // doc comment above), but the wording used to say "low margin" even
+        // when the margin genuinely clears `WEAK_BAND_DECISIVE_MARGIN`. That
+        // is a false statement of fact — the real reason for hedging on this
+        // path is that the margin is uncalibrated, not that it is small.
+        // Only claim "low margin" when it actually is (below the threshold,
+        // or missing); otherwise say plainly that it is not calibrated here.
+        let margin_uncalibrated_but_large = !margin_validated_for_path
+            && !synthetic_top
+            && margin.is_some_and(|m| m >= WEAK_BAND_DECISIVE_MARGIN);
+        if margin_uncalibrated_but_large {
+            Relevance {
+                band,
+                qualifier: Some("uncalibrated margin"),
+                warning: Some(format!(
+                    "weak match; this result's margin over the rest of the {field_word} is not calibrated on this search path — absolute cosine similarity is weakly calibrated in the {QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range on this corpus overall, and {WEAK_BAND_DECISIVE_MARGIN:.2} was only ever validated against quick_check's exact-cosine margin, not this page's mixed scale{channel_note}. Read the preview to confirm before treating this as evidence the topic came up."
+                )),
+            }
+        } else {
+            Relevance {
+                band,
+                qualifier: Some("low margin"),
+                warning: Some(format!(
+                    "weak match, low margin over the rest of the {field_word} — absolute cosine similarity is weakly calibrated in the {QUICK_CHECK_FLOOR:.2}-{WEAK_BAND_TOP:.2} range on this corpus (genuine and fabricated-probe scores overlap here){channel_note}. Read the preview to confirm before treating this as evidence the topic came up."
+                )),
+            }
         }
     }
 }
@@ -420,32 +441,9 @@ pub(crate) fn format_search_results_with_rank_scores(
 
         // rank-1's own score (which may differ from `top_score`, the max raw
         // score across the whole page — display order follows the rerank, not
-        // raw score) plus the margin over rank 2, mirroring the discriminating
-        // signal `format_quick_check` already surfaces.
+        // raw score).
         let rank1_score = results[0].score;
-        let margin = results.get(1).map(|second| rank1_score - second.score);
-        let margin_attr = match margin {
-            Some(m) => format!("{:.3}", m),
-            None => "n/a".to_string(),
-        };
 
-        out.push_str(&format!(
-            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\">\n",
-            results.len(),
-            relevance,
-            top_score,
-            rank1_score,
-            margin_attr,
-        ));
-        out.push_str(&format!(
-            "    <preview>{}</preview>\n",
-            xml_escape(&preview_short)
-        ));
-        // Rank-1 can be in the weak band even when `relevance` (computed from
-        // the page's max raw score) is not, and vice versa — the caveat is
-        // about what Claude is about to read at the top of the list, so it is
-        // keyed on rank 1 specifically.
-        //
         // Rank-1's content carries a `[keyword] ` prefix exactly when its
         // score is synthetic (`score_fts_candidate` / `FTS_REFLECTION_SCORE`
         // in `mcp::tools`, both the FTS chunk fallback and the keyword-only
@@ -475,6 +473,21 @@ pub(crate) fn format_search_results_with_rank_scores(
         // (rank 2 at 0.349) produced a false 0.139 "leads" margin instead of
         // the true negative one). A lower-positioned row that outscores
         // rank 1 must never let this claim "leads".
+        //
+        // Review finding [medium] (W3-W follow-up): this same
+        // `comparable_runner_up` — MAX of the rest of the page, [keyword]
+        // rows excluded — must also drive the machine-readable `margin`
+        // attribute rendered in `<summary>` below, not just the `<caveat>`
+        // wording. It used to be computed separately there as
+        // `rank1_score - results.get(1).score` (next row by DISPLAY
+        // POSITION, [keyword] rows counted) — the same by-position and
+        // synthetic-floor defects this comment describes, just on a
+        // different output field, which let the attribute contradict the
+        // caveat sitting right next to it (live receipt: F2 rendered
+        // `margin="0.270"` next to a caveat correctly saying "low margin
+        // over the rest of the list", while ranks 4-5 on that same page
+        // actually outscored rank 1). Hoisted above the `<summary>` format!
+        // so both fields share one computation and can never drift apart.
         let comparable_runner_up = results
             .iter()
             .skip(1)
@@ -483,6 +496,27 @@ pub(crate) fn format_search_results_with_rank_scores(
             .fold(None, |acc: Option<f32>, score| {
                 Some(acc.map_or(score, |best: f32| best.max(score)))
             });
+        let margin_attr = match comparable_runner_up {
+            Some(second) => format!("{:.3}", rank1_score - second),
+            None => "n/a".to_string(),
+        };
+
+        out.push_str(&format!(
+            "  <summary count=\"{}\" relevance=\"{}\" top-score=\"{:.3}\" rank1-score=\"{:.3}\" margin=\"{}\">\n",
+            results.len(),
+            relevance,
+            top_score,
+            rank1_score,
+            margin_attr,
+        ));
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(&preview_short)
+        ));
+        // Rank-1 can be in the weak band even when `relevance` (computed from
+        // the page's max raw score) is not, and vice versa — the caveat is
+        // about what Claude is about to read at the top of the list, so it is
+        // keyed on rank 1 specifically.
         // Review finding [high] #1 part (b): even with the runner-up fixed,
         // this page's margin is not on a validated scale — it mixes chunks,
         // reflections, TAD-decayed rows and scope-multiplied rows (see
@@ -2138,6 +2172,13 @@ mod tests {
         // regardless of how large or clean the arithmetic margin is — this is
         // the mechanism `format_search_results_with_rank_scores` uses to stay
         // hedged until a same-path threshold exists.
+        //
+        // Review finding [low] (W3-W): with the hedge forced on regardless of
+        // the arithmetic, the wording must not then state a FACT the
+        // arithmetic contradicts. A margin of 0.30 (>= WEAK_BAND_DECISIVE_
+        // MARGIN) is not "low" — the real reason for hedging here is that the
+        // margin is not calibrated on this path, not that it is small. The
+        // text must say that, not "low margin over the rest of the list".
         let would_be_decisive = relevance_assessment(0.60, Some(0.30), 1, false, false);
         let warning = would_be_decisive
             .warning
@@ -2150,6 +2191,36 @@ mod tests {
         assert!(
             warning.contains("weakly calibrated"),
             "must still fall back to the honest low-margin caveat: {warning}"
+        );
+        assert!(
+            warning.contains("not calibrated on this search path"),
+            "a margin that clears WEAK_BAND_DECISIVE_MARGIN but is uncalibrated must say so \
+             honestly, not claim it is low: {warning}"
+        );
+        assert!(
+            !warning.contains("low margin"),
+            "the arithmetic margin (0.30) is not low — calling it low is false: {warning}"
+        );
+        assert!(
+            warning.contains("Read the preview"),
+            "the same 'read the preview' instruction must survive: {warning}"
+        );
+
+        // A GENUINELY low margin (below WEAK_BAND_DECISIVE_MARGIN) on the
+        // same uncalibrated path must still get the original "low margin"
+        // wording — that case really is low, regardless of calibration.
+        let genuinely_low = relevance_assessment(0.60, Some(0.55), 1, false, false);
+        let low_warning = genuinely_low
+            .warning
+            .expect("weak band always carries a warning");
+        assert!(
+            low_warning.contains("low margin"),
+            "a margin below WEAK_BAND_DECISIVE_MARGIN must keep the 'low margin' wording: \
+             {low_warning}"
+        );
+        assert!(
+            !low_warning.contains("not calibrated on this search path"),
+            "a genuinely low margin should not be reworded as merely uncalibrated: {low_warning}"
         );
 
         // Control: the identical (top, runner_up, synthetic_top) with

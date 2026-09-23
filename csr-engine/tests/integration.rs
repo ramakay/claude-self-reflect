@@ -1062,6 +1062,76 @@ fn weak_band_search_path_never_renders_decisive_for_f2_and_f5_shaped_pages() {
     }
 }
 
+/// Pulls the `margin="..."` attribute value out of the `<summary ...>` tag.
+/// Panics if the tag or attribute is missing — every non-empty result set
+/// renders exactly one `<summary>` line.
+fn extract_summary_margin_attr(xml: &str) -> String {
+    let summary_line = xml
+        .lines()
+        .find(|l| l.trim_start().starts_with("<summary "))
+        .unwrap_or_else(|| panic!("no <summary> line in: {xml}"));
+    let after = summary_line
+        .split("margin=\"")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no margin attribute in: {summary_line}"));
+    after.split('"').next().unwrap().to_string()
+}
+
+#[test]
+fn summary_margin_attribute_uses_comparable_runner_up_not_position() {
+    // Review finding [medium] (W3-W follow-up on review [high] #1): the
+    // `<summary margin="...">` machine-readable attribute was fixed for the
+    // `<caveat>` wording but NOT for itself — it was still computed as
+    // `rank1_score - results.get(1).score`, the next row by DISPLAY
+    // POSITION, and a `[keyword]` synthetic-floor row counted as a valid
+    // runner-up there too. Same defect, different output field.
+    //
+    // Live receipt (HEAD build, VACUUM INTO clone of the live DB): F2
+    // ("migrating csr-engine storage from SQLite to PostgreSQL") rendered
+    // `rank1-score="0.526" margin="0.270"` (against rank 2's 0.256) while
+    // ranks 4 and 5 on the SAME page scored 0.579 and 0.554 — rank 1 does
+    // not lead the page at all. The `<caveat>` right next to it correctly
+    // says "low margin over the rest of the list", so the machine-readable
+    // attribute directly contradicted its own neighboring text.
+    //
+    // Page shape below is the HEAD F2 page: [0.526, 0.256, 0.293, 0.579,
+    // 0.554, 0.407-as-[keyword]]. The comparable runner-up is
+    // max(0.256, 0.293, 0.579, 0.554) = 0.579 (the [keyword] row is
+    // excluded, same rule `comparable_runner_up` already applies to the
+    // caveat) — correct margin = 0.526 - 0.579 = -0.053, NOT the by-position
+    // 0.526 - 0.256 = 0.270 the pre-fix attribute rendered.
+    let mut kw_row = fixture_chunk("kw", 0.407);
+    kw_row.chunk.content = format!("[keyword] {}", kw_row.chunk.content);
+    let results = vec![
+        fixture_chunk("r0", 0.526),
+        fixture_chunk("r1", 0.256),
+        fixture_chunk("r2", 0.293),
+        fixture_chunk("r3", 0.579),
+        fixture_chunk("r4", 0.554),
+        kw_row,
+    ];
+    let xml = format::format_search_results(&results, "probe", "fixture-project", 1, 1);
+    assert_eq!(
+        extract_summary_margin_attr(&xml),
+        "-0.053",
+        "margin attribute must use the max-of-rest comparable runner-up, not rank 2 by position: {xml}"
+    );
+
+    // A page whose only non-rank-1 rows are all [keyword]: no comparable
+    // runner-up exists at all, so the attribute must render "n/a", not a
+    // cosine-vs-synthetic-floor number.
+    let mut only_kw = fixture_chunk("kw-only", 0.40);
+    only_kw.chunk.content = format!("[keyword] {}", only_kw.chunk.content);
+    let na_results = vec![fixture_chunk("r0", 0.55), only_kw];
+    let xml_na = format::format_search_results(&na_results, "probe", "fixture-project", 1, 1);
+    assert_eq!(
+        extract_summary_margin_attr(&xml_na),
+        "n/a",
+        "no comparable runner-up means the attribute must be n/a, not a cosine-vs-keyword-floor \
+         number: {xml_na}"
+    );
+}
+
 /// One row of `tests/fixtures/reflect_path_pages.json` — a full
 /// reflect_on_past-style page (numeric scores + the `[keyword] ` synthetic
 /// flag) captured 2026-09-22 for the 5 rank-1-correct bursts (B1-B5) and the
