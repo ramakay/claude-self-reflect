@@ -157,6 +157,39 @@ pub struct ParsedTranscript {
     /// number that should stay near zero on a real transcript; a nonzero
     /// count is the actual schema-drift signal.
     pub unrecognized_entries: usize,
+    /// `remove`/`dequeue` `queue-operation` bookkeeping lines, in file
+    /// order, positioned relative to `entries` — an `enqueue` line already
+    /// becomes a real `Entry` (see `classify_queue_operation`), but
+    /// `remove`/`dequeue` carried no fidelity-critical text of their own so
+    /// they were previously dropped as `Metadata` entirely. `render_prompts`
+    /// needs them to know when a queued prompt was withdrawn (never
+    /// delivered) instead of staying armed to dedupe an unrelated later
+    /// prompt with the same text (gap-G6, inbox-B3 review #2 finding 1a).
+    pub(crate) queue_events: Vec<QueueEvent>,
+}
+
+/// A `queue-operation` line other than `enqueue` — `remove` or `dequeue` —
+/// positioned relative to `ParsedTranscript::entries`.
+#[derive(Debug, Clone)]
+pub(crate) struct QueueEvent {
+    pub op: QueueOpKind,
+    /// Normalized (`strip_control_chars` + trim) content, when the line
+    /// carried a non-empty `content` field. Real `dequeue` lines are
+    /// observed with an empty/absent `content` (verified against a live
+    /// transcript: 57/57 dequeues carry no content) — those decode to
+    /// `None`.
+    pub content: Option<String>,
+    /// `ParsedTranscript::entries.len()` at the moment this line was seen
+    /// during parsing — i.e. this event occurred immediately before
+    /// `entries[before_entry_index]` (or after the last entry, if this
+    /// equals `entries.len()`).
+    pub before_entry_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueOpKind {
+    Remove,
+    Dequeue,
 }
 
 /// Per-tool_result-character cap for the `preview` field. Mirrors the spirit
@@ -212,7 +245,12 @@ fn parse_transcript_reader(reader: impl BufRead) -> ParsedTranscript {
             }
         };
 
-        match classify_line(&value, &mut seen_queued) {
+        match classify_line(
+            &value,
+            &mut seen_queued,
+            &mut out.queue_events,
+            out.entries.len(),
+        ) {
             LineOutcome::Entry(mut entry) => {
                 turn += 1;
                 entry.turn = turn;
@@ -248,6 +286,8 @@ enum LineOutcome {
 fn classify_line(
     value: &serde_json::Value,
     seen_queued: &mut HashSet<(String, String)>,
+    queue_events: &mut Vec<QueueEvent>,
+    entries_so_far: usize,
 ) -> LineOutcome {
     let Some(type_str) = value.get("type").and_then(|v| v.as_str()) else {
         return LineOutcome::Unrecognized;
@@ -255,7 +295,9 @@ fn classify_line(
 
     match type_str {
         "user" | "assistant" | "system" => LineOutcome::Entry(build_message_entry(type_str, value)),
-        "queue-operation" => classify_queue_operation(value, seen_queued),
+        "queue-operation" => {
+            classify_queue_operation(value, seen_queued, queue_events, entries_so_far)
+        }
         "attachment" => classify_attachment(value, seen_queued),
         "file-history-delta" => classify_file_history_delta(value),
         // Recognized vendor/harness metadata kinds that carry no
@@ -362,9 +404,36 @@ fn build_message_entry(type_str: &str, value: &serde_json::Value) -> Entry {
 fn classify_queue_operation(
     value: &serde_json::Value,
     seen_queued: &mut HashSet<(String, String)>,
+    queue_events: &mut Vec<QueueEvent>,
+    entries_so_far: usize,
 ) -> LineOutcome {
-    if value.get("operation").and_then(|v| v.as_str()) != Some("enqueue") {
-        return LineOutcome::Metadata;
+    match value.get("operation").and_then(|v| v.as_str()) {
+        Some("remove") => {
+            queue_events.push(QueueEvent {
+                op: QueueOpKind::Remove,
+                content: value
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| strip_control_chars(c).trim().to_string())
+                    .filter(|c| !c.is_empty()),
+                before_entry_index: entries_so_far,
+            });
+            return LineOutcome::Metadata;
+        }
+        Some("dequeue") => {
+            queue_events.push(QueueEvent {
+                op: QueueOpKind::Dequeue,
+                content: value
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .map(|c| strip_control_chars(c).trim().to_string())
+                    .filter(|c| !c.is_empty()),
+                before_entry_index: entries_so_far,
+            });
+            return LineOutcome::Metadata;
+        }
+        Some("enqueue") => {}
+        _ => return LineOutcome::Metadata,
     }
     let Some(content) = value.get("content").and_then(|v| v.as_str()) else {
         return LineOutcome::Metadata;
@@ -677,6 +746,22 @@ pub(crate) fn strip_queued_prefix(text: &str) -> &str {
     t
 }
 
+/// True for a plain `/name` slash-command invocation with no arguments —
+/// `text` matches `^/[A-Za-z0-9:_-]+\s*$` (a leading slash, one or more
+/// name characters covering plugin-scoped names like `/codex:rescue`, then
+/// only trailing whitespace, if any). No regex crate needed for a check
+/// this small.
+fn is_bare_slash_command(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    let Some(rest) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+}
+
 /// Extract the text between the first `open`...`close` tag pair in `text`.
 fn extract_tag(text: &str, open: &str, close: &str) -> Option<String> {
     let start = text.find(open)? + open.len();
@@ -747,6 +832,14 @@ pub(crate) fn prompt_noise_class(e: &Entry) -> Option<&'static str> {
     }
     if text.starts_with("[SYSTEM NOTIFICATION") {
         return Some("task_notification");
+    }
+    // A bare slash command typed with no arguments (e.g. `/compact`) never
+    // goes through the `<command-name>` echo shape above — Claude Code
+    // records it as plain text. Without this it shows as a genuine human
+    // prompt, and a queued copy of it inflates `queued_duplicate` instead
+    // of its own class (gap-G6, inbox-B3 review #2 finding, medium).
+    if is_bare_slash_command(text) {
+        return Some("slash_command_no_args");
     }
     if e.is_meta {
         return Some("meta");

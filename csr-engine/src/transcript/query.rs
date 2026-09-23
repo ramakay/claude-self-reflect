@@ -392,27 +392,108 @@ fn command_display_override(text: &str) -> Option<String> {
     Some(format!("{name} {args}"))
 }
 
-fn render_prompts(parsed: &ParsedTranscript, req: &TranscriptRequest) -> ViewData {
-    use std::collections::HashSet;
+/// Apply one `remove`/`dequeue` queue-operation event to the currently
+/// `armed` (still-pending, undelivered) queued-prompt multiset. `Remove`
+/// carries the withdrawn text and disarms exactly that entry (inbox-B3
+/// review #2 finding 1a — a removed queued prompt must never stay armed to
+/// dedupe an unrelated later prompt with the same text). `Dequeue` lines
+/// are observed with no content on real transcripts (57/57 in the sampled
+/// corpus) and are intentionally treated as a no-op here rather than
+/// blindly popping the oldest armed entry: two prompts queued back to back
+/// (adjacent `enqueue`s) can have their delivered twins arrive interleaved
+/// with unrelated turns in between and NOT in enqueue order — a live
+/// example is two queued prompts whose twins arrive several turns apart,
+/// each still delivered enqueue-then-match. Popping a contentless
+/// `dequeue` blind would disarm the wrong one of the two. The per-text
+/// match-then-consume walk in `render_prompts` already dedupes each queued
+/// text against its own twin exactly once, which is everything a
+/// contentless `dequeue` could tell us anyway.
+fn apply_queue_event(ev: &super::QueueEvent, armed: &mut Vec<String>) {
+    if ev.op != super::QueueOpKind::Remove {
+        return;
+    }
+    let Some(content) = &ev.content else {
+        return;
+    };
+    if let Some(pos) = armed.iter().position(|t| t == content) {
+        armed.remove(pos);
+    }
+}
 
+fn render_prompts(parsed: &ParsedTranscript, req: &TranscriptRequest) -> ViewData {
     const QUEUED_PREFIX: &str = "[queued] ";
 
     let mut hidden_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    // Normalized text of already-emitted items whose ORIGINAL entry was a
-    // `[queued] ` copy and hasn't yet absorbed its delivered twin. Only
-    // entries that pass through this set get deduped — a human prompt typed
-    // twice with neither copy queued is never touched (inbox-B3 review
-    // finding, medium).
-    let mut emitted_queued_texts: HashSet<String> = HashSet::new();
+    // Ordered multiset of queued-prompt texts (already `[queued] `-emitted
+    // in this walk) still awaiting a delivered twin. A `Vec` rather than a
+    // `HashSet` so two identically-worded queued prompts each get their own
+    // slot — matching consumes exactly one occurrence, not "any".
+    let mut armed: Vec<String> = Vec::new();
+    // Cursor into `parsed.queue_events` (already file-order, i.e. increasing
+    // `before_entry_index`) — shared across the pre-scan and main walk
+    // below so no event is ever applied twice.
+    let mut qi = 0usize;
     let mut items: Vec<RenderItem> = Vec::new();
 
-    for e in parsed
-        .entries
-        .iter()
-        .filter(|e| e.role == Role::User && req.role.matches_role(Role::User))
-        .filter(|e| !e.text.trim().is_empty())
-        .filter(|e| turn_in_range(e.turn, req.turns))
-    {
+    // Turn numbers are `entries` index + 1 (assigned sequentially over
+    // recognized entries only — see `Entry::turn` doc), so a `--turns`
+    // range starting above turn 1 corresponds exactly to entries index
+    // `start - 1`.
+    let range_start_turn = req
+        .turns
+        .and_then(|(start, _)| if start > 1 { Some(start) } else { None });
+
+    // Pre-scan: a paged read (`--turns N..`) must not show a delivered twin
+    // whose queued copy landed on an earlier page. Silently replay every
+    // queued entry and queue-op event BEFORE the range start through the
+    // same arm/disarm machine the main walk uses below — nothing here is
+    // ever emitted or counted (inbox-B3 review #2 finding 1d).
+    if !req.include_system {
+        if let Some(start) = range_start_turn {
+            for (idx, e) in parsed.entries.iter().enumerate() {
+                while qi < parsed.queue_events.len()
+                    && parsed.queue_events[qi].before_entry_index <= idx
+                {
+                    apply_queue_event(&parsed.queue_events[qi], &mut armed);
+                    qi += 1;
+                }
+                if e.turn >= start {
+                    break;
+                }
+                if e.role != Role::User || e.text.trim().is_empty() {
+                    continue;
+                }
+                if !e.text.starts_with(QUEUED_PREFIX) {
+                    continue;
+                }
+                if super::prompt_noise_class(e).is_some() {
+                    continue;
+                }
+                armed.push(super::strip_queued_prefix(&e.text).trim().to_string());
+            }
+        }
+    }
+
+    for (idx, e) in parsed.entries.iter().enumerate() {
+        if !req.include_system {
+            while qi < parsed.queue_events.len()
+                && parsed.queue_events[qi].before_entry_index <= idx
+            {
+                apply_queue_event(&parsed.queue_events[qi], &mut armed);
+                qi += 1;
+            }
+        }
+
+        if e.role != Role::User || !req.role.matches_role(Role::User) {
+            continue;
+        }
+        if e.text.trim().is_empty() {
+            continue;
+        }
+        if !turn_in_range(e.turn, req.turns) {
+            continue;
+        }
+
         // `include_system=true` must reproduce the pre-change output
         // byte-for-byte: no command-name rewrite, raw `e.text` only
         // (inbox-B3 review finding, high).
@@ -439,15 +520,33 @@ fn render_prompts(parsed: &ParsedTranscript, req: &TranscriptRequest) -> ViewDat
             }
             let normalized = super::strip_queued_prefix(&display_text).trim().to_string();
             let is_queued = e.text.starts_with(QUEUED_PREFIX);
-            if emitted_queued_texts.remove(&normalized) {
-                // This entry's text matches an earlier-emitted queued copy
-                // — it's that copy's delivered (or re-queued) twin. Each
-                // queued copy absorbs at most one twin.
+
+            if is_queued {
+                // Arm this queued text — it stays armed until a matching
+                // delivered twin consumes it, or a `remove` withdraws it
+                // (`apply_queue_event`), however far away either lands
+                // (inbox-B3 review #2 finding 1a).
+                armed.push(normalized);
+            } else if let Some(pos) = armed.iter().position(|t| *t == normalized) {
+                // This delivered entry matches an armed queued text —
+                // consume exactly that one slot. Matching always takes
+                // priority over disarming (see the FIFO note below): two
+                // queued prompts delivered out of textual order must each
+                // still find their own twin.
+                armed.remove(pos);
                 *hidden_counts.entry("queued_duplicate").or_insert(0) += 1;
                 continue;
-            }
-            if is_queued {
-                emitted_queued_texts.insert(normalized);
+            } else {
+                // A genuine human turn that matches nothing armed. Any
+                // still-armed queued text is now stale relative to real
+                // conversation flow — disarm the rest so it can never
+                // falsely dedupe an unrelated FUTURE prompt that happens to
+                // share its wording (inbox-B3 review #2 finding 1a's
+                // "thousands of turns later" case). Noise-classified
+                // entries never reach this branch (handled above), so a
+                // task-notification or similar between a queued prompt and
+                // its real twin never disarms anything.
+                armed.clear();
             }
         }
 
@@ -1514,7 +1613,14 @@ mod tests {
     }
 
     /// (iv) surviving items' turn numbers must equal their turn numbers
-    /// under `include_system=true` — filtering never renumbers turns.
+    /// under `include_system=true` — filtering never renumbers turns, and
+    /// (inbox-B3 review #2 finding 1c/2c) a surviving turn's default-view
+    /// text must actually derive from THAT SAME turn's raw text, not from
+    /// an already-emitted item that merely absorbed this turn's number
+    /// during dedupe. A mutation that reattaches an emitted queued item's
+    /// turn number to its consumed twin (`it.turn = e.turn`) passes a
+    /// plain set-membership check but fails this one — verified manually
+    /// (see git history / PR description) and restored.
     #[test]
     fn prompts_view_turn_numbers_stable_across_include_system() {
         let dir = tempfile::tempdir().unwrap();
@@ -1525,29 +1631,61 @@ mod tests {
         full_req.include_system = true;
         let full_out = transcript::run(dir.path(), &full_req);
         let full_v: Value = serde_json::from_str(&full_out).unwrap();
-        // Note: default-mode display text can differ from the raw
-        // `include_system` text (the `/codex:rescue` override, the
-        // "[queued] " marker) — review finding, high — so this can't
-        // correlate by text. Turn numbers are assigned at parse time,
-        // independent of `render_prompts` filtering, so every surviving
-        // default-mode turn must be a turn that also appears in the
-        // unfiltered `include_system=true` view.
-        let full_turns: std::collections::HashSet<u64> = full_v["items"]
+        let full_by_turn: HashMap<u64, String> = full_v["items"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|i| i["turn"].as_u64().unwrap())
+            .map(|i| {
+                (
+                    i["turn"].as_u64().unwrap(),
+                    i["text"].as_str().unwrap().to_string(),
+                )
+            })
             .collect();
 
         let mut default_req = base_req(ViewKind::Prompts, &path.to_string_lossy());
         default_req.json = true;
         let default_out = transcript::run(dir.path(), &default_req);
         let default_v: Value = serde_json::from_str(&default_out).unwrap();
-        for item in default_v["items"].as_array().unwrap() {
+        let default_items = default_v["items"].as_array().unwrap();
+
+        // Pin the fixture's exact surviving turn list — a regression that
+        // hides/reveals a different noise class shifts this list, which
+        // would otherwise silently defeat the per-turn checks below.
+        let turns: Vec<u64> = default_items
+            .iter()
+            .map(|i| i["turn"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            turns,
+            vec![1, 2, 5, 7, 13],
+            "surviving turn list changed, got: {default_out}"
+        );
+
+        const QUEUED_PREFIX: &str = "[queued] ";
+        for item in default_items {
             let turn = item["turn"].as_u64().unwrap();
-            assert!(
-                full_turns.contains(&turn),
-                "turn {turn} in default view must also appear under include_system=true, got: {default_out}"
+            let default_text = item["text"].as_str().unwrap();
+            let full_text = full_by_turn.get(&turn).unwrap_or_else(|| {
+                panic!(
+                    "turn {turn} in default view must also appear under include_system=true, got: {default_out}"
+                )
+            });
+            // Reproduce render_prompts' own display_text derivation from
+            // this turn's raw include_system text, then require it match
+            // what the default view actually rendered for the SAME turn —
+            // this is turn-to-text, not just turn membership.
+            let stripped = crate::transcript::strip_queued_prefix(full_text);
+            let expected = match command_display_override(stripped) {
+                Some(over) if full_text.starts_with(QUEUED_PREFIX) => {
+                    format!("{QUEUED_PREFIX}{over}")
+                }
+                Some(over) => over,
+                None => full_text.clone(),
+            };
+            assert_eq!(
+                default_text, expected,
+                "turn {turn}: default-view text does not derive from this turn's own include_system text, got: {default_out}"
             );
         }
     }
@@ -1601,6 +1739,242 @@ mod tests {
         assert_eq!(v["hidden"].get("local_command"), None);
         assert_eq!(v["hidden"].get("compaction_summary"), None);
         assert_eq!(v["items"].as_array().unwrap().len(), 2, "got: {out}");
+    }
+
+    // ─── gap-G6: transcript prompts residuals (inbox-B3 review #2) ───
+
+    /// (finding 1a) a queued prompt whose text was withdrawn via a
+    /// `queue-operation remove` must NOT stay armed to swallow a later,
+    /// unrelated delivered prompt that happens to share its exact wording
+    /// — even when the two are dozens of turns apart.
+    #[test]
+    fn prompts_view_removed_queued_text_does_not_hide_a_later_unrelated_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("removed_then_repeated.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"start"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-22T00:00:01Z","content":"yes"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"remove","timestamp":"2026-09-22T00:00:02Z","content":"yes"}}"#
+        )
+        .unwrap();
+        // 50 unrelated turns between the withdrawal and the later real
+        // "yes" — task-notifications specifically (noise-classified, never
+        // disarm anything on their own) so this test isolates the
+        // `remove`-disarms-its-own-content mechanism from the separate
+        // "a genuine non-matching human turn disarms the rest" rule (which
+        // would otherwise also mask this bug after the first ordinary
+        // human turn).
+        for n in 0..50 {
+            writeln!(
+                f,
+                r#"{{"type":"assistant","timestamp":"2026-09-22T00:01:{n:02}Z","message":{{"role":"assistant","content":[{{"type":"text","text":"working on it {n}"}}]}}}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"type":"user","timestamp":"2026-09-22T00:02:{n:02}Z","origin":{{"kind":"task-notification"}},"message":{{"role":"user","content":"<task-notification>bg task {n} finished</task-notification>"}}}}"#
+            )
+            .unwrap();
+        }
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:03:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"yes"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        req.json = true;
+        let out = transcript::run(dir.path(), &req);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let texts: Vec<String> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            texts.iter().filter(|t| *t == "yes").count(),
+            1,
+            "the real, later 'yes' must be shown once — the withdrawn queued copy must not hide it, got: {out}"
+        );
+        assert_eq!(v["hidden"].get("queued_duplicate"), None, "got: {out}");
+    }
+
+    /// (finding 1a / real-corpus fix) two queued prompts enqueued back to
+    /// back must EACH dedupe against their own delivered twin even when
+    /// the twins arrive interleaved with an unrelated real prompt in
+    /// between and out of enqueue order at the text level — mirrors the
+    /// live 585b0176 turn 2384/2385 shape.
+    #[test]
+    fn prompts_view_two_queued_fifo_prompts_both_dedupe_across_an_intervening_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fifo_two_queued.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-22T00:00:00Z","content":"do the first thing"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-22T00:00:01Z","content":"do the second thing"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-09-22T00:00:02Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ack"}}]}}}}"#
+        )
+        .unwrap();
+        // the FIRST queued item's twin arrives first — must consume only
+        // that one, leaving the second still armed.
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:03Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"do the first thing"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-09-22T00:00:04Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ack again"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:05Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"do the second thing"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        req.json = true;
+        let out = transcript::run(dir.path(), &req);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let texts: Vec<String> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "[queued] do the first thing",
+                "[queued] do the second thing"
+            ],
+            "both queued prompts must dedupe against their own twin, got: {out}"
+        );
+        assert_eq!(v["hidden"]["queued_duplicate"], json!(2), "got: {out}");
+    }
+
+    /// (finding 1d) a page fetched with `--turns N..` must not re-show a
+    /// delivered twin whose queued copy landed on an earlier page.
+    #[test]
+    fn prompts_view_range_resume_has_no_duplicate_across_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range_resume.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"start"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"queue-operation","operation":"enqueue","timestamp":"2026-09-22T00:00:01Z","content":"go build it"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","timestamp":"2026-09-22T00:00:02Z","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:03Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"go build it"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        // Page 1: turns 1..2 — shows the queued placeholder.
+        let mut page1 = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        page1.json = true;
+        page1.turns = Some((1, Some(2)));
+        let out1 = transcript::run(dir.path(), &page1);
+        let v1: Value = serde_json::from_str(&out1).unwrap();
+
+        // Page 2: turns 3.. — must recognize turn 4 as the queued item's
+        // twin (pre-scanned from turns 1-2) and hide it as a duplicate,
+        // not show it as a fresh prompt.
+        let mut page2 = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        page2.json = true;
+        page2.turns = Some((3, None));
+        let out2 = transcript::run(dir.path(), &page2);
+        let v2: Value = serde_json::from_str(&out2).unwrap();
+
+        assert_eq!(
+            v2["hidden"]["queued_duplicate"],
+            json!(1),
+            "page 2 must recognize turn 4 as the page-1 queued item's twin, got: {out2}"
+        );
+
+        let mut all_texts: Vec<String> = v1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(v2["items"].as_array().unwrap())
+            .map(|i| {
+                crate::transcript::strip_queued_prefix(i["text"].as_str().unwrap()).to_string()
+            })
+            .collect();
+        all_texts.sort();
+        let mut deduped = all_texts.clone();
+        deduped.dedup();
+        assert_eq!(
+            all_texts, deduped,
+            "no prompt text should appear on both pages, got page1={out1} page2={out2}"
+        );
+    }
+
+    /// (finding 1b) a bare slash command with no arguments (e.g. `/compact`
+    /// typed directly, not via the `<command-name>` echo shape) must be
+    /// hidden as `slash_command_no_args`, not shown as a genuine human
+    /// prompt.
+    #[test]
+    fn prompts_view_bare_slash_command_is_hidden_as_slash_command_no_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bare_slash.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:00Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"/compact"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","timestamp":"2026-09-22T00:00:01Z","origin":{{"kind":"human"}},"message":{{"role":"user","content":"/compact  "}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let mut req = base_req(ViewKind::Prompts, &path.to_string_lossy());
+        req.json = true;
+        let out = transcript::run(dir.path(), &req);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 0, "got: {out}");
+        assert_eq!(v["hidden"]["slash_command_no_args"], json!(2), "got: {out}");
     }
 
     #[test]
