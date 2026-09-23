@@ -216,16 +216,33 @@ download_and_install() {
 }
 
 # --- Report stale processes + restart the daemon (gap-G2 spec 2e) ---
+#
+# FORWARD-PORT NOTE (gap-G2 review finding 5): this branch's base predates
+# #316 on main, which rewrote this script's staging/rename logic. `git
+# merge-tree main HEAD` conflicts in this file. When this branch lands,
+# reconcile with that rewrite and port this function's logic + a test
+# alongside installer/lib.js's (see the matching note in postinstall.js).
 
 report_stale_and_kickstart() {
-    STATUS_JSON="$("${INSTALL_DIR}/${BINARY_NAME}" status 2>/dev/null || true)"
-    if [ -n "$STATUS_JSON" ]; then
-        STALE_COUNT="$(printf '%s' "$STATUS_JSON" | grep -c '"pid":' 2>/dev/null || echo 0)"
-        if [ "$STALE_COUNT" -gt 0 ] 2>/dev/null; then
+    # `status --stale` is a DB-free fast path (run-registry read + a
+    # liveness check per pid, milliseconds) — NOT the full `status`, whose
+    # SQLite gather measured 8-31s on a 563k-chunk corpus under load
+    # (gap-G2 review finding 2: the old fixed timeout around the full
+    # command missed on 2 of 3 timed runs). Plain per-line text output
+    # (`pid <n> (<role>, started <ts>, parent <p>)`), one full line per
+    # process — `grep -A3` over pretty JSON used to print only the array
+    # opener plus 3 lines of the FIRST entry (gap-G2 review finding 3).
+    if STALE_OUTPUT="$("${INSTALL_DIR}/${BINARY_NAME}" status --stale 2>/dev/null)"; then
+        if [ -n "$STALE_OUTPUT" ]; then
+            STALE_COUNT="$(printf '%s\n' "$STALE_OUTPUT" | grep -c '^pid ' 2>/dev/null || echo 0)"
             warn "$STALE_COUNT process(es) are still running the previous csr-engine build:"
-            printf '%s\n' "$STATUS_JSON" | grep -A3 '"stale_processes"' >&2 || true
+            printf '%s\n' "$STALE_OUTPUT" | while IFS= read -r line; do
+                printf '    %s\n' "$line" >&2
+            done
             printf '  Restart Claude Code sessions (and any other MCP host) using csr-engine to pick up this build.\n' >&2
         fi
+    else
+        warn "could not determine stale processes"
     fi
 
     DAEMON_LABEL="com.ramakay.csr-engine.daemon"

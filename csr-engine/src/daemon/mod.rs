@@ -11,10 +11,10 @@
 //! 7. Memory registry loop — periodic metadata-only scan of native memory files (`~/.claude/projects/*/memory/*.md`) into `memory_registry`; never embeds or injects memory content
 //! 8. Provenance backfill loop — one idle-gated structural batch at a time
 //! 9. Import catch-up sweep — reconciles `import_state.file_mtime` against
-//!    the live filesystem once at startup and every 30 minutes, recovering
-//!    files whose watcher import failed with `database is locked` on their
-//!    last write and never got a later notify event to retry against
-//!    (`import::catchup::catchup_sweep`)
+//!    the live filesystem once the daemon is idle (then every 30 minutes,
+//!    also idle-gated), recovering files whose watcher import failed with
+//!    `database is locked` on their last write and never got a later notify
+//!    event to retry against (`import::catchup::catchup_sweep`)
 
 pub mod consolidation;
 pub mod dream_cadence;
@@ -216,17 +216,25 @@ impl Daemon {
     /// (gap-G2) — the daemon's plist sets `KeepAlive.SuccessfulExit=false`,
     /// so any non-zero exit gets launchd to restart it from the new image.
     ///
-    /// `startup_identity` is this process's own exe identity, captured by
-    /// `main()` as the literal first thing it does — NOT re-captured here.
-    /// By the time `run()` starts, `Engine::new()` (storage open, HNSW
-    /// load/rebuild, embeddings warm) has already run, which can take
-    /// seconds on a large corpus; capturing identity this late would widen
-    /// the window in which a replacement landing during this process's own
-    /// startup goes permanently invisible (it would record the NEW file's
-    /// identity as its own baseline). See `binary_identity::ReplacementWatch::new`.
+    /// `startup_identity`/`startup_exe_path` are this process's own exe
+    /// identity and path, both captured together by `main()` (via
+    /// `binary_identity::current_exe_path_and_identity`) as the literal
+    /// first thing it does — NOT re-captured here. By the time `run()`
+    /// starts, `Engine::new()` (storage open, HNSW load/rebuild, embeddings
+    /// warm) has already run, which can take seconds on a large corpus;
+    /// capturing either this late — or re-deriving the path via a second
+    /// `current_exe()` call, as this used to do — would widen the window in
+    /// which a replacement landing during this process's own startup goes
+    /// permanently invisible: it would either record the NEW file's
+    /// identity as its own baseline, or (on Linux, where a second
+    /// `current_exe()` call after the same window can return a `(deleted)`
+    /// path) fail closed forever. See
+    /// `binary_identity::current_exe_path_and_identity`'s doc (gap-G2
+    /// review finding 4).
     pub async fn run(
         self,
         startup_identity: Option<crate::binary_identity::FileIdentity>,
+        startup_exe_path: Option<PathBuf>,
     ) -> Result<i32> {
         let _lock = Self::acquire_lock()?;
         tracing::info!("daemon started, acquired lockfile");
@@ -235,7 +243,7 @@ impl Daemon {
         // even from another `csr-engine` invocation. Best-effort — a
         // missing state dir must never stop the daemon from starting.
         let own_identity = startup_identity;
-        let own_exe_path = std::env::current_exe().ok();
+        let own_exe_path = startup_exe_path;
         let run_record_path = own_identity
             .zip(crate::binary_identity::default_run_dir())
             .and_then(|(identity, run_dir)| {
@@ -1122,23 +1130,27 @@ impl Daemon {
         // (gap-G2, watched by `replacement_watch_handle` spawned above) —
         // whichever comes first. The replacement watch is only armed when
         // this process's own identity was captured at start; without it,
-        // fall back to the plain signal wait.
-        let mut exit_code = 0i32;
-        match replacement_watch_handle {
+        // fall back to the plain signal wait. The signal-vs-replaced race
+        // and its exit-code mapping live in `shutdown_reason` (a seam, not
+        // inlined here) specifically so a test can drive that mapping
+        // directly — see its doc.
+        let exit_code = match replacement_watch_handle {
             Some(mut handle) => {
-                tokio::select! {
-                    result = wait_for_termination_signal() => {
-                        handle.abort();
-                        result?
-                    }
-                    _ = &mut handle => {
-                        tracing::info!("binary replaced, exiting for launchd restart");
-                        exit_code = crate::binary_identity::DAEMON_REPLACED_EXIT_CODE;
-                    }
+                let code =
+                    shutdown_reason(wait_for_termination_signal(), Some(&mut handle)).await?;
+                if code == 0 {
+                    // Signal won the race; the replacement watch is no
+                    // longer useful — stop it rather than leaving it
+                    // polling until process exit.
+                    handle.abort();
                 }
+                code
             }
-            None => wait_for_termination_signal().await?,
-        }
+            None => {
+                wait_for_termination_signal().await?;
+                0
+            }
+        };
         tracing::info!("shutting down daemon gracefully");
 
         // Signal all loops to stop
@@ -1267,6 +1279,49 @@ async fn wait_for_termination_signal() -> Result<()> {
 #[cfg(not(unix))]
 async fn wait_for_termination_signal() -> Result<()> {
     tokio::signal::ctrl_c().await.map_err(Into::into)
+}
+
+/// Resolves to the process exit code `Daemon::run` should return, once
+/// EITHER `signal` (the plain Ctrl+C/SIGTERM wait) or `replaced` (the
+/// binary-replacement watch) resolves, whichever comes first: `0` for an
+/// ordinary signal-driven shutdown, propagating any error `signal` returns;
+/// [`crate::binary_identity::DAEMON_REPLACED_EXIT_CODE`] once `replaced`
+/// resolves. `replaced` is `None` when this process never captured its own
+/// startup identity (nothing to watch), in which case this just awaits
+/// `signal`.
+///
+/// Extracted out of `run()`'s inline `tokio::select!` as a seam a test can
+/// drive directly with stub futures — a future edit that drops the
+/// replacement arm, or maps it to any exit code other than 75, compiles
+/// fine and only shows up in production when launchd doesn't restart the
+/// daemon after an install (gap-G2 review finding 1: the previous test only
+/// asserted `DAEMON_REPLACED_EXIT_CODE == 75`, a tautology that never
+/// called this mapping).
+async fn shutdown_reason<S, R>(signal: S, replaced: Option<R>) -> Result<i32>
+where
+    S: std::future::Future<Output = Result<()>>,
+    R: std::future::Future,
+{
+    match replaced {
+        Some(replaced) => {
+            tokio::pin!(signal);
+            tokio::pin!(replaced);
+            tokio::select! {
+                result = &mut signal => {
+                    result?;
+                    Ok(0)
+                }
+                _ = &mut replaced => {
+                    tracing::info!("binary replaced, exiting for launchd restart");
+                    Ok(crate::binary_identity::DAEMON_REPLACED_EXIT_CODE)
+                }
+            }
+        }
+        None => {
+            signal.await?;
+            Ok(0)
+        }
+    }
 }
 
 /// Resolves once the shutdown flag is set. Used to race a bounded-duration
@@ -1483,12 +1538,50 @@ async fn ancestry_refresh_loop(
     }
 }
 
-/// Runs `import::catchup::catchup_sweep` once immediately, then every 30
-/// minutes. Each stale file's actual reimport acquires its own `heavy_work`
-/// permit rather than holding one across the whole scan — a large sweep
-/// (thousands of untouched-but-recent files) must not starve the live
-/// watcher for the entire pass, the same discipline `ancestry_refresh_loop`
-/// uses per-repository above.
+/// Blocks until the daemon is idle (per `dream_cadence::is_idle`) or
+/// shutdown is requested. Returns `false` on shutdown (caller should stop),
+/// `true` once idle. Polls on the same ten-second cadence as the rest of
+/// this file's shutdown-aware loops.
+async fn wait_until_idle_or_shutdown(storage: &Storage, shutdown: &AtomicBool) -> bool {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        if dream_cadence::is_idle(
+            dream_cadence::last_activity_at(storage),
+            chrono::Utc::now(),
+            dream_cadence::idle_secs(),
+        ) {
+            return true;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    }
+}
+
+/// Runs `import::catchup::catchup_sweep` once the daemon is idle, then every
+/// 30 minutes (also idle-gated). Each stale file's actual reimport acquires
+/// its own `heavy_work` permit rather than holding one across the whole scan
+/// — a large sweep (thousands of untouched-but-recent files) must not starve
+/// the live watcher for the entire pass, the same discipline
+/// `ancestry_refresh_loop` uses per-repository above.
+///
+/// Idle-gated the same way `provenance_backfill_handle` is (two-phase check:
+/// once before the pass starts, once more per file after the permit is
+/// acquired): unlike that loop's small fixed batches, this sweep can touch
+/// thousands of files in one pass on the live corpus (dry run: 22k scanned,
+/// 522 stale), so if it started unconditionally at daemon startup or on
+/// every 30-minute tick it would compete with an active user for
+/// `heavy_work` for the whole first pass. The per-file re-check means an
+/// activity resumption mid-sweep defers every remaining file in that pass
+/// (see `import::catchup::DEFERRED_NOT_IDLE`) rather than running to
+/// completion regardless of load; deferred files stay stale and are picked
+/// up by the next sweep.
+///
+/// Reimports go through `import::watcher::import_file_content_diff` — the
+/// same content-diffing path the live watcher uses — not
+/// `Engine::import_file`'s count-incremental path, which would silently
+/// stamp a busy-dropped tail as reimported without ever re-embedding it (see
+/// that function's docs).
 async fn catchup_loop(
     storage: Arc<Storage>,
     projects_dir: PathBuf,
@@ -1500,6 +1593,9 @@ async fn catchup_loop(
         if shutdown.load(Ordering::SeqCst) {
             return;
         }
+        if !wait_until_idle_or_shutdown(&storage, &shutdown).await {
+            return;
+        }
 
         let now = chrono::Utc::now();
         let sweep_engine = engine.clone();
@@ -1509,11 +1605,18 @@ async fn catchup_loop(
             &storage,
             &projects_dir,
             now,
-            move |path, project_name| {
+            move |path, _project_name| {
                 let engine = sweep_engine.clone();
                 let heavy_work = sweep_heavy_work.clone();
                 let shutdown = sweep_shutdown.clone();
                 async move {
+                    if !dream_cadence::is_idle(
+                        dream_cadence::last_activity_at(engine.storage()),
+                        chrono::Utc::now(),
+                        dream_cadence::idle_secs(),
+                    ) {
+                        return Err(anyhow::anyhow!(crate::import::catchup::DEFERRED_NOT_IDLE));
+                    }
                     let Some(permit) =
                         acquire_heavy_work_unless_shutdown(heavy_work, &shutdown).await
                     else {
@@ -1521,7 +1624,24 @@ async fn catchup_loop(
                             "daemon shutting down before catch-up import"
                         ));
                     };
-                    let result = engine.import_file(&path, &project_name).await.map(|_| ());
+                    // Re-check after the (possibly long) wait for a permit —
+                    // activity may have resumed while we were queued.
+                    if !dream_cadence::is_idle(
+                        dream_cadence::last_activity_at(engine.storage()),
+                        chrono::Utc::now(),
+                        dream_cadence::idle_secs(),
+                    ) {
+                        drop(permit);
+                        return Err(anyhow::anyhow!(crate::import::catchup::DEFERRED_NOT_IDLE));
+                    }
+                    let result = crate::import::watcher::import_file_content_diff(
+                        engine.storage(),
+                        engine.embeddings(),
+                        engine.search(),
+                        engine.projects_dir(),
+                        &path,
+                    )
+                    .await;
                     drop(permit);
                     result
                 }
@@ -1537,6 +1657,7 @@ async fn catchup_loop(
                     reimported = summary.reimported,
                     skipped = summary.skipped,
                     failed = summary.failed,
+                    deferred = summary.deferred,
                     "import catch-up sweep completed"
                 );
                 if let Err(e) = storage.set_meta(
@@ -2409,6 +2530,53 @@ mod tests {
         std::env::remove_var("CSR_NO_MEMORY_REGISTRY");
     }
 
+    /// Opus review, medium finding on gap-G1: `catchup_loop` must not run
+    /// its sweep unconditionally at startup and on every 30-minute tick —
+    /// `wait_until_idle_or_shutdown` is the gate. Already-idle storage (a
+    /// far-past seeded `import_state.file_mtime`, well past the default
+    /// 30-minute idle threshold) must return `true` on the very first check,
+    /// with no polling wait.
+    #[tokio::test]
+    async fn wait_until_idle_or_shutdown_returns_true_when_already_idle() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .upsert_import_state_explicit(
+                "/tmp/does-not-matter.jsonl",
+                "conv",
+                1,
+                "2020-01-01T00:00:00Z",
+            )
+            .unwrap();
+        let shutdown = AtomicBool::new(false);
+
+        let idle = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            wait_until_idle_or_shutdown(&storage, &shutdown),
+        )
+        .await
+        .expect("must not block polling when already idle");
+        assert!(idle);
+    }
+
+    /// Companion to the above: shutdown must win even when the daemon would
+    /// never otherwise go idle (no activity rows at all — `last_activity_at`
+    /// returns `None`, which `dream_cadence::is_idle` deliberately never
+    /// treats as idle). Without the shutdown check this would hang the test
+    /// (and, in production, block the daemon from ever stopping the loop).
+    #[tokio::test]
+    async fn wait_until_idle_or_shutdown_returns_false_on_shutdown() {
+        let storage = Storage::open_memory().unwrap();
+        let shutdown = AtomicBool::new(true);
+
+        let idle = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            wait_until_idle_or_shutdown(&storage, &shutdown),
+        )
+        .await
+        .expect("must not block polling when shutdown is already set");
+        assert!(!idle);
+    }
+
     #[test]
     fn enrich_initial_delay_env() {
         // Unique to this module — no shared mutex needed, same rationale as
@@ -2681,6 +2849,78 @@ mod tests {
             result.is_ok(),
             "SIGTERM must resolve as a clean shutdown signal"
         );
+    }
+
+    // --- gap-G2 review finding 1: `shutdown_reason` is the exact mapping
+    // `Daemon::run` calls from `signal-vs-replaced resolved first` to the
+    // process exit code. These drive it directly (never through the real
+    // signal handler, never through the real 30s/3s poll) so they run in
+    // milliseconds and would fail if the replacement arm were dropped or
+    // remapped — the bug the previous test (`wait_for_binary_replacement_
+    // resolves_after_confirmation` in `binary_identity.rs`) could not catch
+    // because it only asserted `DAEMON_REPLACED_EXIT_CODE == 75`, a
+    // tautology that never called this function. ---
+
+    #[tokio::test]
+    async fn shutdown_reason_returns_75_when_replaced_resolves_first() {
+        // Signal side never resolves; replacement side resolves immediately.
+        let signal = std::future::pending::<Result<()>>();
+        let replaced = std::future::ready(());
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            shutdown_reason(signal, Some(replaced)),
+        )
+        .await
+        .expect("must not hang waiting on a signal that never resolves")
+        .expect("replaced arm must not propagate an error");
+        assert_eq!(
+            code,
+            crate::binary_identity::DAEMON_REPLACED_EXIT_CODE,
+            "a confirmed binary replacement must map to the launchd-restart \
+             exit code — a mutant that maps this arm to 0 (or drops it) must \
+             fail this assertion, since launchd's KeepAlive.SuccessfulExit=false \
+             only restarts on a NON-zero exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reason_returns_0_when_signal_resolves_first() {
+        // Replacement side never resolves; signal side resolves immediately.
+        let signal = std::future::ready(Ok(()));
+        let replaced = std::future::pending::<()>();
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            shutdown_reason(signal, Some(replaced)),
+        )
+        .await
+        .expect("must not hang waiting on a replacement watch that never resolves")
+        .expect("signal arm must not propagate an error");
+        assert_eq!(
+            code, 0,
+            "an ordinary signal-driven shutdown must exit 0, not the \
+             replaced-binary code"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reason_propagates_a_signal_error() {
+        let signal = std::future::ready(Err(anyhow::anyhow!("signal handler install failed")));
+        let replaced = std::future::pending::<()>();
+        let err = shutdown_reason(signal, Some(replaced))
+            .await
+            .expect_err("an error from the signal future must propagate, not be swallowed");
+        assert!(err.to_string().contains("signal handler install failed"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reason_falls_back_to_the_plain_signal_when_replaced_is_none() {
+        // No startup identity captured -> nothing to watch; must still
+        // resolve once the signal does, and never look like a replacement.
+        let signal = std::future::ready(Ok(()));
+        let code = shutdown_reason::<_, std::future::Pending<()>>(signal, None)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
     }
 
     #[tokio::test]

@@ -74,6 +74,13 @@ enum Commands {
         /// Force a fresh full integrity check (slow on large DBs; otherwise cached)
         #[arg(long)]
         deep: bool,
+        /// DB-free fast path: only the stale-process report (run registry +
+        /// liveness check, milliseconds), no SQLite gather at all. For
+        /// installers, which need this right after writing a fresh binary
+        /// and cannot afford the full status gather's multi-second DB
+        /// pass (gap-G2 review finding 2).
+        #[arg(long)]
+        stale: bool,
     },
     /// Handle Claude Code hook events
     Hook {
@@ -608,7 +615,13 @@ fn main() -> Result<()> {
     // would record the NEW file's identity as its own baseline and could
     // never see itself as replaced (gap-G2; caught by a scratch-HOME smoke
     // test where the replace happened to land in exactly that window).
-    let startup_identity = csr_engine::binary_identity::current_exe_identity();
+    // Captured together (path + identity, ONE `current_exe()` call) rather
+    // than separately: a caller that re-derives the path later via its own
+    // `current_exe()` call can race the same startup-window replacement and
+    // get back a `(deleted)` path on Linux, which fails every downstream
+    // replacement check closed forever (gap-G2 review finding 4) — see
+    // `binary_identity::current_exe_path_and_identity`'s doc.
+    let startup_exe = csr_engine::binary_identity::current_exe_path_and_identity();
     // Raise the open-file ceiling before any index load so a low soft RLIMIT_NOFILE
     // cannot turn a transient EMFILE inside hnsw_rs's mmap load into a process exit.
     csr_engine::runtime::raise_fd_limit();
@@ -642,12 +655,16 @@ fn main() -> Result<()> {
     // `main` calls — see `runtime::tests::run_to_completion_bounds_the_wait_for_an_abandoned_blocking_task`.
     csr_engine::runtime::run_to_completion(
         runtime,
-        run(startup_identity),
+        run(startup_exe),
         std::time::Duration::from_secs(5),
     )
 }
 
-async fn run(startup_identity: Option<csr_engine::binary_identity::FileIdentity>) -> Result<()> {
+async fn run(
+    startup_exe: Option<(PathBuf, csr_engine::binary_identity::FileIdentity)>,
+) -> Result<()> {
+    let startup_identity = startup_exe.as_ref().map(|(_, identity)| *identity);
+    let startup_exe_path = startup_exe.map(|(path, _)| path);
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -666,8 +683,12 @@ async fn run(startup_identity: Option<csr_engine::binary_identity::FileIdentity>
         compact,
         swiftbar,
         deep,
+        stale,
     }) = args.command
     {
+        if stale {
+            return csr_engine::status::handle_stale();
+        }
         return csr_engine::status::handle(
             &args.db_path,
             &args.projects_dir,
@@ -857,7 +878,7 @@ async fn run(startup_identity: Option<csr_engine::binary_identity::FileIdentity>
             config,
             !no_ai,
         );
-        let exit_code = daemon.run(startup_identity).await?;
+        let exit_code = daemon.run(startup_identity, startup_exe_path).await?;
         if exit_code != 0 {
             // Skips `runtime::run_to_completion`'s bounded shutdown wait
             // (see that function's doc comment) — deliberately: the
@@ -1590,7 +1611,8 @@ async fn run(startup_identity: Option<csr_engine::binary_identity::FileIdentity>
     };
 
     if should_serve {
-        eng.serve_mcp(jsonrpc_stdout, startup_identity).await?;
+        eng.serve_mcp(jsonrpc_stdout, startup_identity, startup_exe_path)
+            .await?;
     } else if args.watch {
         // If watching (with or without import), keep the process alive
         tracing::info!("watching for new conversations. Press Ctrl+C to stop.");

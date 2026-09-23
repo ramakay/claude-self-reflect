@@ -251,28 +251,49 @@ function runOrExplainActivation(destPath, pathBinary) {
 }
 
 // --- Stale-process report + daemon restart (gap-G2 spec 2e) ---
+//
+// FORWARD-PORT NOTE (gap-G2 review finding 5): this branch's base predates
+// #316, which rewrote this file's staging/rename logic and added
+// installer/lib.js on main. `git merge-tree main HEAD` conflicts in this
+// file. When this branch lands on top of that rewrite, move
+// reportStaleAndKickstart (and the matching shell function in
+// scripts/install.sh) into lib.js behind an injectable exec, drop the
+// now-redundant staging duplicate, and add an installer test feeding a
+// fake `status --stale` output.
 
 const DAEMON_LABEL = 'com.ramakay.csr-engine.daemon';
 
 function reportStaleAndKickstart(binaryPath) {
   try {
-    const statusJson = execFileSync(binaryPath, ['status'], {
+    // `status --stale` is a DB-free fast path (run-registry read + a
+    // liveness check per pid, milliseconds) — NOT the full `status`, whose
+    // SQLite gather measured 8-31s on a 563k-chunk corpus under load, right
+    // after this same install wrote a fresh binary the OS has to
+    // codesign-verify on its first exec. The old 10s timeout around the
+    // full command missed on 2 of 3 timed runs on that machine, so the
+    // stale-process report (spec 2e) silently never printed (gap-G2 review
+    // finding 2). Plain per-line text, not JSON: `pid <n> (<role>, started
+    // <ts>, parent <p>)`, matching `csr_engine::status::format_stale_processes`.
+    const output = execFileSync(binaryPath, ['status', '--stale'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 10000,
+      timeout: 5000,
     });
-    const status = JSON.parse(statusJson);
-    const stale = Array.isArray(status.stale_processes) ? status.stale_processes : [];
-    if (stale.length > 0) {
-      console.log(`\n  \x1b[1;33m${stale.length} process(es) are still running the previous csr-engine build:\x1b[0m`);
-      for (const p of stale) {
-        console.log(`    pid ${p.pid} (${p.role}, started ${p.started_at}${p.parent ? `, parent ${p.parent}` : ''})`);
+    const lines = output.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (lines.length > 0) {
+      console.log(`\n  \x1b[1;33m${lines.length} process(es) are still running the previous csr-engine build:\x1b[0m`);
+      for (const line of lines) {
+        console.log(`    ${line}`);
       }
       console.log('  Restart Claude Code sessions (and any other MCP host) using csr-engine to pick up this build.');
     }
   } catch {
-    // status is best-effort here — a fresh install with no prior run
-    // registry, or a status failure, must not fail the install.
+    // A fresh install with no prior run registry prints nothing (not an
+    // error) via the same path above — this catch is only reached on an
+    // actual failure (spawn error, non-zero exit, timeout). Report it
+    // rather than staying silent, so a real failure doesn't look identical
+    // to "nothing was stale" (gap-G2 review finding 2).
+    console.log('  could not determine stale processes');
   }
 
   if (platform() !== 'darwin') return;

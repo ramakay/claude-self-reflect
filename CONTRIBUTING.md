@@ -13,7 +13,7 @@ cargo test
 
 ```bash
 cargo fmt
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
