@@ -39,12 +39,22 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
 /// by silent confidence.
 pub const QUICK_CHECK_FLOOR: f32 = 0.45;
 
-/// Top of the measured fabrication-overlap band (highest fabricated probe: 0.605,
-/// rounded up). At or above this, a match is at least `partial`; below it a match
-/// is `weak` — absolute cosine is weakly calibrated in this band on this corpus
-/// and does not reliably separate genuine matches from noise by score alone.
-/// `format_quick_check` surfaces a top1-top2 margin alongside the score as a
-/// cheap discriminating signal instead of pretending the score settles it.
+/// Top of the measured fabrication-overlap band. At or above this, a match is
+/// at least `partial`; below it a match is `weak` — absolute cosine is weakly
+/// calibrated in this band on this corpus and does not reliably separate
+/// genuine matches from noise by score alone. `format_quick_check` surfaces a
+/// top1-top2 margin alongside the score as a cheap discriminating signal
+/// instead of pretending the score settles it.
+///
+/// This edge came from the 2026-08-03 measurement (`examples/quick_check_
+/// floor.rs`, exact cosine over the then-current corpus): the highest
+/// fabricated probe measured 0.605, rounded up to 0.62. It is a fixed
+/// constant, not recomputed as the corpus grows. Corpus growth has already
+/// pushed fabricated probes above it: a 2026-09-22 re-measurement
+/// (`examples/quick_check_floor_margin.rs`) found one at 0.629, which lands
+/// in `partial` and carries no caveat at all — a known, tracked gap (not
+/// asserted as a hard invariant, since asserting it would block a future fix
+/// for it) — see `weak_band_fabricated_probes_still_carry_a_caveat`.
 pub const WEAK_BAND_TOP: f32 = 0.62;
 
 /// Band a similarity score into the relevance vocabulary shared by every result
@@ -94,6 +104,22 @@ pub fn relevance_label(score: f32) -> &'static str {
 /// not by raw score) rather than re-derived from a single contaminated data
 /// point. Re-deriving it against real reflect_on_past-path margins (hybrid
 /// rerank, not exact-cosine quick_check) is a follow-up, not done here.
+///
+/// W3-W update (2026-09-22): that follow-up surfaced two more reasons this
+/// constant cannot be applied on the reflect_on_past/search path yet, beyond
+/// the synthetic-runner-up issue above. (a) The search page mixes chunks,
+/// reflections, TAD-decayed rows and scope-multiplied rows (0.3x for
+/// out-of-family reflections, `CURRENT_PROJECT_ALL_SCOPE_BOOST` for
+/// in-family ones) — margins on that page are not on the same scale this
+/// constant was measured against. (b) Live receipts on that page (F2: 0.526
+/// vs 0.414, margin 0.112; F5: 0.488 vs 0.349-by-position while rank 6 on
+/// the same page actually scores 0.511, higher than rank 1) both clear this
+/// threshold while being false or meaningless "leads" claims. So
+/// `relevance_assessment`'s `margin_validated_for_path` parameter keeps this
+/// constant decisive for `quick_check` (its exact-cosine top1-top2 margin is
+/// what it was measured against) and forces the low-margin hedge on the
+/// search path unconditionally, regardless of the arithmetic, until a
+/// same-path threshold is derived.
 pub const WEAK_BAND_DECISIVE_MARGIN: f32 = 0.10;
 
 /// A relevance band plus the extra context needed to word a `weak`-band result
@@ -143,11 +169,28 @@ pub struct Relevance {
 /// lower-raw-score result to rank 1) or a missing runner-up never renders a
 /// "leads by ..." clause, it falls through to the honest low-confidence
 /// caveat instead.
+///
+/// `margin_validated_for_path` (review finding [high] #1): whether
+/// [`WEAK_BAND_DECISIVE_MARGIN`] was actually derived against the scale this
+/// call's margin lives on. `format_quick_check` computes an exact-cosine
+/// top1-top2 margin — the same scale the constant was measured against — so
+/// it passes `true`. `format_search_results_with_rank_scores` renders a page
+/// that mixes chunks, reflections, TAD-decayed rows and scope-multiplied
+/// rows; re-deriving a threshold for that mixed scale is a follow-up, not
+/// done here, so it passes `false` and this function always renders the
+/// low-margin hedge for it, regardless of how large the arithmetic margin
+/// is. Live receipts prove this is not a hypothetical: on the search page,
+/// "migrating csr-engine storage from SQLite to PostgreSQL" (0.526 vs 0.414,
+/// margin 0.112) and "adding a Redis caching layer ..." (0.488 vs the actual
+/// best-of-rest 0.511 — a NEGATIVE margin once the runner-up is computed
+/// correctly) both cleared 0.10 by position before this fix while being
+/// false or meaningless "leads" claims.
 pub fn relevance_assessment(
     top: f32,
     runner_up: Option<f32>,
     list_len: usize,
     synthetic_top: bool,
+    margin_validated_for_path: bool,
 ) -> Relevance {
     let band = relevance_label(top);
     if band != "weak" {
@@ -162,7 +205,9 @@ pub fn relevance_assessment(
     let field_word = if list_len > 1 { "list" } else { "field" };
     // WEAK_BAND_DECISIVE_MARGIN is > 0.0, so `m >= WEAK_BAND_DECISIVE_MARGIN`
     // already implies a positive margin — no separate `m > 0.0` check needed.
-    let decisive = !synthetic_top && margin.is_some_and(|m| m >= WEAK_BAND_DECISIVE_MARGIN);
+    let decisive = margin_validated_for_path
+        && !synthetic_top
+        && margin.is_some_and(|m| m >= WEAK_BAND_DECISIVE_MARGIN);
 
     if decisive {
         // `decisive` only fires when `margin` is `Some` and positive, so this
@@ -419,19 +464,38 @@ pub(crate) fn format_search_results_with_rank_scores(
         // claims (live receipt: a fabricated probe scoring 0.601 against a
         // `[keyword] ` rank-2 at 0.405 read as decisive with a 0.196
         // "margin" that was actually cosine-vs-floor, not cosine-vs-cosine).
-        // Skip synthetic rows and use the first genuinely comparable
-        // (non-`[keyword] `) result instead; if none exists on this page,
-        // there is no comparable runner-up at all.
+        // Skip synthetic rows.
+        //
+        // Review finding [high] #1 (W3-W): the runner-up must be the MAX
+        // score among ALL other non-`[keyword] ` rows on the page, not the
+        // next one by display position — rerank order is not monotone in
+        // score, so a lower-positioned row can outscore rank 1 (live
+        // receipt: "adding a Redis caching layer ..." had rank 1 at 0.488
+        // and rank 6 at 0.511, above rank 1; the old by-position runner-up
+        // (rank 2 at 0.349) produced a false 0.139 "leads" margin instead of
+        // the true negative one). A lower-positioned row that outscores
+        // rank 1 must never let this claim "leads".
         let comparable_runner_up = results
             .iter()
             .skip(1)
-            .find(|r| !r.chunk.content.starts_with("[keyword] "))
-            .map(|r| r.score);
+            .filter(|r| !r.chunk.content.starts_with("[keyword] "))
+            .map(|r| r.score)
+            .fold(None, |acc: Option<f32>, score| {
+                Some(acc.map_or(score, |best: f32| best.max(score)))
+            });
+        // Review finding [high] #1 part (b): even with the runner-up fixed,
+        // this page's margin is not on a validated scale — it mixes chunks,
+        // reflections, TAD-decayed rows and scope-multiplied rows (see
+        // `WEAK_BAND_DECISIVE_MARGIN` docs). `quick_check`'s exact-cosine
+        // top1-top2 margin is the only validated basis for this constant, so
+        // `margin_validated_for_path: false` here always renders the honest
+        // low-margin hedge on this path, regardless of the arithmetic.
         let rank1_assessment = relevance_assessment(
             rank1_score,
             comparable_runner_up,
             results.len(),
             rank1_synthetic,
+            false,
         );
         if let Some(warning) = &rank1_assessment.warning {
             out.push_str(&format!("    <caveat>{}</caveat>\n", warning));
@@ -604,7 +668,12 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     // index (`search_chunks`/`search_chunks_filtered`) — no FTS fallback, so
     // `synthetic_top` is always false here; still passed explicitly so this
     // call site does not silently drift if that changes.
-    let assessment = relevance_assessment(top.score, results.get(1).map(|r| r.score), 1, false);
+    //
+    // `margin_validated_for_path: true` — this margin is exact-cosine top1-
+    // top2 over a single, uniform vector-index page, exactly the scale
+    // `WEAK_BAND_DECISIVE_MARGIN` was measured against.
+    let assessment =
+        relevance_assessment(top.score, results.get(1).map(|r| r.score), 1, false, true);
 
     out.push_str("  <found>true</found>\n");
     // The runner-up is fetched only to calculate the margin. Keep the public
@@ -1978,7 +2047,7 @@ mod tests {
         // it must never trigger the "leads by margin" claim even when the
         // raw numbers alone would — `WEAK_BAND_DECISIVE_MARGIN` was derived
         // from cosine scores.
-        let non_synthetic = relevance_assessment(0.55, Some(0.40), 1, false);
+        let non_synthetic = relevance_assessment(0.55, Some(0.40), 1, false, true);
         assert!(
             non_synthetic
                 .warning
@@ -1989,7 +2058,7 @@ mod tests {
             non_synthetic.warning
         );
 
-        let synthetic = relevance_assessment(0.55, Some(0.40), 1, true);
+        let synthetic = relevance_assessment(0.55, Some(0.40), 1, true, true);
         let warning = synthetic
             .warning
             .expect("weak band always carries a warning");
@@ -2011,7 +2080,7 @@ mod tests {
         // WEAK_BAND_DECISIVE_MARGIN (a positive threshold), so it always
         // falls through to the honest low-confidence caveat — the wording
         // must never say "leads the field by a -0.050 margin".
-        let assessment = relevance_assessment(0.61, Some(0.66), 1, false);
+        let assessment = relevance_assessment(0.61, Some(0.66), 1, false, true);
         let warning = assessment
             .warning
             .expect("weak band always carries a warning");
@@ -2038,7 +2107,7 @@ mod tests {
         // asserts (honestly) that the runner-up IS comparable — the
         // contamination is a caller-side filtering bug, not something this
         // function can detect from the numbers alone.
-        let contaminated_call = relevance_assessment(0.601, Some(0.405), 2, false);
+        let contaminated_call = relevance_assessment(0.601, Some(0.405), 2, false, true);
         let contaminated_warning = contaminated_call.warning.as_ref().unwrap();
         assert!(
             contaminated_warning.contains("leads the field")
@@ -2051,13 +2120,46 @@ mod tests {
         // this decisive wording. See
         // `weak_band_margin_skips_synthetic_keyword_runner_up` in
         // tests/integration.rs for the full-renderer receipt.
-        let no_comparable_runner_up = relevance_assessment(0.601, None, 2, false);
+        let no_comparable_runner_up = relevance_assessment(0.601, None, 2, false, true);
         let warning = no_comparable_runner_up
             .warning
             .expect("weak band always carries a warning");
         assert!(
             !warning.contains("leads"),
             "no comparable runner-up means there is nothing to lead over: {warning}"
+        );
+    }
+
+    #[test]
+    fn relevance_assessment_margin_validated_for_path_false_always_hedges() {
+        // Review finding [high] #1: `WEAK_BAND_DECISIVE_MARGIN` was only ever
+        // validated against `quick_check`'s exact-cosine top1-top2 margin.
+        // `margin_validated_for_path: false` must force the low-margin hedge
+        // regardless of how large or clean the arithmetic margin is — this is
+        // the mechanism `format_search_results_with_rank_scores` uses to stay
+        // hedged until a same-path threshold exists.
+        let would_be_decisive = relevance_assessment(0.60, Some(0.30), 1, false, false);
+        let warning = would_be_decisive
+            .warning
+            .expect("weak band always carries a warning");
+        assert!(
+            !warning.contains("leads"),
+            "margin_validated_for_path=false must suppress decisive wording even for a huge \
+             margin: {warning}"
+        );
+        assert!(
+            warning.contains("weakly calibrated"),
+            "must still fall back to the honest low-margin caveat: {warning}"
+        );
+
+        // Control: the identical (top, runner_up, synthetic_top) with
+        // margin_validated_for_path=true IS decisive — proving the flag,
+        // not some other input, gates this.
+        let control = relevance_assessment(0.60, Some(0.30), 1, false, true);
+        assert!(
+            control.warning.as_ref().unwrap().contains("leads"),
+            "control case should be decisive when the path IS validated: {:?}",
+            control.warning
         );
     }
 

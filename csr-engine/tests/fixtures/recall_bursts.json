@@ -517,7 +517,8 @@
     "rank_used": 1,
     "requeried": true,
     "fabricated": false,
-    "rank1_band": "weak"
+    "rank1_band": "weak",
+    "runner_up_synthetic": true
   },
   {
     "top": 0.586,

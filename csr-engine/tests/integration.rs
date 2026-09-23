@@ -642,6 +642,13 @@ fn test_format_recency_results_includes_age_stamp() {
 /// (2026-08-03 baseline) — `top`/`runner_up` are that probe's real top-1 and
 /// top-2 exact-cosine scores, so `top - runner_up` is a genuine margin, not
 /// a synthesized one.
+///
+/// `runner_up_synthetic` (review finding [medium] #3): true exactly for the
+/// one row (top=0.563, runner_up=0.450) whose `runner_up` is
+/// `score_fts_candidate`'s synthetic `[keyword] ` FTS-fallback floor, not a
+/// cosine measurement — the live burst confirmed this row's real rank-2 by
+/// score is 0.583, not 0.450. Absent/false for every other row, where
+/// `runner_up` is a genuine cosine measurement.
 #[derive(serde::Deserialize)]
 struct BurstFixtureRow {
     top: f32,
@@ -655,6 +662,8 @@ struct BurstFixtureRow {
     #[allow(dead_code)]
     requeried: Option<bool>,
     fabricated: bool,
+    #[serde(default)]
+    runner_up_synthetic: bool,
 }
 
 fn load_burst_fixture() -> Vec<BurstFixtureRow> {
@@ -728,7 +737,19 @@ fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
 
         let mut results = vec![fixture_chunk("rank1", row.top)];
         if let Some(second) = row.runner_up {
-            results.push(fixture_chunk("rank2", second));
+            // Review finding [medium] #3: the 0.563/0.450 row's runner-up is
+            // `score_fts_candidate`'s synthetic `[keyword] ` FTS-fallback
+            // floor, not a cosine measurement (the live burst's real rank-2
+            // by score is 0.583). Building it as a plain cosine row here
+            // exercised the exact cosine-vs-floor comparison this item
+            // closes — tag it with the same `[keyword] ` prefix the real
+            // renderer would see, so `comparable_runner_up` correctly skips
+            // it.
+            let mut rank2 = fixture_chunk("rank2", second);
+            if row.runner_up_synthetic {
+                rank2.chunk.content = format!("[keyword] {}", rank2.chunk.content);
+            }
+            results.push(rank2);
         }
         let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
         assert!(
@@ -754,6 +775,22 @@ fn weak_band_wording_never_calls_a_rank1_correct_hit_spurious() {
     assert!(
         checked > 0,
         "fixture must contain at least one rank-1-correct weak-band burst to regress against"
+    );
+    // Review finding [medium] #3 / [high] #1 combined receipt: with the
+    // decisive branch disabled on the search path (its margin scale is not
+    // validated the way quick_check's is) AND the synthetic runner-up
+    // correctly tagged above, every rank-1-correct weak-band burst must
+    // render the honest low-margin hedge — never a decisive "leads" claim,
+    // which would have been the cosine-vs-synthetic-floor artifact this
+    // fixture used to hide. Expected receipt: 0 decisive, 5 low-margin.
+    assert_eq!(
+        decisive_after, 0,
+        "reflect_on_past-path decisive wording is not validated on this scale — no rank-1-correct \
+         burst should ever render it: {decisive_after} of {checked} did"
+    );
+    assert_eq!(
+        low_margin_after, caveated_after,
+        "every caveated rank-1-correct burst must be the low-margin hedge, not decisive"
     );
     // Review finding [medium] #3: report this honestly rather than as an
     // unqualified win. The objective ("stop calling rank-1-correct hits
@@ -942,10 +979,16 @@ fn weak_band_margin_skips_synthetic_keyword_runner_up() {
         "must fall back to the honest low-margin caveat: {xml}"
     );
 
-    // Control: the identical (top, runner_up) pair WITHOUT the `[keyword] `
-    // prefix on rank 2 IS decisive — proving the fix is about comparability,
-    // not a blanket disabling of margin-decisive wording in the search
-    // renderer.
+    // W3-W (review finding [high] #1) superseded the old "control" case
+    // here: a genuinely comparable (cosine-vs-cosine) runner-up used to be
+    // treated as decisive on this path, but the review found that basis
+    // false on live data (F2, F5 — see `weak_band_search_path_never_renders_
+    // decisive_for_f2_and_f5_shaped_pages`) — the reflect_on_past page mixes
+    // chunks, reflections, TAD-decayed and scope-multiplied rows on a scale
+    // `WEAK_BAND_DECISIVE_MARGIN` was never validated against. So the
+    // comparable case must ALSO hedge now — proving the fix disables
+    // decisive wording for this path across the board, not just for the
+    // synthetic-runner-up case above.
     let comparable_results = vec![fixture_chunk("rank1", 0.601), fixture_chunk("rank2", 0.405)];
     let xml_comparable = format::format_search_results(
         &comparable_results,
@@ -955,32 +998,190 @@ fn weak_band_margin_skips_synthetic_keyword_runner_up() {
         1,
     );
     assert!(
-        xml_comparable.contains("leads the field") || xml_comparable.contains("leads the list"),
-        "a genuinely comparable (cosine-vs-cosine) 0.196 margin should still be decisive: {xml_comparable}"
+        !xml_comparable.contains("leads the field") && !xml_comparable.contains("leads the list"),
+        "a comparable runner-up must still hedge on the search path — margin-decisive wording is \
+         quick_check-only until this path gets its own validated threshold: {xml_comparable}"
+    );
+    assert!(
+        xml_comparable.contains("weakly calibrated"),
+        "must fall back to the honest low-margin caveat: {xml_comparable}"
+    );
+}
+
+// ─── W3-W: reflect_on_past-path decisive wording is falsified by its own data (review [high]) ───
+
+/// Numeric-only shape from review finding [high] #1's live receipt: F2
+/// (`migrating csr-engine storage from SQLite to PostgreSQL`) rendered
+/// "leads the list" comparing rank 1 (0.526, a real chunk) against its
+/// immediate rank-2 by POSITION (0.414, a `[reflection]` row) while a lower
+/// row on the same page never entered the comparison at all. Margin 0.112
+/// clears `WEAK_BAND_DECISIVE_MARGIN` (0.10) even after skipping `[keyword]`
+/// rows, because none of these six rows is `[keyword]`-prefixed — the bug is
+/// the *position* of the comparison, not the keyword-skip.
+const F2_SHAPED_PAGE: [f32; 6] = [0.526, 0.414, 0.271, 0.345, 0.256, 0.319];
+
+/// F5 (`adding a Redis caching layer in front of the csr-engine search
+/// path`): rank 1 is 0.488, its immediate rank-2 (0.349) yields a 0.139
+/// margin — but rank 6 on the same page scores 0.511, ABOVE rank 1. A
+/// runner-up computed by position can never see this; a runner-up computed
+/// as the max of the rest of the page always does, and correctly reports a
+/// negative margin (no lead at all).
+const F5_SHAPED_PAGE: [f32; 6] = [0.488, 0.349, 0.320, 0.287, 0.334, 0.511];
+
+fn results_from_scores(scores: &[f32]) -> Vec<EnrichedResult> {
+    scores
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| fixture_chunk(&format!("r{i}"), s))
+        .collect()
+}
+
+#[test]
+fn weak_band_search_path_never_renders_decisive_for_f2_and_f5_shaped_pages() {
+    // Review finding [high] #1, spec item (1)+(2)+(3): fix the runner-up to
+    // be the max of the rest of the page (not the next row by position), AND
+    // disable the decisive branch entirely on the reflect_on_past/search
+    // path (its margin scale is not validated the way quick_check's
+    // exact-cosine top1-top2 margin is — this page mixes chunks, reflections,
+    // TAD-decayed and scope-multiplied rows). Either fix alone closes these
+    // two cases; both are required in general (fixing only the runner-up
+    // position still leaves a page where the best-of-rest genuinely trails
+    // rank 1 by >= 0.10 on this uncalibrated scale).
+    for (tag, page) in [("F2", F2_SHAPED_PAGE), ("F5", F5_SHAPED_PAGE)] {
+        let results = results_from_scores(&page);
+        let xml = format::format_search_results(&results, "probe", "fixture-project", 1, 1);
+        assert!(
+            !xml.contains("leads the field") && !xml.contains("leads the list"),
+            "{tag}-shaped page must never render a decisive lead on the search path: {xml}"
+        );
+        assert!(
+            !xml.contains("margin over the rest of the list is real")
+                && !xml.contains("margin over the rest of the field is real"),
+            "{tag}-shaped page must never claim the margin over the rest of the list is real: {xml}"
+        );
+    }
+}
+
+/// One row of `tests/fixtures/reflect_path_pages.json` — a full
+/// reflect_on_past-style page (numeric scores + the `[keyword] ` synthetic
+/// flag) captured 2026-09-22 for the 5 rank-1-correct bursts (B1-B5) and the
+/// 8 fabricated probes (F1-F8) against the live corpus (`/tmp/w3w/after.json`
+/// at HEAD 64ef0d4). No prompts, previews, session ids or project names —
+/// this is a public repo.
+#[derive(serde::Deserialize)]
+struct ReflectPathRow {
+    score: f32,
+    kw: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    reflection: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct ReflectPathPage {
+    tag: String,
+    #[allow(dead_code)]
+    note: String,
+    rows: Vec<ReflectPathRow>,
+}
+
+fn load_reflect_path_pages() -> Vec<ReflectPathPage> {
+    let path = fixtures_dir().join("reflect_path_pages.json");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[test]
+fn weak_band_reflect_on_past_path_receipt_for_bursts_and_fabricated_probes() {
+    // Review finding [medium] #2: `weak_band_fabricated_probes_still_carry_a_
+    // caveat` only ever exercises `format_quick_check`, so it stays green
+    // while the live reflect_on_past renderer calls 2 of 8 fabricated probes
+    // decisive (F2, F5). This test drives the actual page-shaped renderer
+    // (`format_search_results`, what `reflect_on_past` uses) over all 13
+    // captured pages and is the receipt table the item spec asks for.
+    let pages = load_reflect_path_pages();
+    assert_eq!(pages.len(), 13, "expected 5 bursts + 8 fabricated probes");
+
+    let mut none_count = 0;
+    let mut decisive_count = 0;
+    let mut hedge_count = 0;
+    println!("W3-W receipt: reflect_on_past-path wording per captured page (HEAD, post-fix)");
+    for page in &pages {
+        let scores: Vec<f32> = page.rows.iter().map(|r| r.score).collect();
+        let results: Vec<EnrichedResult> = page
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut chunk = fixture_chunk(&format!("{}-r{i}", page.tag), r.score);
+                if r.kw {
+                    chunk.chunk.content = format!("[keyword] {}", chunk.chunk.content);
+                }
+                chunk
+            })
+            .collect();
+        let xml = format::format_search_results(&results, "probe", "fixture-project", 1, 1);
+        let wording = if !xml.contains("<caveat>") {
+            none_count += 1;
+            "none (not weak band)"
+        } else if xml.contains("leads the field") || xml.contains("leads the list") {
+            decisive_count += 1;
+            "DECISIVE leads"
+        } else {
+            hedge_count += 1;
+            "low-margin hedge"
+        };
+        println!(
+            "  {:<3} rank1={:.3} rows={scores:?} -> {wording}",
+            page.tag,
+            scores.first().copied().unwrap_or(0.0)
+        );
+        assert!(
+            !xml.contains("leads the field") && !xml.contains("leads the list"),
+            "{}: reflect_on_past-path decisive wording is not validated on this path — every \
+             page must render the honest low-margin hedge (or no caveat, outside the weak band): {xml}",
+            page.tag
+        );
+    }
+    println!(
+        "W3-W receipt totals: none={none_count} decisive={decisive_count} hedge={hedge_count} \
+         (of {} pages) — decisive must be 0 until the margin threshold is re-derived against \
+         this path's own scale",
+        pages.len()
     );
 }
 
 #[test]
-fn weak_band_ordering_and_scores_are_byte_identical_across_the_wording_change() {
+fn format_search_results_preserves_input_order_and_scores() {
     // CONSTRAINT: the label/banner rewrite must never touch ranking order or
-    // the rendered score values. Render a fixed, known-order slice and assert
-    // the exact rank/score sequence — this is the "before vs after" proof
-    // required by the spec, made concrete as an invariant on the current
-    // renderer rather than a diff against deleted code.
+    // the rendered score values. Render a fixed slice and assert the exact
+    // rank/score sequence — this is the "before vs after" proof required by
+    // the spec, made concrete as an invariant on the current renderer rather
+    // than a diff against deleted code.
     //
-    // Review finding [low]: this is a formatter smoke test only — it renders
-    // an already-sorted slice through a formatter that never reorders its
-    // input, so it cannot by itself catch a ranking regression introduced
-    // upstream. The actual ordering guarantee for this work item comes from
-    // diff scope: the WP-B changes touch only src/format/mod.rs and its
-    // tests, never src/search/rerank.rs, src/search/mod.rs, or the ranking
-    // code in src/mcp/tools.rs (owned by WP-A) — verifiable with `git diff
-    // --stat` against the pre-WP-B commit. This test's job is narrower: catch
-    // an accidental reorder introduced inside the formatter itself.
+    // Review finding [low]: the previous version of this test (`..._byte_
+    // identical_across_the_wording_change`) fed a MONOTONE descending slice
+    // (0.900, 0.700, 0.500) — input order and score order were identical, so
+    // even a formatter that silently re-sorted by score would still pass.
+    // Rerank pages are non-monotone in practice (live receipt: F6 scored
+    // 0.558, 0.660, 0.618, 0.510 in that rank order — rank 2 and 3 outscore
+    // rank 1). Feed a non-monotone slice so a hypothetical re-sort-by-score
+    // inside the formatter is actually caught (verified live: reverting to
+    // `.sort_by(|a, b| b.score.total_cmp(&a.score))` before rendering flips
+    // this assertion).
+    //
+    // Ownership note: this test's job is narrower than the name might
+    // suggest — it only guards against an accidental reorder introduced
+    // INSIDE the formatter. `format_search_results` never sorts its input
+    // (verified: no `.sort` call in `src/format/mod.rs`'s render path), so
+    // upstream ranking correctness (rerank order, W3-K's territory) is not
+    // this test's responsibility — that lives in `src/search/rerank.rs` and
+    // `src/mcp/tools.rs`'s own tests.
     let results = vec![
-        fixture_chunk("a", 0.900),
-        fixture_chunk("b", 0.700),
-        fixture_chunk("c", 0.500),
+        fixture_chunk("a", 0.558),
+        fixture_chunk("b", 0.660),
+        fixture_chunk("c", 0.618),
+        fixture_chunk("d", 0.510),
     ];
     let xml = format::format_search_results(&results, "fixture query", "fixture-project", 1, 1);
 
@@ -988,11 +1189,12 @@ fn weak_band_ordering_and_scores_are_byte_identical_across_the_wording_change() 
     assert_eq!(
         rank_score_pairs,
         vec![
-            (1, "0.900".to_string()),
-            (2, "0.700".to_string()),
-            (3, "0.500".to_string()),
+            (1, "0.558".to_string()),
+            (2, "0.660".to_string()),
+            (3, "0.618".to_string()),
+            (4, "0.510".to_string()),
         ],
-        "rank/score sequence must stay exactly input order: {xml}"
+        "rank/score sequence must stay exactly input order, even when it is not score-descending: {xml}"
     );
 }
 
