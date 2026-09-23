@@ -699,6 +699,53 @@ pub fn handle(
     Ok(())
 }
 
+/// `csr-engine status --stale` — a DB-free fast path that ONLY reads the run
+/// registry (`~/.claude-self-reflect/run/*.json`) and does a `kill(0)`
+/// liveness check per pid: milliseconds, no SQLite open, no DB gather at
+/// all. Prints one line per stale process, `pid <n> (<role>, started <ts>,
+/// parent <p>)`; nothing when there are none.
+///
+/// Exists because the full `status` gather can take 8-31s on a large, busy
+/// DB (measured on a 563k-chunk corpus under concurrent load) — installers
+/// call `status` right after writing a fresh binary, when codesign
+/// verification and a cold page cache make the first exec of that binary
+/// even slower, so a short fixed timeout around the full command frequently
+/// fires and the installer silently drops the stale-process report spec 2e
+/// asks for (gap-G2 review finding 2). Plain per-line text rather than JSON
+/// so `install.sh` (POSIX `sh`, no `jq`) can consume it without a parser,
+/// and so it can never be truncated the way `grep -A3` on pretty JSON was
+/// (gap-G2 review finding 3).
+pub fn handle_stale() -> Result<()> {
+    for line in format_stale_processes(&gather_stale_processes()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Pure formatting for [`handle_stale`]: one `pid <n> (<role>, started <ts>,
+/// parent <p>)` line per entry, `parent` omitted when unknown. Extracted so
+/// the exact text both installers grep/print (`installer/postinstall.js`,
+/// `scripts/install.sh`) is directly unit-testable without depending on
+/// `~/.claude-self-reflect/run` (this process's real, unoverridable
+/// `HOME`) — see `format_stale_processes_matches_the_pid_role_started_parent_contract`.
+fn format_stale_processes(stale: &[crate::binary_identity::StaleProcess]) -> Vec<String> {
+    stale
+        .iter()
+        .map(|p| {
+            format!(
+                "pid {} ({}, started {}{})",
+                p.pid,
+                p.role,
+                p.started_at,
+                match &p.parent {
+                    Some(parent) => format!(", parent {parent}"),
+                    None => String::new(),
+                }
+            )
+        })
+        .collect()
+}
+
 /// Public wrapper for `gather_status` — used by the telemetry module to embed
 /// a fresh status snapshot in its report without re-implementing the gather logic.
 pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
@@ -1899,6 +1946,47 @@ fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- gap-G2 review findings 2/3: `status --stale`'s output format is
+    // the contract both installers depend on (`pid <n> (<role>, started
+    // <ts>, parent <p>)`, one line per entry, no truncation). ---
+
+    #[test]
+    fn format_stale_processes_matches_the_pid_role_started_parent_contract() {
+        let stale = vec![
+            crate::binary_identity::StaleProcess {
+                pid: 1234,
+                role: "mcp_stdio".to_string(),
+                started_at: "2026-09-22T10:06:00Z".to_string(),
+                parent: Some("/Applications/Claude.app".to_string()),
+            },
+            crate::binary_identity::StaleProcess {
+                pid: 23450,
+                role: "daemon".to_string(),
+                started_at: "2026-09-22T09:00:00Z".to_string(),
+                parent: None,
+            },
+        ];
+        let lines = format_stale_processes(&stale);
+        assert_eq!(
+            lines,
+            vec![
+                "pid 1234 (mcp_stdio, started 2026-09-22T10:06:00Z, parent /Applications/Claude.app)"
+                    .to_string(),
+                "pid 23450 (daemon, started 2026-09-22T09:00:00Z)".to_string(),
+            ],
+            "every entry (not just the first, and not just its first 3 \
+             fields) must appear on its own complete line — a `grep -A3` \
+             over pretty JSON on a 2-entry list used to print only the \
+             array opener plus 3 lines of the FIRST entry (gap-G2 review \
+             finding 3)"
+        );
+    }
+
+    #[test]
+    fn format_stale_processes_is_empty_for_no_stale_processes() {
+        assert!(format_stale_processes(&[]).is_empty());
+    }
 
     #[test]
     fn test_compact_includes_narratives() {

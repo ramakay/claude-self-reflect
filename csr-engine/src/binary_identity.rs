@@ -123,6 +123,35 @@ pub fn current_exe_identity() -> Option<FileIdentity> {
     FileIdentity::capture(&path)
 }
 
+/// Resolve `std::env::current_exe()` and capture its identity in the SAME
+/// call, for a caller that needs to re-stat this exact path again later
+/// (the daemon's replacement poll, the MCP server's [`ReplacementWatch`]).
+///
+/// On Linux, `current_exe()` reads `/proc/self/exe`. If an atomic rename of
+/// this process's own binary lands during `Engine::new()`'s multi-second
+/// startup work (storage open, HNSW load/rebuild, embeddings warm), a
+/// *second* `current_exe()` call made after that work finishes can return
+/// `<path> (deleted)` instead of the real path — the kernel keeps resolving
+/// the dangling fd, but appends that suffix once the dentry is gone.
+/// [`FileIdentity::capture`] on that string then always returns `None`
+/// (`fs::metadata` on a path containing `(deleted)` never matches a real
+/// file), so anything computed from it — [`exe_replaced`],
+/// [`poll_replacement`] — fails closed forever: the daemon never exits 75,
+/// the MCP notice never appears. macOS is unaffected (`current_exe()` uses
+/// `_NSGetExecutablePath`, which returns the invoked path independent of
+/// the dentry) — this is a Linux-only startup-window bug (gap-G2 review
+/// finding 4).
+///
+/// Callers must call this ONCE, as early in process startup as possible
+/// (`main()`, before `Engine::new()` runs — same rule as
+/// [`current_exe_identity`]'s doc), and THREAD the returned `(path,
+/// identity)` pair through instead of re-deriving either half later.
+pub fn current_exe_path_and_identity() -> Option<(PathBuf, FileIdentity)> {
+    let path = std::env::current_exe().ok()?;
+    let identity = FileIdentity::capture(&path)?;
+    Some((path, identity))
+}
+
 fn is_valid_executable(path: &Path) -> bool {
     let Ok(md) = std::fs::metadata(path) else {
         return false;
@@ -235,18 +264,25 @@ pub struct ReplacementWatch {
 }
 
 impl ReplacementWatch {
-    /// `start` should be captured as early as possible in process startup
-    /// (see [`current_exe_identity`]'s doc for why: `Engine::new()` alone
-    /// can take several seconds — codesign verification on first launch of
-    /// a freshly installed binary, `HnswIo::load_hnsw` on a large corpus —
-    /// and capturing identity only after that work finishes widens the
-    /// window in which a replacement landing during startup goes
-    /// permanently invisible to this process, because it would capture the
-    /// NEW file's identity as its own "start" baseline).
-    pub fn new(start: Option<FileIdentity>) -> Self {
+    /// `exe_path`/`start` should both come from the SAME
+    /// [`current_exe_path_and_identity`] call, made as early as possible in
+    /// process startup (see that function's doc, and
+    /// [`current_exe_identity`]'s: `Engine::new()` alone can take several
+    /// seconds — codesign verification on first launch of a freshly
+    /// installed binary, `HnswIo::load_hnsw` on a large corpus — and
+    /// capturing identity only after that work finishes widens the window
+    /// in which a replacement landing during startup goes permanently
+    /// invisible to this process).
+    ///
+    /// Deliberately does NOT call `std::env::current_exe()` itself: a
+    /// second call made here, after construction (which on the MCP path
+    /// happens after `Engine::new()`), can race the SAME startup-window
+    /// replacement and return a `(deleted)` path on Linux — see
+    /// `current_exe_path_and_identity`'s doc (gap-G2 review finding 4).
+    pub fn new(exe_path: Option<PathBuf>, start: Option<FileIdentity>) -> Self {
         Self {
             start,
-            exe_path: std::env::current_exe().ok(),
+            exe_path,
             last_checked_secs: AtomicI64::new(i64::MIN),
             replaced: AtomicBool::new(false),
             replaced_mtime: Mutex::new(None),
@@ -627,9 +663,15 @@ mod tests {
         );
     }
 
-    /// The daemon-loop seam: proves the async wait resolves (and therefore
-    /// the daemon maps to `DAEMON_REPLACED_EXIT_CODE`) once a replacement
-    /// is confirmed, using the exact function `Daemon::run` calls.
+    /// Proves the async wait itself resolves once a replacement is
+    /// confirmed, using the exact function `Daemon::run` spawns
+    /// (`wait_for_binary_replacement`). It does NOT exercise the mapping
+    /// from "resolved" to the exit code `Daemon::run` returns — that
+    /// mapping lives in `daemon::shutdown_reason` and is covered directly
+    /// by `daemon::tests::shutdown_reason_returns_75_when_replaced_resolves_first`
+    /// (gap-G2 review finding 1: this test used to also assert
+    /// `DAEMON_REPLACED_EXIT_CODE == 75`, which is a tautology about the
+    /// constant's own value, not a test of anything `Daemon::run` does).
     #[tokio::test]
     async fn wait_for_binary_replacement_resolves_after_confirmation() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -656,9 +698,6 @@ mod tests {
             outcome.is_ok(),
             "must confirm the replacement well within the timeout"
         );
-        // This is exactly what `Daemon::run` does once the wait above resolves.
-        let exit_code = DAEMON_REPLACED_EXIT_CODE;
-        assert_eq!(exit_code, 75);
     }
 
     #[tokio::test]

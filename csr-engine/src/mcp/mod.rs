@@ -250,10 +250,13 @@ const BINARY_REPLACEMENT_CHECK_INTERVAL: std::time::Duration = std::time::Durati
 
 #[tool_router]
 impl CsrServer {
-    /// `startup_identity` should be captured as early in process startup as
-    /// possible (main.rs does this before `Engine::new()` runs) — see
-    /// `binary_identity::ReplacementWatch::new`'s doc for why capturing it
-    /// here, after construction, would be too late.
+    /// `startup_identity`/`startup_exe_path` should both come from the SAME
+    /// `binary_identity::current_exe_path_and_identity()` call, captured as
+    /// early in process startup as possible (main.rs does this before
+    /// `Engine::new()` runs) — see `binary_identity::ReplacementWatch::new`'s
+    /// doc for why capturing either here, after construction, or via a
+    /// fresh `current_exe()` call, would be too late (gap-G2 review
+    /// finding 4).
     pub fn new(
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
@@ -261,6 +264,7 @@ impl CsrServer {
         projects_dir: PathBuf,
         index_dir: PathBuf,
         startup_identity: Option<crate::binary_identity::FileIdentity>,
+        startup_exe_path: Option<PathBuf>,
     ) -> Self {
         // Derive db_path from index_dir (sibling: index_dir/../csr-engine.db)
         let db_path = index_dir
@@ -278,6 +282,7 @@ impl CsrServer {
             db_path,
             task_manager: TaskManager::new(),
             binary_watch: Arc::new(crate::binary_identity::ReplacementWatch::new(
+                startup_exe_path,
                 startup_identity,
             )),
         }

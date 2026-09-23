@@ -817,16 +817,21 @@ impl Engine {
     /// (claim failed, or non-unix) falls back to the unmodified stdio
     /// transport — the pre-existing behaviour.
     ///
-    /// `startup_identity` is this process's own exe identity, captured by
-    /// `main()` before `Engine::new()` ran (storage open, HNSW load/rebuild,
-    /// embeddings warm — seconds on a large corpus). Capturing it any later,
-    /// here, would widen the window in which a replacement landing during
-    /// this process's own startup goes permanently invisible to it (see
-    /// `binary_identity::ReplacementWatch::new`'s doc).
+    /// `startup_identity`/`startup_exe_path` are this process's own exe
+    /// identity and path, both captured together by `main()` before
+    /// `Engine::new()` ran (storage open, HNSW load/rebuild, embeddings
+    /// warm — seconds on a large corpus). Capturing either any later, here
+    /// (or re-deriving the path via a fresh `current_exe()` call), would
+    /// widen the window in which a replacement landing during this
+    /// process's own startup goes permanently invisible to it — on Linux, a
+    /// `current_exe()` call made after that window can return a `(deleted)`
+    /// path (see `binary_identity::current_exe_path_and_identity`'s doc,
+    /// gap-G2 review finding 4).
     pub async fn serve_mcp(
         self,
         stdout: Option<crate::hooks::ClaimedStdout>,
         startup_identity: Option<crate::binary_identity::FileIdentity>,
+        startup_exe_path: Option<std::path::PathBuf>,
     ) -> Result<()> {
         // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
         let enrichment_handles = crate::daemon::spawn_enrichment_loops(
@@ -843,6 +848,7 @@ impl Engine {
             self.projects_dir,
             self.index_dir,
             startup_identity,
+            startup_exe_path,
         );
         // Record this process in the run registry so `status` can tell any
         // session when a newer binary was installed underneath its live
