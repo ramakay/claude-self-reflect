@@ -1522,4 +1522,106 @@ mod tests {
              resurrect the tombstones engine B just compacted away"
         );
     }
+
+    // WP-D medium (second review): the epoch guard above only protects the
+    // FIRST post-compaction flush. `dump_to_disk` adopts the newer on-disk
+    // epoch into `self.epoch` unconditionally on a stale dump, so by the
+    // very next flush `self.epoch == on_disk_epoch` again and
+    // `stale_generation` is false — even though this engine's in-memory
+    // graph/id-maps were never reloaded and still hold the pre-compaction
+    // (tombstoned) generation. A second genuine insert-and-flush on the
+    // same stale engine therefore republishes that old graph over the
+    // compacted one: the same ping-pong the first fix was meant to close,
+    // one flush later. Must fail on the code that only guards a single
+    // flush (revert to `self.epoch = new_epoch;` unconditional).
+    #[tokio::test]
+    async fn stale_engine_second_genuine_flush_does_not_republish_orphans_either() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+        }
+
+        // First construction: writes a fresh, compact 40-chunk cache (epoch 1).
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+
+        // Delete 30 of 40 chunks — negative drift, material orphans.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_chunk(&format!("chunk-{i}")).unwrap();
+            }
+        }
+
+        // Engine A: a long-lived foreground process that loads BEFORE
+        // compaction, at epoch 1.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        assert!(crate::search::needs_compaction(&index_dir));
+
+        // Engine B: the daemon's compaction loop — rebuilds from SQLite (10
+        // live chunks) and publishes generation epoch 2.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        let (chunks_b, _) = eng_b.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks_b, 10);
+        assert!(!crate::search::needs_compaction(&index_dir));
+
+        // Flush 1: engine A's first genuine post-compaction insert. This is
+        // the scenario the previous test already covers, and must still
+        // defer to engine B's generation.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            insert_test_chunk(&storage, "chunk-new-1");
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_chunk("chunk-new-1".into(), vec![0.1_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // Flush 2: the SAME long-lived engine A does a second genuine
+        // insert-and-flush without ever reloading. If the epoch guard only
+        // lasted one flush, `self.epoch` now equals the on-disk epoch again,
+        // `stale_generation` reads false, and this flush republishes engine
+        // A's original 40-entry (30-tombstoned) graph over the compacted
+        // generation.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            insert_test_chunk(&storage, "chunk-new-2");
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_chunk("chunk-new-2".into(), vec![0.1_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // The next fresh load must see engine B's compact generation plus
+        // BOTH of engine A's genuine new chunks (recovered via SQLite
+        // backfill), with no resurrected tombstones and no re-triggered
+        // compaction marker — on the SECOND stale flush, not just the
+        // first.
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        assert_eq!(
+            eng_c.search.read().await.chunk_count(),
+            12,
+            "engine A's second stale-but-genuinely-dirty flush must not \
+             have republished the 30 orphans engine B already compacted \
+             away, and both genuine new chunks must still be present \
+             (backfilled from SQLite on the next load)"
+        );
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "no ping-pong on the SECOND stale flush: a stale engine must \
+             never publish from memory again once it has deferred once, \
+             not just on its first post-compaction flush"
+        );
+    }
 }

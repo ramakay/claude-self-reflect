@@ -970,7 +970,23 @@ impl SearchEngine {
         // Lock is released when lock_file is dropped
         self.chunk_dirty = false;
         self.reflection_dirty = false;
-        self.epoch = new_epoch;
+        // WP-D medium (second review): do NOT adopt `new_epoch` when this
+        // dump was stale. Adopting it (`self.epoch = on_disk_epoch`)
+        // used to make `self.epoch == on_disk_epoch` again, so the very
+        // NEXT flush would see `stale_generation == false` (the epochs
+        // matched) and publish this engine's still-unreloaded,
+        // pre-compaction graph/id-maps over the generation it just
+        // deferred to — the same ping-pong one flush later. Leaving
+        // `self.epoch` at its old (lower) value keeps `stale_generation`
+        // true for every future dump from this engine, so it never
+        // publishes from memory again until the process reloads a fresh
+        // manifest (restart, or a future `Engine::new`). SQLite remains
+        // the durable record; the next fresh load's additive backfill
+        // recovers this engine's genuine new rows regardless of how many
+        // times it deferred here.
+        if !stale_generation {
+            self.epoch = new_epoch;
+        }
         // The manifest we just published (`std::fs::rename` above already
         // succeeded — this line only runs on that success path, never on an
         // early `?` return) now describes this engine's in-memory maps for

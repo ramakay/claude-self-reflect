@@ -1100,6 +1100,35 @@ async fn compact_if_marked(
         Ok(permit) => permit,
         Err(_) => return false,
     };
+    // WP-D low: recheck shutdown at the acquire/handoff boundary, BEFORE
+    // ever touching `engine.rebuild_search_index()`. A bare `acquire_owned`
+    // followed directly by `select!` still starts the ~11-min
+    // `spawn_blocking` stream: `spawn_blocking` dispatches its closure onto
+    // the blocking thread pool as soon as the enclosing async fn is polled
+    // once (the very first thing `rebuild_search_index` does), which
+    // happens whether or not `select!` goes on to pick that branch. If the
+    // compaction loop was waiting behind another `heavy_work` holder and
+    // shutdown arrives while it waits, it gets the permit with shutdown
+    // already set — `select!` is unbiased and may poll the rebuild branch
+    // first regardless, so the expensive stream starts on a background
+    // thread and burns CPU for the rest of its run even though its result
+    // is discarded (this function returns before ever awaiting it, per the
+    // "detached thread" doc above). Checking shutdown here, before
+    // `rebuild_search_index()` is ever called, skips dispatching that
+    // doomed work entirely. Not a correctness bug — the marker and the
+    // on-disk generation are left exactly as untouched either way — so
+    // there is no new observable-behavior regression test for this hunk;
+    // it's caught by the existing `compact_if_marked_*` tests continuing to
+    // pass unchanged.
+    if shutdown.load(Ordering::SeqCst) {
+        tracing::info!(
+            "compaction rebuild abandoned before starting — shutdown requested \
+             while waiting for the heavy-work permit, needs_compaction marker \
+             left in place for the next daemon start"
+        );
+        drop(permit);
+        return true;
+    }
     tracing::info!("needs_compaction marker found — rebuilding HNSW index");
     tokio::select! {
         result = engine.rebuild_search_index() => {
