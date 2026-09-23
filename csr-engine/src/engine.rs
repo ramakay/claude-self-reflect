@@ -46,18 +46,50 @@ pub struct Engine {
     /// ones), but recovery costs a full re-insert of the corpus, which defeats
     /// the entire point of the import-only path.
     skip_index_persistence: bool,
+    /// True only when `Engine::new` took the cache-miss path (no on-disk
+    /// manifest, or one `load_from_disk` rejected outright — a corrupt file,
+    /// not negative drift) and built a fresh index from SQLite. That index
+    /// is compact by construction and already dumped+`clear_needs_compaction`ed
+    /// before this field is set — see [`Self::index_freshly_rebuilt`].
+    index_freshly_rebuilt: bool,
 }
 
 impl Engine {
     /// Create an engine from pre-built components (for testing).
+    ///
+    /// Derives `index_dir` as `projects_dir.join("index")`. That derivation
+    /// is only correct when the caller's real index directory actually lives
+    /// there — true for tests, but **not** for the daemon, whose real index
+    /// directory sits next to the database (`~/.claude-self-reflect/index`),
+    /// not under `projects_dir` (`~/.claude/projects`). A daemon-assembled
+    /// engine that persists the index (`flush_index`/`dump_to_disk`/
+    /// `rebuild_search_index`) must use [`Self::from_parts_with_index_dir`]
+    /// instead, or it silently writes the compacted HNSW cache into the
+    /// wrong directory and the real cache's `needs_compaction` marker is
+    /// never cleared.
     pub fn from_parts(
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
     ) -> Self {
-        // Derive index_dir from projects_dir for test constructor
         let index_dir = projects_dir.join("index");
+        Self::from_parts_with_index_dir(storage, embeddings, search, projects_dir, index_dir)
+    }
+
+    /// Create an engine from pre-built components with an explicit
+    /// `index_dir`, independent of `projects_dir`. Use this whenever the
+    /// caller already knows its real on-disk index directory (the daemon
+    /// does — see `Daemon::index_dir`) instead of relying on `from_parts`'s
+    /// `projects_dir.join("index")` derivation, which is wrong for any
+    /// caller whose database and projects tree live in different places.
+    pub fn from_parts_with_index_dir(
+        storage: Arc<Storage>,
+        embeddings: Arc<EmbeddingEngine>,
+        search: Arc<RwLock<SearchEngine>>,
+        projects_dir: PathBuf,
+        index_dir: PathBuf,
+    ) -> Self {
         Self {
             storage,
             embeddings,
@@ -65,6 +97,7 @@ impl Engine {
             projects_dir,
             index_dir,
             skip_index_persistence: false,
+            index_freshly_rebuilt: false,
         }
     }
 
@@ -88,9 +121,24 @@ impl Engine {
         let t_count = t0.elapsed();
 
         // Try loading from disk cache first
+        let mut index_freshly_rebuilt = false;
         let search = if let Some(cached) =
             SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count)
         {
+            // Track the additive-backfill delta and the loaded cache's
+            // on-disk age purely as a staleness diagnostic (logged below) —
+            // how far behind SQLite the on-disk HNSW cache was at load time,
+            // and how long it's been since anything last flushed it. Local
+            // to this branch; nothing downstream of `Engine::new` reads
+            // either value (there is no cache staleness to report on the
+            // rebuild path below — a fresh dump has zero drift and zero age
+            // by construction).
+            let mut backfill_added = 0usize;
+            let cache_age = std::fs::metadata(index_dir.join("manifest.json"))
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok());
+
             let t_total = t0.elapsed();
             let startup_line = format!(
                 "CSR startup: storage={:.0}ms embed={:.0}ms cache_load={:.0}ms total={:.0}ms ({} chunks, cached)",
@@ -133,6 +181,7 @@ impl Engine {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing reflections into HNSW cache");
                         }
+                        backfill_added += added;
                     }
                 }
             }
@@ -144,6 +193,16 @@ impl Engine {
             // full HNSW rebuild (~tens of seconds), while keeping peak transient
             // memory O(batch) rather than O(corpus).
             if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+                // The manifest count is written by whoever dumps, from the DB at
+                // dump time. A long-running process that loaded before a purge
+                // and dumps after it persists every purged vector under a count
+                // that matches the DB, so the count check above accepts it.
+                let db_id_set: std::collections::HashSet<&str> =
+                    db_chunk_ids.iter().map(|s| s.as_str()).collect();
+                let orphan_chunks = search.blank_orphan_chunks(&db_id_set);
+                if orphan_chunks > 0 {
+                    tracing::info!(orphan_chunks, "blanked orphan chunk entries in HNSW cache");
+                }
                 let missing: Vec<String> = db_chunk_ids
                     .into_iter()
                     .filter(|id| !search.has_chunk(id))
@@ -153,14 +212,64 @@ impl Engine {
                         if added > 0 {
                             tracing::info!(added, "backfilled missing chunks into HNSW cache");
                         }
+                        backfill_added += added;
                     }
                 }
             }
+            if backfill_added > 0 {
+                tracing::info!(
+                    backfill_added,
+                    cache_age_secs = cache_age.map(|d| d.as_secs()),
+                    "HNSW cache behind DB at startup — additive backfill applied"
+                );
+            }
+            // hnsw_rs cannot delete. A blanked slot still takes a neighbour
+            // position, so a cache that is materially tombstones eventually
+            // wants a full rebuild for compactness. `Engine::new` runs in
+            // foreground processes (MCP serve, hooks, CLI query commands) —
+            // never synchronously here: that used to be the ~minutes-long
+            // stall a fresh MCP handshake cannot afford under Claude Code's
+            // 30s CONNECT_TIMEOUT. `search_index`/`search_chunks_filtered`
+            // already overfetch past tombstoned slots, so this process keeps
+            // serving full-page results with the cache as-is; a
+            // `needs_compaction` marker tells the daemon's compaction loop
+            // (or the explicit `rebuild-index` command) to do the rebuild
+            // out-of-band.
+            //
+            // Materiality is the CUMULATIVE blank share of each id map
+            // (`chunk_tombstone_count`/`reflection_tombstone_count`, both
+            // O(1)) after this reconciliation, not the count of ids blanked
+            // during this one load. A per-load delta resets to 0 on every
+            // subsequent load/dump round trip (blanks persist through
+            // `dump_to_disk`), so a corpus that loses a handful of ids every
+            // few minutes would never cross the per-load threshold even as
+            // its cumulative tombstone share grows without bound.
+            let orphans_material = search.chunk_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+                > search.chunk_slot_count().max(1)
+                || search.reflection_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+                    > search.reflection_slot_count().max(1);
+            if orphans_material {
+                tracing::info!(
+                    "HNSW cache holds purged vectors — serving with tombstones, marked needs_compaction"
+                );
+                crate::search::mark_needs_compaction(&index_dir);
+            }
+            // Everything above (blank_orphan_*/backfill_missing_*) is pure
+            // DB-mirroring reconciliation, not new content this process
+            // should feel responsible for publishing — clear the dirty
+            // flags it set so this process's NEXT dump (a real
+            // `store_reflection` insert, an import) doesn't republish this
+            // possibly-stale reconciliation over a newer generation the
+            // daemon's compaction loop may swap in concurrently. See
+            // `clear_reconciliation_dirty`'s doc comment (WP-D medium #2).
+            search.clear_reconciliation_dirty();
             search
         } else {
             // Cache miss — rebuild from SQLite vectors, streaming in bounded
             // batches so peak transient memory is O(batch) instead of
             // O(corpus) (no `load_all_chunk_vectors()` + clone-into-index).
+            // The dump below writes a brand-new manifest, so there is no drift
+            // and no stale age to report.
             tracing::info!("building search index from stored vectors");
 
             let (mut search, chunk_total, reflection_total) =
@@ -176,6 +285,10 @@ impl Engine {
             if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
                 tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
             }
+            // A from-scratch rebuild is compact by construction (no
+            // tombstones), so any pending compaction request is satisfied.
+            crate::search::clear_needs_compaction(&index_dir);
+            index_freshly_rebuilt = true;
             let t_total = t0.elapsed();
 
             tracing::info!(
@@ -224,6 +337,7 @@ impl Engine {
             projects_dir: projects_dir.to_path_buf(),
             index_dir,
             skip_index_persistence: false,
+            index_freshly_rebuilt,
         })
     }
 
@@ -251,6 +365,7 @@ impl Engine {
             projects_dir: projects_dir.to_path_buf(),
             index_dir,
             skip_index_persistence: true,
+            index_freshly_rebuilt: false,
         })
     }
 
@@ -336,7 +451,12 @@ impl Engine {
             chunks,
             suppression,
             evidence,
+            entrypoint,
         } = parsed;
+        if let Some(ep) = entrypoint.as_deref() {
+            self.storage
+                .set_conversation_entrypoint(&conversation_id, ep)?;
+        }
         if chunks.is_empty() {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent
@@ -562,6 +682,19 @@ impl Engine {
         &self.index_dir
     }
 
+    /// True when this `Engine::new` call took the cache-miss path and built
+    /// a fresh, compact index from SQLite from scratch (first-ever run, or
+    /// `load_from_disk` rejecting a missing/corrupt manifest — interface 4,
+    /// out of WP-D's scope). That index is already dumped and has
+    /// `needs_compaction` cleared before construction returns, so callers
+    /// like the `rebuild-index` CLI command that would otherwise
+    /// unconditionally call [`Self::rebuild_search_index`] right after
+    /// constructing an `Engine` can skip a second, fully redundant ~11-min
+    /// rebuild of a corpus this size.
+    pub fn index_freshly_rebuilt(&self) -> bool {
+        self.index_freshly_rebuilt
+    }
+
     /// Flush the HNSW index to disk if it has been modified.
     /// Safe to call multiple times — skips if not dirty.
     pub async fn flush_index(&self) {
@@ -603,11 +736,44 @@ impl Engine {
     /// end so the persisted index is compact: search never has to over-fetch
     /// past tombstones, and the next process start loads from cache instead
     /// of rebuilding. Returns `(chunks, reflections)` indexed.
+    ///
+    /// The streaming rebuild itself is synchronous CPU/IO work that takes
+    /// minutes on the real corpus (hnsw insert is not async) — it runs on
+    /// `spawn_blocking`'s dedicated thread pool rather than directly inside
+    /// this `async fn`, so it never pins a tokio runtime worker for the
+    /// whole rebuild and starves every other task scheduled on that thread
+    /// (the daemon's compaction loop is the caller that matters here: it
+    /// shares a runtime with the file watcher and every other background
+    /// loop).
+    ///
+    /// `rebuild_search_index_streaming` reads its id lists once, at the
+    /// start of a pass that then runs for minutes — a live watcher/hook can
+    /// both import new rows AND delete rows (scrub, seam rewrites) in that
+    /// window; none of those other processes take the daemon's heavy-work
+    /// permit. Immediately after the stream completes, re-probe current DB
+    /// ids and reconcile `fresh` both directions against them, the same way
+    /// `Engine::new`'s cached-load path does: backfill anything the fresh
+    /// index is missing (rows that landed mid-rebuild — so the swapped-in
+    /// index never regresses recall for them), and blank anything `fresh`
+    /// holds that the DB no longer has (rows deleted mid-rebuild — WP-D low
+    /// #6: without this, a swapped-in "fresh" index could still hand back a
+    /// dead id until the next `Engine::new` reconciliation, contradicting
+    /// the "no dead id is ever returned" contract).
     pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
-        let (fresh, chunk_count, reflection_count) =
-            rebuild_search_index_streaming(&self.storage, RECONCILE_BATCH)?;
+        let storage = self.storage.clone();
+        let (mut fresh, chunk_count, reflection_count) = tokio::task::spawn_blocking(move || {
+            rebuild_search_index_streaming(&storage, RECONCILE_BATCH)
+        })
+        .await
+        .context("rebuild_search_index_streaming task panicked")??;
+
+        reconcile_fresh_against_db(&self.storage, &mut fresh);
+
         *self.search.write().await = fresh;
         self.flush_index_checked().await?;
+        // Compact by construction — clears any pending compaction request
+        // (`needs_compaction` marker) a foreground process may have left.
+        crate::search::clear_needs_compaction(&self.index_dir);
         Ok((chunk_count, reflection_count))
     }
 
@@ -639,12 +805,35 @@ impl Engine {
     }
 
     /// Start the MCP server on stdio with background enrichment loops.
-    pub async fn serve_mcp(self) -> Result<()> {
+    ///
+    /// `stdout` is fd 1 already claimed for the JSON-RPC transport by
+    /// `main.rs`, before this engine's own construction had a chance to run
+    /// `hnsw_rs` through its index rebuild path. `Some` on unix routes the
+    /// transport's write half through that claimed descriptor instead of
+    /// `rmcp::transport::io::stdio()`'s own fd 1, so anything the process
+    /// still writes to fd 1 directly (the enrichment loops and `--watch`
+    /// importer started below, both of which insert into the same HNSW index)
+    /// lands on stderr rather than corrupting the protocol stream. `None`
+    /// (claim failed, or non-unix) falls back to the unmodified stdio
+    /// transport — the pre-existing behaviour.
+    ///
+    /// `startup_identity` is this process's own exe identity, captured by
+    /// `main()` before `Engine::new()` ran (storage open, HNSW load/rebuild,
+    /// embeddings warm — seconds on a large corpus). Capturing it any later,
+    /// here, would widen the window in which a replacement landing during
+    /// this process's own startup goes permanently invisible to it (see
+    /// `binary_identity::ReplacementWatch::new`'s doc).
+    pub async fn serve_mcp(
+        self,
+        stdout: Option<crate::hooks::ClaimedStdout>,
+        startup_identity: Option<crate::binary_identity::FileIdentity>,
+    ) -> Result<()> {
         // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
         let enrichment_handles = crate::daemon::spawn_enrichment_loops(
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
+            self.projects_dir().to_path_buf(),
         );
 
         let server = CsrServer::new(
@@ -653,21 +842,48 @@ impl Engine {
             self.search,
             self.projects_dir,
             self.index_dir,
+            startup_identity,
         );
-        // Record which build is serving, so `status` can tell the user when a
-        // newer binary was installed underneath this connection.
-        crate::binary_stamp::record_serving_binary();
-        let service = server.serve(rmcp::transport::io::stdio()).await?;
+        // Record this process in the run registry so `status` can tell any
+        // session when a newer binary was installed underneath its live
+        // MCP connection (gap-G2: one record per process, not a single
+        // last-writer-wins stamp — see `binary_identity`).
+        let run_record_path = startup_identity
+            .zip(crate::binary_identity::default_run_dir())
+            .and_then(|(identity, run_dir)| {
+                crate::binary_identity::write_run_record(&run_dir, "mcp_stdio", identity)
+            });
+        #[cfg(unix)]
+        let service = match stdout {
+            Some(claimed) => {
+                server
+                    .serve((tokio::io::stdin(), claimed.into_async_writer()))
+                    .await?
+            }
+            None => server.serve(rmcp::transport::io::stdio()).await?,
+        };
+        #[cfg(not(unix))]
+        let service = {
+            let _ = stdout;
+            server.serve(rmcp::transport::io::stdio()).await?
+        };
         service.waiting().await?;
 
         // Clean up enrichment loops on MCP server exit
         for handle in enrichment_handles {
             handle.abort();
         }
+        if let Some(path) = run_record_path {
+            crate::binary_identity::remove_run_record(&path);
+        }
 
         Ok(())
     }
 }
+
+/// A loaded cache is rebuilt when orphan slots in either index exceed 1/N of
+/// its live rows (5%). Below that the blanked slots cost less than a rebuild.
+const ORPHAN_REBUILD_DIVISOR: usize = 20;
 
 /// Batch size for reconciling the HNSW cache against SQLite: both the
 /// additive-drift backfill (missing ids only) and the cache-miss full
@@ -727,6 +943,73 @@ fn backfill_missing_reflections(
     missing_ids: &[String],
 ) -> Result<usize> {
     backfill_missing_reflections_batched(storage, search, missing_ids, RECONCILE_BATCH)
+}
+
+/// Reconcile `fresh` against the CURRENT DB state, immediately after a
+/// streaming rebuild (`rebuild_search_index_streaming`) completes.
+///
+/// That streaming pass reads its id lists once, at the start of a pass that
+/// then runs for minutes on the real corpus — a live watcher/hook can both
+/// import new rows AND delete rows (scrub, seam rewrites) in that window;
+/// none of those other processes take the daemon's heavy-work permit. This
+/// blanks anything `fresh` still holds that the DB no longer has (rows
+/// deleted mid-rebuild — WP-D low #6: the swapped-in index must never hand
+/// back a dead id) and backfills anything the DB has that `fresh` is
+/// missing (rows that landed mid-rebuild, so the swapped-in index never
+/// regresses recall for them).
+///
+/// Named and called by `Engine::rebuild_search_index` specifically so a
+/// test can call this exact function instead of reimplementing its logic
+/// inline — a test that copies this reconciliation rather than calling it
+/// keeps passing even after the real blanking/backfill calls in
+/// `rebuild_search_index` are deleted (WP-D low #7).
+fn reconcile_fresh_against_db(storage: &Storage, fresh: &mut SearchEngine) {
+    if let Ok(db_ids) = storage.load_all_reflection_ids() {
+        let db_id_set: std::collections::HashSet<&str> =
+            db_ids.iter().map(|s| s.as_str()).collect();
+        let blanked = fresh.blank_orphan_reflections(&db_id_set);
+        if blanked > 0 {
+            tracing::info!(
+                blanked,
+                "blanked reflections deleted while the rebuild was streaming"
+            );
+        }
+        let missing: Vec<String> = db_id_set
+            .iter()
+            .filter(|id| !fresh.has_reflection(id))
+            .map(|s| s.to_string())
+            .collect();
+        if !missing.is_empty() {
+            if let Ok(added) = backfill_missing_reflections(storage, fresh, &missing) {
+                if added > 0 {
+                    tracing::info!(added, "backfilled reflections that landed mid-rebuild");
+                }
+            }
+        }
+    }
+    if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+        let db_id_set: std::collections::HashSet<&str> =
+            db_chunk_ids.iter().map(|s| s.as_str()).collect();
+        let blanked = fresh.blank_orphan_chunks(&db_id_set);
+        if blanked > 0 {
+            tracing::info!(
+                blanked,
+                "blanked chunks deleted while the rebuild was streaming"
+            );
+        }
+        let missing: Vec<String> = db_id_set
+            .iter()
+            .filter(|id| !fresh.has_chunk(id))
+            .map(|s| s.to_string())
+            .collect();
+        if !missing.is_empty() {
+            if let Ok(added) = backfill_missing_chunks(storage, fresh, &missing) {
+                if added > 0 {
+                    tracing::info!(added, "backfilled chunks that landed mid-rebuild");
+                }
+            }
+        }
+    }
 }
 
 /// Rebuild the HNSW index from SQLite, streaming vectors in bounded batches
@@ -881,5 +1164,490 @@ mod tests {
         for i in 0..3 {
             assert!(search.has_reflection(&format!("refl-{i}")));
         }
+    }
+
+    // --- WP-D low #6: `rebuild_search_index`'s post-stream reconciliation
+    // must blank ids the DB no longer has, not just backfill ids it gained,
+    // so the swapped-in index never hands back a dead id. This exercises
+    // the exact reconciliation call embedded in `rebuild_search_index`
+    // (`db_id_set` from a fresh `load_all_chunk_ids` probe, then
+    // `blank_orphan_chunks`) against a `fresh` engine produced by the same
+    // `rebuild_search_index_streaming` it uses, with the deletion happening
+    // in the window between the two — the scenario a live watcher/hook
+    // (no heavy-work permit) creates during the real multi-minute rebuild. ---
+    #[test]
+    fn rebuild_search_index_post_stream_reconciliation_blanks_ids_deleted_during_the_window() {
+        let storage = Storage::open_memory().unwrap();
+        for i in 0..5 {
+            insert_test_chunk(&storage, &format!("chunk-{i}"));
+        }
+
+        // Snapshot, exactly as `rebuild_search_index`'s `spawn_blocking` does.
+        let (mut fresh, chunk_total, _reflection_total) =
+            rebuild_search_index_streaming(&storage, RECONCILE_BATCH).unwrap();
+        assert_eq!(chunk_total, 5);
+        for i in 0..5 {
+            assert!(fresh.has_chunk(&format!("chunk-{i}")));
+        }
+
+        // Simulate a watcher/hook deleting rows in the window while the
+        // (in reality minutes-long) stream above was still running.
+        storage.delete_chunk("chunk-1").unwrap();
+        storage.delete_chunk("chunk-3").unwrap();
+
+        // Call the SAME function `rebuild_search_index` calls — not a
+        // reimplementation of its logic — so removing the blanking calls
+        // inside `reconcile_fresh_against_db` fails this test (WP-D low #7).
+        reconcile_fresh_against_db(&storage, &mut fresh);
+
+        assert!(!fresh.has_chunk("chunk-1"));
+        assert!(!fresh.has_chunk("chunk-3"));
+        assert_eq!(
+            fresh.chunk_count(),
+            3,
+            "the swapped-in index must never hand back a dead id — no dead \
+             id is ever returned"
+        );
+        for i in [0, 2, 4] {
+            assert!(fresh.has_chunk(&format!("chunk-{i}")));
+        }
+    }
+
+    // --- WP-D: foreground `Engine::new` must not inline-rebuild on material
+    // orphans; it defers to the `needs_compaction` marker instead. ---
+
+    #[tokio::test]
+    async fn orphans_material_in_foreground_marks_compaction_instead_of_rebuilding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        // Seed 40 chunks directly (bypassing Engine, matching the pattern
+        // other tests here use) so the first `Engine::new` has a real corpus
+        // to build a cache from.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+        }
+
+        // First construction: no cache exists yet, so this is the
+        // out-of-scope "missing manifest still rebuilds" path (interface 4).
+        // It writes a fresh, compact 40-point cache to disk.
+        {
+            let eng = Engine::new(&db_path, &projects_dir).unwrap();
+            assert_eq!(eng.search.read().await.chunk_count(), 40);
+        }
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "a fresh full rebuild must not leave a stale compaction marker"
+        );
+
+        // Delete 30 of 40 rows (75% — comfortably over ORPHAN_REBUILD_DIVISOR's
+        // 1/20 materiality threshold) to simulate the dip: DB count now below
+        // what the cache/manifest describes.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_chunk(&format!("chunk-{i}")).unwrap();
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let eng2 = Engine::new(&db_path, &projects_dir).unwrap();
+        let elapsed = t0.elapsed();
+
+        // The whole point: this must be a cache load + reconciliation, not a
+        // from-scratch rebuild of the remaining 10 points. On a corpus this
+        // tiny both paths are fast in wall-clock terms, so the receipt that
+        // actually matters is behavioural: the marker is set and the engine
+        // is still serving (never panicked/blocked on a rebuild loop).
+        assert!(
+            crate::search::needs_compaction(&index_dir),
+            "material orphans in a foreground Engine::new must set the \
+             needs_compaction marker instead of rebuilding inline"
+        );
+        assert_eq!(
+            eng2.search.read().await.chunk_count(),
+            10,
+            "the 30 deleted ids must be reconciled (blanked) even without an \
+             inline full rebuild"
+        );
+        tracing::debug!(?elapsed, "orphan-reconciliation Engine::new completed");
+
+        // The explicit maintenance path (also what the daemon's compaction
+        // loop calls) consumes and clears the marker, and produces a compact
+        // index with no tombstoned slots left over.
+        let (chunks, _reflections) = eng2.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks, 10);
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "rebuild_search_index must clear the needs_compaction marker it satisfies"
+        );
+    }
+
+    // --- WP-D medium #2: a pre-compaction engine's later flush must not
+    // republish the orphans a concurrent daemon compaction already removed. ---
+
+    #[tokio::test]
+    async fn pre_compaction_engine_flush_does_not_republish_orphans_after_daemon_compacts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+        }
+
+        // First construction: no cache exists yet — writes a fresh, compact
+        // 40-point cache to disk (out-of-scope "missing manifest" path).
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+
+        // Delete 30 of 40 rows — negative drift, material orphans.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_chunk(&format!("chunk-{i}")).unwrap();
+            }
+        }
+
+        // Engine A: a long-lived foreground process (the MCP server is the
+        // real example) that loads BEFORE compaction. Its own startup
+        // reconciliation blanks the 30 orphans and marks needs_compaction —
+        // and, per the fix under test, must NOT leave chunk_dirty set.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        assert!(crate::search::needs_compaction(&index_dir));
+        assert!(
+            !eng_a.search.read().await.is_chunk_dirty(),
+            "pure startup reconciliation must not leave the chunk side dirty \
+             (WP-D medium #2 fix)"
+        );
+
+        // Engine B: the daemon's compaction loop, consuming the marker —
+        // rebuilds from SQLite (10 live chunks) and dumps a fresh, compact
+        // generation, clearing needs_compaction.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        let (chunks_b, _) = eng_b.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks_b, 10);
+        assert!(!crate::search::needs_compaction(&index_dir));
+
+        // Engine A now does the real-world thing that triggers a dump on a
+        // long-lived process: a new reflection lands and gets flushed (the
+        // `store_reflection`/stop-hook path). This must dump ONLY the
+        // reflection side — the chunk side was never touched by genuine new
+        // content, so it must carry forward from whatever is on disk NOW
+        // (engine B's compact 10-point generation), not republish engine A's
+        // stale pre-compaction 40-slot/30-tombstone snapshot.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            storage
+                .insert_reflection("refl-a", "content", &[], &[0.2_f32; 384])
+                .unwrap();
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_reflection("refl-a".into(), vec![0.2_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // The next fresh load (a new process, or a restarted daemon) must
+        // see the compact 10-chunk generation with no re-triggered
+        // materiality — not engine A's republished orphans.
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        assert_eq!(
+            eng_c.search.read().await.chunk_count(),
+            10,
+            "engine A's flush must not have republished the 30 orphans engine \
+             B already compacted away"
+        );
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "the next load must not be material — no ping-pong back into \
+             another daemon rebuild"
+        );
+        assert!(
+            eng_c.search.read().await.has_reflection("refl-a"),
+            "engine A's genuine new reflection must still have been persisted"
+        );
+    }
+
+    // --- Opus review follow-up on WP-D medium #2: `clear_reconciliation_dirty`
+    // only protects a side the engine never genuinely touched. A side the
+    // engine DID genuinely mutate (a real `insert_chunk`/`insert_reflection`)
+    // is dirty on its own merits and was still published from memory even
+    // when a concurrent compaction had already replaced that exact side with
+    // a newer, compact generation — reviving the tombstones the compaction
+    // just removed. The compaction-epoch guard in `dump_to_disk` closes this:
+    // it refuses to publish EITHER side from memory once the on-disk epoch is
+    // newer than what this engine loaded, dirty or not. ---
+
+    #[tokio::test]
+    async fn stale_engine_genuine_reflection_insert_does_not_republish_orphans_a_daemon_already_compacted(
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                storage
+                    .insert_reflection(&format!("refl-{i}"), "content", &[], &[0.1_f32; 384])
+                    .unwrap();
+            }
+        }
+
+        // First construction: writes a fresh, compact 40-reflection cache
+        // (epoch 1 — the first generation this on-disk cache ever gets).
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+
+        // Delete 30 of 40 reflections — negative drift, material orphans.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_reflection(&format!("refl-{i}")).unwrap();
+            }
+        }
+
+        // Engine A: a long-lived foreground process (an MCP server is the
+        // real example) that loads BEFORE compaction, at epoch 1.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        assert!(crate::search::needs_compaction(&index_dir));
+
+        // Engine B: the daemon's compaction loop — rebuilds from SQLite (10
+        // live reflections) and publishes generation epoch 2.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        let (_chunks_b, reflections_b) = eng_b.rebuild_search_index().await.unwrap();
+        assert_eq!(reflections_b, 10);
+        assert!(!crate::search::needs_compaction(&index_dir));
+
+        // Engine A now does exactly what `store_reflection` does in
+        // production: a genuine NEW reflection lands on the exact side a
+        // concurrent compaction just replaced. Its `reflection_dirty` flag
+        // is legitimately true — this is not reconciliation noise, it is
+        // real new content — so the pre-epoch fix still published engine
+        // A's stale, 41-slot/30-tombstone in-memory reflection graph over
+        // engine B's newer, compact 10-slot generation.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            storage
+                .insert_reflection("refl-a", "content", &[], &[0.2_f32; 384])
+                .unwrap();
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_reflection("refl-a".into(), vec![0.2_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // The next fresh load must see engine B's compact generation plus
+        // engine A's genuine new reflection (recovered via SQLite
+        // backfill), with no resurrected tombstones and no re-triggered
+        // compaction marker.
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        assert_eq!(
+            eng_c.search.read().await.reflection_count(),
+            11,
+            "engine A's stale-but-genuinely-dirty flush must not have \
+             republished the 30 orphans engine B already compacted away, \
+             and the genuine new reflection must still be present \
+             (backfilled from SQLite on the next load)"
+        );
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "no ping-pong: engine A's stale-but-dirty flush must not \
+             resurrect the tombstones engine B just compacted away"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_engine_genuine_chunk_insert_does_not_republish_orphans_a_daemon_already_compacted(
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+        }
+
+        // First construction: writes a fresh, compact 40-chunk cache
+        // (epoch 1).
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+
+        // Delete 30 of 40 chunks — negative drift, material orphans.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_chunk(&format!("chunk-{i}")).unwrap();
+            }
+        }
+
+        // Engine A: a long-lived foreground process that loads BEFORE
+        // compaction, at epoch 1.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        assert!(crate::search::needs_compaction(&index_dir));
+
+        // Engine B: the daemon's compaction loop — rebuilds from SQLite (10
+        // live chunks) and publishes generation epoch 2.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        let (chunks_b, _) = eng_b.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks_b, 10);
+        assert!(!crate::search::needs_compaction(&index_dir));
+
+        // Engine A now does exactly what a `--import`/`--enrich`/`setup`
+        // run that straddles a compaction does: a genuine NEW chunk lands
+        // on the exact side a concurrent compaction just replaced.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            insert_test_chunk(&storage, "chunk-new");
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_chunk("chunk-new".into(), vec![0.1_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // The next fresh load must see engine B's compact generation plus
+        // engine A's genuine new chunk (recovered via SQLite backfill),
+        // with no resurrected tombstones and no re-triggered compaction
+        // marker.
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        assert_eq!(
+            eng_c.search.read().await.chunk_count(),
+            11,
+            "engine A's stale-but-genuinely-dirty flush must not have \
+             republished the 30 orphans engine B already compacted away, \
+             and the genuine new chunk must still be present (backfilled \
+             from SQLite on the next load)"
+        );
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "no ping-pong: engine A's stale-but-dirty chunk flush must not \
+             resurrect the tombstones engine B just compacted away"
+        );
+    }
+
+    // WP-D medium (second review): the epoch guard above only protects the
+    // FIRST post-compaction flush. `dump_to_disk` adopts the newer on-disk
+    // epoch into `self.epoch` unconditionally on a stale dump, so by the
+    // very next flush `self.epoch == on_disk_epoch` again and
+    // `stale_generation` is false — even though this engine's in-memory
+    // graph/id-maps were never reloaded and still hold the pre-compaction
+    // (tombstoned) generation. A second genuine insert-and-flush on the
+    // same stale engine therefore republishes that old graph over the
+    // compacted one: the same ping-pong the first fix was meant to close,
+    // one flush later. Must fail on the code that only guards a single
+    // flush (revert to `self.epoch = new_epoch;` unconditional).
+    #[tokio::test]
+    async fn stale_engine_second_genuine_flush_does_not_republish_orphans_either() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let index_dir = tmp.path().join("index");
+
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+        }
+
+        // First construction: writes a fresh, compact 40-chunk cache (epoch 1).
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+
+        // Delete 30 of 40 chunks — negative drift, material orphans.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..30 {
+                storage.delete_chunk(&format!("chunk-{i}")).unwrap();
+            }
+        }
+
+        // Engine A: a long-lived foreground process that loads BEFORE
+        // compaction, at epoch 1.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        assert!(crate::search::needs_compaction(&index_dir));
+
+        // Engine B: the daemon's compaction loop — rebuilds from SQLite (10
+        // live chunks) and publishes generation epoch 2.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        let (chunks_b, _) = eng_b.rebuild_search_index().await.unwrap();
+        assert_eq!(chunks_b, 10);
+        assert!(!crate::search::needs_compaction(&index_dir));
+
+        // Flush 1: engine A's first genuine post-compaction insert. This is
+        // the scenario the previous test already covers, and must still
+        // defer to engine B's generation.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            insert_test_chunk(&storage, "chunk-new-1");
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_chunk("chunk-new-1".into(), vec![0.1_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // Flush 2: the SAME long-lived engine A does a second genuine
+        // insert-and-flush without ever reloading. If the epoch guard only
+        // lasted one flush, `self.epoch` now equals the on-disk epoch again,
+        // `stale_generation` reads false, and this flush republishes engine
+        // A's original 40-entry (30-tombstoned) graph over the compacted
+        // generation.
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            insert_test_chunk(&storage, "chunk-new-2");
+        }
+        {
+            let mut idx = eng_a.search.write().await;
+            idx.insert_chunk("chunk-new-2".into(), vec![0.1_f32; 384]);
+        }
+        eng_a.flush_index_checked().await.unwrap();
+
+        // The next fresh load must see engine B's compact generation plus
+        // BOTH of engine A's genuine new chunks (recovered via SQLite
+        // backfill), with no resurrected tombstones and no re-triggered
+        // compaction marker — on the SECOND stale flush, not just the
+        // first.
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        assert_eq!(
+            eng_c.search.read().await.chunk_count(),
+            12,
+            "engine A's second stale-but-genuinely-dirty flush must not \
+             have republished the 30 orphans engine B already compacted \
+             away, and both genuine new chunks must still be present \
+             (backfilled from SQLite on the next load)"
+        );
+        assert!(
+            !crate::search::needs_compaction(&index_dir),
+            "no ping-pong on the SECOND stale flush: a stale engine must \
+             never publish from memory again once it has deferred once, \
+             not just on its first post-compaction flush"
+        );
     }
 }

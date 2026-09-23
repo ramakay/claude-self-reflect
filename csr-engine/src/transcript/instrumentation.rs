@@ -256,6 +256,9 @@ mod tests {
             text: text.to_string(),
             tool_uses: vec![],
             tool_results: vec![],
+            origin_kind: None,
+            is_meta: false,
+            is_compact_summary: false,
         }
     }
 
@@ -276,6 +279,9 @@ mod tests {
                 prompt: None,
             }],
             tool_results: vec![],
+            origin_kind: None,
+            is_meta: false,
+            is_compact_summary: false,
         }
     }
 
@@ -300,6 +306,9 @@ mod tests {
                 byte_size,
                 preview: preview.to_string(),
             }],
+            origin_kind: None,
+            is_meta: false,
+            is_compact_summary: false,
         }
     }
 

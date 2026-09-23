@@ -23,10 +23,36 @@ const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
     END;
-    CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+    CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
         INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+";
+
+/// Keyword channel for reflections. `csr_reflect_on_past` fuses semantic and
+/// FTS5 ranks (RRF); with only `chunks_fts` on the keyword side a stored
+/// reflection could never earn a keyword rank and lost the fusion to any chunk
+/// present in both lists, even at cosine 1.0 (2026-09-22 probe, three
+/// `memory-archive` rows). A standard FTS5 table keyed by id, not an
+/// external-content one: `INSERT OR REPLACE` on `reflections` never fires the
+/// delete trigger for the row it replaces, so the triggers delete by id first.
+const CREATE_REFLECTIONS_FTS: &str = "
+    CREATE VIRTUAL TABLE IF NOT EXISTS reflections_fts USING fts5(
+        id UNINDEXED,
+        content,
+        tokenize='porter unicode61'
+    );
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_ai AFTER INSERT ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = new.id;
+        INSERT INTO reflections_fts(id, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_ad AFTER DELETE ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = old.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_au AFTER UPDATE OF content ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = old.id;
+        INSERT INTO reflections_fts(id, content) VALUES (new.id, new.content);
     END;
 ";
 
@@ -148,6 +174,58 @@ fn migrate_chunks_fts(conn: &Connection) -> Result<()> {
     }
 
     verify_chunks_fts(conn)
+}
+
+fn chunks_fts_au_trigger_sql(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn is_content_scoped_au_trigger(sql: &str) -> bool {
+    let compact: String = sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.contains("afterupdateofcontenton")
+}
+
+/// Recreate `chunks_fts_au` scoped to `UPDATE OF content` if an
+/// already-migrated database still has the unscoped `AFTER UPDATE ON chunks`
+/// definition. `migrate_chunks_fts` above short-circuits once the
+/// external-content schema and a trigger COUNT of 3 already hold, so it never
+/// revisits an existing trigger's exact definition — this is a narrower,
+/// always-checked follow-up that does.
+///
+/// An unscoped trigger fires the delete+reinsert `chunks_fts` pair on every
+/// `UPDATE` to `chunks`, including timestamp-only restamps that never touch
+/// `content`. Measured on a `/tmp` clone: 280,775 timestamp-only restamp
+/// UPDATEs (`restamp_chunk_timestamp_if_content_matches`) grew
+/// `chunks_fts_data` from 51,745 blocks / 202.5 MB to 65,764 blocks /
+/// 257.2 MB (+54.6 MB, +27%) purely from re-inserting unchanged content.
+fn migrate_chunks_fts_au_content_scoped(conn: &Connection) -> Result<()> {
+    let Some(sql) = chunks_fts_au_trigger_sql(conn)? else {
+        // No chunks_fts_au trigger yet — migrate_chunks_fts (run earlier in
+        // `run()`) is responsible for creating the correct one from scratch.
+        return Ok(());
+    };
+    if is_content_scoped_au_trigger(&sql) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER chunks_fts_au;
+         CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
+             INSERT INTO chunks_fts(chunks_fts, rowid, content)
+             VALUES ('delete', old.rowid, old.content);
+             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;",
+    )?;
+    Ok(())
 }
 
 fn main_database_path(conn: &Connection) -> Result<Option<std::path::PathBuf>> {
@@ -405,6 +483,20 @@ pub fn run(conn: &Connection) -> Result<()> {
             supersedes     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_chunk_provenance_author ON chunk_provenance(author);
+
+        -- W3-B1 review#2 (HIGH): the transcript's own `entrypoint` field
+        -- (`cli`, `sdk-cli`, `sdk-*`, `claude-desktop`, ...), recorded once
+        -- per conversation at import time. Replaces
+        -- `session_registry`-absence as the headless signal for
+        -- `queries::filter_unregistered_conversation_rows` — registry
+        -- absence only ever meant \"never typed a prompt through
+        -- history.jsonl\", which is also true of a real interactive session
+        -- history.jsonl never recorded. Missing here (never populated, or
+        -- pre-dates this column) means \"unknown\", not \"headless\".
+        CREATE TABLE IF NOT EXISTS conversation_entrypoint (
+            conversation_id TEXT PRIMARY KEY,
+            entrypoint      TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS derivation_ledger (
             id           TEXT NOT NULL,
@@ -781,6 +873,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     migrate_chunks_fts(conn)?;
+    migrate_chunks_fts_au_content_scoped(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).
@@ -855,6 +948,20 @@ pub fn run(conn: &Connection) -> Result<()> {
         if !already_purged {
             conn.execute_batch("DELETE FROM session_instrumentation;")?;
             crate::storage::queries::set_meta(conn, "steer_noise_filter_v2", "1")?;
+        }
+    }
+
+    // Keyword index over reflections (see `CREATE_REFLECTIONS_FTS`). One-shot
+    // per database: create the table and triggers, then backfill every row
+    // that already exists; the triggers keep it current from then on.
+    {
+        let installed = crate::storage::queries::get_meta(conn, "reflections_fts_v1")?.is_some();
+        if !installed {
+            conn.execute_batch(CREATE_REFLECTIONS_FTS)?;
+            conn.execute_batch(
+                "INSERT INTO reflections_fts(id, content) SELECT id, content FROM reflections;",
+            )?;
+            crate::storage::queries::set_meta(conn, "reflections_fts_v1", "1")?;
         }
     }
 
@@ -1849,6 +1956,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_identity_v2(conn)?;
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
+    migrate_strip_memory_tag_from_derived_reflections(conn)?;
 
     finish_chunks_fts_compaction(conn)?;
 
@@ -2098,6 +2206,70 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Meta key gating [`migrate_strip_memory_tag_from_derived_reflections`] so it
+/// scans `reflections` once rather than on every startup.
+const STRIP_MEMORY_TAG_FROM_DERIVED_KEY: &str = "strip_csr_memory_tag_from_derived_reflections_v1";
+
+/// One-shot repair for the bug where `store_reflection`'s explicit-memory
+/// stamp (`csr:memory`) leaked onto pipeline-derived reflections (stories,
+/// episodes, briefings, cache rows, `narrative_*` extractions) because they
+/// shared the same insert path. A derived tag on a row means it was never a
+/// deliberate memory write; strip the stamp so `is_explicit_memory` /
+/// `reflection_recall_standing` stop granting it unearned user standing (the
+/// live 2026-09-22 case: reflection `3e4c5285`, tagged `session_story` +
+/// `csr:memory`, scored `adj 0.994 = cos 0.494 + user 0.50`).
+///
+/// Gated by [`STRIP_MEMORY_TAG_FROM_DERIVED_KEY`] so the scan runs once, not
+/// on every `migrations::run`. Also naturally idempotent: a second run (e.g.
+/// after a manual meta-row reset) only ever re-examines rows that still
+/// contain the literal tag string, and stripping an already-stripped tag is a
+/// no-op.
+fn migrate_strip_memory_tag_from_derived_reflections(conn: &Connection) -> Result<()> {
+    let already_done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [STRIP_MEMORY_TAG_FROM_DERIVED_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+    let memory_tag = crate::mcp::tools::EXPLICIT_MEMORY_TAG;
+    let mut stmt =
+        conn.prepare("SELECT id, tags FROM reflections WHERE tags LIKE '%' || ?1 || '%'")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([memory_tag], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut repaired = 0i64;
+    for (id, tags_json) in rows {
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if !crate::mcp::tools::has_derived_reflection_tag(&tags) {
+            continue;
+        }
+        let stripped: Vec<String> = tags.into_iter().filter(|t| t != memory_tag).collect();
+        let stripped_json = serde_json::to_string(&stripped)?;
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = ?2",
+            rusqlite::params![stripped_json, id],
+        )?;
+        repaired += 1;
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![STRIP_MEMORY_TAG_FROM_DERIVED_KEY, repaired.to_string()],
+    )?;
+    if repaired > 0 {
+        tracing::info!(
+            repaired,
+            "migrate_strip_memory_tag_from_derived_reflections: stripped csr:memory from derived rows"
+        );
+    }
+    Ok(())
+}
+
 /// Does `table` carry an index named `index_name`? Answered from
 /// `pragma_index_list`, so a column that exists without its index — the exact
 /// shape a half-applied migration leaves behind — is *detected*, not assumed
@@ -2323,6 +2495,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trigger_count, 3);
+    }
+
+    fn chunks_fts_data_block_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM chunks_fts_data", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn timestamp_only_update_does_not_touch_chunks_fts() {
+        // Break caught: an `AFTER UPDATE ON chunks` (any column) trigger
+        // fires the delete+reinsert pair into chunks_fts on every UPDATE,
+        // including ones that never touch `content` — e.g. the WP-A
+        // timestamp-restamp backfill. Scoping the trigger to
+        // `UPDATE OF content` must leave chunks_fts_data's block count
+        // unchanged across a timestamp-only UPDATE.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 ('c1', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta gamma delta', 1);",
+        )
+        .unwrap();
+        let before = chunks_fts_data_block_count(&conn);
+
+        conn.execute(
+            "UPDATE chunks SET timestamp = ?1 WHERE id = 'c1'",
+            ["2026-09-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        let after = chunks_fts_data_block_count(&conn);
+        assert_eq!(
+            before, after,
+            "a timestamp-only UPDATE must not touch chunks_fts_data"
+        );
+        // Content still searchable and matches exactly once — the row
+        // itself was never deleted, just left alone.
+        assert_eq!(matching_live_ids(&conn, "alpha").len(), 1);
+
+        // A content UPDATE, by contrast, SHOULD still resync the index.
+        conn.execute(
+            "UPDATE chunks SET content = 'epsilon zeta' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "alpha").is_empty());
+        assert_eq!(matching_live_ids(&conn, "epsilon").len(), 1);
+    }
+
+    #[test]
+    fn legacy_unscoped_au_trigger_is_upgraded_to_content_scoped() {
+        // Simulates a database migrated before this fix: chunks_fts_au fires
+        // on ANY update. A later `run()` (which always calls
+        // migrate_chunks_fts_au_content_scoped, unlike migrate_chunks_fts
+        // itself, which short-circuits once the schema+trigger COUNT already
+        // match) must recreate it scoped to `UPDATE OF content` without
+        // losing FTS sync.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER chunks_fts_au;
+             CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+                 INSERT INTO chunks_fts(chunks_fts, rowid, content)
+                 VALUES ('delete', old.rowid, old.content);
+                 INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;",
+        )
+        .unwrap();
+        let legacy_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!is_content_scoped_au_trigger(&legacy_sql));
+
+        run(&conn).unwrap();
+
+        let upgraded_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            is_content_scoped_au_trigger(&upgraded_sql),
+            "sql was: {upgraded_sql}"
+        );
+
+        // Still functionally correct after the upgrade: content updates stay synced.
+        conn.execute_batch(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 ('c1', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta', 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chunks SET content = 'gamma delta' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "alpha").is_empty());
+        assert_eq!(matching_live_ids(&conn, "gamma").len(), 1);
     }
 
     #[test]
@@ -3661,5 +3941,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("No.".into(), "/tmp/child.jsonl".into(), None));
+    }
+
+    #[test]
+    fn strip_memory_tag_from_derived_reflections_repairs_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE reflections (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                tags TEXT DEFAULT '[]',
+                timestamp TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        let story_tags =
+            serde_json::to_string(&["session_story", "project_x", "csr:memory"]).unwrap();
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp)
+             VALUES ('story_1', 'a story', ?1, '2026-01-01T00:00:00Z')",
+            [&story_tags],
+        )
+        .unwrap();
+        let memory_tags = serde_json::to_string(&["anukriti", "csr:memory"]).unwrap();
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp)
+             VALUES ('mem_1', 'a memory', ?1, '2026-01-01T00:00:00Z')",
+            [&memory_tags],
+        )
+        .unwrap();
+
+        migrate_strip_memory_tag_from_derived_reflections(&conn).unwrap();
+
+        let story_after: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='story_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let tags: Vec<String> = serde_json::from_str(&story_after).unwrap();
+        assert!(
+            !tags.iter().any(|t| t == "csr:memory"),
+            "derived row must lose the explicit-memory stamp: {tags:?}"
+        );
+        assert!(tags.iter().any(|t| t == "session_story"), "{tags:?}");
+
+        let memory_after: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='mem_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let memory_tags_after: Vec<String> = serde_json::from_str(&memory_after).unwrap();
+        assert!(
+            memory_tags_after.iter().any(|t| t == "csr:memory"),
+            "an explicit memory (no derived tag) must keep its stamp: {memory_tags_after:?}"
+        );
+
+        // Idempotency: re-adding the tag by hand and re-running must be a
+        // no-op — the meta key gates the scan to once.
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = 'story_1'",
+            [&story_tags],
+        )
+        .unwrap();
+        migrate_strip_memory_tag_from_derived_reflections(&conn).unwrap();
+        let story_after_second: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='story_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            story_after_second, story_tags,
+            "second run is gated by the meta key and must not rescan"
+        );
     }
 }

@@ -1,7 +1,9 @@
 pub mod backfill;
+pub mod catchup;
 pub mod codex_rollout;
 pub mod coedit_backfill;
 pub mod dream_marker;
+pub mod entrypoint_backfill;
 pub mod memory_registry;
 pub mod plans;
 pub mod provenance_backfill;
@@ -105,6 +107,13 @@ pub(crate) struct ParsedConversation {
     pub chunks: Vec<ConversationChunk>,
     pub suppression: CsrSuppressionStats,
     pub evidence: HashMap<String, crate::provenance::ChunkEvidence>,
+    /// The transcript's own `"entrypoint"` field (`cli`, `sdk-cli`, `sdk-*`,
+    /// `claude-desktop`, ...), read verbatim off the first JSONL line that
+    /// carries one. `None` when no line in the file has the field (older
+    /// transcripts, or a non-Claude-Code source) — callers must treat that as
+    /// "unknown", never as a headless signal. See
+    /// `storage::queries::is_headless_entrypoint`.
+    pub entrypoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +270,39 @@ pub(crate) fn derive_conversation_attribution(
     derive_conversation_attribution_canonical(&canonical_base, &canonical_file)
 }
 
+/// `derive_conversation_attribution`'s project, falling back to
+/// `storage.get_project_for_conversation` (the chunk row) only when the path
+/// attribution resolves to `"unknown"` — a transcript whose recorded path
+/// sits outside `projects_dir` (a `/private/var/folders` temp path,
+/// `~/.claude/transcripts`, a codex/grok rollout). Both `process_v3_extraction`
+/// (daemon) and `backfill_stories_cli` (summarizer) need this exact fallback
+/// order: the path attribution is authoritative when it resolves to
+/// something real (it correctly rescopes a sidechain transcript once its
+/// source file is rediscovered, which the chunk row's project can be stuck
+/// wrong on forever — see `process_v3_extraction`'s doc), but a bare
+/// `.map(...).or_else(...)` is not enough, because `.map` always produces
+/// `Some("unknown")` and `Option::or_else` never runs on a `Some` — that
+/// exact bug once made `backfill_stories_cli` permanently write
+/// `project_unknown` for every conversation whose import path fell outside
+/// `projects_dir`, which the (b) fix's hard project-scope drop then removed
+/// under any explicit scope.
+pub(crate) fn project_for_conversation_or_attribution(
+    storage: &crate::storage::Storage,
+    projects_dir: &Path,
+    file_path: &Path,
+    conv_id: &str,
+) -> String {
+    let from_path = derive_conversation_attribution(projects_dir, file_path).project_name;
+    if from_path != "unknown" {
+        return from_path;
+    }
+    storage
+        .get_project_for_conversation(conv_id)
+        .ok()
+        .flatten()
+        .unwrap_or(from_path)
+}
+
 pub(crate) fn derive_conversation_attribution_canonical(
     canonical_projects_dir: &Path,
     canonical_file_path: &Path,
@@ -314,6 +356,11 @@ pub(crate) fn derive_conversation_attribution_canonical(
 /// `extraction::provenance` (single registry). Deliberately starts_with, not
 /// contains: import-skip drops a whole conversation, so only transcripts that
 /// ARE an agent prompt qualify — not real sessions that merely quote one.
+///
+/// Must be fed the RAW opening prompt. The search sanitizer deletes the
+/// paragraph holding a signature, so testing its output never matches: that
+/// ordering let 19,830 agent transcripts (48% of all chunks) into the corpus
+/// between 2026-09-01 and 2026-09-19.
 fn is_csr_agent_prompt(first_user_message: &str) -> bool {
     let mut trimmed = first_user_message.trim_start();
     // `claude -p -` (prompt via stdin) records the literal "-" argument as the
@@ -326,6 +373,95 @@ fn is_csr_agent_prompt(first_user_message: &str) -> bool {
     crate::extraction::provenance::AGENT_PROMPT_SIGNATURES
         .iter()
         .any(|sig| trimmed.starts_with(sig))
+}
+
+/// The text of `parsed` when it can be a transcript's opening prompt: a user
+/// row Claude Code did not inject (`isMeta` caveats, compact summaries) that
+/// still says something once CSR's own hook wrappers are removed. Wrappers are
+/// stripped from the returned text so a prompt behind one still leads.
+fn opening_prompt_candidate(parsed: &serde_json::Value) -> Option<String> {
+    let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if msg_type != "user" && msg_type != "human" {
+        return None;
+    }
+    let injected = ["isMeta", "isCompactSummary"]
+        .iter()
+        .any(|key| parsed.get(key).and_then(|v| v.as_bool()).unwrap_or(false));
+    if injected {
+        return None;
+    }
+    let mut ignored = 0;
+    let text = scrub_csr_system_reminders(&extract_message_text_raw(parsed), &mut ignored);
+    // A slash command is something a person ran: the session opens here.
+    if text.contains("<command-name>") {
+        return Some(text);
+    }
+    // Only the wrapper spans go. Prose typed after pasted harness output is the
+    // opening prompt, and skipping it would hand the decision to a later row.
+    let prose = HARNESS_WRAPPER_RE.replace_all(&text, "");
+    let leading = prose.trim_start();
+    if leading.is_empty()
+        || HARNESS_ROW_PREFIXES
+            .iter()
+            .any(|prefix| leading.starts_with(prefix))
+    {
+        return None;
+    }
+    Some(leading.to_string())
+}
+
+/// Tag-delimited blocks the harness writes into user rows.
+static HARNESS_WRAPPER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    let spans = [
+        "local-command-caveat",
+        "local-command-stdout",
+        "task-notification",
+    ]
+    .iter()
+    .map(|tag| format!("<{tag}>.*?</{tag}>"))
+    .collect::<Vec<_>>()
+    .join("|");
+    Regex::new(&format!("(?s){spans}")).unwrap()
+});
+
+/// Openings of whole rows the harness writes as plain text, never a person or an
+/// agent prompt. Older transcripts carry them without `isMeta`/`isCompactSummary`.
+const HARNESS_ROW_PREFIXES: [&str; 3] = [
+    "[SYSTEM NOTIFICATION",
+    "Caveat: The messages below were generated by the user while running local commands",
+    "This session is being continued from a previous conversation",
+];
+
+/// What a transcript's opening prompt says about the whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptKind {
+    /// Opens with a CSR agent prompt: the importer skips it whole.
+    Agent,
+    Real,
+    /// Could not be opened. Never evidence for deleting anything.
+    Unreadable,
+}
+
+/// Classify the transcript at `path` by its opening prompt. Reads only as far as
+/// that prompt; shares `opening_prompt_candidate` and the predicate with the
+/// importer, so `backfill scrub` purges exactly what import skips.
+pub(crate) fn classify_transcript(path: &Path) -> TranscriptKind {
+    let Ok(file) = fs::File::open(path) else {
+        return TranscriptKind::Unreadable;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(parsed) = sonic_rs::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(prompt) = opening_prompt_candidate(&parsed) {
+            return if is_csr_agent_prompt(&prompt) {
+                TranscriptKind::Agent
+            } else {
+                TranscriptKind::Real
+            };
+        }
+    }
+    TranscriptKind::Real
 }
 
 pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<ConversationChunk>> {
@@ -450,7 +586,9 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
     let mut last_timestamp: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
+    let mut agent_prompt_checked = false;
     let mut csr_sanitizer = CsrMessageSanitizer::default();
+    let mut entrypoint: Option<String> = None;
 
     loop {
         let line_start = byte_offset;
@@ -472,6 +610,18 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // The harness stamps `"entrypoint"` on most record types (user,
+        // assistant, system, attachment, ...), not only the ones this loop
+        // keeps as messages below — capture it off the first line that has
+        // it, before the type filter below would `continue` past it.
+        if entrypoint.is_none() {
+            if let Some(ep) = parsed.get("entrypoint").and_then(|v| v.as_str()) {
+                if !ep.is_empty() {
+                    entrypoint = Some(ep.to_string());
+                }
+            }
+        }
 
         // Extract message type
         let msg_type = parsed
@@ -497,6 +647,24 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
 
         let seq = message_seq;
         message_seq += 1;
+
+        // Skip CSR's own agent-subprocess transcripts (briefing analyst, compaction
+        // summarizer, ratification extractor, sentinel-led narrators). Their FIRST
+        // user message IS the agent prompt. Tested on the raw text, before the
+        // sanitizer below deletes the very paragraph that identifies it.
+        if !agent_prompt_checked {
+            if let Some(prompt) = opening_prompt_candidate(&parsed) {
+                agent_prompt_checked = true;
+                if is_csr_agent_prompt(&prompt) {
+                    return Ok(ParsedConversation {
+                        chunks: Vec::new(),
+                        suppression: csr_sanitizer.stats,
+                        evidence: HashMap::new(),
+                        entrypoint,
+                    });
+                }
+            }
+        }
 
         sanitize_message_for_search(&mut parsed, &mut csr_sanitizer);
         register_tool_uses(&parsed, &mut tool_names);
@@ -627,21 +795,23 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
             chunks: Vec::new(),
             suppression: csr_sanitizer.stats,
             evidence: HashMap::new(),
+            entrypoint,
         });
     }
 
-    // Skip CSR's own agent-subprocess transcripts (the session-briefing analyst,
-    // the compaction summarizer). Their FIRST user message IS the agent prompt, so
-    // importing them pollutes the search index with CSR talking to itself — which
-    // then feeds back into the next briefing. A normal user session never opens with
-    // these strings; quoting them later in a session (e.g. via hook-injected context)
-    // is fine because we only test the first user message.
+    // Second net behind the raw check in the loop: the sanitized preview can be a
+    // LATER user message when the first one scrubbed to nothing (a hook wrapper
+    // ahead of the agent prompt). Importing these pollutes the search index with
+    // CSR talking to itself, which then feeds back into the next briefing. A normal
+    // user session never opens with these strings; quoting them later in a session
+    // is fine because only the first surviving user message is tested.
     if let Some(ref fm) = first_user_message {
         if is_csr_agent_prompt(fm) {
             return Ok(ParsedConversation {
                 chunks: Vec::new(),
                 suppression: csr_sanitizer.stats,
                 evidence: HashMap::new(),
+                entrypoint,
             });
         }
     }
@@ -655,7 +825,7 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
     // Priority: JSONL summary > first user message > None
     let chunk_summary = summary.or(first_user_message);
 
-    let (chunks, mut evidence) = chunk_message_core_with_evidence(
+    let (chunks, mut parts_by_chunk) = chunk_message_core_with_evidence(
         &conversation_id,
         project_name,
         &timestamp,
@@ -665,25 +835,33 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
         &chunk_summary,
         Some(&message_evidence),
     );
+    // Scrub before the evidence exists. The spans and the tool-result share are
+    // measured against `chunk.content`, and `replace_chunk_evidence` re-derives
+    // the share from the persisted spans and refuses the chunk when the two
+    // disagree; evidence computed from the unscrubbed text failed that check on
+    // every trimmed tool result and aborted the file's import.
+    let mut evidence = HashMap::new();
     let chunks = chunks
         .into_iter()
         .filter_map(|mut chunk| {
-            scrub_contaminated_text(&chunk.content).map(|content| {
-                chunk.content = content;
-                chunk
-            })
+            let content = scrub_contaminated_text(&chunk.content)?;
+            let parts = parts_by_chunk.remove(&chunk.id).unwrap_or_default();
+            let parts = if content == chunk.content {
+                parts
+            } else {
+                realign_parts(parts, &content)
+            };
+            chunk.content = content;
+            attach_chunk_evidence(&chunk, parts, &mut evidence);
+            Some(chunk)
         })
         .collect::<Vec<_>>();
-    let retained = chunks
-        .iter()
-        .map(|chunk| chunk.id.as_str())
-        .collect::<HashSet<_>>();
-    evidence.retain(|chunk_id, _| retained.contains(chunk_id.as_str()));
 
     Ok(ParsedConversation {
         chunks,
         suppression: csr_sanitizer.stats,
         evidence,
+        entrypoint,
     })
 }
 
@@ -754,15 +932,14 @@ fn chunk_message_core_with_evidence(
     message_sidechains: &[bool],
     summary: &Option<String>,
     message_evidence: Option<&[MessageEvidence]>,
-) -> (
-    Vec<ConversationChunk>,
-    HashMap<String, crate::provenance::ChunkEvidence>,
-) {
+) -> (Vec<ConversationChunk>, HashMap<String, Vec<EventPart>>) {
     debug_assert_eq!(messages.len(), message_authors.len());
     debug_assert_eq!(messages.len(), message_sidechains.len());
     debug_assert!(message_evidence.is_none_or(|evidence| evidence.len() == messages.len()));
     let mut chunks = Vec::new();
-    let mut evidence_by_chunk = HashMap::new();
+    // Event parts per chunk, not finished evidence: the caller still scrubs the
+    // chunk text, and spans have to be measured against what it persists.
+    let mut parts_by_chunk = HashMap::new();
     let mut buffer = String::new();
     let mut authors = Vec::new();
     let mut sidechains = Vec::new();
@@ -789,10 +966,10 @@ fn chunk_message_core_with_evidence(
                     chunk_author(&authors),
                     chunk_is_sidechain(&sidechains, conversation_id),
                 );
-                attach_chunk_evidence(
+                stash_chunk_parts(
                     chunks.last().expect("chunk was just pushed"),
                     std::mem::take(&mut buffered_parts),
-                    &mut evidence_by_chunk,
+                    &mut parts_by_chunk,
                 );
                 authors.clear();
                 sidechains.clear();
@@ -816,12 +993,12 @@ fn chunk_message_core_with_evidence(
                     *author,
                     chunk_is_sidechain(std::slice::from_ref(is_sidechain), conversation_id),
                 );
-                attach_chunk_evidence(
+                stash_chunk_parts(
                     chunks.last().expect("chunk was just pushed"),
                     source
                         .map(|evidence| slice_event_parts(evidence, start, end))
                         .unwrap_or_default(),
-                    &mut evidence_by_chunk,
+                    &mut parts_by_chunk,
                 );
                 start = end;
             }
@@ -840,10 +1017,10 @@ fn chunk_message_core_with_evidence(
                 chunk_author(&authors),
                 chunk_is_sidechain(&sidechains, conversation_id),
             );
-            attach_chunk_evidence(
+            stash_chunk_parts(
                 chunks.last().expect("chunk was just pushed"),
                 std::mem::take(&mut buffered_parts),
-                &mut evidence_by_chunk,
+                &mut parts_by_chunk,
             );
             authors.clear();
             sidechains.clear();
@@ -872,13 +1049,92 @@ fn chunk_message_core_with_evidence(
             chunk_author(&authors),
             chunk_is_sidechain(&sidechains, conversation_id),
         );
-        attach_chunk_evidence(
+        stash_chunk_parts(
             chunks.last().expect("chunk was just pushed"),
             buffered_parts,
-            &mut evidence_by_chunk,
+            &mut parts_by_chunk,
         );
     }
-    (chunks, evidence_by_chunk)
+    (chunks, parts_by_chunk)
+}
+
+fn stash_chunk_parts(
+    chunk: &ConversationChunk,
+    parts: Vec<EventPart>,
+    parts_by_chunk: &mut HashMap<String, Vec<EventPart>>,
+) {
+    if !parts.is_empty() {
+        parts_by_chunk.insert(chunk.id.clone(), parts);
+    }
+}
+
+/// Re-derive a chunk's event parts against the text that will actually be
+/// persisted. `scrub_contaminated_text` runs on the finished chunk and can trim
+/// its edges or cut wrappers and paragraphs out of the middle, so a part sliced
+/// from the unscrubbed message may no longer be literally present. Spans are
+/// later re-validated by slicing the event's extracted text at
+/// `[combined_start, combined_end)` and hashing it, and the persisted
+/// tool-result share is recomputed from the spans over `chunk.content`, so a
+/// span may only describe text that is both still in the chunk and contiguous
+/// in the source part. Parts are matched in order behind a moving cursor: the
+/// whole part first, then its wrapper-free paragraphs, each trimmed the way the
+/// chunk edges are. Whatever cannot be located is dropped from the evidence
+/// rather than described inaccurately.
+fn realign_parts(parts: Vec<EventPart>, content: &str) -> Vec<EventPart> {
+    let mut cursor = 0usize;
+    let mut kept = Vec::with_capacity(parts.len());
+    for part in parts {
+        let whole = [(0usize, part.text.as_str())];
+        let pieces;
+        let candidates: &[(usize, &str)] = if content[cursor..].contains(part.text.as_str()) {
+            &whole
+        } else {
+            pieces = surviving_pieces(&part.text);
+            &pieces
+        };
+        for &(byte_offset, piece) in candidates {
+            let Some(found) = content[cursor..].find(piece) else {
+                continue;
+            };
+            cursor += found + piece.len();
+            let start = part.combined_start + part.text[..byte_offset].chars().count();
+            kept.push(EventPart {
+                event: part.event.clone(),
+                text: piece.to_string(),
+                combined_start: start,
+                combined_end: start + piece.chars().count(),
+            });
+        }
+    }
+    kept
+}
+
+/// The runs of `text` that the chunk-level scrub can leave in place, as
+/// `(byte offset in text, run)`: wrapper matches are cut out, the remainder is
+/// split into paragraphs on the same `"\n\n"` boundary the scrub uses, and each
+/// run is trimmed of edge whitespace. Empty runs are skipped.
+fn surviving_pieces(text: &str) -> Vec<(usize, &str)> {
+    let mut gaps = Vec::new();
+    let mut gap_start = 0usize;
+    for wrapper in CSR_SYSTEM_REMINDER_RE.find_iter(text) {
+        gaps.push((gap_start, &text[gap_start..wrapper.start()]));
+        gap_start = wrapper.end();
+    }
+    gaps.push((gap_start, &text[gap_start..]));
+
+    let mut pieces = Vec::new();
+    for (gap_offset, gap) in gaps {
+        let mut paragraph_offset = 0usize;
+        for paragraph in gap.split("\n\n") {
+            let trimmed = paragraph.trim();
+            if !trimmed.is_empty() {
+                let lead = paragraph.len() - paragraph.trim_start().len();
+                pieces.push((gap_offset + paragraph_offset + lead, trimmed));
+            }
+            paragraph_offset += paragraph.len() + 2;
+        }
+    }
+    pieces
 }
 
 fn slice_event_parts(message: &MessageEvidence, start: usize, end: usize) -> Vec<EventPart> {
@@ -1144,25 +1400,59 @@ fn sanitize_message_for_search(
         .and_then(|value| value.as_str())
         .map(str::to_owned);
     let scrub_wrappers = matches!(msg_type.as_deref(), Some("user" | "human"));
+    let text = if scrub_wrappers && is_harness_written_row(message) {
+        RowText::Drop
+    } else {
+        RowText::Keep { scrub_wrappers }
+    };
 
     if let Some(content) = message
         .get_mut("message")
         .and_then(|value| value.get_mut("content"))
     {
-        sanitize_content(content, scrub_wrappers, sanitizer);
+        sanitize_content(content, text, sanitizer);
     } else if let Some(content) = message.get_mut("content") {
-        sanitize_content(content, scrub_wrappers, sanitizer);
+        sanitize_content(content, text, sanitizer);
     }
+}
+
+/// What the sanitizer does with a row's prose. Tool blocks are judged on their own.
+#[derive(Clone, Copy)]
+enum RowText {
+    Keep {
+        scrub_wrappers: bool,
+    },
+    /// The harness wrote this row into the user channel; nobody typed it.
+    Drop,
+}
+
+/// Rows Claude Code writes into the user channel itself: task notifications,
+/// messages from peer sessions, idle notices. Indexed as prose they came back as
+/// the owner's own history. A coordinator's message to a subagent
+/// (`origin.kind == "coordinator"`) is a real instruction and stays.
+fn is_harness_written_row(message: &serde_json::Value) -> bool {
+    let prompt_source = message
+        .get("promptSource")
+        .and_then(serde_json::Value::as_str);
+    let origin = message
+        .get("origin")
+        .and_then(|origin| origin.get("kind"))
+        .and_then(serde_json::Value::as_str);
+    prompt_source == Some("system") || matches!(origin, Some("task-notification" | "peer"))
 }
 
 fn sanitize_content(
     content: &mut serde_json::Value,
-    scrub_wrappers: bool,
+    row_text: RowText,
     sanitizer: &mut CsrMessageSanitizer,
 ) {
     if let Some(text) = content.as_str() {
-        *content =
-            serde_json::Value::String(sanitize_text_for_search(text, scrub_wrappers, sanitizer));
+        *content = serde_json::Value::String(match row_text {
+            RowText::Keep { scrub_wrappers } => {
+                sanitize_text_for_search(text, scrub_wrappers, sanitizer)
+            }
+            RowText::Drop => String::new(),
+        });
         return;
     }
 
@@ -1196,6 +1486,9 @@ fn sanitize_content(
                 }
             }
             Some("text") => {
+                let RowText::Keep { scrub_wrappers } = row_text else {
+                    continue;
+                };
                 if let Some(text) = item.get_mut("text") {
                     if let Some(raw) = text.as_str() {
                         *text = serde_json::Value::String(sanitize_text_for_search(
@@ -1644,6 +1937,88 @@ mod tests {
         );
     }
 
+    /// Opus review finding (low, W3-K spec (c)): a transcript whose recorded
+    /// import path sits outside `projects_dir` (a `/private/var/folders` temp
+    /// path, `~/.claude/transcripts`, a codex/grok rollout) resolves to
+    /// `"unknown"` via `derive_conversation_attribution`. The bug this closes
+    /// is in the CALLERS (`process_v3_extraction`, `backfill_stories_cli`):
+    /// `.map(|path| ...).or_else(...)` never falls back because `.map`
+    /// already yields `Some("unknown")`. `project_for_conversation_or_attribution`
+    /// is the single fallback point both callers now share.
+    #[test]
+    fn project_for_conversation_falls_back_when_path_attribution_is_unknown() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let chunk = ConversationChunk {
+            id: "chunk-1".into(),
+            conversation_id: "conv-outside".into(),
+            project_name: "real-project-from-chunk".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "hello".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        let projects_dir = Path::new("/Users/test/.claude/projects");
+        // A path outside `projects_dir` entirely — `derive_conversation_attribution`
+        // resolves this to "unknown".
+        let outside_path = Path::new("/private/var/folders/xx/tmp-transcript.jsonl");
+        assert_eq!(
+            derive_conversation_attribution(projects_dir, outside_path).project_name,
+            "unknown",
+            "sanity: this path must resolve to unknown for the test to mean anything"
+        );
+
+        let project = project_for_conversation_or_attribution(
+            &storage,
+            projects_dir,
+            outside_path,
+            "conv-outside",
+        );
+        assert_eq!(
+            project, "real-project-from-chunk",
+            "an unknown path attribution must fall back to the chunk row's real project"
+        );
+    }
+
+    /// The positive case the fallback must not break: when the path
+    /// attribution DOES resolve to a real project, it wins even if the chunk
+    /// row disagrees (the chunk row can be stuck on a stale rescope target —
+    /// see `process_v3_extraction`'s doc).
+    #[test]
+    fn project_for_conversation_prefers_path_attribution_when_it_resolves() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let chunk = ConversationChunk {
+            id: "chunk-2".into(),
+            conversation_id: "conv-inside".into(),
+            project_name: "subagents".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "hello".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.1, 0.2, 0.3, 0.4]).unwrap();
+
+        let projects_dir = Path::new("/Users/test/.claude/projects");
+        let file_path = projects_dir
+            .join("-Users-test-projects-real-project")
+            .join("session.jsonl");
+
+        let project = project_for_conversation_or_attribution(
+            &storage,
+            projects_dir,
+            &file_path,
+            "conv-inside",
+        );
+        assert_eq!(project, "real-project");
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_projects_root_attributes_canonical_sidechain_path() {
@@ -1833,6 +2208,138 @@ mod tests {
             .any(|evidence| evidence.tool_result_share.is_some_and(|share| share > 0.0)));
     }
 
+    /// The daemon failed ~900 imports a day with "provided tool-result share
+    /// does not match persisted spans": the chunk scrub trimmed the trailing
+    /// newline off a tool result after the share had been computed, so the
+    /// persisted text was one char shorter than the spans said. Run the exact
+    /// storage check the importer runs.
+    #[test]
+    fn scrubbed_chunk_evidence_survives_the_storage_consistency_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing-newline.jsonl");
+        std::fs::write(
+            &path,
+            [
+                r#"{"type":"assistant","uuid":"a1","timestamp":"2026-09-17T00:00:01Z","message":{"content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"user","uuid":"u1","timestamp":"2026-09-17T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"call-1","content":"Cargo.toml\nsrc\ntarget\n"}]}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+        assert_eq!(parsed.chunks.len(), 1);
+        let chunk = &parsed.chunks[0];
+        assert!(
+            !chunk.content.ends_with('\n'),
+            "scrub trims the chunk edge: {:?}",
+            chunk.content
+        );
+        let evidence = parsed
+            .evidence
+            .get(&chunk.id)
+            .expect("evidence for the chunk");
+        assert_eq!(evidence.tool_result_share, Some(1.0));
+        let span_chars: usize = evidence
+            .spans
+            .iter()
+            .map(|span| span.end_char - span.start_char)
+            .sum();
+        assert_eq!(span_chars, chunk.content.chars().count());
+
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        storage.insert_chunk(chunk, &[0.0; 4]).unwrap();
+        storage
+            .replace_chunk_evidence(evidence)
+            .expect("persisted spans agree with the scrubbed content");
+    }
+
+    #[test]
+    fn realigned_parts_slice_the_source_text_and_sit_in_the_scrubbed_chunk() {
+        use crate::provenance::{validated_span_tier, ProvenanceEvent, TrustTier};
+
+        let original = "  alpha line\n\n<system-reminder>\nCSR PICKUP — this prompt matches a past episode\n</system-reminder>\n\nbeta line\n";
+        let event = ProvenanceEvent {
+            event_id: "evt-1".into(),
+            conversation_id: "conv".into(),
+            message_key: "u1".into(),
+            seq: 0,
+            channel: "tool_result:Bash".into(),
+            trust_tier: TrustTier::External,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: None,
+            observed_at: "2026-09-17T00:00:00Z".into(),
+        };
+        let part = EventPart {
+            event: event.clone(),
+            text: original.to_string(),
+            combined_start: 0,
+            combined_end: original.chars().count(),
+        };
+        let scrubbed = scrub_contaminated_text(original).expect("not pure contamination");
+        // Wrapper cut out, edges trimmed, blank paragraphs left where it was.
+        assert_eq!(scrubbed, "alpha line\n\n\n\nbeta line");
+
+        let kept = realign_parts(vec![part], &scrubbed);
+        let texts: Vec<&str> = kept.iter().map(|part| part.text.as_str()).collect();
+        assert_eq!(texts, ["alpha line", "beta line"]);
+        for part in &kept {
+            assert!(scrubbed.contains(&part.text));
+            let span = crate::provenance::ChunkSpan {
+                chunk_id: "chunk".into(),
+                event_id: event.event_id.clone(),
+                start_char: part.combined_start,
+                end_char: part.combined_end,
+                content_hash: crate::provenance::content_hash(&part.text),
+            };
+            assert_eq!(
+                validated_span_tier(&event, &span, original),
+                TrustTier::External,
+                "span {}..{} must slice {:?} out of the source part",
+                span.start_char,
+                span.end_char,
+                part.text
+            );
+        }
+    }
+
+    #[test]
+    fn realign_drops_parts_the_scrub_removed_entirely() {
+        use crate::provenance::{ProvenanceEvent, TrustTier};
+
+        let event = |id: &str| ProvenanceEvent {
+            event_id: id.into(),
+            conversation_id: "conv".into(),
+            message_key: id.into(),
+            seq: 0,
+            channel: "text".into(),
+            trust_tier: TrustTier::UserHistory,
+            parent_event_id: None,
+            receipt_kind: "jsonl".into(),
+            receipt_ref: None,
+            observed_at: "2026-09-17T00:00:00Z".into(),
+        };
+        let parts = vec![
+            EventPart {
+                event: event("keep"),
+                text: "kept text".into(),
+                combined_start: 0,
+                combined_end: 9,
+            },
+            EventPart {
+                event: event("gone"),
+                text: "<system-reminder>\nEPISODE INDEX — earlier threads\n</system-reminder>"
+                    .into(),
+                combined_start: 0,
+                combined_end: 70,
+            },
+        ];
+        let kept = realign_parts(parts, "kept text");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].event.event_id, "keep");
+    }
+
     #[test]
     fn sidechain_events_cannot_exceed_parent_context_floor() {
         use crate::provenance::TrustTier;
@@ -1923,6 +2430,201 @@ mod tests {
         ));
         // A real message that merely starts with a dash stays importable.
         assert!(!is_csr_agent_prompt("- fix the daemon\n- ship release"));
+        // The narrator preamble is a side-session; a bare sentinel is not. Lessons
+        // output legitimately leads with one, and a user may open a session with it.
+        assert!(is_csr_agent_prompt(
+            "[[CSR:RECAP]] machine-marker: this is a CSR narrator side-session.\nYou are a post-turn narrator."
+        ));
+        assert!(!is_csr_agent_prompt(
+            "[[CSR:LESSONS]]\n- stop punting decisions (seen 4× across 3 sessions)\n\nadd these to CLAUDE.md"
+        ));
+        assert!(!is_csr_agent_prompt(
+            "[[CSR:RECAP]] is the marker I asked about"
+        ));
+        // A recap pasted into a real session carries the sentinel at the end.
+        assert!(!is_csr_agent_prompt(
+            "recap [2h ago]: fixed the bug: shipped it. [[CSR:RECAP]]\n\nwhy did this regress?"
+        ));
+    }
+
+    fn write_transcript(dir: &Path, name: &str, first_user: &str) -> PathBuf {
+        let path = dir.join(name);
+        let lines = [
+            serde_json::json!({"type": "queue-operation", "operation": "enqueue", "content": first_user}),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-09-15T00:00:00Z",
+                "message": {"content": first_user}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-09-15T00:00:05Z",
+                "message": {"content": [{"type": "text", "text": "{\"intent\": \"reply the importer must never index\"}"}]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    /// The signature sits in its own paragraph, which the search sanitizer
+    /// deletes. The skip has to fire on the raw text, through the real parser.
+    #[test]
+    fn agent_transcripts_are_skipped_whole_by_the_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let ratification = write_transcript(
+            dir.path(),
+            "ratification.jsonl",
+            "-\n# Ratification Dialog-Act Extraction\n\nYou are extracting OBSERVABLE dialog-acts.\n\nUSER: keep the daemon",
+        );
+        let narrator = write_transcript(
+            dir.path(),
+            "narrator.jsonl",
+            "[[CSR:RECAP]] machine-marker: this is a CSR narrator side-session, never corpus material.\nYou are a post-turn rubber-duck narrator.\n\nTRANSCRIPT EXCERPT:\nUSER: keep the daemon",
+        );
+        let analyst = write_transcript(
+            dir.path(),
+            "analyst.jsonl",
+            "You are CSR Episode Analyst. Generate a brief.\n\nEpisode 1: shipped the fix",
+        );
+        for path in [&ratification, &narrator, &analyst] {
+            assert_eq!(
+                classify_transcript(path),
+                TranscriptKind::Agent,
+                "{}",
+                path.display()
+            );
+            let parsed = parse_jsonl_file_with_stats(path, "project").unwrap();
+            assert!(parsed.chunks.is_empty(), "{}", path.display());
+            assert!(parsed.evidence.is_empty(), "{}", path.display());
+        }
+    }
+
+    fn write_rows(dir: &Path, name: &str, rows: &[serde_json::Value]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        path
+    }
+
+    /// Rows Claude Code injects are never the opening prompt, in either direction.
+    #[test]
+    fn injected_rows_never_decide_whether_a_transcript_is_an_agent_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = |text: &str, meta: bool| {
+            serde_json::json!({
+                "type": "user",
+                "isMeta": meta,
+                "timestamp": "2026-09-15T00:00:00Z",
+                "message": {"content": text}
+            })
+        };
+        // A real session whose injected first row happens to lead with a signature.
+        let real = write_rows(
+            dir.path(),
+            "real.jsonl",
+            &[
+                row(
+                    "You are summarizing a coding session for the statusline",
+                    true,
+                ),
+                row("Why did the daemon regress after this shipped?", false),
+            ],
+        );
+        assert_eq!(classify_transcript(&real), TranscriptKind::Real);
+        assert!(!parse_jsonl_file_with_stats(&real, "project")
+            .unwrap()
+            .chunks
+            .is_empty());
+        // An agent transcript behind an injected caveat row.
+        let agent = write_rows(
+            dir.path(),
+            "agent.jsonl",
+            &[
+                row(
+                    "Caveat: the messages below were generated by local commands.",
+                    true,
+                ),
+                row(
+                    "-\n# Ratification Dialog-Act Extraction\n\nUSER: keep the daemon",
+                    false,
+                ),
+            ],
+        );
+        assert_eq!(classify_transcript(&agent), TranscriptKind::Agent);
+        assert!(parse_jsonl_file_with_stats(&agent, "project")
+            .unwrap()
+            .chunks
+            .is_empty());
+        // The same rows from an older harness that set neither flag.
+        let unflagged = write_rows(
+            dir.path(),
+            "unflagged.jsonl",
+            &[
+                row("<local-command-caveat>Caveat: generated by local commands.</local-command-caveat>", false),
+                row("This session is being continued from a previous conversation that ran out of context.", false),
+                row("[[CSR:RECAP]] machine-marker: narrator side-session.\nYou are a narrator.", false),
+            ],
+        );
+        assert_eq!(classify_transcript(&unflagged), TranscriptKind::Agent);
+        // Pasted harness output followed by a typed request IS the opening prompt,
+        // whatever a later row leads with. So is a slash command.
+        for (name, opening) in [
+            ("pasted.jsonl", "<local-command-stdout>error details</local-command-stdout>\n\nHelp me debug why the narrator produces this error."),
+            ("slash.jsonl", "<command-name>/compact</command-name>"),
+        ] {
+            let real = write_rows(
+                dir.path(),
+                name,
+                &[
+                    row(opening, false),
+                    row("[[CSR:RECAP]] machine-marker: narrator side-session.\nYou are a narrator.", false),
+                ],
+            );
+            assert_eq!(classify_transcript(&real), TranscriptKind::Real, "{name}");
+        }
+        assert!(parse_jsonl_file_with_stats(&unflagged, "project")
+            .unwrap()
+            .chunks
+            .is_empty());
+        assert_eq!(
+            classify_transcript(&dir.path().join("gone.jsonl")),
+            TranscriptKind::Unreadable
+        );
+    }
+
+    #[test]
+    fn real_session_quoting_csr_output_is_still_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_transcript(
+            dir.path(),
+            "real.jsonl",
+            "recap [2h ago]: fixed the bug: shipped it. [[CSR:RECAP]]\n\nWhy did the daemon regress after this shipped?",
+        );
+        assert_eq!(classify_transcript(&path), TranscriptKind::Real);
+        let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+        assert!(!parsed.chunks.is_empty());
+        let content = parsed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(content.contains("Why did the daemon regress after this shipped?"));
+        assert!(!content.contains("[[CSR:RECAP]]"));
     }
 
     #[test]
@@ -2296,6 +2998,98 @@ mod tests {
         }
         assert!(v3.contains("USER PROSE BEFORE"));
         assert!(v3.contains("USER PROSE AFTER"));
+    }
+
+    #[test]
+    fn rows_the_harness_wrote_into_the_user_channel_are_not_indexed_as_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("harness-rows.jsonl");
+        let user_row = |text: &str, extra: serde_json::Value| {
+            let mut row = serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-09-19T21:00:00Z",
+                "message": {"role": "user", "content": text}
+            });
+            row.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            row
+        };
+        let lines = [
+            user_row(
+                "TYPED PROMPT trace the prompt-submit latency",
+                serde_json::json!({"origin": {"kind": "human"}, "promptSource": "typed"}),
+            ),
+            user_row(
+                "<task-notification>\n<task-id>NOTIFICATION MUST DISAPPEAR</task-id>\n</task-notification>",
+                serde_json::json!({
+                    "origin": {"kind": "task-notification"},
+                    "promptSource": "system",
+                    "turnOrigin": "task_notification"
+                }),
+            ),
+            // Subagent transcripts carry the origin without a promptSource.
+            user_row(
+                "Another Claude session sent a message: PEER MESSAGE MUST DISAPPEAR",
+                serde_json::json!({"origin": {"kind": "peer"}, "isMeta": true}),
+            ),
+            user_row(
+                "[Cross-session idle notice] IDLE NOTICE MUST DISAPPEAR",
+                serde_json::json!({"promptSource": "system", "isMeta": true}),
+            ),
+            user_row(
+                "The coordinator sent a message while you were working:\nCOORDINATOR ORDER stop and report",
+                serde_json::json!({"origin": {"kind": "coordinator"}}),
+            ),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-09-19T21:00:05Z",
+                "origin": {"kind": "task-notification"},
+                "promptSource": "system",
+                "message": {"content": [
+                    {"type": "text", "text": "ARRAY NOTIFICATION MUST DISAPPEAR"},
+                    {"type": "tool_result", "tool_use_id": "read-call", "content": "SIBLING RESULT MUST STAY"}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let serialized =
+            serde_json::to_string(&parse_jsonl_messages_for_search(&path).unwrap()).unwrap();
+        let indexed = parse_jsonl_file(&path, "project")
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in [
+            "NOTIFICATION MUST DISAPPEAR",
+            "PEER MESSAGE MUST DISAPPEAR",
+            "IDLE NOTICE MUST DISAPPEAR",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "sanitizer kept {forbidden}"
+            );
+            assert!(!indexed.contains(forbidden), "index kept {forbidden}");
+        }
+        for retained in [
+            "TYPED PROMPT",
+            "COORDINATOR ORDER",
+            "SIBLING RESULT MUST STAY",
+        ] {
+            assert!(serialized.contains(retained), "sanitizer lost {retained}");
+            assert!(indexed.contains(retained), "index lost {retained}");
+        }
     }
 
     #[test]

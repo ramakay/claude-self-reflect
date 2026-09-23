@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use anyhow::Result;
@@ -26,6 +25,27 @@ pub struct IngestStats {
     pub parse_errors: usize,
 }
 
+/// Per-file identity used to detect that `history.jsonl` was replaced rather
+/// than appended to.
+///
+/// On Unix this is the inode. Windows has no inode; the closest stable stand-in
+/// is the creation timestamp, which changes when the path is backed by a new
+/// file. `file_index()` would be the exact analogue but it is still unstable
+/// (rust-lang/rust#63010), and this check does not warrant pulling in a
+/// `windows-sys` dependency: the head hash and the size check already catch
+/// rotation on their own, so this value only has to be a corroborating signal.
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.ino()
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    metadata.creation_time()
+}
+
 /// Incrementally ingest `~/.claude/history.jsonl` into `session_registry`.
 ///
 /// Called ONLY from the daemon loop (single writer) — never from setup or
@@ -43,7 +63,7 @@ pub fn ingest_history(storage: &Storage, history_path: &Path) -> Result<IngestSt
 
     let metadata = std::fs::metadata(history_path)?;
     let file_size = metadata.len();
-    let inode = metadata.ino();
+    let inode = file_identity(&metadata);
 
     // First line for head-hash (bounded read — do not load whole file).
     let first_line_bytes = read_first_line_bytes(history_path)?;

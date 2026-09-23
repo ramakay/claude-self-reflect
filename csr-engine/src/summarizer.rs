@@ -3,6 +3,7 @@
 //! Flow: SQLite retrieves context → Haiku formats it into a 2-3 sentence story → stored as reflection.
 //! Graceful degradation: returns None if claude CLI unavailable or times out.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::engine::Engine;
+use crate::import;
 use crate::search::cross_project::resolve_project_from_cwd;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
@@ -124,6 +126,9 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
             // built-in tool (Bash, Edit, Write, Agent) under the user's
             // permission mode; this call is a pure text summary.
             cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
+            // No user settings (plugins, SessionStart hooks) and no transcript
+            // left behind for the watcher to re-import.
+            cmd.args(crate::narrative::isolation_args());
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {
@@ -426,7 +431,7 @@ async fn generate_and_store(
         format!("conv_{}", conv_id),
     ];
 
-    crate::mcp::tools::store_reflection(
+    crate::mcp::tools::store_reflection_internal(
         engine.storage(),
         engine.embeddings(),
         engine.search(),
@@ -524,9 +529,36 @@ pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Res
             None => continue, // phantom reference
         };
 
+        // Derived from `import_state.file_path` via the same attribution
+        // function the importer uses, not from `chunks.project_name`: a
+        // sidechain transcript's chunk row can be permanently stuck on the
+        // daemon-side rescope target ("subagents") once its source file is
+        // gone, because `rescope_sidechain_conversation` only runs when the
+        // file is (re)discovered. Falls back to the chunk row when no
+        // recorded import path resolves (e.g. a synthetic/test conversation)
+        // OR when the recorded path resolves to "unknown" (a path outside
+        // `projects_dir`) — see `project_for_conversation_or_attribution`'s
+        // doc for why a bare `.map(...).or_else(...)` was not enough.
         let project = engine
             .storage()
-            .get_project_for_conversation(conv_id)?
+            .import_paths_for_conversations(std::slice::from_ref(conv_id), 1)?
+            .get(conv_id)
+            .and_then(|paths| paths.first())
+            .map(|path| {
+                import::project_for_conversation_or_attribution(
+                    engine.storage(),
+                    engine.projects_dir(),
+                    Path::new(path),
+                    conv_id,
+                )
+            })
+            .or_else(|| {
+                engine
+                    .storage()
+                    .get_project_for_conversation(conv_id)
+                    .ok()
+                    .flatten()
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         let story = if enrichment_type == "extracted_v3" {
@@ -547,7 +579,7 @@ pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Res
                     format!("project_{}", project),
                     format!("conv_{}", conv_id),
                 ];
-                crate::mcp::tools::store_reflection(
+                crate::mcp::tools::store_reflection_internal(
                     engine.storage(),
                     engine.embeddings(),
                     engine.search(),

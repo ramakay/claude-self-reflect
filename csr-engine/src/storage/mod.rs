@@ -452,6 +452,22 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// Keyword hits over reflections, `(id, ordinal, bm25)` in bm25 order.
+    pub fn fts5_search_reflections(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, usize, f64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search_reflections(&conn, query, limit)
+    }
+
+    /// See `queries::fts5_reflection_prefix_matches`.
+    pub fn fts5_reflection_prefix_matches(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_reflection_prefix_matches(&conn, query, limit)
+    }
+
     // ─── Reflection tag queries ───
 
     pub fn get_reflections_by_tag(
@@ -783,6 +799,29 @@ impl Storage {
         Ok(out)
     }
 
+    /// Read an arbitrary meta-stored counter, or `None` when the key was
+    /// never written. Unlike `get_csr_tool_blocks_suppressed`'s `.unwrap_or(0)`
+    /// convention, callers that must distinguish "never ran" from "ran and
+    /// found zero" (e.g. `csr-engine status`'s watcher/catch-up counters)
+    /// need the absence signal preserved, not collapsed into a real zero.
+    pub fn get_meta_counter(&self, key: &str) -> Result<Option<i64>> {
+        Ok(self.get_meta(key)?.and_then(|v| v.parse::<i64>().ok()))
+    }
+
+    /// Increment an arbitrary meta-stored counter by `count`, holding the
+    /// connection lock across the read-modify-write so two same-process
+    /// callers can never race the meta table (mirrors `bump_aux_counter_by`).
+    pub fn bump_meta_counter_by(&self, key: &str, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let current: i64 = queries::get_meta(&conn, key)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        queries::set_meta(&conn, key, &(current + count as i64).to_string())
+    }
+
     pub fn get_csr_tool_blocks_suppressed(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let split_value = queries::get_meta(&conn, "csr_tool_blocks_suppressed")?;
@@ -832,6 +871,50 @@ impl Storage {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically remove one conversation that should never have been corpus.
+    /// See `queries::purge_conversation`. Returns the number of chunks removed.
+    ///
+    /// IMMEDIATE, not deferred: the purge reads before it writes, and a deferred
+    /// transaction whose snapshot goes stale between the two (a hook in a live
+    /// session commits) fails at once with SQLITE_BUSY, which no busy timeout
+    /// covers. Taking the write lock first makes contention a wait instead.
+    pub fn purge_conversation(&self, conversation_id: &str) -> Result<usize> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let chunks = queries::purge_conversation(&tx, conversation_id)?;
+        tx.commit()?;
+        Ok(chunks)
+    }
+
+    /// How long this connection waits for another writer before SQLITE_BUSY.
+    /// Maintenance commands raise it: they share the database with live hooks.
+    pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+
+    /// See `queries::enrichment_reflection_refs`.
+    pub fn enrichment_reflection_refs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::enrichment_reflection_refs(&conn)
+    }
+
+    /// See `queries::reflection_conversation_tags`.
+    pub fn reflection_conversation_tags(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::reflection_conversation_tags(&conn)
+    }
+
+    /// Atomically delete a batch of reflections. See `queries::purge_reflections`.
+    pub fn purge_reflections(&self, ids: &[String]) -> Result<usize> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let deleted = queries::purge_reflections(&tx, ids)?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     /// Record a task-derived resolution proposal. Proposals are NOT verdicts:
@@ -906,6 +989,34 @@ impl Storage {
         queries::get_chunk_source(&conn, id)
     }
 
+    /// See `queries::set_conversation_entrypoint`.
+    pub fn set_conversation_entrypoint(
+        &self,
+        conversation_id: &str,
+        entrypoint: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::set_conversation_entrypoint(&conn, conversation_id, entrypoint)
+    }
+
+    /// The recorded `conversation_entrypoint` value for one conversation, or
+    /// `None` when never recorded — test/inspection helper; the hot filter
+    /// path uses the batched `queries::conversation_entrypoints` instead.
+    pub fn get_conversation_entrypoint(&self, conversation_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_conversation_entrypoint(&conn, conversation_id)
+    }
+
+    /// See `queries::pending_entrypoint_backfill_batch`.
+    pub fn pending_entrypoint_backfill_batch(
+        &self,
+        after_file_path: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::pending_entrypoint_backfill_batch(&conn, after_file_path, limit)
+    }
+
     pub fn rescope_sidechain_conversation(
         &self,
         conversation_id: &str,
@@ -919,6 +1030,80 @@ impl Storage {
             project_name,
             parent_conversation_id,
         )
+    }
+
+    /// See `queries::repair_reflection_project_tag`.
+    pub fn repair_reflection_project_tag(
+        &self,
+        conversation_id: &str,
+        old_project: &str,
+        new_project: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::repair_reflection_project_tag(&conn, conversation_id, old_project, new_project)
+    }
+
+    /// Meta key gating [`Storage::repair_sidechain_project_misattribution`].
+    const SIDECHAIN_MISATTRIBUTION_REPAIR_KEY: &'static str =
+        "sidechain_project_misattribution_repair_v1";
+
+    /// One-shot repair for the bug where a sidechain conversation's chunk row
+    /// — and every reflection derived from it (`extracted_v3_*`/`v3_cache_*`/
+    /// `story_*`) — stayed permanently tagged with the daemon-side rescope
+    /// target `project_subagents` because its source transcript disappeared
+    /// before `rescope_sidechain_conversation` ever ran (that only fires when
+    /// the file is (re)discovered — see `daemon::process_v3_extraction`'s doc
+    /// comment for the live count: 592 conversations, 2026-09-22). The real
+    /// project is still recoverable for every one of these from
+    /// `import_state.file_path`, using the exact attribution the importer
+    /// applies to a live file (`import::derive_conversation_attribution`).
+    ///
+    /// Gated by [`Self::SIDECHAIN_MISATTRIBUTION_REPAIR_KEY`] so the scan
+    /// runs once, not on every call. A conversation with no recorded (or
+    /// ambiguous) `import_state` path, or one whose path does not resolve
+    /// away from `subagents`/`unknown`, is simply skipped — safe to call
+    /// again (e.g. after clearing the meta row) without double-repairing
+    /// anything `rescope_sidechain_conversation` already fixed.
+    pub fn repair_sidechain_project_misattribution(&self, projects_dir: &Path) -> Result<usize> {
+        if self
+            .get_meta(Self::SIDECHAIN_MISATTRIBUTION_REPAIR_KEY)?
+            .is_some()
+        {
+            return Ok(0);
+        }
+        let broken_ids: Vec<String> = {
+            let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT conversation_id FROM chunks WHERE project_name = 'subagents'",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ids
+        };
+        let mut repaired = 0usize;
+        for conv_id in &broken_ids {
+            let paths = self.import_paths_for_conversations(std::slice::from_ref(conv_id), 1)?;
+            let Some(path) = paths.get(conv_id).and_then(|p| p.first()) else {
+                continue; // no unambiguous recorded path — leave for a later pass
+            };
+            let attribution =
+                crate::import::derive_conversation_attribution(projects_dir, Path::new(path));
+            if attribution.project_name == "subagents" || attribution.project_name == "unknown" {
+                continue; // did not actually resolve to anything better
+            }
+            let Some(parent) = attribution.parent_conversation_id.as_deref() else {
+                continue; // not shaped like a sidechain path after all
+            };
+            self.rescope_sidechain_conversation(conv_id, &attribution.project_name, parent)?;
+            self.repair_reflection_project_tag(conv_id, "subagents", &attribution.project_name)?;
+            repaired += 1;
+        }
+        self.set_meta(
+            Self::SIDECHAIN_MISATTRIBUTION_REPAIR_KEY,
+            &repaired.to_string(),
+        )?;
+        Ok(repaired)
     }
 
     /// Wipe a conversation's chunks + embeddings + FTS rows + provenance edges, so an
@@ -1044,6 +1229,17 @@ impl Storage {
         queries::mark_file_imported_with_suppression(&mut conn, path, chunks, suppression)
     }
 
+    /// Transcript files recorded per conversation id. See
+    /// `queries::import_paths_for_conversations`.
+    pub fn import_paths_for_conversations(
+        &self,
+        conversation_ids: &[String],
+        max_paths_per_id: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::import_paths_for_conversations(&conn, conversation_ids, max_paths_per_id)
+    }
+
     /// Read an import_state mtime keyed by a synthetic (non-filesystem) `file_path`,
     /// for aux-source adapters. See `queries::get_import_state_mtime`.
     pub fn get_import_state_mtime(&self, file_path: &str) -> Result<Option<String>> {
@@ -1062,6 +1258,38 @@ impl Storage {
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::upsert_import_state_explicit(&conn, file_path, conversation_id, chunks, mtime)
+    }
+
+    /// Distinct `(conversation_id, summary)` pairs for every `codex_rollout`
+    /// conversation. See `queries::codex_conversation_summaries`.
+    pub fn codex_conversation_summaries(&self) -> Result<Vec<(String, Option<String>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::codex_conversation_summaries(&conn)
+    }
+
+    /// Distinct `codex_rollout` conversation ids with a harness-marker chunk
+    /// anywhere, not just in `summary`. See
+    /// `queries::codex_conversations_with_harness_content`.
+    pub fn codex_conversations_with_harness_content(
+        &self,
+        markers: &[&str],
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::codex_conversations_with_harness_content(&conn, markers)
+    }
+
+    /// Clear a stored import_state mtime so the row is picked up on the next
+    /// discovery pass. See `queries::invalidate_import_state_mtime`.
+    pub fn invalidate_import_state_mtime(&self, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::invalidate_import_state_mtime(&conn, file_path)
+    }
+
+    /// Flip every stored chunk of `conversation_id` to `is_sidechain = 1`.
+    /// See `queries::mark_conversation_chunks_sidechain`.
+    pub fn mark_conversation_chunks_sidechain(&self, conversation_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_conversation_chunks_sidechain(&conn, conversation_id)
     }
 
     // ─── Session registry queries (multi-source corpus, v9.4) ───
@@ -1281,9 +1509,56 @@ impl Storage {
         queries::set_chunk_saga_columns(&conn, chunk_id, seq, is_sidechain)
     }
 
+    /// `(file_path, conversation_id)` pairs from `import_state` whose
+    /// `conversation_id` starts with `prefix`.
+    pub fn import_state_rows_for_conversation_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::import_state_rows_for_conversation_prefix(&conn, prefix)
+    }
+
+    /// Re-stamp one chunk's `timestamp` in place, gated on id + conversation_id
+    /// + content still matching. See `queries::restamp_chunk_timestamp_if_content_matches`.
+    pub fn restamp_chunk_timestamp_if_content_matches(
+        &self,
+        chunk_id: &str,
+        conversation_id: &str,
+        content: &str,
+        new_timestamp: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::restamp_chunk_timestamp_if_content_matches(
+            &conn,
+            chunk_id,
+            conversation_id,
+            content,
+            new_timestamp,
+        )
+    }
+
+    /// Batched form of [`Storage::restamp_chunk_timestamp_if_content_matches`]:
+    /// runs every `(chunk_id, conversation_id, content, new_timestamp)` row in
+    /// one transaction. See `queries::restamp_chunk_timestamps_batch`.
+    pub fn restamp_chunk_timestamps_batch(
+        &self,
+        updates: &[(String, String, String, String)],
+    ) -> Result<(usize, usize)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::restamp_chunk_timestamps_batch(&conn, updates)
+    }
+
     pub fn list_all_import_state_file_paths(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::list_all_import_state_file_paths(&conn)
+    }
+
+    /// `(file_path, file_mtime)` for every `import_state` row with a recorded
+    /// mtime. See `queries::list_import_state_entries`.
+    pub fn list_import_state_entries(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::list_import_state_entries(&conn)
     }
 
     pub fn ground_truth_sessions_for_target(
@@ -2489,6 +2764,93 @@ mod tests {
             .unwrap();
         assert_eq!(provenance.author, Speaker::Assistant);
         assert_eq!(provenance.source_conv_id, "parent-session");
+    }
+
+    /// Spec (c): a sidechain conversation whose source file is already gone
+    /// (the live 2026-09-22 state of 592 conversations) can never get
+    /// rescoped through file (re)discovery. The repair must recover the real
+    /// project from the recorded `import_state.file_path` alone — the file
+    /// itself never needs to exist on disk, only the projects_dir prefix
+    /// structure the path encodes.
+    #[test]
+    fn repair_sidechain_project_misattribution_recovers_from_a_gone_file() {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+
+        let storage = Storage::open_memory().unwrap();
+        let conv_id = "agent-aec0a3cf2fe94c998";
+        let chunk = ConversationChunk {
+            id: format!("{conv_id}-chunk"),
+            conversation_id: conv_id.to_string(),
+            project_name: "subagents".into(),
+            timestamp: "2026-09-01T00:00:00Z".into(),
+            content: "stale sidechain content".into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: true,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+        storage
+            .insert_reflection(
+                &format!("extracted_v3_{conv_id}"),
+                "v3 extraction content",
+                &[
+                    "narrative_extracted_v3".into(),
+                    format!("conv_{conv_id}"),
+                    "project_subagents".into(),
+                ],
+                &[0.0; 4],
+            )
+            .unwrap();
+
+        // The file itself never has to exist — only the recorded path,
+        // matching the shape a real deleted sidechain transcript left behind.
+        let missing_path =
+            "/tmp/does-not-exist/claude_projects/-Users-test-projects-anukriti-meta-campaigns/\
+             6897846e-0000-4000-8000-000000000000/subagents/agent-aec0a3cf2fe94c998.jsonl";
+        storage
+            .upsert_import_state_explicit(missing_path, conv_id, 1, "2026-09-01T00:00:00Z")
+            .unwrap();
+
+        let projects_dir = Path::new("/tmp/does-not-exist/claude_projects");
+        let repaired = storage
+            .repair_sidechain_project_misattribution(projects_dir)
+            .unwrap();
+        assert_eq!(
+            repaired, 1,
+            "must repair exactly the one broken conversation"
+        );
+
+        let (project_name, source): (String, String) = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT project_name, source FROM chunks WHERE id = ?1",
+                [&chunk.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(project_name, "anukriti-meta-campaigns");
+        assert_eq!(source, "sidechain");
+
+        let (_, tags, _) = storage
+            .get_reflection_by_id(&format!("extracted_v3_{conv_id}"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            tags.iter().any(|t| t == "project_anukriti-meta-campaigns"),
+            "reflection tag must be rewritten too: {tags:?}"
+        );
+        assert!(!tags.iter().any(|t| t == "project_subagents"));
+
+        // Idempotent: the meta key gates a second call to a no-op.
+        let second = storage
+            .repair_sidechain_project_misattribution(projects_dir)
+            .unwrap();
+        assert_eq!(second, 0, "second call is gated by the meta key");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod completions;
 pub mod elicitation;
 pub mod resources;
+pub mod stage_probe;
 pub mod tasks;
 pub mod tools;
 
@@ -174,6 +175,10 @@ pub struct TranscriptParams {
     /// Reserved for v2 (subagent sidechain inclusion) — rejected with a
     /// clear message in v1
     pub sidechains: Option<bool>,
+    /// prompts view: include non-human user turns (task notifications,
+    /// skill bodies, cross-session messages, local-command echoes,
+    /// compaction summaries) and queued duplicates; default false
+    pub include_system: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -232,16 +237,30 @@ pub struct CsrServer {
     index_dir: PathBuf,
     db_path: String,
     task_manager: TaskManager,
+    /// Detects that the binary on disk has diverged from this process's own
+    /// image (gap-G2). Shared across `Clone`s of this server (the task-tool
+    /// path clones `self`) so the "check at most every 30s" cadence is
+    /// process-wide, not per-clone.
+    binary_watch: Arc<crate::binary_identity::ReplacementWatch>,
 }
+
+/// How often `call_tool` re-stats the on-disk binary. Cheap between checks
+/// (an atomic bool read), so this only bounds `stat` syscall frequency.
+const BINARY_REPLACEMENT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tool_router]
 impl CsrServer {
+    /// `startup_identity` should be captured as early in process startup as
+    /// possible (main.rs does this before `Engine::new()` runs) — see
+    /// `binary_identity::ReplacementWatch::new`'s doc for why capturing it
+    /// here, after construction, would be too late.
     pub fn new(
         storage: Arc<Storage>,
         embeddings: Arc<EmbeddingEngine>,
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
         index_dir: PathBuf,
+        startup_identity: Option<crate::binary_identity::FileIdentity>,
     ) -> Self {
         // Derive db_path from index_dir (sibling: index_dir/../csr-engine.db)
         let db_path = index_dir
@@ -258,6 +277,9 @@ impl CsrServer {
             index_dir,
             db_path,
             task_manager: TaskManager::new(),
+            binary_watch: Arc::new(crate::binary_identity::ReplacementWatch::new(
+                startup_identity,
+            )),
         }
     }
 
@@ -291,7 +313,18 @@ impl CsrServer {
     }
 
     /// Flush the HNSW index to disk if dirty.
+    ///
+    /// A no-op once the on-disk binary has been replaced underneath this
+    /// process (gap-G2): index writes belong to the current image, and a
+    /// superseded process dumping over it would rewrite `manifest.json`
+    /// without whatever fields the current build's format has grown (the
+    /// live case that triggered this: the epoch field the W3-D
+    /// compaction-epoch guard needs). Searching from the stale in-memory
+    /// index keeps working — only persistence stops.
     async fn flush_index(&self) {
+        if self.binary_watch.is_replaced() {
+            return;
+        }
         let mut idx = self.search.write().await;
         if idx.is_dirty() {
             let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
@@ -380,7 +413,7 @@ impl CsrServer {
 
     #[tool(
         name = "csr_quick_check",
-        description = "Quick check if a topic was discussed before. Returns count and top match only. Much faster than full search - use for existence checks. Answers negatively: when nothing scores above the relevance floor it returns <found>false</found> with no preview, and matches in the weak band are labelled as possibly spurious.",
+        description = "Quick check if a topic was discussed before. Returns count and top match only. Much faster than full search - use for existence checks. Answers negatively: when nothing scores above the relevance floor it returns <found>false</found> with no preview. Matches in the weak band carry a margin-aware calibration caveat: absolute cosine is weakly calibrated in that band, but a result that clearly beats the field is not called spurious just for landing there.",
         annotations(
             title = "Quick Check",
             read_only_hint = true,
@@ -661,7 +694,7 @@ impl CsrServer {
 
     #[tool(
         name = "csr_transcript",
-        description = "Structured facts from a Claude Code session transcript JSONL: stats, prompts, tool calls, touched files, errors, a turn-range/last-N slice, or a text grep — without hand-rolling a jq/Python parser over raw JSONL. Every view emits turn numbers so a follow-up slice can zoom in; large results honestly truncate with a `turns` resume hint instead of silently cutting.",
+        description = "Structured facts from a Claude Code session transcript JSONL: stats, prompts, tool calls, touched files, errors, a turn-range/last-N slice, or a text grep — without hand-rolling a jq/Python parser over raw JSONL. Every view emits turn numbers so a follow-up slice can zoom in; large results honestly truncate with a `turns` resume hint instead of silently cutting. The `prompts` view shows human-typed turns only by default, hiding task notifications, skill bodies, cross-session messages, local-command echoes, compaction summaries, and queued/delivered duplicates behind a `hidden: class=count` header — pass `include_system: true` to see everything, unfiltered.",
         annotations(
             title = "Transcript Query",
             read_only_hint = true,
@@ -688,6 +721,7 @@ impl CsrServer {
             json_mode,
             p.budget_chars,
             p.sidechains.unwrap_or(false),
+            p.include_system.unwrap_or(false),
         );
         // Text-mode output is a hand-built pseudo-XML envelope
         // (`<transcript_slice>…</transcript_slice>`) around verbatim
@@ -903,8 +937,16 @@ impl ServerHandler for CsrServer {
             .client_capabilities()
             .is_some_and(|capabilities| capabilities.supports_tasks());
 
+        // gap-G2 spec 2c: check at most once per interval, regardless of
+        // how often tools are called; cheap (an atomic read) on every call
+        // that doesn't land on the boundary.
+        let binary_notice = self
+            .binary_watch
+            .check_notice(BINARY_REPLACEMENT_CHECK_INTERVAL);
+
         if tasks::is_taskable(request.name.as_ref()) && client_supports_tasks {
             let server = self.clone();
+            let notice = binary_notice.clone();
             let task_options = TaskOptions::default()
                 .with_ttl_ms(30_000)
                 .with_poll_interval_ms(500)
@@ -916,7 +958,9 @@ impl ServerHandler for CsrServer {
                     tokio::select! {
                         _ = task_context.cancelled() => Err(TaskExit::Cancelled),
                         result = tool_router.call(tool_call) => match result {
-                            Ok(CallToolResponse::Complete(result)) => Ok(result),
+                            Ok(CallToolResponse::Complete(result)) => Ok(
+                                crate::binary_identity::append_binary_replaced_notice(result, notice),
+                            ),
                             Ok(_) => Err(TaskExit::Error(rmcp::ErrorData::internal_error(
                                 "Tool returned an unsupported response while executing as a task",
                                 None,
@@ -930,7 +974,13 @@ impl ServerHandler for CsrServer {
         }
 
         let tool_call = ToolCallContext::new(self, request, context);
-        Self::tool_router().call(tool_call).await
+        let response = Self::tool_router().call(tool_call).await?;
+        Ok(match response {
+            CallToolResponse::Complete(result) => CallToolResponse::Complete(
+                crate::binary_identity::append_binary_replaced_notice(result, binary_notice),
+            ),
+            other => other,
+        })
     }
 
     async fn get_task(
@@ -1037,6 +1087,68 @@ mod tests {
 
     // ─── adversarial review finding 6: tool_names()/find_tool() must agree
     // with tool_count() and actually resolve csr_transcript ───
+
+    // ─── inbox-B3: `include_system` must deserialize off the wire and
+    // actually change `csr_transcript prompts` behavior, not just sit in
+    // the params struct unused ───
+
+    #[test]
+    fn transcript_params_include_system_deserializes_and_reaches_request() {
+        let json = r#"{"session":"ignored","view":"prompts","include_system":true}"#;
+        let params: TranscriptParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.include_system, Some(true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let proj_dir = dir.path().join("proj");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        let session_path = proj_dir.join("sess1.jsonl");
+        std::fs::write(
+            &session_path,
+            "{\"type\":\"user\",\"origin\":{\"kind\":\"task-notification\"},\"message\":{\"role\":\"user\",\"content\":\"<task-notification>done</task-notification>\"}}\n",
+        )
+        .unwrap();
+
+        let default_out = tools::transcript(
+            dir.path(),
+            &session_path.to_string_lossy(),
+            "prompts",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            default_out.contains("hidden: task_notification=1"),
+            "got: {default_out}"
+        );
+        assert!(!default_out.contains("done"));
+
+        let with_system_out = tools::transcript(
+            dir.path(),
+            &session_path.to_string_lossy(),
+            "prompts",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            params.include_system.unwrap_or(false),
+        )
+        .unwrap();
+        assert!(with_system_out.contains("done"), "got: {with_system_out}");
+        assert!(!with_system_out.contains("hidden:"));
+    }
 
     #[test]
     fn tool_names_includes_csr_transcript_and_matches_tool_count() {

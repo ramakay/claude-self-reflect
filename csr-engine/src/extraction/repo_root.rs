@@ -104,6 +104,92 @@ fn git_toplevel(dir: &Path) -> Option<String> {
     }
 }
 
+/// Where a directory sits in git right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPlace {
+    /// Canonical top level of the working tree the directory is in: the main
+    /// checkout, or the linked worktree when it is inside one.
+    pub toplevel: PathBuf,
+    /// Canonical git COMMON directory: one value for a main checkout, every
+    /// subdirectory under it and every linked worktree, and a different value
+    /// for a nested repository or submodule sitting inside that checkout.
+    pub common_dir: String,
+}
+
+/// Both answers from one `git` call. The top level says which working tree a
+/// directory is in, the common directory says which repository; neither can be
+/// derived from the other (a linked worktree lives anywhere, a submodule's
+/// common directory is under its superproject's `.git`).
+///
+/// For comparing two directories in the same instant, never for storing: a
+/// path says nothing about which repository lived there last month. No
+/// fallback of any kind. `git` missing, too old for `--path-format` (before
+/// 2.31), a `safe.directory` refusal, a bare repository, a directory that is
+/// gone, or `git` still running at `deadline` (it is killed): all `None`, and
+/// every caller treats `None` as "not the same repository".
+pub fn git_place(dir: &Path, deadline: std::time::Instant) -> Option<GitPlace> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    if !dir.is_dir() || std::time::Instant::now() >= deadline {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(&k);
+        }
+    }
+    let mut child = cmd
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // The answer is two short lines, far below the pipe buffer, so waiting for
+    // exit before reading cannot deadlock.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    // Exactly two lines, in the order asked. A path holding a newline gives
+    // more and is refused.
+    let mut lines = text.lines();
+    let (toplevel, common_dir) = (lines.next()?, lines.next()?);
+    if lines.next().is_some() || toplevel.is_empty() || common_dir.is_empty() {
+        return None;
+    }
+    Some(GitPlace {
+        toplevel: std::fs::canonicalize(toplevel).ok()?,
+        common_dir: std::fs::canonicalize(common_dir)
+            .ok()?
+            .to_string_lossy()
+            .into_owned(),
+    })
+}
+
 /// Backfill fallback: walk up from `dir` looking for the nearest ancestor
 /// (including `dir` itself) that contains a `.git` entry — matches
 /// `extraction::repo_path::canonical_repo_path`'s ancestor walk, but returns
@@ -162,6 +248,101 @@ mod tests {
             .as_ref()
             .map(|g| fs::canonicalize(g).unwrap_or_else(|_| PathBuf::from(g)));
         assert_eq!(got_canon, Some(expected));
+    }
+
+    /// `git <args>` with ambient `GIT_*` stripped (see the test above).
+    /// `false` when git is unavailable, so callers skip instead of failing.
+    fn git(args: &[&str], dir: &Path) -> bool {
+        let mut cmd = Command::new("git");
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd.arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    #[test]
+    fn a_deadline_already_past_answers_none_instead_of_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        assert!(git_place(&repo, soon()).is_some());
+        assert_eq!(git_place(&repo, std::time::Instant::now()), None);
+    }
+
+    #[test]
+    fn common_dir_is_shared_by_subdirectories_and_worktrees_but_not_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join("sub/deeper")).unwrap();
+        if !git(&["init", "-q"], &repo) {
+            return; // git unavailable in this environment
+        }
+        let main = GitPlace {
+            toplevel: fs::canonicalize(&repo).unwrap(),
+            common_dir: fs::canonicalize(repo.join(".git"))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        };
+        assert_eq!(git_place(&repo, soon()), Some(main.clone()));
+        assert_eq!(
+            git_place(&repo.join("sub/deeper"), soon()),
+            Some(main.clone())
+        );
+
+        // A linked worktree is its own top level in the main repository.
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        if git(&["add", "a.txt"], &repo)
+            && git(&["commit", "-q", "-m", "a"], &repo)
+            && git(&["worktree", "add", "-q", "../wt", "-b", "wt"], &repo)
+        {
+            let wt = tmp.path().join("wt");
+            fs::create_dir_all(wt.join("sub")).unwrap();
+            assert_eq!(
+                git_place(&wt.join("sub"), soon()),
+                Some(GitPlace {
+                    toplevel: fs::canonicalize(&wt).unwrap(),
+                    common_dir: main.common_dir.clone(),
+                })
+            );
+        }
+
+        // A repository nested inside the checkout is its own repository.
+        let nested = repo.join("vendor/other");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(git(&["init", "-q"], &nested));
+        let nested_place = git_place(&nested, soon()).unwrap();
+        assert_ne!(nested_place.common_dir, main.common_dir);
+        assert_eq!(nested_place.toplevel, fs::canonicalize(&nested).unwrap());
+
+        // No working tree, no answer: outside any repository, a directory that
+        // is gone, and inside a bare repository.
+        assert_eq!(git_place(tmp.path(), soon()), None);
+        assert_eq!(git_place(&tmp.path().join("missing"), soon()), None);
+        let bare = tmp.path().join("bare.git");
+        if git(
+            &["init", "-q", "--bare", bare.to_str().unwrap()],
+            tmp.path(),
+        ) {
+            assert_eq!(git_place(&bare, soon()), None);
+        }
     }
 
     #[test]

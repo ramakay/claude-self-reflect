@@ -161,6 +161,9 @@ async fn call_claude_for_acts(prompt: &str) -> Option<crate::narrative::ParsedNa
             // built-in tool (Bash, Edit, Write, Agent) under the user's
             // permission mode; this call is a pure text extraction.
             cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
+            // No user settings (plugins, SessionStart hooks) and no transcript
+            // left behind for the watcher to re-import.
+            cmd.args(crate::narrative::isolation_args());
             // Must come LAST: --mcp-config is variadic in the claude CLI and would
             // consume any positional arg that followed it.
             if let Some(path) = &mcp_config_path {

@@ -1078,6 +1078,9 @@ mod tests {
             text: text.into(),
             tool_uses: Vec::new(),
             tool_results: Vec::new(),
+            origin_kind: None,
+            is_meta: false,
+            is_compact_summary: false,
         }
     }
 

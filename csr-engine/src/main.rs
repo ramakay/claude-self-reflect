@@ -91,6 +91,12 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
     },
+    /// Force a full HNSW index rebuild from SQLite now, in the foreground.
+    /// Explicit maintenance command counterpart to the daemon's
+    /// `needs_compaction`-marker compaction loop — use when no daemon is
+    /// running, or to compact immediately rather than wait for the next
+    /// daemon cycle.
+    RebuildIndex,
     /// Analyze code quality using AST patterns
     Quality {
         /// File path to analyze
@@ -144,6 +150,12 @@ enum Commands {
         /// clear message in v1, never silently ignored.
         #[arg(long)]
         sidechains: bool,
+
+        /// prompts view: include non-human user turns (task notifications,
+        /// skill bodies, cross-session messages, local-command echoes,
+        /// compaction summaries) and queued duplicates; default false.
+        #[arg(long)]
+        include_system: bool,
     },
     /// Run ratification extraction for specific conversation IDs (one-off,
     /// bypasses the daemon queue ordering)
@@ -237,6 +249,20 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// One-time, idempotent re-stamp of `codex_rollout` chunk timestamps that
+    /// were collapsed onto the session-start time by the pre-fix chunker. No
+    /// re-embedding, no HNSW writes — content-guarded `UPDATE`s only. Safe to
+    /// run repeatedly; a second run is a no-op once the meta marker is set.
+    BackfillCodexTimestamps,
+    /// One-time, idempotent invalidation of already-imported `codex_rollout`
+    /// conversations whose stored summary is Codex harness boilerplate
+    /// (`<recommended_plugins>`, `# AGENTS.md instructions`, ...) rather than
+    /// the real first user turn — see the WP-A adapter strip in
+    /// `import::codex_rollout::canonical_message`. Clears their
+    /// `import_state` mtime only; run `setup`/the daemon afterward to
+    /// actually re-import them through the fixed adapter. Safe to run
+    /// repeatedly; a second run is a no-op once the meta marker is set.
+    BackfillCodexHarnessStrip,
     /// Historical deterministic capture operations.
     Backfill {
         #[command(subcommand)]
@@ -387,6 +413,10 @@ enum BackfillAction {
         /// Restrict remediation to one contaminated conversation.
         #[arg(long)]
         conversation: Option<String>,
+        /// Only purge conversations whose transcript is a CSR agent prompt
+        /// (narrator, ratification, briefing children); skip the emission scrub.
+        #[arg(long)]
+        agent_transcripts: bool,
     },
 }
 
@@ -561,6 +591,17 @@ fn default_projects_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    // Captured as the literal first thing this process does, before ANY
+    // other work — `Engine::new()` alone (storage open, HNSW load/rebuild,
+    // embeddings warm) can take seconds on a large corpus, and macOS
+    // codesign/Gatekeeper verification on a freshly installed binary's
+    // first launch adds more before even that. Capturing identity any
+    // later widens the window in which a binary replacement landing during
+    // this process's own startup goes permanently invisible to it: it
+    // would record the NEW file's identity as its own baseline and could
+    // never see itself as replaced (gap-G2; caught by a scratch-HOME smoke
+    // test where the replace happened to land in exactly that window).
+    let startup_identity = csr_engine::binary_identity::current_exe_identity();
     // Raise the open-file ceiling before any index load so a low soft RLIMIT_NOFILE
     // cannot turn a transient EMFILE inside hnsw_rs's mmap load into a process exit.
     csr_engine::runtime::raise_fd_limit();
@@ -569,10 +610,37 @@ fn main() -> Result<()> {
         .worker_threads(workers)
         .enable_all()
         .build()?;
-    runtime.block_on(run())
+    // `run()` can return while a `spawn_blocking` task the daemon's
+    // compaction loop started (inside `Engine::rebuild_search_index`) is
+    // still streaming an HNSW rebuild on the blocking pool — shutdown
+    // abandons *awaiting* that task (see `daemon::compact_if_marked`'s
+    // `tokio::select!`), but the closure itself keeps running. A bare
+    // `runtime.block_on(run())` returning here would drop `runtime`
+    // implicitly, and dropping a `Runtime` blocks the dropping thread until
+    // every spawned blocking task returns (tokio 1.53.1
+    // `src/runtime/runtime.rs`, `src/task/blocking.rs`) — minutes, on the
+    // real corpus, well past whatever asked this process to stop. That
+    // includes SIGTERM (`launchctl bootout`, the installer's stop step) —
+    // `Daemon::run` waits on `daemon::wait_for_termination_signal`, which
+    // races SIGINT against an installed SIGTERM handler, specifically so
+    // SIGTERM reaches `run()`'s return here instead of killing the process
+    // at the OS's default disposition before any Rust code (including this
+    // bound) ever runs. `csr_engine::runtime::run_to_completion` bounds
+    // that wait with `shutdown_timeout` instead of blocking indefinitely:
+    // the abandoned closure only builds an in-memory `SearchEngine` nothing
+    // will read once this process exits, so leaving its thread running past
+    // the timeout — until the OS reclaims it on process exit — is safe.
+    // Extracted into `runtime::run_to_completion` (not inlined here) so the
+    // shutdown-bounding behaviour has a test that calls the exact function
+    // `main` calls — see `runtime::tests::run_to_completion_bounds_the_wait_for_an_abandoned_blocking_task`.
+    csr_engine::runtime::run_to_completion(
+        runtime,
+        run(startup_identity),
+        std::time::Duration::from_secs(5),
+    )
 }
 
-async fn run() -> Result<()> {
+async fn run(startup_identity: Option<csr_engine::binary_identity::FileIdentity>) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
@@ -782,7 +850,56 @@ async fn run() -> Result<()> {
             config,
             !no_ai,
         );
-        return daemon.run().await;
+        let exit_code = daemon.run(startup_identity).await?;
+        if exit_code != 0 {
+            // Skips `runtime::run_to_completion`'s bounded shutdown wait
+            // (see that function's doc comment) — deliberately: the
+            // daemon's own `run()` already completed its full graceful
+            // teardown (shutdown flag, joined loops, bounded flush) before
+            // returning this code, so nothing meaningful is left running
+            // except the same kind of abandoned-blocking-task case that
+            // wait already tolerates. Exiting immediately here, rather
+            // than threading the code back through `Result<()>`, is what
+            // makes it observable to launchd: this process's `Result` flows
+            // through `run_to_completion` -> `fn main() -> Result<()>`,
+            // which anyhow always maps to exit code 1 on `Err` and 0 on
+            // `Ok(())` — there is no path for a specific non-zero success
+            // code other than exiting directly.
+            std::process::exit(exit_code);
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::RebuildIndex) = args.command {
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        if eng.index_freshly_rebuilt() {
+            // Engine::new's own cache-miss path already streamed a fresh,
+            // compact index from SQLite and dumped it — the exact case an
+            // operator running this command most needs to be fast in (first
+            // run, or a corrupt manifest). Calling rebuild_search_index()
+            // again here would be a second, fully redundant ~11-min pass
+            // over the same corpus.
+            //
+            // `Engine::new` only logs that dump's failure as a non-fatal
+            // warning (foreground processes must never block startup on
+            // persistence), so without this call a failed dump would print
+            // "rebuilt" and exit 0 while the on-disk cache stayed stale or
+            // absent — every later startup would then rebuild inline for
+            // ~11 min instead of loading the cache this command claimed to
+            // have written. `flush_index_checked` is a no-op when the dump
+            // already succeeded (nothing dirty) and otherwise re-attempts
+            // and surfaces the error via `?`.
+            eng.flush_index_checked().await?;
+            let (chunks, reflections) = (
+                eng.storage().count_chunk_embeddings().unwrap_or(0),
+                eng.storage().count_reflection_embeddings().unwrap_or(0),
+            );
+            println!("rebuilt index: {chunks} chunks, {reflections} reflections");
+            return Ok(());
+        }
+        let (chunks, reflections) = eng.rebuild_search_index().await?;
+        println!("rebuilt index: {chunks} chunks, {reflections} reflections");
+        return Ok(());
     }
 
     if let Some(Commands::Ratify {
@@ -837,6 +954,7 @@ async fn run() -> Result<()> {
         json,
         budget_chars,
         sidechains,
+        include_system,
     }) = args.command
     {
         use csr_engine::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
@@ -876,6 +994,7 @@ async fn run() -> Result<()> {
             json,
             budget_chars,
             sidechains,
+            include_system,
         };
         let out = csr_engine::transcript::run(&args.projects_dir, &req);
         print!("{out}");
@@ -1037,6 +1156,29 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Commands::BackfillCodexTimestamps) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Storage only — this backfill never touches embeddings or the HNSW
+        // index, so it does not need a full `Engine` (1.2 GB load, possible
+        // index rebuild/dump on a cache miss).
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let stats = csr_engine::import::codex_rollout::restamp_codex_chunk_timestamps(&storage)?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
+    if let Some(Commands::BackfillCodexHarnessStrip) = args.command {
+        if let Some(parent) = args.db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+        let stats = csr_engine::import::codex_rollout::invalidate_polluted_codex_rollouts(&eng)?;
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
     if let Some(Commands::Backfill {
         action:
             BackfillAction::Intent {
@@ -1087,18 +1229,30 @@ async fn run() -> Result<()> {
     }
 
     if let Some(Commands::Backfill {
-        action: BackfillAction::Scrub {
-            dry_run,
-            conversation,
-        },
+        action:
+            BackfillAction::Scrub {
+                dry_run,
+                conversation,
+                agent_transcripts,
+            },
     }) = &args.command
     {
         let report = if *dry_run {
             let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
-            csr_engine::import::scrub::dry_run_scrub(&storage, conversation.as_deref())?
+            csr_engine::import::scrub::dry_run_scrub(
+                &storage,
+                conversation.as_deref(),
+                *agent_transcripts,
+            )?
         } else {
             let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-            csr_engine::import::scrub::run_scrub(&eng, false, conversation.as_deref()).await?
+            csr_engine::import::scrub::run_scrub(
+                &eng,
+                false,
+                conversation.as_deref(),
+                *agent_transcripts,
+            )
+            .await?
         };
         print!("{}", report.format_text(*dry_run));
         if !dry_run {
@@ -1322,16 +1476,27 @@ async fn run() -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Write-only hooks (precompact, session-end) import a transcript but
-        // never search, so build an import-only engine that skips loading and
-        // re-dumping the whole HNSW graph — the dominant cost of these hooks on
-        // a large corpus. Everyone else needs the loaded index.
-        let eng = if csr_engine::hooks::is_import_only_hook(name) {
-            engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
-        } else {
-            engine::Engine::new(&args.db_path, &args.projects_dir)?
+        // Read the input before building the engine: whether this invocation
+        // will query the index depends on it (a harness turn or a "continue"
+        // never searches), and loading the whole HNSW graph is the dominant
+        // cost of a hook process on a large corpus. Hooks that only import or
+        // write run on the import-only engine, which skips that load and the
+        // re-dump. Everyone else needs the loaded index.
+        let stdin_started = std::time::Instant::now();
+        let input = csr_engine::hooks::read_stdin_json();
+        let stdin_elapsed = stdin_started.elapsed();
+        let eng = {
+            // Hook stdout is the injection channel. A stale or missing cache
+            // makes `Engine::new` rebuild through hnsw_rs, which prints to
+            // stdout; keep that off the channel until the handler owns it.
+            let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
+            if csr_engine::hooks::hook_needs_index(name, &input) {
+                engine::Engine::new(&args.db_path, &args.projects_dir)?
+            } else {
+                engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
+            }
         };
-        csr_engine::hooks::dispatch_hook(name, &eng).await?;
+        csr_engine::hooks::dispatch_hook(name, &eng, input, stdin_elapsed).await?;
         return Ok(());
     }
 
@@ -1339,6 +1504,46 @@ async fn run() -> Result<()> {
     if let Some(parent) = args.db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+
+    // `--bench` never reaches `serve_mcp`, so it must not claim stdout: a
+    // claim that is dropped without `into_async_writer` ever being called
+    // leaks the saved descriptor and leaves fd 1 pointed at stderr for
+    // whatever's left of the process. Settling this ahead of the
+    // `should_serve`/claim below (rather than after `Engine::new`, where it
+    // used to sit) also means `--bench` no longer pays for building a whole
+    // `Engine` just to print this line.
+    if args.bench {
+        tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
+        return Ok(());
+    }
+
+    // Whether this run serves MCP only depends on `args`, so it can be
+    // computed before `Engine::new` — which it now has to be: stdout has to
+    // be claimed for the JSON-RPC channel *before* `Engine::new` runs, since
+    // that call is what triggers the index rebuild/backfill that can print
+    // through hnsw_rs.
+    let should_serve = args.serve
+        || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
+
+    // MCP stdout is the JSON-RPC transport for the lifetime of this process,
+    // not just for the duration of `Engine::new`: the server also runs
+    // `spawn_enrichment_loops` and, with `--watch`, the file importer,
+    // in-process, and both insert into the same HNSW index that can print
+    // through hnsw_rs at any point in the session, not only at startup. A
+    // scoped guard around `Engine::new` alone (as the hook path uses) would
+    // not cover that. Claim fd 1 for the rest of the process up front; `None`
+    // when the claim fails or on non-unix falls back to the unmodified stdio
+    // transport inside `serve_mcp`. Once the claim succeeds, `serve_mcp` is
+    // reached unless the process instead exits on an error from `Engine::new`
+    // or one of `--import`/`--enrich`/`--backfill-saga` via `?` — and in that
+    // case the leaked descriptor dies with the process, since `--bench` (the
+    // one branch that would otherwise return early past this point) has
+    // already been handled above.
+    let jsonrpc_stdout = if should_serve {
+        csr_engine::hooks::ClaimedStdout::claim()
+    } else {
+        None
+    };
 
     let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
 
@@ -1364,12 +1569,10 @@ async fn run() -> Result<()> {
 
     if args.backfill_saga {
         let stats = csr_engine::import::backfill::backfill_saga_columns(&eng)?;
+        // `--backfill-saga --serve` would now send this text to stderr (fd 1
+        // was already claimed for JSON-RPC above). That combination is not a
+        // meaningful invocation, so the redirected output is acceptable.
         print!("{}", stats.format_text());
-    }
-
-    if args.bench {
-        tracing::info!("benchmark mode not yet implemented in main — use `cargo bench`");
-        return Ok(());
     }
 
     // Start file watcher if requested (runs as background task)
@@ -1379,11 +1582,8 @@ async fn run() -> Result<()> {
         None
     };
 
-    // Start MCP stdio server if --serve or no explicit action
-    let should_serve = args.serve
-        || (!args.import && !args.bench && !args.watch && !args.enrich && !args.backfill_saga);
     if should_serve {
-        eng.serve_mcp().await?;
+        eng.serve_mcp(jsonrpc_stdout, startup_identity).await?;
     } else if args.watch {
         // If watching (with or without import), keep the process alive
         tracing::info!("watching for new conversations. Press Ctrl+C to stop.");
