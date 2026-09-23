@@ -68,6 +68,14 @@ async fn main() -> Result<()> {
     let mut projects = PathBuf::from("/Users/ramakrishnanannaswamy/.claude/projects");
     let mut ids: Vec<String> = Vec::new();
     let mut query_override: Option<String> = None;
+    // Opus review finding (high, W3-K spec (b) gate): the eval gate must
+    // also verify a SCOPED run for a memory-file reflection whose project_*
+    // tag alone would not resolve to the family — `probe_reflection` only
+    // ever ran `project=all` before this, which cannot catch a row that
+    // vanishes under an explicit project filter. `--project <name>` runs the
+    // full pipeline scoped to that project alongside the existing all-scope
+    // run.
+    let mut project_override: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if let Some(q) = a.strip_prefix("q=") {
@@ -76,6 +84,8 @@ async fn main() -> Result<()> {
             db = PathBuf::from(args.next().expect("--db needs a value"));
         } else if a == "--projects-dir" {
             projects = PathBuf::from(args.next().expect("--projects-dir needs a value"));
+        } else if a == "--project" {
+            project_override = Some(args.next().expect("--project needs a value"));
         } else {
             ids.push(a);
         }
@@ -260,6 +270,32 @@ async fn main() -> Result<()> {
             .take(12)
         {
             println!("   {}", line.trim());
+        }
+
+        // Scoped run (`--project <name>`): the eval-gate check for spec (b)
+        // — a memory-file reflection whose project_* tag alone would not
+        // resolve to the family (but a bare family tag does) must still
+        // reach the page under an EXPLICIT project filter, not just
+        // project=all. `probe_reflection` never exercised this path before
+        // (Opus review finding, W3-K).
+        if let Some(project) = project_override.as_deref() {
+            let scoped_out = csr_engine::mcp::tools::reflect_on_past(
+                engine.storage(),
+                engine.embeddings(),
+                engine.search(),
+                &content,
+                6,
+                0.1,
+                Some(project),
+            )
+            .await?;
+            let scoped_rank = rank_of_id_in_rendered_output(&scoped_out, id);
+            println!(
+                "scoped reflect_on_past(own text, project={project}): rank={} (of the returned page)",
+                scoped_rank
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            );
         }
     }
     Ok(())

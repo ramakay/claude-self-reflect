@@ -56,6 +56,15 @@ pub struct StageSample {
     /// "displacers"). Empty when the target had no surviving candidate at
     /// this stage, or on every other stage.
     pub rerank_breakdown: Vec<RerankBreakdownRow>,
+    /// Every candidate's conversation id at this stage, in rank order —
+    /// what `record_stage`'s `ranked` argument already carries per-row, kept
+    /// here so a caller can post-filter the FULL ranked list (e.g. strip
+    /// contaminated conversations from the `final_page` stage before
+    /// counting a decontaminated hit@N) rather than only ever seeing the
+    /// single target's rank. Opus review finding (W3-K EVAL GATE): the
+    /// probe's prior "decontaminated hit@6" was a brute-force embedding
+    /// ground truth, not a number the real pipeline ever produced.
+    pub ranked_conversations: Vec<String>,
 }
 
 /// One candidate's rerank score decomposition, captured for [`StageSample`]'s
@@ -127,6 +136,7 @@ pub(crate) fn record_stage(stage: &'static str, ranked: &[(String, String, f32)]
             target_score: hit.map(|(_, (_, _, score))| *score),
             target_fts_rank: None,
             rerank_breakdown: Vec::new(),
+            ranked_conversations: ranked.iter().map(|(_, conv, _)| conv.clone()).collect(),
         });
     });
 }

@@ -618,6 +618,18 @@ async fn main() -> Result<()> {
     // in the global contamination set — its own recall can't be scored
     // meaningfully once its content is what "decontaminated" would exclude.
     let mut decontam_hit_counts: HashMap<&str, (usize, usize)> = HashMap::new();
+    /// Opus review finding (high, W3-K EVAL GATE item 3): the brute-force
+    /// number above is ground truth over raw embeddings, never a number the
+    /// real pipeline produces. This runs the REAL `reflect_on_past` (scoped
+    /// to the conversation's own project, the realistic call shape) at an
+    /// overfetched limit, strips global-contamination conversations from the
+    /// `final_page` stage's full ranked list, then re-counts hit@6 over the
+    /// filtered survivors — a genuine pipeline decontaminated hit@6, not a
+    /// brute-force proxy. `None` for the same reason as the brute-force
+    /// number: the conversation is itself in the global contamination set,
+    /// or the scoped call errored.
+    const PIPELINE_DECONTAM_OVERFETCH: usize = LIMIT * 5;
+    let mut pipeline_decontam_hit_counts: HashMap<&str, (usize, usize)> = HashMap::new();
 
     for (source_label, sample) in [("codex", &codex_sample), ("claude", &claude_sample)] {
         for conv in sample {
@@ -652,6 +664,57 @@ async fn main() -> Result<()> {
                     conv.conversation_id
                 ),
             }
+
+            let pipeline_decontam_hit = if global_contamination.contains(&conv.conversation_id) {
+                None
+            } else {
+                let (result, overfetch_samples) = stage_probe::scope(&conv.conversation_id, || {
+                    csr_engine::mcp::tools::reflect_on_past(
+                        engine.storage(),
+                        engine.embeddings(),
+                        engine.search(),
+                        &conv.query_text,
+                        PIPELINE_DECONTAM_OVERFETCH,
+                        0.1,
+                        Some(conv.project_name.as_str()),
+                    )
+                })
+                .await;
+                match result {
+                    Ok(_) => overfetch_samples
+                        .iter()
+                        .find(|s| s.stage == "final_page")
+                        .map(|final_page| {
+                            final_page
+                                .ranked_conversations
+                                .iter()
+                                .filter(|c| !global_contamination.contains(*c))
+                                .take(LIMIT)
+                                .any(|c| c == &conv.conversation_id)
+                        }),
+                    Err(_) => None,
+                }
+            };
+            match pipeline_decontam_hit {
+                Some(hit) => {
+                    let entry = pipeline_decontam_hit_counts
+                        .entry(source_label)
+                        .or_insert((0, 0));
+                    entry.1 += 1;
+                    if hit {
+                        entry.0 += 1;
+                    }
+                    println!(
+                        "  {source_label:<6} {} decontam_hit@6(pipeline, overfetch={PIPELINE_DECONTAM_OVERFETCH})={hit}",
+                        conv.conversation_id
+                    );
+                }
+                None => println!(
+                    "  {source_label:<6} {} decontam_hit@6(pipeline)=n/a (self-contaminated or error)",
+                    conv.conversation_id
+                ),
+            }
+
             for (scope_label, project) in [
                 ("scoped", Some(conv.project_name.as_str())),
                 ("unscoped", None),
@@ -749,6 +812,18 @@ async fn main() -> Result<()> {
     );
     for source in ["codex", "claude"] {
         if let Some((hits, total)) = decontam_hit_counts.get(source) {
+            println!(
+                "  {source}: {hits}/{total} = {:.1}%",
+                100.0 * (*hits as f64) / (*total as f64).max(1.0)
+            );
+        }
+    }
+    println!(
+        "\n--- decontaminated hit@6 summary (REAL pipeline, overfetch={PIPELINE_DECONTAM_OVERFETCH}, \
+         contaminated conversations stripped from the final page before counting) ---"
+    );
+    for source in ["codex", "claude"] {
+        if let Some((hits, total)) = pipeline_decontam_hit_counts.get(source) {
             println!(
                 "  {source}: {hits}/{total} = {:.1}%",
                 100.0 * (*hits as f64) / (*total as f64).max(1.0)
