@@ -119,45 +119,77 @@ pub const EXPLICIT_MEMORY_TAG: &str = "csr:memory";
 /// the same undated floor `score_fts_candidate` gives a keyword-only chunk.
 const FTS_REFLECTION_SCORE: f32 = 0.40;
 
+/// Tags that mark a reflection row as pipeline-derived (a story, episode,
+/// briefing, cache or extraction) rather than a deliberate memory write. A
+/// derived tag always wins over [`EXPLICIT_MEMORY_TAG`]: the summarizer/story
+/// paths route through the same storage helper the MCP `store_reflection`
+/// tool uses, so a derived row can carry both tags, and standing must follow
+/// what the row actually is, not what it happens to be stamped with.
+const DERIVED_REFLECTION_TAGS: &[&str] = &[
+    "session_story",
+    "session_episode",
+    "session_briefing",
+    "context_cache",
+];
+
+pub(crate) fn has_derived_reflection_tag(tags: &[String]) -> bool {
+    tags.iter()
+        .any(|t| t.starts_with("narrative_") || DERIVED_REFLECTION_TAGS.contains(&t.as_str()))
+}
+
 /// Whether a reflection row is an explicit memory write (the `store_reflection`
-/// tool) rather than a pipeline-derived narrative. Rows carrying
-/// [`EXPLICIT_MEMORY_TAG`] are explicit by construction; rows written before the
-/// stamp existed are recognised by shape: a UUID id (every derived writer uses a
-/// `v3_` / `extracted` / `story_` / `heuristic` / `fact_` prefix) with none of
-/// the derived-pipeline tags.
+/// tool) rather than a pipeline-derived narrative. A derived tag
+/// (`session_story`/`session_episode`/`session_briefing`/`context_cache`/
+/// `narrative_*`) always disqualifies a row, even alongside
+/// [`EXPLICIT_MEMORY_TAG`] — see [`has_derived_reflection_tag`]. Absent a
+/// derived tag, rows carrying [`EXPLICIT_MEMORY_TAG`] are explicit by
+/// construction; rows written before the stamp existed are recognised by
+/// shape: a UUID id (every derived writer uses a `v3_` / `extracted` /
+/// `story_` / `heuristic` / `fact_` prefix).
 pub(crate) fn is_explicit_memory(id: &str, tags: &[String]) -> bool {
+    if has_derived_reflection_tag(tags) {
+        return false;
+    }
     if tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
         return true;
     }
-    if !is_uuid(id) {
-        return false;
-    }
-    const DERIVED_TAGS: &[&str] = &[
-        "session_story",
-        "session_episode",
-        "session_briefing",
-        "context_cache",
-    ];
-    !tags
-        .iter()
-        .any(|t| t.starts_with("narrative_") || DERIVED_TAGS.contains(&t.as_str()))
+    is_uuid(id)
 }
 
-/// Recall standing for a reflection candidate. Explicit memory writes rank with
+/// Below this raw (pre-decay, pre-scope) cosine, an explicit memory does not
+/// clear the recall floor and must not be granted UserHistory standing — same
+/// floor `format::QUICK_CHECK_FLOOR` uses to call a match "weak": below it,
+/// cosine similarity on this corpus is not calibrated enough to trust as a
+/// relevance signal, let alone lift with a flat +0.50. Without this gate a
+/// legacy uuid-shaped reflection at cosine 0.12 outranked the actually
+/// relevant chunk for the query — measured live 2026-09-22, project
+/// EnhanceMe: `ca488584` (raw 0.116, adj 0.616) and `54dbda97` (raw 0.114,
+/// adj 0.614) both outranked the target codex chunk at cosine 0.549.
+const EXPLICIT_MEMORY_STANDING_FLOOR: f32 = crate::format::QUICK_CHECK_FLOOR;
+
+/// Recall standing for a reflection candidate. Explicit memory writes that
+/// clear [`EXPLICIT_MEMORY_STANDING_FLOOR`] on raw cosine rank with
 /// user-history standing: `search::rerank` gives user-authored chunks a flat
 /// `W_USER` boost, and without equal standing an exact memory match (cosine
 /// 1.0) lost the page to any user chunk above cosine ~0.5 — measured live
 /// 2026-09-22: seven 0.63-cosine user chunks scored 1.13 against the memory's
-/// 1.00. Derived narratives keep their cached provenance floor. This is a
-/// ranking policy only: it never writes `reflections.min_trust`, and the row's
-/// provenance event stays Unknown
+/// 1.00. Below the floor the boost does not apply — the row keeps its
+/// derived-narrative treatment (cached provenance floor, usually Unknown) —
+/// so a memory that is only weakly (or not at all) related to the query
+/// cannot use a raw cosine as low as `EXPLICIT_MEMORY_STANDING_FLOOR - 1` to
+/// jump above genuinely relevant content. `raw_cosine` is 0.0 for
+/// keyword-only reflection hits (no HNSW cosine exists), which conservatively
+/// keeps them off this boost too — their own keyword channel still surfaces
+/// them (see `fuse_rrf`). This is a ranking policy only: it never writes
+/// `reflections.min_trust`, and the row's provenance event stays Unknown
 /// (`reflection_tags_cannot_raise_its_observed_event_above_unknown`).
 fn reflection_recall_standing(
     storage: &Storage,
     id: &str,
     tags: &[String],
+    raw_cosine: f32,
 ) -> crate::provenance::TrustTier {
-    if is_explicit_memory(id, tags) {
+    if is_explicit_memory(id, tags) && raw_cosine >= EXPLICIT_MEMORY_STANDING_FLOOR {
         return crate::provenance::TrustTier::UserHistory;
     }
     storage
@@ -440,6 +472,62 @@ pub fn search_mode_from(value: Option<&str>) -> SearchMode {
         Some("fts") => SearchMode::Fts,
         _ => SearchMode::Hybrid,
     }
+}
+
+/// An out-of-family reflection keeps its fused rank under an explicit project
+/// filter when it is among the first K rows of the reflection keyword ranking.
+/// The keyword channel OR-joins single query words, so merely matching is weak
+/// evidence; leading the ranking is not. Measured live 2026-09-23: a real
+/// burst answer (a May story from the sibling Anukriti-Campaigns project, only
+/// reachable as `[keyword] [story]`) and its narrative ranked 1 and 2, while
+/// the rows that leaked into project=EnhanceMe ranked 15, 21 and 24 (and 38 on
+/// the other query).
+const OUT_OF_FAMILY_KEYWORD_TOP_K: usize = 3;
+
+/// Stable partition under an explicit project filter: weak out-of-family
+/// reflections/stories sink below every other result, everything else keeps
+/// its fused order. Chunk search is already pre-filtered to the family, so
+/// only reflection rows can be out of family. A reflection is in family when
+/// its resolved project or ANY of its tags (bare, or with the `project_`
+/// prefix stripped) is in the family: explicit memories often carry the bare
+/// project name next to a topical `project_<topic>` tag. An out-of-family row
+/// keeps its place when its raw cosine clears `QUICK_CHECK_FLOOR` (a strong
+/// sibling-project answer, e.g. a May story tagged with a sibling project that
+/// a real burst query needed) and sinks when it does not (live 2026-09-23,
+/// project=EnhanceMe: an anukriti story at 0.121 and an unknown-project
+/// reflection at 0.116 sat at ranks 5-6). A row at the very top of the
+/// reflection keyword ranking also keeps its place (see
+/// [`OUT_OF_FAMILY_KEYWORD_TOP_K`]). No-op without an explicit project.
+fn sink_out_of_family_under_explicit_scope(
+    enriched: &mut Vec<EnrichedResult>,
+    scope: &SearchProjectScope,
+    reflection_tags: &HashMap<String, Vec<String>>,
+    reflection_raw_cosine: &HashMap<String, f32>,
+    reflection_keyword_ids: &HashSet<&str>,
+) {
+    if scope.effective_project.is_none() {
+        return;
+    }
+    let in_family = |e: &EnrichedResult| {
+        if scope.is_family(&e.chunk.project_name) {
+            return true;
+        }
+        reflection_tags.get(&e.chunk.id).is_some_and(|tags| {
+            tags.iter()
+                .any(|t| scope.is_family(t.strip_prefix("project_").unwrap_or(t)))
+        })
+    };
+    let strong = |e: &EnrichedResult| {
+        reflection_keyword_ids.contains(e.chunk.id.as_str())
+            || reflection_raw_cosine
+                .get(&e.chunk.id)
+                .is_some_and(|c| *c >= crate::format::QUICK_CHECK_FLOOR)
+    };
+    let (keep, sink): (Vec<_>, Vec<_>) = std::mem::take(enriched)
+        .into_iter()
+        .partition(|e| in_family(e) || strong(e));
+    enriched.extend(keep);
+    enriched.extend(sink);
 }
 
 fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<String> {
@@ -1052,7 +1140,11 @@ async fn reflect_gather_pass(
     // content. Tags are kept per id so the rerank below can tell explicit
     // memory writes from derived narratives (`reflection_recall_standing`).
     let mut reflection_tags: HashMap<String, Vec<String>> = HashMap::new();
+    // Raw (pre-decay, pre-scope) cosine per semantic reflection hit, so the
+    // standing grant can be gated by actual relevance.
+    let mut reflection_raw_cosine: HashMap<String, f32> = HashMap::new();
     for r in &reflection_results {
+        reflection_raw_cosine.insert(r.id.clone(), r.score);
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
                 let events = reflection_tad_events
@@ -1290,7 +1382,15 @@ async fn reflect_gather_pass(
             // Reflection ids are not chunk ids: the chunk floor lookup would
             // read Unknown for every one of them.
             min_trust: match reflection_tags.get(&e.chunk.id) {
-                Some(tags) => reflection_recall_standing(storage, &e.chunk.id, tags),
+                Some(tags) => reflection_recall_standing(
+                    storage,
+                    &e.chunk.id,
+                    tags,
+                    reflection_raw_cosine
+                        .get(&e.chunk.id)
+                        .copied()
+                        .unwrap_or(0.0),
+                ),
                 None => storage
                     .get_chunk_min_trust(&e.chunk.id)
                     .unwrap_or(crate::provenance::TrustTier::Unknown),
@@ -1488,6 +1588,26 @@ async fn reflect_gather_pass(
             .unwrap_or(usize::MAX)
     };
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+    // Under an explicit project filter, chunk search is already restricted to
+    // the project family, but reflections and stories are not: RRF places them
+    // by rank, so a cosine-0.12 story from another project could sit above
+    // in-family hits (measured live 2026-09-23, project=EnhanceMe: ranks 5-7
+    // were an anukriti story, an unknown-project reflection and a subagent
+    // extraction). Sink out-of-family rows below every in-family row instead
+    // of dropping them: a hard drop lost the answer to a real burst query
+    // (a May story tagged with a sibling project name).
+    let reflection_keyword_ids: HashSet<&str> = reflection_fts_hits
+        .iter()
+        .filter(|(_, ordinal, _)| *ordinal < OUT_OF_FAMILY_KEYWORD_TOP_K)
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    sink_out_of_family_under_explicit_scope(
+        &mut enriched,
+        scope,
+        &reflection_tags,
+        &reflection_raw_cosine,
+        &reflection_keyword_ids,
+    );
 
     // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
     // ranked plan chunk survive while its origin conversation fell outside the
@@ -3877,6 +3997,279 @@ mod tests {
         ));
         assert!(!is_explicit_memory("v3_abc", &["context_cache".into()]));
         assert!(!is_explicit_memory("extracted_1", &["free".into()]));
+    }
+
+    #[test]
+    fn derived_tag_overrides_explicit_memory_stamp() {
+        let uuid = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        assert!(
+            !is_explicit_memory(
+                uuid,
+                &["session_story".into(), EXPLICIT_MEMORY_TAG.to_string()]
+            ),
+            "a stamped session_story must not count as an explicit memory"
+        );
+        assert!(!is_explicit_memory(
+            uuid,
+            &[
+                "narrative_extracted_v3".into(),
+                EXPLICIT_MEMORY_TAG.to_string()
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn weak_similarity_memory_does_not_outrank_relevant_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        // Relevant chunk: cosine 0.55 to the query, no standing of its own.
+        let relevant_cosine = 0.55_f32;
+        let relevant_vector = vec![
+            relevant_cosine,
+            (1.0 - relevant_cosine * relevant_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let chunk = crate::import::ConversationChunk {
+            id: "relevant-chunk".into(),
+            conversation_id: "conv-relevant".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "the codex revival is blocked on the iOS deploy step".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &relevant_vector).unwrap();
+        engine.insert_chunk(chunk.id.clone(), relevant_vector);
+
+        // Legacy uuid-shaped memory: cosine 0.12, well under the floor.
+        let weak_cosine = 0.12_f32;
+        let weak_vector = vec![
+            weak_cosine,
+            (1.0 - weak_cosine * weak_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let memory_id = "ca488584-0000-4000-8000-000000000001";
+        storage
+            .insert_reflection(
+                memory_id,
+                "an unrelated anukriti campaign note",
+                &["anukriti".to_string()],
+                &weak_vector,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), weak_vector);
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival 2026 iOS deploy blocker where stuck",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_eq!(
+            &out[start..end],
+            "conv-relevant",
+            "a cosine-0.12 memory must not outrank a cosine-0.55 relevant chunk:\n{out}"
+        );
+    }
+
+    async fn first_cid_for_scope(project: &str, chunk_cos: f32, story_cos: f32) -> String {
+        first_cid_for_scope_tagged(
+            project,
+            chunk_cos,
+            story_cos,
+            &["session_story", "project_sinkscope-away"],
+        )
+        .await
+    }
+
+    async fn first_cid_for_scope_tagged(
+        project: &str,
+        chunk_cos: f32,
+        story_cos: f32,
+        story_tags: &[&str],
+    ) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk_vec = vec![chunk_cos, (1.0 - chunk_cos * chunk_cos).sqrt(), 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "in-family-chunk".into(),
+            conversation_id: "conv-in-family".into(),
+            project_name: "sinkscope-home".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "deploy notes for the home project".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &chunk_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), chunk_vec);
+        let story_vec = vec![story_cos, (1.0 - story_cos * story_cos).sqrt(), 0.0, 0.0];
+        storage
+            .insert_reflection(
+                "story_elsewhere",
+                "a story from a different project",
+                &story_tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story_elsewhere".to_string(), story_vec);
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "deploy notes",
+            2,
+            0.0,
+            Some(project),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        out[start..end].to_string()
+    }
+
+    // Vector mode already multiplies an out-of-family score by 0.3, so the
+    // story must beat the chunk after that multiplier for the sink to decide.
+    #[tokio::test]
+    async fn explicit_scope_sinks_weak_out_of_family_story_below_in_family_hits() {
+        // story 0.40 * 0.3 = 0.12 beats chunk 0.10 without the sink.
+        assert_eq!(
+            first_cid_for_scope("sinkscope-home", 0.10, 0.40).await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_a_strong_out_of_family_story_in_place() {
+        // story 0.95 clears QUICK_CHECK_FLOOR; 0.95 * 0.3 = 0.285 beats 0.20.
+        assert_ne!(
+            first_cid_for_scope("sinkscope-home", 0.20, 0.95).await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_family_tag_keeps_a_memory_with_a_topical_project_tag_in_family() {
+        // Live shape of e97fa3b4: a bare project tag plus a topical project_
+        // tag that resolves the row's project elsewhere. It must not sink.
+        assert_ne!(
+            first_cid_for_scope_tagged(
+                "sinkscope-home",
+                0.10,
+                0.40,
+                &["sinkscope-home", "project_sinkscope-topic"],
+            )
+            .await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_a_keyword_matched_out_of_family_story_in_place() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk_vec = vec![0.10_f32, (1.0_f32 - 0.01).sqrt(), 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "in-family-chunk".into(),
+            conversation_id: "conv-in-family".into(),
+            project_name: "sinkscope-home".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "unrelated deploy notes".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &chunk_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), chunk_vec);
+        // Weak semantically (0.40, under the floor) but its text carries the
+        // query's own terms, so the keyword channel finds it.
+        let story_vec = vec![0.40_f32, (1.0_f32 - 0.16).sqrt(), 0.0, 0.0];
+        storage
+            .insert_reflection(
+                "story_sibling",
+                "morning mantras pronunciation comment on the reel",
+                &[
+                    "session_story".to_string(),
+                    "project_sinkscope-away".to_string(),
+                ],
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story_sibling".to_string(), story_vec);
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "morning mantras pronunciation",
+            2,
+            0.0,
+            Some("sinkscope-home"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_ne!(
+            &out[start..end],
+            "conv-in-family",
+            "a keyword-matched sibling-project story must keep its fused rank:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unscoped_search_keeps_the_better_out_of_family_story_first() {
+        assert_ne!(
+            first_cid_for_scope("all", 0.10, 0.40).await,
+            "conv-in-family"
+        );
     }
 
     /// Seven user-authored chunks at cosine 0.63 to the query (the live shape
