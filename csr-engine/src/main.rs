@@ -591,6 +591,18 @@ fn default_projects_dir() -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    let started = std::time::Instant::now();
+    let args = Args::parse();
+    if matches!(&args.command, Some(Commands::Hook { name, .. }) if name == "prompt-submit") {
+        let _ = std::panic::catch_unwind(|| {
+            csr_engine::hooks::prompt_transport::run_client(
+                &args.db_path,
+                &args.projects_dir,
+                started,
+            );
+        });
+        return Ok(());
+    }
     // Raise the open-file ceiling before any index load so a low soft RLIMIT_NOFILE
     // cannot turn a transient EMFILE inside hnsw_rs's mmap load into a process exit.
     csr_engine::runtime::raise_fd_limit();
@@ -599,7 +611,7 @@ fn main() -> Result<()> {
         .worker_threads(workers)
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(args));
     // `run()` can return while a `spawn_blocking` task the daemon's
     // compaction loop started (inside `Engine::rebuild_search_index`) is
     // still streaming an HNSW rebuild on the blocking pool — shutdown
@@ -619,15 +631,13 @@ fn main() -> Result<()> {
     result
 }
 
-async fn run() -> Result<()> {
+async fn run(args: Args) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_writer(std::io::stderr)
         .init();
-
-    let args = Args::parse();
 
     // Handle subcommands that don't need Engine::new()
     if let Some(Commands::Setup { anthropic_key }) = args.command {
@@ -1453,7 +1463,7 @@ async fn run() -> Result<()> {
             // stdout; keep that off the channel until the handler owns it.
             let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
             if csr_engine::hooks::hook_needs_index(name, &input) {
-                engine::Engine::new(&args.db_path, &args.projects_dir)?
+                engine::Engine::new_for_hook(&args.db_path, &args.projects_dir)?
             } else {
                 engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
             }
