@@ -753,6 +753,17 @@ impl Daemon {
         // `Arc<AtomicBool>` every other loop uses, so shutdown is one flag.
         let journal_handle =
             crate::journal::spawn_for_daemon(self.storage.clone(), shutdown.clone());
+        let prompt_handle = crate::hooks::prompt_transport::spawn_for_daemon(
+            Arc::new(crate::engine::Engine::from_parts_with_index_dir(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+                self.index_dir.clone(),
+            )),
+            heavy_work.clone(),
+            shutdown.clone(),
+        );
         if journal_handle.is_some() {
             tracing::info!("journal server started (v10.1 journal v4)");
         }
@@ -763,6 +774,9 @@ impl Daemon {
 
         // Signal all loops to stop
         shutdown.store(true, Ordering::SeqCst);
+
+        // Stop admitting prompt requests and remove the private socket.
+        let _ = prompt_handle.await;
 
         // Give loops time to finish current work (5s timeout)
         let timeout = tokio::time::Duration::from_secs(5);
