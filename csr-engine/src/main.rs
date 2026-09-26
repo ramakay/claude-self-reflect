@@ -102,6 +102,18 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Reaction-judge shadow mode: `status`, `run` (one scoring pass now), or
+    /// `parity` (Rust packing + probabilities vs the Python fixture)
+    ReactionShadow {
+        /// status | run | parity
+        action: String,
+        /// parity: fixture JSONL (default <models dir>/parity_dev40.jsonl)
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// run: max model scorings in this pass
+        #[arg(long, default_value_t = csr_engine::reaction_shadow::DEFAULT_MAX_SCORES_PER_CYCLE)]
+        max: usize,
+    },
     /// Structured facts from a session transcript JSONL — stats, prompts,
     /// tool calls, touched files, errors, a turn-range slice, or a text
     /// grep — without hand-rolling a jq/Python parser over raw JSONL.
@@ -896,6 +908,36 @@ async fn run() -> Result<()> {
             no_llm,
             as_of.as_deref(),
         );
+    }
+
+    if let Some(Commands::ReactionShadow {
+        ref action,
+        ref fixture,
+        max,
+    }) = args.command
+    {
+        use csr_engine::reaction_shadow as rs;
+        let root = rs::models_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+        let out = match action.as_str() {
+            "parity" => rs::parity(
+                &root,
+                &fixture
+                    .clone()
+                    .unwrap_or_else(|| root.join("parity_dev40.jsonl")),
+            )?,
+            "status" => rs::status(&csr_engine::storage::Storage::open(&args.db_path)?, &root)?,
+            "run" => serde_json::to_value(rs::run_cycle(
+                &csr_engine::storage::Storage::open(&args.db_path)?,
+                &args.projects_dir,
+                &root,
+                max,
+                rs::DEFAULT_WINDOW_DAYS,
+                None,
+            )?)?,
+            other => anyhow::bail!("unknown action {other}: use status, run or parity"),
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
     }
 
     if let Some(Commands::Quality { ref path }) = args.command {

@@ -1943,6 +1943,42 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
 
+    // Reaction-judge shadow mode (src/reaction_shadow.rs): per-transcript scan
+    // state and one row per (human turn, model build). Written by the daemon
+    // only; nothing in the hook, search or injection path reads these tables.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reaction_shadow_files (
+            path       TEXT PRIMARY KEY,
+            mtime_ns   INTEGER NOT NULL,
+            size       INTEGER NOT NULL,
+            entrypoint TEXT,
+            models     TEXT NOT NULL,
+            pairs      INTEGER NOT NULL DEFAULT 0,
+            complete   INTEGER NOT NULL DEFAULT 0,
+            scanned_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reaction_shadow_scores (
+            turn_uuid              TEXT NOT NULL,
+            model                  TEXT NOT NULL,
+            model_sha256           TEXT NOT NULL,
+            session_id             TEXT NOT NULL,
+            project_dir            TEXT NOT NULL,
+            ts                     TEXT,
+            p_correction           REAL NOT NULL,
+            p_acceptance           REAL NOT NULL,
+            n_tokens               INTEGER NOT NULL,
+            previous_human_request TEXT NOT NULL,
+            assistant_tail         TEXT NOT NULL,
+            human_turn             TEXT NOT NULL,
+            scored_at              TEXT NOT NULL,
+            PRIMARY KEY (turn_uuid, model_sha256)
+        );
+        CREATE INDEX IF NOT EXISTS idx_reaction_shadow_session
+            ON reaction_shadow_scores(session_id);
+        CREATE INDEX IF NOT EXISTS idx_reaction_shadow_ts
+            ON reaction_shadow_scores(ts);",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

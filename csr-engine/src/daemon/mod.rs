@@ -640,6 +640,70 @@ impl Daemon {
         };
         tracing::info!("trained re-ranker nightly loop started");
 
+        // Reaction-judge shadow mode: score new interactive (assistant tail,
+        // human turn) pairs with every installed student and log the
+        // probabilities. First pass after a minute, then every 15 minutes, under
+        // the heavy-work permit; models load per pass and are dropped after it.
+        // Nothing reads the scores back, so behaviour does not change.
+        let reaction_shadow_handle = {
+            let storage = self.storage.clone();
+            let projects_dir = self.projects_dir.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                if crate::reaction_shadow::disabled() {
+                    tracing::info!("reaction shadow loop disabled via CSR_NO_REACTION_SHADOW");
+                    return;
+                }
+                let mut waits = 6;
+                loop {
+                    for _ in 0..waits {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    waits = 90;
+                    let Some(models_root) = crate::reaction_shadow::models_dir() else {
+                        continue;
+                    };
+                    if crate::reaction_shadow::installed_specs(&models_root).is_empty() {
+                        continue;
+                    }
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    let s = storage.clone();
+                    let projects_dir = projects_dir.clone();
+                    let shutdown = shutdown.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::reaction_shadow::run_cycle(
+                            &s,
+                            &projects_dir,
+                            &models_root,
+                            crate::reaction_shadow::DEFAULT_MAX_SCORES_PER_CYCLE,
+                            crate::reaction_shadow::DEFAULT_WINDOW_DAYS,
+                            Some(&shutdown),
+                        ) {
+                            Ok(sum) if sum.scores_written > 0 || sum.errors > 0 => tracing::info!(
+                                scores = sum.scores_written,
+                                pairs_seen = sum.pairs_seen,
+                                files_parsed = sum.files_parsed,
+                                errors = sum.errors,
+                                budget_exhausted = sum.budget_exhausted,
+                                "reaction shadow pass"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("reaction shadow pass failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+
         // Compaction loop: every ~5 minutes, checks for the `needs_compaction`
         // marker a foreground process (`Engine::new` in an MCP server, hook, or
         // CLI query command) leaves when it finds the loaded HNSW cache
@@ -739,6 +803,7 @@ impl Daemon {
         // transactionally. Await it so shutdown cannot detach a half-harvested
         // training attempt.
         let _ = trained_rerank_handle.await;
+        let _ = tokio::time::timeout(timeout, reaction_shadow_handle).await;
         // The loop itself races an in-flight rebuild against the shutdown
         // flag (see the compaction loop above) and returns within one
         // `wait_for_shutdown` poll interval (~200ms) if shutdown wins
