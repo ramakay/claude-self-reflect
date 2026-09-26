@@ -111,11 +111,15 @@ fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
 /// `--strict-mcp-config` also avoids spawning a recursive csr-engine MCP server
 /// and gives the fastest possible `claude -p` startup.
 pub fn minimal_mcp_config() -> anyhow::Result<std::path::PathBuf> {
-    let config = serde_json::json!({ "mcpServers": {} });
     let dir = dirs::home_dir()
         .map(|h| h.join(".claude-self-reflect"))
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    std::fs::create_dir_all(&dir).ok();
+    minimal_mcp_config_in(&dir)
+}
+
+fn minimal_mcp_config_in(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let config = serde_json::json!({ "mcpServers": {} });
+    std::fs::create_dir_all(dir).ok();
     let path = dir.join("briefing-mcp.json");
 
     // Atomic write. All three call sites can run concurrently, so a plain
@@ -445,7 +449,8 @@ mod tests {
 
     #[test]
     fn test_minimal_mcp_config_is_empty() {
-        let path = minimal_mcp_config().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = minimal_mcp_config_in(dir.path()).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let servers = v["mcpServers"].as_object().unwrap();
