@@ -144,6 +144,12 @@ struct ProbeCache {
 }
 
 fn cache_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    return Some(std::env::temp_dir().join(format!(
+        "csr-test-intent-probes-{}.json",
+        std::process::id()
+    )));
+    #[cfg(not(test))]
     dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("intent_probes.json"))
 }
 
