@@ -15,6 +15,7 @@
 //! Always returns Ok(()) — never blocks Claude Code (catch-all wrapper).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -53,8 +54,9 @@ const MAX_CHUNK_AGE_DAYS: i64 = 21;
 /// Handle the prompt-submit hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
-    if let Err(e) = handle_inner(input, engine, cwd).await {
-        eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e);
+    match render(input, engine, cwd).await {
+        Ok(output) => print!("{output}"),
+        Err(e) => eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e),
     }
 
     // Chunk the active transcript after injection is printed to stdout.
@@ -77,7 +79,170 @@ const MAX_SYMBOL_PROBES: usize = 12;
 /// Maximum age (in minutes) to apply continuity boost.
 const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 
-async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+/// Render the complete injection without touching process stdout or importing a
+/// transcript. Both the legacy handler and the daemon use this exact pipeline.
+pub async fn render(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<String> {
+    Ok(prepare(input, engine, cwd).await?.delivered())
+}
+
+pub(super) struct PreparedPrompt {
+    pub text: String,
+    effects: PendingEffects,
+}
+
+impl PreparedPrompt {
+    pub fn delivered(mut self) -> String {
+        self.effects.commit();
+        self.text
+    }
+}
+
+/// Exposure bookkeeping is committed only after the hook acknowledges a full
+/// response. A timeout must not teach the reranker that undelivered text was seen.
+pub(super) async fn prepare(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+) -> Result<PreparedPrompt> {
+    let mut prepared = PreparedPrompt {
+        text: String::new(),
+        effects: PendingEffects {
+            storage: engine.storage().clone(),
+            impressions: Vec::new(),
+            retrievals: Vec::new(),
+            dream_claims: Vec::new(),
+        },
+    };
+    handle_inner(
+        input,
+        engine,
+        cwd,
+        &mut prepared.text,
+        &mut prepared.effects,
+    )
+    .await?;
+    Ok(prepared)
+}
+
+struct PendingImpression {
+    session: Option<String>,
+    project: String,
+    surface: String,
+    query: Option<String>,
+    embedding: Option<Vec<f32>>,
+    intent: String,
+    items: Vec<ExposureItem>,
+}
+
+struct PendingEffects {
+    storage: std::sync::Arc<crate::storage::Storage>,
+    impressions: Vec<PendingImpression>,
+    retrievals: Vec<(String, String, String)>,
+    dream_claims: Vec<(String, Option<String>)>,
+}
+
+impl PendingEffects {
+    #[allow(clippy::too_many_arguments)]
+    fn record_impression(
+        &mut self,
+        session: Option<&str>,
+        project: &str,
+        surface: &str,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        intent: &str,
+        items: Vec<ExposureItem>,
+    ) {
+        self.impressions.push(PendingImpression {
+            session: session.map(str::to_owned),
+            project: project.into(),
+            surface: surface.into(),
+            query: query.map(str::to_owned),
+            embedding: embedding.map(ToOwned::to_owned),
+            intent: intent.into(),
+            items,
+        });
+    }
+
+    fn commit(&mut self) {
+        // The claims are now receipts and must survive this value's drop.
+        self.dream_claims.clear();
+        for (id, source, session) in self.retrievals.drain(..) {
+            let _ = self
+                .storage
+                .log_retrieval_event(&id, &source, "prompt_submit", &session);
+        }
+        for item in self.impressions.drain(..) {
+            super::exposure::record_impression(
+                &self.storage,
+                item.session.as_deref(),
+                &item.project,
+                &item.surface,
+                item.query.as_deref(),
+                item.embedding.as_deref(),
+                &item.intent,
+                item.items,
+            );
+        }
+    }
+}
+
+impl Drop for PendingEffects {
+    fn drop(&mut self) {
+        // Only claims won by this render are listed. Keep the claim throughout
+        // rendering to preserve cross-process dedupe, but release it if no full
+        // response was acknowledged. On the daemon this always runs on its one
+        // blocking render worker, with the admission permits still held.
+        for (id, session) in self.dream_claims.drain(..) {
+            let _ = self.storage.with_connection(|conn| {
+                conn.execute("DELETE FROM dream_deliveries WHERE dream_id = ?1 AND channel = 'prompt' AND session_id IS ?2",
+                    rusqlite::params![id, session])?;
+                Ok(())
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn undelivered_dream_claim_is_released_but_acknowledged_claim_survives() {
+    use crate::storage::dream_delivery::{already_delivered, claim_delivery, DeliveryChannel};
+    let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+    for delivered in [false, true] {
+        assert!(claim_delivery(
+            &storage,
+            "dream",
+            DeliveryChannel::Prompt,
+            Some("session")
+        ));
+        let mut pending = PendingEffects {
+            storage: storage.clone(),
+            impressions: Vec::new(),
+            retrievals: Vec::new(),
+            dream_claims: vec![("dream".into(), Some("session".into()))],
+        };
+        if delivered {
+            pending.commit();
+        }
+        drop(pending);
+        assert_eq!(
+            storage
+                .with_connection(|conn| {
+                    Ok(already_delivered(conn, "dream", DeliveryChannel::Prompt))
+                })
+                .unwrap(),
+            delivered
+        );
+    }
+}
+
+async fn handle_inner(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    output: &mut String,
+    effects: &mut PendingEffects,
+) -> Result<()> {
     // Every exit that needs neither an embedding nor the index is decided in
     // `early_exit`, which also picks the engine this process was built with.
     let prompt = input.prompt.as_deref().unwrap_or_default();
@@ -86,11 +251,12 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         Some(EarlyExit::LineagePickup) => {
             if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                 emit_pickup(
+                    output,
                     &ep,
                     &age,
                     "the user asked to continue; the episode below is the work being resumed.",
                 );
-                record_episode_exposure(input, engine, cwd, prompt, None, "continue", &ep, None);
+                record_episode_exposure(input, effects, cwd, prompt, None, "continue", &ep, None);
             }
             return Ok(());
         }
@@ -136,13 +302,14 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     classified_intent = "continue";
                     if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
+                            output,
                             &ep,
                             &age,
                             "the user asked to continue; the episode below is the work being resumed.",
                         );
                         record_episode_exposure(
                             input,
-                            engine,
+                            effects,
                             cwd,
                             prompt,
                             Some(&query_vec),
@@ -157,13 +324,14 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     classified_intent = "state_recall";
                     if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
+                            output,
                             &ep,
                             &age,
                             "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
                         );
                         record_episode_exposure(
                             input,
-                            engine,
+                            effects,
                             cwd,
                             prompt,
                             Some(&query_vec),
@@ -211,10 +379,10 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     .await;
                     if let Some((ep, age, _score)) = &corr {
                         if let Some(map) = format_code_map(ep, age) {
-                            println!("{}", map);
+                            writeln!(output, "{}", map)?;
                             record_episode_exposure(
                                 input,
-                                engine,
+                                effects,
                                 cwd,
                                 prompt,
                                 Some(&query_vec),
@@ -250,9 +418,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             prompt,
             input.session_id.as_deref(),
         ) {
-            println!("{line}");
-            super::exposure::record_impression(
-                engine.storage(),
+            effects
+                .dream_claims
+                .push((dream_id.clone(), input.session_id.clone()));
+            writeln!(output, "{line}")?;
+            effects.record_impression(
                 input.session_id.as_deref(),
                 &project,
                 "prompt_submit",
@@ -283,12 +453,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             let names: Vec<(String, String)> =
                 rows.into_iter().map(|(sid, a)| (sid, a.name)).collect();
             if let Some((sid, name)) = symbol_overlap(prompt, &names) {
-                println!(
+                writeln!(output,
                     "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
                     name, sid
-                );
-                super::exposure::record_impression(
-                    engine.storage(),
+                )?;
+                effects.record_impression(
                     input.session_id.as_deref(),
                     &project,
                     "prompt_submit",
@@ -382,7 +551,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     };
     let mut preface_exposures = Vec::new();
     if let Some((ep, age, score)) = correlated {
-        print!("{}", format_semantic_pickup(&ep, &age, score));
+        output.push_str(&format_semantic_pickup(&ep, &age, score));
         preface_exposures.push(episode_exposure_item(&ep, Some(f64::from(score))));
     }
 
@@ -585,7 +754,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     if ctx.is_empty() {
         record_prompt_exposure(
             input,
-            engine,
+            effects,
             cwd,
             prompt,
             &query_vec,
@@ -597,9 +766,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
     let formatted = ctx.format_with_receipt(PROMPT_TOKEN_BUDGET);
     if !formatted.text.is_empty() {
-        // stdout injection: Claude Code prepends this to the system prompt.
-        // Uses print! (not println!) to avoid double-newline — formatter output ends with \n.
-        print!("{}", formatted.text);
+        output.push_str(&formatted.text);
     }
 
     let rendered_exposures = super::exposure::rendered_exposure_items(
@@ -612,18 +779,17 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // TAD: Log retrieval events only for actually-injected items (not filtered-out ones)
     if let Some(ref session_id) = input.session_id {
         for item in &rendered_exposures {
-            let _ = engine.storage().log_retrieval_event(
-                &item.memory_id,
-                &item.source_type,
-                "prompt_submit",
-                session_id,
-            );
+            effects.retrievals.push((
+                item.memory_id.clone(),
+                item.source_type.clone(),
+                session_id.clone(),
+            ));
         }
     }
     preface_exposures.extend(rendered_exposures);
     record_prompt_exposure(
         input,
-        engine,
+        effects,
         cwd,
         prompt,
         &query_vec,
@@ -700,7 +866,7 @@ fn scored_exposure_item(result: &predictor::ScoredResult) -> Option<ExposureItem
 #[allow(clippy::too_many_arguments)]
 fn record_prompt_exposure(
     input: &HookInput,
-    engine: &Engine,
+    effects: &mut PendingEffects,
     cwd: &Path,
     prompt: &str,
     query_vec: &[f32],
@@ -713,8 +879,7 @@ fn record_prompt_exposure(
         item.rank = rank as i64;
     }
     let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_default();
-    super::exposure::record_impression(
-        engine.storage(),
+    effects.record_impression(
         input.session_id.as_deref(),
         &project,
         "prompt_submit",
@@ -728,7 +893,7 @@ fn record_prompt_exposure(
 #[allow(clippy::too_many_arguments)]
 fn record_episode_exposure(
     input: &HookInput,
-    engine: &Engine,
+    effects: &mut PendingEffects,
     cwd: &Path,
     prompt: &str,
     query_vec: Option<&[f32]>,
@@ -737,8 +902,7 @@ fn record_episode_exposure(
     score: Option<f64>,
 ) {
     let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_default();
-    super::exposure::record_impression(
-        engine.storage(),
+    effects.record_impression(
         input.session_id.as_deref(),
         &project,
         "prompt_submit",
@@ -769,7 +933,7 @@ fn ancestry_releases_for_prompt(
 /// How a prompt leaves `handle_inner` before anything embeds it or queries
 /// the index.
 #[derive(Debug, PartialEq, Eq)]
-enum EarlyExit {
+pub(super) enum EarlyExit {
     /// Nothing to inject.
     Silent,
     /// Route A pickup by recency: SQLite only, no embedding, no index.
@@ -781,7 +945,7 @@ enum EarlyExit {
 /// engine choice made before startup cannot drift from what the handler does.
 /// Anything added here must stay index-free: these prompts run on an engine
 /// whose index is empty.
-fn early_exit(prompt: &str) -> Option<EarlyExit> {
+pub(super) fn early_exit(prompt: &str) -> Option<EarlyExit> {
     // No prompt → silent exit
     if prompt.is_empty() {
         return Some(EarlyExit::Silent);
@@ -868,13 +1032,16 @@ fn is_continuation_prompt(prompt: &str) -> bool {
 /// imperative. Used only by Route A lineage pickup (is_continuation_prompt /
 /// Continue / StateRecall) — the CONTINUUM banner is reserved for the active
 /// conversation lineage, never for a Route-B topic match.
-fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
-    println!("CSR PICKUP — {}", reason);
-    print!(
-        "{}",
-        crate::hooks::session_start::format_tier0_block(ep, &[], age)
+fn emit_pickup(output: &mut String, ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
+    output.push_str(&format!("CSR PICKUP — {}\n", reason));
+    output.push_str(&crate::hooks::session_start::format_tier0_block(
+        ep,
+        &[],
+        age,
+    ));
+    output.push_str(
+        "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.\n",
     );
-    println!("Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.");
 }
 
 /// Minimum length (both sides) before a prompt/episode-request containment
