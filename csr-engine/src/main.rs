@@ -604,6 +604,15 @@ fn default_projects_dir() -> PathBuf {
 
 fn main() -> Result<()> {
     let started = std::time::Instant::now();
+    if std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some() {
+        eprintln!(
+            "CSR timing-probe main_unix_ns={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+    }
     let args = Args::parse();
     if matches!(&args.command, Some(Commands::Hook { name, .. }) if name == "prompt-submit") {
         let _ = std::panic::catch_unwind(|| {
