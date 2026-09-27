@@ -383,6 +383,8 @@ pub fn run(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    super::embedding_changes::migrate(conn)?;
+
     // Enrichment state — tracks per-conversation progressive enrichment
     conn.execute_batch(
         "

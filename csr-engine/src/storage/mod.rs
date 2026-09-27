@@ -9,6 +9,7 @@ pub mod dream_clusters;
 pub mod dream_delivery;
 pub mod dream_items;
 pub mod dream_report;
+pub(crate) mod embedding_changes;
 pub mod intent_events;
 pub mod migrations;
 pub mod queries;

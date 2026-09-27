@@ -31,18 +31,21 @@ struct Request {
 
 // Rendering observes these switches. A differently configured daemon must
 // abstain rather than silently use different ranking or injection policy.
+const POLICY_KEYS: &[&str] = &[
+    "CSR_NO_ANTI_PATTERNS",
+    "CSR_NO_GRAPH_SLICES",
+    "CSR_TRAINED_RERANK",
+    "CSR_NO_DREAM_INJECT",
+    "CSR_DREAM_CONSUMPTION",
+    "CSR_NO_RECAP",
+    "CSR_NO_VALIDITY_PARTITION",
+];
+
 fn policy() -> Vec<Option<String>> {
-    [
-        "CSR_NO_ANTI_PATTERNS",
-        "CSR_NO_GRAPH_SLICES",
-        "CSR_TRAINED_RERANK",
-        "CSR_NO_DREAM_INJECT",
-        "CSR_DREAM_CONSUMPTION",
-        "CSR_NO_RECAP",
-    ]
-    .iter()
-    .map(|key| std::env::var(key).ok())
-    .collect()
+    POLICY_KEYS
+        .iter()
+        .map(|key| std::env::var(key).ok())
+        .collect()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,10 +62,17 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 /// covers synchronous stdin, filesystem calls, and runtime shutdown. No Rust
 /// timeout can preempt those operations. Leave scheduling margin below 3s.
 pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
+    let timing_probe = std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some();
     if std::thread::Builder::new()
         .name("prompt-deadline".into())
         .spawn(move || {
             std::thread::sleep(PROCESS_BUDGET.saturating_sub(started.elapsed()));
+            if timing_probe {
+                eprintln!(
+                    "CSR timing-probe deadline_total_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
             // Rust's exit cleanup flushes stdout and can deadlock behind a
             // writer holding its lock on a full pipe. This client owns no DB
             // or index state; bypass all cleanup to enforce its deadline.
@@ -271,9 +281,10 @@ impl Drop for BoundSocket {
 
 /// Start an independent endpoint sharing the daemon's warm engine. Single
 /// flight bounds work even if a client disappears while SQLite/ONNX is busy.
+/// Prompt work never takes the daemon heavy-work permit: a stuck renderer must
+/// not prevent reconciliation, imports, or enrichment from making progress.
 pub fn spawn_for_daemon(
     engine: Arc<Engine>,
-    heavy_work: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -308,9 +319,6 @@ pub fn spawn_for_daemon(
                 let Ok(slot) = slots.clone().try_acquire_owned() else {
                     continue;
                 };
-                let Ok(heavy) = heavy_work.clone().try_acquire_owned() else {
-                    continue;
-                };
                 let engine = engine.clone();
                 let database = database.clone();
                 tokio::spawn(async move {
@@ -337,7 +345,7 @@ pub fn spawn_for_daemon(
                         tokio::task::spawn_blocking(move || {
                             // The worker owns admission until rendering, delivery,
                             // and receipt commit/rollback have actually finished.
-                            let (_slot, _heavy) = (slot, heavy);
+                            let _slot = slot;
                             if tokio::time::Instant::now() >= deadline {
                                 return None;
                             }
@@ -382,7 +390,7 @@ pub fn spawn_for_daemon(
             }
         }
         #[cfg(not(unix))]
-        let _ = (engine, heavy_work, shutdown);
+        let _ = (engine, shutdown);
     })
 }
 
@@ -461,11 +469,7 @@ mod tests {
         assert!(expected.starts_with("CSR PICKUP —"), "{expected}");
         assert!(expected.contains("Fixed token validation"));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = spawn_for_daemon(
-            engine.clone(),
-            Arc::new(Semaphore::new(1)),
-            shutdown.clone(),
-        );
+        let server = spawn_for_daemon(engine.clone(), shutdown.clone());
         ready(dir.path()).await;
         assert_eq!(request(dir.path(), input).await, Some(expected));
         assert!(!engine.embeddings().is_loaded());
@@ -481,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // Serializes process-wide policy environment during this test.
-    async fn absent_stale_and_busy_daemons_fail_open() {
+    async fn absent_and_stale_daemons_fail_open_and_stale_socket_recovers() {
         let _env = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         assert!(request(dir.path(), input(dir.path())).await.is_none());
@@ -495,14 +499,8 @@ mod tests {
         let recovered = BoundSocket::bind(dir.path()).unwrap();
         drop(recovered);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let heavy = Arc::new(Semaphore::new(1));
-        let permit = heavy.clone().acquire_owned().await.unwrap();
-        let server = spawn_for_daemon(fixture(dir.path()), heavy, shutdown.clone());
+        let server = spawn_for_daemon(fixture(dir.path()), shutdown.clone());
         ready(dir.path()).await;
-        let started = Instant::now();
-        assert!(request(dir.path(), input(dir.path())).await.is_none());
-        assert!(started.elapsed() < Duration::from_millis(500));
-        drop(permit);
         assert!(request(dir.path(), input(dir.path()))
             .await
             .unwrap()
@@ -543,7 +541,7 @@ mod tests {
             "semantic fixture must inject content: {expected}"
         );
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = spawn_for_daemon(engine, Arc::new(Semaphore::new(1)), shutdown.clone());
+        let server = spawn_for_daemon(engine, shutdown.clone());
         ready(dir.path()).await;
         assert_eq!(request(dir.path(), input).await, Some(expected));
         shutdown.store(true, Ordering::SeqCst);
@@ -559,8 +557,7 @@ mod tests {
         let storage = engine.storage().clone();
         let evidence = storage.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let heavy = Arc::new(Semaphore::new(1));
-        let server = spawn_for_daemon(engine, heavy.clone(), shutdown.clone());
+        let server = spawn_for_daemon(engine, shutdown.clone());
         ready(dir.path()).await;
         let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -577,19 +574,11 @@ mod tests {
         let started = Instant::now();
         assert!(request(dir.path(), input(dir.path())).await.is_none());
         assert!(started.elapsed() < Duration::from_millis(1200));
-        assert_eq!(heavy.available_permits(), 0);
         let started = Instant::now();
         assert!(request(dir.path(), input(dir.path())).await.is_none());
         assert!(started.elapsed() < Duration::from_millis(500));
         release_tx.send(()).unwrap();
         holder.join().unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while heavy.available_permits() == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
         let impressions: i64 = evidence
             .with_connection(|conn| {
                 Ok(conn.query_row(
@@ -603,6 +592,57 @@ mod tests {
             impressions, 0,
             "timed-out context must not be recorded as shown"
         );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if request(dir.path(), input(dir.path())).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Stabilize policy reads without mutating process environment.
+    async fn mismatched_render_policy_abstains_for_every_switch() {
+        let _env = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_for_daemon(fixture(dir.path()), shutdown.clone());
+        ready(dir.path()).await;
+        assert!(POLICY_KEYS.contains(&"CSR_NO_VALIDITY_PARTITION"));
+        for (index, key) in POLICY_KEYS.iter().enumerate() {
+            let mut client_policy = policy();
+            client_policy[index] = if client_policy[index].as_deref() == Some("1") {
+                None
+            } else {
+                Some("1".into())
+            };
+            let bytes = serde_json::to_vec(&Request {
+                version: VERSION,
+                database: "csr-engine.db".into(),
+                projects_dir: dir.path().canonicalize().unwrap(),
+                policy: client_policy,
+                input: input(dir.path()),
+            })
+            .unwrap();
+            let mut stream = tokio::net::UnixStream::connect(socket_path(dir.path()))
+                .await
+                .unwrap();
+            write_frame(&mut stream, &bytes).await.unwrap();
+            assert!(
+                tokio::time::timeout(REQUEST_BUDGET, read_frame(&mut stream))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "daemon must abstain when {key} differs"
+            );
+        }
+        // Matching configuration still renders after all rejected requests.
         assert!(request(dir.path(), input(dir.path())).await.is_some());
         shutdown.store(true, Ordering::SeqCst);
         server.await.unwrap();
