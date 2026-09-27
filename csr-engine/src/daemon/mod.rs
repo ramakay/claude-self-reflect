@@ -13,6 +13,7 @@
 
 pub mod consolidation;
 pub mod dream_cadence;
+mod index_sync;
 pub mod ratification;
 pub mod trained_rerank;
 
@@ -158,6 +159,11 @@ impl Daemon {
         // Shared one-owner permit for watcher batches, plan imports, and
         // dream cycles. Owned permits provide RAII release on every exit.
         let heavy_work = Arc::new(Semaphore::new(1));
+
+        // Hooks/MCP/CLI writers have their own engines. Observe their SQLite
+        // mutations independently of the transcript watcher's import-state skip.
+        let index_sync_handle =
+            index_sync::spawn(self.storage.clone(), self.search.clone(), shutdown.clone());
 
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
@@ -761,7 +767,6 @@ impl Daemon {
                 self.projects_dir.clone(),
                 self.index_dir.clone(),
             )),
-            heavy_work.clone(),
             shutdown.clone(),
         );
         if journal_handle.is_some() {
@@ -777,6 +782,7 @@ impl Daemon {
 
         // Stop admitting prompt requests and remove the private socket.
         let _ = prompt_handle.await;
+        let _ = index_sync_handle.await;
 
         // Give loops time to finish current work (5s timeout)
         let timeout = tokio::time::Duration::from_secs(5);

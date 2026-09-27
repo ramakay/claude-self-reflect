@@ -62,11 +62,7 @@ async fn main() -> Result<()> {
     let primed = csr_engine::hooks::prompt_submit::render(&primer, &engine, &cwd).await?;
     let first_render_ms = started.elapsed().as_millis();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let server = csr_engine::hooks::prompt_transport::spawn_for_daemon(
-        engine,
-        Arc::new(tokio::sync::Semaphore::new(1)),
-        shutdown.clone(),
-    );
+    let server = csr_engine::hooks::prompt_transport::spawn_for_daemon(engine, shutdown.clone());
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while !csr_engine::hooks::prompt_transport::socket_path(temp.path()).exists() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
