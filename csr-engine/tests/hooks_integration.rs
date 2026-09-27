@@ -235,6 +235,10 @@ mod prompt_process {
                 .unwrap();
             let _ = stream.write_all(&body);
         });
+        let parent_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let started = Instant::now();
         let mut child = command(dir.path()).spawn().unwrap();
         child
@@ -244,19 +248,45 @@ mod prompt_process {
             .write_all(&payload(dir.path()))
             .unwrap();
         // Intentionally do not drain stdout: wait_with_output would hide the
-        // watchdog's stdio-cleanup deadlock. Bound a regression without hanging CI.
-        loop {
+        // watchdog's stdio-cleanup deadlock. The 10s bound only catches a real
+        // hang; the deadline itself is asserted below from the probes.
+        let wall = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 assert!(status.success());
-                break;
+                break started.elapsed();
             }
-            if started.elapsed() >= Duration::from_secs(3) {
+            if started.elapsed() >= Duration::from_secs(10) {
                 child.kill().unwrap();
                 child.wait().unwrap();
                 panic!("watchdog blocked on stdout cleanup");
             }
             std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let probe = |key: &str| -> u128 {
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("missing timing probe {key}: {stderr}"))
+                .parse()
+                .unwrap()
+        };
+        let main_ns = probe("CSR timing-probe main_unix_ns=");
+        let watchdog_ms = probe("CSR timing-probe deadline_total_ms=");
+        let before_main = Duration::from_nanos(main_ns.saturating_sub(parent_ns) as u64);
+        // Same split as the stalled-stdin test: the OS phase before main is
+        // outside the watchdog's reach, the code-controlled interval is not.
+        assert!(watchdog_ms < 1500, "watchdog={watchdog_ms}ms; {stderr}");
+        assert!(
+            wall.saturating_sub(before_main) < Duration::from_secs(3),
+            "wall={wall:?} before_main={before_main:?} stderr={stderr}"
+        );
         peer.join().unwrap();
     }
 }
