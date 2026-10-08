@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rmcp::ServiceExt;
 use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
@@ -874,15 +873,19 @@ impl Engine {
         let service = match stdout {
             Some(claimed) => {
                 server
-                    .serve((tokio::io::stdin(), claimed.into_async_writer()))
+                    .serve_io(tokio::io::stdin(), claimed.into_async_writer())
                     .await?
             }
-            None => server.serve(rmcp::transport::io::stdio()).await?,
+            None => {
+                let (stdin, stdout) = rmcp::transport::io::stdio();
+                server.serve_io(stdin, stdout).await?
+            }
         };
         #[cfg(not(unix))]
         let service = {
             let _ = stdout;
-            server.serve(rmcp::transport::io::stdio()).await?
+            let (stdin, stdout) = rmcp::transport::io::stdio();
+            server.serve_io(stdin, stdout).await?
         };
         service.waiting().await?;
 

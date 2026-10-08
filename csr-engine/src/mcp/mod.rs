@@ -1,5 +1,6 @@
 pub mod completions;
 pub mod elicitation;
+pub mod opener_guard;
 pub mod resources;
 pub mod stage_probe;
 pub mod tasks;
@@ -872,6 +873,32 @@ fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, rmcp::E
     match result {
         Ok(text) => Ok(CallToolResult::success(vec![ContentBlock::text(text)])),
         Err(e) => Err(rmcp::ErrorData::internal_error(format!("{e}"), None)),
+    }
+}
+
+impl CsrServer {
+    /// Serve MCP over a byte-stream pair: stdio in production, an in-process
+    /// duplex in tests. The [`opener_guard::LegacyOpenerGuard`] in front of
+    /// rmcp's handshake keeps a `server/discover` probe for a protocol this
+    /// server does not speak from locking the session into per-request `_meta`
+    /// mode before the client's legacy `initialize` arrives.
+    pub async fn serve_io<R, W>(
+        self,
+        read: R,
+        write: W,
+    ) -> anyhow::Result<rmcp::service::RunningService<RoleServer, Self>>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        use rmcp::ServiceExt;
+
+        let supported = ServerHandler::supported_protocol_versions(&self);
+        let transport = opener_guard::LegacyOpenerGuard::new(
+            rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write),
+            supported,
+        );
+        Ok(self.serve(transport).await?)
     }
 }
 
