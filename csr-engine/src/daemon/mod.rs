@@ -18,6 +18,7 @@
 
 pub mod consolidation;
 pub mod dream_cadence;
+mod index_sync;
 pub mod ratification;
 pub mod trained_rerank;
 
@@ -315,6 +316,11 @@ impl Daemon {
         // a partial-move borrow error) — the compaction loop's `Engine`
         // over this daemon's real index_dir. See `Self::compaction_engine`.
         let compaction_engine = Arc::new(self.compaction_engine());
+
+        // Hooks/MCP/CLI writers have their own engines. Observe their SQLite
+        // mutations independently of the transcript watcher's import-state skip.
+        let index_sync_handle =
+            index_sync::spawn(self.storage.clone(), self.search.clone(), shutdown.clone());
 
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
@@ -1079,6 +1085,70 @@ impl Daemon {
         };
         tracing::info!("trained re-ranker nightly loop started");
 
+        // Reaction-judge shadow mode: score new interactive (assistant tail,
+        // human turn) pairs with every installed student and log the
+        // probabilities. First pass after a minute, then every 15 minutes, under
+        // the heavy-work permit; models load per pass and are dropped after it.
+        // Nothing reads the scores back, so behaviour does not change.
+        let reaction_shadow_handle = {
+            let storage = self.storage.clone();
+            let projects_dir = self.projects_dir.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                if crate::reaction_shadow::disabled() {
+                    tracing::info!("reaction shadow loop disabled via CSR_NO_REACTION_SHADOW");
+                    return;
+                }
+                let mut waits = 6;
+                loop {
+                    for _ in 0..waits {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    waits = 90;
+                    let Some(models_root) = crate::reaction_shadow::models_dir() else {
+                        continue;
+                    };
+                    if crate::reaction_shadow::installed_specs(&models_root).is_empty() {
+                        continue;
+                    }
+                    let permit = match heavy_work.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
+                    let s = storage.clone();
+                    let projects_dir = projects_dir.clone();
+                    let shutdown = shutdown.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        match crate::reaction_shadow::run_cycle(
+                            &s,
+                            &projects_dir,
+                            &models_root,
+                            crate::reaction_shadow::DEFAULT_MAX_SCORES_PER_CYCLE,
+                            crate::reaction_shadow::DEFAULT_WINDOW_DAYS,
+                            Some(&shutdown),
+                        ) {
+                            Ok(sum) if sum.scores_written > 0 || sum.errors > 0 => tracing::info!(
+                                scores = sum.scores_written,
+                                pairs_seen = sum.pairs_seen,
+                                files_parsed = sum.files_parsed,
+                                errors = sum.errors,
+                                budget_exhausted = sum.budget_exhausted,
+                                "reaction shadow pass"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("reaction shadow pass failed: {e}"),
+                        }
+                    })
+                    .await;
+                }
+            })
+        };
+
         // Compaction loop: every ~5 minutes, checks for the `needs_compaction`
         // marker a foreground process (`Engine::new` in an MCP server, hook, or
         // CLI query command) leaves when it finds the loaded HNSW cache
@@ -1122,6 +1192,16 @@ impl Daemon {
         // `Arc<AtomicBool>` every other loop uses, so shutdown is one flag.
         let journal_handle =
             crate::journal::spawn_for_daemon(self.storage.clone(), shutdown.clone());
+        let prompt_handle = crate::hooks::prompt_transport::spawn_for_daemon(
+            Arc::new(crate::engine::Engine::from_parts_with_index_dir(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir.clone(),
+                self.index_dir.clone(),
+            )),
+            shutdown.clone(),
+        );
         if journal_handle.is_some() {
             tracing::info!("journal server started (v10.1 journal v4)");
         }
@@ -1155,6 +1235,10 @@ impl Daemon {
 
         // Signal all loops to stop
         shutdown.store(true, Ordering::SeqCst);
+
+        // Stop admitting prompt requests and remove the private socket.
+        let _ = prompt_handle.await;
+        let _ = index_sync_handle.await;
 
         // Give loops time to finish current work (5s timeout)
         let timeout = tokio::time::Duration::from_secs(5);
@@ -1212,6 +1296,7 @@ impl Daemon {
         // transactionally. Await it so shutdown cannot detach a half-harvested
         // training attempt.
         let _ = trained_rerank_handle.await;
+        let _ = tokio::time::timeout(timeout, reaction_shadow_handle).await;
         // The loop itself races an in-flight rebuild against the shutdown
         // flag (see the compaction loop above) and returns within one
         // `wait_for_shutdown` poll interval (~200ms) if shutdown wins

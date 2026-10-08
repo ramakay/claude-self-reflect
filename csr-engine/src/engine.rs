@@ -102,6 +102,16 @@ impl Engine {
     }
 
     pub fn new(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        Self::new_with_persistence(db_path, projects_dir, true)
+    }
+
+    /// Search-capable hook engine: load/reconcile in memory, never publish or
+    /// clean up the daemon-owned index, including on a cache miss.
+    pub fn new_for_hook(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        Self::new_with_persistence(db_path, projects_dir, false)
+    }
+
+    fn new_with_persistence(db_path: &Path, projects_dir: &Path, persist: bool) -> Result<Self> {
         let t0 = std::time::Instant::now();
 
         tracing::info!(?db_path, "opening storage");
@@ -248,7 +258,7 @@ impl Engine {
                 > search.chunk_slot_count().max(1)
                 || search.reflection_tombstone_count() * ORPHAN_REBUILD_DIVISOR
                     > search.reflection_slot_count().max(1);
-            if orphans_material {
+            if orphans_material && persist {
                 tracing::info!(
                     "HNSW cache holds purged vectors — serving with tombstones, marked needs_compaction"
                 );
@@ -281,13 +291,12 @@ impl Engine {
             let reflection_count = storage
                 .count_reflection_embeddings()
                 .unwrap_or(reflection_count);
-            // Dump to disk for next startup
-            if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
-                tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
+            if persist {
+                if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
+                    tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
+                }
+                crate::search::clear_needs_compaction(&index_dir);
             }
-            // A from-scratch rebuild is compact by construction (no
-            // tombstones), so any pending compaction request is satisfied.
-            crate::search::clear_needs_compaction(&index_dir);
             index_freshly_rebuilt = true;
             let t_total = t0.elapsed();
 
@@ -312,17 +321,19 @@ impl Engine {
         };
 
         // Clean stale numbered HNSW files from previous sessions (crash resilience).
-        // Acquire exclusive lock to avoid racing with concurrent dump_to_disk writers.
-        if let Ok(lock_file) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(index_dir.join("index.lock"))
-        {
-            if fs2::FileExt::lock_exclusive(&lock_file).is_ok() {
-                crate::search::cleanup_stale_index_files(&index_dir);
+        if persist {
+            // Acquire exclusive lock to avoid racing with concurrent dump_to_disk writers.
+            if let Ok(lock_file) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(index_dir.join("index.lock"))
+            {
+                if fs2::FileExt::lock_exclusive(&lock_file).is_ok() {
+                    crate::search::cleanup_stale_index_files(&index_dir);
+                }
+                // lock released on drop
             }
-            // lock released on drop
         }
 
         // The index is built and reconciled; hand the allocator's freed transient
@@ -336,7 +347,7 @@ impl Engine {
             search: Arc::new(RwLock::new(search)),
             projects_dir: projects_dir.to_path_buf(),
             index_dir,
-            skip_index_persistence: false,
+            skip_index_persistence: !persist,
             index_freshly_rebuilt,
         })
     }

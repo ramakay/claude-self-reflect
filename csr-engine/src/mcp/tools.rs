@@ -309,14 +309,14 @@ fn reflection_recall_standing(
 /// Determine a reflection's project from its tags: the pipeline writers stamp
 /// `project_<name>`; explicit memories usually carry the bare project name as
 /// a plain tag, which must not read as cross-project (a penalty, or under an
-/// explicit scope an outright drop — see [`reflection_project_allowed`]).
+/// explicit scope a sink below in-family rows — see [`reflection_in_family`]).
 /// Falls back to `"unknown"` when no tag identifies a project at all.
 fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> String {
     // Prefer a `project_*` tag that already matches the scope's family: a
     // memory-file reflection can carry several `project_*` slugs (one per
     // source memory file) plus a bare family tag, and the *first* one found
     // is not necessarily the one that keeps the row in scope — see
-    // `reflection_project_allowed`'s doc for the live shape this fixes.
+    // `reflection_in_family`'s doc for the live shape this fixes.
     tags.iter()
         .filter_map(|t| t.strip_prefix("project_"))
         .find(|candidate| scope.is_family(candidate))
@@ -330,32 +330,25 @@ fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> St
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Whether a reflection/story carrying `tags` may appear at all under
-/// `scope`. Under an explicit project filter (`scope.effective_project`
-/// set), a reflection outside the family — including one that resolved to
-/// `"unknown"` because no tag identified a project — must be dropped from the
-/// candidate set entirely, exactly like chunks: chunk search is already
-/// pre-filtered to family ids before this point
-/// (`search_chunks_filtered`/`get_chunk_ids_for_project` in
-/// `reflect_gather_pass`), so a reflection getting only the softer 0.3x
-/// `project_scope_multiplier` penalty instead of being dropped let
-/// out-of-family stories and unrelated memories sit on the page above
-/// in-family chunks (live 2026-09-22, project EnhanceMe: ranks 5-7 were an
-/// unknown-project memory, an anukriti story, and a `project_subagents`
-/// reflection). With no filter (`scope.effective_project` is `None`, e.g. an
-/// `all`-scope search), every reflection is allowed — the multiplier's soft
-/// current-project boost still applies for those, not this hard gate.
+/// Whether a reflection/story carrying `tags` is in the project family of
+/// `scope`. This is the in-family test `sink_out_of_family_under_explicit_scope`
+/// relies on; it does NOT exclude anything. Under an explicit project filter,
+/// an out-of-family (or `"unknown"`-project) reflection is kept as a candidate
+/// and sunk below every in-family row unless it clears the relevance floor or
+/// leads the reflection keyword ranking: a hard drop lost a real answer (a
+/// sibling-project story ranked 1 in the keyword index; 6cf8a2b). With no
+/// filter (`scope.effective_project` is `None`) every reflection is in family.
 ///
 /// Checks EVERY tag (each `project_*` tag with the prefix stripped, plus
 /// every bare tag) against `scope.is_family`, not just whichever single tag
 /// [`resolve_reflection_project`] would pick to *display* — a memory-file
 /// reflection can carry several `project_*` slugs (one per source memory
 /// file) plus a bare family tag, and deciding from only the first `project_*`
-/// tag dropped in-family rows whose first tag happened not to match (live
-/// 2026-09-22: `e97fa3b4`/`5eb5aebb`/`22ffc13b`, each carrying a non-matching
-/// `project_*` slug alongside the matching bare tag `anukriti-meta-campaigns`,
-/// vanished from `project=anukriti-meta-campaigns` scoped search).
-fn reflection_project_allowed(tags: &[String], scope: &SearchProjectScope) -> bool {
+/// tag misclassified in-family rows whose first tag happened not to match
+/// (live 2026-09-22: `e97fa3b4`/`5eb5aebb`/`22ffc13b`, each carrying a
+/// non-matching `project_*` slug alongside the matching bare tag
+/// `anukriti-meta-campaigns`).
+fn reflection_in_family(tags: &[String], scope: &SearchProjectScope) -> bool {
     scope.effective_project.is_none()
         || tags.iter().any(|tag| {
             let candidate = tag.strip_prefix("project_").unwrap_or(tag.as_str());
@@ -365,9 +358,8 @@ fn reflection_project_allowed(tags: &[String], scope: &SearchProjectScope) -> bo
 
 /// Result row for a reflection hit from either channel. `keyword` marks a hit
 /// that arrived through `reflections_fts` rather than the vector index, with
-/// the same `[keyword] ` prefix keyword-only chunks carry. Callers must check
-/// [`reflection_project_allowed`] before calling this — it always builds a
-/// result row, it does not filter.
+/// the same `[keyword] ` prefix keyword-only chunks carry. It always builds a result row, it does not filter; out-of-family rows are
+/// handled by `sink_out_of_family_under_explicit_scope`.
 fn reflection_result(
     id: &str,
     score: f32,
@@ -378,10 +370,9 @@ fn reflection_result(
     keyword: bool,
 ) -> EnrichedResult {
     let project_name = resolve_reflection_project(tags, scope);
-    // Cross-project multiplicative penalty (soft — only reached when
-    // `reflection_project_allowed` has already let this row through, so under
-    // an explicit scope this is always the in-family 1.0 case; the 0.3x arm
-    // still applies to the unscoped/current-project-boost path).
+    // Cross-project multiplicative penalty (soft): an out-of-family row under
+    // an explicit scope keeps the 0.3x arm and is then ordered by
+    // `sink_out_of_family_under_explicit_scope`, never dropped.
     let final_score = score * project_scope_multiplier(&project_name, scope);
     let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
         "[episode] "
@@ -632,6 +623,61 @@ pub fn search_mode_from(value: Option<&str>) -> SearchMode {
         Some("fts") => SearchMode::Fts,
         _ => SearchMode::Hybrid,
     }
+}
+
+/// An out-of-family reflection keeps its fused rank under an explicit project
+/// filter when it is among the first K rows of the reflection keyword ranking.
+/// The keyword channel OR-joins single query words, so merely matching is weak
+/// evidence; leading the ranking is not. Measured live 2026-09-23: a real
+/// burst answer (a May story from the sibling Anukriti-Campaigns project, only
+/// reachable as `[keyword] [story]`) and its narrative ranked 1 and 2, while
+/// the rows that leaked into project=EnhanceMe ranked 15, 21 and 24 (and 38 on
+/// the other query).
+const OUT_OF_FAMILY_KEYWORD_TOP_K: usize = 3;
+
+/// Stable partition under an explicit project filter: weak out-of-family
+/// reflections/stories sink below every other result, everything else keeps
+/// its fused order. Chunk search is already pre-filtered to the family, so
+/// only reflection rows can be out of family. A reflection is in family when
+/// its resolved project or ANY of its tags (bare, or with the `project_`
+/// prefix stripped) is in the family: explicit memories often carry the bare
+/// project name next to a topical `project_<topic>` tag. An out-of-family row
+/// keeps its place when its raw cosine clears `QUICK_CHECK_FLOOR` (a strong
+/// sibling-project answer, e.g. a May story tagged with a sibling project that
+/// a real burst query needed) and sinks when it does not (live 2026-09-23,
+/// project=EnhanceMe: an anukriti story at 0.121 and an unknown-project
+/// reflection at 0.116 sat at ranks 5-6). A row at the very top of the
+/// reflection keyword ranking also keeps its place (see
+/// [`OUT_OF_FAMILY_KEYWORD_TOP_K`]). No-op without an explicit project.
+fn sink_out_of_family_under_explicit_scope(
+    enriched: &mut Vec<EnrichedResult>,
+    scope: &SearchProjectScope,
+    reflection_tags: &HashMap<String, Vec<String>>,
+    reflection_raw_cosine: &HashMap<String, f32>,
+    reflection_keyword_ids: &HashSet<&str>,
+) {
+    if scope.effective_project.is_none() {
+        return;
+    }
+    let in_family = |e: &EnrichedResult| {
+        if scope.is_family(&e.chunk.project_name) {
+            return true;
+        }
+        reflection_tags
+            .get(&e.chunk.id)
+            .is_some_and(|tags| reflection_in_family(tags, scope))
+    };
+    let strong = |e: &EnrichedResult| {
+        reflection_keyword_ids.contains(e.chunk.id.as_str())
+            || reflection_raw_cosine
+                .get(&e.chunk.id)
+                .is_some_and(|c| *c >= crate::format::QUICK_CHECK_FLOOR)
+    };
+    let (keep, sink): (Vec<_>, Vec<_>) = std::mem::take(enriched)
+        .into_iter()
+        .partition(|e| in_family(e) || strong(e));
+    enriched.extend(keep);
+    enriched.extend(sink);
 }
 
 fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<String> {
@@ -1272,9 +1318,6 @@ async fn reflect_gather_pass(
     for r in &reflection_results {
         reflection_raw_cosine.insert(r.id.clone(), r.score);
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
-            if !reflection_project_allowed(&tags, scope) {
-                continue;
-            }
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
                 let events = reflection_tad_events
                     .get(&r.id)
@@ -1342,19 +1385,9 @@ async fn reflect_gather_pass(
             .fts5_search_reflections(query, fetch)
             .unwrap_or_default();
         // `reflections_fts` carries no project column (only the tags JSON
-        // does), so the keyword channel is otherwise entirely unscoped —
-        // under an explicit project filter it must drop out-of-family hits
-        // the same way the semantic channel and `fts5_search`'s chunk query
-        // do (`reflection_project_allowed`).
-        if scope.effective_project.is_some() {
-            reflection_fts_hits.retain(|(id, _, _)| {
-                storage
-                    .get_reflection_by_id(id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(_, tags, _)| reflection_project_allowed(&tags, scope))
-            });
-        }
+        // does), so the keyword channel is unscoped: out-of-family hits are
+        // not dropped here — `sink_out_of_family_under_explicit_scope`
+        // decides (strong or keyword-top-K rows keep their rank, weak ones sink).
         fts_window_full |= reflection_fts_hits.len() == fetch;
         // Exact-prefix reflections: a memory whose content starts with the
         // query verbatim is a stronger keyword signal than anything the
@@ -1368,15 +1401,6 @@ async fn reflect_gather_pass(
         reflection_prefix_ids = storage
             .fts5_reflection_prefix_matches(query, fetch)
             .unwrap_or_default();
-        if scope.effective_project.is_some() {
-            reflection_prefix_ids.retain(|id| {
-                storage
-                    .get_reflection_by_id(id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(_, tags, _)| reflection_project_allowed(&tags, scope))
-            });
-        }
         fts_order = {
             let mut keyword_ranking: Vec<(&str, usize, f64)> = fts_hits
                 .iter()
@@ -1778,6 +1802,26 @@ async fn reflect_gather_pass(
             .unwrap_or(usize::MAX)
     };
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+    // Under an explicit project filter, chunk search is already restricted to
+    // the project family, but reflections and stories are not: RRF places them
+    // by rank, so a cosine-0.12 story from another project could sit above
+    // in-family hits (measured live 2026-09-23, project=EnhanceMe: ranks 5-7
+    // were an anukriti story, an unknown-project reflection and a subagent
+    // extraction). Sink out-of-family rows below every in-family row instead
+    // of dropping them: a hard drop lost the answer to a real burst query
+    // (a May story tagged with a sibling project name).
+    let reflection_keyword_ids: HashSet<&str> = reflection_fts_hits
+        .iter()
+        .filter(|(_, ordinal, _)| *ordinal < OUT_OF_FAMILY_KEYWORD_TOP_K)
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    sink_out_of_family_under_explicit_scope(
+        &mut enriched,
+        scope,
+        &reflection_tags,
+        &reflection_raw_cosine,
+        &reflection_keyword_ids,
+    );
 
     // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
     // ranked plan chunk survive while its origin conversation fell outside the
@@ -4291,6 +4335,183 @@ mod tests {
         assert!(!is_explicit_memory(&id, &stored_tags));
     }
 
+    async fn first_cid_for_scope(project: &str, chunk_cos: f32, story_cos: f32) -> String {
+        first_cid_for_scope_tagged(
+            project,
+            chunk_cos,
+            story_cos,
+            &["session_story", "project_sinkscope-away"],
+        )
+        .await
+    }
+
+    async fn first_cid_for_scope_tagged(
+        project: &str,
+        chunk_cos: f32,
+        story_cos: f32,
+        story_tags: &[&str],
+    ) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk_vec = vec![chunk_cos, (1.0 - chunk_cos * chunk_cos).sqrt(), 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "in-family-chunk".into(),
+            conversation_id: "conv-in-family".into(),
+            project_name: "sinkscope-home".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "deploy notes for the home project".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &chunk_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), chunk_vec);
+        let story_vec = vec![story_cos, (1.0 - story_cos * story_cos).sqrt(), 0.0, 0.0];
+        storage
+            .insert_reflection(
+                "story_elsewhere",
+                "a story from a different project",
+                &story_tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story_elsewhere".to_string(), story_vec);
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "deploy notes",
+            2,
+            0.0,
+            Some(project),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        out[start..end].to_string()
+    }
+
+    // Vector mode already multiplies an out-of-family score by 0.3, so the
+    // story must beat the chunk after that multiplier for the sink to decide.
+    #[tokio::test]
+    async fn explicit_scope_sinks_weak_out_of_family_story_below_in_family_hits() {
+        // story 0.40 * 0.3 = 0.12 beats chunk 0.10 without the sink.
+        assert_eq!(
+            first_cid_for_scope("sinkscope-home", 0.10, 0.40).await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_a_strong_out_of_family_story_in_place() {
+        // story 0.95 clears QUICK_CHECK_FLOOR; 0.95 * 0.3 = 0.285 beats 0.20.
+        assert_ne!(
+            first_cid_for_scope("sinkscope-home", 0.20, 0.95).await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_family_tag_keeps_a_memory_with_a_topical_project_tag_in_family() {
+        // Live shape of e97fa3b4: a bare project tag plus a topical project_
+        // tag that resolves the row's project elsewhere. It must not sink.
+        assert_ne!(
+            first_cid_for_scope_tagged(
+                "sinkscope-home",
+                0.10,
+                0.40,
+                &["sinkscope-home", "project_sinkscope-topic"],
+            )
+            .await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_a_keyword_matched_out_of_family_story_in_place() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk_vec = vec![0.10_f32, (1.0_f32 - 0.01).sqrt(), 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "in-family-chunk".into(),
+            conversation_id: "conv-in-family".into(),
+            project_name: "sinkscope-home".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "unrelated deploy notes".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &chunk_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), chunk_vec);
+        // Weak semantically (0.40, under the floor) but its text carries the
+        // query's own terms, so the keyword channel finds it.
+        let story_vec = vec![0.40_f32, (1.0_f32 - 0.16).sqrt(), 0.0, 0.0];
+        storage
+            .insert_reflection(
+                "story_sibling",
+                "morning mantras pronunciation comment on the reel",
+                &[
+                    "session_story".to_string(),
+                    "project_sinkscope-away".to_string(),
+                ],
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story_sibling".to_string(), story_vec);
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "morning mantras pronunciation",
+            2,
+            0.0,
+            Some("sinkscope-home"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_ne!(
+            &out[start..end],
+            "conv-in-family",
+            "a keyword-matched sibling-project story must keep its fused rank:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unscoped_search_keeps_the_better_out_of_family_story_first() {
+        assert_ne!(
+            first_cid_for_scope("all", 0.10, 0.40).await,
+            "conv-in-family"
+        );
+    }
+
     /// Seven user-authored chunks at cosine 0.63 to the query (the live shape
     /// measured 2026-09-22: one recap paragraph quoted into many sessions)
     /// against one reflection at cosine 1.0. Returns the first `<cid>`.
@@ -4638,12 +4859,15 @@ mod tests {
 
     /// Spec (b): under an explicit project filter, reflections and stories
     /// outside the family — including ones that resolve to "unknown" because
-    /// no tag names a project — must be dropped, not merely soft-penalized.
-    /// Live 2026-09-22 defect (project EnhanceMe): an unknown-project memory
-    /// and an anukriti story both out-ranked in-family results. A bare
-    /// project tag that matches the scope still keeps the row in the family.
+    /// no tag names a project — are NOT dropped (6cf8a2b: a hard drop lost a
+    /// real sibling-project answer); they must rank after every in-family row
+    /// (`sink_out_of_family_under_explicit_scope` + the 0.3x cross-project
+    /// multiplier). Live 2026-09-22 defect (project EnhanceMe): an
+    /// unknown-project memory and an anukriti story both out-ranked in-family
+    /// results. A bare project tag that matches the scope still keeps the row
+    /// in the family.
     #[tokio::test]
-    async fn explicit_project_scope_drops_out_of_family_and_unknown_reflections() {
+    async fn explicit_project_scope_sinks_out_of_family_and_unknown_reflections() {
         let storage = Arc::new(Storage::open_memory().unwrap());
         let mut engine = SearchEngine::new(8);
         let query = [1.0_f32, 0.0, 0.0, 0.0];
@@ -4706,13 +4930,18 @@ mod tests {
             out.contains("<cid>memory-in-family</cid>"),
             "an in-family bare-tag memory must stay on the page:\n{out}"
         );
+        let pos = |cid: &str| {
+            out.find(&format!("<cid>{cid}</cid>"))
+                .unwrap_or_else(|| panic!("{cid} must be present (sunk, not dropped):\n{out}"))
+        };
+        let in_family = pos("memory-in-family");
         assert!(
-            !out.contains("<cid>story-out-of-family</cid>"),
-            "an out-of-family story must be dropped under an explicit scope, not just penalized:\n{out}"
+            pos("story-out-of-family") > in_family,
+            "an out-of-family story must rank after every in-family row:\n{out}"
         );
         assert!(
-            !out.contains("<cid>memory-unknown-project</cid>"),
-            "an unknown-project memory must be dropped under an explicit scope:\n{out}"
+            pos("memory-unknown-project") > in_family,
+            "an unknown-project memory must rank after every in-family row:\n{out}"
         );
     }
 
@@ -4720,7 +4949,7 @@ mod tests {
     /// `project_*` tag that does NOT itself resolve to the scope's family
     /// (`project_meta_campaigns_setup` vs scope `anukriti-meta-campaigns`)
     /// alongside the bare family tag every `MEMORY-ARCHIVE` writer also
-    /// stamps (`anukriti-meta-campaigns`). `reflection_project_allowed` must
+    /// stamps (`anukriti-meta-campaigns`). `reflection_in_family` must
     /// accept the row on ANY tag clearing `scope.is_family`, not just the
     /// first `project_*` tag found — before this fix it read only that first
     /// tag, resolved to `meta_campaigns_setup`, failed `is_family`, and

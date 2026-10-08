@@ -116,6 +116,18 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Reaction-judge shadow mode: `status`, `run` (one scoring pass now), or
+    /// `parity` (Rust packing + probabilities vs the Python fixture)
+    ReactionShadow {
+        /// status | run | parity
+        action: String,
+        /// parity: fixture JSONL (default <models dir>/parity_dev40.jsonl)
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// run: max model scorings in this pass
+        #[arg(long, default_value_t = csr_engine::reaction_shadow::DEFAULT_MAX_SCORES_PER_CYCLE)]
+        max: usize,
+    },
     /// Structured facts from a session transcript JSONL — stats, prompts,
     /// tool calls, touched files, errors, a turn-range slice, or a text
     /// grep — without hand-rolling a jq/Python parser over raw JSONL.
@@ -622,6 +634,27 @@ fn main() -> Result<()> {
     // replacement check closed forever (gap-G2 review finding 4) — see
     // `binary_identity::current_exe_path_and_identity`'s doc.
     let startup_exe = csr_engine::binary_identity::current_exe_path_and_identity();
+    let started = std::time::Instant::now();
+    if std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some() {
+        eprintln!(
+            "CSR timing-probe main_unix_ns={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+    }
+    let args = Args::parse();
+    if matches!(&args.command, Some(Commands::Hook { name, .. }) if name == "prompt-submit") {
+        let _ = std::panic::catch_unwind(|| {
+            csr_engine::hooks::prompt_transport::run_client(
+                &args.db_path,
+                &args.projects_dir,
+                started,
+            );
+        });
+        return Ok(());
+    }
     // Raise the open-file ceiling before any index load so a low soft RLIMIT_NOFILE
     // cannot turn a transient EMFILE inside hnsw_rs's mmap load into a process exit.
     csr_engine::runtime::raise_fd_limit();
@@ -655,12 +688,13 @@ fn main() -> Result<()> {
     // `main` calls — see `runtime::tests::run_to_completion_bounds_the_wait_for_an_abandoned_blocking_task`.
     csr_engine::runtime::run_to_completion(
         runtime,
-        run(startup_exe),
+        run(args, startup_exe),
         std::time::Duration::from_secs(5),
     )
 }
 
 async fn run(
+    args: Args,
     startup_exe: Option<(PathBuf, csr_engine::binary_identity::FileIdentity)>,
 ) -> Result<()> {
     let startup_identity = startup_exe.as_ref().map(|(_, identity)| *identity);
@@ -671,8 +705,6 @@ async fn run(
         )
         .with_writer(std::io::stderr)
         .init();
-
-    let args = Args::parse();
 
     // Handle subcommands that don't need Engine::new()
     if let Some(Commands::Setup { anthropic_key }) = args.command {
@@ -962,6 +994,36 @@ async fn run(
             no_llm,
             as_of.as_deref(),
         );
+    }
+
+    if let Some(Commands::ReactionShadow {
+        ref action,
+        ref fixture,
+        max,
+    }) = args.command
+    {
+        use csr_engine::reaction_shadow as rs;
+        let root = rs::models_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+        let out = match action.as_str() {
+            "parity" => rs::parity(
+                &root,
+                &fixture
+                    .clone()
+                    .unwrap_or_else(|| root.join("parity_dev40.jsonl")),
+            )?,
+            "status" => rs::status(&csr_engine::storage::Storage::open(&args.db_path)?, &root)?,
+            "run" => serde_json::to_value(rs::run_cycle(
+                &csr_engine::storage::Storage::open(&args.db_path)?,
+                &args.projects_dir,
+                &root,
+                max,
+                rs::DEFAULT_WINDOW_DAYS,
+                None,
+            )?)?,
+            other => anyhow::bail!("unknown action {other}: use status, run or parity"),
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
     }
 
     if let Some(Commands::Quality { ref path }) = args.command {
@@ -1519,7 +1581,7 @@ async fn run(
             // stdout; keep that off the channel until the handler owns it.
             let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
             if csr_engine::hooks::hook_needs_index(name, &input) {
-                engine::Engine::new(&args.db_path, &args.projects_dir)?
+                engine::Engine::new_for_hook(&args.db_path, &args.projects_dir)?
             } else {
                 engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
             }

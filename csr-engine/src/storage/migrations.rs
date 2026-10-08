@@ -383,6 +383,8 @@ pub fn run(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    super::embedding_changes::migrate(conn)?;
+
     // Enrichment state — tracks per-conversation progressive enrichment
     conn.execute_batch(
         "
@@ -1779,11 +1781,20 @@ pub fn run(conn: &Connection) -> Result<()> {
              ADD COLUMN distinct_session_count INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
-    conn.execute(
-        "UPDATE rerank_models SET curated_veto_epsilon = ?1
-         WHERE curated_veto_epsilon IS NULL",
-        [super::trained_rerank::CURATED_VETO_EPSILON],
+    // Probe first: an UPDATE takes the write lock even when no row matches,
+    // and this runs on every storage open.
+    let unset_epsilon: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rerank_models WHERE curated_veto_epsilon IS NULL)",
+        [],
+        |row| row.get(0),
     )?;
+    if unset_epsilon {
+        conn.execute(
+            "UPDATE rerank_models SET curated_veto_epsilon = ?1
+             WHERE curated_veto_epsilon IS NULL",
+            [super::trained_rerank::CURATED_VETO_EPSILON],
+        )?;
+    }
 
     // Dream backfill (`.plans/dream-backfill-design.md`, Stage 0 + the D3/D4
     // round-2 deltas in its §8, which bind over §3-6 wherever they conflict)
@@ -1957,6 +1968,42 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
     migrate_strip_memory_tag_from_derived_reflections(conn)?;
+
+    // Reaction-judge shadow mode (src/reaction_shadow.rs): per-transcript scan
+    // state and one row per (human turn, model build). Written by the daemon
+    // only; nothing in the hook, search or injection path reads these tables.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reaction_shadow_files (
+            path       TEXT PRIMARY KEY,
+            mtime_ns   INTEGER NOT NULL,
+            size       INTEGER NOT NULL,
+            entrypoint TEXT,
+            models     TEXT NOT NULL,
+            pairs      INTEGER NOT NULL DEFAULT 0,
+            complete   INTEGER NOT NULL DEFAULT 0,
+            scanned_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reaction_shadow_scores (
+            turn_uuid              TEXT NOT NULL,
+            model                  TEXT NOT NULL,
+            model_sha256           TEXT NOT NULL,
+            session_id             TEXT NOT NULL,
+            project_dir            TEXT NOT NULL,
+            ts                     TEXT,
+            p_correction           REAL NOT NULL,
+            p_acceptance           REAL NOT NULL,
+            n_tokens               INTEGER NOT NULL,
+            previous_human_request TEXT NOT NULL,
+            assistant_tail         TEXT NOT NULL,
+            human_turn             TEXT NOT NULL,
+            scored_at              TEXT NOT NULL,
+            PRIMARY KEY (turn_uuid, model_sha256)
+        );
+        CREATE INDEX IF NOT EXISTS idx_reaction_shadow_session
+            ON reaction_shadow_scores(session_id);
+        CREATE INDEX IF NOT EXISTS idx_reaction_shadow_ts
+            ON reaction_shadow_scores(ts);",
+    )?;
 
     finish_chunks_fts_compaction(conn)?;
 
@@ -2186,11 +2233,14 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
             BEFORE DELETE ON provenance_events WHEN OLD.channel='user_confirmation'
             BEGIN SELECT RAISE(ABORT,'confirmation events are immutable'); END;"
     )?;
-    // Only this cache may change. The complete preexisting intent payload and
-    // its transcript identity remain append-only, including nullable fields.
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS intent_events_no_update;
-        CREATE TRIGGER intent_events_no_update BEFORE UPDATE ON intent_events
+    migrate_intent_events_no_update_scoped(conn)
+}
+
+/// Only the `min_trust` cache may change. The complete preexisting intent
+/// payload and its transcript identity remain append-only, including nullable
+/// fields.
+const INTENT_EVENTS_NO_UPDATE_SCOPED: &str =
+    "CREATE TRIGGER intent_events_no_update BEFORE UPDATE ON intent_events
         WHEN NEW.id IS NOT OLD.id OR NEW.session_id IS NOT OLD.session_id
           OR NEW.project IS NOT OLD.project OR NEW.turn IS NOT OLD.turn
           OR NEW.kind IS NOT OLD.kind OR NEW.quote IS NOT OLD.quote
@@ -2201,8 +2251,51 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
           OR NEW.ts IS NOT OLD.ts OR NEW.created_at IS NOT OLD.created_at
           OR NEW.detector IS NOT OLD.detector OR NEW.classifier_score IS NOT OLD.classifier_score
           OR NEW.marker IS NOT OLD.marker
-        BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END;",
-    )?;
+        BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END";
+
+fn intent_events_no_update_is_scoped(conn: &Connection) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'intent_events_no_update'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let compact = |sql: &str| -> String { sql.split_whitespace().collect() };
+    Ok(sql.is_some_and(|sql| compact(&sql) == compact(INTENT_EVENTS_NO_UPDATE_SCOPED)))
+}
+
+/// Replace the blanket `intent_events_no_update` with the column-scoped one,
+/// once. Every hook process runs these migrations on open, several at a time
+/// at session start, so this must be a pure read on a database that already
+/// has the scoped trigger: an unconditional DROP+CREATE here raced between
+/// concurrent opens ("trigger intent_events_no_update already exists") and
+/// made every open wait for the write lock behind the daemon ("database is
+/// locked"). The rewrite itself runs under `BEGIN IMMEDIATE` and re-checks the
+/// shape once it holds the lock, so concurrent first upgrades serialize and
+/// only the first one writes.
+fn migrate_intent_events_no_update_scoped(conn: &Connection) -> Result<()> {
+    if intent_events_no_update_is_scoped(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let rewrite = (|| -> Result<()> {
+        if intent_events_no_update_is_scoped(conn)? {
+            return Ok(());
+        }
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS intent_events_no_update;
+             {INTENT_EVENTS_NO_UPDATE_SCOPED};"
+        ))?;
+        Ok(())
+    })();
+    match rewrite {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(err);
+        }
+    }
     Ok(())
 }
 
@@ -2964,6 +3057,89 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    // ---- migrations on an up-to-date database write nothing ----------------
+    //
+    // Every hook process opens storage, so `run` executes several times at
+    // session start (session-start, session-briefing, the MCP server) and on
+    // every prompt. An unconditional DROP+CREATE of `intent_events_no_update`
+    // made each of those opens a schema write: concurrent opens raced between
+    // the DROP and the CREATE ("trigger intent_events_no_update already
+    // exists"), and any open behind a long daemon write waited out the busy
+    // timeout and died with "database is locked".
+
+    #[test]
+    fn rerunning_migrations_on_a_migrated_database_leaves_the_schema_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("csr.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        run(&conn).unwrap();
+        let schema_version = |conn: &Connection| -> i64 {
+            conn.query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = schema_version(&conn);
+        run(&conn).unwrap();
+        assert_eq!(schema_version(&conn), before);
+    }
+
+    #[test]
+    fn migrations_on_a_migrated_database_do_not_wait_for_another_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("csr.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        run(&writer).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let opener = rusqlite::Connection::open(&path).unwrap();
+        opener.busy_timeout(std::time::Duration::ZERO).unwrap();
+        run(&opener).expect("an up-to-date database must migrate without the write lock");
+        writer.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn concurrent_upgrades_of_the_intent_trigger_all_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("csr.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+            run(&conn).unwrap();
+            // The pre-provenance shape every existing database starts from.
+            conn.execute_batch(
+                "DROP TRIGGER intent_events_no_update;
+                 CREATE TRIGGER intent_events_no_update
+                    BEFORE UPDATE ON intent_events
+                    BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
+            )
+            .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    run(&conn).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().expect("concurrent migrations::run");
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("INSERT INTO intent_events(session_id,project,turn,kind,quote,transcript_path,byte_start,byte_end,classifier_hash,ts) VALUES('s','p',1,'correction','no','/a',0,2,'h','now');").unwrap();
+        conn.execute("UPDATE intent_events SET min_trust=3", [])
+            .expect("the upgraded trigger lets the trust cache change");
+        assert!(conn
+            .execute("UPDATE intent_events SET quote='yes'", [])
+            .is_err());
     }
 
     #[test]

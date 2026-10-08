@@ -5,7 +5,7 @@ pub mod reinstatement;
 pub mod rerank;
 pub mod trained_rerank;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -37,8 +37,10 @@ pub struct SearchEngine {
     reflection_index: Hnsw<'static, f32, DistCosine>,
     chunk_id_map: Vec<String>,
     reflection_id_map: Vec<String>,
-    chunk_id_set: HashSet<String>,
-    reflection_id_set: HashSet<String>,
+    chunk_positions: HashMap<String, usize>,
+    reflection_positions: HashMap<String, usize>,
+    /// Process-local identity, stable across mutations and distinct after index swaps.
+    generation: u64,
     active_reflection_count: usize,
     /// Chunk index dirty since the last `dump_to_disk`. Split from a single
     /// `dirty` flag so a reflection-only mutation (e.g. `store_reflection`,
@@ -183,6 +185,7 @@ pub fn clear_needs_compaction(index_dir: &Path) {
 const MANIFEST_VERSION: u32 = 2;
 const LEGACY_MANIFEST_VERSION: u32 = 1;
 static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
+static ENGINE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Metadata for validating a cached HNSW index.
 /// The `_expected` counts are DB row counts passed in from storage,
@@ -245,8 +248,9 @@ impl SearchEngine {
             ),
             chunk_id_map: Vec::new(),
             reflection_id_map: Vec::new(),
-            chunk_id_set: HashSet::new(),
-            reflection_id_set: HashSet::new(),
+            chunk_positions: HashMap::new(),
+            reflection_positions: HashMap::new(),
+            generation: ENGINE_GENERATION.fetch_add(1, Ordering::Relaxed),
             active_reflection_count: 0,
             chunk_dirty: false,
             reflection_dirty: false,
@@ -255,21 +259,27 @@ impl SearchEngine {
         }
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
-        if !self.chunk_id_set.insert(id.clone()) {
+        if self.chunk_positions.contains_key(&id) {
             return; // Already indexed — skip duplicate
         }
         let idx = self.chunk_id_map.len();
+        self.chunk_positions.insert(id.clone(), idx);
         self.chunk_id_map.push(id);
         self.chunk_index.insert((&embedding, idx));
         self.chunk_dirty = true;
     }
 
     pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
-        if !self.reflection_id_set.insert(id.clone()) {
+        if self.reflection_positions.contains_key(&id) {
             return; // Already indexed — skip duplicate
         }
         let idx = self.reflection_id_map.len();
+        self.reflection_positions.insert(id.clone(), idx);
         self.reflection_id_map.push(id);
         self.reflection_index.insert((&embedding, idx));
         self.active_reflection_count += 1;
@@ -281,15 +291,9 @@ impl SearchEngine {
     /// so search results won't include this reflection. The vector stays in the
     /// index but maps to nothing.
     pub fn remove_reflection(&mut self, id: &str) {
-        let removed = if let Some(pos) = self.reflection_id_map.iter().position(|x| x == id) {
-            self.reflection_id_map[pos] = String::new(); // Blank out the mapping
+        if let Some(pos) = self.reflection_positions.remove(id) {
+            self.reflection_id_map[pos].clear();
             self.active_reflection_count = self.active_reflection_count.saturating_sub(1);
-            true
-        } else {
-            false
-        };
-        let removed_from_set = self.reflection_id_set.remove(id);
-        if removed || removed_from_set {
             self.reflection_dirty = true;
         }
     }
@@ -300,26 +304,20 @@ impl SearchEngine {
     /// re-inserting a reused deterministic id was skipped as a duplicate (Codex
     /// HIGH), so stale plan content kept matching forever.
     pub fn remove_chunk(&mut self, id: &str) {
-        let removed = if let Some(pos) = self.chunk_id_map.iter().position(|x| x == id) {
-            self.chunk_id_map[pos] = String::new();
-            true
-        } else {
-            false
-        };
-        let removed_from_set = self.chunk_id_set.remove(id);
-        if removed || removed_from_set {
+        if let Some(pos) = self.chunk_positions.remove(id) {
+            self.chunk_id_map[pos].clear();
             self.chunk_dirty = true;
         }
     }
 
     /// Check if a reflection ID exists in the index (non-blanked).
     pub fn has_reflection(&self, id: &str) -> bool {
-        self.reflection_id_set.contains(id)
+        self.reflection_positions.contains_key(id)
     }
 
     /// Check if a chunk ID is already present in the index.
     pub fn has_chunk(&self, id: &str) -> bool {
-        self.chunk_id_set.contains(id)
+        self.chunk_positions.contains_key(id)
     }
 
     /// Blank reflection IDs in the map that are not present in the given DB ID set.
@@ -328,7 +326,7 @@ impl SearchEngine {
         let mut blanked = 0;
         for entry in &mut self.reflection_id_map {
             if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
-                self.reflection_id_set.remove(entry.as_str());
+                self.reflection_positions.remove(entry.as_str());
                 *entry = String::new();
                 blanked += 1;
             }
@@ -347,7 +345,7 @@ impl SearchEngine {
         let mut blanked = 0;
         for entry in &mut self.chunk_id_map {
             if !entry.is_empty() && !db_ids.contains(entry.as_str()) {
-                self.chunk_id_set.remove(entry.as_str());
+                self.chunk_positions.remove(entry.as_str());
                 *entry = String::new();
                 blanked += 1;
             }
@@ -372,20 +370,20 @@ impl SearchEngine {
     /// ever removed from the DB while still occupying a neighbour position
     /// in the HNSW graph (hnsw_rs cannot delete), not just the ones blanked
     /// during this process's most recent reconciliation pass. O(1): both
-    /// `chunk_id_map` (every slot ever inserted) and `chunk_id_set` (live
+    /// `chunk_id_map` (every slot ever inserted) and `chunk_positions` (live
     /// ids only) are already maintained incrementally by `insert_chunk` /
     /// `remove_chunk` / `blank_orphan_chunks`, so this never rescans the map.
     pub fn chunk_tombstone_count(&self) -> usize {
         self.chunk_id_map
             .len()
-            .saturating_sub(self.chunk_id_set.len())
+            .saturating_sub(self.chunk_positions.len())
     }
 
     /// Reflection counterpart of [`Self::chunk_tombstone_count`].
     pub fn reflection_tombstone_count(&self) -> usize {
         self.reflection_id_map
             .len()
-            .saturating_sub(self.reflection_id_set.len())
+            .saturating_sub(self.reflection_positions.len())
     }
 
     /// Search chunk index. Returns results sorted by descending score.
@@ -401,7 +399,7 @@ impl SearchEngine {
         self.search_index(
             &self.chunk_index,
             &self.chunk_id_map,
-            self.chunk_id_set.len(),
+            self.chunk_positions.len(),
             query_vec,
             limit,
             min_score,
@@ -421,7 +419,7 @@ impl SearchEngine {
         self.search_index(
             &self.reflection_index,
             &self.reflection_id_map,
-            self.reflection_id_set.len(),
+            self.reflection_positions.len(),
             query_vec,
             limit,
             min_score,
@@ -577,7 +575,7 @@ impl SearchEngine {
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.chunk_id_set.len()
+        self.chunk_positions.len()
     }
 
     pub fn reflection_count(&self) -> usize {
@@ -1170,30 +1168,33 @@ impl SearchEngine {
             io.leak();
         }
 
-        // Rebuild ID sets from the loaded maps
-        let chunk_id_set: HashSet<String> = manifest
+        // Rebuild live reverse positions without changing the on-disk manifest layout.
+        let chunk_positions: HashMap<String, usize> = manifest
             .chunk_id_map
             .iter()
-            .filter(|s| !s.is_empty())
-            .cloned()
+            .enumerate()
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(position, id)| (id.clone(), position))
             .collect();
-        let reflection_id_set: HashSet<String> = manifest
+        let reflection_positions: HashMap<String, usize> = manifest
             .reflection_id_map
             .iter()
-            .filter(|s| !s.is_empty())
-            .cloned()
+            .enumerate()
+            .filter(|(_, id)| !id.is_empty())
+            .map(|(position, id)| (id.clone(), position))
             .collect();
 
         // Use non-blank map count — orphans will be blanked by Engine::new reconciliation
-        let active_count = reflection_id_set.len();
+        let active_count = reflection_positions.len();
 
         Some(Self {
             chunk_index: chunk_hnsw,
             reflection_index: refl_hnsw,
             chunk_id_map: manifest.chunk_id_map,
             reflection_id_map: manifest.reflection_id_map,
-            chunk_id_set,
-            reflection_id_set,
+            chunk_positions,
+            reflection_positions,
+            generation: ENGINE_GENERATION.fetch_add(1, Ordering::Relaxed),
             active_reflection_count: active_count,
             chunk_dirty: false,
             reflection_dirty: false,
@@ -1981,6 +1982,56 @@ mod tests {
             1,
             "remove then insert replaces one live vector; it does not add a chunk"
         );
+    }
+
+    #[test]
+    fn reverse_positions_follow_reinsert_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = SearchEngine::new(10);
+        let original_generation = engine.generation();
+        assert_ne!(original_generation, SearchEngine::new(10).generation());
+        for _ in 0..2 {
+            engine.insert_chunk("chunk".into(), vec![0.1; 384]);
+            engine.insert_reflection("reflection".into(), vec![0.2; 384]);
+        }
+        assert_eq!(
+            engine.chunk_slot_count(),
+            1,
+            "duplicate inserts are skipped"
+        );
+        assert_eq!(engine.reflection_slot_count(), 1);
+        engine.remove_chunk("chunk");
+        engine.remove_reflection("reflection");
+        engine.insert_chunk("chunk".into(), vec![0.3; 384]);
+        engine.insert_reflection("reflection".into(), vec![0.4; 384]);
+        assert_eq!(engine.chunk_positions.get("chunk"), Some(&1));
+        assert_eq!(engine.reflection_positions.get("reflection"), Some(&1));
+        assert_eq!(engine.generation(), original_generation);
+        engine.dump_to_disk(dir.path(), 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1).unwrap();
+        assert_ne!(loaded.generation(), original_generation);
+        assert_eq!(loaded.chunk_positions.get("chunk"), Some(&1));
+        assert_eq!(loaded.reflection_positions.get("reflection"), Some(&1));
+        loaded.remove_chunk("chunk");
+        loaded.remove_reflection("reflection");
+        // A stale reverse position would blank the old tombstone and leave the
+        // reinserted point searchable, even though the live count becomes zero.
+        assert!(loaded.chunk_id_map.iter().all(String::is_empty));
+        assert!(loaded.reflection_id_map.iter().all(String::is_empty));
+        assert_eq!(loaded.chunk_tombstone_count(), 2);
+        assert_eq!(loaded.reflection_tombstone_count(), 2);
+        loaded.remove_chunk("chunk");
+        loaded.remove_reflection("reflection");
+        assert_eq!(loaded.chunk_tombstone_count(), 2);
+        assert_eq!(loaded.reflection_tombstone_count(), 2);
+        loaded.insert_chunk("chunk".into(), vec![0.5; 384]);
+        loaded.insert_reflection("reflection".into(), vec![0.6; 384]);
+        assert_eq!(loaded.blank_orphan_chunks(&HashSet::new()), 1);
+        assert_eq!(loaded.blank_orphan_reflections(&HashSet::new()), 1);
+        assert!(!loaded.has_chunk("chunk"));
+        assert!(!loaded.has_reflection("reflection"));
+        assert_eq!(loaded.chunk_tombstone_count(), 3);
+        assert_eq!(loaded.reflection_tombstone_count(), 3);
     }
 
     #[test]
