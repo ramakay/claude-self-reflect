@@ -393,12 +393,19 @@ pub(crate) enum Claim<'a> {
 
 /// Resolve the commit that made the change behind `claim` for the witness
 /// minted at `w_oid`, or the reason to abstain. See the module doc.
+///
+/// `boundary` is the HEAD at which the witness was last reinstated, if its
+/// latest live event is a reinstatement. A new negative conclusion
+/// (obsolete / superseded) searches from there instead of from `w_oid`:
+/// commits before it belong to a change the reinstatement cancelled.
 pub(crate) fn resolve_receipt(
     resolver: &mut ReceiptResolver,
     subject: &Subject,
     w_oid: &str,
+    boundary: Option<&str>,
     claim: &Claim,
 ) -> Result<String, Abstain> {
+    let search_from = boundary.unwrap_or(w_oid);
     let base = match resolver.state_at(subject, w_oid) {
         SymbolState::Present(base) => base,
         SymbolState::Absent => return Err(Abstain::NotAtWitness),
@@ -418,7 +425,7 @@ pub(crate) fn resolve_receipt(
                 return Err(Abstain::Moved);
             }
             let receipt = resolver
-                .first_commit_where(subject, w_oid, head, &|s| *s == SymbolState::Absent)
+                .first_commit_where(subject, search_from, head, &|s| *s == SymbolState::Absent)
                 .ok_or(Abstain::NoReceipt)?;
             // ... or already at the commit that dropped the qualified name.
             if resolver.leaf_present_at(subject, &receipt) == Some(true) {
@@ -433,7 +440,7 @@ pub(crate) fn resolve_receipt(
                 _ => {}
             }
             resolver
-                .first_commit_where(subject, w_oid, successor_oid, &|s| !is_base(s))
+                .first_commit_where(subject, search_from, successor_oid, &|s| !is_base(s))
                 .ok_or(Abstain::NoReceipt)
         }
         Claim::Reinstated {

@@ -649,6 +649,12 @@ pub(crate) fn dream_join_cancellable(
             }
 
             let latest_for_w = witness_verdicts::latest_event(conn, w.id)?;
+            // A witness whose latest live event is a reinstatement had every
+            // earlier negative event cancelled: nothing at or before the
+            // commit that reinstatement observed may be reused as a
+            // successor or a receipt (see `reinstatement_boundary`).
+            let boundary = reinstatement_boundary(latest_for_w.as_ref());
+            let boundary_oid = parse_oid(boundary);
 
             let candidate: Option<(WitnessVerdictRow, Option<&WitnessLedgerRow>)> = match h {
                 // Reinstatement FIRST: exact blake3 stamp equality with the
@@ -692,6 +698,7 @@ pub(crate) fn dream_join_cancellable(
                     &repo_root,
                     head_oid,
                     w,
+                    boundary_oid,
                     &head_stamp_rows,
                     stats,
                 )
@@ -771,6 +778,7 @@ pub(crate) fn dream_join_cancellable(
                     &candidate,
                     successor,
                     latest_for_w.as_ref(),
+                    boundary,
                     &head_oid_str,
                 );
                 stats.receipt_searches += resolver.searches - searches_before;
@@ -821,6 +829,7 @@ fn resolve_candidate_receipt(
     candidate: &WitnessVerdictRow,
     successor: Option<&WitnessLedgerRow>,
     latest: Option<&WitnessVerdictRow>,
+    boundary: Option<&str>,
     head_oid: &str,
 ) -> std::result::Result<String, receipt::Abstain> {
     use receipt::Abstain;
@@ -856,7 +865,19 @@ fn resolve_candidate_receipt(
                 .ok_or(Abstain::Unparseable)?,
         },
     };
-    receipt::resolve_receipt(resolver, &subject, w_oid, &claim)
+    receipt::resolve_receipt(resolver, &subject, w_oid, boundary, &claim)
+}
+
+/// The HEAD a witness's latest live event was a reinstatement at, if it was:
+/// the earliest point a NEW negative conclusion about that witness may draw
+/// on. Everything before it was cancelled by the reinstatement, so a
+/// successor row or a receipt commit from that older era (A at C1, B at C2,
+/// A restored at C3, B again at C4: the second supersession is C4's, not
+/// C2's) must not be reused.
+fn reinstatement_boundary(latest: Option<&WitnessVerdictRow>) -> Option<&str> {
+    latest
+        .filter(|l| l.verdict == VerdictKind::AnchorReinstated)
+        .map(|l| l.observed_head_oid.as_str())
 }
 
 /// Search `head_stamp_rows` — the anchor's successor-candidate set,
@@ -870,7 +891,10 @@ fn resolve_candidate_receipt(
 ///    (`compare(w, W2) == AncestorOf`);
 /// 3. `W2.at_oid` is ancestor-or-equal of the observed HEAD
 ///    (`compare(W2, HEAD)` is `AncestorOf` or `Equal`) — the HEAD-path
-///    requirement that kills divergent-branch receipts.
+///    requirement that kills divergent-branch receipts;
+/// 4. when `boundary` is set (the witness was last reinstated there),
+///    `W2.at_oid` is a descendant-or-equal of it: a successor minted before
+///    the reinstatement belongs to the cancelled era.
 ///
 /// Early-exits on the first qualifying candidate. Worst case per anchor is
 /// therefore O(k*c) candidate checks (k = witnesses, c = HEAD-stamp-matching
@@ -887,6 +911,7 @@ fn find_successor<'a>(
     repo_root: &str,
     head_oid: &ObjectId,
     w: &WitnessLedgerRow,
+    boundary: Option<ObjectId>,
     head_stamp_rows: &[&'a WitnessLedgerRow],
     stats: &mut DreamStats,
 ) -> Option<&'a WitnessLedgerRow> {
@@ -910,6 +935,16 @@ fn find_successor<'a>(
                 continue;
             }
             _ => continue,
+        }
+        if let Some(boundary) = boundary {
+            match compare_cached(auditor, causal_cache, repo_root, boundary, candidate_oid) {
+                Some(CausalOrder::AncestorOf) | Some(CausalOrder::Equal) => {}
+                Some(CausalOrder::Incomparable) => {
+                    any_incomparable = true;
+                    continue;
+                }
+                _ => continue,
+            }
         }
         // HEAD-path check: the successor's commit must itself be on the
         // observed HEAD's history (ancestor-or-equal), or its receipt could
@@ -2299,5 +2334,55 @@ mod tests {
         assert!(text.contains("not_at_witness=1"), "{text}");
         assert!(text.contains("moved=0"), "{text}");
         assert!(text.contains("positional_symbol=0"), "{text}");
+    }
+
+    #[test]
+    fn rechange_after_a_reinstatement_does_not_reuse_the_cancelled_receipt() {
+        // A at C1, B at C2 (superseded, receipt C2), A restored at C3
+        // (reinstated), B again at C4. The second supersession of the C1
+        // witness is C4's work; the cancelled C2 row and commit must not be
+        // picked up again.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1 A");
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1")]);
+        run_join(&storage, false);
+
+        repo.write("lib.rs", &foo_src("2"));
+        let c2 = repo.commit("c2 B");
+        insert_rows(&storage, &file, &[(&c2, "b3:2")]);
+        run_join(&storage, false);
+        let first = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(first.verdict, VerdictKind::SupersededBy);
+        assert_eq!(first.receipt_oid.as_deref(), Some(c2.as_str()));
+
+        repo.write("lib.rs", &foo_src("1"));
+        let c3 = repo.commit("c3 A restored");
+        insert_rows(&storage, &file, &[(&c3, "b3:1")]);
+        run_join(&storage, false);
+        let restored = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(restored.verdict, VerdictKind::AnchorReinstated);
+        assert_eq!(restored.receipt_oid.as_deref(), Some(c3.as_str()));
+
+        repo.write("lib.rs", &foo_src("2"));
+        let c4 = repo.commit("c4 B again");
+        insert_rows(&storage, &file, &[(&c4, "b3:2")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_no_receipt, 0, "{stats:?}");
+
+        let second = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(second.verdict, VerdictKind::SupersededBy);
+        assert_eq!(
+            second.receipt_oid.as_deref(),
+            Some(c4.as_str()),
+            "second supersession must be C4, not the cancelled C2 {c2}"
+        );
+        assert_eq!(
+            second.successor_witness_id,
+            Some(witness_at(&storage, &file, &c4)),
+            "successor must be the post-reinstatement row"
+        );
     }
 }
