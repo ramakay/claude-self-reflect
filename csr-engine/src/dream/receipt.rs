@@ -92,7 +92,10 @@ enum SymbolMap {
     FileAbsent,
     /// Unreadable, unsupported language, or not a clean parse.
     Unknown,
-    Map(Rc<HashMap<String, String>>),
+    /// `symbol -> normalized span stamp`; `None` marks a name whose span
+    /// cannot be told apart from a neighbour's at this commit (see
+    /// [`ambiguous_symbols`]), which reads as [`SymbolState::Unknown`].
+    Map(Rc<HashMap<String, Option<String>>>),
 }
 
 /// Per-run memo + counters.
@@ -154,7 +157,8 @@ impl ReceiptResolver {
         match self.symbol_map(subject, commit) {
             SymbolMap::FileAbsent => SymbolState::Absent,
             SymbolMap::Map(map) => match map.get(symbol) {
-                Some(stamp) => SymbolState::Present(stamp.clone()),
+                Some(Some(stamp)) => SymbolState::Present(stamp.clone()),
+                Some(None) => SymbolState::Unknown,
                 None => SymbolState::Absent,
             },
             SymbolMap::Unknown => SymbolState::Unknown,
@@ -270,10 +274,52 @@ pub(crate) fn symbol_leaf(symbol: &str) -> &str {
     }
 }
 
+/// Indices (into `spans`, inclusive `(start, end)` lines) of every span that
+/// overlaps another without one strictly containing the other. Identical
+/// ranges overlap. A span nested strictly inside another (a method in its
+/// class) is fine: the container's content legitimately includes it.
+///
+/// Why: a span stamp covers whole lines, so two definitions on the same
+/// line (or sharing a boundary line) share bytes - an edit to one changes
+/// the other's stamp, and a verdict about either would be about both.
+fn ambiguous_spans(spans: &[(usize, usize)]) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    // Start ascending, end descending: a container sorts before what it holds.
+    order.sort_by(|&a, &b| {
+        spans[a]
+            .0
+            .cmp(&spans[b].0)
+            .then(spans[b].1.cmp(&spans[a].1))
+    });
+    let mut flagged = vec![false; spans.len()];
+    for (pos, &i) in order.iter().enumerate() {
+        let (start_i, end_i) = spans[i];
+        for &j in &order[pos + 1..] {
+            let (start_j, end_j) = spans[j];
+            if start_j > end_i {
+                break;
+            }
+            let identical = start_j == start_i && end_j == end_i;
+            if identical || end_j > end_i {
+                flagged[i] = true;
+                flagged[j] = true;
+            }
+        }
+    }
+    flagged
+}
+
 /// Normalized stamp of every symbol span in `bytes`, named exactly as the
 /// HEAD pass names them. `None` when the parse is not clean, the language is
 /// unsupported, or a span does not fit the file (all of which are Unknown).
-fn symbol_stamps(subject: &Subject, commit: &str, bytes: &[u8]) -> Option<HashMap<String, String>> {
+///
+/// A name whose state cannot be trusted maps to `None` (reads as Unknown):
+/// its span overlaps a neighbour's without containing it ([`ambiguous_spans`]).
+fn symbol_stamps(
+    subject: &Subject,
+    commit: &str,
+    bytes: &[u8],
+) -> Option<HashMap<String, Option<String>>> {
     let derived = rederive_symbol_spans(
         bytes,
         subject.file,
@@ -293,8 +339,9 @@ fn symbol_stamps(subject: &Subject, commit: &str, bytes: &[u8]) -> Option<HashMa
         }
         lines
     };
-    let mut out = HashMap::with_capacity(derived.nodes.len());
-    for (node, symbol) in derived.nodes.iter().zip(derived.symbols) {
+    let mut spans = Vec::with_capacity(derived.nodes.len());
+    let mut stamps = Vec::with_capacity(derived.nodes.len());
+    for node in &derived.nodes {
         // 0-based row span -> 1-based inclusive lines, the convention the
         // HEAD pass hands to `Anchor::with_span`.
         let (start, end) = (node.span_start, node.span_end);
@@ -310,7 +357,13 @@ fn symbol_stamps(subject: &Subject, commit: &str, bytes: &[u8]) -> Option<HashMa
             span.extend_from_slice(line);
             span.push(b'\n');
         }
-        out.insert(symbol, stamp_normalized(&span).as_str().to_string());
+        spans.push((start, end));
+        stamps.push(stamp_normalized(&span).as_str().to_string());
+    }
+    let overlapping = ambiguous_spans(&spans);
+    let mut out: HashMap<String, Option<String>> = HashMap::with_capacity(derived.symbols.len());
+    for ((symbol, stamp), overlaps) in derived.symbols.iter().zip(stamps).zip(overlapping) {
+        out.insert(symbol.clone(), (!overlaps).then_some(stamp));
     }
     Some(out)
 }
@@ -456,5 +509,32 @@ pub(crate) fn resolve_receipt(
                 .first_commit_where(subject, negative_observed_head, head, &is_base)
                 .ok_or(Abstain::NoReceipt)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_nesting_is_not_an_overlap() {
+        // class (0..5) holding two methods (1..2, 3..4) and a sibling fn.
+        let spans = [(0, 5), (1, 2), (3, 4), (7, 8)];
+        assert_eq!(ambiguous_spans(&spans), [false; 4]);
+        // Nested deeper, sharing the container's first line.
+        assert_eq!(ambiguous_spans(&[(0, 9), (0, 4), (1, 3)]), [false; 3]);
+    }
+
+    #[test]
+    fn identical_and_partially_overlapping_spans_are_ambiguous() {
+        // Same line; shared boundary line; and a clean third span.
+        let spans = [(3, 3), (3, 3), (10, 12), (12, 14), (20, 21)];
+        assert_eq!(ambiguous_spans(&spans), [true, true, true, true, false]);
+        // A span straddling the end of a container flags both, not the one
+        // it fully contains.
+        assert_eq!(
+            ambiguous_spans(&[(0, 5), (2, 3), (4, 8)]),
+            [true, false, true]
+        );
     }
 }

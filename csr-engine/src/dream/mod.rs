@@ -2385,4 +2385,68 @@ mod tests {
             "successor must be the post-reinstatement row"
         );
     }
+
+    #[test]
+    fn definitions_sharing_a_line_abstain_instead_of_sharing_a_stamp() {
+        // `foo` and `bar` live on one line, so a change to `bar` changes
+        // `foo`'s line-span stamp. `foo` itself never changed.
+        let repo = TestRepo::new();
+        repo.write(
+            "lib.rs",
+            "fn foo() -> i32 { 1 } fn bar() -> i32 { 2 }\nfn other() {}\n",
+        );
+        let c1 = repo.commit("c1");
+        repo.write(
+            "lib.rs",
+            "fn foo() -> i32 { 1 } fn bar() -> i32 { 3 }\nfn other() {}\n",
+        );
+        let c2 = repo.commit("c2 changes bar only");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert_eq!(stats.abstained_unparseable, 1, "{stats:?}");
+        assert!(latest(&storage, &file, &c1).is_none());
+    }
+
+    #[test]
+    fn a_class_with_a_method_changed_on_its_own_line_still_supersedes_the_class() {
+        // Strict nesting is not an overlap: the class legitimately contains
+        // the method's lines, so the method edit is a class edit.
+        let repo = TestRepo::new();
+        repo.write(
+            "mod.py",
+            "class Foo:\n    def bar(self):\n        return 1\n",
+        );
+        let c1 = repo.commit("c1");
+        repo.write(
+            "mod.py",
+            "class Foo:\n    def bar(self):\n        return 2\n",
+        );
+        let c2 = repo.commit("c2 changes the method body");
+
+        let storage = open_storage();
+        let file = repo.path.join("mod.py").to_string_lossy().to_string();
+        storage
+            .with_connection(|conn| {
+                for (oid, stamp) in [(&c1, "b3:1"), (&c2, "b3:2")] {
+                    let mut row = ledger_row("proj", &file, oid, stamp);
+                    row.symbol = Some("Foo".into());
+                    witness_ledger::insert_witness(conn, &row)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.abstained_unparseable, 0, "{stats:?}");
+        let v = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(v.verdict, VerdictKind::SupersededBy);
+        assert_eq!(v.receipt_oid.as_deref(), Some(c2.as_str()));
+    }
 }
