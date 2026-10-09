@@ -67,9 +67,11 @@
 //!      receipt is the first commit in `W..HEAD` where it is absent. A
 //!      same-leaf symbol under another qualification at HEAD or at that
 //!      receipt commit means it MOVED, not died (`abstained_moved`).
-//!    - `superseded_by`: the successor's normalized span content differs
-//!      from `W`'s (equal -> `abstained_same_content`); the receipt is the
-//!      first commit in `W..W2.at_oid` whose content differs from `W`'s.
+//!    - `superseded_by`: the symbol is PRESENT at the successor's commit
+//!      (absent -> `abstained_successor_absent`) with normalized span
+//!      content that differs from `W`'s (equal -> `abstained_same_content`);
+//!      the receipt is the first commit in `W..W2.at_oid` at which the
+//!      symbol is present with content that differs from `W`'s.
 //!    - `anchor_reinstated`: HEAD content equals `W`'s; the receipt is the
 //!      first commit in `L.observed_head..HEAD` where the content equals
 //!      `W`'s again (`L` = the negative event being cancelled).
@@ -221,6 +223,9 @@ pub struct DreamStats {
     /// equals the witness's (reformat, or two span methods over the same
     /// code) — nothing was superseded.
     pub abstained_same_content: usize,
+    /// `superseded_by` withheld: the successor witness's commit does not
+    /// contain the symbol, so it cannot be what replaced the witness.
+    pub abstained_successor_absent: usize,
     /// `anchor_obsolete` withheld: the qualified symbol is gone but the file
     /// still has a symbol with the same leaf name (at the receipt commit or
     /// at HEAD) - the symbol moved or was re-nested, not deleted.
@@ -265,7 +270,7 @@ impl DreamStats {
              reinstated             : {}\n\
              abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}  positional_symbol={}\n\
              receipts: found={}  searches={}\n\
-             receipt abstained: unparseable={}  not_at_witness={}  present_at_head={}  same_content={}  moved={}  no_receipt={}\n\
+             receipt abstained: unparseable={}  not_at_witness={}  present_at_head={}  same_content={}  successor_absent={}  moved={}  no_receipt={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
             self.anchors_considered,
@@ -286,6 +291,7 @@ impl DreamStats {
             self.abstained_not_at_witness,
             self.abstained_present_at_head,
             self.abstained_same_content,
+            self.abstained_successor_absent,
             self.abstained_moved,
             self.abstained_no_receipt,
             self.events_written,
@@ -793,6 +799,9 @@ pub(crate) fn dream_join_cancellable(
                             receipt::Abstain::NotAtWitness => stats.abstained_not_at_witness += 1,
                             receipt::Abstain::PresentAtHead => stats.abstained_present_at_head += 1,
                             receipt::Abstain::SameContent => stats.abstained_same_content += 1,
+                            receipt::Abstain::SuccessorAbsent => {
+                                stats.abstained_successor_absent += 1
+                            }
                             receipt::Abstain::Moved => stats.abstained_moved += 1,
                             receipt::Abstain::NoReceipt => stats.abstained_no_receipt += 1,
                         }
@@ -2485,5 +2494,69 @@ mod tests {
         assert_eq!(stats.events_written, 0, "{stats:?}");
         assert_eq!(stats.abstained_unparseable, 1, "{stats:?}");
         assert!(latest(&storage, &file, &c1).is_none());
+    }
+
+    #[test]
+    fn successor_commit_without_the_symbol_does_not_certify_supersession() {
+        // A ledger row claims `foo` at c2, but c2 has no `foo`.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_with("1", "fn other() {}\n"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "fn other() {}\n");
+        let c2 = repo.commit("c2 foo is gone");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_successor_absent, 1, "{stats:?}");
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert!(latest(&storage, &file, &c1).is_none());
+    }
+
+    #[test]
+    fn supersession_receipt_skips_commits_where_the_symbol_is_absent() {
+        // c2 deletes `foo`, c3 brings it back with different content. The
+        // content change is c3's; c2 is a deletion, not a successor.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_with("1", "fn other() {}\n"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "fn other() {}\n");
+        let _c2 = repo.commit("c2 foo gone");
+        repo.write("lib.rs", &foo_with("2", "fn other() {}\n"));
+        let c3 = repo.commit("c3 foo back, different");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c3, "b3:3")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.abstained_successor_absent, 0, "{stats:?}");
+        let v = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(v.verdict, VerdictKind::SupersededBy);
+        assert_eq!(v.receipt_oid.as_deref(), Some(c3.as_str()));
+    }
+
+    #[test]
+    fn unknown_state_before_the_supersession_match_abstains() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_with("1", "fn other() {}\n"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "fn foo( {{{ ]\nlet = ;\n");
+        let _c2 = repo.commit("c2 syntax error");
+        repo.write("lib.rs", &foo_with("2", "fn other() {}\n"));
+        let c3 = repo.commit("c3 foo changed");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c3, "b3:3")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_no_receipt, 1, "{stats:?}");
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
     }
 }

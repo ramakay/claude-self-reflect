@@ -437,6 +437,10 @@ pub(crate) enum Abstain {
     /// The successor's content equals the witness's (reformat / span-method
     /// artifact): nothing was superseded.
     SameContent,
+    /// The successor witness row names a commit at which the symbol does not
+    /// exist (a stale or mis-minted row): a successor that is not there
+    /// cannot certify a supersession.
+    SuccessorAbsent,
     /// The qualified symbol is gone but the file still has a symbol with the
     /// same leaf name (moved out of / into another container, or
     /// re-qualified), either at the receipt commit or at HEAD: a rename of
@@ -507,11 +511,20 @@ pub(crate) fn resolve_receipt(
         Claim::Superseded { successor_oid } => {
             match resolver.state_at(subject, successor_oid) {
                 SymbolState::Unknown => return Err(Abstain::Unparseable),
+                SymbolState::Absent => return Err(Abstain::SuccessorAbsent),
                 s if is_base(&s) => return Err(Abstain::SameContent),
-                _ => {}
+                SymbolState::Present(_) => {}
             }
+            // The change is the first commit that HAS the symbol with other
+            // content; a commit where it is merely absent is a deletion, not
+            // the successor's content.
             resolver
-                .first_commit_where(subject, search_from, successor_oid, &|s| !is_base(s))
+                .first_commit_where(
+                    subject,
+                    search_from,
+                    successor_oid,
+                    &|s| matches!(s, SymbolState::Present(p) if *p != base),
+                )
                 .ok_or(Abstain::NoReceipt)
         }
         Claim::Reinstated {
