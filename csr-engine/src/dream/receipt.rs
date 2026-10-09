@@ -26,16 +26,20 @@
 //! `git log --ancestry-path --reverse <from>..<to> -- <path>`, whose state
 //! satisfies the predicate. There is no fallback receipt: no HEAD, no
 //! successor `at_oid`. If the search is unbounded (more than
-//! [`MAX_COMMITS`]), git fails, or an `Unknown` is met first, the caller
-//! abstains.
+//! [`MAX_COMMITS`]; git is asked for one more than that and stopped there),
+//! git fails or outlives its deadline (killed, [`GIT_DEADLINE`]), or an
+//! `Unknown` is met first, the caller abstains.
 //!
 //! Everything is memoized for the lifetime of one [`ReceiptResolver`] (one
 //! dream run): the parsed per-file symbol map per `(repo, path, commit)`,
 //! whole-file stamps, and the commit list per `(repo, path, from, to)`.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use codewitness::{stamp_normalized, Auditor, ObjectId};
 
@@ -209,7 +213,7 @@ impl ReceiptResolver {
 
     /// Commits that touched `relpath` strictly after `from` up to and
     /// including `to`, oldest first, restricted to `to`'s ancestry path.
-    /// `None` when git fails or the list exceeds [`MAX_COMMITS`].
+    /// `None` when git fails or times out, or the list exceeds [`MAX_COMMITS`].
     pub(crate) fn commits_touching(
         &mut self,
         repo_root: &str,
@@ -227,7 +231,8 @@ impl ReceiptResolver {
             return hit.clone();
         }
         self.searches += 1;
-        let result = git_commits_touching(repo_root, relpath, from, to).map(Rc::new);
+        let result = git_commits_touching(repo_root, relpath, from, to, MAX_COMMITS, GIT_DEADLINE)
+            .map(Rc::new);
         self.commits.insert(key, result.clone());
         result
     }
@@ -386,36 +391,88 @@ fn symbol_stamps(
     Some(out)
 }
 
+/// How long one `git log` receipt search may run before it is killed and the
+/// search abstains.
+const GIT_DEADLINE: Duration = Duration::from_secs(20);
+
 /// `git log --format=%H --topo-order --reverse --ancestry-path from..to --
-/// relpath`. Never `-n` (it applies before `--reverse`).
+/// relpath`, bounded: at most `max + 1` commits are requested (`-n` applies
+/// BEFORE `--reverse`, so receiving more than `max` proves the range is
+/// longer than the cap and the caller must abstain, while `max` or fewer is
+/// the complete list), and the process gets `deadline` to finish.
 fn git_commits_touching(
     repo_root: &str,
     relpath: &str,
     from: &str,
     to: &str,
+    max: usize,
+    deadline: Duration,
 ) -> Option<Vec<String>> {
-    let output = git_at(repo_root)
-        .arg("log")
+    let mut cmd = git_at(repo_root);
+    cmd.arg("log")
         .arg("--format=%H")
         .arg("--topo-order")
         .arg("--reverse")
         .arg("--ancestry-path")
+        .arg("-n")
+        .arg((max + 1).to_string())
         .arg(format!("{from}..{to}"))
         .arg("--")
-        .arg(relpath)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
+        .arg(relpath);
+    let stdout = run_with_deadline(cmd, deadline)?;
+    parse_commit_list(&stdout, max)
+}
+
+/// The commit list on `stdout` (one hash per line), or `None` when it is not
+/// UTF-8 or holds more than `max` commits.
+fn parse_commit_list(stdout: &[u8], max: usize) -> Option<Vec<String>> {
+    let text = std::str::from_utf8(stdout).ok()?;
     let commits: Vec<String> = text
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
-    (commits.len() <= MAX_COMMITS).then_some(commits)
+    (commits.len() <= max).then_some(commits)
+}
+
+/// Run `cmd` and return its stdout if it exits successfully within
+/// `deadline`. On timeout the child is killed and reaped. Stdout is drained
+/// on its own thread so a full pipe can never block the child (and with it
+/// the deadline poll).
+fn run_with_deadline(mut cmd: Command, deadline: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf).ok().map(|_| buf)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Timed out, or the wait itself failed: do not leave it running.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    // After a kill the reader is deliberately not joined: a grandchild that
+    // inherited the pipe would hold it open and stall the caller past the
+    // deadline. The thread ends by itself once the pipe closes.
+    let status = status?;
+    let output = reader.join().ok().flatten();
+    status.success().then_some(output).flatten()
 }
 
 /// Why a candidate event was withheld instead of written with a receipt.
@@ -567,5 +624,87 @@ mod tests {
             ambiguous_spans(&[(0, 5), (2, 3), (4, 8)]),
             [true, false, true]
         );
+    }
+
+    #[test]
+    fn a_commit_list_longer_than_the_cap_abstains() {
+        let out = b"a1\nb2\nc3\n";
+        assert_eq!(parse_commit_list(out, 3).unwrap(), ["a1", "b2", "c3"]);
+        assert!(
+            parse_commit_list(out, 2).is_none(),
+            "cap + 1 means unbounded"
+        );
+        assert!(parse_commit_list(b"", 0).unwrap().is_empty());
+        assert!(parse_commit_list(&[0xff, 0xfe], 5).is_none());
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let mut cmd = git_at(&dir.to_string_lossy());
+        let out = cmd
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn git_search_requests_one_commit_past_the_cap_and_abstains_on_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git_ok(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.rs"), "// base\n").unwrap();
+        git_ok(dir, &["add", "-A"]);
+        git_ok(dir, &["commit", "-q", "-m", "base"]);
+        let base = {
+            let o = git_at(&dir.to_string_lossy())
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        for n in 0..3 {
+            std::fs::write(dir.join("a.rs"), format!("// edit {n}\n")).unwrap();
+            git_ok(dir, &["add", "-A"]);
+            git_ok(dir, &["commit", "-q", "-m", &format!("edit {n}")]);
+        }
+        let root = dir.to_string_lossy().to_string();
+        let ask = |max| git_commits_touching(&root, "a.rs", &base, "HEAD", max, GIT_DEADLINE);
+
+        let all = ask(3).expect("3 commits fit a cap of 3");
+        assert_eq!(all.len(), 3);
+        assert!(ask(2).is_none(), "3 commits exceed a cap of 2: abstain");
+        assert!(ask(10).is_some());
+        // `-n` before `--reverse`: an in-cap list is still oldest first.
+        assert_eq!(
+            git_commits_touching(&root, "a.rs", &base, "HEAD", 3, GIT_DEADLINE).unwrap(),
+            all
+        );
+    }
+
+    #[test]
+    fn a_git_process_past_its_deadline_is_killed_and_the_search_abstains() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exec sleep 30"]);
+        let started = Instant::now();
+        assert!(run_with_deadline(cmd, Duration::from_millis(200)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must not wait out the child: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_larger_than_a_pipe_buffer_does_not_deadlock_the_deadline_poll() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 1000000 /dev/zero"]);
+        let out = run_with_deadline(cmd, Duration::from_secs(20)).expect("completes");
+        assert_eq!(out.len(), 1_000_000);
+
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "echo partial; exit 3"]);
+        assert!(run_with_deadline(failing, Duration::from_secs(20)).is_none());
     }
 }
