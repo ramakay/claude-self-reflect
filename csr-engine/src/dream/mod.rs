@@ -24,16 +24,18 @@
 //!    means the symbol no longer stamps at HEAD (span vanished, or the
 //!    file/function is gone).
 //! 3. For every witness `W` in the anchor (INCLUDING the row at HEAD
-//!    itself — see the reinstatement rule):
+//!    itself — see the reinstatement rule), the ledger stamps pick a
+//!    CANDIDATE verdict kind:
 //!    - `H` exists and `W.stamp == H.stamp`: content already matches
 //!      current truth. If `W`'s own latest live verdict was negative
-//!      (`anchor_obsolete` / `superseded_by`), emit `anchor_reinstated` —
-//!      but ONLY from a HEAD that has moved forward from where that
-//!      negative verdict was observed (see "Forward-only judgment"). A
-//!      checkout of a different branch or an older commit whose content
-//!      happens to match proves nothing and abstains. Otherwise: intact, no
-//!      event. Reinstatement requires EXACT blake3 stamp equality — a
-//!      near-revert (`A'` close to but not equal to `A`) never reinstates.
+//!      (`anchor_obsolete` / `superseded_by`), the candidate is
+//!      `anchor_reinstated` — but ONLY from a HEAD that has moved forward
+//!      from where that negative verdict was observed (see "Forward-only
+//!      judgment"). A checkout of a different branch or an older commit
+//!      whose content happens to match proves nothing and abstains.
+//!      Otherwise: intact, no event. Reinstatement requires EXACT blake3
+//!      stamp equality — a near-revert (`A'` close to but not equal to `A`)
+//!      never reinstates.
 //!    - `H` exists and stamps differ: search the anchor's rows whose stamp
 //!      equals `H.stamp` for a valid successor `W2` — one that is (i) a
 //!      causal DESCENDANT of `W` (`codewitness::causal::compare(W.at_oid,
@@ -42,16 +44,41 @@
 //!      minted on a divergent, never-merged branch can never certify
 //!      supersession. Both checks come from git commit-graph ancestry —
 //!      never insertion order or wall-clock time. The first qualifying row
-//!      becomes `W`'s successor: emit `superseded_by`. Any `Incomparable`
-//!      on either check abstains (`abstained_incomparable_ancestry`); a
-//!      candidate pool that fails for other reasons abstains
-//!      (`abstained_no_successor`).
-//!    - `H` absent: `anchor_obsolete` — but ONLY IF `W.at_oid` is a proper
-//!      ancestor of the observed HEAD. If HEAD is an ancestor of `W`
-//!      (e.g. a historical commit is checked out) or the two are
+//!      becomes `W`'s successor: candidate `superseded_by`. Any
+//!      `Incomparable` on either check abstains
+//!      (`abstained_incomparable_ancestry`); a candidate pool that fails for
+//!      other reasons abstains (`abstained_no_successor`).
+//!    - `H` absent: candidate `anchor_obsolete` — but ONLY IF `W.at_oid` is
+//!      a proper ancestor of the observed HEAD. If HEAD is an ancestor of
+//!      `W` (e.g. a historical commit is checked out) or the two are
 //!      `Incomparable`, the run is looking at a HEAD that is BEHIND the
 //!      witness and can prove nothing about it — abstain
 //!      (`head_behind_witness`).
+//! 4. A candidate that is NEW for its witness (its kind differs from the
+//!    witness's latest live event) must then be backed by a true receipt
+//!    (`receipt` module). Ledger stamps only pick the candidate; they are
+//!    weak evidence of change (rows minted by two span methods, raw stamps
+//!    that count a reformat as a rewrite, and a `H` that can be missing
+//!    while the symbol is at HEAD). So the symbol itself is re-read from the
+//!    committed bytes (`receipt::SymbolState`: present with a normalized
+//!    span stamp / absent / unknown) and the claim is checked against git:
+//!    - `anchor_obsolete`: the symbol is present at `W.at_oid` and ABSENT in
+//!      the HEAD blob (present there -> `abstained_present_at_head`); the
+//!      receipt is the first commit in `W..HEAD` where it is absent.
+//!    - `superseded_by`: the successor's normalized span content differs
+//!      from `W`'s (equal -> `abstained_same_content`); the receipt is the
+//!      first commit in `W..W2.at_oid` whose content differs from `W`'s.
+//!    - `anchor_reinstated`: HEAD content equals `W`'s; the receipt is the
+//!      first commit in `L.observed_head..HEAD` where the content equals
+//!      `W`'s again (`L` = the negative event being cancelled).
+//!
+//!    A needed state that is unknown (unparseable, unsupported language, or
+//!    the witness symbol not present at its own commit) abstains
+//!    (`abstained_unrederivable`); a conclusion with no nameable commit
+//!    abstains (`abstained_no_receipt`). The receipt is NEVER the observed
+//!    HEAD or the successor's `at_oid`. Receipts are computed lazily, only
+//!    for new events, so re-running at a newer HEAD re-searches nothing for
+//!    conclusions already on record.
 //!
 //! # Forward-only judgment
 //!
@@ -70,8 +97,9 @@
 //! # Supersession vs reinstatement (deliberate contract)
 //!
 //! A -> B -> A' supersession is LEGITIMATE: supersession on any differing
-//! stamp with a valid HEAD-path successor is receipt-backed truth (the
-//! content demonstrably changed). Near-revert abstention applies ONLY to
+//! stamp with a valid HEAD-path successor is a candidate; it becomes truth
+//! only when the symbol's normalized content demonstrably changed and a
+//! commit can be named as the one that changed it. Near-revert abstention applies ONLY to
 //! reinstatement — `anchor_reinstated` fires strictly on exact blake3
 //! stamp equality, never on similarity.
 //!
@@ -101,6 +129,7 @@
 pub mod backfill;
 pub mod cli;
 pub mod policy;
+pub(crate) mod receipt;
 pub mod report;
 pub(crate) mod strategy;
 pub mod threads;
@@ -115,7 +144,9 @@ use rusqlite::Connection;
 
 use crate::engine::Engine;
 use crate::extraction::repo_root::repo_root_for_file;
-use crate::import::backfill::{self as witness_backfill, open_repo_head, StampSpansStats};
+use crate::import::backfill::{
+    self as witness_backfill, open_repo_head, relpath_in_repo, StampSpansStats,
+};
 use crate::storage::codegraph::stored_repo_root_for_file;
 use crate::storage::witness_ledger::{self, WitnessLedgerRow};
 use crate::storage::witness_verdicts::{self, VerdictKind, WitnessVerdictRow};
@@ -160,6 +191,27 @@ pub struct DreamStats {
     /// The anchor's file has no resolvable git repository (or live HEAD) —
     /// the whole anchor is skipped; none of its witnesses are counted above.
     pub abstained_no_repo: usize,
+    /// A NEW conclusion was withheld because the symbol's content at a
+    /// commit the receipt needs could not be established (not a clean
+    /// parse, unsupported language, unreadable blob, or the witness symbol
+    /// is not present at its own commit) — see `receipt::SymbolState`.
+    pub abstained_unrederivable: usize,
+    /// `anchor_obsolete` withheld: the join found no stamp at HEAD but the
+    /// symbol is in the HEAD blob (the HEAD pass missed it).
+    pub abstained_present_at_head: usize,
+    /// `superseded_by` withheld: the successor's normalized span content
+    /// equals the witness's (reformat, or two span methods over the same
+    /// code) — nothing was superseded.
+    pub abstained_same_content: usize,
+    /// A NEW conclusion was withheld because no commit could be named as
+    /// the one that made the change (empty or oversized history range, git
+    /// failure, or an unknown state met first). Never falls back to HEAD.
+    pub abstained_no_receipt: usize,
+    /// New events whose receipt is a commit found in history.
+    pub receipts_found: usize,
+    /// `git log` receipt-range searches actually run (memo misses). A
+    /// re-run whose conclusions are already recorded runs none.
+    pub receipt_searches: usize,
     /// Verdict events actually written (or, under `--dry-run`, that WOULD
     /// have been written — the decision is identical either way, see
     /// `witness_verdicts::is_new_event`).
@@ -190,6 +242,7 @@ impl DreamStats {
              obsolete               : {}\n\
              reinstated             : {}\n\
              abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}\n\
+             receipts: found={}  searches={}  abstained: unrederivable={}  present_at_head={}  same_content={}  no_receipt={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
             self.anchors_considered,
@@ -203,6 +256,12 @@ impl DreamStats {
             self.head_behind_witness,
             self.head_not_forward,
             self.abstained_no_repo,
+            self.receipts_found,
+            self.receipt_searches,
+            self.abstained_unrederivable,
+            self.abstained_present_at_head,
+            self.abstained_same_content,
+            self.abstained_no_receipt,
             self.events_written,
             self.events_deduped,
         )
@@ -481,6 +540,8 @@ pub(crate) fn dream_join_cancellable(
     // see `compare_cached`. Oids are content-addressed, so a single map
     // across repos cannot alias.
     let mut causal_cache: CausalCache = HashMap::new();
+    // Receipt memo (parsed symbol maps, commit lists) for the whole run.
+    let mut resolver = receipt::ReceiptResolver::new();
 
     for (_key, group_rows) in groups {
         if should_cancel.is_some_and(|cancel| cancel()) {
@@ -552,7 +613,7 @@ pub(crate) fn dream_join_cancellable(
 
             let latest_for_w = witness_verdicts::latest_event(conn, w.id)?;
 
-            let candidate: Option<WitnessVerdictRow> = match h {
+            let candidate: Option<(WitnessVerdictRow, Option<&WitnessLedgerRow>)> = match h {
                 // Reinstatement FIRST: exact blake3 stamp equality with the
                 // current HEAD stamp recovers a negative witness. It is not
                 // gated on `compare(W, HEAD)`, but it IS gated (below, once
@@ -562,13 +623,18 @@ pub(crate) fn dream_join_cancellable(
                 // Still strictly EXACT equality — a near-revert A' never
                 // reinstates (see "Supersession vs reinstatement").
                 Some(h) if h.stamp == w.stamp => match &latest_for_w {
-                    Some(l) if l.verdict.is_negative() => Some(WitnessVerdictRow {
-                        witness_id: w.id,
-                        verdict: VerdictKind::AnchorReinstated,
-                        successor_witness_id: None,
-                        receipt_oid: Some(head_oid_str.clone()),
-                        observed_head_oid: head_oid_str.clone(),
-                    }),
+                    Some(l) if l.verdict.is_negative() => Some((
+                        WitnessVerdictRow {
+                            witness_id: w.id,
+                            verdict: VerdictKind::AnchorReinstated,
+                            successor_witness_id: None,
+                            // Filled in by `receipt::resolve_receipt` once
+                            // the event is known to be new.
+                            receipt_oid: None,
+                            observed_head_oid: head_oid_str.clone(),
+                        },
+                        None,
+                    )),
                     _ => {
                         if !w_is_head_row {
                             stats.intact += 1;
@@ -592,12 +658,17 @@ pub(crate) fn dream_join_cancellable(
                     &head_stamp_rows,
                     stats,
                 )
-                .map(|w2| WitnessVerdictRow {
-                    witness_id: w.id,
-                    verdict: VerdictKind::SupersededBy,
-                    successor_witness_id: Some(w2.id),
-                    receipt_oid: w2.at_oid.clone(),
-                    observed_head_oid: head_oid_str.clone(),
+                .map(|w2| {
+                    (
+                        WitnessVerdictRow {
+                            witness_id: w.id,
+                            verdict: VerdictKind::SupersededBy,
+                            successor_witness_id: Some(w2.id),
+                            receipt_oid: None,
+                            observed_head_oid: head_oid_str.clone(),
+                        },
+                        Some(w2),
+                    )
                 }),
                 // H absent: obsolete ONLY when the witness is a proper
                 // ancestor of the observed HEAD. A HEAD that is an ancestor
@@ -608,13 +679,16 @@ pub(crate) fn dream_join_cancellable(
                         compare_cached(auditor, &mut causal_cache, &repo_root, w_oid, *head_oid)
                     });
                     match w_ancestor_of_head {
-                        Some(CausalOrder::AncestorOf) => Some(WitnessVerdictRow {
-                            witness_id: w.id,
-                            verdict: VerdictKind::AnchorObsolete,
-                            successor_witness_id: None,
-                            receipt_oid: Some(head_oid_str.clone()),
-                            observed_head_oid: head_oid_str.clone(),
-                        }),
+                        Some(CausalOrder::AncestorOf) => Some((
+                            WitnessVerdictRow {
+                                witness_id: w.id,
+                                verdict: VerdictKind::AnchorObsolete,
+                                successor_witness_id: None,
+                                receipt_oid: None,
+                                observed_head_oid: head_oid_str.clone(),
+                            },
+                            None,
+                        )),
                         _ => {
                             stats.head_behind_witness += 1;
                             None
@@ -623,7 +697,7 @@ pub(crate) fn dream_join_cancellable(
                 }
             };
 
-            let Some(candidate) = candidate else {
+            let Some((mut candidate, successor)) = candidate else {
                 continue;
             };
             // Forward-only judgment: a witness that already has a live
@@ -644,12 +718,47 @@ pub(crate) fn dream_join_cancellable(
                     continue;
                 }
             }
+            // Receipts are computed ONLY for a conclusion that is new for
+            // this witness (kind differs from its latest live event): a
+            // re-run at a newer HEAD must not re-search git for conclusions
+            // already on record.
+            let is_new = witness_verdicts::is_new_event(latest_for_w.as_ref(), &candidate);
+            if is_new {
+                let searches_before = resolver.searches;
+                let resolved = resolve_candidate_receipt(
+                    &mut resolver,
+                    &w.project,
+                    &repo_root,
+                    auditor,
+                    w,
+                    &candidate,
+                    successor,
+                    latest_for_w.as_ref(),
+                    &head_oid_str,
+                );
+                stats.receipt_searches += resolver.searches - searches_before;
+                match resolved {
+                    Ok(receipt_oid) => {
+                        candidate.receipt_oid = Some(receipt_oid);
+                        stats.receipts_found += 1;
+                    }
+                    Err(abstain) => {
+                        match abstain {
+                            receipt::Abstain::Unrederivable => stats.abstained_unrederivable += 1,
+                            receipt::Abstain::PresentAtHead => stats.abstained_present_at_head += 1,
+                            receipt::Abstain::SameContent => stats.abstained_same_content += 1,
+                            receipt::Abstain::NoReceipt => stats.abstained_no_receipt += 1,
+                        }
+                        continue;
+                    }
+                }
+            }
             match candidate.verdict {
                 VerdictKind::SupersededBy => stats.superseded += 1,
                 VerdictKind::AnchorObsolete => stats.obsolete += 1,
                 VerdictKind::AnchorReinstated => stats.reinstated += 1,
             }
-            if witness_verdicts::is_new_event(latest_for_w.as_ref(), &candidate) {
+            if is_new {
                 stats.events_written += 1;
                 if !dry_run {
                     witness_verdicts::insert_verdict_if_changed(conn, &candidate)?;
@@ -660,6 +769,55 @@ pub(crate) fn dream_join_cancellable(
         }
     }
     Ok(false)
+}
+
+/// Resolve the true receipt for a NEW candidate event (see `receipt`).
+#[allow(clippy::too_many_arguments)]
+fn resolve_candidate_receipt(
+    resolver: &mut receipt::ReceiptResolver,
+    project: &str,
+    repo_root: &str,
+    auditor: &Auditor,
+    w: &WitnessLedgerRow,
+    candidate: &WitnessVerdictRow,
+    successor: Option<&WitnessLedgerRow>,
+    latest: Option<&WitnessVerdictRow>,
+    head_oid: &str,
+) -> std::result::Result<String, receipt::Abstain> {
+    use receipt::Abstain;
+    let relpath = relpath_in_repo(repo_root, &w.file)
+        .or_else(|| {
+            // Symlinked temp/home roots: the stored file and the discovered
+            // repo root may spell the same directory differently.
+            let file = std::fs::canonicalize(&w.file).ok()?;
+            let root = std::fs::canonicalize(repo_root).ok()?;
+            relpath_in_repo(&root.to_string_lossy(), &file.to_string_lossy())
+        })
+        .ok_or(Abstain::Unrederivable)?;
+    let w_oid = w.at_oid.as_deref().ok_or(Abstain::Unrederivable)?;
+    let subject = receipt::Subject {
+        auditor,
+        repo_root,
+        file: &w.file,
+        relpath: &relpath,
+        project,
+        symbol: w.symbol.as_deref(),
+    };
+    let claim = match candidate.verdict {
+        VerdictKind::AnchorObsolete => receipt::Claim::Obsolete { head: head_oid },
+        VerdictKind::SupersededBy => receipt::Claim::Superseded {
+            successor_oid: successor
+                .and_then(|s| s.at_oid.as_deref())
+                .ok_or(Abstain::Unrederivable)?,
+        },
+        VerdictKind::AnchorReinstated => receipt::Claim::Reinstated {
+            head: head_oid,
+            negative_observed_head: latest
+                .map(|l| l.observed_head_oid.as_str())
+                .ok_or(Abstain::Unrederivable)?,
+        },
+    };
+    receipt::resolve_receipt(resolver, &subject, w_oid, &claim)
 }
 
 /// Search `head_stamp_rows` — the anchor's successor-candidate set,
@@ -851,6 +1009,11 @@ mod tests {
         }
     }
 
+    /// Parseable Rust source defining `foo` whose body is `body`.
+    fn foo_src(body: &str) -> String {
+        format!("fn foo() {{\n    {body}\n}}\n")
+    }
+
     fn run_join(storage: &Storage, dry_run: bool) -> DreamStats {
         let mut stats = DreamStats::default();
         storage
@@ -862,7 +1025,7 @@ mod tests {
     #[test]
     fn single_at_oid_anchor_has_no_history_to_judge() {
         let repo = TestRepo::new();
-        repo.write("lib.rs", "one");
+        repo.write("lib.rs", &foo_src("one"));
         repo.commit("c1");
         let storage = open_storage();
         storage
@@ -884,9 +1047,9 @@ mod tests {
     #[test]
     fn linear_history_supersedes_the_older_witness() {
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2"); // live HEAD.
 
         let storage = open_storage();
@@ -924,9 +1087,9 @@ mod tests {
     #[test]
     fn rerun_at_unchanged_head_writes_nothing_new() {
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -955,9 +1118,9 @@ mod tests {
         // different successor/receipt/observed HEAD. Same verdict kind, so
         // no new event for c1; c2's witness is genuinely newly superseded.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -971,7 +1134,7 @@ mod tests {
         let first = run_join(&storage, false);
         assert_eq!(first.events_written, 1);
 
-        repo.write("lib.rs", "3");
+        repo.write("lib.rs", &foo_src("3"));
         let c3 = repo.commit("c3");
         storage
             .with_connection(|conn| {
@@ -996,9 +1159,9 @@ mod tests {
     #[test]
     fn witness_with_only_sub_floor_events_is_judged_fresh_by_the_join() {
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1039,9 +1202,9 @@ mod tests {
         // the real run that follows it must produce IDENTICAL verdict
         // computations, and the dry run must leave zero verdict rows.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1091,15 +1254,15 @@ mod tests {
         // ancestor of HEAD) and ABSTAIN on the c_feature witness
         // (Incomparable ancestry against HEAD) — never guess either way.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
 
         repo.checkout_new("feature");
-        repo.write("lib.rs", "feature-branch");
+        repo.write("lib.rs", &foo_src("feature-branch"));
         let c_feature = repo.commit("c_feature");
 
         repo.checkout("main");
-        repo.write("lib.rs", "main-branch");
+        repo.write("lib.rs", &foo_src("main-branch"));
         let c_main = repo.commit("c_main"); // live HEAD stays on main.
 
         let storage = open_storage();
@@ -1161,9 +1324,9 @@ mod tests {
         // after HEAD moved to c3) must reinstate c1's witness rather than
         // leaving it superseded forever.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "B");
+        repo.write("lib.rs", &foo_src("B"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1180,7 +1343,7 @@ mod tests {
         // HEAD moves on: c3 reverts the content back to "A" (same stamp as
         // c1) — a fresh witness_ledger row for c3, as `stamp_spans_into`
         // would mint after re-stamping at the new HEAD.
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c3 = repo.commit("c3 (revert)");
         storage
             .with_connection(|conn| {
@@ -1214,10 +1377,10 @@ mod tests {
         // unknown-oid row (not in the object database at all) cannot prove
         // ancestry and must abstain, never guess.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
-        let _c2 = repo.commit("c2"); // live HEAD — deliberately NOT in the ledger.
+        repo.write("lib.rs", "// foo removed\n");
+        let _c2 = repo.commit("c2 (foo gone)"); // live HEAD — deliberately NOT in the ledger.
 
         let storage = open_storage();
         let file = repo.file_path();
@@ -1260,11 +1423,11 @@ mod tests {
         // them. Both must abstain (`head_behind_witness`), never be
         // declared obsolete.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2");
-        repo.write("lib.rs", "3");
+        repo.write("lib.rs", &foo_src("3"));
         let c3 = repo.commit("c3");
         repo.git(&["checkout", "-q", &c1]); // detached HEAD at the ancestor.
 
@@ -1295,15 +1458,15 @@ mod tests {
         // first) — a receipt minted on a divergent, never-merged branch.
         // The successor must be c_main (ancestor-or-equal of HEAD).
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
 
         repo.checkout_new("feature");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c_feat = repo.commit("c_feat");
 
         repo.checkout("main");
-        repo.write("lib.rs", "2"); // same content as the feature branch.
+        repo.write("lib.rs", &foo_src("2")); // same content as the feature branch.
         let c_main = repo.commit("c_main"); // live HEAD.
 
         let storage = open_storage();
@@ -1346,9 +1509,9 @@ mod tests {
         // verdict was observed (c2), so the run abstains: no reinstatement,
         // the verdict stays as drawn.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "B");
+        repo.write("lib.rs", &foo_src("B"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1392,12 +1555,12 @@ mod tests {
         // identical stamp) must NOT reinstate: main's HEAD (c1) is an
         // ancestor of the observed HEAD (c2), not a descendant.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "0");
+        repo.write("lib.rs", &foo_src("0"));
         let c0 = repo.commit("c0");
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
         repo.checkout_new("dev");
-        repo.write("lib.rs", "");
+        repo.write("lib.rs", "// foo removed\n");
         let _c2 = repo.commit("c2 (symbol deleted)");
 
         let storage = open_storage();
@@ -1442,11 +1605,11 @@ mod tests {
         // identical stamp). Dream at c2: obsolete. Dream at c3, a
         // descendant of the observed HEAD c2: anchor_reinstated fires.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "0");
+        repo.write("lib.rs", &foo_src("0"));
         let c0 = repo.commit("c0");
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "");
+        repo.write("lib.rs", "// foo removed\n");
         let _c2 = repo.commit("c2 (symbol deleted)");
 
         let storage = open_storage();
@@ -1460,7 +1623,7 @@ mod tests {
         let first = run_join(&storage, false);
         assert_eq!(first.obsolete, 2, "{first:?}");
 
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c3 = repo.commit("c3 (restored)");
         storage
             .with_connection(|conn| {
@@ -1486,9 +1649,9 @@ mod tests {
     #[test]
     fn unparsable_observed_head_abstains_as_head_not_forward() {
         let repo = TestRepo::new();
-        repo.write("lib.rs", "1");
+        repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "2");
+        repo.write("lib.rs", &foo_src("2"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1533,9 +1696,9 @@ mod tests {
         // (HEAD). Anchor identity is (file, symbol): with identical content
         // the P1 witness is intact, never `anchor_obsolete`.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "A\n");
+        repo.write("lib.rs", &format!("{}// trailer\n", foo_src("A")));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1558,9 +1721,9 @@ mod tests {
     #[test]
     fn head_row_under_another_project_supersedes_changed_content() {
         let repo = TestRepo::new();
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "B");
+        repo.write("lib.rs", &foo_src("B"));
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
@@ -1603,11 +1766,11 @@ mod tests {
         // valid HEAD-path successor exists. Near-revert abstention applies
         // ONLY to reinstatement (exact stamp equality), never here.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "A");
+        repo.write("lib.rs", &foo_src("A"));
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "B");
+        repo.write("lib.rs", &foo_src("B"));
         let c2 = repo.commit("c2");
-        repo.write("lib.rs", "A "); // A-prime: almost, but not exactly, A.
+        repo.write("lib.rs", &foo_src("A2")); // A-prime: almost, but not exactly, A.
         let c3 = repo.commit("c3");
 
         let storage = open_storage();
@@ -1631,5 +1794,291 @@ mod tests {
         );
         assert_eq!(stats.abstained_no_successor, 0);
         assert_eq!(stats.abstained_incomparable_ancestry, 0);
+    }
+    // ---- true receipts (item 2) -------------------------------------------
+
+    /// `foo` plus an unrelated sibling, so "unrelated edit" commits can
+    /// touch the same file without touching `foo`.
+    fn foo_with(body: &str, tail: &str) -> String {
+        format!("{}{tail}", foo_src(body))
+    }
+
+    fn insert_rows(storage: &Storage, file: &str, rows: &[(&str, &str)]) {
+        storage
+            .with_connection(|conn| {
+                for (oid, stamp) in rows {
+                    witness_ledger::insert_witness(conn, &ledger_row("proj", file, oid, stamp))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn witness_at(storage: &Storage, file: &str, oid: &str) -> i64 {
+        storage
+            .witnesses_for_file("proj", file)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.at_oid.as_deref() == Some(oid))
+            .unwrap()
+            .id
+    }
+
+    fn latest(storage: &Storage, file: &str, oid: &str) -> Option<WitnessVerdictRow> {
+        storage
+            .latest_witness_verdict(witness_at(storage, file, oid))
+            .unwrap()
+    }
+
+    #[test]
+    fn obsolete_receipt_is_the_commit_that_deleted_the_symbol() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1 adds foo");
+        repo.write("lib.rs", &foo_with("1", "fn other() {}\n"));
+        let c2 = repo.commit("c2 unrelated edit, same file");
+        repo.write("lib.rs", "fn other() {}\n");
+        let c3 = repo.commit("c3 deletes foo");
+        repo.write("lib.rs", "fn other() {}\nfn another() {}\n");
+        let c4 = repo.commit("c4 unrelated");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:1")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 2, "{stats:?}");
+        assert_eq!(stats.receipts_found, 2, "{stats:?}");
+        assert_eq!(stats.events_written, 2, "{stats:?}");
+        for oid in [&c1, &c2] {
+            let v = latest(&storage, &file, oid).unwrap();
+            assert_eq!(v.verdict, VerdictKind::AnchorObsolete);
+            assert_eq!(v.receipt_oid.as_deref(), Some(c3.as_str()), "not HEAD {c4}");
+            assert_eq!(v.observed_head_oid, c4);
+        }
+    }
+
+    #[test]
+    fn superseded_receipt_is_the_commit_that_changed_the_symbol() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", &foo_src("2"));
+        let c2 = repo.commit("c2 changes foo");
+        repo.write("lib.rs", &foo_with("2", "fn other() {}\n"));
+        let c3 = repo.commit("c3 unrelated");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(
+            &storage,
+            &file,
+            &[(&c1, "b3:1"), (&c2, "b3:2"), (&c3, "b3:2")],
+        );
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.intact, 1, "{stats:?}");
+        let v = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(v.verdict, VerdictKind::SupersededBy);
+        assert_eq!(v.receipt_oid.as_deref(), Some(c2.as_str()));
+        assert_eq!(
+            v.successor_witness_id,
+            Some(witness_at(&storage, &file, &c2))
+        );
+    }
+
+    #[test]
+    fn whole_file_witness_receipt_is_the_commit_that_changed_the_file() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "one\n");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "two\n");
+        let c2 = repo.commit("c2");
+        repo.write("lib.rs", "two\n\n");
+        let c3 = repo.commit("c3 blank line only");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                for (oid, stamp) in [(&c1, "b3:1"), (&c2, "b3:2"), (&c3, "b3:3")] {
+                    let mut row = ledger_row("proj", &file, oid, stamp);
+                    row.symbol = None;
+                    row.span_start = None;
+                    row.span_end = None;
+                    witness_ledger::insert_witness(conn, &row)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let stats = run_join(&storage, false);
+        // c1 -> c3: content changed, receipt c2. c2 -> c3: whitespace only.
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.abstained_same_content, 1, "{stats:?}");
+        let v = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(v.receipt_oid.as_deref(), Some(c2.as_str()));
+        assert!(latest(&storage, &file, &c2).is_none());
+    }
+
+    #[test]
+    fn whitespace_only_reformat_is_not_a_supersession() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "fn foo() {\n\t1   \n}\n\n");
+        let c2 = repo.commit("c2 reformat only");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        // Raw stamps differ (they are raw), the normalized content does not.
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.abstained_same_content, 1, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert!(latest(&storage, &file, &c1).is_none());
+    }
+
+    #[test]
+    fn reinstated_receipt_is_the_commit_that_restored_the_symbol() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1 foo");
+        repo.write("lib.rs", &foo_with("1", "// pad\n"));
+        let c1b = repo.commit("c1b unrelated");
+        repo.write("lib.rs", "// gone\n");
+        let c2 = repo.commit("c2 deletes foo");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c1b, "b3:1")]);
+        let first = run_join(&storage, false);
+        assert_eq!(first.obsolete, 2, "{first:?}");
+        assert_eq!(
+            latest(&storage, &file, &c1).unwrap().receipt_oid.as_deref(),
+            Some(c2.as_str())
+        );
+
+        repo.write("lib.rs", "// gone\n// still gone\n");
+        let _c3 = repo.commit("c3 unrelated");
+        repo.write("lib.rs", &foo_with("1", "// back\n"));
+        let c4 = repo.commit("c4 restores identical foo");
+        repo.write("lib.rs", &foo_with("1", "// back\n// later\n"));
+        let c5 = repo.commit("c5 unrelated");
+        insert_rows(&storage, &file, &[(&c5, "b3:1")]);
+
+        let second = run_join(&storage, false);
+        assert_eq!(second.reinstated, 2, "{second:?}");
+        assert_eq!(second.receipts_found, 2, "{second:?}");
+        for oid in [&c1, &c1b] {
+            let v = latest(&storage, &file, oid).unwrap();
+            assert_eq!(v.verdict, VerdictKind::AnchorReinstated);
+            assert_eq!(v.receipt_oid.as_deref(), Some(c4.as_str()), "not HEAD {c5}");
+            assert_eq!(v.observed_head_oid, c5);
+        }
+    }
+
+    #[test]
+    fn symbol_present_at_head_without_a_head_row_is_not_obsolete() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", &foo_with("1", "// pad\n"));
+        let c2 = repo.commit("c2");
+        repo.write("lib.rs", &foo_with("1", "// pad\n// more\n"));
+        let _c3 = repo.commit("c3 (HEAD, no ledger row)");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:1")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 0, "{stats:?}");
+        assert_eq!(stats.abstained_present_at_head, 2, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert!(latest(&storage, &file, &c1).is_none());
+    }
+
+    #[test]
+    fn unparseable_content_abstains_instead_of_guessing() {
+        // "1" / "2" are not a parseable Rust symbol anywhere: state at the
+        // witness's own commit is Unknown, so no event, no HEAD fallback.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "1");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "2");
+        let c2 = repo.commit("c2");
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.abstained_unrederivable, 1, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn unknown_state_inside_the_range_abstains_with_no_receipt() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", &foo_with("1", "// pad\n"));
+        let c1b = repo.commit("c1b");
+        repo.write("lib.rs", "fn foo( {{{ ]\nlet = ;\n");
+        let _c2 = repo.commit("c2 syntax error");
+        repo.write("lib.rs", "// gone\n");
+        let _c3 = repo.commit("c3 foo gone");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c1b, "b3:1")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 0, "{stats:?}");
+        assert_eq!(stats.abstained_no_receipt, 2, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert_eq!(stats.receipts_found, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn rerun_at_a_newer_head_runs_no_receipt_search_and_writes_nothing() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", &foo_src("2"));
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+        let first = run_join(&storage, false);
+        assert_eq!(first.events_written, 1, "{first:?}");
+        assert!(first.receipt_searches >= 1, "{first:?}");
+
+        repo.write("lib.rs", &foo_with("2", "fn other() {}\n"));
+        let c3 = repo.commit("c3 unrelated");
+        insert_rows(&storage, &file, &[(&c3, "b3:2")]);
+
+        let second = run_join(&storage, false);
+        assert_eq!(second.superseded, 1, "same conclusion: {second:?}");
+        assert_eq!(second.events_deduped, 1, "{second:?}");
+        assert_eq!(second.events_written, 0, "{second:?}");
+        assert_eq!(second.receipt_searches, 0, "no git search: {second:?}");
+        assert_eq!(second.receipts_found, 0, "{second:?}");
+        let n: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+        // The recorded receipt is still the changing commit, untouched.
+        assert_eq!(
+            latest(&storage, &file, &c1).unwrap().receipt_oid.as_deref(),
+            Some(c2.as_str())
+        );
     }
 }

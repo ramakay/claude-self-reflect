@@ -657,7 +657,7 @@ fn build_transcript_index(
 /// Resolve `file`'s path relative to `repo_root`. `None` when `file` is not
 /// actually rooted under `repo_root` (e.g. a stale/mismatched `repo_root`
 /// value) — never a guess.
-fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
+pub(crate) fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
     Path::new(file)
         .strip_prefix(Path::new(repo_root))
         .ok()
@@ -671,7 +671,7 @@ fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
 /// linked worktree), an inherited `GIT_DIR` would silently override `-C`
 /// and point the command at the WRONG repository. This backfill always
 /// targets the explicit `repo_root` it resolved — never ambient state.
-fn git_at(repo_root: &str) -> Command {
+pub(crate) fn git_at(repo_root: &str) -> Command {
     let mut cmd = Command::new("git");
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("GIT_") {

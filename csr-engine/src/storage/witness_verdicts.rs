@@ -160,8 +160,12 @@ pub struct WitnessVerdictRow {
     pub verdict: VerdictKind,
     /// Set only for `SupersededBy`.
     pub successor_witness_id: Option<i64>,
-    /// Commit proving the verdict: the successor's `at_oid` for
-    /// `SupersededBy`, else the HEAD oid observed when the dream cycle ran.
+    /// The commit that made the change, found in git history by
+    /// `dream::receipt`: the first commit that deleted the symbol
+    /// (`AnchorObsolete`), first changed its normalized content
+    /// (`SupersededBy`), or first restored it (`AnchorReinstated`). Never the
+    /// observed HEAD and never the successor witness's `at_oid` -- when no
+    /// such commit can be named the dream abstains and writes no event.
     pub receipt_oid: Option<String>,
     /// HEAD (or, for a multi-repo dream run, that witness's own repo's HEAD)
     /// observed when the dream cycle that minted this event ran. Never

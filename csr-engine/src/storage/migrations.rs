@@ -1289,9 +1289,12 @@ pub fn run(conn: &Connection) -> Result<()> {
     // (both close the same class of "accidental new state, never validated"
     // bug at the DB layer, not just by convention). `successor_witness_id` is
     // set only for `superseded_by` (the OLDER witness's replacement); NULL for
-    // `anchor_obsolete`/`anchor_reinstated`. `receipt_oid` is the commit proving
-    // the verdict (the successor's `at_oid` for `superseded_by`, else the HEAD
-    // oid observed when the dream cycle ran). `observed_head_oid` is NOT NULL —
+    // `anchor_obsolete`/`anchor_reinstated`. `receipt_oid` is the commit that
+    // MADE the change, found in git history by `dream::receipt` (the first
+    // commit that deleted the symbol / changed its normalized content / restored
+    // it) -- never the observed HEAD and never the successor witness's `at_oid`.
+    // Events minted before the v2 epoch floor used those stand-ins and are
+    // retired (see `witness_verdicts::LIVE_EVENT_FLOOR_SQL`). `observed_head_oid` is NOT NULL —
     // every event is anchored to the HEAD commit the dream cycle that minted it
     // saw (per-repo HEAD when a run visits multiple repos), never wall-clock
     // time.
