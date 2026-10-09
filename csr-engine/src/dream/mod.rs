@@ -9,7 +9,7 @@
 //! ancestry (`codewitness::causal::compare`) alone, exactly like
 //! `codewitness` itself.
 //!
-//! # The join, in one pass per `(project, file, symbol)` anchor
+//! # The join, in one pass per `(file, symbol)` anchor
 //!
 //! For every anchor with committed-tier `witness_ledger` rows at more than
 //! one distinct `at_oid` (a single stamp ever recorded has no history to
@@ -115,7 +115,7 @@ pub struct DreamStats {
     /// existing at HEAD (see the module doc). This pass runs FOR REAL even
     /// under `--dry-run` (append-only evidence, harmless — see `run_dream`).
     pub stamp_spans: StampSpansStats,
-    /// `(project, file, symbol)` anchors with committed-tier rows at more
+    /// `(file, symbol)` anchors with committed-tier rows at more
     /// than one distinct `at_oid` — the population the join actually walks.
     pub anchors_considered: usize,
     /// Non-HEAD committed witness rows examined across those anchors.
@@ -363,17 +363,21 @@ fn run_dream_inner(
     }
 }
 
-/// A `(project, file, symbol)` anchor key.
-type AnchorKey = (String, String, Option<String>);
+/// A `(file, symbol)` anchor key. The session-derived `project` is
+/// deliberately NOT part of the identity: the HEAD stamp pass assigns one
+/// project per file, so the same absolute file+symbol is stamped under
+/// different projects over time, and a project-keyed group would never see
+/// the HEAD row minted under the newer project (every old group would go
+/// `anchor_obsolete` on every pass).
+type AnchorKey = (String, Option<String>);
 
 /// Group already-sorted rows (see `witness_ledger::all_committed_witnesses`'s
-/// `ORDER BY project, file, COALESCE(symbol,''), id`) into contiguous
-/// `(project, file, symbol)` anchors, preserving each group's insertion
-/// (`id`) order.
+/// `ORDER BY file, COALESCE(symbol,''), id`) into contiguous `(file,
+/// symbol)` anchors, preserving each group's insertion (`id`) order.
 fn group_by_anchor(rows: Vec<WitnessLedgerRow>) -> Vec<(AnchorKey, Vec<WitnessLedgerRow>)> {
     let mut groups: Vec<(AnchorKey, Vec<WitnessLedgerRow>)> = Vec::new();
     for row in rows {
-        let key = (row.project.clone(), row.file.clone(), row.symbol.clone());
+        let key = (row.file.clone(), row.symbol.clone());
         match groups.last_mut() {
             Some((k, v)) if *k == key => v.push(row),
             _ => groups.push((key, vec![row])),
@@ -621,7 +625,7 @@ pub(crate) fn dream_join_cancellable(
 }
 
 /// Search `head_stamp_rows` — the anchor's successor-candidate set,
-/// precomputed ONCE per `(project, file, symbol)` group as the rows whose
+/// precomputed ONCE per `(file, symbol)` group as the rows whose
 /// stamp equals the current HEAD stamp (typically 1-2 rows; `h` itself is
 /// always one of them) — for a valid successor to `w`. A candidate `W2`
 /// qualifies iff ALL of:
@@ -1265,6 +1269,76 @@ mod tests {
                 .is_none(),
             "Demote state must clear after reinstatement"
         );
+    }
+
+    #[test]
+    fn head_row_under_another_project_keeps_same_content_witness_intact() {
+        // The stamp pass assigns one project per file, so the same absolute
+        // file+symbol is stamped under P1 at c1 and later under P2 at c2
+        // (HEAD). Anchor identity is (file, symbol): with identical content
+        // the P1 witness is intact, never `anchor_obsolete`.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "A");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "A\n");
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("p1", &file, &c1, "b3:A"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("p2", &file, &c2, "b3:A"))
+            })
+            .unwrap();
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.anchors_considered, 1, "one (file, symbol) anchor");
+        assert_eq!(stats.obsolete, 0, "{stats:?}");
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.intact, 1, "{stats:?}");
+        assert_eq!(stats.events_written, 0);
+    }
+
+    #[test]
+    fn head_row_under_another_project_supersedes_changed_content() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "A");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "B");
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("p1", &file, &c1, "b3:A"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("p2", &file, &c2, "b3:B"))
+            })
+            .unwrap();
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 0, "{stats:?}");
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+
+        let p1_id = storage
+            .witnesses_for_file("p1", &file)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let p2_id = storage
+            .witnesses_for_file("p2", &file)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let verdict = storage.latest_witness_verdict(p1_id).unwrap().unwrap();
+        assert_eq!(verdict.verdict, VerdictKind::SupersededBy);
+        assert_eq!(verdict.successor_witness_id, Some(p2_id));
+        assert_eq!(verdict.receipt_oid, Some(c2));
     }
 
     #[test]

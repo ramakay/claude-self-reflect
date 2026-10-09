@@ -409,22 +409,26 @@ pub fn symbol_verdict_state(
     // whose `at_oid` equals the newest event's `observed_head_oid`); if ANY
     // witness of the symbol carries that stamp, the symbol is present at
     // current truth — evolution, not staleness: Annotate. Otherwise the
-    // symbol is truly gone or fully stale: Demote.
+    // symbol is truly gone or fully stale: Demote. These ledger lookups are
+    // PROJECT-AGNOSTIC (file + symbol only): the HEAD stamp pass assigns one
+    // project per file, so the HEAD row for the same absolute file+symbol may
+    // sit under a different project than the witness whose verdict is being
+    // resolved. Only the outer negative-event filter is project-scoped.
     let head_oid = &latest_per_witness[0].observed_head_oid;
     let head_stamp: Option<String> = conn
         .query_row(
             "SELECT stamp FROM witness_ledger
-             WHERE project = ?1 AND file = ?2 AND symbol IS ?3 AND at_oid = ?4
-             LIMIT 1",
-            params![project, file, symbol, head_oid],
+             WHERE file = ?1 AND symbol IS ?2 AND at_oid = ?3
+             ORDER BY id DESC LIMIT 1",
+            params![file, symbol, head_oid],
             |r| r.get(0),
         )
         .optional()?;
     let intact_at_head = match head_stamp {
         Some(head_stamp) => conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM witness_ledger
-                 WHERE project = ?1 AND file = ?2 AND symbol IS ?3 AND stamp = ?4)",
-            params![project, file, symbol, head_stamp],
+                 WHERE file = ?1 AND symbol IS ?2 AND stamp = ?3)",
+            params![file, symbol, head_stamp],
             |r| r.get(0),
         )?,
         None => false,
@@ -716,7 +720,7 @@ pub fn symbol_verdict_states_for_files(
                     v.witness_id, v.verdict, v.successor_witness_id,
                     v.receipt_oid, v.observed_head_oid,
                     EXISTS(SELECT 1 FROM witness_ledger wl2
-                           WHERE wl2.project = wl.project AND wl2.file = wl.file
+                           WHERE wl2.file = wl.file
                              AND wl2.symbol IS wl.symbol
                              AND wl2.at_oid = v.observed_head_oid)
              FROM witness_verdicts v
@@ -830,7 +834,7 @@ pub(crate) fn symbol_verdict_states_for_lineages(
                     v.witness_id, v.verdict, v.successor_witness_id,
                     v.receipt_oid, v.observed_head_oid,
                     EXISTS(SELECT 1 FROM witness_ledger wl2
-                           WHERE wl2.project = wl.project AND wl2.file = wl.file
+                           WHERE wl2.file = wl.file
                              AND wl2.symbol IS wl.symbol
                              AND wl2.at_oid = v.observed_head_oid
                              AND ((wl.source_kind = 'backfill_rederived_v2'
@@ -1295,6 +1299,67 @@ mod tests {
             state.representative.receipt_oid.as_deref(),
             Some("bbb"),
             "annotation carries the most recent negative event's receipt"
+        );
+    }
+
+    #[test]
+    fn head_stamp_lookup_is_project_agnostic() {
+        // The stamp pass assigns ONE project per file, so the HEAD row for
+        // the same absolute file+symbol can sit under another project than
+        // the witness being judged. Three witnesses: p1 @aaa (b3:1),
+        // p1 @bbb (b3:2), and p2 @ccc (b3:1 — HEAD, same content as aaa).
+        // The p1 witness at bbb is obsolete, observed at HEAD ccc. A
+        // project-keyed lookup finds no row at ccc under p1 and demotes;
+        // the project-agnostic lookup sees b3:1 intact at HEAD: Annotate.
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        witness_ledger::insert_witness(&conn, &ledger_row("bbb", "b3:2")).unwrap();
+        let mut head = ledger_row("ccc", "b3:1");
+        head.project = "other".into();
+        witness_ledger::insert_witness(&conn, &head).unwrap();
+        let bbb_id: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE at_oid = 'bbb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: bbb_id,
+                verdict: VerdictKind::AnchorObsolete,
+                successor_witness_id: None,
+                receipt_oid: Some("ccc".into()),
+                observed_head_oid: "ccc".into(),
+            },
+        )
+        .unwrap();
+        let single = symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
+            .unwrap()
+            .expect("negative-latest witness must surface");
+        assert_eq!(single.channel, VerdictChannel::Annotate);
+
+        let pairs = vec![("proj".to_string(), "/repo/src/lib.rs".to_string())];
+        let batched = symbol_verdict_states_for_files(&conn, &pairs).unwrap();
+        let key = (
+            "proj".to_string(),
+            "/repo/src/lib.rs".to_string(),
+            "foo".to_string(),
+        );
+        assert_eq!(batched[&key].channel, VerdictChannel::Annotate);
+
+        let lineages = vec![(
+            "proj".to_string(),
+            "/repo/src/lib.rs".to_string(),
+            "foo".to_string(),
+            None,
+        )];
+        let by_lineage = symbol_verdict_states_for_lineages(&conn, &lineages).unwrap();
+        assert_eq!(by_lineage[&key].channel, VerdictChannel::Annotate);
+        assert!(
+            all_demoted_symbols(&conn).unwrap().is_empty(),
+            "not demoted: the symbol is intact at HEAD under another project"
         );
     }
 

@@ -293,8 +293,10 @@ pub fn count_all(conn: &Connection) -> Result<i64> {
 }
 
 /// Every `tier = 'committed'` witness row, ordered so that all rows sharing
-/// `(project, file, symbol)` are contiguous (`ORDER BY project, file,
-/// COALESCE(symbol,''), id`) — the grouping order `dream`'s successor join
+/// `(file, symbol)` are contiguous (`ORDER BY file, COALESCE(symbol,''), id`;
+/// project is deliberately not part of anchor identity — the stamp pass
+/// assigns one project per file, so the same file+symbol appears under
+/// several projects over time) — the grouping order `dream`'s successor join
 /// needs to walk each anchor's history without a second sort pass.
 /// `tier = 'worktree'` rows are excluded: only committed history can support
 /// a supersession claim (mirrors `codewitness::Auditor::audit_against_successor`'s
@@ -303,7 +305,7 @@ pub fn all_committed_witnesses(conn: &Connection) -> Result<Vec<WitnessLedgerRow
     let sql = format!(
         "SELECT {SELECT_COLUMNS} FROM witness_ledger
          WHERE tier = 'committed'
-         ORDER BY project, file, COALESCE(symbol,''), id"
+         ORDER BY file, COALESCE(symbol,''), id"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
