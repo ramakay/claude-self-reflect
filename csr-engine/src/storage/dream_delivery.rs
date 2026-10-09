@@ -171,7 +171,10 @@ fn headline_from_parts(
     })
 }
 
-/// Every receipt-bearing conclusion for `project`, newest witnessed first.
+/// Every receipt-bearing CURRENT conclusion for `project`, newest witnessed
+/// first. Only each witness's LATEST live event is considered: a witness
+/// whose latest event is `anchor_reinstated` no longer surfaces its earlier
+/// `anchor_obsolete` — delivery shows what is true now, not the history.
 /// Adverse verdicts (`anchor_obsolete`, `superseded_by`) sort ahead of
 /// restorative ones at equal date, mirroring `dream_clusters`'s tier 2 —
 /// this is the same priority order, applied to a single row rather than a
@@ -183,6 +186,8 @@ pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<Dre
          JOIN witness_ledger l ON l.id = v.witness_id
          WHERE l.project = ?1
            AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
            AND v.receipt_oid IS NOT NULL
            AND TRIM(v.receipt_oid) != ''
          GROUP BY l.file, l.symbol, v.verdict, v.receipt_oid
@@ -233,8 +238,8 @@ fn verdict_rank(verdict: &str) -> u8 {
     }
 }
 
-/// Cheap existence probe: does this project have any receipt-bearing verdict
-/// at all? Hooks call this before doing any real work, so a project with no
+/// Cheap existence probe: does this project have any receipt-bearing CURRENT
+/// verdict (a witness's latest live event) at all? Hooks call this before doing any real work, so a project with no
 /// dreams costs one indexed count.
 pub fn has_receipted_conclusion(conn: &Connection, project: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
@@ -244,6 +249,8 @@ pub fn has_receipted_conclusion(conn: &Connection, project: &str) -> Result<bool
              JOIN witness_ledger l ON l.id = v.witness_id
              WHERE l.project = ?1
                AND v.id > {LIVE_EVENT_FLOOR_SQL}
+               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                           WHERE v2.witness_id = v.witness_id)
                AND v.receipt_oid IS NOT NULL
                AND TRIM(v.receipt_oid) != ''"
         ),
@@ -474,6 +481,98 @@ mod tests {
             .unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].symbol.as_deref(), Some("new_fn"));
+    }
+
+    #[test]
+    fn a_reinstated_witness_does_not_surface_its_earlier_obsolete_verdict() {
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "proj", "src/a.rs", "flip", Some("1111111"));
+        seed(&storage, "proj", "src/b.rs", "still_gone", Some("3333333"));
+        let witness_id: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM witness_ledger WHERE symbol = 'flip'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id,
+                        verdict: VerdictKind::AnchorReinstated,
+                        successor_witness_id: None,
+                        receipt_oid: Some("2222222".into()),
+                        observed_head_oid: "head2".into(),
+                    },
+                )
+            })
+            .unwrap();
+
+        let conclusions = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let flip: Vec<_> = conclusions
+            .iter()
+            .filter(|c| c.symbol.as_deref() == Some("flip"))
+            .collect();
+        assert_eq!(
+            flip.len(),
+            1,
+            "only the latest event surfaces: {conclusions:?}"
+        );
+        assert_eq!(flip[0].verdict, "anchor_reinstated");
+        assert_eq!(flip[0].receipt_oid, "2222222");
+        assert!(
+            conclusions.iter().any(
+                |c| c.symbol.as_deref() == Some("still_gone") && c.verdict == "anchor_obsolete"
+            ),
+            "a witness whose latest event is still negative keeps surfacing"
+        );
+
+        // The existence probe is latest-only too: with the only other
+        // witness retired behind the floor, a project whose sole remaining
+        // witness is reinstated still has a (restorative) conclusion.
+        assert!(storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+    }
+
+    #[test]
+    fn existence_probe_counts_only_each_witness_latest_event() {
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "proj", "src/a.rs", "flip", Some("1111111"));
+        // Latest event has NO receipt: the earlier receipted obsolete is no
+        // longer the current state, so nothing receipt-bearing is current.
+        let witness_id: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT id FROM witness_ledger", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id,
+                        verdict: VerdictKind::AnchorReinstated,
+                        successor_witness_id: None,
+                        receipt_oid: None,
+                        observed_head_oid: "head2".into(),
+                    },
+                )
+            })
+            .unwrap();
+        assert!(!storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+        assert!(storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
