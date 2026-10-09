@@ -20,6 +20,7 @@
 //! relapsed symbol can die more than once) and are not claimed to form a
 //! single end-to-end monotone chain; the printed table is a diagnostic
 //! funnel, not a formal one.
+use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::collections::HashSet;
 
 use anyhow::Result;
@@ -109,7 +110,8 @@ pub fn sql_stages(conn: &Connection, fam: &Family) -> Result<SqlStages> {
             "SELECT COUNT(DISTINCT w.symbol) FROM witness_ledger w \
              JOIN witness_verdicts v ON v.witness_id = w.id \
              WHERE w.project IN ({clause}) AND w.symbol IS NOT NULL \
-             AND v.verdict IN ('anchor_obsolete','superseded_by')"
+             AND v.verdict IN ('anchor_obsolete','superseded_by') \
+             AND v.id > {LIVE_EVENT_FLOOR_SQL}"
         ),
         family_params(fam).as_slice(),
         |r| r.get(0),
@@ -120,7 +122,8 @@ pub fn sql_stages(conn: &Connection, fam: &Family) -> Result<SqlStages> {
             "SELECT COUNT(*) FROM witness_verdicts v \
              JOIN witness_ledger w ON w.id = v.witness_id \
              WHERE w.project IN ({clause}) \
-             AND v.verdict IN ('anchor_obsolete','superseded_by')"
+             AND v.verdict IN ('anchor_obsolete','superseded_by') \
+             AND v.id > {LIVE_EVENT_FLOOR_SQL}"
         ),
         family_params(fam).as_slice(),
         |r| r.get(0),
@@ -130,7 +133,8 @@ pub fn sql_stages(conn: &Connection, fam: &Family) -> Result<SqlStages> {
         &format!(
             "SELECT COUNT(*) FROM witness_verdicts v \
              JOIN witness_ledger w ON w.id = v.witness_id \
-             WHERE w.project IN ({clause}) AND v.verdict = 'anchor_reinstated'"
+             WHERE w.project IN ({clause}) AND v.verdict = 'anchor_reinstated' \
+             AND v.id > {LIVE_EVENT_FLOOR_SQL}"
         ),
         family_params(fam).as_slice(),
         |r| r.get(0),
@@ -188,7 +192,8 @@ pub fn sql_stages(conn: &Connection, fam: &Family) -> Result<SqlStages> {
                 "SELECT DISTINCT w.file, w.symbol FROM witness_ledger w
                  JOIN witness_verdicts v ON v.witness_id = w.id
                  WHERE w.project IN ({clause}) AND w.symbol IS NOT NULL
-                   AND v.verdict IN ('anchor_obsolete','superseded_by')"
+                   AND v.verdict IN ('anchor_obsolete','superseded_by')
+                   AND v.id > {LIVE_EVENT_FLOOR_SQL}"
             ))?;
             let rows = stmt.query_map(family_params(fam).as_slice(), |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -415,5 +420,32 @@ mod tests {
         let s = sql_stages(&conn, &fam).unwrap();
         assert_eq!(s.episodes, 0);
         assert_eq!(s.funeral_symbols, 0);
+    }
+
+    #[test]
+    fn sql_stages_ignore_events_below_the_live_floor() {
+        let conn = open();
+        let fam = Family::single("proj");
+        // 15 retired v1 events (negative + one reinstatement), then the
+        // floor, then ONE live negative and ONE live reinstatement.
+        for i in 0..15 {
+            seed_dead_symbol(&conn, "proj", &format!("old{i}"), "anchor_obsolete");
+        }
+        seed_dead_symbol(&conn, "proj", "old_back", "anchor_reinstated");
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        seed_dead_symbol(&conn, "proj", "live_dead", "anchor_obsolete");
+        seed_dead_symbol(&conn, "proj", "live_back", "anchor_reinstated");
+
+        let s = sql_stages(&conn, &fam).unwrap();
+        assert_eq!(s.negative_verdicts, 1, "retired negatives counted: {s:?}");
+        assert_eq!(s.funeral_symbols, 1, "retired symbols counted: {s:?}");
+        assert_eq!(s.reinstated, 1, "retired reinstatement counted: {s:?}");
     }
 }

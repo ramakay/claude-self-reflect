@@ -106,6 +106,7 @@
 //!
 //! Zero LLM calls anywhere in this module.
 
+use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::path::Path;
 use std::process::Command;
 
@@ -252,6 +253,7 @@ pub fn detect_bulk(conn: &Connection, family: &Family) -> Result<BulkFlags> {
          JOIN witness_ledger w ON w.id = v.witness_id
          WHERE w.project IN ({in_clause})
            AND v.verdict IN ('anchor_obsolete','superseded_by')
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
            AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2 WHERE v2.witness_id = v.witness_id)"
     );
     let params: Vec<&dyn rusqlite::ToSql> = family
@@ -851,7 +853,11 @@ fn finalize_death(
 
 fn latest_verdict_created_at(conn: &Connection, witness_id: i64) -> Result<Option<String>> {
     conn.query_row(
-        "SELECT created_at FROM witness_verdicts WHERE witness_id = ?1 ORDER BY id DESC LIMIT 1",
+        &format!(
+            "SELECT created_at FROM witness_verdicts
+             WHERE witness_id = ?1 AND id > {LIVE_EVENT_FLOOR_SQL}
+             ORDER BY id DESC LIMIT 1"
+        ),
         params![witness_id],
         |r| r.get(0),
     )
@@ -1516,5 +1522,65 @@ mod tests {
             !death.orderable(),
             "with no receipt_oid, the only remaining tier is the unorderable fallback"
         );
+    }
+
+    #[test]
+    fn detect_bulk_counts_only_live_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        if !init_repo(&repo) {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        std::fs::write(repo.join("f0.rs"), "fn f0() {}\n").unwrap();
+        std::fs::write(repo.join("f1.rs"), "fn f1() {}\n").unwrap();
+        let Some(oid_old) = commit_all_with_date(&repo, now - 400 * 86_400) else {
+            return;
+        };
+        std::fs::write(repo.join("f2.rs"), "fn f2() {}\n").unwrap();
+        std::fs::write(repo.join("f3.rs"), "fn f3() {}\n").unwrap();
+        let Some(oid_mid) = commit_all_with_date(&repo, now - 200 * 86_400) else {
+            return;
+        };
+        std::fs::write(repo.join("f4.rs"), "fn f4() {}\n").unwrap();
+        std::fs::write(repo.join("f5.rs"), "fn f5() {}\n").unwrap();
+        let Some(oid_new) = commit_all_with_date(&repo, now - 40 * 86_400) else {
+            return;
+        };
+
+        let conn = open();
+        let family = Family::single("proj");
+        let oids = [oid_old, oid_mid, oid_new];
+        let seed = |i: usize| {
+            let file = repo.join(format!("f{}.rs", i % 6));
+            let wid = seed_witness(&conn, "proj", &file, &format!("b3:s{i}"), "deadbeef");
+            mark(&conn, wid, Some(oids[i % 3].as_str()), "headoid");
+            wid
+        };
+        // 15 retired events: on their own a textbook bulk sweep.
+        let first_retired = seed(0);
+        for i in 1..15 {
+            seed(i);
+        }
+        assert!(detect_bulk(&conn, &family).unwrap().oid_degenerate);
+
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        seed(15);
+
+        assert!(
+            !detect_bulk(&conn, &family).unwrap().oid_degenerate,
+            "15 retired events plus 1 live one is a family of 1, not 16"
+        );
+        // The created_at helper reads live events only, too.
+        assert!(latest_verdict_created_at(&conn, first_retired)
+            .unwrap()
+            .is_none());
     }
 }

@@ -46,6 +46,7 @@
 //!
 //! Zero LLM calls anywhere in this module.
 
+use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Command;
 
@@ -442,7 +443,11 @@ fn git_commit_committer_ts(repo_root: &str, oid: &str) -> Option<i64> {
 /// rather than widening `witness_verdicts`'s public row type for one caller.
 fn latest_verdict_created_at(conn: &Connection, witness_id: i64) -> Result<Option<String>> {
     conn.query_row(
-        "SELECT created_at FROM witness_verdicts WHERE witness_id = ?1 ORDER BY id DESC LIMIT 1",
+        &format!(
+            "SELECT created_at FROM witness_verdicts
+             WHERE witness_id = ?1 AND id > {LIVE_EVENT_FLOOR_SQL}
+             ORDER BY id DESC LIMIT 1"
+        ),
         params![witness_id],
         |r| r.get(0),
     )
@@ -2126,6 +2131,47 @@ mod tests {
         assert!(
             pairs.is_empty(),
             "no shared symbol or rare token beyond the shared file path"
+        );
+    }
+
+    #[test]
+    fn latest_verdict_created_at_reads_live_events_only() {
+        let conn = open();
+        conn.execute(
+            "INSERT INTO witness_ledger (project, file, symbol, stamp, tier, at_oid, source_kind)
+             VALUES ('proj', '/f.rs', 'foo', 'b3:foo', 'committed', 'oid', 'backfill')",
+            [],
+        )
+        .unwrap();
+        let wid = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid, created_at)
+             VALUES (?1, 'anchor_obsolete', 'head', '2026-01-01 00:00:00')",
+            params![wid],
+        )
+        .unwrap();
+        assert_eq!(
+            latest_verdict_created_at(&conn, wid).unwrap().as_deref(),
+            Some("2026-01-01 00:00:00")
+        );
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        assert!(latest_verdict_created_at(&conn, wid).unwrap().is_none());
+        conn.execute(
+            "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid, created_at)
+             VALUES (?1, 'anchor_reinstated', 'head', '2026-02-02 00:00:00')",
+            params![wid],
+        )
+        .unwrap();
+        assert_eq!(
+            latest_verdict_created_at(&conn, wid).unwrap().as_deref(),
+            Some("2026-02-02 00:00:00")
         );
     }
 }
