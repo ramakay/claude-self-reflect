@@ -32,6 +32,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
+
+use super::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use sha2::{Digest, Sha256};
 
 /// Which channel qualified a [`DreamItem`] — see the module doc's two-channel
@@ -363,14 +365,15 @@ pub(crate) fn verdict_rows_for_project(
     conn: &Connection,
     project: &str,
 ) -> Result<Vec<VerdictGroupRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT l.file, l.symbol, v.verdict, v.receipt_oid, MAX(v.created_at) AS witnessed_at
          FROM witness_verdicts v
          JOIN witness_ledger l ON l.id = v.witness_id
          WHERE l.project = ?1
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
          GROUP BY l.file, l.symbol, v.verdict, v.receipt_oid
-         ORDER BY witnessed_at DESC",
-    )?;
+         ORDER BY witnessed_at DESC"
+    ))?;
     let rows = stmt
         .query_map(params![project], |row| {
             Ok(VerdictGroupRow {
@@ -799,6 +802,44 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verdict_rows_ignore_events_at_or_below_the_floor() {
+        let conn = open();
+        insert_witness_with_verdict(
+            &conn,
+            "proj",
+            "/repo/src/a.rs",
+            Some("old_fn"),
+            "aaa",
+            "b3:1",
+            VerdictKind::SupersededBy,
+            "aaa",
+        );
+        assert_eq!(verdict_rows_for_project(&conn, "proj").unwrap().len(), 1);
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        assert!(verdict_rows_for_project(&conn, "proj").unwrap().is_empty());
+        insert_witness_with_verdict(
+            &conn,
+            "proj",
+            "/repo/src/b.rs",
+            Some("new_fn"),
+            "bbb",
+            "b3:2",
+            VerdictKind::AnchorObsolete,
+            "bbb",
+        );
+        let rows = verdict_rows_for_project(&conn, "proj").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol.as_deref(), Some("new_fn"));
     }
 
     // ---- channel A: exact-token qualification ------------------------------

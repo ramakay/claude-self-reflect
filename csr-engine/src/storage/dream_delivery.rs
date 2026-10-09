@@ -38,6 +38,8 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
+
+use super::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use sha2::{Digest, Sha256};
 
 use super::Storage;
@@ -175,16 +177,17 @@ fn headline_from_parts(
 /// this is the same priority order, applied to a single row rather than a
 /// cluster.
 pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<DreamHeadline>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT l.file, l.symbol, v.verdict, v.receipt_oid, MAX(v.created_at) AS witnessed_at
          FROM witness_verdicts v
          JOIN witness_ledger l ON l.id = v.witness_id
          WHERE l.project = ?1
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
            AND v.receipt_oid IS NOT NULL
            AND TRIM(v.receipt_oid) != ''
          GROUP BY l.file, l.symbol, v.verdict, v.receipt_oid
-         ORDER BY witnessed_at DESC",
-    )?;
+         ORDER BY witnessed_at DESC"
+    ))?;
     let rows = stmt
         .query_map(params![project], |row| {
             Ok((
@@ -235,12 +238,15 @@ fn verdict_rank(verdict: &str) -> u8 {
 /// dreams costs one indexed count.
 pub fn has_receipted_conclusion(conn: &Connection, project: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM witness_verdicts v
-         JOIN witness_ledger l ON l.id = v.witness_id
-         WHERE l.project = ?1
-           AND v.receipt_oid IS NOT NULL
-           AND TRIM(v.receipt_oid) != ''",
+        &format!(
+            "SELECT COUNT(*)
+             FROM witness_verdicts v
+             JOIN witness_ledger l ON l.id = v.witness_id
+             WHERE l.project = ?1
+               AND v.id > {LIVE_EVENT_FLOOR_SQL}
+               AND v.receipt_oid IS NOT NULL
+               AND TRIM(v.receipt_oid) != ''"
+        ),
         params![project],
         |row| row.get(0),
     )?;
@@ -420,6 +426,54 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Retire every event currently in the table behind the v2 epoch floor.
+    fn raise_floor_to_max_event(storage: &Storage) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO meta(key, value)
+                     VALUES ('witness_verdicts_v2_floor',
+                             (SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) FROM witness_verdicts))
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn delivery_readers_ignore_events_at_or_below_the_floor() {
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "proj", "src/a.rs", "old_fn", Some("1111111"));
+        assert!(storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+        assert_eq!(
+            storage
+                .with_connection(|conn| receipted_conclusions(conn, "proj"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        raise_floor_to_max_event(&storage);
+        assert!(!storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+        assert!(storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap()
+            .is_empty());
+
+        seed(&storage, "proj", "src/b.rs", "new_fn", Some("2222222"));
+        let live = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].symbol.as_deref(), Some("new_fn"));
     }
 
     #[test]

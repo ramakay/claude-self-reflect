@@ -33,6 +33,16 @@
 //! matters, so "skip iff the latest has the same verdict kind" is the whole
 //! contract.
 //!
+//! # Live events (the v2 epoch floor)
+//!
+//! Events minted before the epoch floor (`meta` key
+//! `witness_verdicts_v2_floor`, set once by the migration to the table's
+//! `MAX(id)` the first time a binary with the fixed join opens a database)
+//! came out of the old buggy join. The table is append-only so they stay,
+//! but every reader ignores `id <= floor` — see
+//! [`LIVE_EVENT_FLOOR_SQL`]. A witness whose only events are below the floor
+//! is judged fresh by the join.
+//!
 //! # Symbol-level current state (order-independent, two channels)
 //!
 //! [`symbol_verdict_state`] answers "what is the CURRENT state of this
@@ -77,6 +87,22 @@
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+
+/// `meta` key holding the v2 epoch floor: the `MAX(id)` of `witness_verdicts`
+/// at the moment the first binary with the fixed dream join opened the
+/// database (see `storage::migrations`). Events with `id <= floor` were
+/// minted by the old buggy join; they stay in the append-only table but are
+/// invisible to every live reader.
+pub(crate) const LIVE_FLOOR_META_KEY: &str = "witness_verdicts_v2_floor";
+
+/// THE one place the live-event rule lives: an uncorrelated scalar subquery
+/// yielding the epoch floor (0 when the key is absent, e.g. a bare test
+/// schema). Every reader that feeds the dream join or a user-visible
+/// surface appends `AND <alias>.id > ` + this constant. SQLite evaluates the
+/// uncorrelated subquery once per statement, and `id > N` stays a rowid /
+/// index-column range test, so partial-index plans (the recap feed's
+/// `idx_witness_verdicts_recap_created`) keep working.
+pub(crate) const LIVE_EVENT_FLOOR_SQL: &str = "COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'witness_verdicts_v2_floor'), 0)";
 
 /// The three deterministic conclusions the `dream` successor join can draw
 /// about a witness. There is no "unknown" variant — every witness with more
@@ -143,14 +169,17 @@ pub struct WitnessVerdictRow {
     pub observed_head_oid: String,
 }
 
-/// The latest recorded event for `witness_id` (highest `id` — insertion
-/// order, which for an append-only table is also chronological order) —
-/// `None` if no event has ever been recorded for it.
+/// The latest LIVE event for `witness_id` (highest `id` above the epoch
+/// floor — insertion order, which for an append-only table is also
+/// chronological order) — `None` if no live event has ever been recorded for
+/// it. A witness whose only events predate the floor reads as never judged.
 pub fn latest_event(conn: &Connection, witness_id: i64) -> Result<Option<WitnessVerdictRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid
-         FROM witness_verdicts WHERE witness_id = ?1 ORDER BY id DESC LIMIT 1",
-    )?;
+         FROM witness_verdicts
+         WHERE witness_id = ?1 AND id > {LIVE_EVENT_FLOOR_SQL}
+         ORDER BY id DESC LIMIT 1"
+    ))?;
     let row = stmt
         .query_row(params![witness_id], |row| {
             let verdict_str: String = row.get(1)?;
@@ -376,15 +405,16 @@ pub fn symbol_verdict_state(
     // id order is chronological WITHIN one witness), returned newest-first
     // globally so index 0 carries the most recent `observed_head_oid` seen
     // for this symbol.
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.witness_id, v.verdict, v.successor_witness_id, v.receipt_oid, v.observed_head_oid
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
          WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol IS ?3
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
            AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
                        WHERE v2.witness_id = v.witness_id)
-         ORDER BY v.id DESC",
-    )?;
+         ORDER BY v.id DESC"
+    ))?;
     let latest_per_witness: Vec<WitnessVerdictRow> = stmt
         .query_map(params![project, file, symbol], |row| {
             let verdict_str: String = row.get(1)?;
@@ -467,19 +497,20 @@ pub struct DreamEventRow {
     pub created_at: String,
 }
 
-/// Every `witness_verdicts` event ever recorded, newest-first, joined to its
+/// Every LIVE `witness_verdicts` event, newest-first, joined to its
 /// witness's `(project, file, symbol)` identity. This is EVERY event, not
 /// just the latest per witness — the dream report's timeline is a journal of
 /// conclusions drawn over time, not just current state (that's
 /// `all_demoted_symbols`/`symbol_verdict_state`).
 pub fn all_events_with_anchor(conn: &Connection) -> Result<Vec<DreamEventRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT v.id, wl.project, wl.file, wl.symbol, v.verdict, v.successor_witness_id,
                 v.receipt_oid, v.observed_head_oid, v.created_at
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
-         ORDER BY v.id DESC",
-    )?;
+         WHERE v.id > {LIVE_EVENT_FLOOR_SQL}
+         ORDER BY v.id DESC"
+    ))?;
     let rows = stmt
         .query_map([], |row| {
             let verdict_str: String = row.get(4)?;
@@ -576,7 +607,10 @@ pub(crate) fn conversation_ids_for_anchors(
 /// cycle has ever written an event (a fresh install, or `dream` never run).
 pub fn last_dream_run(conn: &Connection) -> Result<Option<(String, String)>> {
     conn.query_row(
-        "SELECT observed_head_oid, created_at FROM witness_verdicts ORDER BY id DESC LIMIT 1",
+        &format!(
+            "SELECT observed_head_oid, created_at FROM witness_verdicts
+             WHERE id > {LIVE_EVENT_FLOOR_SQL} ORDER BY id DESC LIMIT 1"
+        ),
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
@@ -588,8 +622,10 @@ pub fn last_dream_run(conn: &Connection) -> Result<Option<(String, String)>> {
 /// recorded (not latest-per-witness) — the report header's "totals by
 /// verdict type" and `status`'s `by_verdict` block.
 pub fn event_totals_by_verdict(conn: &Connection) -> Result<(i64, i64, i64)> {
-    let mut stmt =
-        conn.prepare("SELECT verdict, COUNT(*) FROM witness_verdicts GROUP BY verdict")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT verdict, COUNT(*) FROM witness_verdicts
+         WHERE id > {LIVE_EVENT_FLOOR_SQL} GROUP BY verdict"
+    ))?;
     let mut obsolete = 0i64;
     let mut superseded = 0i64;
     let mut reinstated = 0i64;
@@ -640,13 +676,14 @@ pub struct DemotedSymbol {
 /// batched fn deliberately excludes; they are the rare case (minted only for
 /// files with no symbol-level nodes).
 pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT DISTINCT wl.project, wl.file, wl.symbol
          FROM witness_verdicts v
          JOIN witness_ledger wl ON wl.id = v.witness_id
          WHERE v.verdict IN ('anchor_obsolete','superseded_by')
-           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2 WHERE v2.witness_id = v.witness_id)",
-    )?;
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2 WHERE v2.witness_id = v.witness_id)"
+    ))?;
     let anchors: Vec<(String, String, Option<String>)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -727,6 +764,7 @@ pub fn symbol_verdict_states_for_files(
              JOIN witness_ledger wl ON wl.id = v.witness_id
              WHERE wl.symbol IS NOT NULL
                AND ({})
+               AND v.id > {LIVE_EVENT_FLOOR_SQL}
                AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
                            WHERE v2.witness_id = v.witness_id)
              ORDER BY v.id DESC",
@@ -845,6 +883,7 @@ pub(crate) fn symbol_verdict_states_for_lineages(
              FROM witness_verdicts v
              JOIN witness_ledger wl ON wl.id = v.witness_id
              WHERE ({})
+               AND v.id > {LIVE_EVENT_FLOOR_SQL}
                AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
                            WHERE v2.witness_id = v.witness_id)
              ORDER BY v.id DESC",
@@ -967,11 +1006,14 @@ pub fn since_then_conclusion(
 ) -> Result<SinceThenConclusion> {
     let event = conn
         .query_row(
-            "SELECT v.verdict, v.receipt_oid, v.created_at
-             FROM witness_verdicts v
-             JOIN witness_ledger wl ON wl.id = v.witness_id
-             WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
-             ORDER BY v.id DESC LIMIT 1",
+            &format!(
+                "SELECT v.verdict, v.receipt_oid, v.created_at
+                 FROM witness_verdicts v
+                 JOIN witness_ledger wl ON wl.id = v.witness_id
+                 WHERE wl.project = ?1 AND wl.file = ?2 AND wl.symbol = ?3
+                   AND v.id > {LIVE_EVENT_FLOOR_SQL}
+                 ORDER BY v.id DESC LIMIT 1"
+            ),
             params![project, file, symbol],
             |row| {
                 Ok((
@@ -1057,12 +1099,13 @@ pub struct DayDigest {
 /// timeline, so the digest matches that same corpus-wide scope (consistent
 /// with `DreamReportData::totals`, which is also corpus-wide).
 pub fn day_digest(conn: &Connection, day: &str) -> Result<DayDigest> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT receipt_oid FROM witness_verdicts
          WHERE verdict IN ('superseded_by', 'anchor_obsolete')
+           AND id > {LIVE_EVENT_FLOOR_SQL}
            AND SUBSTR(datetime(created_at), 1, 10) = ?1
-         ORDER BY id DESC",
-    )?;
+         ORDER BY id DESC"
+    ))?;
     let receipt_rows: Vec<Option<String>> = stmt
         .query_map(params![day], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1977,5 +2020,156 @@ mod tests {
         assert_eq!(empty.retired_count, 0);
         assert_eq!(empty.proposal_count, 0);
         assert!(empty.receipts.is_empty());
+    }
+
+    // --- v2 epoch floor ----------------------------------------------------
+
+    fn set_floor(conn: &Connection, floor: i64) {
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![LIVE_FLOOR_META_KEY, floor.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn raw_event(conn: &Connection, witness_id: i64, verdict: &str, receipt: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO witness_verdicts
+                (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid)
+             VALUES (?1, ?2, NULL, ?3, ?3)",
+            params![witness_id, verdict, receipt],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn witness(conn: &Connection, at_oid: &str, stamp: &str) -> i64 {
+        witness_ledger::insert_witness(conn, &ledger_row(at_oid, stamp)).unwrap();
+        conn.query_row(
+            "SELECT id FROM witness_ledger WHERE at_oid = ?1",
+            params![at_oid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn witness_with_only_sub_floor_events_has_no_latest_event() {
+        let conn = open();
+        let w = witness(&conn, "aaa", "b3:1");
+        let old = raw_event(&conn, w, "anchor_obsolete", "old");
+        assert!(latest_event(&conn, w).unwrap().is_some(), "floor 0: live");
+        set_floor(&conn, old);
+        assert!(
+            latest_event(&conn, w).unwrap().is_none(),
+            "an event at or below the floor is invisible: the join judges the witness fresh"
+        );
+        // A new live event of the SAME kind still writes (nothing live to dedupe against).
+        let row = WitnessVerdictRow {
+            witness_id: w,
+            verdict: VerdictKind::AnchorObsolete,
+            successor_witness_id: None,
+            receipt_oid: Some("new".into()),
+            observed_head_oid: "new".into(),
+        };
+        assert!(insert_verdict_if_changed(&conn, &row).unwrap());
+        assert_eq!(
+            latest_event(&conn, w)
+                .unwrap()
+                .unwrap()
+                .receipt_oid
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn every_verdict_reader_ignores_events_at_or_below_the_floor() {
+        let conn = open();
+        let w_old = witness(&conn, "aaa", "b3:1");
+        let w_head = witness(&conn, "bbb", "b3:2");
+        let old1 = raw_event(&conn, w_old, "anchor_obsolete", "oldrcpt");
+        let old2 = raw_event(&conn, w_old, "superseded_by", "oldrcpt2");
+        let today = conn
+            .query_row("SELECT SUBSTR(datetime('now'), 1, 10)", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+
+        // Floor 0: everything is live, every reader sees the events.
+        assert!(
+            symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
+                .unwrap()
+                .is_some()
+        );
+        let pairs = vec![("proj".to_string(), "/repo/src/lib.rs".to_string())];
+        assert_eq!(
+            symbol_verdict_states_for_files(&conn, &pairs)
+                .unwrap()
+                .len(),
+            1
+        );
+        let lineages = vec![(
+            "proj".to_string(),
+            "/repo/src/lib.rs".to_string(),
+            "foo".to_string(),
+            None,
+        )];
+        assert_eq!(
+            symbol_verdict_states_for_lineages(&conn, &lineages)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(all_demoted_symbols(&conn).unwrap().len(), 1);
+        assert_eq!(all_events_with_anchor(&conn).unwrap().len(), 2);
+        assert!(last_dream_run(&conn).unwrap().is_some());
+        assert_eq!(event_totals_by_verdict(&conn).unwrap(), (1, 1, 0));
+        assert_eq!(
+            since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo")
+                .unwrap()
+                .verdict,
+            Some(VerdictKind::SupersededBy)
+        );
+        assert_eq!(day_digest(&conn, &today).unwrap().retired_count, 2);
+
+        // Floor at the newest old event: all of them vanish.
+        set_floor(&conn, old2.max(old1));
+        assert!(
+            symbol_verdict_state(&conn, "proj", "/repo/src/lib.rs", Some("foo"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(symbol_verdict_states_for_files(&conn, &pairs)
+            .unwrap()
+            .is_empty());
+        assert!(symbol_verdict_states_for_lineages(&conn, &lineages)
+            .unwrap()
+            .is_empty());
+        assert!(all_demoted_symbols(&conn).unwrap().is_empty());
+        assert!(all_events_with_anchor(&conn).unwrap().is_empty());
+        assert!(last_dream_run(&conn).unwrap().is_none());
+        assert_eq!(event_totals_by_verdict(&conn).unwrap(), (0, 0, 0));
+        let since = since_then_conclusion(&conn, "proj", "/repo/src/lib.rs", "foo").unwrap();
+        assert_eq!(since.verdict, None);
+        assert!(since.witnessed, "the ledger still witnessed it");
+        let digest = day_digest(&conn, &today).unwrap();
+        assert_eq!(digest.retired_count, 0);
+        assert!(digest.receipts.is_empty());
+
+        // A live event above the floor is seen again, and only it.
+        let live = raw_event(&conn, w_head, "anchor_obsolete", "livercpt");
+        assert!(live > old2);
+        assert_eq!(all_events_with_anchor(&conn).unwrap().len(), 1);
+        assert_eq!(event_totals_by_verdict(&conn).unwrap(), (1, 0, 0));
+        assert_eq!(
+            last_dream_run(&conn)
+                .unwrap()
+                .map(|(oid, _)| oid)
+                .as_deref(),
+            Some("livercpt")
+        );
+        assert_eq!(day_digest(&conn, &today).unwrap().retired_count, 1);
     }
 }

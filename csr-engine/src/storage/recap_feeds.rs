@@ -7,6 +7,7 @@ use regex::Regex;
 use rusqlite::params;
 
 use super::dream_delivery::{self, DeliveryChannel, DreamHeadline};
+use super::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use super::Storage;
 use crate::hooks::recap::{
     CorrectionIdentity, CorrectionLine, DreamClause, RetiredLine, SettledFact,
@@ -251,7 +252,7 @@ impl Storage {
             .conn
             .lock()
             .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
-        let mut statement = conn.prepare(
+        let mut statement = conn.prepare(&format!(
             "SELECT COALESCE(NULLIF(wl.symbol, ''), wl.file),
                     COALESCE(v.receipt_oid, ''),
                     SUBSTR(datetime(v.created_at), 1, 10)
@@ -260,9 +261,10 @@ impl Storage {
              WHERE julianday(v.created_at) > julianday(?1)
                AND wl.project = ?2
                AND v.verdict IN ('superseded_by', 'anchor_obsolete')
+               AND v.id > {LIVE_EVENT_FLOOR_SQL}
              ORDER BY julianday(v.created_at) DESC, v.id DESC
-             LIMIT ?3",
-        )?;
+             LIMIT ?3"
+        ))?;
         let rows = statement
             .query_map(params![since_ts, project, RETIRED_FEED_LIMIT], |row| {
                 let receipt: String = row.get(1)?;
@@ -790,6 +792,57 @@ mod tests {
     }
 
     #[test]
+    fn retired_feed_ignores_events_at_or_below_the_floor() {
+        let storage = Storage::open_memory().unwrap();
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/old.rs",
+            Some("old_fn"),
+            "anchor_obsolete",
+            "0ldoid1",
+            "2026-08-05T00:00:00Z",
+        );
+        assert_eq!(
+            storage
+                .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
+                .unwrap()
+                .len(),
+            1
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO meta(key, value)
+                     VALUES ('witness_verdicts_v2_floor',
+                             (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
+            .unwrap()
+            .is_empty());
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/new.rs",
+            Some("new_fn"),
+            "anchor_obsolete",
+            "neWoid2",
+            "2026-08-06T00:00:00Z",
+        );
+        let live = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].label, "new_fn");
+    }
+
+    #[test]
     fn retired_feed_normalizes_sqlite_and_rfc3339_timestamps() {
         let storage = Storage::open_memory().unwrap();
         seed_witness_verdict(
@@ -1093,7 +1146,7 @@ mod tests {
         storage
             .with_connection(|conn| {
                 let retired_plan = conn
-                    .prepare(
+                    .prepare(&format!(
                         "EXPLAIN QUERY PLAN
                          SELECT v.witness_id
                          FROM witness_verdicts v INDEXED BY idx_witness_verdicts_recap_created
@@ -1101,9 +1154,10 @@ mod tests {
                          WHERE julianday(v.created_at) > julianday(?1)
                            AND wl.project = ?2
                            AND v.verdict IN ('superseded_by', 'anchor_obsolete')
+                           AND v.id > {LIVE_EVENT_FLOOR_SQL}
                          ORDER BY julianday(v.created_at) DESC, v.id DESC
-                         LIMIT 3",
-                    )?
+                         LIMIT 3"
+                    ))?
                     .query_map(rusqlite::params!["2026-08-01T00:00:00Z", "alpha"], |row| {
                         row.get::<_, String>(3)
                     })?

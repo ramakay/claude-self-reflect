@@ -332,6 +332,42 @@ fn finish_chunks_fts_compaction(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Set the `witness_verdicts` v2 epoch floor exactly once.
+///
+/// Every event already in the table when the first binary with the fixed
+/// dream join opens a database was minted by the old buggy join (branch
+/// flapping, project-keyed anchors, one event per observed HEAD). The table is
+/// append-only, so those events stay, but the floor
+/// (`COALESCE(MAX(id), 0)` at that moment) retires them from every live
+/// reader — see `witness_verdicts::LIVE_EVENT_FLOOR_SQL`. A fresh database
+/// gets floor 0.
+///
+/// CHECK-THEN-INSERT: when the key already exists this performs a single
+/// read and NO write. Migrations that write on every open took the write lock
+/// in read-only hook processes and surfaced 'database is locked' (the
+/// a55e868 trigger-race fix); this must never regress into that shape.
+fn ensure_witness_verdicts_v2_floor(conn: &Connection) -> Result<()> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM meta WHERE key = ?1",
+            [super::witness_verdicts::LIVE_FLOOR_META_KEY],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+    // OR IGNORE: two processes racing the first open must not clobber each
+    // other (or fail) — whoever lands first sets the floor.
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value)
+         SELECT ?1, CAST(COALESCE(MAX(id), 0) AS TEXT) FROM witness_verdicts",
+        [super::witness_verdicts::LIVE_FLOOR_META_KEY],
+    )?;
+    Ok(())
+}
+
 /// Run all database migrations.
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -1293,6 +1329,8 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_witness_chunk_bindings_chunk
             ON witness_chunk_bindings(chunk_id);",
     )?;
+
+    ensure_witness_verdicts_v2_floor(conn)?;
 
     // Recap normalizes SQLite and RFC3339 timestamps through julianday(). This
     // partial covering index matches that expression and the feed's newest-
@@ -3646,6 +3684,70 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1, "verdict events must survive a migration rerun");
+    }
+
+    fn floor_value(conn: &rusqlite::Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'witness_verdicts_v2_floor'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn insert_verdicts(conn: &rusqlite::Connection, n: usize) {
+        for _ in 0..n {
+            conn.execute(
+                "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+                 VALUES (1, 'anchor_obsolete', 'deadbeef')",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn witness_verdicts_v2_floor_is_zero_on_a_fresh_database() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        assert_eq!(floor_value(&conn).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn witness_verdicts_v2_floor_is_set_once_to_the_max_event_id() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        // Simulate a pre-fix database: events exist, the key does not.
+        insert_verdicts(&conn, 3);
+        conn.execute(
+            "DELETE FROM meta WHERE key = 'witness_verdicts_v2_floor'",
+            [],
+        )
+        .unwrap();
+        run(&conn).unwrap();
+        assert_eq!(floor_value(&conn).as_deref(), Some("3"));
+
+        // Later events and later opens never move the floor.
+        insert_verdicts(&conn, 2);
+        run(&conn).unwrap();
+        assert_eq!(floor_value(&conn).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn witness_verdicts_v2_floor_step_performs_no_write_when_the_key_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        insert_verdicts(&conn, 2);
+        let before = conn.total_changes();
+        ensure_witness_verdicts_v2_floor(&conn).unwrap();
+        ensure_witness_verdicts_v2_floor(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "an existing floor must be read, never rewritten"
+        );
+        assert_eq!(floor_value(&conn).as_deref(), Some("0"));
     }
 
     #[test]

@@ -994,6 +994,46 @@ mod tests {
     }
 
     #[test]
+    fn witness_with_only_sub_floor_events_is_judged_fresh_by_the_join() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "1");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "2");
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c1, "b3:1"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c2, "b3:2"))
+            })
+            .unwrap();
+        assert_eq!(run_join(&storage, false).events_written, 1);
+        let deduped = run_join(&storage, false);
+        assert_eq!(deduped.events_deduped, 1, "live event dedupes: {deduped:?}");
+
+        // Retire every event so far behind the v2 floor.
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE meta SET value = (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts)
+                     WHERE key = 'witness_verdicts_v2_floor'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let fresh = run_join(&storage, false);
+        assert_eq!(
+            fresh.events_written, 1,
+            "no live event: the witness is judged fresh and re-minted: {fresh:?}"
+        );
+        assert_eq!(fresh.events_deduped, 0);
+        assert_eq!(fresh.head_not_forward, 0);
+    }
+
+    #[test]
     fn dry_run_computes_but_writes_no_verdicts_and_matches_the_real_run() {
         // H5: `--dry-run` suppresses ONLY verdict insertion. A dry run and
         // the real run that follows it must produce IDENTICAL verdict
