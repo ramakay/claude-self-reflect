@@ -80,6 +80,10 @@
 //!    for new events, so re-running at a newer HEAD re-searches nothing for
 //!    conclusions already on record.
 //!
+//! A witness whose symbol contains `#` (the positional collision suffix,
+//! `remove#5`) gets no verdict at all (`abstained_positional_symbol`): the
+//! number is a span-order rank, not an identity.
+//!
 //! # Forward-only judgment
 //!
 //! Before ANY candidate event (superseded / obsolete / reinstated) is
@@ -191,6 +195,13 @@ pub struct DreamStats {
     /// The anchor's file has no resolvable git repository (or live HEAD) —
     /// the whole anchor is skipped; none of its witnesses are counted above.
     pub abstained_no_repo: usize,
+    /// Witness skipped outright: its symbol carries the `#N` collision
+    /// suffix the HEAD pass mints (`qualify_witness_symbols`). The suffix is
+    /// positional - adding one sibling renumbers the rest - so the same
+    /// string names different functions over time and no verdict about it
+    /// can be trusted. HEAD-row witnesses are skipped silently, like every
+    /// other non-considered HEAD row.
+    pub abstained_positional_symbol: usize,
     /// A NEW conclusion was withheld because the symbol's content at a
     /// commit the receipt needs could not be established (not a clean
     /// parse, unsupported language, unreadable blob, or the witness symbol
@@ -241,7 +252,7 @@ impl DreamStats {
              superseded            : {}\n\
              obsolete               : {}\n\
              reinstated             : {}\n\
-             abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}\n\
+             abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}  positional_symbol={}\n\
              receipts: found={}  searches={}  abstained: unrederivable={}  present_at_head={}  same_content={}  no_receipt={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
@@ -256,6 +267,7 @@ impl DreamStats {
             self.head_behind_witness,
             self.head_not_forward,
             self.abstained_no_repo,
+            self.abstained_positional_symbol,
             self.receipts_found,
             self.receipt_searches,
             self.abstained_unrederivable,
@@ -609,6 +621,17 @@ pub(crate) fn dream_join_cancellable(
                 // HEAD can itself carry a negative latest event, and the
                 // reinstatement arm below must still fire for it.
                 stats.witnesses_considered += 1;
+            }
+
+            // Positional symbols (`remove#5`): the suffix is the Nth
+            // collision by span order, so it names a different function as
+            // soon as a sibling is added or removed. Comparing "remove#10"
+            // across commits compares two different functions - no verdict.
+            if w.symbol.as_deref().is_some_and(|s| s.contains('#')) {
+                if !w_is_head_row {
+                    stats.abstained_positional_symbol += 1;
+                }
+                continue;
             }
 
             let latest_for_w = witness_verdicts::latest_event(conn, w.id)?;
@@ -2080,5 +2103,67 @@ mod tests {
             latest(&storage, &file, &c1).unwrap().receipt_oid.as_deref(),
             Some(c2.as_str())
         );
+    }
+
+    fn insert_symbol_rows(storage: &Storage, file: &str, symbol: &str, rows: &[(&str, &str)]) {
+        storage
+            .with_connection(|conn| {
+                for (oid, stamp) in rows {
+                    let mut row = ledger_row("proj", file, oid, stamp);
+                    row.symbol = Some(symbol.into());
+                    witness_ledger::insert_witness(conn, &row)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn witness_of(storage: &Storage, file: &str, symbol: &str, oid: &str) -> i64 {
+        storage
+            .witnesses_for_file("proj", file)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.at_oid.as_deref() == Some(oid) && r.symbol.as_deref() == Some(symbol))
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn positional_symbol_gets_no_verdict_but_a_plain_sibling_still_does() {
+        // Two `foo` definitions: the second is minted as `foo#2`. Both change
+        // between c1 and c2, but only the plain-named one may be judged.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "fn foo() {\n    1\n}\nfn foo() {\n    a\n}\n");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "fn foo() {\n    2\n}\nfn foo() {\n    b\n}\n");
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_symbol_rows(&storage, &file, "foo", &[(&c1, "b3:1"), (&c2, "b3:2")]);
+        insert_symbol_rows(&storage, &file, "foo#2", &[(&c1, "b3:a"), (&c2, "b3:b")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_positional_symbol, 1, "{stats:?}");
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.events_written, 1, "{stats:?}");
+
+        let plain = storage
+            .latest_witness_verdict(witness_of(&storage, &file, "foo", &c1))
+            .unwrap()
+            .expect("plain sibling is still judged");
+        assert_eq!(plain.verdict, VerdictKind::SupersededBy);
+        assert_eq!(plain.receipt_oid.as_deref(), Some(c2.as_str()));
+        assert!(
+            storage
+                .latest_witness_verdict(witness_of(&storage, &file, "foo#2", &c1))
+                .unwrap()
+                .is_none(),
+            "positional symbol must carry no verdict"
+        );
+        assert!(storage
+            .latest_witness_verdict(witness_of(&storage, &file, "foo#2", &c2))
+            .unwrap()
+            .is_none());
     }
 }
