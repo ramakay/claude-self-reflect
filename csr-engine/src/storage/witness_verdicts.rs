@@ -393,6 +393,19 @@ pub struct SymbolVerdictState {
     pub representative: WitnessVerdictRow,
 }
 
+/// The ledger stamp of `(file, symbol)` at an observed HEAD. Project-agnostic
+/// by design (see `symbol_verdict_state`), so it is served by
+/// `idx_witness_ledger_file_symbol (file, symbol, at_oid)`: the project-led
+/// ledger indexes cannot answer it and it would scan the whole table.
+const HEAD_STAMP_SQL: &str = "SELECT stamp FROM witness_ledger
+     WHERE file = ?1 AND symbol IS ?2 AND at_oid = ?3
+     ORDER BY id DESC LIMIT 1";
+
+/// Whether any ledger row of `(file, symbol)` carries the given stamp. Same
+/// index as [`HEAD_STAMP_SQL`] (the `(file, symbol)` prefix).
+const INTACT_STAMP_SQL: &str = "SELECT EXISTS(SELECT 1 FROM witness_ledger
+         WHERE file = ?1 AND symbol IS ?2 AND stamp = ?3)";
+
 /// Resolve the module doc's two-channel rule for one anchor: `None` when no
 /// witness has a negative latest event; otherwise `Demote` or `Annotate`
 /// depending on whether any witness is intact at the most recent observed
@@ -450,21 +463,16 @@ pub fn symbol_verdict_state(
     // resolved. Only the outer negative-event filter is project-scoped.
     let head_oid = &latest_per_witness[0].observed_head_oid;
     let head_stamp: Option<String> = conn
-        .query_row(
-            "SELECT stamp FROM witness_ledger
-             WHERE file = ?1 AND symbol IS ?2 AND at_oid = ?3
-             ORDER BY id DESC LIMIT 1",
-            params![file, symbol, head_oid],
-            |r| r.get(0),
-        )
+        .query_row(HEAD_STAMP_SQL, params![file, symbol, head_oid], |r| {
+            r.get(0)
+        })
         .optional()?;
     let intact_at_head = match head_stamp {
-        Some(head_stamp) => conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM witness_ledger
-                 WHERE file = ?1 AND symbol IS ?2 AND stamp = ?3)",
-            params![file, symbol, head_stamp],
-            |r| r.get(0),
-        )?,
+        Some(head_stamp) => {
+            conn.query_row(INTACT_STAMP_SQL, params![file, symbol, head_stamp], |r| {
+                r.get(0)
+            })?
+        }
         None => false,
     };
     Ok(Some(SymbolVerdictState {
@@ -723,6 +731,33 @@ pub fn all_demoted_symbols(conn: &Connection) -> Result<Vec<DemotedSymbol>> {
     Ok(out)
 }
 
+/// SQL for [`symbol_verdict_states_for_files`] over `pairs` `(project, file)`
+/// bind pairs. The correlated `wl2` probe is served by
+/// `idx_witness_ledger_file_symbol`.
+fn files_states_sql(pairs: usize) -> String {
+    let pair_filter: Vec<String> = (0..pairs)
+        .map(|i| format!("(wl.project = ?{} AND wl.file = ?{})", 2 * i + 1, 2 * i + 2))
+        .collect();
+    format!(
+        "SELECT wl.project, wl.file, wl.symbol,
+                v.witness_id, v.verdict, v.successor_witness_id,
+                v.receipt_oid, v.observed_head_oid,
+                EXISTS(SELECT 1 FROM witness_ledger wl2
+                       WHERE wl2.file = wl.file
+                         AND wl2.symbol IS wl.symbol
+                         AND wl2.at_oid = v.observed_head_oid)
+         FROM witness_verdicts v
+         JOIN witness_ledger wl ON wl.id = v.witness_id
+         WHERE wl.symbol IS NOT NULL
+           AND ({})
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
+         ORDER BY v.id DESC",
+        pair_filter.join(" OR ")
+    )
+}
+
 /// Bulk variant of [`symbol_verdict_state`]: resolve the CURRENT state of
 /// EVERY symbol-level anchor recorded for the given `(project, file)` pairs,
 /// in ONE query per ≤400-pair batch (chunk binding previously issued one
@@ -753,27 +788,7 @@ pub fn symbol_verdict_states_for_files(
     // SQLITE_MAX_VARIABLE_NUMBER reasoning as `codegraph::nodes_for_conversations`.
     const BATCH: usize = 400;
     for batch in files.chunks(BATCH) {
-        let pair_filter: Vec<String> = (0..batch.len())
-            .map(|i| format!("(wl.project = ?{} AND wl.file = ?{})", 2 * i + 1, 2 * i + 2))
-            .collect();
-        let sql = format!(
-            "SELECT wl.project, wl.file, wl.symbol,
-                    v.witness_id, v.verdict, v.successor_witness_id,
-                    v.receipt_oid, v.observed_head_oid,
-                    EXISTS(SELECT 1 FROM witness_ledger wl2
-                           WHERE wl2.file = wl.file
-                             AND wl2.symbol IS wl.symbol
-                             AND wl2.at_oid = v.observed_head_oid)
-             FROM witness_verdicts v
-             JOIN witness_ledger wl ON wl.id = v.witness_id
-             WHERE wl.symbol IS NOT NULL
-               AND ({})
-               AND v.id > {LIVE_EVENT_FLOOR_SQL}
-               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
-                           WHERE v2.witness_id = v.witness_id)
-             ORDER BY v.id DESC",
-            pair_filter.join(" OR ")
-        );
+        let sql = files_states_sql(batch.len());
         let params: Vec<&dyn rusqlite::types::ToSql> = batch
             .iter()
             .flat_map(|(p, f)| {
@@ -844,6 +859,49 @@ pub fn symbol_verdict_states_for_files(
     Ok(out)
 }
 
+/// SQL for [`symbol_verdict_states_for_lineages`] over `anchors` bind
+/// quadruples. The correlated `wl2` probe is served by
+/// `idx_witness_ledger_file_symbol`.
+fn lineage_states_sql(anchors: usize) -> String {
+    let filters: Vec<String> = (0..anchors)
+        .map(|i| {
+            let base = 4 * i + 1;
+            format!(
+                "(wl.project = ?{base} AND wl.file = ?{} AND wl.symbol = ?{}
+                  AND ((?{} IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
+                       OR (wl.source_kind = 'backfill_rederived_v2'
+                           AND wl.source_id = ?{})))",
+                base + 1,
+                base + 2,
+                base + 3,
+                base + 3
+            )
+        })
+        .collect();
+    format!(
+        "SELECT wl.project, wl.file, wl.symbol,
+                v.witness_id, v.verdict, v.successor_witness_id,
+                v.receipt_oid, v.observed_head_oid,
+                EXISTS(SELECT 1 FROM witness_ledger wl2
+                       WHERE wl2.file = wl.file
+                         AND wl2.symbol IS wl.symbol
+                         AND wl2.at_oid = v.observed_head_oid
+                         AND ((wl.source_kind = 'backfill_rederived_v2'
+                               AND wl2.source_kind = 'backfill_rederived_v2'
+                               AND wl2.source_id IS wl.source_id)
+                              OR (wl.source_kind <> 'backfill_rederived_v2'
+                                  AND wl2.source_kind <> 'backfill_rederived_v2')))
+         FROM witness_verdicts v
+         JOIN witness_ledger wl ON wl.id = v.witness_id
+         WHERE ({})
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
+         ORDER BY v.id DESC",
+        filters.join(" OR ")
+    )
+}
+
 /// Binding-only bulk state lookup. Each anchor carries the exact selected
 /// re-derivation generation (`Some(source_id)`) or the legacy lineage
 /// (`None`). Both negative-event selection and the intact-at-HEAD check are
@@ -856,43 +914,7 @@ pub(crate) fn symbol_verdict_states_for_lineages(
     let mut out = std::collections::BTreeMap::new();
     const BATCH: usize = 200;
     for batch in anchors.chunks(BATCH) {
-        let filters: Vec<String> = (0..batch.len())
-            .map(|i| {
-                let base = 4 * i + 1;
-                format!(
-                    "(wl.project = ?{base} AND wl.file = ?{} AND wl.symbol = ?{}
-                      AND ((?{} IS NULL AND wl.source_kind <> 'backfill_rederived_v2')
-                           OR (wl.source_kind = 'backfill_rederived_v2'
-                               AND wl.source_id = ?{})))",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 3
-                )
-            })
-            .collect();
-        let sql = format!(
-            "SELECT wl.project, wl.file, wl.symbol,
-                    v.witness_id, v.verdict, v.successor_witness_id,
-                    v.receipt_oid, v.observed_head_oid,
-                    EXISTS(SELECT 1 FROM witness_ledger wl2
-                           WHERE wl2.file = wl.file
-                             AND wl2.symbol IS wl.symbol
-                             AND wl2.at_oid = v.observed_head_oid
-                             AND ((wl.source_kind = 'backfill_rederived_v2'
-                                   AND wl2.source_kind = 'backfill_rederived_v2'
-                                   AND wl2.source_id IS wl.source_id)
-                                  OR (wl.source_kind <> 'backfill_rederived_v2'
-                                      AND wl2.source_kind <> 'backfill_rederived_v2')))
-             FROM witness_verdicts v
-             JOIN witness_ledger wl ON wl.id = v.witness_id
-             WHERE ({})
-               AND v.id > {LIVE_EVENT_FLOOR_SQL}
-               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
-                           WHERE v2.witness_id = v.witness_id)
-             ORDER BY v.id DESC",
-            filters.join(" OR ")
-        );
+        let sql = lineage_states_sql(batch.len());
         let params: Vec<&dyn rusqlite::types::ToSql> = batch
             .iter()
             .flat_map(|(project, file, symbol, source_id)| {
@@ -2175,5 +2197,54 @@ mod tests {
             Some("livercpt")
         );
         assert_eq!(day_digest(&conn, &today).unwrap().retired_count, 1);
+    }
+
+    /// `EXPLAIN QUERY PLAN` detail lines for `sql`, every parameter bound NULL.
+    fn plan_of(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let n = stmt.parameter_count();
+        stmt.query_map(
+            rusqlite::params_from_iter(std::iter::repeat_n(None::<String>, n)),
+            |row| row.get::<_, String>(3),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join("\n")
+    }
+
+    #[test]
+    fn symbol_verdict_state_ledger_probes_use_an_index_not_a_table_scan() {
+        let conn = open();
+        for (name, sql) in [("head stamp", HEAD_STAMP_SQL), ("intact", INTACT_STAMP_SQL)] {
+            let plan = plan_of(&conn, sql);
+            assert!(
+                !plan.contains("SCAN witness_ledger"),
+                "{name} lookup scans the ledger:\n{plan}"
+            );
+            assert!(
+                plan.contains("idx_witness_ledger_file_symbol"),
+                "{name} lookup must use the (file, symbol, at_oid) index:\n{plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_verdict_state_correlated_ledger_probe_uses_an_index() {
+        let conn = open();
+        for (name, sql) in [
+            ("files", files_states_sql(2)),
+            ("lineages", lineage_states_sql(2)),
+        ] {
+            let plan = plan_of(&conn, &sql);
+            assert!(
+                !plan.contains("SCAN wl2") && !plan.contains("SCAN witness_ledger"),
+                "{name} wl2 subquery scans the ledger:\n{plan}"
+            );
+            assert!(
+                plan.contains("idx_witness_ledger_file_symbol"),
+                "{name} wl2 subquery must use the (file, symbol, at_oid) index:\n{plan}"
+            );
+        }
     }
 }

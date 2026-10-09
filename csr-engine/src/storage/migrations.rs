@@ -1246,8 +1246,14 @@ pub fn run(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_witness_ledger_identity ON witness_ledger (project, file, COALESCE(symbol,''), COALESCE(span_start,-1), COALESCE(span_end,-1), stamp, tier, COALESCE(at_oid,''), source_kind, COALESCE(source_id,''));
-        CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);",
+        CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);
+        CREATE INDEX IF NOT EXISTS idx_witness_ledger_file_symbol ON witness_ledger(file, symbol, at_oid);",
     )?;
+    // `idx_witness_ledger_file_symbol` serves the project-agnostic anchor
+    // probes (the HEAD-stamp / intact lookups and the correlated EXISTS in
+    // the verdict-state readers): they match on (file, symbol[, at_oid])
+    // with no project, and both indexes above lead with `project`, so
+    // without it each probe scanned the whole ledger.
 
     // Mutable publication bookkeeping for append-only witness evidence.
     // `witness_ledger` itself remains immutable: a re-derivation run first
