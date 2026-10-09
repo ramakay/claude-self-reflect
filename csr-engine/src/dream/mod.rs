@@ -64,7 +64,9 @@
 //!    span stamp / absent / unknown) and the claim is checked against git:
 //!    - `anchor_obsolete`: the symbol is present at `W.at_oid` and ABSENT in
 //!      the HEAD blob (present there -> `abstained_present_at_head`); the
-//!      receipt is the first commit in `W..HEAD` where it is absent.
+//!      receipt is the first commit in `W..HEAD` where it is absent. A
+//!      same-leaf symbol under another qualification at HEAD or at that
+//!      receipt commit means it MOVED, not died (`abstained_moved`).
 //!    - `superseded_by`: the successor's normalized span content differs
 //!      from `W`'s (equal -> `abstained_same_content`); the receipt is the
 //!      first commit in `W..W2.at_oid` whose content differs from `W`'s.
@@ -214,6 +216,10 @@ pub struct DreamStats {
     /// equals the witness's (reformat, or two span methods over the same
     /// code) — nothing was superseded.
     pub abstained_same_content: usize,
+    /// `anchor_obsolete` withheld: the qualified symbol is gone but the file
+    /// still has a symbol with the same leaf name (at the receipt commit or
+    /// at HEAD) - the symbol moved or was re-nested, not deleted.
+    pub abstained_moved: usize,
     /// A NEW conclusion was withheld because no commit could be named as
     /// the one that made the change (empty or oversized history range, git
     /// failure, or an unknown state met first). Never falls back to HEAD.
@@ -253,7 +259,7 @@ impl DreamStats {
              obsolete               : {}\n\
              reinstated             : {}\n\
              abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}  positional_symbol={}\n\
-             receipts: found={}  searches={}  abstained: unrederivable={}  present_at_head={}  same_content={}  no_receipt={}\n\
+             receipts: found={}  searches={}  abstained: unrederivable={}  present_at_head={}  same_content={}  moved={}  no_receipt={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
             self.anchors_considered,
@@ -273,6 +279,7 @@ impl DreamStats {
             self.abstained_unrederivable,
             self.abstained_present_at_head,
             self.abstained_same_content,
+            self.abstained_moved,
             self.abstained_no_receipt,
             self.events_written,
             self.events_deduped,
@@ -770,6 +777,7 @@ pub(crate) fn dream_join_cancellable(
                             receipt::Abstain::Unrederivable => stats.abstained_unrederivable += 1,
                             receipt::Abstain::PresentAtHead => stats.abstained_present_at_head += 1,
                             receipt::Abstain::SameContent => stats.abstained_same_content += 1,
+                            receipt::Abstain::Moved => stats.abstained_moved += 1,
                             receipt::Abstain::NoReceipt => stats.abstained_no_receipt += 1,
                         }
                         continue;
@@ -2165,5 +2173,97 @@ mod tests {
             .latest_witness_verdict(witness_of(&storage, &file, "foo#2", &c2))
             .unwrap()
             .is_none());
+    }
+
+    /// A `Foo::render` witness whose method moved to a top-level `render`.
+    const NESTED_RENDER: &str = "struct Foo;\nimpl Foo {\n    fn render() {\n        1\n    }\n}\n";
+
+    fn render_rows(storage: &Storage, file: &str, oids: &[&str]) {
+        let rows: Vec<(&str, &str)> = oids.iter().map(|o| (*o, "b3:1")).collect();
+        insert_symbol_rows(storage, file, "Foo::render", &rows);
+    }
+
+    #[test]
+    fn moved_to_top_level_is_not_obsolete_when_the_leaf_survives_at_head() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", NESTED_RENDER);
+        let c1 = repo.commit("c1 Foo::render");
+        repo.write("lib.rs", &format!("{NESTED_RENDER}// pad\n"));
+        let c1b = repo.commit("c1b unrelated");
+        repo.write("lib.rs", "fn render() {\n    1\n}\n");
+        let _c2 = repo.commit("c2 render moved out of impl Foo");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        render_rows(&storage, &file, &[&c1, &c1b]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 0, "{stats:?}");
+        assert_eq!(stats.abstained_moved, 2, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert!(storage
+            .latest_witness_verdict(witness_of(&storage, &file, "Foo::render", &c1))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn moved_then_deleted_is_not_obsolete_when_the_leaf_survives_at_the_receipt() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", NESTED_RENDER);
+        let c1 = repo.commit("c1 Foo::render");
+        repo.write("lib.rs", &format!("{NESTED_RENDER}// pad\n"));
+        let c1b = repo.commit("c1b unrelated");
+        repo.write("lib.rs", "fn render() {\n    1\n}\n");
+        let _c2 = repo.commit("c2 moved: Foo::render absent, render present");
+        repo.write("lib.rs", "fn other() {}\n");
+        let _c3 = repo.commit("c3 render deleted (HEAD)");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        render_rows(&storage, &file, &[&c1, &c1b]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 0, "{stats:?}");
+        assert_eq!(stats.abstained_moved, 2, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn real_deletion_of_a_qualified_symbol_is_still_obsolete_with_the_deleting_commit() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", NESTED_RENDER);
+        let c1 = repo.commit("c1 Foo::render");
+        repo.write("lib.rs", &format!("{NESTED_RENDER}// pad\n"));
+        let c1b = repo.commit("c1b unrelated");
+        repo.write("lib.rs", "struct Foo;\nfn other() {}\n");
+        let c2 = repo.commit("c2 deletes render for good");
+        repo.write("lib.rs", "struct Foo;\nfn other() {}\nfn another() {}\n");
+        let _c3 = repo.commit("c3 unrelated (HEAD)");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        render_rows(&storage, &file, &[&c1, &c1b]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_moved, 0, "{stats:?}");
+        assert_eq!(stats.obsolete, 2, "{stats:?}");
+        let v = storage
+            .latest_witness_verdict(witness_of(&storage, &file, "Foo::render", &c1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.verdict, VerdictKind::AnchorObsolete);
+        assert_eq!(v.receipt_oid.as_deref(), Some(c2.as_str()));
+    }
+
+    #[test]
+    fn symbol_leaf_strips_collision_suffix_and_container() {
+        use super::receipt::symbol_leaf;
+        assert_eq!(symbol_leaf("make_renderer.render"), "render");
+        assert_eq!(symbol_leaf("Foo::bar#2"), "bar");
+        assert_eq!(symbol_leaf("remove#10"), "remove");
+        assert_eq!(symbol_leaf("out"), "out");
+        assert_eq!(symbol_leaf("A.B::c"), "c");
+        assert_eq!(symbol_leaf("weird#x"), "weird#x");
     }
 }

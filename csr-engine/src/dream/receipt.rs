@@ -151,30 +151,55 @@ impl ReceiptResolver {
             return state;
         };
 
-        if !self.symbols.contains_key(&key) {
-            if self.symbols.len() >= MAX_MEMOIZED_FILES {
-                self.symbols.clear();
-            }
-            let parsed = match self.read(subject, commit) {
-                FileRead::Absent => SymbolMap::FileAbsent,
-                FileRead::Unknown => SymbolMap::Unknown,
-                FileRead::Bytes(bytes) => {
-                    self.parses += 1;
-                    match symbol_stamps(subject, commit, &bytes) {
-                        Some(map) => SymbolMap::Map(Rc::new(map)),
-                        None => SymbolMap::Unknown,
-                    }
-                }
-            };
-            self.symbols.insert(key.clone(), parsed);
-        }
-        match self.symbols.get(&key) {
-            Some(SymbolMap::FileAbsent) => SymbolState::Absent,
-            Some(SymbolMap::Map(map)) => match map.get(symbol) {
+        match self.symbol_map(subject, commit) {
+            SymbolMap::FileAbsent => SymbolState::Absent,
+            SymbolMap::Map(map) => match map.get(symbol) {
                 Some(stamp) => SymbolState::Present(stamp.clone()),
                 None => SymbolState::Absent,
             },
-            _ => SymbolState::Unknown,
+            SymbolMap::Unknown => SymbolState::Unknown,
+        }
+    }
+
+    /// Parsed symbol map of the subject's file at `commit`, memoized.
+    fn symbol_map(&mut self, subject: &Subject, commit: &str) -> SymbolMap {
+        let key: FileKey = (
+            subject.repo_root.to_string(),
+            subject.relpath.to_string(),
+            commit.to_string(),
+        );
+        if let Some(hit) = self.symbols.get(&key) {
+            return hit.clone();
+        }
+        if self.symbols.len() >= MAX_MEMOIZED_FILES {
+            self.symbols.clear();
+        }
+        let parsed = match self.read(subject, commit) {
+            FileRead::Absent => SymbolMap::FileAbsent,
+            FileRead::Unknown => SymbolMap::Unknown,
+            FileRead::Bytes(bytes) => {
+                self.parses += 1;
+                match symbol_stamps(subject, commit, &bytes) {
+                    Some(map) => SymbolMap::Map(Rc::new(map)),
+                    None => SymbolMap::Unknown,
+                }
+            }
+        };
+        self.symbols.insert(key, parsed.clone());
+        parsed
+    }
+
+    /// Whether the file at `commit` still has a symbol whose leaf name
+    /// equals the subject symbol's leaf, under ANY qualification (see
+    /// [`symbol_leaf`]). `Some(false)` when the file is not in the commit's
+    /// tree; `None` when the file's symbols cannot be established (Unknown)
+    /// or the subject is a whole-file witness.
+    pub(crate) fn leaf_present_at(&mut self, subject: &Subject, commit: &str) -> Option<bool> {
+        let leaf = symbol_leaf(subject.symbol?);
+        match self.symbol_map(subject, commit) {
+            SymbolMap::FileAbsent => Some(false),
+            SymbolMap::Map(map) => Some(map.keys().any(|name| symbol_leaf(name) == leaf)),
+            SymbolMap::Unknown => None,
         }
     }
 
@@ -224,6 +249,24 @@ impl ReceiptResolver {
             }
         }
         None
+    }
+}
+
+/// Leaf name of a ledger symbol: the `#N` collision suffix stripped, then
+/// everything after the last `.` or `::` container separator
+/// (`make_renderer.render` -> `render`, `Foo::bar#2` -> `bar`).
+pub(crate) fn symbol_leaf(symbol: &str) -> &str {
+    let base = match symbol.rfind('#') {
+        Some(i) if i + 1 < symbol.len() && symbol[i + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+            &symbol[..i]
+        }
+        _ => symbol,
+    };
+    let after_dot = base.rfind('.').map(|i| i + 1);
+    let after_colons = base.rfind("::").map(|i| i + 2);
+    match after_dot.max(after_colons) {
+        Some(i) => &base[i..],
+        None => base,
     }
 }
 
@@ -316,6 +359,11 @@ pub(crate) enum Abstain {
     /// The successor's content equals the witness's (reformat / span-method
     /// artifact): nothing was superseded.
     SameContent,
+    /// The qualified symbol is gone but the file still has a symbol with the
+    /// same leaf name (moved out of / into another container, or
+    /// re-qualified), either at the receipt commit or at HEAD: a rename of
+    /// the qualification, not a deletion.
+    Moved,
     /// The conclusion holds but no commit in the range can be named as the
     /// one that made the change (empty/oversized range, git failure, or an
     /// unknown state met first).
@@ -355,9 +403,19 @@ pub(crate) fn resolve_receipt(
                 SymbolState::Present(_) => return Err(Abstain::PresentAtHead),
                 SymbolState::Unknown => return Err(Abstain::Unrederivable),
             }
-            resolver
+            // Moved, not deleted: a same-leaf symbol still exists at HEAD
+            // under some other qualification.
+            if resolver.leaf_present_at(subject, head) == Some(true) {
+                return Err(Abstain::Moved);
+            }
+            let receipt = resolver
                 .first_commit_where(subject, w_oid, head, &|s| *s == SymbolState::Absent)
-                .ok_or(Abstain::NoReceipt)
+                .ok_or(Abstain::NoReceipt)?;
+            // ... or already at the commit that dropped the qualified name.
+            if resolver.leaf_present_at(subject, &receipt) == Some(true) {
+                return Err(Abstain::Moved);
+            }
+            Ok(receipt)
         }
         Claim::Superseded { successor_oid } => {
             match resolver.state_at(subject, successor_oid) {
