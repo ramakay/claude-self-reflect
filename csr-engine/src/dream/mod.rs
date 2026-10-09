@@ -26,15 +26,14 @@
 //! 3. For every witness `W` in the anchor (INCLUDING the row at HEAD
 //!    itself — see the reinstatement rule):
 //!    - `H` exists and `W.stamp == H.stamp`: content already matches
-//!      current truth. If `W`'s own latest recorded verdict was negative
+//!      current truth. If `W`'s own latest live verdict was negative
 //!      (`anchor_obsolete` / `superseded_by`), emit `anchor_reinstated` —
-//!      REGARDLESS of ancestry direction between `W` and HEAD (recovery on
-//!      exact blake3 equality is always safe; ancestry proof is required
-//!      only for NEGATIVE verdicts). This covers both the forward
-//!      A -> B -> A revert and a checkout of an older commit whose content
-//!      matches a negatively-marked witness. Otherwise: intact, no event.
-//!      Reinstatement requires EXACT blake3 stamp equality — a near-revert
-//!      (`A'` close to but not equal to `A`) never reinstates.
+//!      but ONLY from a HEAD that has moved forward from where that
+//!      negative verdict was observed (see "Forward-only judgment"). A
+//!      checkout of a different branch or an older commit whose content
+//!      happens to match proves nothing and abstains. Otherwise: intact, no
+//!      event. Reinstatement requires EXACT blake3 stamp equality — a
+//!      near-revert (`A'` close to but not equal to `A`) never reinstates.
 //!    - `H` exists and stamps differ: search the anchor's rows whose stamp
 //!      equals `H.stamp` for a valid successor `W2` — one that is (i) a
 //!      causal DESCENDANT of `W` (`codewitness::causal::compare(W.at_oid,
@@ -53,6 +52,20 @@
 //!      `Incomparable`, the run is looking at a HEAD that is BEHIND the
 //!      witness and can prove nothing about it — abstain
 //!      (`head_behind_witness`).
+//!
+//! # Forward-only judgment
+//!
+//! Before ANY candidate event (superseded / obsolete / reinstated) is
+//! emitted for a witness `W` that already has a latest live event `L`, the
+//! run requires `compare(L.observed_head_oid, HEAD)` to be `AncestorOf` or
+//! `Equal`: the current HEAD must be where the previous verdict was drawn,
+//! or a descendant of it. Otherwise the run abstains (`head_not_forward`) —
+//! including when the observed oid does not parse or the compare fails.
+//! This kills branch flapping (a `main` <-> `dev` checkout of the same repo
+//! used to flip `anchor_obsolete` / `anchor_reinstated` on every dream
+//! pass): reinstatement now requires HEAD to have moved forward from where
+//! the negative verdict was observed. A witness with no live event has
+//! nothing to flap and is judged on the current HEAD as before.
 //!
 //! # Supersession vs reinstatement (deliberate contract)
 //!
@@ -137,6 +150,13 @@ pub struct DreamStats {
     /// checked out — or the two are incomparable): the run cannot prove
     /// obsolescence from a HEAD behind the witness — no event.
     pub head_behind_witness: usize,
+    /// A candidate event was withheld because the witness's latest live
+    /// event was observed at a HEAD that the current HEAD has NOT moved
+    /// forward from (the current HEAD is behind it, on a diverged branch,
+    /// or the ancestry could not be proven / the oid did not parse) — the
+    /// run is judging a different line of history than the one the existing
+    /// verdict was drawn on (branch flapping), so it abstains.
+    pub head_not_forward: usize,
     /// The anchor's file has no resolvable git repository (or live HEAD) —
     /// the whole anchor is skipped; none of its witnesses are counted above.
     pub abstained_no_repo: usize,
@@ -169,7 +189,7 @@ impl DreamStats {
              superseded            : {}\n\
              obsolete               : {}\n\
              reinstated             : {}\n\
-             abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  no_repo={}\n\
+             abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
             self.anchors_considered,
@@ -181,6 +201,7 @@ impl DreamStats {
             self.abstained_incomparable_ancestry,
             self.abstained_no_successor,
             self.head_behind_witness,
+            self.head_not_forward,
             self.abstained_no_repo,
             self.events_written,
             self.events_deduped,
@@ -532,14 +553,13 @@ pub(crate) fn dream_join_cancellable(
             let latest_for_w = witness_verdicts::latest_event(conn, w.id)?;
 
             let candidate: Option<WitnessVerdictRow> = match h {
-                // Reinstatement FIRST, and NEVER ancestry-gated: exact
-                // blake3 stamp equality with the current HEAD stamp recovers
-                // a negative witness regardless of what `compare(W, HEAD)`
-                // would say — including H's own row after a checkout of an
-                // older commit whose content matches. Recovery on exact
-                // stamp equality is always safe; ancestry proof is required
-                // only for NEGATIVE verdicts (the arms below). Still
-                // strictly EXACT equality — a near-revert A' never
+                // Reinstatement FIRST: exact blake3 stamp equality with the
+                // current HEAD stamp recovers a negative witness. It is not
+                // gated on `compare(W, HEAD)`, but it IS gated (below, once
+                // a candidate exists) on the forward-only rule: HEAD must
+                // have moved forward from where the negative verdict was
+                // observed, so a checkout of another branch cannot flip it.
+                // Still strictly EXACT equality — a near-revert A' never
                 // reinstates (see "Supersession vs reinstatement").
                 Some(h) if h.stamp == w.stamp => match &latest_for_w {
                     Some(l) if l.verdict.is_negative() => Some(WitnessVerdictRow {
@@ -606,6 +626,24 @@ pub(crate) fn dream_join_cancellable(
             let Some(candidate) = candidate else {
                 continue;
             };
+            // Forward-only judgment: a witness that already has a live
+            // event may only be re-judged from a HEAD that has moved
+            // FORWARD (descendant-or-equal) from the HEAD where that event
+            // was observed. Otherwise the run is on another branch (or a
+            // checkout of history) and would flap the verdict — abstain.
+            if let Some(l) = &latest_for_w {
+                let forward = parse_oid(Some(l.observed_head_oid.as_str()))
+                    .and_then(|observed| {
+                        compare_cached(auditor, &mut causal_cache, &repo_root, observed, *head_oid)
+                    })
+                    .is_some_and(|order| {
+                        matches!(order, CausalOrder::AncestorOf | CausalOrder::Equal)
+                    });
+                if !forward {
+                    stats.head_not_forward += 1;
+                    continue;
+                }
+            }
             match candidate.verdict {
                 VerdictKind::SupersededBy => stats.superseded += 1,
                 VerdictKind::AnchorObsolete => stats.obsolete += 1,
@@ -1215,14 +1253,13 @@ mod tests {
     }
 
     #[test]
-    fn checkout_of_matching_older_head_reinstates_negative_witness() {
-        // Reinstatement is NEVER ancestry-gated: c1 (content A) -> c2
-        // (content B). Dream at HEAD=c2 marks the c1 witness superseded.
-        // Then c1 itself is checked out (HEAD moves BACKWARDS): the c1
-        // witness's stamp equals the current HEAD stamp (it IS the row at
-        // HEAD), so its negative verdict must be recovered with
-        // anchor_reinstated even though compare(W, HEAD) is Equal, not
-        // AncestorOf — and the symbol's Demote state must clear.
+    fn checkout_of_matching_older_head_does_not_reinstate() {
+        // Forward-only judgment: c1 (content A) -> c2 (content B). Dream at
+        // HEAD=c2 marks the c1 witness superseded. Then c1 itself is checked
+        // out (HEAD moves BACKWARDS). The c1 witness's stamp equals the HEAD
+        // stamp, but HEAD is not a descendant of where the superseded
+        // verdict was observed (c2), so the run abstains: no reinstatement,
+        // the verdict stays as drawn.
         let repo = TestRepo::new();
         repo.write("lib.rs", "A");
         let c1 = repo.commit("c1");
@@ -1243,10 +1280,111 @@ mod tests {
 
         repo.git(&["checkout", "-q", &c1]); // HEAD moves backwards to c1.
         let second = run_join(&storage, false);
+        assert_eq!(second.reinstated, 0, "{second:?}");
         assert_eq!(
-            second.reinstated, 1,
-            "the negatively-marked c1 witness matches the checked-out HEAD stamp: {second:?}"
+            second.head_not_forward, 1,
+            "the c1 reinstatement is withheld: HEAD is behind the observed HEAD: {second:?}"
         );
+        assert_eq!(second.events_written, 0);
+
+        let c1_id = storage
+            .witnesses_for_file("proj", &file)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.at_oid.as_deref() == Some(c1.as_str()))
+            .unwrap()
+            .id;
+        let verdict = storage.latest_witness_verdict(c1_id).unwrap().unwrap();
+        assert_eq!(verdict.verdict, VerdictKind::SupersededBy);
+        assert_eq!(verdict.receipt_oid, Some(c2));
+    }
+
+    #[test]
+    fn branch_checkout_does_not_flap_obsolete_into_reinstated() {
+        // c0 -> c1 on main (symbol present, content A). `dev` branches off
+        // c1 and deletes the symbol (c2). Dreaming on `dev` marks the
+        // witnesses obsolete. Checking out `main` (symbol present with the
+        // identical stamp) must NOT reinstate: main's HEAD (c1) is an
+        // ancestor of the observed HEAD (c2), not a descendant.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "0");
+        let c0 = repo.commit("c0");
+        repo.write("lib.rs", "A");
+        let c1 = repo.commit("c1");
+        repo.checkout_new("dev");
+        repo.write("lib.rs", "");
+        let _c2 = repo.commit("c2 (symbol deleted)");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c0, "b3:0"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c1, "b3:A"))
+            })
+            .unwrap();
+
+        let on_dev = run_join(&storage, false);
+        assert_eq!(on_dev.obsolete, 2, "{on_dev:?}");
+        assert_eq!(on_dev.events_written, 2);
+
+        repo.checkout("main");
+        let on_main = run_join(&storage, false);
+        assert_eq!(on_main.reinstated, 0, "{on_main:?}");
+        assert!(on_main.head_not_forward >= 1, "{on_main:?}");
+        assert_eq!(on_main.events_written, 0, "{on_main:?}");
+
+        let c1_id = storage
+            .witnesses_for_file("proj", &file)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.at_oid.as_deref() == Some(c1.as_str()))
+            .unwrap()
+            .id;
+        assert_eq!(
+            storage
+                .latest_witness_verdict(c1_id)
+                .unwrap()
+                .unwrap()
+                .verdict,
+            VerdictKind::AnchorObsolete
+        );
+    }
+
+    #[test]
+    fn restore_in_a_descendant_commit_reinstates() {
+        // c0 -> c1 (content A) -> c2 (symbol deleted) -> c3 (A restored,
+        // identical stamp). Dream at c2: obsolete. Dream at c3, a
+        // descendant of the observed HEAD c2: anchor_reinstated fires.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "0");
+        let c0 = repo.commit("c0");
+        repo.write("lib.rs", "A");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "");
+        let _c2 = repo.commit("c2 (symbol deleted)");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c0, "b3:0"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c1, "b3:A"))
+            })
+            .unwrap();
+        let first = run_join(&storage, false);
+        assert_eq!(first.obsolete, 2, "{first:?}");
+
+        repo.write("lib.rs", "A");
+        let c3 = repo.commit("c3 (restored)");
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c3, "b3:A"))
+            })
+            .unwrap();
+        let second = run_join(&storage, false);
+        assert_eq!(second.reinstated, 1, "{second:?}");
+        assert_eq!(second.head_not_forward, 0, "{second:?}");
 
         let c1_id = storage
             .witnesses_for_file("proj", &file)
@@ -1257,18 +1395,50 @@ mod tests {
             .id;
         let verdict = storage.latest_witness_verdict(c1_id).unwrap().unwrap();
         assert_eq!(verdict.verdict, VerdictKind::AnchorReinstated);
-        assert_eq!(verdict.receipt_oid, Some(c1.clone()));
+        assert_eq!(verdict.receipt_oid, Some(c3));
+    }
 
-        // Channel rules: no witness of the symbol carries an uncancelled
-        // negative event any more (c2's witness was abstained, never
-        // negatively marked) — the Demote state is fully cleared.
-        assert!(
-            storage
-                .symbol_verdict_state("proj", &file, Some("foo"))
-                .unwrap()
-                .is_none(),
-            "Demote state must clear after reinstatement"
-        );
+    #[test]
+    fn unparsable_observed_head_abstains_as_head_not_forward() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "1");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "2");
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c1, "b3:1"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c2, "b3:2"))
+            })
+            .unwrap();
+        let w1_id = storage
+            .witnesses_for_file("proj", &file)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.at_oid.as_deref() == Some(c1.as_str()))
+            .unwrap()
+            .id;
+        // A prior (obsolete) event whose observed HEAD is not an oid.
+        storage
+            .with_connection(|conn| {
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id: w1_id,
+                        verdict: VerdictKind::AnchorObsolete,
+                        successor_witness_id: None,
+                        receipt_oid: None,
+                        observed_head_oid: "not-an-oid".into(),
+                    },
+                )
+            })
+            .unwrap();
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.head_not_forward, 1, "{stats:?}");
+        assert_eq!(stats.events_written, 0);
     }
 
     #[test]
