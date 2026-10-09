@@ -274,6 +274,14 @@ pub(crate) fn symbol_leaf(symbol: &str) -> &str {
     }
 }
 
+/// `Some(base)` when `symbol` carries the positional collision suffix the
+/// HEAD pass appends to duplicate names (`foo#2` -> `foo`).
+fn collision_base(symbol: &str) -> Option<&str> {
+    let i = symbol.rfind('#')?;
+    (i > 0 && i + 1 < symbol.len() && symbol[i + 1..].bytes().all(|b| b.is_ascii_digit()))
+        .then(|| &symbol[..i])
+}
+
 /// Indices (into `spans`, inclusive `(start, end)` lines) of every span that
 /// overlaps another without one strictly containing the other. Identical
 /// ranges overlap. A span nested strictly inside another (a method in its
@@ -314,7 +322,10 @@ fn ambiguous_spans(spans: &[(usize, usize)]) -> Vec<bool> {
 /// unsupported, or a span does not fit the file (all of which are Unknown).
 ///
 /// A name whose state cannot be trusted maps to `None` (reads as Unknown):
-/// its span overlaps a neighbour's without containing it ([`ambiguous_spans`]).
+/// - its span overlaps a neighbour's without containing it ([`ambiguous_spans`]);
+/// - it heads a collision group (`foo` while `foo#2` exists): the bare name
+///   goes to the span-earliest duplicate, so a same-named definition added
+///   above an unchanged `foo` silently renames the original to `foo#2`.
 fn symbol_stamps(
     subject: &Subject,
     commit: &str,
@@ -364,6 +375,13 @@ fn symbol_stamps(
     let mut out: HashMap<String, Option<String>> = HashMap::with_capacity(derived.symbols.len());
     for ((symbol, stamp), overlaps) in derived.symbols.iter().zip(stamps).zip(overlapping) {
         out.insert(symbol.clone(), (!overlaps).then_some(stamp));
+    }
+    for symbol in &derived.symbols {
+        if let Some(base) = collision_base(symbol) {
+            if let Some(entry) = out.get_mut(base) {
+                *entry = None;
+            }
+        }
     }
     Some(out)
 }

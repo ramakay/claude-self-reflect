@@ -2181,42 +2181,54 @@ mod tests {
     }
 
     #[test]
-    fn positional_symbol_gets_no_verdict_but_a_plain_sibling_still_does() {
+    fn collision_group_members_get_no_verdict_but_an_unrelated_sibling_still_does() {
         // Two `foo` definitions: the second is minted as `foo#2`. Both change
-        // between c1 and c2, but only the plain-named one may be judged.
+        // between c1 and c2. Neither may be judged: `foo#2` is positional,
+        // and the bare `foo` heads a collision group, so which definition it
+        // names is itself unproven. A uniquely named `other` is unaffected.
         let repo = TestRepo::new();
-        repo.write("lib.rs", "fn foo() {\n    1\n}\nfn foo() {\n    a\n}\n");
+        repo.write(
+            "lib.rs",
+            "fn foo() {\n    1\n}\nfn foo() {\n    a\n}\nfn other() {\n    x\n}\n",
+        );
         let c1 = repo.commit("c1");
-        repo.write("lib.rs", "fn foo() {\n    2\n}\nfn foo() {\n    b\n}\n");
+        repo.write(
+            "lib.rs",
+            "fn foo() {\n    2\n}\nfn foo() {\n    b\n}\nfn other() {\n    y\n}\n",
+        );
         let c2 = repo.commit("c2");
 
         let storage = open_storage();
         let file = repo.file_path();
         insert_symbol_rows(&storage, &file, "foo", &[(&c1, "b3:1"), (&c2, "b3:2")]);
         insert_symbol_rows(&storage, &file, "foo#2", &[(&c1, "b3:a"), (&c2, "b3:b")]);
+        insert_symbol_rows(&storage, &file, "other", &[(&c1, "b3:x"), (&c2, "b3:y")]);
 
         let stats = run_join(&storage, false);
         assert_eq!(stats.abstained_positional_symbol, 1, "{stats:?}");
+        assert_eq!(stats.abstained_unparseable, 1, "bare foo: {stats:?}");
         assert_eq!(stats.superseded, 1, "{stats:?}");
         assert_eq!(stats.events_written, 1, "{stats:?}");
 
-        let plain = storage
-            .latest_witness_verdict(witness_of(&storage, &file, "foo", &c1))
+        let other = storage
+            .latest_witness_verdict(witness_of(&storage, &file, "other", &c1))
             .unwrap()
-            .expect("plain sibling is still judged");
-        assert_eq!(plain.verdict, VerdictKind::SupersededBy);
-        assert_eq!(plain.receipt_oid.as_deref(), Some(c2.as_str()));
-        assert!(
-            storage
-                .latest_witness_verdict(witness_of(&storage, &file, "foo#2", &c1))
+            .expect("uniquely named sibling is still judged");
+        assert_eq!(other.verdict, VerdictKind::SupersededBy);
+        assert_eq!(other.receipt_oid.as_deref(), Some(c2.as_str()));
+        for symbol in ["foo", "foo#2"] {
+            assert!(
+                storage
+                    .latest_witness_verdict(witness_of(&storage, &file, symbol, &c1))
+                    .unwrap()
+                    .is_none(),
+                "{symbol} must carry no verdict"
+            );
+            assert!(storage
+                .latest_witness_verdict(witness_of(&storage, &file, symbol, &c2))
                 .unwrap()
-                .is_none(),
-            "positional symbol must carry no verdict"
-        );
-        assert!(storage
-            .latest_witness_verdict(witness_of(&storage, &file, "foo#2", &c2))
-            .unwrap()
-            .is_none());
+                .is_none());
+        }
     }
 
     /// A `Foo::render` witness whose method moved to a top-level `render`.
@@ -2448,5 +2460,30 @@ mod tests {
         let v = latest(&storage, &file, &c1).unwrap();
         assert_eq!(v.verdict, VerdictKind::SupersededBy);
         assert_eq!(v.receipt_oid.as_deref(), Some(c2.as_str()));
+    }
+
+    #[test]
+    fn same_named_definition_inserted_before_an_unchanged_one_abstains() {
+        // The new `foo` takes the bare name and the untouched original
+        // becomes `foo#2`: the content under the name `foo` changed, but
+        // `foo` (the thing the witness is about) did not.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_with("1", "fn other() {}\n"));
+        let c1 = repo.commit("c1");
+        repo.write(
+            "lib.rs",
+            &format!("{}{}", foo_src("99"), foo_with("1", "fn other() {}\n")),
+        );
+        let c2 = repo.commit("c2 new foo above the original");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert_eq!(stats.abstained_unparseable, 1, "{stats:?}");
+        assert!(latest(&storage, &file, &c1).is_none());
     }
 }
