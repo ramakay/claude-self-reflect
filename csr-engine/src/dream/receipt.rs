@@ -14,7 +14,7 @@
 //!   file for a whole-file witness).
 //! - `Absent`: the file is not in the commit's tree, or the file parsed
 //!   cleanly and the symbol is not in it.
-//! - `Unknown`: the blob could not be read or the parse was not clean /
+//! - `Unknown` (abstains as `Unparseable`): the blob could not be read or the parse was not clean /
 //!   the language is unsupported. Unknown is NEVER read as absent or as
 //!   changed: every search that meets one before a match abstains.
 //!
@@ -350,10 +350,17 @@ fn git_commits_touching(
 /// Why a candidate event was withheld instead of written with a receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Abstain {
-    /// The symbol's content at a needed commit could not be established
-    /// (unparseable, unsupported language, unreadable blob, or the witness
-    /// symbol is not present at its own commit under the shared naming).
-    Unrederivable,
+    /// A needed commit's content could not be established: the file's parse
+    /// there is not clean (or the language is unsupported), or the blob is
+    /// unreadable / its path could not be located. Never read as absent.
+    Unparseable,
+    /// The parse at the witness's own commit is clean but the witness symbol
+    /// is not in the file (or the file is not in that commit's tree) under
+    /// the shared naming: the ledger row claims a symbol at a commit that
+    /// never contained it (typical of legacy `source_kind='backfill'` rows).
+    /// Also covers a reinstatement whose symbol, re-read at HEAD, does not
+    /// have the witness's content.
+    NotAtWitness,
     /// The join found no stamp at HEAD, but the symbol is in the HEAD blob.
     PresentAtHead,
     /// The successor's content equals the witness's (reformat / span-method
@@ -392,8 +399,10 @@ pub(crate) fn resolve_receipt(
     w_oid: &str,
     claim: &Claim,
 ) -> Result<String, Abstain> {
-    let SymbolState::Present(base) = resolver.state_at(subject, w_oid) else {
-        return Err(Abstain::Unrederivable);
+    let base = match resolver.state_at(subject, w_oid) {
+        SymbolState::Present(base) => base,
+        SymbolState::Absent => return Err(Abstain::NotAtWitness),
+        SymbolState::Unknown => return Err(Abstain::Unparseable),
     };
     let is_base = |s: &SymbolState| matches!(s, SymbolState::Present(p) if *p == base);
     match claim {
@@ -401,7 +410,7 @@ pub(crate) fn resolve_receipt(
             match resolver.state_at(subject, head) {
                 SymbolState::Absent => {}
                 SymbolState::Present(_) => return Err(Abstain::PresentAtHead),
-                SymbolState::Unknown => return Err(Abstain::Unrederivable),
+                SymbolState::Unknown => return Err(Abstain::Unparseable),
             }
             // Moved, not deleted: a same-leaf symbol still exists at HEAD
             // under some other qualification.
@@ -419,7 +428,7 @@ pub(crate) fn resolve_receipt(
         }
         Claim::Superseded { successor_oid } => {
             match resolver.state_at(subject, successor_oid) {
-                SymbolState::Unknown => return Err(Abstain::Unrederivable),
+                SymbolState::Unknown => return Err(Abstain::Unparseable),
                 s if is_base(&s) => return Err(Abstain::SameContent),
                 _ => {}
             }
@@ -431,8 +440,10 @@ pub(crate) fn resolve_receipt(
             head,
             negative_observed_head,
         } => {
-            if !is_base(&resolver.state_at(subject, head)) {
-                return Err(Abstain::Unrederivable);
+            match resolver.state_at(subject, head) {
+                SymbolState::Unknown => return Err(Abstain::Unparseable),
+                s if !is_base(&s) => return Err(Abstain::NotAtWitness),
+                _ => {}
             }
             resolver
                 .first_commit_where(subject, negative_observed_head, head, &is_base)

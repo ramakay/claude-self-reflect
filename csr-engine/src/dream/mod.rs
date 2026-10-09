@@ -74,9 +74,10 @@
 //!      first commit in `L.observed_head..HEAD` where the content equals
 //!      `W`'s again (`L` = the negative event being cancelled).
 //!
-//!    A needed state that is unknown (unparseable, unsupported language, or
-//!    the witness symbol not present at its own commit) abstains
-//!    (`abstained_unrederivable`); a conclusion with no nameable commit
+//!    A needed state that is unknown (unparseable, unsupported language,
+//!    unreadable blob) abstains (`abstained_unparseable`); a witness symbol
+//!    that is not in the file at its own commit abstains
+//!    (`abstained_not_at_witness`); a conclusion with no nameable commit
 //!    abstains (`abstained_no_receipt`). The receipt is NEVER the observed
 //!    HEAD or the successor's `at_oid`. Receipts are computed lazily, only
 //!    for new events, so re-running at a newer HEAD re-searches nothing for
@@ -204,11 +205,15 @@ pub struct DreamStats {
     /// can be trusted. HEAD-row witnesses are skipped silently, like every
     /// other non-considered HEAD row.
     pub abstained_positional_symbol: usize,
-    /// A NEW conclusion was withheld because the symbol's content at a
-    /// commit the receipt needs could not be established (not a clean
-    /// parse, unsupported language, unreadable blob, or the witness symbol
-    /// is not present at its own commit) — see `receipt::SymbolState`.
-    pub abstained_unrederivable: usize,
+    /// A NEW conclusion was withheld because the file's content at a commit
+    /// the receipt needs could not be established: not a clean parse,
+    /// unsupported language, or unreadable blob - see `receipt::SymbolState`.
+    pub abstained_unparseable: usize,
+    /// A NEW conclusion was withheld because the file parses cleanly at the
+    /// witness's own commit but the witness symbol is not in it (many legacy
+    /// `source_kind='backfill'` rows claim a symbol at a commit that never
+    /// contained it).
+    pub abstained_not_at_witness: usize,
     /// `anchor_obsolete` withheld: the join found no stamp at HEAD but the
     /// symbol is in the HEAD blob (the HEAD pass missed it).
     pub abstained_present_at_head: usize,
@@ -259,7 +264,8 @@ impl DreamStats {
              obsolete               : {}\n\
              reinstated             : {}\n\
              abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}  positional_symbol={}\n\
-             receipts: found={}  searches={}  abstained: unrederivable={}  present_at_head={}  same_content={}  moved={}  no_receipt={}\n\
+             receipts: found={}  searches={}\n\
+             receipt abstained: unparseable={}  not_at_witness={}  present_at_head={}  same_content={}  moved={}  no_receipt={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
             self.anchors_considered,
@@ -276,7 +282,8 @@ impl DreamStats {
             self.abstained_positional_symbol,
             self.receipts_found,
             self.receipt_searches,
-            self.abstained_unrederivable,
+            self.abstained_unparseable,
+            self.abstained_not_at_witness,
             self.abstained_present_at_head,
             self.abstained_same_content,
             self.abstained_moved,
@@ -774,7 +781,8 @@ pub(crate) fn dream_join_cancellable(
                     }
                     Err(abstain) => {
                         match abstain {
-                            receipt::Abstain::Unrederivable => stats.abstained_unrederivable += 1,
+                            receipt::Abstain::Unparseable => stats.abstained_unparseable += 1,
+                            receipt::Abstain::NotAtWitness => stats.abstained_not_at_witness += 1,
                             receipt::Abstain::PresentAtHead => stats.abstained_present_at_head += 1,
                             receipt::Abstain::SameContent => stats.abstained_same_content += 1,
                             receipt::Abstain::Moved => stats.abstained_moved += 1,
@@ -824,8 +832,8 @@ fn resolve_candidate_receipt(
             let root = std::fs::canonicalize(repo_root).ok()?;
             relpath_in_repo(&root.to_string_lossy(), &file.to_string_lossy())
         })
-        .ok_or(Abstain::Unrederivable)?;
-    let w_oid = w.at_oid.as_deref().ok_or(Abstain::Unrederivable)?;
+        .ok_or(Abstain::Unparseable)?;
+    let w_oid = w.at_oid.as_deref().ok_or(Abstain::Unparseable)?;
     let subject = receipt::Subject {
         auditor,
         repo_root,
@@ -839,13 +847,13 @@ fn resolve_candidate_receipt(
         VerdictKind::SupersededBy => receipt::Claim::Superseded {
             successor_oid: successor
                 .and_then(|s| s.at_oid.as_deref())
-                .ok_or(Abstain::Unrederivable)?,
+                .ok_or(Abstain::Unparseable)?,
         },
         VerdictKind::AnchorReinstated => receipt::Claim::Reinstated {
             head: head_oid,
             negative_observed_head: latest
                 .map(|l| l.observed_head_oid.as_str())
-                .ok_or(Abstain::Unrederivable)?,
+                .ok_or(Abstain::Unparseable)?,
         },
     };
     receipt::resolve_receipt(resolver, &subject, w_oid, &claim)
@@ -2048,7 +2056,8 @@ mod tests {
 
         let stats = run_join(&storage, false);
         assert_eq!(stats.superseded, 0, "{stats:?}");
-        assert_eq!(stats.abstained_unrederivable, 1, "{stats:?}");
+        assert_eq!(stats.abstained_unparseable, 1, "{stats:?}");
+        assert_eq!(stats.abstained_not_at_witness, 0, "{stats:?}");
         assert_eq!(stats.events_written, 0, "{stats:?}");
     }
 
@@ -2265,5 +2274,30 @@ mod tests {
         assert_eq!(symbol_leaf("out"), "out");
         assert_eq!(symbol_leaf("A.B::c"), "c");
         assert_eq!(symbol_leaf("weird#x"), "weird#x");
+    }
+
+    #[test]
+    fn symbol_missing_at_its_own_commit_is_not_at_witness_not_unparseable() {
+        // Clean parse at both commits, but the file never contained `foo`:
+        // a legacy backfill row claiming a symbol at a commit without it.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "fn bar() {\n    1\n}\n");
+        let c1 = repo.commit("c1 only bar");
+        repo.write("lib.rs", "fn bar() {\n    2\n}\n");
+        let c2 = repo.commit("c2 only bar");
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_not_at_witness, 1, "{stats:?}");
+        assert_eq!(stats.abstained_unparseable, 0, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        let text = stats.format_text(false);
+        assert!(text.contains("unparseable=0"), "{text}");
+        assert!(text.contains("not_at_witness=1"), "{text}");
+        assert!(text.contains("moved=0"), "{text}");
+        assert!(text.contains("positional_symbol=0"), "{text}");
     }
 }
