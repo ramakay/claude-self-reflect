@@ -391,6 +391,16 @@ fn symbol_stamps(
     Some(out)
 }
 
+/// Committer time of `commit` (full hex oid) as UTC `YYYY-MM-DD HH:MM:SS`,
+/// read from the object database. `None` when the commit cannot be read.
+/// This is when the change HAPPENED, as opposed to when a dream noticed it.
+pub(crate) fn commit_time_utc(auditor: &Auditor, commit: &str) -> Option<String> {
+    let oid = commit.parse::<ObjectId>().ok()?;
+    let seconds = auditor.repo().find_commit(oid).ok()?.time().ok()?.seconds;
+    let when = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;
+    Some(when.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
 /// How long one `git log` receipt search may run before it is killed and the
 /// search abstains.
 const GIT_DEADLINE: Duration = Duration::from_secs(20);

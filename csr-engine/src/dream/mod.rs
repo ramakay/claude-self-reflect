@@ -773,6 +773,8 @@ pub(crate) fn dream_join_cancellable(
             // re-run at a newer HEAD must not re-search git for conclusions
             // already on record.
             let is_new = witness_verdicts::is_new_event(latest_for_w.as_ref(), &candidate);
+            // When the receipt commit was made (not when this run noticed).
+            let mut receipt_committed_at: Option<String> = None;
             if is_new {
                 let searches_before = resolver.searches;
                 let resolved = resolve_candidate_receipt(
@@ -790,6 +792,7 @@ pub(crate) fn dream_join_cancellable(
                 stats.receipt_searches += resolver.searches - searches_before;
                 match resolved {
                     Ok(receipt_oid) => {
+                        receipt_committed_at = receipt::commit_time_utc(auditor, &receipt_oid);
                         candidate.receipt_oid = Some(receipt_oid);
                         stats.receipts_found += 1;
                     }
@@ -817,7 +820,11 @@ pub(crate) fn dream_join_cancellable(
             if is_new {
                 stats.events_written += 1;
                 if !dry_run {
-                    witness_verdicts::insert_verdict_if_changed(conn, &candidate)?;
+                    witness_verdicts::insert_verdict_with_commit_time(
+                        conn,
+                        &candidate,
+                        receipt_committed_at.as_deref(),
+                    )?;
                 }
             } else {
                 stats.events_deduped += 1;
@@ -2558,5 +2565,59 @@ mod tests {
         assert_eq!(stats.abstained_no_receipt, 1, "{stats:?}");
         assert_eq!(stats.superseded, 0, "{stats:?}");
         assert_eq!(stats.events_written, 0, "{stats:?}");
+    }
+
+    #[test]
+    fn the_receipt_commit_time_is_recorded_and_reaches_the_delivered_headline() {
+        // c2 is committed on 2026-09-12; the dream runs "today". The event
+        // must carry c2's committer time, and the headline must show it.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", &foo_src("2"));
+        repo.git(&["add", "-A"]);
+        let mut commit = Command::new("git");
+        // Same scrub as `TestRepo::git`: an inherited GIT_* (a hook's
+        // GIT_INDEX_FILE, say) would point this at the wrong repository.
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("GIT_") {
+                commit.env_remove(&k);
+            }
+        }
+        let committed = commit
+            .current_dir(&repo.path)
+            .env("GIT_COMMITTER_DATE", "2026-09-12T10:20:30+0000")
+            .args(["commit", "-q", "-m", "c2 changes foo"])
+            .output()
+            .unwrap();
+        assert!(committed.status.success(), "{committed:?}");
+        let c2 = repo.head();
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.events_written, 1, "{stats:?}");
+
+        let (receipt, committed_at): (String, Option<String>) = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT receipt_oid, receipt_committed_at FROM witness_verdicts",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(receipt, c2);
+        assert_eq!(committed_at.as_deref(), Some("2026-09-12 10:20:30"));
+
+        let headlines = storage
+            .with_connection(|conn| {
+                crate::storage::dream_delivery::receipted_conclusions(conn, "proj")
+            })
+            .unwrap();
+        assert_eq!(headlines.len(), 1);
+        assert_eq!(headlines[0].witnessed_date, "2026-09-12");
+        assert_eq!(headlines[0].receipt_oid, c2);
     }
 }

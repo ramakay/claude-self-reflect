@@ -255,7 +255,7 @@ impl Storage {
         let mut statement = conn.prepare(&format!(
             "SELECT COALESCE(NULLIF(wl.symbol, ''), wl.file),
                     COALESCE(v.receipt_oid, ''),
-                    SUBSTR(datetime(v.created_at), 1, 10)
+                    SUBSTR(COALESCE(v.receipt_committed_at, datetime(v.created_at)), 1, 10)
              FROM witness_verdicts v INDEXED BY idx_witness_verdicts_recap_created
              JOIN witness_ledger wl ON wl.id = v.witness_id
              WHERE julianday(v.created_at) > julianday(?1)
@@ -1213,5 +1213,47 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn retired_feed_shows_the_commit_date_when_recorded_and_created_at_otherwise() {
+        let storage = Storage::open_memory().unwrap();
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/a.rs",
+            Some("with_commit_time"),
+            "superseded_by",
+            "aaaaaaa1",
+            "2026-10-08T01:00:00Z",
+        );
+        seed_witness_verdict(
+            &storage,
+            "alpha",
+            "/repo/src/b.rs",
+            Some("without_commit_time"),
+            "superseded_by",
+            "bbbbbbb2",
+            "2026-10-07T01:00:00Z",
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE witness_verdicts SET receipt_committed_at = '2026-09-12 14:30:00'
+                     WHERE receipt_oid = 'aaaaaaa1'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let retired = storage
+            .recap_retired_since_with("alpha", "2026-08-01T00:00:00Z", ConsumptionMode::Full)
+            .unwrap();
+        // Still ordered by when the dreamer learned it...
+        assert_eq!(retired[0].label, "with_commit_time");
+        assert_eq!(retired[1].label, "without_commit_time");
+        // ...but dated by when the change happened, where that is known.
+        assert_eq!(retired[0].date, "2026-09-12");
+        assert_eq!(retired[1].date, "2026-10-07");
     }
 }

@@ -228,6 +228,18 @@ pub fn is_new_event(latest: Option<&WitnessVerdictRow>, candidate: &WitnessVerdi
 /// `BEGIN IMMEDIATE` takes the write lock up front, so no second writer can
 /// interleave between reading the latest event and appending the new one.
 pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> Result<bool> {
+    insert_verdict_with_commit_time(conn, row, None)
+}
+
+/// [`insert_verdict_if_changed`] that also records the receipt commit's
+/// committer time (`receipt_committed_at`, UTC `YYYY-MM-DD HH:MM:SS`) on the
+/// event it appends. The column is written once, at insert; nothing updates
+/// it later, so the ledger stays append-only.
+pub fn insert_verdict_with_commit_time(
+    conn: &Connection,
+    row: &WitnessVerdictRow,
+    receipt_committed_at: Option<&str>,
+) -> Result<bool> {
     // `new_unchecked` rather than `Connection::transaction` because the
     // storage locking idiom hands out `&Connection` (behind the Mutex), not
     // `&mut Connection`; the Mutex already guarantees the exclusive access
@@ -239,14 +251,16 @@ pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> 
     }
     let changed = tx.execute(
         "INSERT INTO witness_verdicts
-            (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+            (witness_id, verdict, successor_witness_id, receipt_oid, observed_head_oid,
+             receipt_committed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             row.witness_id,
             row.verdict.as_str(),
             row.successor_witness_id,
             row.receipt_oid,
             row.observed_head_oid,
+            receipt_committed_at,
         ],
     )?;
     super::artifact_backfill::record_witness(&tx, &tx.last_insert_rowid().to_string())?;

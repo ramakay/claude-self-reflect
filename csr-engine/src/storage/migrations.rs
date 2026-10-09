@@ -368,6 +368,20 @@ fn ensure_witness_verdicts_v2_floor(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add `witness_verdicts.receipt_committed_at`: the receipt commit's
+/// committer time (UTC, `YYYY-MM-DD HH:MM:SS`), so a delivered conclusion can
+/// say when the change HAPPENED rather than when the dreamer noticed
+/// (`created_at`). NULL on every event written before the column existed.
+///
+/// CHECK-THEN-ALTER: when the column exists this is one `pragma_table_info`
+/// read and NO write (see `ensure_witness_verdicts_v2_floor`).
+fn ensure_witness_verdicts_receipt_committed_at(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "witness_verdicts", "receipt_committed_at")? {
+        conn.execute_batch("ALTER TABLE witness_verdicts ADD COLUMN receipt_committed_at TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Run all database migrations.
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -1339,6 +1353,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON witness_chunk_bindings(chunk_id);",
     )?;
 
+    ensure_witness_verdicts_receipt_committed_at(conn)?;
     ensure_witness_verdicts_v2_floor(conn)?;
 
     // Recap normalizes SQLite and RFC3339 timestamps through julianday(). This
@@ -4303,6 +4318,53 @@ mod tests {
         assert_eq!(
             story_after_second, story_tags,
             "second run is gated by the meta key and must not rescan"
+        );
+    }
+
+    #[test]
+    fn witness_verdicts_receipt_committed_at_is_added_to_an_old_table_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // A table as it existed before the column.
+        conn.execute_batch(
+            "CREATE TABLE witness_verdicts (
+                id INTEGER PRIMARY KEY,
+                witness_id INTEGER NOT NULL,
+                verdict TEXT NOT NULL,
+                successor_witness_id INTEGER,
+                receipt_oid TEXT,
+                observed_head_oid TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid)
+            VALUES (1, 'anchor_obsolete', 'head');",
+        )
+        .unwrap();
+        assert!(!has_column(&conn, "witness_verdicts", "receipt_committed_at").unwrap());
+        ensure_witness_verdicts_receipt_committed_at(&conn).unwrap();
+        assert!(has_column(&conn, "witness_verdicts", "receipt_committed_at").unwrap());
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT receipt_committed_at FROM witness_verdicts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing, None, "old events stay NULL, never backfilled");
+    }
+
+    #[test]
+    fn witness_verdicts_receipt_committed_at_step_performs_no_write_when_the_column_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        assert!(has_column(&conn, "witness_verdicts", "receipt_committed_at").unwrap());
+        let before = conn.total_changes();
+        ensure_witness_verdicts_receipt_committed_at(&conn).unwrap();
+        ensure_witness_verdicts_receipt_committed_at(&conn).unwrap();
+        run(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "an existing column is only read"
         );
     }
 }

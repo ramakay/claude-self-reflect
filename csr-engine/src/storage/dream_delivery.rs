@@ -89,6 +89,10 @@ pub struct DreamHeadline {
     pub verdict: String,
     /// Never empty — a headline without a receipt is not constructed.
     pub receipt_oid: String,
+    /// When the change happened: the receipt commit's committer time when the
+    /// event recorded it, else when the dreamer recorded the event
+    /// (`witness_verdicts.created_at`). Presentation only: list order is the
+    /// recorded time, see [`receipted_conclusions`].
     pub witnessed_at: String,
     /// `YYYY-MM-DD` slice of `witnessed_at`, or the whole value when it is
     /// shorter. Presentation only.
@@ -180,8 +184,14 @@ fn headline_from_parts(
 /// this is the same priority order, applied to a single row rather than a
 /// cluster.
 pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<DreamHeadline>> {
+    // `learned_at` (when the dreamer recorded it) orders the list, so fresh
+    // conclusions surface first; `committed_at` (when the receipt commit was
+    // made, NULL for events written before that was recorded) is what the
+    // headline DISPLAYS.
     let mut stmt = conn.prepare(&format!(
-        "SELECT l.file, l.symbol, v.verdict, v.receipt_oid, MAX(v.created_at) AS witnessed_at
+        "SELECT l.file, l.symbol, v.verdict, v.receipt_oid,
+                MAX(v.created_at) AS learned_at,
+                MAX(v.receipt_committed_at) AS committed_at
          FROM witness_verdicts v
          JOIN witness_ledger l ON l.id = v.witness_id
          WHERE l.project = ?1
@@ -191,7 +201,7 @@ pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<Dre
            AND v.receipt_oid IS NOT NULL
            AND TRIM(v.receipt_oid) != ''
          GROUP BY l.file, l.symbol, v.verdict, v.receipt_oid
-         ORDER BY witnessed_at DESC"
+         ORDER BY learned_at DESC"
     ))?;
     let rows = stmt
         .query_map(params![project], |row| {
@@ -201,31 +211,38 @@ pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<Dre
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut out: Vec<DreamHeadline> = rows
+    let mut out: Vec<(String, DreamHeadline)> = rows
         .into_iter()
-        .filter_map(|(file, symbol, verdict, receipt_oid, witnessed_at)| {
-            headline_from_parts(
-                project.to_string(),
-                file,
-                symbol,
-                verdict,
-                receipt_oid,
-                witnessed_at,
-            )
-        })
+        .filter_map(
+            |(file, symbol, verdict, receipt_oid, learned_at, committed_at)| {
+                let displayed = committed_at
+                    .filter(|at| !at.trim().is_empty())
+                    .unwrap_or_else(|| learned_at.clone());
+                headline_from_parts(
+                    project.to_string(),
+                    file,
+                    symbol,
+                    verdict,
+                    receipt_oid,
+                    displayed,
+                )
+                .map(|headline| (learned_at, headline))
+            },
+        )
         .collect();
-    out.sort_by(|a, b| {
-        b.witnessed_date
-            .cmp(&a.witnessed_date)
+    out.sort_by(|(learned_a, a), (learned_b, b)| {
+        date_of(learned_b)
+            .cmp(&date_of(learned_a))
             .then_with(|| verdict_rank(&a.verdict).cmp(&verdict_rank(&b.verdict)))
-            .then_with(|| b.witnessed_at.cmp(&a.witnessed_at))
+            .then_with(|| learned_b.cmp(learned_a))
             .then_with(|| a.id.cmp(&b.id))
     });
-    Ok(out)
+    Ok(out.into_iter().map(|(_, headline)| headline).collect())
 }
 
 /// Lower sorts first: adverse before restorative before anything unknown.
@@ -805,5 +822,121 @@ mod tests {
             None,
             "a total with no id list was measured in verdicts, not dreams"
         );
+    }
+
+    /// Insert a receipted `anchor_obsolete` for `symbol` with an explicit
+    /// recorded time and (optionally) a receipt commit time.
+    fn seed_dated(
+        storage: &Storage,
+        symbol: &str,
+        receipt: &str,
+        created_at: &str,
+        committed_at: Option<&str>,
+    ) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO witness_ledger
+                        (project, file, symbol, stamp, tier, at_oid, source_kind)
+                     VALUES ('proj', '/repo/a.rs', ?1, ?2, 'committed', 'aaaa111', 'test')",
+                    params![symbol, format!("b3:{symbol}")],
+                )?;
+                let witness_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO witness_verdicts
+                        (witness_id, verdict, receipt_oid, observed_head_oid,
+                         created_at, receipt_committed_at)
+                     VALUES (?1, 'anchor_obsolete', ?2, 'head', ?3, ?4)",
+                    params![witness_id, receipt, created_at, committed_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn delivered_headline_carries_the_commit_date_not_the_dream_date() {
+        let storage = Storage::open_memory().unwrap();
+        seed_dated(
+            &storage,
+            "VidhiVow",
+            "0145628",
+            "2026-10-08 01:00:00",
+            Some("2026-09-12 14:30:00"),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].witnessed_date, "2026-09-12");
+        assert_eq!(rows[0].witnessed_at, "2026-09-12 14:30:00");
+        // The conclusion id does not depend on either date.
+        assert_eq!(
+            rows[0].id,
+            conclusion_id(
+                "proj",
+                "/repo/a.rs",
+                Some("VidhiVow"),
+                "anchor_obsolete",
+                "0145628"
+            )
+        );
+        // ...and the recap clause shows the same date.
+        let clause = storage
+            .recap_top_dream_with("proj", crate::storage::recap_feeds::ConsumptionMode::Full)
+            .unwrap()
+            .expect("an undelivered dream");
+        assert_eq!(clause.date, "2026-09-12");
+    }
+
+    #[test]
+    fn a_row_without_a_commit_time_falls_back_to_the_recorded_date() {
+        let storage = Storage::open_memory().unwrap();
+        seed_dated(&storage, "old_row", "abc1234", "2026-08-11 10:00:00", None);
+        seed_dated(
+            &storage,
+            "blank",
+            "def5678",
+            "2026-08-12 10:00:00",
+            Some("  "),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let date_of_label = |label: &str| {
+            rows.iter()
+                .find(|row| row.label() == label)
+                .map(|row| row.witnessed_date.clone())
+                .unwrap()
+        };
+        assert_eq!(date_of_label("old_row"), "2026-08-11");
+        assert_eq!(date_of_label("blank"), "2026-08-12");
+    }
+
+    #[test]
+    fn ordering_follows_when_the_dreamer_learned_it_not_the_commit_date() {
+        let storage = Storage::open_memory().unwrap();
+        // Learned later, but the change itself is much older.
+        seed_dated(
+            &storage,
+            "learned_last",
+            "1111111",
+            "2026-10-08 09:00:00",
+            Some("2026-06-01 00:00:00"),
+        );
+        // Learned earlier, committed more recently.
+        seed_dated(
+            &storage,
+            "learned_first",
+            "2222222",
+            "2026-10-01 09:00:00",
+            Some("2026-09-30 00:00:00"),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let labels: Vec<&str> = rows.iter().map(|row| row.label()).collect();
+        assert_eq!(labels, ["learned_last", "learned_first"]);
+        assert_eq!(rows[0].witnessed_date, "2026-06-01");
     }
 }
