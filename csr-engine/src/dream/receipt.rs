@@ -391,14 +391,23 @@ fn symbol_stamps(
     Some(out)
 }
 
-/// Committer time of `commit` (full hex oid) as UTC `YYYY-MM-DD HH:MM:SS`,
-/// read from the object database. `None` when the commit cannot be read.
-/// This is when the change HAPPENED, as opposed to when a dream noticed it.
-pub(crate) fn commit_time_utc(auditor: &Auditor, commit: &str) -> Option<String> {
+/// Committer time of `commit` (full hex oid) as RFC 3339 in the committer's
+/// OWN UTC offset (`2026-09-12T22:57:11-07:00`), read from the object
+/// database. `None` when the commit cannot be read. This is when the change
+/// HAPPENED, as opposed to when a dream noticed it, and its first ten
+/// characters are the date the committer saw (what `git log` shows).
+pub(crate) fn commit_time_local(auditor: &Auditor, commit: &str) -> Option<String> {
     let oid = commit.parse::<ObjectId>().ok()?;
-    let seconds = auditor.repo().find_commit(oid).ok()?.time().ok()?.seconds;
-    let when = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?;
-    Some(when.format("%Y-%m-%d %H:%M:%S").to_string())
+    let time = auditor.repo().find_commit(oid).ok()?.time().ok()?;
+    format_commit_time(time.seconds, time.offset)
+}
+
+/// RFC 3339 rendering of `seconds` since the epoch at `offset_seconds` east
+/// of UTC. `None` when either is out of range.
+fn format_commit_time(seconds: i64, offset_seconds: i32) -> Option<String> {
+    let zone = chrono::FixedOffset::east_opt(offset_seconds)?;
+    let when = chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, 0)?.with_timezone(&zone);
+    Some(when.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
 }
 
 /// How long one `git log` receipt search may run before it is killed and the
@@ -612,6 +621,27 @@ pub(crate) fn resolve_receipt(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn commit_time_is_rendered_in_the_committers_own_offset() {
+        // 2026-09-13T05:57:11Z is 22:57:11 the previous day at -07:00.
+        let utc = chrono::DateTime::parse_from_rfc3339("2026-09-13T05:57:11Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            format_commit_time(utc, -7 * 3600).as_deref(),
+            Some("2026-09-12T22:57:11-07:00")
+        );
+        assert_eq!(
+            format_commit_time(utc, 5 * 3600 + 30 * 60).as_deref(),
+            Some("2026-09-13T11:27:11+05:30")
+        );
+        assert_eq!(
+            format_commit_time(utc, 0).as_deref(),
+            Some("2026-09-13T05:57:11+00:00")
+        );
+        assert_eq!(format_commit_time(utc, 100 * 3600), None);
+    }
+
     use super::*;
 
     #[test]

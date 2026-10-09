@@ -792,7 +792,7 @@ pub(crate) fn dream_join_cancellable(
                 stats.receipt_searches += resolver.searches - searches_before;
                 match resolved {
                     Ok(receipt_oid) => {
-                        receipt_committed_at = receipt::commit_time_utc(auditor, &receipt_oid);
+                        receipt_committed_at = receipt::commit_time_local(auditor, &receipt_oid);
                         candidate.receipt_oid = Some(receipt_oid);
                         stats.receipts_found += 1;
                     }
@@ -2567,10 +2567,16 @@ mod tests {
         assert_eq!(stats.events_written, 0, "{stats:?}");
     }
 
-    #[test]
-    fn the_receipt_commit_time_is_recorded_and_reaches_the_delivered_headline() {
-        // c2 is committed on 2026-09-12; the dream runs "today". The event
-        // must carry c2's committer time, and the headline must show it.
+    /// Build a two-commit repo whose second commit (the receipt) has the given
+    /// `GIT_COMMITTER_DATE`, run the join, and return the stored
+    /// `receipt_committed_at` plus the delivered headline.
+    fn deliver_with_committer_date(
+        committer_date: &str,
+    ) -> (
+        Option<String>,
+        crate::storage::dream_delivery::DreamHeadline,
+        String,
+    ) {
         let repo = TestRepo::new();
         repo.write("lib.rs", &foo_src("1"));
         let c1 = repo.commit("c1");
@@ -2586,7 +2592,7 @@ mod tests {
         }
         let committed = commit
             .current_dir(&repo.path)
-            .env("GIT_COMMITTER_DATE", "2026-09-12T10:20:30+0000")
+            .env("GIT_COMMITTER_DATE", committer_date)
             .args(["commit", "-q", "-m", "c2 changes foo"])
             .output()
             .unwrap();
@@ -2609,15 +2615,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(receipt, c2);
-        assert_eq!(committed_at.as_deref(), Some("2026-09-12 10:20:30"));
 
-        let headlines = storage
+        let mut headlines = storage
             .with_connection(|conn| {
                 crate::storage::dream_delivery::receipted_conclusions(conn, "proj")
             })
             .unwrap();
         assert_eq!(headlines.len(), 1);
-        assert_eq!(headlines[0].witnessed_date, "2026-09-12");
-        assert_eq!(headlines[0].receipt_oid, c2);
+        (committed_at, headlines.remove(0), c2)
+    }
+
+    #[test]
+    fn the_receipt_commit_time_is_recorded_and_reaches_the_delivered_headline() {
+        // The receipt is committed 22:57 on 2026-09-12 at -07:00 (05:57 on
+        // 09-13 UTC). `git log` shows 09-12; so must the delivered line.
+        let (committed_at, headline, c2) = deliver_with_committer_date("2026-09-12T22:57:11-07:00");
+        assert_eq!(committed_at.as_deref(), Some("2026-09-12T22:57:11-07:00"));
+        assert_eq!(headline.witnessed_date, "2026-09-12");
+        assert_eq!(headline.witnessed_at, "2026-09-12T22:57:11-07:00");
+        assert_eq!(headline.receipt_oid, c2);
+    }
+
+    #[test]
+    fn a_commit_east_of_utc_near_midnight_is_dated_by_its_local_day() {
+        // 00:10 on 2026-09-13 at +05:30 is 18:40 on 09-12 UTC; the committer
+        // saw 09-13.
+        let (committed_at, headline, _) = deliver_with_committer_date("2026-09-13T00:10:00+05:30");
+        assert_eq!(committed_at.as_deref(), Some("2026-09-13T00:10:00+05:30"));
+        assert_eq!(headline.witnessed_date, "2026-09-13");
+    }
+
+    #[test]
+    fn a_utc_commit_keeps_its_own_day_and_a_plus_zero_offset_is_explicit() {
+        let (committed_at, headline, _) = deliver_with_committer_date("2026-09-12T10:20:30+0000");
+        assert_eq!(committed_at.as_deref(), Some("2026-09-12T10:20:30+00:00"));
+        assert_eq!(headline.witnessed_date, "2026-09-12");
     }
 }

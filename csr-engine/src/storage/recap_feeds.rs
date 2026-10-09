@@ -1239,7 +1239,7 @@ mod tests {
         storage
             .with_connection(|conn| {
                 conn.execute(
-                    "UPDATE witness_verdicts SET receipt_committed_at = '2026-09-12 14:30:00'
+                    "UPDATE witness_verdicts SET receipt_committed_at = '2026-09-12T22:57:11-07:00'
                      WHERE receipt_oid = 'aaaaaaa1'",
                     [],
                 )?;

@@ -89,8 +89,8 @@ pub struct DreamHeadline {
     pub verdict: String,
     /// Never empty — a headline without a receipt is not constructed.
     pub receipt_oid: String,
-    /// When the change happened: the receipt commit's committer time when the
-    /// event recorded it, else when the dreamer recorded the event
+    /// When the change happened: the receipt commit's committer time (RFC 3339
+    /// in the committer's own offset) when the event recorded it, else when the dreamer recorded the event
     /// (`witness_verdicts.created_at`). Presentation only: list order is the
     /// recorded time, see [`receipted_conclusions`].
     pub witnessed_at: String,
@@ -938,5 +938,80 @@ mod tests {
         let labels: Vec<&str> = rows.iter().map(|row| row.label()).collect();
         assert_eq!(labels, ["learned_last", "learned_first"]);
         assert_eq!(rows[0].witnessed_date, "2026-06-01");
+    }
+
+    #[test]
+    fn an_offset_commit_time_is_dated_locally_and_julianday_normalizes_it() {
+        let storage = Storage::open_memory().unwrap();
+        // 22:57 on 09-12 at -07:00 is 05:57 on 09-13 UTC.
+        seed_dated(
+            &storage,
+            "west",
+            "1111111",
+            "2026-10-08 01:00:00",
+            Some("2026-09-12T22:57:11-07:00"),
+        );
+        // 00:10 on 09-13 at +05:30 is 18:40 on 09-12 UTC.
+        seed_dated(
+            &storage,
+            "east",
+            "2222222",
+            "2026-10-07 01:00:00",
+            Some("2026-09-13T00:10:00+05:30"),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let date_of_label = |label: &str| {
+            rows.iter()
+                .find(|row| row.label() == label)
+                .map(|row| row.witnessed_date.clone())
+                .unwrap()
+        };
+        assert_eq!(date_of_label("west"), "2026-09-12");
+        assert_eq!(date_of_label("east"), "2026-09-13");
+
+        // julianday() accepts the +-HH:MM suffix and normalizes to UTC, so
+        // comparisons against `created_at` (SQLite UTC text) stay correct
+        // where plain text comparison would not.
+        let (same_instant, before_created, after_created, text_order_wrong): (i64, i64, i64, i64) =
+            storage
+                .with_connection(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT
+                            ABS(julianday('2026-09-12T22:57:11-07:00')
+                                - julianday('2026-09-13 05:57:11')) < 1e-9,
+                            julianday('2026-09-12T22:57:11-07:00') < julianday('2026-09-13 05:57:12'),
+                            julianday('2026-09-12T22:57:11-07:00') > julianday('2026-09-13 05:57:10'),
+                            -- text says the commit is older than 09-13 01:00Z;
+                            -- the instants say it is newer
+                            ('2026-09-12T22:57:11-07:00' < '2026-09-13 01:00:00')
+                            AND julianday('2026-09-12T22:57:11-07:00')
+                                > julianday('2026-09-13 01:00:00')",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?)
+                })
+                .unwrap();
+        assert_eq!(same_instant, 1);
+        assert_eq!(before_created, 1);
+        assert_eq!(after_created, 1);
+        assert_eq!(text_order_wrong, 1);
+
+        // The column itself, read back through julianday(), orders by instant.
+        let ordered: Vec<String> = storage
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT receipt_oid FROM witness_verdicts
+                     ORDER BY julianday(receipt_committed_at)",
+                )?;
+                let out = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(out)
+            })
+            .unwrap();
+        // east = 09-12 18:40Z, west = 09-13 05:57Z
+        assert_eq!(ordered, ["2222222", "1111111"]);
     }
 }

@@ -369,9 +369,12 @@ fn ensure_witness_verdicts_v2_floor(conn: &Connection) -> Result<()> {
 }
 
 /// Add `witness_verdicts.receipt_committed_at`: the receipt commit's
-/// committer time (UTC, `YYYY-MM-DD HH:MM:SS`), so a delivered conclusion can
-/// say when the change HAPPENED rather than when the dreamer noticed
-/// (`created_at`). NULL on every event written before the column existed.
+/// committer time as RFC 3339 in the committer's OWN offset
+/// (`2026-09-12T22:57:11-07:00`), so a delivered conclusion can say when the
+/// change HAPPENED rather than when the dreamer noticed (`created_at`), dated
+/// the way `git log` dates it (first 10 chars). NULL on every event written
+/// before the column existed. Text order is NOT time order across offsets;
+/// `julianday()` normalizes the `+-HH:MM` suffix, so compare through it.
 ///
 /// CHECK-THEN-ALTER: when the column exists this is one `pragma_table_info`
 /// read and NO write (see `ensure_witness_verdicts_v2_floor`).

@@ -232,8 +232,10 @@ pub fn insert_verdict_if_changed(conn: &Connection, row: &WitnessVerdictRow) -> 
 }
 
 /// [`insert_verdict_if_changed`] that also records the receipt commit's
-/// committer time (`receipt_committed_at`, UTC `YYYY-MM-DD HH:MM:SS`) on the
-/// event it appends. The column is written once, at insert; nothing updates
+/// committer time (`receipt_committed_at`, RFC 3339 in the committer's own
+/// offset, e.g. `2026-09-12T22:57:11-07:00`, so its first 10 characters are
+/// the date `git log` shows) on the event it appends. Compare it with
+/// `julianday()`, which normalizes the offset; never compare it as text. The column is written once, at insert; nothing updates
 /// it later, so the ledger stays append-only.
 pub fn insert_verdict_with_commit_time(
     conn: &Connection,
