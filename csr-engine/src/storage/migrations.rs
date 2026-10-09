@@ -1261,15 +1261,17 @@ pub fn run(conn: &Connection) -> Result<()> {
     // time.
     //
     // Idempotency is APP-SIDE ONLY (`witness_verdicts::insert_verdict_if_changed`):
-    // before inserting, the writer reads the LATEST event for that witness and
-    // skips iff the candidate is identical in (verdict, successor_witness_id,
-    // receipt_oid, observed_head_oid). There is deliberately NO UNIQUE identity
+    // before inserting, the writer reads the LATEST live event for that witness
+    // and skips iff the candidate has the same VERDICT KIND (event identity is
+    // the verdict kind only: the same conclusion at a newer observed_head_oid,
+    // receipt_oid or successor is not a new event). There is deliberately NO UNIQUE identity
     // index on this table: event history legitimately re-visits earlier states
     // (B -> A -> B: superseded, reinstated, superseded again with the exact
     // same fields as the first event) and a UNIQUE index would silently swallow
     // the third event via `INSERT OR IGNORE`, freezing the witness's state at
     // "reinstated" forever. Only the LATEST event per witness matters, so
-    // "skip iff identical to latest" is the whole idempotency contract.
+    // "skip iff the latest has the same verdict kind" is the whole idempotency
+    // contract.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS witness_verdicts (
             id INTEGER PRIMARY KEY,

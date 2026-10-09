@@ -949,6 +949,51 @@ mod tests {
     }
 
     #[test]
+    fn same_conclusion_at_a_newer_head_is_deduped() {
+        // c1 -> c2 supersedes the c1 witness. HEAD then moves forward to c3
+        // (content changed again): c1 is still superseded, now with a
+        // different successor/receipt/observed HEAD. Same verdict kind, so
+        // no new event for c1; c2's witness is genuinely newly superseded.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", "1");
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", "2");
+        let c2 = repo.commit("c2");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c1, "b3:1"))?;
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c2, "b3:2"))
+            })
+            .unwrap();
+        let first = run_join(&storage, false);
+        assert_eq!(first.events_written, 1);
+
+        repo.write("lib.rs", "3");
+        let c3 = repo.commit("c3");
+        storage
+            .with_connection(|conn| {
+                witness_ledger::insert_witness(conn, &ledger_row("proj", &file, &c3, "b3:3"))
+            })
+            .unwrap();
+        let second = run_join(&storage, false);
+        assert_eq!(second.superseded, 2, "{second:?}");
+        assert_eq!(
+            second.events_written, 1,
+            "only c2's witness is new: {second:?}"
+        );
+        assert_eq!(second.events_deduped, 1, "{second:?}");
+        let n: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
     fn dry_run_computes_but_writes_no_verdicts_and_matches_the_real_run() {
         // H5: `--dry-run` suppresses ONLY verdict insertion. A dry run and
         // the real run that follows it must produce IDENTICAL verdict

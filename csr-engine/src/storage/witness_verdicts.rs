@@ -18,16 +18,20 @@
 //!
 //! [`insert_verdict_if_changed`] is the only write entry point. It compares
 //! the candidate event against the LATEST recorded event for that
-//! `witness_id` (see [`is_new_event`]) and skips the insert iff the two are
-//! identical in `(verdict, successor_witness_id, receipt_oid,
-//! observed_head_oid)` — so re-running `dream` at an unchanged HEAD with an
-//! unchanged conclusion adds nothing. There is deliberately NO UNIQUE
+//! `witness_id` (see [`is_new_event`]) and skips the insert iff the two carry
+//! the SAME VERDICT KIND. Event identity is the verdict kind only: the same
+//! conclusion re-confirmed at a newer `observed_head_oid`, with a different
+//! `receipt_oid`, or pointing at a different `successor_witness_id` is NOT a
+//! new event — it is the same conclusion, and re-recording it per HEAD
+//! (62k of 74k events in one live database) buried the real transitions and
+//! made every re-confirmation look like news. There is deliberately NO UNIQUE
 //! identity index backstop on the table: event history legitimately
 //! re-visits earlier states (B -> A -> B — superseded, reinstated, then
 //! superseded again with the exact same fields as the first event), and a
 //! UNIQUE index would silently swallow that third event, freezing the
 //! witness at "reinstated" forever. Only the latest event per witness
-//! matters, so "skip iff identical to latest" is the whole contract.
+//! matters, so "skip iff the latest has the same verdict kind" is the whole
+//! contract.
 //!
 //! # Symbol-level current state (order-independent, two channels)
 //!
@@ -163,25 +167,21 @@ pub fn latest_event(conn: &Connection, witness_id: i64) -> Result<Option<Witness
 }
 
 /// `true` when `candidate` would be a genuinely NEW conclusion relative to
-/// `latest` — i.e. they differ in `verdict`, `successor_witness_id`,
-/// `receipt_oid`, or `observed_head_oid`. Pure (no I/O) so both the dry-run
+/// `latest` — i.e. there is no latest event, or the two differ in `verdict`
+/// kind. A different `observed_head_oid`, `receipt_oid` or
+/// `successor_witness_id` alone is NOT a new event: the same conclusion
+/// re-drawn at a newer HEAD adds nothing. Pure (no I/O) so both the dry-run
 /// preview path and the real write path in [`insert_verdict_if_changed`]
 /// share exactly one definition of "changed".
 pub fn is_new_event(latest: Option<&WitnessVerdictRow>, candidate: &WitnessVerdictRow) -> bool {
     match latest {
         None => true,
-        Some(latest) => {
-            latest.verdict != candidate.verdict
-                || latest.successor_witness_id != candidate.successor_witness_id
-                || latest.receipt_oid != candidate.receipt_oid
-                || latest.observed_head_oid != candidate.observed_head_oid
-        }
+        Some(latest) => latest.verdict != candidate.verdict,
     }
 }
 
-/// Insert `row` unless it is identical in `(verdict, successor_witness_id,
-/// receipt_oid, observed_head_oid)` to the LATEST recorded event for
-/// `row.witness_id` — see the module-level idempotency doc (app-side only,
+/// Insert `row` unless the LATEST live event for `row.witness_id` already has
+/// the same verdict kind (see [`is_new_event`]) — see the module-level idempotency doc (app-side only,
 /// no DB-level UNIQUE backstop). Returns whether a new row was actually
 /// written (the caller uses this for dream-cycle stats).
 ///
@@ -1182,33 +1182,74 @@ mod tests {
     }
 
     #[test]
-    fn same_verdict_new_head_still_inserts_a_fresh_event() {
-        // Per the module doc: identity is (verdict, successor, observed_head_oid)
-        // — an unchanged conclusion re-confirmed at a NEW HEAD is not
-        // "identical" to the prior event and gets its own row.
+    fn same_verdict_at_a_newer_head_writes_no_row() {
+        // Event identity is the verdict kind only: the same conclusion
+        // re-drawn at a newer HEAD, with a different receipt or successor,
+        // is not a new event.
         let conn = open();
         witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
         let wid: i64 = conn
             .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
             .unwrap();
-        let row_at_head1 = WitnessVerdictRow {
+        let first = WitnessVerdictRow {
             witness_id: wid,
-            verdict: VerdictKind::AnchorObsolete,
-            successor_witness_id: None,
+            verdict: VerdictKind::SupersededBy,
+            successor_witness_id: Some(7),
             receipt_oid: Some("head1".into()),
             observed_head_oid: "head1".into(),
         };
-        let row_at_head2 = WitnessVerdictRow {
+        let newer_head = WitnessVerdictRow {
             observed_head_oid: "head2".into(),
-            receipt_oid: Some("head2".into()),
-            ..row_at_head1.clone()
+            ..first.clone()
         };
-        assert!(insert_verdict_if_changed(&conn, &row_at_head1).unwrap());
-        assert!(insert_verdict_if_changed(&conn, &row_at_head2).unwrap());
+        let other_receipt = WitnessVerdictRow {
+            receipt_oid: Some("head3".into()),
+            ..first.clone()
+        };
+        let other_successor = WitnessVerdictRow {
+            successor_witness_id: Some(8),
+            ..first.clone()
+        };
+        assert!(insert_verdict_if_changed(&conn, &first).unwrap());
+        assert!(!is_new_event(
+            latest_event(&conn, wid).unwrap().as_ref(),
+            &newer_head
+        ));
+        for candidate in [&newer_head, &other_receipt, &other_successor] {
+            assert!(
+                !insert_verdict_if_changed(&conn, candidate).unwrap(),
+                "same verdict kind must not write: {candidate:?}"
+            );
+        }
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 2, "a new observed HEAD must mint a fresh event");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn b_a_b_at_new_heads_still_writes_three_events() {
+        let conn = open();
+        witness_ledger::insert_witness(&conn, &ledger_row("aaa", "b3:1")).unwrap();
+        let wid: i64 = conn
+            .query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))
+            .unwrap();
+        let at = |verdict: VerdictKind, head: &str| WitnessVerdictRow {
+            witness_id: wid,
+            verdict,
+            successor_witness_id: None,
+            receipt_oid: Some(head.into()),
+            observed_head_oid: head.into(),
+        };
+        assert!(insert_verdict_if_changed(&conn, &at(VerdictKind::SupersededBy, "h1")).unwrap());
+        assert!(
+            insert_verdict_if_changed(&conn, &at(VerdictKind::AnchorReinstated, "h2")).unwrap()
+        );
+        assert!(insert_verdict_if_changed(&conn, &at(VerdictKind::SupersededBy, "h3")).unwrap());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM witness_verdicts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
     }
 
     #[test]
