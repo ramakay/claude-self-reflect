@@ -1,0 +1,16 @@
+{
+  "name": "claude-self-reflect",
+  "owner": { "name": "Rama Annaswamy" },
+  "metadata": {
+    "description": "Plugins for Claude Self-Reflect, the local memory for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "csr-companion",
+      "source": "./plugins/csr-companion",
+      "description": "What your memory handed Claude this session, in a pane beside it, and a side agent that asks \"what if...?\"",
+      "version": "0.4.0",
+      "category": "productivity"
+    }
+  ]
+}
