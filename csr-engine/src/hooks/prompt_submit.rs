@@ -744,7 +744,7 @@ async fn handle_inner(
         let item = InjectionItem {
             content: result.content.clone(),
             score: result.final_score,
-            source: format!("{}|{}", result.source, result.min_trust),
+            source: handoff_label(result),
         };
 
         ctx.winning_strategies.push(item);
@@ -1922,9 +1922,50 @@ pub fn symbol_overlap(
         .cloned()
 }
 
+/// The bracket label of one handed line: its source and cached trust floor, then the short id of
+/// the past session it came from. Without the id Claude cannot open that session (the line was all
+/// it had); with it, `get_full_conversation` finds it, as it matches an id by substring. A
+/// subagent's chunk names no session Claude could open, so it carries none.
+fn handoff_label(result: &crate::injection::predictor::ScoredResult) -> String {
+    let session = result
+        .conversation_id
+        .as_deref()
+        .filter(|id| !id.starts_with("agent-"))
+        .and_then(|id| id.get(..8));
+    match session {
+        Some(id) => format!("{}|{}|session {id}", result.source, result.min_trust),
+        None => format!("{}|{}", result.source, result.min_trust),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handed(conversation_id: Option<&str>) -> crate::injection::predictor::ScoredResult {
+        crate::injection::predictor::ScoredResult {
+            content: "the import reuses the upload queue".into(),
+            raw_score: 0.8,
+            final_score: 0.8,
+            source: "conversation".into(),
+            signals: Vec::new(),
+            memory_id: Some("chunk-1".into()),
+            conversation_id: conversation_id.map(str::to_owned),
+            timestamp: None,
+            author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
+        }
+    }
+
+    #[test]
+    fn a_handed_line_names_the_session_claude_can_open() {
+        let label = handoff_label(&handed(Some("a3e857eb-1111-4222-8333-444455556666")));
+        assert!(label.starts_with("conversation|"), "{label}");
+        assert!(label.ends_with("|session a3e857eb"), "{label}");
+        // a subagent's chunk, or none at all: no id to open
+        assert!(!handoff_label(&handed(Some("agent-a1b2c3d4e5"))).contains("session"));
+        assert!(!handoff_label(&handed(None)).contains("session"));
+    }
 
     #[tokio::test]
     async fn chunk_search_reads_cached_floor_without_provenance_event_tables() {
