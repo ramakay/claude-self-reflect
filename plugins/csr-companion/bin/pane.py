@@ -1,10 +1,12 @@
 """The CSR pane and the dreamer's memory, read from csr-engine.
 
 Read-only against csr-engine, no model calls here. The pane is a page of paper in the terminal's own
-type (every row takes a click), the session's gauges on top, then what a senior architect wants first:
-  Touching now         the code Claude reads and edits, by how much of the rest depends on it.
+type (every row takes a click), the session's gauges on top, then each section that has something to
+report, in its own tint beside a pixel isometric icon:
+  Touching now         code Claude edited in the last hour, and code it read there that others depend
+                       on or your past sessions worked on.
   Decisions at risk    past sessions' work on code a later commit changed: what they concluded may not hold.
-  Your rules           corrections you made and approaches you dropped in this repo.
+  Your rules           corrections you typed yourself in this repo (never Claude's own words).
   What if...           the questions CSR's dreamer asked while Claude worked.
   l: Changed since     every commit under your past sessions (Claude gets a Heads up there).
 
@@ -490,6 +492,8 @@ def brief(con, root, session_id):
 # ---------------------------------------------------------------- what CSR remembered for you
 
 EDITS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
+NOW = 3600  # "touching now": what Claude handled in the last hour
+NAMED = re.compile(r"(/(?:Users|home)/[\w./@+-]+)")  # an absolute path in a command Claude ran
 ASK_KEYS = ('query', 'concept', 'topic', 'file_path', 'symbol', 'target', 'pattern', 'conversation_id')
 _ABOUT = {}  # a past session or a stored reflection -> (what it was about, when, project), or None
 
@@ -600,6 +604,7 @@ class Session:
         self.replies = {}  # message id -> (time, context tokens, output tokens)
         self.prompts, self.compacts, self.asked, self.questions = [], [], [], []
         self.tools, self.files, self.edited = Counter(), Counter(), set()
+        self.shell, self.last = Counter(), {}  # files a command named; when Claude last handled each
         self.title = None
 
     def read_transcript(self):
@@ -633,8 +638,14 @@ class Session:
                         path = (part.get('input') or {}).get('file_path')
                         if isinstance(path, str) and path.startswith('/'):
                             self.files[os.path.realpath(path)] += 1
+                            self.last[os.path.realpath(path)] = when or 0
                             if part.get('name') in EDITS:
                                 self.edited.add(os.path.realpath(path))
+                        if part.get('name') == 'Bash':
+                            for named in set(NAMED.findall(str((part.get('input') or {}).get('command') or ''))):
+                                named = named.rstrip('.,;:')
+                                self.shell[named] += 1
+                                self.last[named] = when or 0
                         if str(part.get('name', '')).startswith(CSR_TOOL) and when:
                             self.asked.append(when)
                             args = part.get('input') or {}
@@ -689,7 +700,7 @@ class Session:
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
                     compacts=sorted(self.compacts), asked=sorted(self.asked), tools=self.tools, learned=learned,
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
-                    files=dict(self.files), edited=sorted(self.edited))
+                    files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last))
 
 
 class Clock:
@@ -732,7 +743,8 @@ SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams
                changed='quiet', remembered='recall', kept='turn')
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆')  # where no pictures are drawn
-TINT = 0.08  # an opened row: its section's ink at this strength on the paper
+TINT = 0.15  # an opened row: its section's ink at this strength on the paper
+ROW = 0.065  # every other row of a section
 SS = 2  # draw at twice the size, then shrink: PIL draws no anti-aliased edges
 
 
@@ -820,63 +832,119 @@ def kitty(png, row, col, cols, rows):
     return ''.join(out)
 
 
+ICON = (5, 2)  # a section's icon: five cells by two rows, beside its heading and its first row
+PAPER = (250, 249, 244)
+PAGES = (226, 224, 216)
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(a[:3], b[:3])) + (255,)
+
+
+def iso_icon(name):
+    """A section's icon in pixel art, seen isometric: pigment's nyt inks as flat faces lit from the upper
+    left (the top lightest, the right face darkest), each part outlined in a dark of its own ink. Every
+    corner sits on even x + y, so each edge is a clean two-across, one-down stair."""
+    from PIL import Image, ImageChops, ImageDraw
+    size = (44, 44)
+    image = Image.new('RGBA', size, (0, 0, 0, 0))
+    o = (22, 26)
+    at = lambda x, y, z: (o[0] + x - y, o[1] + (x + y) // 2 - z)
+    white, black = (255, 255, 255), (0, 0, 0)
+
+    def part(ink, paint):
+        layer = Image.new('RGBA', size, (0, 0, 0, 0))
+        paint(ImageDraw.Draw(layer))
+        alpha = layer.getchannel('A')
+        grown = alpha
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            grown = ImageChops.lighter(grown, ImageChops.offset(alpha, dx, dy))
+        image.paste(mix(ink, black, 0.55), (0, 0) + size, ImageChops.subtract(grown, alpha))
+        image.alpha_composite(layer)
+
+    def faces(draw, x, y, z, dx, dy, dz, ink, top=None, left=None, right=None):
+        poly = lambda pts, fill: draw.polygon([at(*p) for p in pts], fill=fill, outline=fill)
+        poly([(x, y + dy, z), (x + dx, y + dy, z), (x + dx, y + dy, z + dz), (x, y + dy, z + dz)],
+             left or mix(ink, white, 0.1))
+        poly([(x + dx, y, z), (x + dx, y + dy, z), (x + dx, y + dy, z + dz), (x + dx, y, z + dz)],
+             right or mix(ink, black, 0.25))
+        poly([(x, y, z + dz), (x + dx, y, z + dz), (x + dx, y + dy, z + dz), (x, y + dy, z + dz)],
+             top or mix(ink, white, 0.5))
+        if not top:  # the light catches the top's two front edges
+            draw.line([at(x, y + dy, z + dz), at(x + dx, y + dy, z + dz), at(x + dx, y, z + dz)],
+                      fill=mix(ink, white, 0.78), width=1)
+
+    def box(x, y, z, dx, dy, dz, ink, more=None, **colors):
+        def paint(draw):
+            faces(draw, x, y, z, dx, dy, dz, ink, **colors)
+            if more:
+                more(draw)
+        part(ink, paint)
+
+    def line(draw, a, b, fill):
+        draw.line([at(*a), at(*b)], fill=fill, width=1)
+
+    c, quiet = INK[SECTION[name]], INK['quiet']
+    if name == 'touching':  # the files Claude has open: a sheet of code on its folder, one line just edited
+        box(-2, -2, 0, 14, 12, 2, c)
+        box(0, 0, 2, 10, 8, 2, c, top=PAPER + (255,), left=PAGES + (255,), right=mix(PAGES, black, 0.12),
+            more=lambda d: [line(d, (2, 2, 4), (8, 2, 4), mix(c, white, 0.2)),
+                            line(d, (4, 4, 4), (8, 4, 4), mix(c, white, 0.2)),
+                            line(d, (2, 6, 4), (6, 6, 4), INK['turn'][:3] + (255,))])
+    elif name in ('risk', 'changed'):  # work a later commit moved: a block slid half off its base
+        if name == 'changed':
+            box(0, 0, 0, 10, 10, 2, quiet)
+            box(2, 0, 2, 10, 10, 2, INK['turn'])
+            box(0, 0, 4, 10, 10, 2, quiet)
+        else:
+            box(0, 0, 0, 8, 8, 6, quiet)
+            box(4, 0, 6, 6, 6, 6, c)
+    elif name in ('rules', 'kept'):  # a rule book: its cover, its spine banded, its pages, a ribbon
+        box(0, 0, 0, 14, 10, 4, c, left=mix(c, black, 0.1), right=PAGES + (255,),
+            more=lambda d: [line(d, (14, 0, 2), (14, 10, 2), mix(PAGES, black, 0.15)),
+                            line(d, (2, 10, 0), (2, 10, 4), mix(c, white, 0.45)),
+                            line(d, (12, 10, 0), (12, 10, 4), mix(c, white, 0.45)),
+                            line(d, (14, 6, 4), (14, 6, -1), INK['turn'][:3] + (255,))])
+    elif name == 'dreams':  # a crescent over a plinth, a star by it
+        box(0, 0, 0, 10, 10, 4, c)
+        cx, cy = at(5, 5, 4)
+        moon = mix(c, white, 0.3)
+
+        def crescent(d):
+            d.ellipse([cx - 6, cy - 14, cx + 3, cy - 5], fill=moon)
+            d.ellipse([cx - 3, cy - 16, cx + 6, cy - 7], fill=(0, 0, 0, 0))
+        part(c, crescent)
+        part(c, lambda d: [d.point(p, fill=moon) for p in
+                           ((cx + 6, cy - 11), (cx + 5, cy - 12), (cx + 7, cy - 12), (cx + 6, cy - 13))])
+    else:  # memory, remembered: a tray of past sessions, one card risen out of it for Claude
+        box(0, 0, 0, 12, 10, 5, c,
+            more=lambda d: d.polygon([at(1, 1, 5), at(11, 1, 5), at(11, 9, 5), at(1, 9, 5)], fill=mix(c, black, 0.45)))
+        part(c, lambda d: [d.polygon([at(2, 4, 5), at(10, 4, 5), at(10, 4, 13), at(2, 4, 13)], fill=PAPER + (255,)),
+                           line(d, (4, 4, 11), (8, 4, 11), mix(c, white, 0.1)),
+                           line(d, (4, 4, 9), (6, 4, 9), mix(c, white, 0.1))])
+    return image.crop(image.getbbox())
+
+
 _ICONS = {}
 
 
-def draw_icon(draw, name, box, color, width):
-    """A section's icon in pigment's hairline (one ink, round strokes) inside box = (x, y, size)."""
-    x0, y0, size = box
-    at = lambda fx, fy: (x0 + fx * size, y0 + fy * size)
-
-    def stroke(*points, thin=1.0):
-        pts, w = [at(*p) for p in points], max(1, round(width * thin))
-        draw.line(pts, fill=color, width=w, joint='curve')
-        for x, y in (pts[0], pts[-1]):  # round caps
-            draw.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=color)
-
-    def disc(cx, cy, r, fill):
-        (x, y), (edge, _) = at(cx, cy), at(cx + r, cy)
-        draw.ellipse([x - (edge - x), y - (edge - x), edge, y + (edge - x)], fill=fill)
-
-    if name == 'session':  # a pulse: your prompts and Claude's replies over time
-        stroke((0.0, 0.56), (0.26, 0.56), (0.38, 0.18), (0.54, 0.9), (0.66, 0.4), (0.74, 0.56), (1.0, 0.56))
-    elif name == 'touching':  # code: the brackets around what Claude has open
-        stroke((0.36, 0.14), (0.06, 0.5), (0.36, 0.86))
-        stroke((0.64, 0.14), (0.94, 0.5), (0.64, 0.86))
-    elif name in ('memory', 'remembered'):  # handed up to Claude, out of the tray of past sessions
-        stroke((0.1, 0.56), (0.1, 0.9), (0.9, 0.9), (0.9, 0.56))
-        stroke((0.5, 0.7), (0.5, 0.08))
-        stroke((0.27, 0.31), (0.5, 0.08), (0.73, 0.31))
-    elif name == 'dreams':  # a crescent and a spark
-        disc(0.42, 0.56, 0.4, color)
-        disc(0.6, 0.4, 0.34, draw.paper)
-        stroke((0.84, 0.04), (0.84, 0.36), thin=0.7)
-        stroke((0.68, 0.2), (1.0, 0.2), thin=0.7)
-    elif name in ('rules', 'kept'):  # a bookmark
-        stroke((0.26, 0.06), (0.74, 0.06), (0.74, 0.94), (0.5, 0.7), (0.26, 0.94), (0.26, 0.06))
-    else:  # risk, changed: a commit on its line
-        stroke((0.0, 0.5), (0.28, 0.5))
-        stroke((0.72, 0.5), (1.0, 0.5))
-        disc(0.5, 0.5, 0.24, color)
-        disc(0.5, 0.5, 0.24 - width / size, draw.paper)
-
-
-_ICONS = {}
-
-
-def icon_png(name, cell):
-    """A section's icon, two cells wide, for the text pane in a pixel terminal."""
-    if (name, cell) in _ICONS:
-        return _ICONS[name, cell]
-    image, draw = canvas(2, 1, cell)
-    draw.paper = (0, 0, 0, 0)
-    size = min(image.width, image.height) * 0.8
-    draw_icon(draw, name, ((image.width - size) / 2, (image.height - size) / 2, size), INK[SECTION[name]][:3] + (255,),
-              max(2 * SS, round(size * 0.1)))
-    _ICONS[name, cell] = shrink(image)
-    return _ICONS[name, cell]
-
-
+def iso_png(name, cell, backs):
+    """The icon at its five cells by two rows, its two rows' tints behind it, blown up by whole pixels."""
+    key = (name, cell, backs)
+    if key in _ICONS:
+        return _ICONS[key]
+    from PIL import Image
+    w, h = ICON[0] * cell[0], ICON[1] * cell[1]
+    image = Image.new('RGBA', (w, h), backs[0] + (255,))
+    image.paste(backs[1] + (255,), (0, cell[1], w, h))
+    icon = iso_icon(name)
+    k = max(1, min((w - 4) // icon.width, (h - 4) // icon.height))
+    icon = icon.resize((icon.width * k, icon.height * k), Image.NEAREST)
+    image.alpha_composite(icon, ((w - icon.width) // 2, (h - icon.height) // 2))
+    out = io.BytesIO()
+    image.save(out, 'PNG')
+    _ICONS[key] = out.getvalue()
+    return _ICONS[key]
 
 
 # ---------------------------------------------------------------- the screen
@@ -891,8 +959,12 @@ def ink(name):
     return f'\x1b[38;2;{r};{g};{b}m'
 
 
-def band(name):
-    r, g, b = (round(p + (i - p) * TINT) for i, p in zip(INK[SECTION[name]][:3], GROUND))
+def tint(name, strength=TINT):
+    return tuple(round(p + (i - p) * strength) for i, p in zip(INK[SECTION[name]][:3], GROUND))
+
+
+def band(name, strength=TINT):
+    r, g, b = tint(name, strength)
     return f'\x1b[48;2;{r};{g};{b}m'
 
 
@@ -1051,16 +1123,18 @@ def entry(when, mark, text, tail, width, rows=2):
     return [head + mark + OFF + ' ' + lines[0]] + [' ' * INDENT + line for line in lines[1:]]
 
 
+GUTTER = 6  # a section's text starts here, its icon beside
+
+
 def heading(name, title, right, width):
-    """A section's head: its icon (pasted over two cells where the terminal draws pictures, its mark
-    elsewhere) and its title in its ink, a count at the right."""
-    glyph = '  ' if PIXELS else GLYPH[name]
-    lead = f' {ink(SECTION[name])}{glyph}{OFF} '
-    room = width - 2 - len(glyph)
+    """A section's head: its icon's place (its mark where the terminal draws no pictures), its title in
+    its ink, a count at the right."""
+    lead = ' ' + ('' if PIXELS else GLYPH[name]).ljust(GUTTER - 2) + ' '
+    room = width - GUTTER
     gap = room - len(title) - len(right) - 1
     if gap < 1:
         right, gap = '', room - len(title) - 1
-    return lead + ink(SECTION[name]) + BOLD + fit(title, room - 1) + OFF + ' ' * max(1, gap) + ink('faint') + right + OFF
+    return lead + ink(SECTION[name]) + BOLD + fit(title, room - 1) + OFF + ' ' * max(1, gap) + ink('quiet') + right + OFF
 
 
 LANE = 9  # the lanes' labels, then their picture
@@ -1118,28 +1192,67 @@ def file_facts(con, path, session_id):
     return dict(callers=callers, symbols=symbols, top=top, shaped=shaped)
 
 
+_WHO = {}  # (transcript, byte) -> whether the words there are yours
+
+
+def typed_by_you(transcript, at):
+    """Whether the words at this byte of a transcript are a prompt you typed: a person's message in the
+    main session, not Claude briefing a subagent, not a tool's output, not a headless run."""
+    if (transcript, at) in _WHO:
+        return _WHO[transcript, at]
+    yours = False
+    if '/subagents/' not in transcript:
+        try:
+            with open(transcript, 'rb') as handle:
+                start = at
+                while start > 0:  # back to the start of the line the words are on
+                    step = min(start, 1 << 16)
+                    handle.seek(start - step)
+                    cut = handle.read(step).rfind(b'\n')
+                    if cut != -1:
+                        start = start - step + cut + 1
+                        break
+                    start -= step
+                handle.seek(start)
+                entry = json.loads(handle.readline())
+            content = (entry.get('message') or {}).get('content')
+            text = content if isinstance(content, str) else ' '.join(
+                p.get('text', '') for p in content or [] if isinstance(p, dict) and p.get('type') == 'text')
+            yours = (entry.get('type') == 'user' and not entry.get('isSidechain') and not entry.get('isMeta')
+                     and entry.get('entrypoint', 'cli') == 'cli' and entry.get('userType', 'external') == 'external'
+                     and bool(text.strip()) and not text.lstrip().startswith('<'))
+        except (OSError, ValueError, AttributeError):
+            yours = False
+    _WHO[transcript, at] = yours
+    return yours
+
+
 def short_path(rel, parts=3):
     return '/'.join(rel.split('/')[-parts:])
 
 
 def page_main(data, s, now):
-    """What a senior architect wants beside the agent, most first:
-      Touching now      the code Claude reads and edits, by how much of the rest depends on it
+    """What a senior architect wants beside the agent, most first, each shown only with something in it:
+      Touching now      code Claude edited in the last hour, and code it read there that the rest
+                        depends on or your past sessions worked on
       Decisions at risk past sessions' work on code that a later commit changed: what they concluded may not hold
-      Your rules        corrections you made and approaches you dropped, in this repo
+      Your rules        corrections you typed yourself in this repo
       What if…          the dreamer's challenges
     Above them, the session's gauges: your prompts, Claude's context and CSR's memory at work."""
     root = data['repo']
     con = connect()
     try:
-        files = {}
-        for path, n in (s.get('files') or {}).items():
+        files, since, last = {}, now - NOW, s.get('last') or {}
+        handled = Counter(s.get('files') or {})
+        handled.update(s.get('shell') or {})
+        for path, n in handled.items():
             main = main_path(path)
-            if not main.startswith(root + '/') or any(mark in main for mark in NESTED):
+            if last.get(path, 0) < since or not main.startswith(root + '/') or any(mark in main for mark in NESTED):
                 continue
-            seen = files.setdefault(main, dict(path=main, uses=0, edited=False))
+            seen = files.setdefault(main, dict(path=main, uses=0, edited=False, read=False))
             seen['uses'] += n
             seen['edited'] = seen['edited'] or path in (s.get('edited') or ())
+            seen['read'] = seen['read'] or path in (s.get('files') or {})
         touching, risks = [], {}
         for seen in files.values():
             rel = seen['path'][len(root) + 1:]
@@ -1148,11 +1261,16 @@ def page_main(data, s, now):
             moved = [n for n in notes if n['kind'] == 'shift']
             for note in moved:
                 risks.setdefault(note['id'], note)
-            meta = ['edited' if seen['edited'] else 'read']
+            if not (facts['callers'] or facts['shaped'] or moved or seen['edited']):
+                continue  # only read or named, and nothing to say about it
+            meta = []
             if facts['callers']:
-                meta.append(f"{facts['callers']} call sites")
+                meta.append(f"{facts['callers']} call site{'s' if facts['callers'] != 1 else ''}")
             if facts['shaped']:
-                meta.append(f"{facts['shaped']} past sessions")
+                meta.append(f"{facts['shaped']} past session{'s' if facts['shaped'] != 1 else ''}")
+            meta.append('edited' if seen['edited'] else 'read' if seen['read'] else 'in a command')
+            if not facts['symbols'] and not facts['shaped']:
+                meta.append('new to CSR')
             top = ', '.join(f'{name} ({n})' for name, n in facts['top'])
             detail = ([f'Most depended on: {top}.'] if top else []) + [n['line'] for n in notes[:2]]
             send = (f"Before we change {rel}: {facts['callers']} call sites depend on it" +
@@ -1187,17 +1305,19 @@ def page_main(data, s, now):
 
         projects = {p for p in (s.get('project'), os.path.basename(root)) if p}
         marks = ','.join('?' * len(projects))
-        rules = []
-        for when, kind, quote, session in con.execute(
-                f"select ts, kind, quote, session_id from intent_events where project in ({marks}) "
-                f"and kind in ('correction', 'abandoned') order by ts desc limit 5", tuple(projects)).fetchall():
+        rules = []  # only your own words: the detector also hears Claude, to itself and to its subagents
+        for when, quote, session, transcript, at in con.execute(
+                f"select ts, quote, session_id, transcript_path, byte_start from intent_events where project in "
+                f"({marks}) and kind = 'correction' order by ts desc limit 200", tuple(projects)).fetchall():
+            if len(rules) >= 4:
+                break
+            if not typed_by_you(transcript, at):
+                continue
             day = short_date(epoch(when)) if epoch(when) else (when or '')[:10]
             here = ' · this session' if session == s['id'] else ''
-            rules.append(dict(key=f'rule:{when}:{quote[:30]}', title=quote,
-                              meta=('you corrected' if kind == 'correction' else 'dropped') + f' · {day}{here}',
-                              detail=[f'Session {session[:8]}. CSR keeps it and hands it to Claude when the work comes near.'],
-                              send=one_line(f"A standing rule from {day}: “{quote}”" if kind == 'correction' else
-                                            f"On {day} we dropped an approach: “{quote}”")))
+            rules.append(dict(key=f'rule:{when}:{quote[:30]}', title=quote, meta=f'you said · {day}{here}',
+                              detail=[f'Your words, session {session[:8]}. CSR hands them to Claude when the work comes near.'],
+                              send=one_line(f"A standing rule from {day}: “{quote}”")))
     finally:
         con.close()
 
@@ -1211,10 +1331,10 @@ def page_main(data, s, now):
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
     if s['compacts']:
         facts.append(f"{len(s['compacts'])} compacts")
-    return dict(head=dict(kicker='CSR · this session', title=s.get('title') or 'This session', facts=' · '.join(facts),
-                          session=s if s.get('learned') else None),
+    return dict(head=dict(facts=' · '.join(facts), session=s if s.get('learned') else None),
+                quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=[
-        dict(name='touching', title='Touching now', right=f'{len(touching)} files' if touching else '', items=touching[:5],
+        dict(name='touching', title='Touching now', right=f"{len(touching)} file{'s' if len(touching) != 1 else ''}" if touching else '', items=touching[:5],
              empty='Nothing yet. As Claude reads and edits code here, each file shows how much depends on it '
                    'and what your past sessions did there.'),
         dict(name='risk', title='Decisions at risk', right=f"{data['changes_total']}" if data['changes_total'] else '',
@@ -1247,13 +1367,14 @@ def page_log(data):
                                         f"changed code we worked on: {named}.")))
     return dict(head=dict(kicker='CSR · changed since your sessions', title='Commits under your past work',
                           facts='When Claude opens one of these files, CSR gives it a Heads up.'),
+                quiet='Nothing changed under past conversations here.',
                 sections=[dict(name='changed', title='Changed since', right=str(data['total']), items=items,
                                empty='Nothing changed under past conversations here.')])
 
 
 MARK_WORD = {'changed': '~', 'removed': '−', 'came back': '+'}
 
-ITEM = 5  # "   • ": an item's text starts here
+ITEM = GUTTER  # an item's text starts under its section's title
 
 
 def item_rows(item, name, width, is_open):
@@ -1261,24 +1382,24 @@ def item_rows(item, name, width, is_open):
     with a flag first in the risk ink."""
     room = width - ITEM
     title = wrap(item['title'].replace('`', ''), room, 6 if is_open else 1)
-    rows = ['   ' + ink(SECTION[name]) + '•' + OFF + ' ' + title[0]] + [' ' * ITEM + line for line in title[1:]]
+    rows = [' ' * ITEM + line for line in title]
     flag, meta = item.get('flag') or '', item.get('meta') or ''
     text = fit(' · '.join(x for x in (flag, meta) if x), room)
-    line = ink('faint') + text
+    line = ink('quiet') + text
     if flag and text.startswith(flag):
-        line = ink('turn') + flag + ink('faint') + text[len(flag):]
+        line = ink('turn') + flag + ink('quiet') + text[len(flag):]
     return rows + [' ' * ITEM + line + OFF] if text else rows
 
 
 def page_lines(page, width, rows, ui):
-    """The page in the terminal's type on paper: masthead and gauges, then each section under a hairline.
-    Every section keeps its heading and first row; the room left goes to the earlier ones first."""
+    """The page in the terminal's type on paper: its facts and the session's gauges, then each section
+    with something to report, its rows in its own tint (every other one a shade deeper), a strip of paper
+    between. Every section keeps its heading and first row; the room left goes to the earlier ones first."""
     head, s = page['head'], page['head'].get('session')
-    out = Lines([' ' + BOLD + fit(head['title'], width - 1) + OFF,
-                 ' ' + ink('quiet') + fit(head['facts'], width - 1) + OFF])
+    out = Lines([' ' + BOLD + fit(head['title'], width - 1) + OFF] if head.get('title') else [])
+    out.put([' ' + ink('quiet') + fit(head['facts'], width - 1) + OFF])
     out.heads, out.lanes = [], None
     if s:
-        out.put([''])
         if PIXELS and width - LANE > 8:
             out.lanes = len(out)
             out.put([' ' + ink('faint') + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')])
@@ -1292,21 +1413,28 @@ def page_lines(page, width, rows, ui):
             if is_open:
                 rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'], indent=ITEM)
             blocks.append((rows_, item))
-        empty = [] if blocks else ['   ' + ink('faint') + l + OFF for l in wrap(section['empty'], width - 3, 2)]
-        base = 2 + (len(blocks[0][0]) if blocks else len(empty))  # rule, heading, first row
-        want = 2 + (sum(len(rows_) for rows_, _ in blocks) if blocks else len(empty))
-        built.append((section, blocks, empty, base, want))
+        if blocks:
+            built.append((section, blocks, 2 + len(blocks[0][0]), 2 + sum(len(rows_) for rows_, _ in blocks)))
+    if not built:
+        return out.put([''] + [' ' + ink('faint') + l + OFF for l in wrap(page.get('quiet') or '', width - 2, 3)])
     left = rows - 1 - len(out) - sum(base for *_, base, _ in built)
-    for section, blocks, empty, base, want in built:
+    for section, blocks, base, want in built:
         room = base + max(0, min(want - base, left))
         left -= room - base
-        out.put([ink('hair') + '─' * width + OFF])
-        out.heads.append((len(out), section['name']))
-        part = Lines([heading(section['name'], section['title'], section['right'], width)])
-        if empty:
-            part.put(empty)
-        else:
-            fit_blocks(part, blocks, room - 1, ui, tail=False)
+        name = section['name']
+        part = Lines([heading(name, section['title'], section['right'], width)])
+        fit_blocks(part, blocks, room - 1, ui, tail=False)
+        shade, k, lit = [], 1, tint(name, ROW)
+        for i, line in enumerate(part):  # each item's rows share a tint, the next item's the other
+            act = part.acts.get(i)
+            if i and act is not part.acts.get(i - 1):
+                k += 1
+            back = lit if k % 2 == 0 else tint(name, ROW * 1.9)
+            opened_row = line.startswith(band(name))
+            shade.append(tint(name) if opened_row else back)
+            part[i] = line if opened_row else tinted(line, '\x1b[48;2;%d;%d;%dm' % back)
+        out.put([''])
+        out.heads.append((len(out), name, (shade[0], shade[1] if len(shade) > 1 else GROUND)))
         start = len(out)
         out.extend(part)
         out.acts.update({start + i: act for i, act in part.acts.items()})
@@ -1324,14 +1452,15 @@ def draw_page(page, cols, rows, ui):
         s = page['head'].get('session')
         if s and lines.lanes is not None:
             pictures.append((lines.lanes, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time())))
-        pictures += [(row, 1, 2, 1, icon_png(name, cell)) for row, name in lines.heads if row < rows - 1]
+        pictures += [(row, 0, ICON[0], ICON[1], iso_png(name, cell, backs))
+                     for row, name, backs in lines.heads if row + ICON[1] <= rows - 1]
     return lines, pictures
 
 
 def draw_main(data, s, cols, rows, now, ui=None):
     if s is None:
         s = dict(id=None, title=None, prompts=[], replies=[], compacts=[], gave=dict(recalls=[], carried=[], dreams=[]),
-                 remembered=[], sessions=0, project=None, files={}, edited=[])
+                 remembered=[], sessions=0, project=None, files={}, edited=[], shell={}, last={})
     return draw_page(page_main(data, s, now), cols, rows, ui or {})
 
 
