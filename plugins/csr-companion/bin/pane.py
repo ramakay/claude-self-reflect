@@ -494,20 +494,81 @@ def voice_and_lines(con, session_id, limit=4, floor=0.40):
     return counts, near[:limit]
 
 
+BUILT = (('skill', re.compile(r'/\.claude/skills/([^/]+)/')),
+         ('mod', re.compile(r'/\.claude/dev-mods/[^/]+/([^/]+)/')),
+         ('plugin', re.compile(r'(?<!\.claude)/plugins/([^/]+)/')))
+
+
+def described(folder, kind):
+    """A built thing's own one-line description: a skill's SKILL.md, a mod's or plugin's plugin.json."""
+    try:
+        if kind == 'skill':
+            with open(os.path.join(folder, 'SKILL.md'), encoding='utf-8') as handle:
+                head = handle.read(4000)
+            found = re.search(r'^description:\s*(.+)$', head, re.M)
+            return found.group(1).strip().strip('"\'') if found else ''
+        with open(os.path.join(folder, '.claude-plugin', 'plugin.json'), encoding='utf-8') as handle:
+            return str(json.load(handle).get('description') or '')
+    except (OSError, ValueError, AttributeError):
+        return ''
+
+
+def built_near(con, session_id, talk, most=3):
+    """Things the person built in other sessions (a skill, a mod, a plugin) that you or Claude named in
+    this session's latest words, newest first: the sessions that built each, and its own description.
+    Read from the code anchors CSR keeps for each session; no model calls."""
+    things = {}
+    for sid, file, at in con.execute(
+            "select session_id, file, max(created_at) from episode_anchors where session_id != ?1 and "
+            "(file like '%/.claude/skills/%' or file like '%/dev-mods/%' or file like '%/plugins/%') "
+            "group by session_id, file", (session_id,)):
+        for kind, pattern in BUILT:
+            found = pattern.search(file)
+            if found:
+                thing = things.setdefault((kind, found.group(1)), dict(kind=kind, name=found.group(1), sessions={},
+                                                                       folder=file[:found.end()]))
+                thing['sessions'][sid] = max(thing['sessions'].get(sid, ''), at or '')
+                break
+    if not things:
+        return []
+    talk = talk.lower()
+    near = [t for t in things.values()
+            if len(t['name']) >= 4 and re.search(r'(?<![\w-])' + re.escape(t['name'].lower()) + r'(?![\w-])', talk)]
+    near.sort(key=lambda t: max(t['sessions'].values()), reverse=True)
+    out = []
+    for thing in near[:most]:
+        latest = max(thing['sessions'], key=thing['sessions'].get)
+        excerpt = ' '.join(described(thing['folder'], thing['kind']).split())
+        out.append(dict(thing, latest=latest, at=thing['sessions'][latest], excerpt=excerpt))
+    return out
+
+
+def recent_files(session, now, window=1800, most=8):
+    """The files Claude handled in the last half hour, newest first; the most handled when none."""
+    recent = sorted((at, path) for path, at in session.last.items() if at and now - at <= window and path in session.files)
+    return [path for _, path in reversed(recent)][:most] or [path for path, _ in session.files.most_common(most)]
+
+
 def brief(con, root, session_id):
     """What CSR remembers near this session, with receipts, for the dreamer's prompt."""
     session = Session(session_id)
-    here = session.load()  # reads the transcript too
-    touched = [path for path, _ in session.files.most_common(8)]
-    files = [path for path in touched if path.startswith(root + '/')]
+    session.read_transcript()
+    touched = recent_files(session, time.time())
     out = []
     if touched:
-        out.append('Files this session worked on: ' + ', '.join(
-            f"{os.path.relpath(path, root) if path in files else '/'.join(path.split('/')[-3:])} ({session.files[path]}×)"
-            for path in touched) + '.')
-    notes, seen = [], set()
-    for path in files[:6]:
-        for note in notes_for(con, root, path, session_id):
+        out.append('Files Claude handled lately, newest first: ' + ', '.join(
+            f"{os.path.relpath(path, root) if path.startswith(root + '/') else '/'.join(path.split('/')[-3:])}"
+            f" ({session.files[path]}×)" for path in touched) + '.')
+    # Lines that start with "* " are what CSR knows about the work in hand: only they count as news.
+    notes, seen, roots = [], set(), {}
+    for path in touched[:6]:
+        folder = os.path.dirname(path)
+        if folder not in roots:
+            owner = repo_root(folder) if os.path.isdir(folder) else None
+            roots[folder] = owner and os.path.realpath(owner)
+        if not roots[folder]:
+            continue  # not in a git repo: no commits to have changed it
+        for note in notes_for(con, roots[folder], path, session_id):
             if note['id'] not in seen:
                 seen.add(note['id'])
                 notes.append(note)
@@ -515,10 +576,19 @@ def brief(con, root, session_id):
     rules = [n for n in notes if n['kind'] == 'rule'][:3]
     if changed:
         out += ['', "Code that changed after one of the person's past sessions worked on it:"]
-        out += [f"- {n['line']} [commit {n['oid'][:7]}, session {n['conversation'][:8]}]" for n in changed]
+        out += [f"* {n['line']} [commit {n['oid'][:7]}, session {n['conversation'][:8]}]" for n in changed]
     if rules:
         out += ['', 'Rules the person set for these files:']
-        out += [f"- {n['line']} [session {n['conversation'][:8]}]" for n in rules]
+        out += [f"* {n['line']} [session {n['conversation'][:8]}]" for n in rules]
+    built = built_near(con, session_id, ' '.join(words for _, words in session.talk[-60:]))
+    if built:
+        out += ['', 'Things the person built in other sessions that came up in this work:']
+        for thing in built:
+            others = len(thing['sessions'])
+            out.append(f"* {thing['kind']} {thing['name']}: built over {others} {'session' if others == 1 else 'sessions'}, "
+                       f"latest {thing['at'][5:10]} [session {thing['latest'][:8]}]")
+            if thing['excerpt']:
+                out.append(f"  {quoted(thing['excerpt'], 400)}")
     project = os.path.basename(root)
     corrections = [(ts, quote, sid) for ts, quote, sid, transcript, at in con.execute(
         "select ts, quote, session_id, transcript_path, byte_start from intent_events where kind = 'correction' "
@@ -528,20 +598,11 @@ def brief(con, root, session_id):
         out += ['', 'Corrections CSR recorded in this repo lately:']
         out += [f"- {short_date(epoch(ts)) if epoch(ts) else (ts or '')[:10]}: {quoted(quote, 200)} [session {sid[:8]}]"
                 for ts, quote, sid in corrections]
-    handed = [item for item in here['remembered']
-              if item['kind'] == 'recall' and re.fullmatch(r'[0-9a-f-]{36}', item['key'])][:5]
-    if handed:
-        out += ['', 'Past sessions CSR handed Claude during this session, newest first:']
-        out += [f"- {quoted(item['text'], 160)} ({', '.join(x for x in (short_date(item['when']) if item.get('when') else '', os.path.basename((item.get('project') or '').rstrip('/'))) if x)}) [session {item['key'][:8]}]"
-                for item in handed]
-    counts, near = voice_and_lines(con, session_id)
+    _, near = voice_and_lines(con, session_id)
     if near:
         out += ['', 'Lines the person wrote in past sessions that sit close to this work:']
         out += [f"- {short_date(when)} ({project}): {quoted(part, 220)} [session {sid[:8]}]"
                 for _, when, sid, project, part in near]
-    if counts:
-        out += ['', 'How the person talks to the agent, from their prompt history: ' + ', '.join(
-            f'"{name}" {n:,}×' for name, n in counts.most_common()) + '.']
     dreams = load_dream_log(root)[:8]
     if dreams:
         out += ['', 'Dreams already offered here, and what the person answered:']
@@ -634,17 +695,32 @@ def memory_of(con, kind, memory, conversation, parent):
     return conversation, session_about(con, conversation)
 
 
+def handoffs(times):
+    """How many times CSR handed Claude something: one injection carries several chunks, all logged in
+    the same second."""
+    return len({int(t) for t in times if t})
+
+
 def remembered_items(con, recalls, questions, session_id):
-    """What CSR handed Claude this session, newest first: one row per past session or reflection, and
-    each time Claude asked CSR itself."""
+    """What CSR handed Claude this session, newest first: one row per past session or reflection, each
+    with how many hand-offs carried it and whether Claude then opened it (a later CSR request naming
+    that session), and each time Claude asked CSR itself."""
     items = {}
     for at, kind, memory, conversation, parent, _ in recalls:
         key, about = memory_of(con, kind, memory, conversation, parent)
         if not about or key == session_id:
             continue
-        item = items.setdefault(key, dict(kind='recall', key=key, at=0, text=about[0], when=about[1], project=about[2],
-                                          times=0))
-        item['at'], item['times'] = max(item['at'], epoch(at) or 0), item['times'] + 1
+        item = items.setdefault(key, dict(kind='recall', key=key, at=0, first=None, text=about[0], when=about[1],
+                                          project=about[2], seconds=set(), opened=False))
+        moment = epoch(at) or 0
+        item['at'] = max(item['at'], moment)
+        item['first'] = moment if item['first'] is None else min(item['first'], moment)
+        if moment:
+            item['seconds'].add(int(moment))
+    for item in items.values():
+        item['times'] = len(item.pop('seconds')) or 1
+        if re.fullmatch(r'[0-9a-f-]{36}', item['key']):
+            item['opened'] = any(when >= (item['first'] or 0) and item['key'][:8] in ask for when, _, ask in questions)
     for when, tool, ask in questions:
         items[('asked', when)] = dict(kind='asked', at=when, text=ask, tool=tool, times=1)
     return sorted(items.values(), key=lambda item: item['at'], reverse=True)
@@ -664,6 +740,7 @@ class Session:
         self.prompts, self.compacts, self.asked, self.questions = [], [], [], []
         self.tools, self.files, self.edited = Counter(), Counter(), set()
         self.shell, self.last = Counter(), {}  # files a command named; when Claude last handled each
+        self.talk = []  # (time, words) the person typed or Claude wrote, newest last; no tool output
         self.title = None
 
     def read_transcript(self):
@@ -692,6 +769,8 @@ class Session:
                     self.replies[message['id']] = (when, context, usage.get('output_tokens') or 0,
                                                    usage.get('cache_creation_input_tokens') or 0)
                 for part in message.get('content') or []:
+                    if isinstance(part, dict) and part.get('type') == 'text' and when and not entry.get('isSidechain'):
+                        self.talk.append((when, part.get('text') or ''))
                     if isinstance(part, dict) and part.get('type') == 'tool_use':
                         self.tools[part.get('name')] += 1
                         path = (part.get('input') or {}).get('file_path')
@@ -717,6 +796,8 @@ class Session:
                     p.get('text', '') for p in content or [] if isinstance(p, dict) and p.get('type') == 'text']
                 if any(t.strip() and not t.lstrip().startswith(('<', '/')) for t in texts):
                     self.prompts.append(when)
+                    if not entry.get('isSidechain'):
+                        self.talk.append((when, own_words('\n'.join(texts))))
             elif kind == 'attachment' and when:
                 queued = entry.get('attachment') or {}
                 text = str(queued.get('prompt') or '').strip()
@@ -727,6 +808,7 @@ class Session:
                 self.compacts.append(when)
             elif kind == 'ai-title' and entry.get('aiTitle'):
                 self.title = entry['aiTitle']
+        del self.talk[:-200]
 
     def load(self):
         self.read_transcript()
@@ -1319,7 +1401,7 @@ LANE = 9  # the lanes' labels, then their picture
 def lanes_legend(s, width, dark=False):
     hue = lambda name: '\x1b[38;2;%d;%d;%dm' % (ON_DARK if dark else INK)[name][:3]
     parts = [(hue('learn') + '▮', f"{short(len(s['learned']['chunks']))} learned"),
-             (hue('recall') + '↑', f"{len(s['gave']['recalls']) + len(s['gave']['carried'])} handed to Claude"),
+             (hue('recall') + '↑', f"{handoffs(s['gave']['recalls']) + len(s['gave']['carried'])} handed to Claude"),
              (hue('asked') + '●', f"{len(s['asked'])} asked")]
     while sum(2 + len(text) + 2 for _, text in parts) - 2 > width and len(parts) > 1:
         parts.pop()
@@ -1461,20 +1543,29 @@ def page_main(data, s, now):
             dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1, meta=meta,
                                detail=[d.get('title') or ''] + reasons[:2], send=send))
 
-    handed = []
+    # Only what Claude reached for: a hand-off it then opened, or a question it asked CSR itself; at most
+    # two rows. The rest stays behind one row with the count, which opens to the list.
+    handed, passive = [], []
     for item in s.get('remembered') or []:
-        if len(handed) >= 4:
-            break
         if item['kind'] == 'recall':
             where = ' · '.join(x for x in (from_when(item.get('when'), now), item.get('project'),
                                            f"{item['times']}×" if item['times'] > 1 else '') if x)
             gist = re.sub(r'\*\*|(?:^|\s)#+\s*', ' ', item['text']).strip()  # a note's markdown, as words
-            handed.append(dict(recall_act(item, now), title=gist, meta=where))
-        else:
+            if item.get('opened') and len(handed) < 2:
+                handed.append(dict(recall_act(item, now), title=gist, meta='opened · ' + where))
+            else:
+                passive.append(f"{gist} · {where}" if where else gist)
+        elif len(handed) < 2:
             handed.append(dict(key=f"asked:{item['at']}", title=item['text'], meta='Claude asked CSR',
                                detail=[f"Through {item.get('tool') or 'a CSR tool'}."],
                                send=one_line(f"Claude asked CSR: “{item['text']}”")))
-    given = len(s['gave']['recalls']) + len(s['gave']['carried']) if s.get('gave') else 0
+    given = handoffs(s['gave']['recalls']) + len(s['gave']['carried']) if s.get('gave') else 0
+    opened = sum(1 for item in s.get('remembered') or [] if item.get('opened'))
+    if given:
+        handed.append(dict(key='handed:all', quiet=True, lines=1,
+                           title=f"{given} handed · {f'{opened} opened' if opened else 'none opened'}",
+                           detail=passive[:5] or ['Nothing left to list.'],
+                           send=one_line('CSR handed you these this session: ' + '; '.join(passive[:5]))))
 
     clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
@@ -1486,7 +1577,7 @@ def page_main(data, s, now):
                 sections=[
         dict(name='dreams', title='What if…', right=('on' + (f' · {week} this week' if week else '')) if data.get('dreams_on') else 'off',
              items=dreams, empty=''),
-        dict(name='remembered', title='Handed to Claude', right=f'{given}×' if given else '', items=handed, empty=''),
+        dict(name='remembered', title='Handed to Claude', right='', items=handed, empty=''),
         dict(name='rules', title='Your rules', right='', items=rules, empty=''),
     ])
 

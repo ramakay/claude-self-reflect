@@ -1,8 +1,9 @@
 // How often the dreamer looks: earned, not a fixed number a day and not unlimited.
 //
 // Three rules, each decided without a model call:
-//  1. Something new. A look happens only when CSR's brief near this work holds
-//     a line (a receipt, a file) the last look did not have.
+//  1. Something new. A look happens only when CSR's brief holds a line about the
+//     work in hand (a "* " line: a note on a file Claude handled lately, a thing
+//     the person built that came up) the last look did not have.
 //  2. Earned pace. It starts on You should know's clock, a look every 6 steps of
 //     Claude's work; a look that finds nothing worth asking doubles the wait, up
 //     to 48 steps; a dream you used (helpful, asked Claude) sets it back to 6.
@@ -34,12 +35,10 @@ export const freshPace = (session: string): Pace => ({
   lastLook: 0,
 })
 
-// The brief's lines that carry a fact: a receipt in brackets, or a listed file.
-// Dreams already offered are left out, so a dream does not count as news.
+// The brief's lines about the work in hand, the ones that start with "* ". Past lines, what CSR handed
+// Claude and dreams already offered never count: they move without the work moving.
 export function facts(brief: string): string[] {
-  const cut = brief.indexOf('Dreams already offered')
-  const body = cut === -1 ? brief : brief.slice(0, cut)
-  return [...new Set(body.split('\n').map(line => line.trim()).filter(line => /\[[^\]]+\]/.test(line) || line.startsWith('- ')))]
+  return [...new Set(brief.split('\n').filter(line => line.startsWith('* ')).map(line => line.trim()))]
 }
 
 export const hasNews = (now: readonly string[], before: readonly string[]) => now.some(line => !before.includes(line))

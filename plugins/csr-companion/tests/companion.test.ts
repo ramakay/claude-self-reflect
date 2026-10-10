@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
+import { facts } from '../hooks/pace'
 
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -34,7 +35,7 @@ const NOTE = {
   conversation: 'd8fe3a96-e6f8',
   at: 1,
 }
-const BRIEF = 'Lines the person wrote in past sessions that sit close to this work:\n- 08-26 (csr-engine): “csr should run on the cross project corpus” [session dc24d328]'
+const BRIEF = 'Things the person built in other sessions that came up in this work:\n* skill notes-sync: built over 2 sessions, latest 08-26 [session dc24d328]'
 const DREAM_LINE = 'What if the notes also read your side branches, so this week’s work gets notes before it reaches main?'
 const DREAM_REPLY = [
   `dream: ${DREAM_LINE}`,
@@ -349,12 +350,31 @@ test('a look that finds nothing doubles the wait, and with nothing new near the 
   expect(seen.forks.length).toBe(1)
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'look', outcome: 'quiet', tokens: 0 }))
 
-  world.brief = `${BRIEF}\n- 10-08 (csr-engine): “the import should retry” [session 3f2a91c0]`
+  world.brief = `${BRIEF}\n- 10-08 (csr-engine): “the import should retry” [session 3f2a91c0]` // a past line: not news
+  await steps($, 48)
+  await settle(() => false)
+  expect(seen.forks.length).toBe(1)
+  expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'look', outcome: 'quiet' }))
+
+  world.brief = `${world.brief}\n* plugin retry-queue: built over 1 session, latest 10-08 [session 3f2a91c0]`
   await steps($, 12)
   await settle(() => seen.forks.length >= 2)
   await settle(() => false)
   expect(seen.forks.length).toBe(2)
   expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 2, every: 24 }))
+})
+
+test('only the brief\'s "* " lines, about the work in hand, count as news', async () => {
+  const brief = [
+    'Things the person built in other sessions that came up in this work:',
+    '* skill pigment: built over 2 sessions, latest 10-09 [session cd677a49]',
+    '  “Archetype-based visual system”',
+    'Lines the person wrote in past sessions that sit close to this work:',
+    '- 06-10 (claude-self-reflect): “my vision” [session 0bab445f]',
+    'Dreams already offered here, and what the person answered:',
+    '- 10-09: “What if…?” [ask_claude]',
+  ].join('\n')
+  expect(facts(brief)).toEqual(['* skill pigment: built over 2 sessions, latest 10-09 [session cd677a49]'])
 })
 
 test('a dream typed past is never asked again, and the dreamer backs off', ON, async ($, on) => {
@@ -370,7 +390,7 @@ test('a dream typed past is never asked again, and the dreamer backs off', ON, a
   expect(seen.store.get('looksToSkip')).toBe(1)
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'answer', answer: 'ignored' }))
 
-  world.brief = `${BRIEF}\n- 10-08 (csr-engine): “the import should retry” [session 3f2a91c0]`
+  world.brief = `${BRIEF}\n* plugin retry-queue: built over 1 session, latest 10-08 [session 3f2a91c0]`
   await steps($, 6) // skipped: backing off
   await settle(() => false)
   expect(seen.forks.length).toBe(1)
@@ -383,17 +403,21 @@ test('a dream typed past is never asked again, and the dreamer backs off', ON, a
   expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
 })
 
-test('a dream that only echoes this session, or asks about the pane, never reaches you', ON, async ($, on) => {
-  const echo = DREAM_REPLY.replace('[session dc24d328]', '[session sess-1]').replace('On 08-26 you asked', 'Today you asked')
-  const tool = DREAM_REPLY.replace('What if the notes also read', 'What if the pane also read')
-  const seen = host(on, { herdr: false, repo: true, replies: [echo, tool] })
+test('a dream about the pane that cites no other session still reaches you: you judge it, not a gate', ON, async ($, on) => {
+  // The one dream acted on (10-09, asked Claude): about the pane, no receipt. A gate once kept it out.
+  const pigment = [
+    "dream: What if the pane took its colours from pigment's nyt inks, the palette your 10.x deck already uses?",
+    'explain:',
+    "**The pane could share the deck's palette**",
+    "* We're tuning the pane's colours by hand.",
+  ].join('\n')
+  const seen = host(on, { herdr: false, repo: true, replies: [pigment] })
   const band = await $.ui.mount(BAND)
   await steps($, 12)
-  await settle(() => seen.forks.length >= 1)
-  await settle(() => false)
-  expect(await band.find({ text: /What if the (notes|pane) also read/ })).toBeUndefined()
-  expect(seen.kept.filter(record => record.kind === 'dream')).toEqual([])
-  expect(seen.kept.filter(record => record.kind === 'look').map(record => record.outcome)).toContain('ungrounded')
+  await settle(async () => (await band.find({ text: /pigment's nyt inks/ })) !== undefined)
+  expect(await band.find({ text: /pigment's nyt inks/ })).toBeDefined()
+  expect(seen.kept.filter(record => record.kind === 'dream').length).toBe(1)
+  expect(seen.kept.some(record => record.outcome === 'ungrounded')).toBe(false)
 })
 
 test('a dream answered in the pane leaves the band, and is never counted as typed past', ON, async ($, on) => {

@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, Settings, SettingsSource } from 'claude-code'
 
 import type { Note, NoteView, Shift, ShiftsData } from '../types'
-import { askClaude, dreamId, dreamPrompt, parseDream, sameDream, standsOnThePast } from './dreamer'
+import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
 import { canAfford, facts, freshPace, hasNews, paceAfter, paceText } from './pace'
 import type { Pace } from './pace'
 
@@ -220,13 +220,13 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
   const used = 'usage' in reply ? tokensOf(reply.usage) : 0
   await $.store.set('briefFacts', [...before.filter(line => !now.includes(line)), ...now].slice(-FACTS_KEPT))
   pace = { ...(await paceOf($)), looks: pace.looks + 1, dreamer: pace.dreamer + used, lastLook: used || pace.lastLook }
-  const parsed = reply.isAnswered ? parseDream(reply.text) : null
-  const found = parsed && standsOnThePast(parsed, brief, session) ? parsed : null // another session under it
+  // No grounding gate: one kept out the only dream acted on. The prompt asks for a receipt; you judge.
+  const found = reply.isAnswered ? parseDream(reply.text) : null
   const repeat = !!found && [...seen, ...known].some(line => sameDream(line, found.line))
   if (!found || repeat) {
     const slower = paceAfter(pace, 'none')
     await $.store.set('pace', slower)
-    return lookCameTo($, cwd, session, !parsed ? 'none' : repeat ? 'repeat' : 'ungrounded', slower.every, used)
+    return lookCameTo($, cwd, session, repeat ? 'repeat' : 'none', slower.every, used)
   }
   await $.store.set('pace', { ...pace, dreams: pace.dreams + 1 })
   const at = await $.clock.now()
