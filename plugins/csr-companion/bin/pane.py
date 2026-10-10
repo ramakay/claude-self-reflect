@@ -761,8 +761,9 @@ SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams
                changed='quiet', remembered='recall', kept='turn')
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆')  # where no pictures are drawn
-DARK = dict(claude=(36, 36, 35), facts=(26, 26, 25), gauges=(16, 16, 16))  # the masthead's grounds, a
-# shade apart: Claude's own status line, the session's facts, its gauges. Its lines read best dark.
+DARK = ((50, 50, 48), (12, 12, 12))  # the masthead's ground, from its first row (Claude's own status line)
+# to its last (the gauges' legend), each row a step darker than the one above; the first lighter than a dark
+# terminal's own ground (herdr's is 40), so the masthead keeps its edge. Its lines read best dark.
 ON_DARK = dict(text=(236, 236, 231), label=(150, 150, 144), you=(236, 236, 231), ctx=(112, 164, 232),
                learn=(96, 196, 146), recall=(96, 196, 146), turn=(240, 112, 82), dream=(226, 176, 64),
                asked=(168, 156, 240), rule=(255, 255, 255, 40))
@@ -795,13 +796,13 @@ def shrink(image):
     return out.getvalue()
 
 
-def session_png(s, cols, cell, now, dark=False):
-    """Three lanes over active session time: your prompts, Claude's context, CSR's memory at work; on the
-    dark ground, in its lighter inks, the ground painted in."""
-    INK = ON_DARK if dark else globals()['INK']
+def session_png(s, cols, cell, now, grounds=None):
+    """Three lanes over active session time: your prompts, Claude's context, CSR's memory at work; given
+    the dark grounds of its three rows, each lane painted on its own, in the lighter inks."""
+    INK = ON_DARK if grounds else globals()['INK']
     image, draw = canvas(cols, 3, cell)
-    if dark:
-        draw.rectangle([0, 0, image.width, image.height], fill=DARK['gauges'] + (255,))
+    for i, ground in enumerate(grounds or ()):
+        draw.rectangle([0, i * cell[1] * SS, image.width, (i + 1) * cell[1] * SS], fill=ground + (255,))
     w, lane = image.width, image.height / 3
     learned, gave = s['learned'], s['gave']
     clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
@@ -811,9 +812,9 @@ def session_png(s, cols, cell, now, dark=False):
     for b in clock.breaks:
         bx = 2 * SS + b / clock.total * (w - 4 * SS)
         for y in range(0, int(3 * lane), 6 * SS):
-            draw.line([(bx, y), (bx, y + 2 * SS)], fill=(255, 255, 255, 60) if dark else (0, 0, 0, 60), width=SS)
+            draw.line([(bx, y), (bx, y + 2 * SS)], fill=(255, 255, 255, 60) if grounds else (0, 0, 0, 60), width=SS)
     for t in s['compacts']:
-        draw.line([(x(t), lane), (x(t), 2 * lane)], fill=(255, 255, 255, 90) if dark else (0, 0, 0, 90), width=SS)
+        draw.line([(x(t), lane), (x(t), 2 * lane)], fill=(255, 255, 255, 90) if grounds else (0, 0, 0, 90), width=SS)
     # you: one tick per prompt
     for t in s['prompts']:
         draw.line([(x(t), lane * 0.2), (x(t), lane * 0.8)], fill=INK['you'], width=2 * SS)
@@ -1030,9 +1031,15 @@ def ansi_wrap(text, width, rows):
     return [ansi_fit(l, width) for l in lines if COLOUR.sub('', l).strip()][:rows]
 
 
-def on_dark(line, shade):
+def dark_steps(n):
+    """n grounds stepping evenly from the masthead's first shade to its last."""
+    (top, bottom), last = DARK, max(1, n - 1)
+    return [tuple(round(a + (b - a) * i / last) for a, b in zip(top, bottom)) for i in range(n)]
+
+
+def on_dark(line, ground):
     """A masthead row on its dark ground, run to the pane's edge, light type laid again after each reset."""
-    back, fg = '\x1b[48;2;%d;%d;%dm' % DARK[shade], '\x1b[38;2;%d;%d;%dm' % ON_DARK['text']
+    back, fg = '\x1b[48;2;%d;%d;%dm' % ground, '\x1b[38;2;%d;%d;%dm' % ON_DARK['text']
     return back + fg + line.replace(OFF, OFF + back + fg) + '\x1b[K' + OFF
 
 
@@ -1468,17 +1475,20 @@ def page_lines(page, width, rows, ui):
     between. Every section keeps its heading and first row; the room left goes to the earlier ones first."""
     head, s = page['head'], page['head'].get('session')
     label = '\x1b[38;2;%d;%d;%dm' % ON_DARK['label']
-    top = [(' ' + line, 'claude') for line in ansi_wrap(head.get('status') or '', width - 1, 2)]  # its status line
+    top = [' ' + line for line in ansi_wrap(head.get('status') or '', width - 1, 2)]  # Claude's status line
     if head.get('title'):
-        top.append((' ' + BOLD + fit(head['title'], width - 1) + OFF, 'facts'))
-    top.append((' ' + fit(head['facts'], width - 1), 'facts'))
-    out = Lines([on_dark(line, shade) for line, shade in top])
-    out.heads, out.lanes = [], None
+        top.append(' ' + BOLD + fit(head['title'], width - 1) + OFF)
+    top.append(' ' + fit(head['facts'], width - 1))
+    lanes = None
     if s:
         if PIXELS and width - LANE > 8:
-            out.lanes = len(out)
-            out.put([on_dark(' ' + label + name.ljust(LANE - 1) + OFF, 'gauges') for name in ('you', 'context', 'memory')])
-        out.put([on_dark('  ' + lanes_legend(s, width - 2, dark=True), 'gauges')])
+            lanes = len(top)
+            top += [' ' + label + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')]
+        top.append('  ' + lanes_legend(s, width - 2, dark=True))
+    grounds = dark_steps(len(top))  # one gradient, top row to bottom
+    out = Lines([on_dark(line, ground) for line, ground in zip(top, grounds)])
+    out.heads = []
+    out.lanes = None if lanes is None else (lanes, grounds[lanes:lanes + 3])  # the gauges' row, their grounds
     built = []
     for section in page['sections']:
         blocks = []
@@ -1526,7 +1536,8 @@ def draw_page(page, cols, rows, ui):
         cell = cell_size()
         s = page['head'].get('session')
         if s and lines.lanes is not None:
-            pictures.append((lines.lanes, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time(), dark=True)))
+            row, grounds = lines.lanes
+            pictures.append((row, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time(), grounds)))
         pictures += [(row, 0, ICON[0], ICON[1], iso_png(name, cell, backs))
                      for row, name, backs in lines.heads if row + ICON[1] <= rows - 1]
     return lines, pictures
