@@ -17,10 +17,10 @@
 //!
 //! No model is involved anywhere. CSR's own payloads stay out: any body that
 //! `contamination_reason` flags is dropped, and so is any body that looks like
-//! it carries a credential.
+//! it carries a credential or `<private>` text.
 
 use anyhow::Result;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -127,23 +127,60 @@ fn file_stem(path: &str) -> String {
     }
 }
 
-/// Text that looks like it carries a credential: never stored or parsed.
+/// Words that name a credential or private text, matched lowercase. A body that
+/// holds one is dropped even when the value itself comes from the environment:
+/// a script missing from the index costs little, a stored credential a lot.
+const SECRET_WORDS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_key",
+    "accesskey",
+    "private_key",
+    "privatekey",
+    "secret",
+    "password",
+    "passwd",
+    "token=",
+    "token =",
+    "bearer ",
+    "-----begin",
+    "<private",
+];
+
+/// Credential values by shape, whatever name they sit under.
+fn secret_shapes() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        RegexSet::new([
+            // OpenAI and Anthropic keys, at the start of a word: `task-1` holds `sk-` too.
+            r"(?i)(?:^|[^a-z0-9])sk-[a-z0-9]",
+            r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+            r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+            r"\b(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}",
+            r"\bxox[abposr]-[A-Za-z0-9-]{10,}",
+            r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{10,}",
+            r"\bAIza[0-9A-Za-z_-]{30,}",
+            r"\bglpat-[A-Za-z0-9_-]{20,}",
+            r"\bnpm_[A-Za-z0-9]{30,}",
+            r"\bhf_[A-Za-z0-9]{30,}",
+            // A JSON web token: header.payload.signature.
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            // A password inside a URL: `scheme://user:password@host`.
+            r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@'"]+:[^\s/@'"]+@"#,
+            // An Authorization value: `token <credential>`, `Basic <credential>`.
+            r"(?i)\b(?:token|basic|bearer|digest)[ \t]+[A-Za-z0-9+/=_.~-]{16,}",
+            // A token given as a literal under a key: `"token": "..."`, `token: '...'`.
+            r#"(?i)token["']?\s*:\s*["'][^"'\s]{8,}"#,
+        ])
+        .expect("secret shapes")
+    })
+}
+
+/// Text that looks like it carries a credential or private text: never stored
+/// or parsed, so it reaches neither `scratch_scripts` nor the code graph.
 fn looks_secret(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    [
-        "api_key",
-        "apikey",
-        "secret",
-        "password",
-        "passwd",
-        "token=",
-        "token =",
-        "bearer ",
-        "-----begin",
-        "sk-",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    SECRET_WORDS.iter().any(|word| lower.contains(word)) || secret_shapes().is_match(body)
 }
 
 /// The redirect or tee target on a heredoc line, if any.
@@ -827,6 +864,213 @@ mod tests {
             "python3 -c 'x = 1 << 4'\ncat > /tmp/b.py <<'EOF'\ndef later():\n    return 3\nEOF";
         let s = extract_scripts(cmd);
         assert!(s.iter().any(|x| x.label == "b"), "{s:?}");
+    }
+
+    /// A fake credential: `prefix` and `len` characters of filler, the filler
+    /// rotated by `seed` so each sample is a distinct string. Built at run time
+    /// so the source holds no token-shaped string for a scanner to flag.
+    fn fake(prefix: &str, len: usize, seed: usize) -> String {
+        const FILL: &str = "Q7XW2KD9PM4TZ8RN5VB3HJ6LC0GF1SY";
+        let fill: String = FILL.chars().cycle().skip(seed).take(len).collect();
+        format!("{prefix}{fill}")
+    }
+
+    /// One line of Python carrying a credential, and the value it carries.
+    fn credential_lines() -> Vec<(&'static str, String, String)> {
+        let pem = format!("-----BEGIN {}-----", "RSA PRIVATE KEY");
+        let mut out = Vec::new();
+        let mut add =
+            |name: &'static str, line: String, value: String| out.push((name, line, value));
+        for (seed, (name, prefix, len)) in [
+            ("github classic", "ghp_", 36),
+            ("github oauth", "gho_", 36),
+            ("github fine-grained", "github_pat_", 82),
+            ("aws access key id", "AKIA", 16),
+            ("aws session key id", "ASIA", 16),
+            ("slack", "xoxb-", 40),
+            ("stripe", "sk_live_", 24),
+            ("google", "AIza", 35),
+            ("gitlab", "glpat-", 20),
+            ("npm", "npm_", 36),
+            ("hugging face", "hf_", 34),
+            ("openai project", "sk-proj-", 48),
+            ("anthropic", "sk-ant-api03-", 48),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let v = fake(prefix, len, seed);
+            add(name, format!("value = \"{v}\""), v);
+        }
+        let v = fake("AKIA", 16, 20);
+        add("aws env name", format!("AWS_ACCESS_KEY_ID = \"{v}\""), v);
+        let v = format!(
+            "{}.{}.{}",
+            fake("eyJ", 20, 21),
+            fake("eyJ", 40, 22),
+            fake("", 43, 23)
+        );
+        add("jwt", format!("session = \"{v}\""), v);
+        let v = fake("", 16, 24);
+        add(
+            "url userinfo",
+            format!("dsn = \"postgres://app:{v}@db.internal:5432/main\""),
+            v,
+        );
+        let v = fake("", 40, 25);
+        add(
+            "authorization token",
+            format!("h = {{\"Authorization\": \"token {v}\"}}"),
+            v,
+        );
+        let v = format!("{}==", fake("", 26, 26));
+        add(
+            "authorization basic",
+            format!("h = {{\"Authorization\": \"Basic {v}\"}}"),
+            v,
+        );
+        let v = fake("", 32, 27);
+        add("json token key", format!("cfg = {{\"token\": \"{v}\"}}"), v);
+        let v = fake("", 40, 28);
+        add(
+            "bearer header",
+            format!("h = {{\"Authorization\": \"Bearer {v}\"}}"),
+            v,
+        );
+        add("pem key", format!("key = \"{pem}\""), pem.clone());
+        let v = "customer-17@example.com".to_string();
+        add(
+            "private tag",
+            format!("email = '<private>{v}</private>'"),
+            v,
+        );
+        out
+    }
+
+    /// The three ways a script reaches the index: a heredoc fed to the
+    /// interpreter, a heredoc written to a file, and a `-c` one-liner.
+    fn wrapped(line: &str) -> [String; 3] {
+        let body = format!("import os\n{line}\ndef run():\n    return os.getcwd()\n");
+        [
+            format!("python3 - <<'EOF'\n{body}EOF"),
+            format!("cat > /tmp/probe.py <<'EOF'\n{body}EOF\npython3 /tmp/probe.py"),
+            format!("python3 -c \"{}\"", body.replace('"', "\\\"")),
+        ]
+    }
+
+    #[test]
+    fn credentials_are_never_extracted() {
+        let mut leaked = Vec::new();
+        for (name, line, _) in credential_lines() {
+            if !looks_secret(&line) {
+                leaked.push(format!("{name} (the line)"));
+            }
+            for (n, cmd) in wrapped(&line).iter().enumerate() {
+                if !extract_scripts(cmd).is_empty() {
+                    leaked.push(format!("{name} (form {n})"));
+                }
+            }
+        }
+        assert!(leaked.is_empty(), "kept as scratch: {leaked:?}");
+        // A JavaScript object key, written to a file.
+        let v = fake("", 32, 29);
+        let js = format!("cat > /tmp/c.js <<'EOF'\nconst c = makeClient({{ token: '{v}' }});\nfunction run() {{ return c }}\nEOF");
+        assert!(extract_scripts(&js).is_empty());
+    }
+
+    #[test]
+    fn code_that_only_resembles_a_credential_is_kept() {
+        // `task-`, `disk-`, `risk-`, `ask-` hold `sk-` but are no key.
+        let cmd = "python3 - <<'EOF'\nlabels = ['task-1', 'disk-usage', 'risk-high', 'ask-later']\ndef tally(xs):\n    return len(xs)\nEOF";
+        assert_eq!(extract_scripts(cmd).len(), 1, "sk- inside a word");
+        // A type that names a token field, and a header built from a variable.
+        let ts = "cat > /tmp/s.ts <<'EOF'\ninterface Session { token: string; user: string }\nfunction who(s: Session) { return s.user }\nEOF";
+        assert_eq!(extract_scripts(ts).len(), 1, "token: string");
+        let py = "python3 - <<'EOF'\nimport os\ndef headers(tok):\n    return {'Authorization': f'token {tok}'}\nEOF";
+        assert_eq!(extract_scripts(py).len(), 1, "token {{tok}}");
+    }
+
+    /// Every text value in every table of the database.
+    fn every_stored_text(storage: &Storage) -> Vec<String> {
+        storage
+            .with_connection(|c| {
+                let tables: Vec<String> = c
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<std::result::Result<_, _>>()?;
+                let mut out = Vec::new();
+                for table in tables {
+                    let mut stmt = c.prepare(&format!("SELECT * FROM \"{table}\""))?;
+                    let cols = stmt.column_count();
+                    let mut rows = stmt.query([])?;
+                    while let Some(row) = rows.next()? {
+                        for i in 0..cols {
+                            match row.get_ref(i)? {
+                                rusqlite::types::ValueRef::Text(t)
+                                | rusqlite::types::ValueRef::Blob(t) => {
+                                    out.push(String::from_utf8_lossy(t).into_owned())
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn credentials_reach_no_table_through_transcript_import() {
+        let (dir, storage) = temp_storage();
+        let samples = credential_lines();
+        let mut commands: Vec<(String, String)> = Vec::new();
+        for (i, (_, line, _)) in samples.iter().enumerate() {
+            for (n, cmd) in wrapped(line).into_iter().enumerate() {
+                commands.push((format!("s{i}-{n}"), cmd));
+            }
+        }
+        // A clean script beside them: it must be stored, or the sweep proves nothing.
+        commands.push((
+            "control".into(),
+            "python3 - <<'EOF'\nimport json\ndef load_rows(p):\n    return json.load(open(p))\nEOF"
+                .into(),
+        ));
+        let refs: Vec<(&str, &str)> = commands
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let path = write_transcript(dir.path(), &refs);
+        let stats = index_transcript(&storage, &path, "conv-a", "proj").unwrap();
+        assert_eq!(
+            stats.scripts_new, 1,
+            "only the control is stored: {stats:?}"
+        );
+
+        let stored = every_stored_text(&storage);
+        assert!(
+            stored.iter().any(|t| t.contains("def load_rows")),
+            "control body stored"
+        );
+        let found: Vec<&str> = samples
+            .iter()
+            .filter(|(_, _, value)| stored.iter().any(|t| t.contains(value.as_str())))
+            .map(|(name, _, _)| *name)
+            .collect();
+        assert!(found.is_empty(), "credential values stored: {found:?}");
+        let (files, edges): (i64, i64) = storage
+            .with_connection(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(DISTINCT file) FROM code_nodes WHERE file LIKE 'scratch/%'", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(DISTINCT src_file) FROM code_edges WHERE src_file LIKE 'scratch/%'", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            (files, edges),
+            (1, 1),
+            "only the control's scratch file has nodes and edges"
+        );
     }
 
     fn temp_storage() -> (tempfile::TempDir, Storage) {
