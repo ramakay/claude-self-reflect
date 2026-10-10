@@ -11,7 +11,8 @@ report, in its own tint beside a pixel isometric icon:
   l: Changed since     every commit under your past sessions (Claude gets a Heads up there).
 
   pane.py --repo PATH --json                    status counts + rows, for the mod
-  pane.py --repo PATH --watch [--sid ID] [--agent PANE]  full-screen pane: d main, l log, s summary, q quits;
+  pane.py --repo PATH --watch [--sid ID] [--agent PANE]  full-screen pane: d main, l log, s summary, f threads,
+      i session info, q quits;
       a click opens a row, a second click puts it in Claude's prompt (herdr pane PANE)
   pane.py --repo PATH --png DIR [--sid ID]    write the pane's pictures, for a look
   pane.py --repo PATH --note FILE [--sid ID]  what CSR remembers about FILE, as notes for the band
@@ -27,6 +28,7 @@ import io
 import json
 import math
 import os
+import plistlib
 import re
 import select
 import shutil
@@ -340,19 +342,6 @@ def claude_status(session_id, now):
 
 # ---------------------------------------------------------------- the masthead's clocks
 
-def claude_fields(session_id, now):
-    """The raw fields the status line wrapper kept beside the line (prompt_cache, rate_limits,
-    context_window); {} when there are none or they are a day old. Like the line, an idle session's
-    fields are old and still right: the clocks inside them are absolute times."""
-    try:
-        with open(kept_file(STATUS_LINES, session_id) or '', encoding='utf-8') as handle:
-            kept = json.load(handle)
-        fields = kept.get('fields')
-        return fields if isinstance(fields, dict) and now - float(kept.get('at') or 0) < 86400 else {}
-    except (OSError, ValueError, TypeError, AttributeError):
-        return {}
-
-
 def seconds_of(value):
     """A time Claude Code gave as epoch seconds, or as a date and time; None when it is neither, or is not
     a time a clock could show (past the year 9999, before 1970)."""
@@ -373,52 +362,6 @@ def percent_of(value):
     return value if ok else None
 
 
-def cache_clock(cache, now):
-    """The prompt cache as a clock: how long it stays warm, or how much the next turn re-reads once cold.
-    (text, ink name) or None when the status line told nothing about it."""
-    if not isinstance(cache, dict):
-        return None
-    expires, warm, cold_cost = seconds_of(cache.get('expires_at')), cache.get('warm'), percent_of(cache.get('recache_tokens_if_cold'))
-    if warm is False or (expires is not None and expires <= now):
-        return ('cache cold' + (f' · re-reads ~{short(cold_cost)}' if cold_cost and cold_cost > 0 else ''), 'turn')
-    if expires is not None and expires - now > 86400:
-        expires = None  # no prompt cache lives a day: that clock is wrong, so say only that it is warm
-    if expires is None:
-        return ('cache warm' + (f' · {cache["ttl"]}' if isinstance(cache.get('ttl'), str) else ''), None) if warm else None
-    left = expires - now
-    return (f'cache warm · {span(left)} left' if left >= 60 else 'cache warm · under 1m left', None if left >= 300 else 'dream')
-
-
-def quota_pieces(limits, now):
-    """The plan's two windows as "5h 34%"; above 70% with the time the window resets, in ink that warns."""
-    pieces = []
-    for key, label in (('five_hour', '5h'), ('seven_day', '7d')):
-        window = (limits or {}).get(key) if isinstance(limits, dict) else None
-        used = percent_of(window.get('used_percentage')) if isinstance(window, dict) else None
-        if used is None:
-            continue
-        resets = seconds_of(window.get('resets_at'))
-        if resets is not None and resets <= now:
-            continue  # that window has rolled over since the status line last ran: the number is old
-        text = f'{label} {round(used)}%'
-        if used > 70 and resets is not None:
-            try:
-                when = datetime.fromtimestamp(resets)
-                text += ' resets ' + when.strftime('%H:%M' if resets - now < 86400 else '%a %H:%M')
-            except (OverflowError, OSError, ValueError):
-                pass  # a reset time this machine cannot show: the percentage alone
-        pieces.append((text, 'turn' if used >= 90 else 'dream' if used > 70 else None))
-    return pieces
-
-
-def masthead(fields, now):
-    """The masthead's clock rows, each a list of (text, ink name) pieces: the cache clock, then the quotas.
-    A row with nothing in it is left out; missing fields draw nothing."""
-    fields = fields if isinstance(fields, dict) else {}
-    clock = cache_clock(fields.get('prompt_cache'), now)
-    return [row for row in ([clock] if clock else [], quota_pieces(fields.get('rate_limits'), now)) if row]
-
-
 def fit_pieces(text, width):
     """The ' · '-joined pieces of text that fit width, the rightmost dropped first."""
     pieces = text.split(' · ')
@@ -427,19 +370,140 @@ def fit_pieces(text, width):
     return fit(' · '.join(pieces), width)
 
 
-def mast_rows(rows, width):
-    """The clock rows as lines for the dark masthead: pieces dropped right to left to fit, a piece's ink
-    where it has one, a dim middle dot between."""
-    hue = lambda name: '\x1b[38;2;%d;%d;%dm' % ON_DARK[name][:3]
-    lines = []
-    for pieces in rows or ():
-        pieces = list(pieces)
-        while len(pieces) > 1 and len(' · '.join(text for text, _ in pieces)) > width:
-            pieces.pop()
-        pieces[0] = (fit(pieces[0][0], width), pieces[0][1])
-        dot = f' {hue("label")}·{OFF} '
-        lines.append(' ' + dot.join((hue(name) if name else '') + text + OFF for text, name in pieces))
-    return lines
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+CTX_AMBER = _env_int('CC_CTX_AMBER_TOKENS', 100_000)  # the status line's own thresholds and env names
+CTX_RED = _env_int('CC_CTX_RED_TOKENS', 400_000)  # also the bar's full scale
+FLOOR_ROWS = 5  # the status line's FLOOR_ROWS: the floor is the median of this many newest compactions
+LAUNCH_AGENTS = os.path.join(HOME, 'Library', 'LaunchAgents')
+DAEMON_LOCK = os.path.join(HOME, '.claude-self-reflect', 'daemon.lock')
+SETTINGS = os.path.join(HOME, '.claude', 'settings.json')
+
+
+def kept_status(session_id, now):
+    """(fields, at) the wrapper kept for this session; ({}, None) when there are none or they are a day old.
+    Like the line, an idle session's fields are old and still right: the clocks inside them are absolute."""
+    try:
+        with open(kept_file(STATUS_LINES, session_id) or '', encoding='utf-8') as handle:
+            kept = json.load(handle)
+        fields, at = kept.get('fields'), float(kept.get('at') or 0)
+        return (fields, at) if isinstance(fields, dict) and now - at < 86400 else ({}, None)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}, None
+
+
+def claude_fields(session_id, now):
+    """The raw fields the status line wrapper kept beside the line (prompt_cache, rate_limits,
+    context_window); {} when there are none or they are a day old."""
+    return kept_status(session_id, now)[0]
+
+
+_LIMITS = {}  # kept file -> (mtime, size, at, rate_limits): a file is parsed again only when it changes
+
+
+def account_limits(now, folder=None):
+    """rate_limits from the newest KEEP/statusline/*.json (by its 'at') written within a day; {} when there
+    are none. The quotas are the account's, so a session that has no status line yet still shows them."""
+    folder = folder or STATUS_LINES
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return {}
+    best = None
+    for name in names:
+        if not name.endswith('.json'):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            stat = os.stat(path)
+            hit = _LIMITS.get(path)
+            if not hit or hit[:2] != (stat.st_mtime_ns, stat.st_size):
+                with open(path, encoding='utf-8') as handle:
+                    kept = json.load(handle)
+                limits = (kept.get('fields') or {}).get('rate_limits')
+                hit = (stat.st_mtime_ns, stat.st_size, float(kept.get('at') or 0), limits if isinstance(limits, dict) else None)
+                _LIMITS[path] = hit
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if hit[3] and now - hit[2] < 86400 and (best is None or hit[2] > best[0]):
+            best = (hit[2], hit[3])
+    return best[1] if best else {}
+
+
+def ctx_now(fields, kept_at, s):
+    """(tokens, size): the newest s['main'] reply when its time > (kept_at or 0) + 5, else
+    fields.context_window.total_input_tokens, or the sum of current_usage's input, cache-read and
+    cache-create tokens. (None, size) when there is neither. size is context_window_size, or None."""
+    window = (fields or {}).get('context_window') if isinstance(fields, dict) else None
+    window = window if isinstance(window, dict) else {}
+    size = percent_of(window.get('context_window_size'))
+    size = size if size and size > 0 else None
+    main = (s or {}).get('main') or []
+    if main:
+        when, tokens = max(main)
+        if when > (kept_at or 0) + 5 and tokens:
+            return tokens, size
+    tokens = percent_of(window.get('total_input_tokens'))
+    if tokens is None and isinstance(window.get('current_usage'), dict):
+        use = window['current_usage']
+        tokens = sum(percent_of(use.get(k)) or 0 for k in ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
+    return (tokens if tokens and tokens > 0 else None), size
+
+
+def median_of(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def cache_info(cache, now):
+    """The prompt cache for the masthead: dict(text, sev, long) - how long it stays warm, or what the next
+    turn re-reads once it is cold; '--' when the status line told nothing about it."""
+    none = dict(text='CACHE --', sev='normal', long='--')
+    if not isinstance(cache, dict):
+        return none
+    expires, warm, cold_cost = seconds_of(cache.get('expires_at')), cache.get('warm'), percent_of(cache.get('recache_tokens_if_cold'))
+    if warm is False or (expires is not None and expires <= now):
+        cost = f' ~{short(cold_cost)}' if cold_cost and cold_cost > 0 else ''
+        return dict(text='CACHE COLD' + cost, sev='amber', long='COLD' + (f' · re-reads{cost}' if cost else ''))
+    if expires is not None and expires - now > 86400:
+        expires = None  # no prompt cache lives a day: that clock is wrong, so say only that it is warm
+    if expires is None:
+        if not warm:
+            return none
+        ttl = one_line(cache['ttl'], 8) if isinstance(cache.get('ttl'), str) and cache['ttl'].strip() else ''
+        return dict(text=f"CACHE {ttl or 'WARM'}", sev='normal', long='WARM' + (f' · ttl {ttl}' if ttl else ''))
+    left = expires - now
+    if left < 60:
+        return dict(text='CACHE <1m', sev='amber', long='WARM · under 1m left')
+    return dict(text=f'CACHE {span(left)}', sev='normal' if left >= 300 else 'amber', long=f'WARM · {span(left)} left')
+
+
+def quota_slot(code, window, now):
+    """One plan window for the masthead: dict(code, text, sev, used, resets, stale). A window that rolled over
+    since the status line last ran is '--' in amber (it was a value and is invalid now); one never reported is
+    '--' in the normal ink. Never a stale number."""
+    used = percent_of(window.get('used_percentage')) if isinstance(window, dict) else None
+    if used is None:
+        return dict(code=code, text=f'{code} --', sev='normal', used=None, resets=None, stale=False)
+    resets = seconds_of(window.get('resets_at'))
+    if resets is not None and resets <= now:
+        return dict(code=code, text=f'{code} --', sev='amber', used=None, resets=resets, stale=True)
+    text = f'{code} {round(used)}%'
+    if used > 70 and resets is not None:
+        try:
+            text += ' ↻' + datetime.fromtimestamp(resets).strftime('%H:%M' if resets - now < 86400 else '%a %H:%M')
+        except (OverflowError, OSError, ValueError):
+            pass  # a reset time this machine cannot show: the percentage alone
+    return dict(code=code, text=text, sev='red' if used >= 90 else 'amber' if used > 70 else 'normal',
+                used=used, resets=resets, stale=False)
 
 
 # One compaction's cost, in input tokens: the post-compaction context written to cache at twice the price of
@@ -452,31 +516,163 @@ PAYBACK_UNDER = 15  # a longer payback than this is not worth saying
 FLOOR_GUESS = 65000  # post-compaction context when a session's own are missing
 
 
-def compaction_payback(sizes, context):
-    """(turns to break even, this session's median post size, its median compaction seconds) for compacting
-    now, from the session's (pre, post, ms) rows; None with no history, or when it would not pay back."""
-    posts = sorted(p for _, p, _ in sizes if isinstance(p, (int, float)) and p > 0)
-    if not posts or not context:
-        return None
-    floor = posts[len(posts) // 2] if len(posts) % 2 else (posts[len(posts) // 2 - 1] + posts[len(posts) // 2]) / 2
+def payback_turns(floor, context):
+    """Turns until compacting at this context pays back, as the status line works it out; None when it would
+    never (the context is at or under the floor)."""
     saved = (context - floor) * 0.1
     if saved <= 0:
         return None
-    turns = (floor * 2 + SUMMARY_OUT * 5 + context * 0.1) / saved
-    if turns > PAYBACK_UNDER:
+    return (floor * 2 + SUMMARY_OUT * 5 + context * 0.1) / saved
+
+
+def floor_of(sizes):
+    """(tokens, measured): the median of the last FLOOR_ROWS measured posts (p > 0) in compact_sizes, else
+    (FLOOR_GUESS, False). The status line takes the same last few, and rounds as JavaScript does."""
+    posts = []
+    for row in sizes or ():
+        post = row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else row
+        if isinstance(post, (int, float)) and not isinstance(post, bool) and post > 0:
+            posts.append(post)
+    posts = sorted(posts[-FLOOR_ROWS:])
+    if not posts:
+        return FLOOR_GUESS, False
+    mid = len(posts) // 2
+    return (posts[mid] if len(posts) % 2 else int((posts[mid - 1] + posts[mid]) / 2 + 0.5)), True
+
+
+def compaction_payback(sizes, context):
+    """(turns to break even, this session's floor, its median compaction seconds) for compacting now, from
+    the session's (pre, post, ms) rows; None with no measured history, or when it would not pay back."""
+    floor, measured = floor_of(sizes)
+    if not measured or not context:
+        return None
+    turns = payback_turns(floor, context)
+    if turns is None or turns > PAYBACK_UNDER:
         return None
     spent = sorted(m for _, _, m in sizes if isinstance(m, (int, float)) and m > 0)
-    return max(1, round(turns)), floor, spent[len(spent) // 2] / 1000 if spent else None
+    return max(1, int(turns + 0.5)), floor, spent[len(spent) // 2] / 1000 if spent else None
 
 
-def payback_phrase(s):
-    """"compact repays in ~6t" for the facts row, from this session's compaction rows and its context since
-    the last one; '' when there is no compaction history or no payback."""
-    sizes = s.get('compact_sizes') or []
-    since = max(s.get('compacts') or [0])
-    later = [r for r in s.get('replies') or [] if r[0] > since]
-    found = compaction_payback(sizes, max(later)[1] if later else 0)  # the newest reply's context
-    return f'compact repays in ~{found[0]}t' if found else ''
+def ctx_trend(main, prompts, compacts):
+    """Tokens per turn: the context at each turn's last main-chain reply since the newest compaction (a turn
+    runs from one prompt to the next); the median of the last five turn-to-turn steps, or None under three turns."""
+    since = max(compacts or [0])
+    turns = sorted(t for t in prompts or () if t > since)
+    main = sorted(main or ())
+    times, ends = [r[0] for r in main], []
+    for i, t in enumerate(turns):
+        low = bisect.bisect_left(times, t)
+        high = bisect.bisect_left(times, turns[i + 1]) if i + 1 < len(turns) else len(main)
+        if high > low:
+            ends.append(main[high - 1][1])
+    if len(ends) < 3:
+        return None
+    return median_of([b - a for a, b in zip(ends, ends[1:])][-5:])
+
+
+def csr_plist_switches(agents):
+    """(key, value, where) for every variable a csr-engine LaunchAgent sets; the caller keeps only CSR_NO_*."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(agents, '*csr-engine*.plist'))):
+        try:
+            with open(path, 'rb') as handle:
+                env = plistlib.load(handle).get('EnvironmentVariables')
+        except (OSError, ValueError, AttributeError):
+            continue  # plistlib.InvalidFileException is a ValueError
+        out += [(k, v, 'daemon') for k, v in (env.items() if isinstance(env, dict) else ())]
+    return out
+
+
+_STS = {}  # (agents, lock, settings) -> (when read, result)
+
+
+def csr_status(now, agents=LAUNCH_AGENTS, lock=DAEMON_LOCK, settings=SETTINGS):
+    """What CSR runs without: dict(sev, inop, daemon). inop = [(label, value, sev)]: a daemon with no live pid
+    (amber), then every CSR_NO_* switch set in a LaunchAgent plist (where 'daemon') or in settings.json's env
+    (where 'hooks'), advisory. Only keys named CSR_NO_* are ever read out. Cached for a minute."""
+    key = (agents, lock, settings)
+    hit = _STS.get(key)
+    if hit and 0 <= now - hit[0] < 60:
+        return hit[1]
+    inop, daemon = [], dict(up=False, pid=None, since=None)
+    try:
+        with open(lock, encoding='utf-8') as handle:
+            pid = int(handle.read().strip())
+        if pid <= 1:
+            raise ValueError(pid)
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            pass  # alive, and not ours
+        stamp_ns = mtime(lock)
+        daemon = dict(up=True, pid=pid, since=stamp_ns / 1e9 if stamp_ns else None)
+    except (OSError, ValueError):
+        pass  # no lock, a garbled lock, or no such process (ProcessLookupError is an OSError)
+    if not daemon['up']:
+        inop.append(('DAEMON', 'DOWN · no live pid in daemon.lock', 'amber'))
+    switches = csr_plist_switches(agents)
+    try:
+        with open(settings, encoding='utf-8') as handle:
+            env = json.load(handle).get('env')
+        switches += [(k, v, 'hooks') for k, v in (env.items() if isinstance(env, dict) else ())]
+    except (OSError, ValueError, AttributeError):
+        pass
+    for name, value, where in switches:
+        if isinstance(name, str) and re.fullmatch(r'CSR_NO_[A-Z0-9_]+', name) \
+                and str(value).strip().lower() not in ('', '0', 'false'):
+            inop.append((name[7:], f'INHIBITED · {name}={one_line(value, 24)} ({where})', 'advisory'))
+    sev = 'amber' if any(row[2] == 'amber' for row in inop) else 'advisory' if inop else None
+    result = dict(sev=sev, inop=inop, daemon=daemon)
+    _STS[key] = (now, result)
+    return result
+
+
+def compacting_slot(info, bar=True, rng=True):
+    """(text, sev) of row 2's left slot while a compaction runs: COMPACTING[ AUTO] m:ss, then a bar against the
+    usual time and the usual range. Amber once it is past the usual longest, else advisory."""
+    usual, elapsed = info.get('usual'), info['elapsed']
+    text = 'COMPACTING' + (' AUTO' if info.get('trigger') == 'auto' else '') + ' ' + clock_text(elapsed)
+    if usual and bar:
+        text += ' ' + compaction_bar(elapsed, usual['high'], 8)
+        if rng:
+            text += f" {clock_text(usual['low'])}–{clock_text(usual['high'])}"
+    return text, 'amber' if usual and elapsed > usual['high'] else 'advisory'
+
+
+def gauges(fields, kept_at, s, now, limits=None, sts=None, compacting=None):
+    """Every number the masthead draws, with its severity:
+      ctx=dict(tokens, size, sev)      sev normal (under CTX_AMBER, or no data), amber, red (CTX_RED)
+      floor=dict(tokens, measured)     floor_of(compact_sizes)
+      trend=int|None                   tokens per turn since the newest compaction
+      payback=dict(text, sev)          ♻ n turns to break even; the timer while a compaction runs
+      cache=dict(text, sev, long)      the prompt cache
+      quotas=[dict(code, text, sev, used, ...)]   riskier first; '--' last
+      sts, compacting                  as given
+    limits: account_limits(now), used only when fields has no rate_limits."""
+    fields = fields if isinstance(fields, dict) else {}
+    s = s or {}
+    tokens, size = ctx_now(fields, kept_at, s)
+    sev = 'normal' if tokens is None or tokens < CTX_AMBER else 'amber' if tokens < CTX_RED else 'red'
+    floor, measured = floor_of(s.get('compact_sizes'))
+    if compacting:
+        payback = dict(zip(('text', 'sev'), compacting_slot(compacting)))
+    elif tokens is None:
+        payback = dict(text='♻ --', sev='normal')
+    else:
+        turns = payback_turns(floor, tokens)
+        if turns is None or turns > PAYBACK_UNDER:
+            payback = dict(text='♻ >15t', sev='normal')
+        else:
+            payback = dict(text=f"♻{' ' if measured else '~'}{max(1, int(turns + 0.5))}t",
+                           sev='red' if turns <= 4 else 'amber' if turns <= 8 else 'advisory')
+    rates = fields.get('rate_limits')
+    rates = rates if isinstance(rates, dict) and rates else (limits if isinstance(limits, dict) else {})
+    quotas = [quota_slot(code, rates.get(key), now) for code, key in (('5H', 'five_hour'), ('7D', 'seven_day'))]
+    quotas.sort(key=lambda q: -q['used'] if q['used'] is not None else 1)  # stable: 5H before 7D on a tie
+    return dict(ctx=dict(tokens=tokens, size=size, sev=sev), floor=dict(tokens=floor, measured=measured),
+                trend=ctx_trend(s.get('main'), s.get('prompts'), s.get('compacts')), payback=payback,
+                cache=cache_info(fields.get('prompt_cache'), now), quotas=quotas,
+                sts=sts or dict(sev=None, inop=[]), compacting=compacting)
 
 
 def dreams_on():
@@ -954,6 +1150,10 @@ class Session:
         self.id = session_id
         found = [path] if path else glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
         self.path = found[0] if found else None
+        self.main = []  # (time, context) of each main-chain reply
+        self._main_id = None  # the message the last of them came from: a reply written in parts is one
+        self.model = None
+        self.told = None  # what CSR injected at the newest SessionStart, as the transcript kept it
         self.offset = 0
         self.replies = {}  # message id -> (time, context tokens, output tokens)
         self.prompts, self.compacts, self.asked, self.questions = [], [], [], []
@@ -998,6 +1198,14 @@ class Session:
                 if message.get('id') and when:
                     self.replies[message['id']] = (when, context, usage.get('output_tokens') or 0,
                                                    usage.get('cache_creation_input_tokens') or 0)
+                if context and when and not entry.get('isSidechain'):
+                    if message.get('id') and message['id'] == self._main_id:
+                        self.main[-1] = (when, context)  # the same reply, written again with its later parts
+                    else:
+                        self.main.append((when, context))
+                    self._main_id = message.get('id')
+                    model = message.get('model')
+                    self.model = model if isinstance(model, str) and model and not model.startswith('<') else self.model
                 if self.measuring is not None and context and not entry.get('isSidechain'):
                     pre, _, ms = self.compact_sizes[self.measuring]
                     self.compact_sizes[self.measuring] = (pre, context, ms)
@@ -1046,6 +1254,12 @@ class Session:
                 if queued.get('type') == 'queued_command' and queued.get('humanTurn') and text \
                         and not text.startswith(('<', '/')):
                     self.prompts.append(when)
+                if queued.get('type') == 'hook_success' and queued.get('hookEvent') == 'SessionStart' \
+                        and re.search(r'csr-engine\S*\s+hook\s+session-start\s*$', str(queued.get('command') or '')) \
+                        and isinstance(queued.get('content'), str) and queued['content'].strip():
+                    # what CSR told Claude: the newest wins, a resume or a compaction injects again
+                    self.told = dict(at=when, source=str(queued.get('hookName') or '').partition(':')[2] or 'startup',
+                                     text=queued['content'])
             elif kind == 'system' and entry.get('subtype') == 'compact_boundary' and when:
                 self.compacts.append(when)
                 meta = entry.get('compactMetadata') if isinstance(entry.get('compactMetadata'), dict) else {}
@@ -1090,9 +1304,12 @@ class Session:
         replies = sorted(self.replies.values())
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
                     compacts=sorted(self.compacts), compact_sizes=self.compact_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
-                    lost=lost_found(self.summaries, self.typed, self.carried or (), project_of(self.path)),
+                    lost=lost_found(self.summaries, self.typed, self.carried or (),
+                                    project_of(self.path)),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
-                    files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last))
+                    files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last),
+                    main=list(self.main), turn_end=self.turn_end, model=self.model, told=self.told,
+                    transcript=bool(self.path))
 
 
 class Clock:
@@ -1191,13 +1408,17 @@ SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆', story='§')  # where no pictures are drawn
 SECTION['coach'], GLYPH['coach'] = 'ctx', '→'  # How Claude read you
-DARK = (PIGMENT['payne'], PIGMENT['night'])  # the masthead's ground, from its first row (Claude's own status
-# line) to its last (the gauges' legend), each row a step darker in CIELAB; payne sits clear of a dark
-# terminal's own ground (herdr's is 40), so the masthead keeps its edge.
+DARK = (PIGMENT['payne'], PIGMENT['payne'])  # the masthead's ground: one flat payne, clear of a dark terminal's
+# own ground (herdr's is 40), so the masthead keeps its edge. dark_steps still blends the pair, for the pages
+# whose title rows step down.
 ON_DARK = dict(text=PIGMENT['chalk'], label=blend(PIGMENT['chalk'], PIGMENT['payne'], 0.45), you=PIGMENT['chalk'],
                ctx=PIGMENT['indigo_lit'], learn=PIGMENT['viridian_lit'], recall=PIGMENT['viridian_lit'],
                turn=PIGMENT['vermilion_lit'], dream=PIGMENT['ochre_lit'], asked=PIGMENT['violet_lit'],
                rule=(255, 255, 255, 40))
+# The cockpit's inks: a normal state is dim and only a deviation lights. Data is the one white; advisory (cyan),
+# amber and red are the three degrees of attention.
+SEV = dict(normal=ON_DARK['label'], data=ON_DARK['text'], advisory=PIGMENT['indigo_lit'],
+           amber=PIGMENT['ochre_lit'], red=PIGMENT['vermilion_lit'])
 TINT = 0.15  # an opened row: its section's ink at this strength on the paper
 HEAD = 0.10  # a section's heading row
 ROW = 0.07  # its items, one tint for all of them; deep enough to read as a card, still under HEAD
@@ -1535,6 +1756,75 @@ def tinted(line, back):
     return back + line.replace(OFF, OFF + back) + '\x1b[K' + OFF
 
 
+def sgr(name):
+    return '\x1b[38;2;%d;%d;%dm' % SEV[name][:3]
+
+
+def slot(text, name):
+    """One slot of the cockpit: its text in the ink of its severity."""
+    return sgr(name) + text + OFF
+
+
+def tape_row(g, width):
+    """Row 1, the context tape: CTX, a bar over 0 to CTX_RED with the post-compaction floor as a bug, the
+    tokens against the window, and the growth per turn. The trend goes first when it is too wide, then the window."""
+    ctx, floor, trend = g['ctx'], g['floor'], g.get('trend')
+    tokens, size = ctx['tokens'], ctx['size']
+    n = max(8, min(24, width - 26))
+    filled = min(n, round(tokens / CTX_RED * n)) if tokens else 0
+    fb = min(n, int(floor['tokens'] / CTX_RED * n))
+    cells = '█' * filled + '░' * (n - filled)
+    arrow = f"{'▲' if trend > 0 else '▼'}{short(abs(trend))}/t" if trend is not None and abs(trend) >= 1000 else ''
+    values = ['--'] if tokens is None else [f'{short(tokens)}/{short(size)}', short(tokens)] if size else [short(tokens)]
+    base = 5 + n + 3 + 1  # ' CTX ', the bar with its ends and its bug, a space
+    tries = ([(values[0], arrow)] if arrow else []) + [(v, '') for v in values]
+    value, tail = next(((v, t) for v, t in tries if base + len(v) + (1 + len(t) if t else 0) <= width), tries[-1])
+    sev = ctx['sev']
+    bar = slot('▕' + cells[:fb], sev) + slot('│', 'data') + slot(cells[fb:] + '▏', sev)  # the bug in the data ink
+    ink_ = 'normal' if tokens is None else 'data' if sev == 'normal' else sev
+    return ' ' + slot('CTX ', 'normal') + bar + ' ' + slot(fit(value, max(1, width - base)), ink_) \
+        + (' ' + slot(tail, 'normal') if tail else '')
+
+
+def gauge_row(g, width):
+    """Row 2: compaction payback (the timer while one runs) at the left, the cache at the right. Too wide, the
+    range goes, then the bar, then the right slot."""
+    cache = g['cache']
+    right = (cache['text'], cache['sev'])
+    info = g.get('compacting')
+    lefts = [compacting_slot(info), compacting_slot(info, True, False), compacting_slot(info, False)] if info \
+        else [(g['payback']['text'], g['payback']['sev'])]
+    for text, sev in lefts:
+        if 1 + len(text) + 1 + len(right[0]) <= width:
+            return ' ' + slot(text, sev) + ' ' * (width - 1 - len(text) - len(right[0])) + slot(*right)
+    text, sev = lefts[-1]
+    return ' ' + slot(fit(text, width - 1), sev)
+
+
+def quota_row(g, width):
+    """Row 3: the plan's windows, riskier first, and STS at the right when CSR runs without something. Too
+    wide, the second window goes, then the first one's reset time; STS never does."""
+    quotas, sts = g['quotas'], g.get('sts') or {}
+    mark = 'STS' if sts.get('sev') else ''
+    reserve = len(mark) + 1 if mark else 0
+    short_ = lambda q: q['text'].split(' ↻')[0]
+    tries = [[(q['text'], q['sev']) for q in quotas], [(q['text'], q['sev']) for q in quotas[:1]],
+             [(short_(q), q['sev']) for q in quotas[:1]]]
+    pieces = next((p for p in tries if 1 + len('  '.join(t for t, _ in p)) + reserve <= width),
+                  [(fit(short_(q), max(1, width - 1 - reserve)), q['sev']) for q in quotas[:1]])
+    line = ' ' + '  '.join(slot(t, sev) for t, sev in pieces)
+    if not mark:
+        return line
+    used = 1 + len('  '.join(t for t, _ in pieces))
+    return line + ' ' * max(1, width - used - len(mark)) + slot(mark, sts['sev'])
+
+
+def cockpit(g, width):
+    """The masthead: exactly 3 strings, each ' ' + slots, no wider than width, each slot in the ink of its
+    severity (SEV): the tape, payback and cache, the quotas and STS."""
+    return [tape_row(g, width), gauge_row(g, width), quota_row(g, width)]
+
+
 class Lines(list):
     """Lines for the screen, and what a click on each one acts on."""
 
@@ -1736,9 +2026,13 @@ LANE = 9  # the lanes' labels, then their picture
 
 def lanes_legend(s, width, dark=False):
     hue = lambda name: '\x1b[38;2;%d;%d;%dm' % (ON_DARK if dark else INK)[name][:3]
-    parts = [(hue('learn') + '▮', f"{short(len(s['learned']['chunks']))} learned"),
-             (hue('recall') + '↑', f"{handoffs(s['gave']['recalls']) + len(s['gave']['carried'])} handed to Claude"),
-             (hue('asked') + '●', f"{len(s['asked'])} asked")]
+    counts = (len(s['learned']['chunks']), handoffs(s['gave']['recalls']) + len(s['gave']['carried']), len(s['asked']))
+    parts = [(hue('learn') + '▮', f'{short(counts[0])} learned'),
+             (hue('recall') + '↑', f'{counts[1]} handed to Claude'),
+             (hue('asked') + '●', f'{counts[2]} asked')]
+    parts = [part for part, n in zip(parts, counts) if n]  # a zero would measure the format, not the session
+    if not parts:
+        return ''
     while sum(2 + len(text) + 2 for _, text in parts) - 2 > width and len(parts) > 1:
         parts.pop()
     words = hue('text') if dark else ink('quiet')
@@ -2058,8 +2352,9 @@ def page_main(data, s, now, ui=None):
       Handed to Claude  what CSR's memory gave Claude this session: past sessions and notes
       How Claude read you  where Claude read a short word of yours one way, so you can check it
       Your rules        corrections you typed yourself in this repo
-    Above them, the session's gauges (and the compaction strip while one runs): your prompts, Claude's context and CSR's memory at work. Code that
-    changed since your past sessions stays one key away (l)."""
+    Above them, the cockpit: three rows of gauges (context, compaction payback and cache, the plan's quotas and CSR's
+    status; the compaction timer takes row 2 while one runs). The rest of the session's facts are one key away (i).
+    Code that changed since your past sessions stays one key away too (l)."""
     root = data['repo']
     con = connect()
     try:
@@ -2141,11 +2436,6 @@ def page_main(data, s, now, ui=None):
                            detail=(passive[:4] + [f'Claude asked: {q}' for q in queries[:2]]) or ['Nothing left to list.'],
                            send=one_line('CSR handed you these this session: ' + '; '.join(passive[:5]))))
 
-    clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
-    facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
-    facts += [phrase for phrase in [payback_phrase(s)] if phrase]
-    if s['compacts']:
-        facts.append(f"{len(s['compacts'])} compacts")
     story, told = data.get('story'), []
     if story:
         told.append(dict(key='story', title=story['now'], open_title=story['text'], lines=6, open_lines=30, detail=[],
@@ -2172,9 +2462,10 @@ def page_main(data, s, now, ui=None):
     sections[2:2] = lost_sections(s, now)
     if starred:  # a question waiting on you comes before the story
         sections[:2] = sections[1::-1]
-    return dict(head=dict(facts=' · '.join(facts), session=s if s.get('learned') else None,
-                          status=data.get('claude_line'), mast=masthead(data.get('claude_fields'), now)),
-                quiet='Nothing to report yet. A section shows here once CSR has something for it.',
+    head = dict(gauges=gauges(data.get('claude_fields'), data.get('claude_at'), s, now, data.get('limits'),
+                              data.get('sts'), data.get('compacting')),
+                session=s if s.get('learned') else None, status=data.get('claude_line'))
+    return dict(head=head, quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=sections)
 
 
@@ -2258,19 +2549,21 @@ def page_lines(page, width, rows, ui):
     between. Every section keeps its heading and first row; the room left goes to the earlier ones first."""
     head, s = page['head'], page['head'].get('session')
     label = '\x1b[38;2;%d;%d;%dm' % ON_DARK['label']
-    top = [' ' + line for line in ansi_wrap(head.get('status') or '', width - 1, 2)]  # Claude's status line
-    top[:0] = compact_rows(head.get('compacting'), width)  # while a compaction runs
-    if head.get('title'):
-        top.append(' ' + BOLD + fit(head['title'], width - 1) + OFF)
-    top.append(' ' + fit_pieces(head['facts'], width - 1))
-    top += mast_rows(head.get('mast'), width - 1)  # the cache clock and the plan's quotas
     lanes = None
-    if s:
-        if PIXELS and width - LANE > 8:
-            lanes = len(top)
-            top += [' ' + label + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')]
-        top.append('  ' + lanes_legend(s, width - 2, dark=True))
-    grounds = dark_steps(len(top))  # one gradient, top row to bottom
+    if head.get('gauges'):  # the cockpit: three rows, nothing else
+        top = cockpit(head['gauges'], width)
+    else:  # the l page: its title and facts
+        top = [' ' + line for line in ansi_wrap(head.get('status') or '', width - 1, 2)]  # Claude's status line
+        top[:0] = compact_rows(head.get('compacting'), width)  # while a compaction runs
+        if head.get('title'):
+            top.append(' ' + BOLD + fit(head['title'], width - 1) + OFF)
+        top.append(' ' + fit_pieces(head['facts'], width - 1))
+        if s:
+            if PIXELS and width - LANE > 8:
+                lanes = len(top)
+                top += [' ' + label + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')]
+            top.append('  ' + lanes_legend(s, width - 2, dark=True))
+    grounds = dark_steps(len(top))  # one flat ground
     out = Lines([on_dark(line, ground) for line, ground in zip(top, grounds)])
     out.heads = []
     out.lanes = None if lanes is None else (lanes, grounds[lanes:lanes + 3])  # the gauges' row, their grounds
@@ -2503,8 +2796,13 @@ def compact_rows(info, width):
 
 
 def with_compacting(page, data):
-    """The page with the compaction strip in its head, for the masthead to draw."""
-    page['head']['compacting'] = data.get('compacting')
+    """The page with the compaction in its head, for the masthead to draw: the timer takes row 2."""
+    info = data.get('compacting')
+    page['head']['compacting'] = info
+    gauge = page['head'].get('gauges')
+    if gauge and info:
+        page['head']['gauges'] = dict(gauge, compacting=info,
+                                      payback=dict(zip(('text', 'sev'), compacting_slot(info))))
     return page
 
 
@@ -2685,6 +2983,134 @@ def threads_keys(pane, keys):
     return False
 
 
+PAPER_INK = dict(normal='you', data='you', advisory='ctx', amber='dream', red='turn')  # SEV, on the paper
+
+
+def reset_text(resets, now):
+    try:
+        return datetime.fromtimestamp(resets).strftime('%H:%M' if resets - now < 86400 else '%a %H:%M')
+    except (OverflowError, OSError, ValueError):
+        return ''
+
+
+def info_rows(data, s, now, width=60):
+    """The i page's checklist, [(label, value, sev)], its values laid for a column width cells wide: what CSR runs without, a compaction under way, the
+    model, Claude's own status line, the context, prompts, compactions, the cache, the quotas, the daemon and
+    the recap. A row with no value is left out, except MODEL and RECAP; a row with an empty label goes
+    under the one above it."""
+    data, s = data or {}, s or {}
+    g = gauges(data.get('claude_fields'), data.get('claude_at'), s, now, data.get('limits'), data.get('sts'),
+               data.get('compacting'))
+    rows = [(label, value, sev) for label, value, sev in g['sts'].get('inop') or []]
+    if data.get('compacting'):
+        lines = [COLOUR.sub('', row).strip() for row in compact_rows(data['compacting'], width)]
+        rows += [('COMPACTING', lines[0], g['payback']['sev'])] + [('', line, None) for line in lines[1:]]
+    rows.append(('MODEL', one_line(s.get('model') or '--', 60), None))
+    if data.get('claude_line'):
+        rows.append(('STATUS LINE', data['claude_line'], None))
+    ctx, main = g['ctx'], s.get('main') or []
+    if ctx['tokens']:
+        measured = len([r for r in s.get('compact_sizes') or () if isinstance(r[1], (int, float)) and r[1] > 0])
+        rows.append(('CONTEXT', ' · '.join(x for x in (
+            short(ctx['tokens']) + (f" of {short(ctx['size'])}" if ctx['size'] else ''),
+            f'peak {short(max(c for _, c in main))}' if main else '',
+            f"floor {short(g['floor']['tokens'])} " + (f'(last {min(FLOOR_ROWS, measured)})' if g['floor']['measured'] else '(guess)'))
+            if x), ctx['sev']))
+    if s.get('prompts'):
+        clock = Clock(s['prompts'] + [r[0] for r in s.get('replies') or ()], now)
+        rows.append(('PROMPTS', f"{len(s['prompts'])} · {span(clock.total)} active", None))
+    if s.get('compacts'):
+        rows.append(('COMPACTS', f"{len(s['compacts'])}" + ('' if data.get('compacting') else f" · {g['payback']['text']}"), None))
+    if g['cache']['text'] != 'CACHE --':
+        rows.append(('CACHE', g['cache']['long'], g['cache']['sev']))
+    for q in g['quotas']:
+        if q['stale']:
+            rows.append((f"{q['code']} LIMIT", '-- · its window rolled over', q['sev']))
+        elif q['used'] is not None:
+            when = reset_text(q['resets'], now) if q['resets'] else ''
+            rows.append((f"{q['code']} LIMIT", f"{round(q['used'])}%" + (f' ↻ {when}' if when else ''), q['sev']))
+    daemon = g['sts'].get('daemon')
+    if daemon and daemon.get('up'):
+        since = f" · since {datetime.fromtimestamp(daemon['since']).strftime('%H:%M')}" if daemon.get('since') else ''
+        rows.append(('DAEMON', f"UP · pid {daemon['pid']}{since}", None))
+    told = s.get('told')
+    if told:
+        rows.append(('RECAP', f"INJECTED {datetime.fromtimestamp(told['at']).strftime('%H:%M')} ({told['source']})", None))
+    elif not s.get('transcript', bool(s.get('prompts') or s.get('replies'))):
+        rows.append(('RECAP', 'AFTER YOUR FIRST PROMPT', None))
+    else:
+        rows.append(('RECAP', 'NONE', None))
+    return rows
+
+
+def info_pad(width):
+    """Where the checklist's values start: the labels and their dots run out to here."""
+    return min(22, max(14, width // 2 - 2))
+
+
+def info_line(label, value, width, sev=None, raw=False):
+    """One checklist row: ' LABEL ' and dots out to a fixed column, then the value, wrapped under itself."""
+    pad = info_pad(width)
+    room = max(8, width - pad - 1)
+    colour = ink(PAPER_INK[sev]) if sev else ink('you')
+    if not label:
+        return [' ' * (pad + 1) + colour + piece + OFF for piece in wrap(one_line(value, 400), room, 3)]
+    head = ink('quiet') + f' {label} ' + ink('faint') + '.' * max(2, pad - len(label) - 2) + OFF
+    if raw:  # Claude's status line, its own colours kept
+        return [head + ' ' + ansi_fit(value, room) + OFF]
+    pieces = wrap(one_line(value, 400), room, 3)
+    return [head + ' ' + colour + pieces[0] + OFF] + [' ' * (pad + 1) + colour + piece + OFF for piece in pieces[1:]]
+
+
+def draw_info(data, s, cols, rows, ui, top=0):
+    """The i page: a dark title and one dark facts row, the checklist on paper (challenge ...... response),
+    then the session's lanes when there is a session to draw. Scrolled by top; (lines, pictures, top)."""
+    width = max(24, cols - 1)
+    now, s = time.time(), s or {}
+    facts = ' · '.join(x for x in ((s.get('id') or '')[:8], one_line(s.get('title') or '', 80)) if x)
+    head = [' ' + BOLD + 'Session info' + OFF, ' ' + fit(facts, width - 1)]
+    out = Lines([on_dark(line, ground) for line, ground in zip(head, dark_steps(len(head)))])
+    body, pictures = Lines(), []
+    for label, value, sev in info_rows(data, s, now, max(8, width - info_pad(width) - 1)):
+        body.put(info_line(label, value, width, sev, raw=label == 'STATUS LINE'))
+    if s.get('prompts') or s.get('replies'):  # a session with nothing yet has no lanes and no counters
+        body.put([''])
+        if PIXELS and width - LANE > 8 and s.get('learned'):
+            try:
+                png = session_png(s, width - LANE, cell_size(), now)
+                pictures.append((len(body), LANE, width - LANE, 3, png))
+                body.put([' ' + ink('faint') + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')])
+            except Exception:  # no picture is better than no page
+                pass
+        suffix = ' · this session'
+        legend = lanes_legend(s, width - 2 - len(suffix)) if s.get('learned') else ''
+        if legend:
+            body.put(['  ' + legend + ink('quiet') + suffix + OFF])
+    body.put([''] + [' ' + ink('faint') + fit_pieces('CTX context · ♻ compact payback · ↻ resets · STS status', width - 2) + OFF])
+    shown, kept, top = window(body, pictures, rows - len(out), top)
+    out.extend(shown)
+    return out, [(r + len(head), c, w, h, png) for r, c, w, h, png in kept], top
+
+
+def info_keys(pane, keys):
+    """The i page's keys: i opens it, i or Esc goes back, j and k scroll; True when the screen must redraw."""
+    if 'i' in keys and pane.view != 'info':
+        pane.view, pane.open, pane.info_top = 'info', None, 0
+        return True
+    if pane.view != 'info':
+        return False
+    if keys == '\x1b' or 'i' in keys:
+        pane.view, pane.open = 'main', None
+        return True
+    step = 3 if any(k in keys for k in ('j', '\x1b[b')) else -3 if any(k in keys for k in ('k', '\x1b[a')) else 0
+    if ' ' in keys:
+        step = 12
+    if step:
+        pane.info_top = max(0, pane.info_top + step)
+        return True
+    return False
+
+
 TALL = 600  # the rows a scrolled main page is laid out in: every section at its whole length
 WHEEL = 3  # rows one wheel notch or one j/k moves
 
@@ -2716,20 +3142,31 @@ def legend_parts(view, width, held=None):
     """The bottom row, and where each label sits on it: (text, [(first col, past last col, key)])."""
     if held:
         return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF, []
-    keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('f', 'every lost thread'), ('q', 'close')] \
-        if view == 'main' else [('d', 'back')] + ([('j/k', 'scroll')] if view in ('summary', 'threads') else []) + [('q', 'close')]
-    marks = '' if view in ('main', 'summary', 'threads') else '~ changed  - removed  + back   '
+    keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('f', 'every lost thread'),
+            ('i', 'session info'), ('q', 'close')] \
+        if view == 'main' else [('d', 'back')] + ([('j/k', 'scroll')] if view in ('summary', 'threads', 'info') else []) + [('q', 'close')]
+    marks = '' if view in ('main', 'summary', 'threads', 'info') else '~ changed  - removed  + back   '
     words = [(key, said) for key, said in keys]
-    while len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width and len(words[0][1]) > 7:
-        words[0] = (words[0][0], words[0][1].rsplit(' ', 1)[0])
-    if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width:  # still too wide: 's summary'
-        words = [words[0]] + [(key, said.rsplit(' ', 1)[-1]) for key, said in words[1:]]
-    sep = '   ' if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) <= width else '  '  # still tight: closer
+    wide = lambda gap: len(marks) + sum(len(k) + len(w) + 1 + gap for k, w in words) - gap + 1
+    if view == 'main':  # one label at a time, from the left, until the row fits: l 'changes', s 'summary', f 'thread', i 'info'
+        for at, label in ((0, 'changes since your'), (0, 'changes since'), (0, 'changes'), (1, 'summary'), (2, 'thread'), (3, 'info')):
+            if wide(2) <= width:
+                break
+            words[at] = (words[at][0], label)
+    else:
+        while len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width and len(words[0][1]) > 7:
+            words[0] = (words[0][0], words[0][1].rsplit(' ', 1)[0])
+        if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width:  # still too wide: 's summary'
+            words = [words[0]] + [(key, said.rsplit(' ', 1)[-1]) for key, said in words[1:]]
+    sep = '   ' if (wide(3) if view == 'main' else len(marks) + sum(len(k) + len(w) + 4 for k, w in words)) <= width else '  '
     total = lambda: 1 + len(marks) + sum(len(k) + 1 + len(w) for k, w in words) + len(sep) * (len(words) - 1)
     if total() > width:
         marks = ''  # the log's marks go before any key does
     while len(words) > 1 and total() > width:
-        words.pop(-2)  # narrower still: the keys before close go, right to left
+        # narrower still: f goes first, then s, then i (the keys least needed to find a page), then scroll
+        at = next((k for name in ('f', 's', 'i', 'j/k') for k, (key, _) in enumerate(words) if key == name and 0 < k < len(words) - 1),
+                  len(words) - 2)
+        words.pop(at)
     if total() > width:
         words = [(words[0][0], fit(words[0][1], max(1, width - len(words[0][0]) - 2)))]
     shown = sep.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
@@ -2741,7 +3178,7 @@ def legend_parts(view, width, held=None):
 
 
 def press(pane, key):
-    """What a page key does, for a click on its label: l, s and f open their pages, d goes back. Scrolling and
+    """What a page key does, for a click on its label: l, s, f and i open their pages, d goes back. Scrolling and
     close stay on the keyboard, so a stray click never closes the pane."""
     if key == 'l' or key == 'd':
         pane.view, pane.open = ('log' if key == 'l' else 'main'), None
@@ -2749,6 +3186,8 @@ def press(pane, key):
         summary_keys(pane, 's')
     elif key == 'f':
         threads_keys(pane, 'f')
+    elif key == 'i':
+        info_keys(pane, 'i')
 
 
 def herdr(*argv):
@@ -2794,6 +3233,7 @@ class Pane:
         self.folds = set()  # folded rows opened with a click
         self.held = None  # why an edit to this file was not loaded, until one is
         self.threads_top = 0  # the f page's first line shown
+        self.info_top = 0  # the i page's first line shown
         self.main_top = 0  # the main page's first line shown, once scrolled or a row is opened
         self.anchor = None  # (row key, screen row) a click just opened: it stays where it was clicked
         self.tall = False  # the main page keeps its scrolled layout until Esc or another page
@@ -2810,13 +3250,15 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
-            self.data['claude_fields'] = claude_fields(self.session and self.session.id, now)
+            self.data['claude_fields'], self.data['claude_at'] = kept_status(self.session and self.session.id, now)
+            self.data['limits'] = account_limits(now)
+            self.data['sts'] = csr_status(now)
             self.data['compacting'] = compacting_info(self.session and self.session.id, now, self.data)
             if self.view == 'summary':
                 self.data['summary'] = newest_summary(self.session and self.session.path)
             force = compaction_ended(self, self.data['compacting']) or force  # the marker went: redraw at once
             self.data['readings'] = how_claude_read(self.session and self.session.id)
-            s = self.session.load() if self.session and self.view in ('main', 'threads') else None
+            s = self.session.load() if self.session and self.view in ('main', 'threads', 'info') else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
             said = SETUP if not os.path.exists(DB) else f'could not read csr-engine: {error}'
             sys.stdout.write(f"\x1b_Ga=d,d=A\x1b\\\x1b[H\x1b[2J{BOLD}CSR{OFF}\n{DIM}"
@@ -2832,10 +3274,13 @@ class Pane:
         ui = dict(open=self.open, sent=self.sent, answered=self.answered, folds=self.folds)
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
                           self.answered,
-                          self.data.get('claude_line'), masthead(self.data.get('claude_fields'), now),
+                          self.data.get('claude_line'),
+                          [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
+                           self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
                           self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
+                          self.info_top,
                           s and [(t['key'], t['hidden'], t['state']) for t in s['lost']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
@@ -2856,6 +3301,8 @@ class Pane:
             lines, pictures = draw_summary(self.data, cols, rows, ui)
         elif self.view == 'threads':
             lines, pictures, self.threads_top = draw_threads(self.data, s, cols, rows, ui, self.threads_top)
+        elif self.view == 'info':
+            lines, pictures, self.info_top = draw_info(self.data, s, cols, rows, ui, self.info_top)
         else:
             lines, pictures = draw_log(self.data, cols, rows, ui)
         self.acts = {row: act for row, act in getattr(lines, 'acts', {}).items() if row < rows - 1}
@@ -2877,6 +3324,8 @@ class Pane:
             self.data['summary']['top'] = max(0, self.data['summary']['top'] + step)
         elif self.view == 'threads':
             self.threads_top = max(0, self.threads_top + step)
+        elif self.view == 'info':
+            self.info_top = max(0, self.info_top + step)
         elif self.view == 'main':
             self.main_top = max(0, self.main_top + step)
 
@@ -3407,7 +3856,7 @@ def watch(root, limit, session_id, agent=None):
                 break
             if keys == '\x1b':
                 pane.open, pane.tall, pane.main_top, redraw['now'] = None, False, 0, True
-            if summary_keys(pane, keys) or threads_keys(pane, keys):
+            if summary_keys(pane, keys) or threads_keys(pane, keys) or info_keys(pane, keys):
                 redraw['now'] = True
             elif pane.view == 'main' and any(k in keys for k in ('j', 'k', ' ', '\x1b[a', '\x1b[b')):
                 pane.scroll(-WHEEL if any(k in keys for k in ('k', '\x1b[a')) else 4 * WHEEL if ' ' in keys else WHEEL)
@@ -3498,7 +3947,9 @@ def main():
         now, cell = time.time(), (16, 34)
         data = load(root, args.limit, args.sid)
         data.update(look=last_look(root), chapter=last_chapter(root, args.sid), story=session_story(args.sid),
-                    claude_fields=claude_fields(args.sid, now), readings=how_claude_read(args.sid))
+                    readings=how_claude_read(args.sid), limits=account_limits(now), sts=csr_status(now))
+        data['claude_fields'], data['claude_at'] = kept_status(args.sid, now)
+        data['claude_line'] = claude_status(args.sid, now)
         os.makedirs(args.png, exist_ok=True)
         if args.sid:
             s = Session(args.sid).load()

@@ -1,4 +1,4 @@
-"""The masthead's clocks: cache, plan quotas and compaction payback, and the wrapper that keeps their fields.
+"""The cockpit masthead: context tape, compaction payback, cache, plan quotas and STS, and the wrapper that keeps their fields.
 python3 -I -m unittest discover -s tests -p 'test_*.py'"""
 import importlib.util
 import json
@@ -22,120 +22,6 @@ PLAIN = re.compile(r'\x1b\[[0-9;]*m|\x1b\[K')
 
 def plain(lines):
     return [PLAIN.sub('', line) for line in lines]
-
-
-class CacheClock(unittest.TestCase):
-    def test_a_warm_cache_says_how_long_it_stays_warm(self):
-        got = pane.cache_clock(dict(warm=True, ttl='1h', expires_at=NOW + 41 * 60 + 20), NOW)
-        self.assertEqual(got, ('cache warm · 41m left', None))
-
-    def test_a_cache_in_its_last_five_minutes_is_inked_as_a_warning(self):
-        self.assertEqual(pane.cache_clock(dict(warm=True, expires_at=NOW + 150), NOW), ('cache warm · 2m left', 'dream'))
-        self.assertEqual(pane.cache_clock(dict(warm=True, expires_at=NOW + 20), NOW)[0], 'cache warm · under 1m left')
-
-    def test_a_cold_cache_says_what_the_next_turn_re_reads(self):
-        cold = dict(warm=False, ttl='1h', expires_at=NOW - 10, recache_tokens_if_cold=152_300)
-        self.assertEqual(pane.cache_clock(cold, NOW), ('cache cold · re-reads ~152k', 'turn'))
-        self.assertEqual(pane.cache_clock(dict(warm=False), NOW), ('cache cold', 'turn'))
-
-    def test_an_expiry_that_has_passed_beats_a_warm_flag_the_status_line_wrote_earlier(self):
-        got = pane.cache_clock(dict(warm=True, expires_at=NOW - 5, recache_tokens_if_cold=90_000), NOW)
-        self.assertEqual(got[0], 'cache cold · re-reads ~90k')
-
-    def test_a_warm_cache_without_an_expiry_shows_its_ttl_only(self):
-        self.assertEqual(pane.cache_clock(dict(warm=True, ttl='5m'), NOW), ('cache warm · 5m', None))
-
-    def test_missing_or_odd_fields_show_nothing_and_never_raise(self):
-        for odd in (None, {}, [], 'warm', dict(ttl='1h'), dict(warm=None), dict(warm=True, expires_at=[1])):
-            self.assertIn(pane.cache_clock(odd, NOW), (None, ('cache warm', None)), odd)
-        self.assertIsNone(pane.cache_clock({}, NOW))
-
-    def test_numbers_no_clock_can_show_never_raise(self):
-        nan, inf = float('nan'), float('inf')
-        self.assertEqual(pane.cache_clock(dict(warm=True, expires_at=nan), NOW), ('cache warm', None))
-        self.assertEqual(pane.cache_clock(dict(warm=True, expires_at=1e20), NOW), ('cache warm', None))
-        self.assertEqual(pane.cache_clock(dict(warm=True, expires_at=NOW + 9 * 86400), NOW), ('cache warm', None))
-        for cost in (nan, inf, -5, 0):
-            self.assertEqual(pane.cache_clock(dict(warm=False, recache_tokens_if_cold=cost), NOW), ('cache cold', 'turn'))
-        for used, at in ((nan, NOW + 60), (inf, NOW + 60), (95, 1e20), (95, inf), (95, -5)):
-            got = pane.quota_pieces(dict(five_hour=dict(used_percentage=used, resets_at=at)), NOW)
-            self.assertIn(got, ([], [('5h 95%', 'turn')]), (used, at))
-
-
-class Quotas(unittest.TestCase):
-    def limits(self, five, seven, five_at=NOW + 7200, seven_at=NOW + 3 * 86400):
-        return dict(five_hour=dict(used_percentage=five, resets_at=five_at),
-                    seven_day=dict(used_percentage=seven, resets_at=seven_at))
-
-    def test_two_windows_in_percent(self):
-        self.assertEqual(pane.quota_pieces(self.limits(34.2, 12), NOW), [('5h 34%', None), ('7d 12%', None)])
-
-    def test_above_seventy_percent_the_reset_time_shows(self):
-        got = pane.quota_pieces(self.limits(82, 12), NOW)
-        reset = datetime.fromtimestamp(NOW + 7200).strftime('%H:%M')
-        self.assertEqual(got[0], (f'5h 82% resets {reset}', 'dream'))
-        self.assertEqual(got[1], ('7d 12%', None))
-        week = pane.quota_pieces(self.limits(10, 91), NOW)[1]
-        self.assertEqual((week[1], week[0].startswith('7d 91% resets ')), ('turn', True))
-        self.assertRegex(week[0], r'resets \w{3} \d\d:\d\d$')  # a day or more away names the weekday
-
-    def test_exactly_seventy_percent_shows_no_reset(self):
-        self.assertEqual(pane.quota_pieces(self.limits(70, 70), NOW), [('5h 70%', None), ('7d 70%', None)])
-
-    def test_a_window_that_has_rolled_over_since_is_left_out(self):
-        got = pane.quota_pieces(self.limits(95, 12, five_at=NOW - 60), NOW)
-        self.assertEqual([text for text, _ in got], ['7d 12%'])
-
-    def test_one_window_alone_and_absent_fields(self):
-        only = dict(seven_day=dict(used_percentage=41))
-        self.assertEqual(pane.quota_pieces(only, NOW), [('7d 41%', None)])
-        for odd in (None, {}, 'x', dict(five_hour=None), dict(five_hour=dict(resets_at=1)),
-                    dict(five_hour=dict(used_percentage='lots'))):
-            self.assertEqual(pane.quota_pieces(odd, NOW), [], odd)
-
-    def test_resets_at_may_be_a_date_string(self):
-        got = pane.quota_pieces(dict(five_hour=dict(used_percentage=80, resets_at='2027-01-15T08:00:00Z')),
-                                pane.epoch('2027-01-15T06:00:00Z'))
-        self.assertTrue(got[0][0].startswith('5h 80% resets '))
-
-
-class MastheadRows(unittest.TestCase):
-    FIELDS = dict(prompt_cache=dict(warm=True, ttl='1h', expires_at=NOW + 41 * 60 + 5),
-                  rate_limits=dict(five_hour=dict(used_percentage=34, resets_at=NOW + 3600),
-                                   seven_day=dict(used_percentage=12, resets_at=NOW + 86400 * 3)))
-
-    def test_the_rows_in_order_and_nothing_when_fields_are_missing(self):
-        rows = pane.masthead(self.FIELDS, NOW)
-        self.assertEqual([[t for t, _ in row] for row in rows], [['cache warm · 41m left'], ['5h 34%', '7d 12%']])
-        self.assertEqual(pane.masthead({}, NOW), [])
-        self.assertEqual(pane.masthead(None, NOW), [])
-        self.assertEqual(pane.masthead(dict(rate_limits='x', prompt_cache=3), NOW), [])
-        only_limits = pane.masthead(dict(rate_limits=self.FIELDS['rate_limits']), NOW)
-        self.assertEqual(len(only_limits), 1)
-
-    def test_rows_fit_the_pane_dropping_pieces_right_to_left(self):
-        rows = pane.masthead(self.FIELDS, NOW)
-        self.assertEqual(plain(pane.mast_rows(rows, 45)), [' cache warm · 41m left', ' 5h 34% · 7d 12%'])
-        self.assertEqual(plain(pane.mast_rows(rows, 8)), [' cache w…', ' 5h 34%'])
-        high = pane.masthead(dict(rate_limits=dict(five_hour=dict(used_percentage=90, resets_at=NOW + 600),
-                                                   seven_day=dict(used_percentage=20))), NOW)
-        wide, narrow = plain(pane.mast_rows(high, 40))[0], plain(pane.mast_rows(high, 12))[0]
-        self.assertTrue(wide.startswith(' 5h 90% resets ') and wide.endswith('· 7d 20%'))
-        self.assertEqual(narrow, ' 5h 90% rese…')
-        for width in (24, 30, 40, 46):
-            for line in plain(pane.mast_rows(rows + high, width)):
-                self.assertLessEqual(len(line), width + 1)
-
-    def test_no_rows_draw_nothing(self):
-        self.assertEqual(pane.mast_rows([], 40), [])
-        self.assertEqual(pane.mast_rows(None, 40), [])
-
-    def test_facts_drop_their_rightmost_pieces_to_fit(self):
-        facts = '12 prompts · 3h20m · compact repays in ~6t · 13 compacts'
-        self.assertEqual(pane.fit_pieces(facts, 60), facts)
-        self.assertEqual(pane.fit_pieces(facts, 42), '12 prompts · 3h20m · compact repays in ~6t')
-        self.assertEqual(pane.fit_pieces(facts, 20), '12 prompts · 3h20m')
-        self.assertEqual(pane.fit_pieces(facts, 6), '12 pr…')
 
 
 # (tokens before, context of the first request after, ms): three of this session's own compactions
@@ -163,13 +49,41 @@ class Payback(unittest.TestCase):
     def test_an_even_number_of_sizes_takes_the_middle_pair(self):
         self.assertEqual(pane.compaction_payback(POSTS[:2], 200_000)[1], (64_971 + 64_115) / 2)
 
-    def test_the_phrase_reads_the_context_since_the_last_compaction(self):
-        replies = [(100.0, 380_000, 5, 0), (400.0, 150_000, 5, 0), (500.0, 200_000, 5, 0)]
-        s = dict(compact_sizes=POSTS, compacts=[300.0], replies=replies)
-        self.assertEqual(pane.payback_phrase(s), 'compact repays in ~13t')  # the 200k reply, not the 380k before the cut
-        self.assertEqual(pane.payback_phrase(dict(s, replies=replies[:1])), '')  # nothing since the cut
-        self.assertEqual(pane.payback_phrase(dict(s, compact_sizes=[])), '')
-        self.assertEqual(pane.payback_phrase(dict(id='x')), '')
+    def test_the_payback_reads_the_status_lines_floor_and_rounding(self):
+        def js(context, posts):  # the status line's own arithmetic: the median of the last 5 posts, Math.round
+            last = sorted(posts[-5:])
+            floor = last[len(last) >> 1]
+            saved = (context - floor) * 0.1
+            turns = (floor * 2 + 4500 * 5 + context * 0.1) / saved if saved > 0 else 99
+            return turns, int(turns + 0.5)
+
+        def row2(context, sizes):
+            fields = dict(context_window=dict(total_input_tokens=context, context_window_size=1_000_000))
+            g = pane.gauges(fields, NOW, dict(compact_sizes=sizes), NOW)
+            return plain(pane.cockpit(g, 49))[1].strip()
+
+        sizes = [(None, p, None) for p in REAL_POSTS]
+        self.assertAlmostEqual(js(300_000, REAL_POSTS)[0], 8.76, places=2)
+        self.assertTrue(row2(300_000, sizes).startswith('♻ 9t'))  # the old all-posts floor (66,832) said 8
+        self.assertTrue(row2(250_000, sizes).startswith('♻ 11t'))
+        self.assertTrue(row2(250_000, []).startswith('♻~10t'))  # no history: the 65k guess, 9.59, marked ~
+        self.assertAlmostEqual((65_000 * 2 + 22_500 + 25_000) / ((250_000 - 65_000) * 0.1), 9.59, places=2)
+        for context in range(120_000, 600_001, 20_000):
+            turns, shown = js(context, REAL_POSTS)
+            want = f'♻ {shown}t' if turns <= 15 else '♻ >15t'
+            self.assertTrue(row2(context, sizes).startswith(want), (context, turns, row2(context, sizes)))
+
+    def test_a_reading_at_or_under_the_floor_never_pays_back_and_says_so(self):
+        sizes = [(None, p, None) for p in REAL_POSTS]
+        fields = dict(context_window=dict(total_input_tokens=60_000, context_window_size=1_000_000))
+        self.assertEqual(pane.gauges(fields, NOW, dict(compact_sizes=sizes), NOW)['payback']['text'], '♻ >15t')
+        self.assertEqual(pane.gauges({}, None, dict(compact_sizes=sizes), NOW)['payback']['text'], '♻ --')
+
+    def test_the_payback_ink_follows_the_turns_to_repay(self):
+        sizes = [(None, 65_000, None)]
+        sev = lambda context: pane.gauges(dict(context_window=dict(total_input_tokens=context)), NOW,
+                                          dict(compact_sizes=sizes), NOW)['payback']['sev']
+        self.assertEqual((sev(1_000_000), sev(300_000), sev(250_000)), ('red', 'amber', 'advisory'))  # 2.7, 7.8, 9.6 turns
 
     def test_a_transcript_gives_its_compaction_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,44 +108,315 @@ class Payback(unittest.TestCase):
             self.assertEqual(len(session.compacts), 4)
 
 
-def stand_in(fields, s=None):
+# the last 16 post-compaction contexts of a real session (receipt R6): floor of the last 5 = 73,120
+REAL_POSTS = [64971, 64115, 62570, 63631, 88915, 67855, 65809, 64168, 68675, 69778, 64700, 69746, 61437, 77136,
+              80254, 73120]
+
+
+def sgr(name):
+    return '\x1b[38;2;%d;%d;%dm' % pane.SEV[name][:3]
+
+
+def session(**more):
+    return dict(dict(id='sess-now', prompts=[], replies=[], compacts=[], compact_sizes=[], main=[], remembered=[],
+                     gave=dict(recalls=[], carried=[], dreams=[]), project='csr-engine'), **more)
+
+
+def fields_of(tokens=None, size=1_000_000, cache=None, limits=None):
+    out = {}
+    if tokens is not None:
+        out['context_window'] = dict(total_input_tokens=tokens, context_window_size=size)
+    if cache is not None:
+        out['prompt_cache'] = cache
+    if limits is not None:
+        out['rate_limits'] = limits
+    return out
+
+
+def limits_of(five, seven, five_at=NOW + 7200, seven_at=NOW + 3 * 86400):
+    return dict(five_hour=dict(used_percentage=five, resets_at=five_at),
+                seven_day=dict(used_percentage=seven, resets_at=seven_at))
+
+
+class Cockpit(unittest.TestCase):
+    def rows(self, fields=None, s=None, width=49, **more):
+        g = pane.gauges(fields, None, s or session(), NOW, **more)
+        return pane.cockpit(g, width)
+
+    def test_the_tape_reads_the_context_against_the_window_with_the_floor_bug(self):  # A1
+        fields = fields_of(87_724)
+        rows = self.rows(fields, session(compact_sizes=POSTS))
+        self.assertEqual(plain(rows)[0], ' CTX ▕███│██' + '░' * 18 + '▏ 88k/1M')
+        bare = plain(self.rows({}))[0]
+        self.assertEqual(bare, ' CTX ▕░░░│' + '░' * 20 + '▏ --')  # no data: '--', the 65k guess for the bug
+        # the bug is in the data ink, the rest of the bar in the severity's ink
+        self.assertIn(sgr('data') + '│' + pane.OFF, rows[0])
+        self.assertIn(sgr('normal') + '▕███' + pane.OFF, rows[0])
+
+    def test_the_tape_lights_amber_at_100k_and_red_at_400k_and_pegs_the_bar(self):
+        amber = self.rows(fields_of(150_000))[0]
+        self.assertIn(sgr('amber') + '▕', amber)
+        red = self.rows(fields_of(432_000))[0]
+        self.assertIn(sgr('red') + '▕', red)
+        self.assertEqual(plain([red])[0].count('█'), 23)  # past the full scale: the bar is full, the value exact
+        self.assertTrue(plain([red])[0].endswith('432k/1M'))
+
+    def test_the_floor_is_the_median_of_the_last_five_posts(self):  # A2
+        self.assertEqual(pane.floor_of([(None, p, None) for p in REAL_POSTS]), (73_120, True))
+        self.assertEqual(pane.floor_of(REAL_POSTS), (73_120, True))
+        self.assertEqual(pane.floor_of([]), (65_000, False))
+        self.assertEqual(pane.floor_of([(None, None, None), (1, 0, 2)]), (65_000, False))
+        self.assertEqual(pane.floor_of([(None, 100, None), (None, 201, None)]), (151, True))  # Math.round(150.5)
+
+    def test_the_trend_is_the_median_of_the_turn_to_turn_steps_since_the_compaction(self):  # A4
+        main = [(100.0 + 100 * k + dt, ctx - extra) for k, ctx in enumerate((100_000, 112_000, 120_000, 135_000), 1)
+                for dt, extra in ((5, 2_000), (10, 0))]
+        s = session(main=main, prompts=[100.0 + 100 * k for k in range(1, 5)], compacts=[50.0])
+        self.assertIn(' ▲12k/t', plain(self.rows(fields_of(), s, width=60))[0])
+        two = session(main=main[:4], prompts=[200.0, 300.0], compacts=[50.0])
+        self.assertNotIn('▲', plain(self.rows(fields_of(), two, width=60))[0])
+        down = session(main=[(105.0, 130_000), (205.0, 120_000), (305.0, 108_000)], prompts=[100.0, 200.0, 300.0])
+        self.assertIn('▼11k/t', plain(self.rows(fields_of(), down, width=60))[0])
+        before = session(main=main, prompts=[100.0 + 100 * k for k in range(1, 5)], compacts=[450.0])
+        self.assertIsNone(pane.gauges(fields_of(), NOW, before, NOW)['trend'])  # the compaction cut the turns
+
+    def test_the_newest_reply_beats_a_kept_status_line_older_than_it(self):
+        fields = fields_of(80_000)
+        main = [(NOW - 10, 91_000)]
+        self.assertEqual(pane.ctx_now(fields, NOW - 60, dict(main=main)), (91_000, 1_000_000))
+        self.assertEqual(pane.ctx_now(fields, NOW - 12, dict(main=main)), (80_000, 1_000_000))  # not 5 s newer
+        usage = dict(context_window=dict(current_usage=dict(input_tokens=2, cache_read_input_tokens=30, cache_creation_input_tokens=8)))
+        self.assertEqual(pane.ctx_now(usage, None, {}), (40, None))
+        self.assertEqual(pane.ctx_now({}, None, {}), (None, None))
+
+    def test_a_dark_cockpit_lights_only_what_deviates(self):  # A5
+        warm = lambda left: dict(warm=True, ttl='1h', expires_at=NOW + left)
+        row2 = lambda left: self.rows(fields_of(cache=warm(left)))[1]
+        self.assertIn(sgr('normal') + 'CACHE 41m' + pane.OFF, row2(41 * 60 + 20))
+        self.assertIn(sgr('amber') + 'CACHE 4m' + pane.OFF, row2(4 * 60 + 10))
+        self.assertIn(sgr('amber') + 'CACHE <1m' + pane.OFF, row2(30))
+        cold = dict(warm=False, expires_at=NOW - 10, recache_tokens_if_cold=152_300)
+        self.assertIn(sgr('amber') + 'CACHE COLD ~152k' + pane.OFF, self.rows(fields_of(cache=cold))[1])
+        self.assertIn(sgr('normal') + 'CACHE --' + pane.OFF, self.rows({})[1])
+        self.assertIn(sgr('normal') + 'CACHE 5m' + pane.OFF, self.rows(fields_of(cache=dict(warm=True, ttl='5m')))[1])
+        row3 = self.rows(fields_of(limits=limits_of(95, 75)))[2]
+        reset = datetime.fromtimestamp(NOW + 3 * 86400).strftime('%a %H:%M')
+        self.assertIn(sgr('amber') + f'7D 75% ↻{reset}' + pane.OFF, row3)
+        self.assertIn(sgr('red') + '5H 95% ↻' + datetime.fromtimestamp(NOW + 7200).strftime('%H:%M') + pane.OFF, row3)
+        low = self.rows(fields_of(limits=limits_of(8, 12)))[2]
+        self.assertIn(sgr('normal') + '5H 8%' + pane.OFF, low)
+        self.assertNotIn('↻', low)
+
+    def test_the_riskier_window_comes_first(self):  # A6
+        first = lambda five, seven: plain(self.rows(fields_of(limits=limits_of(five, seven))))[2].split()[0]
+        self.assertEqual(first(8, 75), '7D')
+        self.assertEqual(first(92, 75), '5H')
+        self.assertEqual(first(30, 30), '5H')  # a tie keeps the 5-hour window first
+
+    def test_a_value_that_went_invalid_is_dashed_in_amber_and_one_never_seen_in_the_normal_ink(self):  # A7
+        gone = limits_of(95, 12, five_at=NOW - 60)
+        row3 = self.rows(fields_of(limits=gone))[2]
+        self.assertIn(sgr('amber') + '5H --' + pane.OFF, row3)
+        self.assertNotIn('95', row3)  # never a stale number
+        self.assertTrue(plain([row3])[0].strip().startswith('7D 12%'))  # a '--' goes last
+        none = self.rows({})[2]
+        self.assertIn(sgr('normal') + '5H --' + pane.OFF, none)
+        self.assertIn(sgr('normal') + '7D --' + pane.OFF, none)
+        only = self.rows(fields_of(limits=dict(seven_day=dict(used_percentage=41, resets_at=NOW + 99))))[2]
+        self.assertTrue(plain([only])[0].strip().startswith('7D 41%'))
+        self.assertIn(sgr('normal') + '5H --' + pane.OFF, only)
+
+    def test_the_account_limits_come_from_another_session_within_a_day(self):  # A8
+        def keep(folder, name, at, limits):
+            with open(os.path.join(folder, name + '.json'), 'w') as handle:
+                json.dump(dict(at=at, line='x', fields=dict(rate_limits=limits)), handle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            keep(tmp, 'old', NOW - 90_000, limits_of(99, 99))
+            self.assertEqual(pane.account_limits(NOW, tmp), {})
+            keep(tmp, 'other', NOW - 3_600, limits_of(33, 44))
+            self.assertEqual(pane.account_limits(NOW, tmp), limits_of(33, 44))
+            keep(tmp, 'newer', NOW - 60, limits_of(35, 45))
+            with open(os.path.join(tmp, 'broken.json'), 'w') as handle:
+                handle.write('{not json')
+            self.assertEqual(pane.account_limits(NOW, tmp), limits_of(35, 45))
+            self.assertEqual(pane.account_limits(NOW + 86_400, tmp), {})  # a day on: both are old
+        self.assertEqual(pane.account_limits(NOW, '/nonexistent/folder'), {})
+        # a session with no status line of its own still shows the account's windows
+        row3 = self.rows(fields_of(), limits=limits_of(33, 44))[2]
+        self.assertTrue(plain([row3])[0].strip().startswith('7D 44%'))
+        own = self.rows(fields_of(limits=limits_of(10, 11)), limits=limits_of(33, 44))[2]
+        self.assertTrue(plain([own])[0].strip().startswith('7D 11%'))  # its own fields win
+
+    def test_sts_names_what_csr_runs_without_and_never_reads_out_another_variable(self):  # A9
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = os.path.join(tmp, 'agents')
+            os.makedirs(agents)
+            with open(os.path.join(agents, 'com.x.csr-engine.daemon.plist'), 'wb') as handle:
+                plistlib.dump({'Label': 'x', 'EnvironmentVariables': {'PATH': 'x', 'CSR_NO_RATIFICATION': '1',
+                                                                       'CSR_NO_RECAP': '0', 'CSR_STORY': '1'}}, handle)
+            with open(os.path.join(agents, 'com.x.other.plist'), 'wb') as handle:
+                plistlib.dump({'EnvironmentVariables': {'CSR_NO_OTHER': '1'}}, handle)  # not a csr-engine agent
+            lock = os.path.join(tmp, 'daemon.lock')
+            with open(lock, 'w') as handle:
+                handle.write(str(os.getpid()))
+            settings = os.path.join(tmp, 'settings.json')
+            with open(settings, 'w') as handle:
+                json.dump(dict(env=dict(CSR_NO_AI_NARRATIVES='true', CSR_NO_DREAMING='false', SECRET='shh')), handle)
+            got = pane.csr_status(NOW, agents, lock, settings)
+            self.assertEqual(got['sev'], 'advisory')
+            self.assertEqual(got['inop'], [('RATIFICATION', 'INHIBITED · CSR_NO_RATIFICATION=1 (daemon)', 'advisory'),
+                                           ('AI_NARRATIVES', 'INHIBITED · CSR_NO_AI_NARRATIVES=true (hooks)', 'advisory')])
+            self.assertTrue(got['daemon']['up'])
+            for secret in ('PATH', 'SECRET', 'shh', 'CSR_STORY'):
+                self.assertNotIn(secret, json.dumps(got))
+            only_plist = pane.csr_status(NOW, agents, lock, os.path.join(tmp, 'none.json'))
+            self.assertEqual([row[0] for row in only_plist['inop']], ['RATIFICATION'])
+            done = subprocess.Popen(['true'])
+            done.wait()
+            dead = os.path.join(tmp, 'dead.lock')
+            with open(dead, 'w') as handle:
+                handle.write(str(done.pid))
+            down = pane.csr_status(NOW, agents, dead, settings)
+            self.assertEqual((down['sev'], down['inop'][0]), ('amber', ('DAEMON', 'DOWN · no live pid in daemon.lock', 'amber')))
+            nothing = pane.csr_status(NOW, os.path.join(tmp, 'x'), os.path.join(tmp, 'no.lock'), os.path.join(tmp, 'no.json'))
+            self.assertEqual([row[0] for row in nothing['inop']], ['DAEMON'])
+            with open(os.path.join(tmp, 'garbled.lock'), 'w') as handle:
+                handle.write('not a pid')
+            self.assertEqual(pane.csr_status(NOW, os.path.join(tmp, 'x'), os.path.join(tmp, 'garbled.lock'),
+                                             os.path.join(tmp, 'no.json'))['sev'], 'amber')
+
+    def test_sts_is_read_once_a_minute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = os.path.join(tmp, 'daemon.lock')
+            args = (os.path.join(tmp, 'agents'), lock, os.path.join(tmp, 'settings.json'))
+            with open(lock, 'w') as handle:
+                handle.write(str(os.getpid()))
+            self.assertIsNone(pane.csr_status(NOW, *args)['sev'])
+            os.remove(lock)
+            self.assertIsNone(pane.csr_status(NOW + 30, *args)['sev'])  # kept
+            self.assertEqual(pane.csr_status(NOW + 61, *args)['sev'], 'amber')  # read again
+
+    def test_sts_lights_row_three_in_its_severity_ink(self):
+        advisory = dict(sev='advisory', inop=[('RATIFICATION', 'x', 'advisory')])
+        self.assertIn(sgr('advisory') + 'STS' + pane.OFF, self.rows({}, sts=advisory)[2])
+        amber = dict(sev='amber', inop=[('DAEMON', 'x', 'amber')])
+        self.assertIn(sgr('amber') + 'STS' + pane.OFF, self.rows({}, sts=amber)[2])
+        self.assertNotIn('STS', plain(self.rows({}))[2])
+        self.assertTrue(plain(self.rows({}, sts=advisory))[2].endswith('STS'))  # right-aligned
+
+    def test_while_a_compaction_runs_its_timer_takes_row_two(self):  # A10
+        usual = dict(low=50.0, median=75.0, high=100.0, n=9)
+        info = dict(elapsed=72, trigger='manual', usual=usual, facts=['CSR keeps 12 chunks of this session'])
+        rows = self.rows(fields_of(300_000, cache=dict(warm=True, expires_at=NOW + 3000)), compacting=info)
+        self.assertEqual(len(rows), 3)
+        row2 = plain(rows)[1]
+        self.assertTrue(row2.strip().startswith('COMPACTING 1:12 █████▊░░ 0:50–1:40'), row2)
+        self.assertNotIn('♻', row2)
+        self.assertTrue(row2.endswith('CACHE 50m'))
+        self.assertIn(sgr('advisory') + 'COMPACTING', rows[1])
+        late = self.rows({}, compacting=dict(info, elapsed=130, trigger='auto'))[1]
+        self.assertIn(sgr('amber') + 'COMPACTING AUTO 2:10', late)  # past the usual longest
+        bare = plain(self.rows({}, compacting=dict(elapsed=5, trigger='manual', usual=None, facts=[])))[1]
+        self.assertTrue(bare.strip().startswith('COMPACTING 0:05 '))
+        for width in (24, 30, 40):  # the range goes, then the bar, then the cache
+            for row in plain(pane.cockpit(pane.gauges(fields_of(), NOW, session(), NOW, compacting=info), width)):
+                self.assertLessEqual(len(row), width)
+        row2 = lambda width: plain(pane.cockpit(pane.gauges(fields_of(), NOW, session(), NOW, compacting=info), width))[1]
+        self.assertTrue(row2(40).startswith(' COMPACTING 1:12 █████▊░░ ') and '0:50' not in row2(40))  # the range goes
+        self.assertTrue(row2(40).endswith('CACHE --'))
+        self.assertTrue('█' not in row2(30) and row2(30).strip().startswith('COMPACTING 1:12') and row2(30).endswith('CACHE --'))  # then the bar
+        self.assertEqual(row2(24), ' COMPACTING 1:12')  # then the right slot
+
+    def test_three_rows_at_every_width_and_sts_always_survives(self):  # A11
+        fields = fields_of(432_000, cache=dict(warm=False, recache_tokens_if_cold=255_000),
+                           limits=limits_of(92, 75))
+        main = [(100.0 + 100 * k + 5, 100_000 + 60_000 * k) for k in range(1, 5)]
+        s = session(main=main, prompts=[100.0 + 100 * k for k in range(1, 5)], compact_sizes=POSTS)
+        sts = dict(sev='amber', inop=[('DAEMON', 'x', 'amber')])
+        info = dict(elapsed=72, trigger='auto', usual=dict(low=50.0, median=75.0, high=100.0, n=9), facts=[])
+        for compacting in (None, info):
+            for width in range(24, 81):
+                g = pane.gauges(fields, NOW, s, NOW, sts=sts, compacting=compacting)
+                rows = pane.cockpit(g, width)
+                self.assertEqual(len(rows), 3, width)
+                for row in plain(rows):
+                    self.assertLessEqual(len(row), width, (width, row))
+                    self.assertTrue(row.startswith(' '))
+                self.assertTrue(plain(rows)[2].endswith('STS'), (width, plain(rows)[2]))
+
+    def test_rows_that_cannot_hold_everything_shrink_in_a_fixed_order(self):
+        fields = fields_of(87_724, size=1_000_000, limits=limits_of(95, 75))
+        main = [(100.0 + 100 * k + 5, 60_000 + 12_000 * k) for k in range(1, 5)]
+        s = session(main=main, prompts=[100.0 + 100 * k for k in range(1, 5)])
+        row1 = lambda width: plain(pane.cockpit(pane.gauges(fields, NOW, s, NOW), width))[0]
+        self.assertTrue(row1(60).endswith('/1M ▲12k/t'))
+        self.assertTrue(row1(29).endswith('/1M') and '▲' not in row1(29))  # the trend goes first
+        self.assertEqual(row1(24).count('█') + row1(24).count('░'), 8)  # the bar shrinks to 8 cells
+        big = pane.gauges(fields_of(1_200_000, size=10_000_000), None, session(), NOW)
+        self.assertTrue(plain(pane.cockpit(big, 40))[0].endswith('1.2M/10M'))
+        self.assertTrue(plain(pane.cockpit(big, 24))[0].endswith('1.2M'))  # then the window
+        row3 = lambda width: plain(pane.cockpit(pane.gauges(fields, NOW, s, NOW, sts=dict(sev='amber', inop=[])), width))[2]
+        self.assertEqual((row3(40).count('↻'), row3(30).count('↻'), row3(24).count('↻')), (2, 1, 1))  # the second window goes
+        self.assertTrue(all(row3(width).endswith('STS') for width in (24, 30, 40)))  # STS never does
+        self.assertTrue(row3(24).strip().startswith('5H 95%'))
+
+    def test_facts_drop_their_rightmost_pieces_to_fit(self):
+        facts = '12 prompts · 3h20m · compact repays in ~6t · 13 compacts'
+        self.assertEqual(pane.fit_pieces(facts, 60), facts)
+        self.assertEqual(pane.fit_pieces(facts, 42), '12 prompts · 3h20m · compact repays in ~6t')
+        self.assertEqual(pane.fit_pieces(facts, 20), '12 prompts · 3h20m')
+        self.assertEqual(pane.fit_pieces(facts, 6), '12 pr…')
+
+    def test_numbers_no_clock_can_show_never_raise(self):
+        nan, inf = float('nan'), float('inf')
+        cache = lambda **c: pane.cache_info(c, NOW)
+        self.assertEqual(cache(warm=True, expires_at=nan)['text'], 'CACHE WARM')
+        self.assertEqual(cache(warm=True, expires_at=1e20)['text'], 'CACHE WARM')
+        self.assertEqual(cache(warm=True, expires_at=NOW + 9 * 86400)['text'], 'CACHE WARM')
+        for cost in (nan, inf, -5, 0):
+            self.assertEqual(cache(warm=False, recache_tokens_if_cold=cost)['text'], 'CACHE COLD')
+        for odd in (None, {}, [], 'warm', dict(ttl='1h'), dict(warm=None), dict(warm=True, expires_at=[1])):
+            self.assertIn(pane.cache_info(odd, NOW)['text'], ('CACHE --', 'CACHE WARM'), odd)
+        for used, at in ((nan, NOW + 60), (inf, NOW + 60), (95, 1e20), (95, inf), (95, -5)):
+            got = pane.quota_slot('5H', dict(used_percentage=used, resets_at=at), NOW)
+            self.assertNotIn('nan', got['text'].lower())
+        self.assertEqual(pane.quota_slot('5H', dict(used_percentage='lots'), NOW)['text'], '5H --')
+        self.assertEqual(pane.quota_slot('5H', 'x', NOW)['text'], '5H --')
+        resets = pane.epoch('2027-01-15T08:00:00Z')
+        self.assertIn('↻', pane.quota_slot('5H', dict(used_percentage=80, resets_at='2027-01-15T08:00:00Z'), resets - 7200)['text'])
+
+    def test_the_page_head_is_the_cockpit_and_nothing_else(self):  # A12
+        s = session(prompts=[NOW - 100] * 12, replies=[(NOW - 50, 90_000, 5, 0)], model='claude-opus-5-5',
+                    compacts=[NOW - 9000], compact_sizes=POSTS)
+        page = stand_in(fields_of(90_000, cache=dict(warm=True, expires_at=NOW + 3000), limits=limits_of(8, 75)), s)
+        lines = pane.page_lines(page, 50, 24, {})
+        text = plain(lines)
+        self.assertEqual(text[:3], plain(pane.cockpit(page['head']['gauges'], 50)))
+        for line in text[:3]:
+            self.assertNotRegex(line, r'prompts|Opus|opus|\d+h\d\dm|compacts')
+        self.assertEqual(text[3].strip(), '')  # the lip, or the first strip of paper
+        self.assertIsNone(lines.lanes)
+        self.assertFalse(any('learned' in line or 'handed' in line for line in text[:8]))
+        tall = pane.page_lines(page, 50, pane.LIP_ROWS, {})
+        lip = '\x1b[48;2;%d;%d;%dm' % pane.blend(pane.DARK[1], pane.PAPER, 0.6)
+        self.assertTrue(tall[3].startswith(lip))
+
+
+def stand_in(fields, s=None, **more):
     """page_main over a stand-in CSR with the status line's fields as given."""
     con = sqlite3.connect(':memory:')
     con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
                 'byte_start int, project text, kind text)')
     connect, pane.connect = pane.connect, lambda: con
     try:
-        s = s or dict(id='sess-now', prompts=[NOW - 100] * 12, replies=[], compacts=[], remembered=[],
-                      gave=dict(recalls=[], carried=[], dreams=[]), project='csr-engine')
+        s = s or session(prompts=[NOW - 100] * 12)
         data = dict(repo='/tmp/csr-engine', dreams=[], chapter=dict(at=1000.0, of=5), dreams_on=True, look=None,
-                    story=None, claude_fields=fields, claude_line='Opus 5 │ 57k')
+                    story=None, claude_fields=fields, claude_line='Opus 5 │ 57k', **more)
         return pane.page_main(data, s, NOW)
     finally:
         pane.connect = connect
-
-
-class OnThePage(unittest.TestCase):
-    def test_the_clock_rows_sit_in_the_masthead_under_the_facts(self):
-        lines = plain(pane.page_lines(stand_in(MastheadRows.FIELDS), 45, 30, {}))
-        facts = next(i for i, line in enumerate(lines) if '12 prompts' in line)
-        self.assertEqual(lines[facts + 1].strip(), 'cache warm · 41m left')
-        self.assertEqual(lines[facts + 2].strip(), '5h 34% · 7d 12%')
-
-    def test_without_fields_the_page_is_the_page_it_was(self):
-        with_none = plain(pane.page_lines(stand_in(None), 45, 30, {}))
-        without = plain(pane.page_lines(stand_in({}), 45, 30, {}))
-        self.assertEqual(with_none, without)
-        self.assertFalse(any('cache' in line for line in with_none))
-
-    def test_the_payback_phrase_joins_the_facts_row_only_with_compaction_history(self):
-        replies = [(NOW - 50, 200_000, 5, 0)]
-        busy = dict(id='sess-now', prompts=[NOW - 100] * 12, replies=replies, compacts=[NOW - 900],
-                    compact_sizes=POSTS, remembered=[], gave=dict(recalls=[], carried=[], dreams=[]), project='p')
-        fact = stand_in({}, busy)['head']['facts']
-        self.assertIn('compact repays in ~13t', fact)
-        self.assertTrue(fact.endswith('1 compacts'))
-        calm = dict(busy, compacts=[], compact_sizes=[])
-        self.assertNotIn('repays', stand_in({}, calm)['head']['facts'])
 
 
 class KeptFields(unittest.TestCase):
@@ -312,7 +497,8 @@ class Wrapper(unittest.TestCase):
             done, folder = self.run_wrapper(home, bare)
             kept = json.load(open(os.path.join(folder, 'sess-w.json')))
             self.assertEqual(kept['fields'], {})
-            self.assertEqual(pane.masthead(kept['fields'], NOW), [])
+            g = pane.gauges(kept['fields'], None, {}, NOW)
+            self.assertEqual((g['cache']['text'], [q['text'] for q in g['quotas']]), ('CACHE --', ['5H --', '7D --']))
 
     def test_without_a_pane_the_line_passes_through_and_nothing_is_kept(self):
         with tempfile.TemporaryDirectory() as home:
@@ -328,8 +514,9 @@ class Wrapper(unittest.TestCase):
                 fields = pane.claude_fields('sess-w', __import__('time').time())
             finally:
                 pane.STATUS_LINES = kept
-            rows = pane.masthead(fields, 1_800_000_000.0)
-            self.assertEqual([[t for t, _ in row] for row in rows][0], ['cache warm · 50m left'])
+            g = pane.gauges(fields, None, {}, 1_800_000_000.0)
+            self.assertEqual(g['cache']['text'], 'CACHE 50m')
+            self.assertEqual(plain(pane.cockpit(g, 49))[1].strip(), '♻ >15t' + ' ' * 33 + 'CACHE 50m')
 
 
 if __name__ == '__main__':
