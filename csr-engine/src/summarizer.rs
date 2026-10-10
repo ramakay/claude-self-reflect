@@ -24,10 +24,6 @@ pub struct StoryContext {
     pub current_v3_enrichment: Option<String>,
     pub related_sessions: Vec<RelatedSession>,
     pub project_name: String,
-    /// The story written at an earlier compaction, when this one rewrites it.
-    pub story_so_far: Option<String>,
-    /// What the person typed since the story so far was written, oldest first.
-    pub asked_since: Vec<String>,
 }
 
 pub struct RelatedSession {
@@ -41,9 +37,8 @@ const TRANSCRIPT_SAMPLE_MSGS: usize = 20;
 const TRANSCRIPT_CHAR_CAP: usize = 30_000;
 /// Numbers a session's story: `story_rev_1` is its first.
 const STORY_REV_TAG: &str = "story_rev_";
-/// The person's prompts a rewrite reads, and how much of each.
-const ASKED_SINCE_MAX: usize = 15;
-const ASKED_CHARS: usize = 300;
+/// The last messages a Haiku story reads beside Claude Code's summary.
+const TAIL_MSGS: usize = 20;
 /// How much of Claude Code's compaction summary a story keeps: what was asked, then where it
 /// stood.
 const ASKED_STORY_CHARS: usize = 420;
@@ -54,15 +49,17 @@ const STOOD_STORY_CHARS: usize = 420;
 pub enum StoryMode {
     /// A session's first story, by Haiku: skipped when it has one.
     First,
-    /// After a compaction, from the summary Claude Code wrote of the session: no model call,
-    /// so every compaction refreshes it.
+    /// After a compaction, from the summary Claude Code wrote of the session. Opted in, Haiku
+    /// writes it from that summary and the last messages; otherwise CSR extracts it, with no
+    /// model call. Either way every compaction refreshes it.
     FromCompaction,
-    /// At the session's end, Haiku rewrites the story to take in the work after the last
-    /// compaction. Opt-in (`CSR_STORY_REWRITES=1`): each is a paid call.
+    /// At the session's end, opted in: Haiku rewrites the story to take in what came after the
+    /// last one, when the person asked something since.
     Rewrite,
 }
 
-/// Opt-in: Haiku rewrites a session's story at its end, when the story has fallen behind.
+/// Opt-in (`CSR_STORY_REWRITES=1`): Haiku writes the session's story, one metered call each time:
+/// after every compaction, and at the session's end when the person asked something since.
 pub fn story_rewrites_enabled() -> bool {
     std::env::var("CSR_STORY_REWRITES")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -91,27 +88,9 @@ fn build_prompt(ctx: &StoryContext) -> String {
         "You are summarizing a coding session for future context restoration after memory compaction.\n\n",
     );
 
-    if let Some(ref so_far) = ctx.story_so_far {
-        prompt.push_str("STORY SO FAR (written earlier in this session):\n");
-        prompt.push_str(so_far);
-        prompt.push_str("\n\n");
-    }
-
-    if !ctx.asked_since.is_empty() {
-        prompt.push_str("WHAT THE PERSON ASKED SINCE THEN:\n");
-        for asked in &ctx.asked_since {
-            prompt.push_str(&format!("- {asked}\n"));
-        }
-        prompt.push('\n');
-    }
-
     // Current session excerpt
     if !ctx.current_session_excerpt.is_empty() {
-        prompt.push_str(if ctx.story_so_far.is_some() {
-            "TRANSCRIPT SINCE THE STORY SO FAR (excerpt):\n"
-        } else {
-            "CURRENT SESSION TRANSCRIPT (excerpt):\n"
-        });
+        prompt.push_str("CURRENT SESSION TRANSCRIPT (excerpt):\n");
         prompt.push_str(&ctx.current_session_excerpt);
         prompt.push_str("\n\n");
     }
@@ -137,23 +116,33 @@ fn build_prompt(ctx: &StoryContext) -> String {
         prompt.push('\n');
     }
 
-    if ctx.story_so_far.is_some() {
-        prompt.push_str(
-            "Rewrite the story so it covers the whole session to now: keep what still matters \
-             from the story so far, correct what changed, and add what happened since. Write 3-4 \
-             sentences: what was being worked on, key files/tools used, and current state \
-             (done/in-progress/blocked). Be specific about technical details. No preamble, no \
-             markdown headers.",
-        );
-    } else {
-        prompt.push_str(
-            "Write 2-3 sentences: what was being worked on, key files/tools used, current state \
-             (done/in-progress/blocked), and how it relates to recent past work if applicable. \
-             Be specific about technical details. No preamble, no markdown headers.",
-        );
-    }
+    prompt.push_str(
+        "Write 2-3 sentences: what was being worked on, key files/tools used, current state \
+         (done/in-progress/blocked), and how it relates to recent past work if applicable. \
+         Be specific about technical details. No preamble, no markdown headers.",
+    );
 
     prompt
+}
+
+/// The story Haiku writes from Claude Code's compaction summary, which carries the session's
+/// whole arc, and its last messages, which the summary never saw (Claude Code keeps them verbatim
+/// after it). Of five ways to tell a long session, blind judges ranked this first on four of five
+/// sessions (2026-10-10): the summary alone reported finished work as still open, and a sample of
+/// the first and last messages lost the middle.
+fn summary_story_prompt(summary: &str, tail: &str) -> String {
+    format!(
+        "You are summarizing a coding session for future context restoration after memory compaction.\n\n\
+         CLAUDE CODE'S SUMMARY OF THE SESSION (written at its latest compaction, from the whole \
+         conversation except its last messages):\n{summary}\n\n\
+         THE LAST MESSAGES (the summary did not see these; they show where the work actually \
+         stood):\n{tail}\n\n\
+         Write 3-4 sentences: what the session was about across its whole life and its main \
+         threads, the key files/tools used, and where the work stood at the end \
+         (done/in-progress/blocked). Where the last messages and the summary differ, trust the last \
+         messages. Be specific about technical details. Keep it under 800 characters. No preamble, \
+         no markdown headers."
+    )
 }
 
 /// Invoke `claude -p` (model chain: env override → haiku alias → CLI default)
@@ -332,7 +321,6 @@ pub fn typed_prompts(messages: &[serde_json::Value], n: usize, chars: usize) -> 
 pub struct PriorStory {
     /// Every stored copy, so a rewrite replaces them all.
     pub ids: Vec<String>,
-    pub text: String,
     /// How many times the story has been written.
     pub rev: usize,
     /// The session's message count when it was written; None for a story from before the
@@ -344,7 +332,7 @@ fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
     let rows = storage
         .get_reflections_by_two_tags("session_story", &format!("conv_{conv_id}"), 10)
         .ok()?;
-    let (_, newest, _, _) = rows.first()?;
+    rows.first()?;
     let rev = rows
         .iter()
         .flat_map(|(_, _, tags, _)| tags.iter())
@@ -353,26 +341,26 @@ fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
         .unwrap_or(1);
     Some(PriorStory {
         ids: rows.iter().map(|(id, _, _, _)| id.clone()).collect(),
-        text: newest.clone(),
         rev,
         covered: storage.story_messages_covered(conv_id).ok().flatten(),
     })
 }
 
 /// Whether to write the session's story now. `messages` is the session's message count;
-/// `summary_at` is where Claude Code's newest compaction summary sits among them.
+/// `summary_at` is where Claude Code's newest compaction summary sits among them; `asked_since`
+/// counts what the person typed after the last story.
 ///
 /// - First: only when the session has no story.
-/// - FromCompaction: whenever there is a summary the story has not taken in yet. It costs no
-///   model call, so nothing caps it.
-/// - Rewrite: when the work the story has not told is at least a quarter of the session. The
-///   share, not a count, decides: a long session pays for a rewrite only when its story has
-///   fallen well behind, and a story that came from the last compaction is usually current.
+/// - FromCompaction: whenever there is a summary the story has not taken in yet. Nothing caps
+///   it: one story per compaction.
+/// - Rewrite: when the person asked something since the last story. Recent work decides, not a
+///   count or a share of the session, so a long session's ending reaches its story too.
 pub fn story_due(
     mode: StoryMode,
     prior: Option<&PriorStory>,
     messages: usize,
     summary_at: Option<usize>,
+    asked_since: usize,
 ) -> Result<(), String> {
     match (mode, prior) {
         (StoryMode::FromCompaction, _) => match (summary_at, prior.and_then(|p| p.covered)) {
@@ -383,12 +371,21 @@ pub fn story_due(
         (_, None) => Ok(()),
         (StoryMode::First, Some(_)) => Err("skip:story_exists".into()),
         (StoryMode::Rewrite, Some(prior)) => match prior.covered {
-            Some(covered) if messages.saturating_sub(covered) * 4 < messages => {
-                Err(format!("skip:story_current({covered}/{messages})"))
+            Some(covered) if covered >= messages || asked_since == 0 => {
+                Err(format!("skip:nothing_asked_since({covered}/{messages})"))
             }
             _ => Ok(()),
         },
     }
+}
+
+/// What the person typed after the story covering the first `covered` messages.
+fn asked_since(messages: &[serde_json::Value], prior: Option<&PriorStory>) -> usize {
+    let covered = prior
+        .and_then(|p| p.covered)
+        .unwrap_or(0)
+        .min(messages.len());
+    typed_prompts(&messages[covered..], usize::MAX, 1).len()
 }
 
 /// Claude Code's own summary at the session's newest compaction: where it sits among the
@@ -483,27 +480,16 @@ fn sentences(text: &str, cap: usize) -> String {
     text[..kept].to_string()
 }
 
-/// Build story context by retrieving data from the engine's DB + search index. A rewrite reads
-/// the story so far, what the person asked since, and the transcript since.
+/// Build story context by retrieving data from the engine's DB + search index.
 pub async fn build_story_context(
     engine: &Engine,
     cwd: &str,
     messages: &[serde_json::Value],
-    prior: Option<&PriorStory>,
 ) -> StoryContext {
     let project_name = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());
 
-    // 1. Sample transcript: since the story so far, when there is one
-    let since = &messages[prior
-        .and_then(|p| p.covered)
-        .unwrap_or(0)
-        .min(messages.len())..];
-    let excerpt = sample_transcript(since, TRANSCRIPT_SAMPLE_MSGS, TRANSCRIPT_CHAR_CAP);
-    let asked_since = if prior.is_some() {
-        typed_prompts(since, ASKED_SINCE_MAX, ASKED_CHARS)
-    } else {
-        Vec::new()
-    };
+    // 1. Sample transcript
+    let excerpt = sample_transcript(messages, TRANSCRIPT_SAMPLE_MSGS, TRANSCRIPT_CHAR_CAP);
 
     // 2. Get V3 enrichment for this project's most recent conversation
     let v3 = get_latest_v3_enrichment(engine.storage(), &project_name);
@@ -522,8 +508,6 @@ pub async fn build_story_context(
         current_v3_enrichment: v3,
         related_sessions: related,
         project_name,
-        story_so_far: prior.map(|p| p.text.clone()),
-        asked_since,
     }
 }
 
@@ -622,21 +606,25 @@ pub async fn generate_story_cli(
         );
         return Ok(());
     }
+    let mut prior = prior_story(engine.storage(), &conv_id);
     let mut due = story_due(
         mode,
-        prior_story(engine.storage(), &conv_id).as_ref(),
+        prior.as_ref(),
         messages.len(),
         newest_compaction_summary(&messages).map(|(at, _)| at),
+        asked_since(&messages, prior.as_ref()),
     );
     if mode == StoryMode::FromCompaction && due.is_err() {
         // SessionStart can run a moment before the summary reaches the transcript: read it again once
         tokio::time::sleep(Duration::from_secs(5)).await;
         messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
+        prior = prior_story(engine.storage(), &conv_id);
         due = story_due(
             mode,
-            prior_story(engine.storage(), &conv_id).as_ref(),
+            prior.as_ref(),
             messages.len(),
             newest_compaction_summary(&messages).map(|(at, _)| at),
+            asked_since(&messages, prior.as_ref()),
         );
     }
     if let Err(skip) = due {
@@ -671,44 +659,120 @@ pub async fn generate_story_cli(
         prior.as_ref(),
         messages.len(),
         summary.as_ref().map(|(at, _)| *at),
+        asked_since(&messages, prior.as_ref()),
     ) {
         log_story_event(&project, &conv_id, &skip);
         return Ok(());
     }
 
     let result = match (mode, summary) {
-        (StoryMode::FromCompaction, Some((at, text))) => match story_from_compaction_summary(&text)
-        {
-            Some((story, templated)) => {
-                if !templated {
-                    log_story_event(&project, &conv_id, "aux_schema_miss:compaction_summary");
-                }
-                let tags = vec!["story_from_compaction".to_string()];
-                store_story(
+        (StoryMode::First, _) | (StoryMode::Rewrite, None) => {
+            // Lock held — generate story (Haiku call happens here)
+            generate_and_store(engine, cwd, &conv_id, &project, &messages, prior.as_ref()).await
+        }
+        (StoryMode::FromCompaction, None) => Ok(()), // story_due refused it already
+        (_, Some((at, text))) => {
+            // Beside the summary, Haiku reads what it never saw: the messages just before it after
+            // a compaction, everything after it at the session's end
+            let by_haiku = mode == StoryMode::Rewrite || story_rewrites_enabled();
+            let after = if mode == StoryMode::FromCompaction {
+                &messages[at.saturating_sub(TAIL_MSGS)..at]
+            } else {
+                &messages[(at + 1).min(messages.len())..]
+            };
+            let mut told = None;
+            if by_haiku {
+                let tail = sample_transcript(after, TAIL_MSGS, TRANSCRIPT_CHAR_CAP);
+                told = haiku_story(
                     engine,
-                    cwd,
-                    &conv_id,
+                    &summary_story_prompt(&text, &tail),
                     &project,
-                    &story,
-                    prior.as_ref(),
-                    at,
-                    tags,
+                    &conv_id,
                 )
                 .await
+                .map(|story| (story, "story_by_haiku"));
             }
-            None => {
-                log_story_event(&project, &conv_id, "skip:summary_unusable");
-                Ok(())
+            if told.is_none() && mode == StoryMode::FromCompaction {
+                // Not opted in, or Haiku failed: CSR's own extract, no model call
+                told = story_from_compaction_summary(&text).map(|(story, templated)| {
+                    if !templated {
+                        log_story_event(&project, &conv_id, "aux_schema_miss:compaction_summary");
+                    }
+                    (story, "story_extracted")
+                });
             }
-        },
-        // Lock held — generate story (Haiku call happens here)
-        _ => generate_and_store(engine, cwd, &conv_id, &project, &messages, prior.as_ref()).await,
+            match told {
+                Some((story, how)) => {
+                    let mut tags = vec![how.to_string()];
+                    if mode == StoryMode::FromCompaction {
+                        tags.push("story_from_compaction".to_string());
+                    }
+                    store_story(
+                        engine,
+                        cwd,
+                        &conv_id,
+                        &project,
+                        &story,
+                        prior.as_ref(),
+                        messages.len(),
+                        tags,
+                    )
+                    .await
+                }
+                None => {
+                    log_story_event(&project, &conv_id, "skip:summary_unusable");
+                    Ok(())
+                }
+            }
+        }
     };
 
     // Release lock (drop closes the file, releasing the advisory lock)
     drop(lock_file);
 
     result
+}
+
+/// One metered Haiku call for a story: its text, or None when narratives are off or the call
+/// failed. A failed call is metered too.
+async fn haiku_story(
+    engine: &Engine,
+    prompt: &str,
+    project: &str,
+    conv_id: &str,
+) -> Option<String> {
+    if crate::narrative::narratives_disabled() {
+        log_story_event(project, conv_id, "skip:narratives_disabled");
+        return None;
+    }
+    let parsed = call_claude_headless(prompt).await;
+    let row = match &parsed {
+        Some(parsed) => crate::storage::NarrativeUsageRow {
+            call_site: "story".into(),
+            model: parsed.model.clone(),
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            cache_read_tokens: parsed.cache_read_tokens,
+            cache_creation_tokens: parsed.cache_creation_tokens,
+            duration_ms: 0, // HAIKU_TIMEOUT bounds it; wall-clock not tracked on this path
+            success: true,
+        },
+        None => crate::storage::NarrativeUsageRow {
+            call_site: "story".into(),
+            model: "unknown".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            duration_ms: 0,
+            success: false,
+        },
+    };
+    let _ = engine.storage().record_narrative_usage(&row);
+    if parsed.is_none() {
+        log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
+    }
+    parsed.map(|parsed| parsed.text)
 }
 
 /// Generate story and store it. Separated so the lock scope is clear.
@@ -720,47 +784,10 @@ async fn generate_and_store(
     messages: &[serde_json::Value],
     prior: Option<&PriorStory>,
 ) -> anyhow::Result<()> {
-    let ctx = build_story_context(engine, cwd, messages, prior).await;
-
-    let story = match generate_session_story(&ctx).await {
-        Some((text, parsed)) => {
-            let _ = engine
-                .storage()
-                .record_narrative_usage(&crate::storage::NarrativeUsageRow {
-                    call_site: "story".into(),
-                    model: parsed.model.clone(),
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    cache_read_tokens: parsed.cache_read_tokens,
-                    cache_creation_tokens: parsed.cache_creation_tokens,
-                    duration_ms: 0, // HAIKU_TIMEOUT bounds it; wall-clock not tracked on this path
-                    success: true,
-                });
-            text
-        }
-        None => {
-            if crate::narrative::narratives_disabled() {
-                log_story_event(project, conv_id, "skip:narratives_disabled");
-            } else {
-                let _ =
-                    engine
-                        .storage()
-                        .record_narrative_usage(&crate::storage::NarrativeUsageRow {
-                            call_site: "story".into(),
-                            model: "unknown".into(),
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_read_tokens: 0,
-                            cache_creation_tokens: 0,
-                            duration_ms: 0,
-                            success: false,
-                        });
-                log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
-            }
-            return Ok(());
-        }
+    let ctx = build_story_context(engine, cwd, messages).await;
+    let Some(story) = haiku_story(engine, &build_prompt(&ctx), project, conv_id).await else {
+        return Ok(());
     };
-
     store_story(
         engine,
         cwd,
@@ -1035,8 +1062,6 @@ mod tests {
                 score: 0.72,
             }],
             project_name: "my-project".to_string(),
-            story_so_far: None,
-            asked_since: vec![],
         };
         let prompt = build_prompt(&ctx);
         assert!(prompt.contains("CURRENT SESSION TRANSCRIPT"));
@@ -1055,8 +1080,6 @@ mod tests {
             current_v3_enrichment: None,
             related_sessions: vec![],
             project_name: "test".to_string(),
-            story_so_far: None,
-            asked_since: vec![],
         };
         let prompt = build_prompt(&ctx);
         assert!(prompt.contains("hello"));
@@ -1074,9 +1097,9 @@ mod tests {
 
     #[test]
     fn a_first_story_is_written_once() {
-        assert_eq!(story_due(StoryMode::First, None, 6, None), Ok(()));
+        assert_eq!(story_due(StoryMode::First, None, 6, None, 0), Ok(()));
         assert_eq!(
-            story_due(StoryMode::First, Some(&prior(1, None)), 4736, None),
+            story_due(StoryMode::First, Some(&prior(1, None)), 4736, None, 3),
             Err("skip:story_exists".into())
         );
     }
@@ -1085,45 +1108,71 @@ mod tests {
     fn every_compaction_retells_the_story_and_nothing_caps_it() {
         let mode = StoryMode::FromCompaction;
         assert_eq!(
-            story_due(mode, None, 900, None),
+            story_due(mode, None, 900, None, 0),
             Err("skip:no_compaction_summary".into())
         );
-        assert_eq!(story_due(mode, None, 900, Some(880)), Ok(()));
+        assert_eq!(story_due(mode, None, 900, Some(880), 0), Ok(()));
         // a story from before the count was kept has not taken any summary in
         assert_eq!(
-            story_due(mode, Some(&prior(1, None)), 900, Some(880)),
+            story_due(mode, Some(&prior(1, None)), 900, Some(880), 0),
             Ok(())
         );
         // the twelfth compaction is told like the second
         assert_eq!(
-            story_due(mode, Some(&prior(11, Some(4200))), 4736, Some(4700)),
+            story_due(mode, Some(&prior(11, Some(4200))), 4736, Some(4700), 0),
             Ok(())
         );
         // the same summary is never told twice (a resumed session, a retry)
         assert_eq!(
-            story_due(mode, Some(&prior(12, Some(4700))), 4736, Some(4700)),
+            story_due(mode, Some(&prior(12, Some(4736))), 4736, Some(4700), 0),
             Err("skip:summary_told(4700)".into())
         );
     }
 
     #[test]
-    fn haiku_rewrites_a_story_only_once_it_has_fallen_a_quarter_behind() {
+    fn haiku_retells_the_ending_only_when_the_person_asked_something_since() {
         let mode = StoryMode::Rewrite;
-        assert_eq!(story_due(mode, None, 900, None), Ok(()));
-        // 4700 of 4736 told: current
+        assert_eq!(story_due(mode, None, 900, None, 0), Ok(()));
+        // 4736 of 4800 told, but a new ask came after: the ending is due, however small a share
         assert_eq!(
-            story_due(mode, Some(&prior(12, Some(4700))), 4736, None),
-            Err("skip:story_current(4700/4736)".into())
-        );
-        assert_eq!(
-            story_due(mode, Some(&prior(3, Some(3001))), 4000, None),
-            Err("skip:story_current(3001/4000)".into())
-        );
-        assert_eq!(
-            story_due(mode, Some(&prior(3, Some(3000))), 4000, None),
+            story_due(mode, Some(&prior(12, Some(4736))), 4800, None, 1),
             Ok(())
         );
-        assert_eq!(story_due(mode, Some(&prior(1, None)), 4000, None), Ok(()));
+        // the agent worked on, nothing new was asked: the story stands
+        assert_eq!(
+            story_due(mode, Some(&prior(12, Some(4736))), 4800, None, 0),
+            Err("skip:nothing_asked_since(4736/4800)".into())
+        );
+        assert_eq!(
+            story_due(mode, Some(&prior(3, Some(4800))), 4800, None, 2),
+            Err("skip:nothing_asked_since(4800/4800)".into())
+        );
+        assert_eq!(
+            story_due(mode, Some(&prior(1, None)), 4000, None, 0),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn asked_since_counts_only_what_came_after_the_story() {
+        let user = |text: &str| serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+        let messages = vec![user("old ask"), user("told ask"), user("new ask")];
+        assert_eq!(asked_since(&messages, None), 3);
+        assert_eq!(asked_since(&messages, Some(&prior(1, Some(2)))), 1);
+        assert_eq!(asked_since(&messages, Some(&prior(1, Some(9)))), 0);
+    }
+
+    #[test]
+    fn a_haiku_story_reads_the_summary_and_the_messages_it_never_saw() {
+        let prompt = summary_story_prompt(
+            "1. Primary Request and Intent: build the reel",
+            "[user]: ship v8",
+        );
+        let at = |needle: &str| prompt.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("build the reel") < at("THE LAST MESSAGES"));
+        assert!(at("THE LAST MESSAGES") < at("ship v8"));
+        assert!(prompt.contains("trust the last messages"));
+        assert!(prompt.contains("under 800 characters"));
     }
 
     const SUMMARY: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
@@ -1195,25 +1244,6 @@ Summary:
     }
 
     #[test]
-    fn a_rewrite_reads_the_story_so_far_and_what_was_asked_since() {
-        let ctx = StoryContext {
-            current_session_excerpt: "[assistant]: installed e434f0f".to_string(),
-            current_v3_enrichment: None,
-            related_sessions: vec![],
-            project_name: "csr".to_string(),
-            story_so_far: Some("The session began as a side pane question.".to_string()),
-            asked_since: vec!["story is a go".to_string()],
-        };
-        let prompt = build_prompt(&ctx);
-        let at = |needle: &str| prompt.find(needle).unwrap_or_else(|| panic!("{needle}"));
-        assert!(at("STORY SO FAR") < at("WHAT THE PERSON ASKED SINCE THEN"));
-        assert!(at("- story is a go") < at("TRANSCRIPT SINCE THE STORY SO FAR"));
-        assert!(prompt.contains("Rewrite the story"));
-        assert!(prompt.contains("3-4 sentences"));
-        assert!(!prompt.contains("CURRENT SESSION TRANSCRIPT"));
-    }
-
-    #[test]
     fn only_what_the_person_typed_counts_as_asked() {
         let user = |content: serde_json::Value| serde_json::json!({"type": "user", "message": {"role": "user", "content": content}});
         let mut summary = user(serde_json::json!(
@@ -1277,7 +1307,6 @@ Summary:
             .mark_story_written("conv-a", "story_conv-a", 640)
             .unwrap();
         let found = prior_story(&storage, "conv-a").unwrap();
-        assert_eq!(found.text, "second story");
         assert_eq!((found.rev, found.covered), (2, Some(640)));
         let mut ids = found.ids.clone();
         ids.sort();

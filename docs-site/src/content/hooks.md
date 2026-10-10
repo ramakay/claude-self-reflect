@@ -54,9 +54,11 @@ Everything else falls through to multi-signal scoring:
 
 ## Session story — kept current at each compaction
 
-A session's story is the short account later sessions read about it. After each compaction, SessionStart starts a detached `csr-engine generate-story --from-compaction`. It rebuilds the story from the summary Claude Code writes as it compacts: what was asked, then where the work stood. There is no model call, so every compaction refreshes the story at no cost. The new story replaces the old one. CSR records how many of the session's messages it covers.
+A session's story is the short account later sessions read about it. After each compaction, SessionStart starts a detached `csr-engine generate-story --from-compaction`, which rebuilds the story from the summary Claude Code writes as it compacts. The new story replaces the old one, and CSR records how many of the session's messages it covers.
 
-The work after the last compaction reaches the story only through an opt-in rewrite. Set `CSR_STORY_REWRITES=1`, and SessionEnd asks Haiku to rewrite the story from the story so far, what you asked since, and the transcript since. It does this only when the untold part is at least a quarter of the session. Each rewrite is one metered `claude -p` call.
+By default CSR extracts the story from that summary: what was asked, then where the work stood. There is no model call. The summary has a blind spot, though. Claude Code keeps the last few messages verbatim after it, so the summary never sees how the work ended.
+
+Set `CSR_STORY_REWRITES=1` and Haiku writes the story instead. It reads the summary for the session's whole arc and the last 20 messages for where it stood. At SessionEnd it runs again, if you asked something since the last story, so the ending reaches the story too. Each is one metered `claude -p` call, about $0.003. On five long sessions, two blind judges ranked this telling first. The other four were the free extract, Haiku over a sample of messages, Haiku rewriting the earlier story, and Haiku over the summary alone.
 
 ## SessionEnd — Automatic Narrative
 
