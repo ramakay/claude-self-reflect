@@ -4009,8 +4009,8 @@ mod tests {
         let scratch = crate::extraction::codegraph::extract_graph_fragment_for_file(
             body,
             "scratch/abcd1234/inline-aaaa.py",
-            "p",
-            "p",
+            "scratch:p",
+            "scratch:p",
             "c1",
             "s1",
         );
@@ -4037,10 +4037,13 @@ mod tests {
             .unwrap();
         let mut out = String::from("why");
         append_scratch_hop(&storage, "why does build_index exist", &[], &mut out);
+        // The repo function's first conversation has no recorded start, so only
+        // the matching body is claimed, never that the scratch became final.
         assert!(
-            out.contains("drafted as scratch in session abcd1234 on 2026-09-30"),
+            out.contains("same body as build_index in src/index.py: drafted as scratch in session abcd1234 on 2026-09-30"),
             "{out}"
         );
+        assert!(!out.contains("became final"), "{out}");
         let mut quiet = String::from("why");
         append_scratch_hop(&storage, "unrelated question here", &[], &mut quiet);
         assert_eq!(quiet, "why");

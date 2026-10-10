@@ -9,8 +9,10 @@
 //!
 //! Three things build on the stored rows:
 //! * P1: the scratch functions become `code_nodes` rows like any file.
-//! * P2: a scratch function with the same name and body as a repo function gets
-//!   a "became final" receipt (shown by `csr_why`).
+//! * P2: a scratch function with the same name and body as a repo function of
+//!   the same project is shown by `csr_why`: as "became final" only when the
+//!   repo function's first conversation began after the scratch was written,
+//!   otherwise as a plain "same body as".
 //! * P3: a plain frequency table of languages and imports for `status`.
 //!
 //! No model is involved anywhere. CSR's own payloads stay out: any body that
@@ -191,29 +193,130 @@ fn stdin_interpreter(line: &str) -> Option<&'static str> {
     None
 }
 
-/// Heredoc marker after `<<` on a line: (marker, byte offset of `<<`).
-fn heredoc_marker(line: &str) -> Option<String> {
-    let mut search = 0;
-    while let Some(rel) = line[search..].find("<<") {
-        let pos = search + rel;
-        let rest = &line[pos + 2..];
-        if rest.starts_with('<') {
-            // here-string `<<<`, not a heredoc
-            search = pos + 3;
+/// Heredoc marker right after a `<<` operator (`rest` starts after the two
+/// `<`): `EOF` for `<<'EOF'`, `<<-EOF`, `<< EOF`. `None` for a here-string
+/// (`<<<`) or a `<<` with no word after it (a shift operator).
+fn marker_after(rest: &str) -> Option<String> {
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let rest = rest.trim_start_matches(['\'', '"', '\\']);
+    let marker: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!marker.is_empty()).then_some(marker)
+}
+
+/// Where a shell `<<` heredoc opens on `line`, outside any quote, given the
+/// quote still open from earlier lines. Returns the marker (if the line opens
+/// one) and the quote left open at the end of the line.
+fn scan_line(line: &str, mut quote: Option<char>) -> (Option<String>, Option<char>) {
+    let mut marker: Option<String> = None;
+    let mut prev_space = true;
+    let mut chars = line.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(q) => {
+                // inside "..." (or `...`): a backslash escapes the next char
+                if c == '\\' {
+                    chars.next();
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\\' => {
+                    chars.next();
+                }
+                '\'' | '"' | '`' => quote = Some(c),
+                // a comment runs to the end of the line
+                '#' if prev_space => break,
+                '<' if marker.is_none() && line[at + 1..].starts_with('<') => {
+                    marker = marker_after(&line[at + 2..]);
+                    chars.next();
+                }
+                _ => {}
+            },
+        }
+        prev_space = c.is_whitespace() || (quote.is_none() && matches!(c, ';' | '&' | '|' | '('));
+    }
+    (marker, quote)
+}
+
+/// One heredoc script found by [`scan_heredocs`].
+struct Heredoc {
+    opener: String,
+    body: String,
+}
+
+/// Most lines one command may make the heredoc scanner visit, so no input can
+/// turn the scan quadratic.
+const MAX_SCAN_STEPS: usize = 200_000;
+
+/// Closed heredocs in `command`, with the number of lines visited. A `<<`
+/// inside a quoted string (a shift in `python3 -c "x << 1"`) opens nothing; a
+/// marker that failed to close once cannot close later; bodies longer than
+/// [`MAX_BODY_BYTES`] are skipped without being copied.
+fn scan_heredocs(command: &str) -> (Vec<Heredoc>, usize) {
+    let lines: Vec<&str> = command.lines().collect();
+    let mut found = Vec::new();
+    let mut unclosed: Vec<String> = Vec::new();
+    let mut steps = 0usize;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < lines.len() && steps < MAX_SCAN_STEPS {
+        steps += 1;
+        let (marker, open) = scan_line(lines[i], quote);
+        quote = open;
+        let Some(marker) = marker else {
+            i += 1;
+            continue;
+        };
+        // The body starts on the next physical line; a quote still open at the
+        // end of this one means the operator was not a heredoc after all.
+        if quote.is_some() || unclosed.contains(&marker) {
+            i += 1;
             continue;
         }
-        let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
-        let rest = rest.trim_start_matches(['\'', '"', '\\']);
-        let marker: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if !marker.is_empty() {
-            return Some(marker);
+        let mut j = i + 1;
+        let mut bytes = 0usize;
+        let mut closed = false;
+        while j < lines.len() && steps < MAX_SCAN_STEPS {
+            steps += 1;
+            if lines[j].trim() == marker {
+                closed = true;
+                break;
+            }
+            bytes += lines[j].len() + 1;
+            j += 1;
         }
-        search = pos + 2;
+        if !closed {
+            unclosed.push(marker);
+            i += 1;
+            continue;
+        }
+        if bytes <= MAX_BODY_BYTES {
+            let mut body = String::with_capacity(bytes);
+            for line in &lines[i + 1..j] {
+                body.push_str(line);
+                body.push('\n');
+            }
+            found.push(Heredoc {
+                opener: lines[i].to_string(),
+                body,
+            });
+        }
+        i = j + 1;
+        quote = None;
     }
-    None
+    (found, steps)
 }
 
 fn quoted_regex() -> &'static Regex {
@@ -224,19 +327,27 @@ fn quoted_regex() -> &'static Regex {
     })
 }
 
-/// Read a shell-quoted string starting just after its opening quote.
-fn read_quoted(rest: &str, quote: char) -> Option<String> {
+/// Read a shell-quoted string starting just after its opening quote: the
+/// unescaped body, and the byte offset in `rest` just past the closing quote
+/// (the body of a double-quoted string is shorter than the text it came from,
+/// so its length is not that offset).
+fn read_quoted(rest: &str, quote: char) -> Option<(String, usize)> {
     if quote == '\'' {
-        return rest.find('\'').map(|end| rest[..end].to_string());
+        return rest
+            .find('\'')
+            .map(|end| (rest[..end].to_string(), end + 1));
     }
     let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
+    let mut chars = rest.char_indices();
+    while let Some((_, c)) = chars.next() {
         match c {
-            '"' => return Some(out),
+            '"' => {
+                let end = chars.next().map_or(rest.len(), |(at, _)| at);
+                return Some((out, end));
+            }
             '\\' => match chars.next() {
-                Some(n @ ('"' | '\\' | '$' | '`')) => out.push(n),
-                Some(n) => {
+                Some((_, n @ ('"' | '\\' | '$' | '`'))) => out.push(n),
+                Some((_, n)) => {
                     out.push('\\');
                     out.push(n);
                 }
@@ -270,38 +381,13 @@ pub fn extract_scripts(command: &str) -> Vec<Script> {
     };
 
     // Heredocs.
-    let lines: Vec<&str> = command.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i];
-        let Some(marker) = heredoc_marker(line) else {
-            i += 1;
-            continue;
-        };
-        let mut j = i + 1;
-        let mut body = String::new();
-        let mut closed = false;
-        while j < lines.len() {
-            if lines[j].trim() == marker {
-                closed = true;
-                break;
+    for heredoc in scan_heredocs(command).0 {
+        if let Some(path) = redirect_target(&heredoc.opener) {
+            if let Some(ext) = ext_for_path(&path) {
+                push(file_stem(&path), ext, heredoc.body);
             }
-            body.push_str(lines[j]);
-            body.push('\n');
-            j += 1;
-        }
-        if closed {
-            if let Some(path) = redirect_target(line) {
-                if let Some(ext) = ext_for_path(&path) {
-                    push(file_stem(&path), ext, body);
-                }
-            } else if let Some(ext) = stdin_interpreter(line) {
-                push("inline".to_string(), ext, body);
-            }
-            i = j + 1;
-        } else {
-            // Unclosed (or a `<<` shift operator): keep scanning the next line.
-            i += 1;
+        } else if let Some(ext) = stdin_interpreter(&heredoc.opener) {
+            push("inline".to_string(), ext, heredoc.body);
         }
     }
 
@@ -317,8 +403,7 @@ pub fn extract_scripts(command: &str) -> Vec<Script> {
             continue;
         };
         match read_quoted(&command[start..], quote) {
-            Some(body) => {
-                let consumed = body.len();
+            Some((body, consumed)) => {
                 push("inline".to_string(), ext, body);
                 from = start + consumed.max(1);
             }
@@ -359,7 +444,13 @@ fn index_command(
     stats: &mut IndexStats,
 ) -> Result<()> {
     let session8: String = session_id.chars().filter(|c| *c != '-').take(8).collect();
-    for (n, script) in extract_scripts(command).into_iter().enumerate() {
+    // Extraction is pure string work, but an import must never be taken down by
+    // a hostile or malformed command: a panic here costs only this command.
+    let scripts = std::panic::catch_unwind(|| extract_scripts(command)).unwrap_or_else(|_| {
+        tracing::warn!("scratch extraction panicked; command skipped");
+        Vec::new()
+    });
+    for (n, script) in scripts.into_iter().enumerate() {
         stats.scripts_seen += 1;
         let id = full_hash(&format!("{conv_id}|{tool_use_id}|{n}"));
         let exists = storage.with_connection(|conn| {
@@ -487,7 +578,7 @@ pub fn index_transcript(
                 continue;
             };
             let tool_use_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            index_command(
+            if let Err(e) = index_command(
                 storage,
                 command,
                 tool_use_id,
@@ -496,13 +587,15 @@ pub fn index_transcript(
                 project,
                 &created_at,
                 &mut stats,
-            )?;
+            ) {
+                tracing::warn!(error = %e, "scratch script skipped");
+            }
         }
     }
     Ok(stats)
 }
 
-/// P2: one "became final" receipt.
+/// P2: one scratch/repo match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Promotion {
     pub name: String,
@@ -511,6 +604,10 @@ pub struct Promotion {
     pub session8: String,
     /// `YYYY-MM-DD`, empty when the transcript had no timestamp.
     pub date: String,
+    /// The repo function was first seen in a conversation that began after the
+    /// scratch script was written. Without that, only the bodies are known to
+    /// match: the repo function may be older than the scratch.
+    pub followed_scratch: bool,
 }
 
 impl Promotion {
@@ -521,33 +618,55 @@ impl Promotion {
         } else {
             format!(" on {}", self.date)
         };
-        format!(
-            "became final: {} in {} was drafted as scratch in session {}{} (same body)",
-            self.name, self.repo_file, self.session8, when
-        )
+        if self.followed_scratch {
+            format!(
+                "became final: {} in {} was drafted as scratch in session {}{} (same body)",
+                self.name, self.repo_file, self.session8, when
+            )
+        } else {
+            format!(
+                "same body as {} in {}: drafted as scratch in session {}{}",
+                self.name, self.repo_file, self.session8, when
+            )
+        }
     }
 }
 
-/// Scratch functions whose name and body hash match a repo function.
-/// `names` limits the search to those repo function names (empty = none).
+/// Matching pairs: a repo function and a scratch function of the SAME project
+/// with the same kind, name and body hash. `followed_scratch` (column 6) is 1
+/// only when the repo function's first conversation is another conversation
+/// than the scratch's and began after the scratch script was written.
+const PROMOTION_PAIRS: &str = "
+    FROM code_nodes r
+    JOIN code_nodes s ON s.name = r.name AND s.body_hash = r.body_hash
+                     AND s.kind = r.kind AND s.project = 'scratch:' || r.project
+    LEFT JOIN scratch_scripts ss ON ss.file = s.file
+    WHERE r.kind IN ('function', 'method')
+      AND r.file NOT LIKE 'scratch/%'
+      AND s.file LIKE 'scratch/%'";
+
+const FOLLOWED_SCRATCH: &str = "CASE WHEN ss.created_at <> '' AND r.first_conv_id <> ''
+         AND ss.conv_id <> r.first_conv_id
+         AND julianday((SELECT MIN(c.timestamp) FROM chunks c
+                         WHERE c.conversation_id = r.first_conv_id)) > julianday(ss.created_at)
+       THEN 1 ELSE 0 END";
+
+/// Scratch functions whose name and body hash match a repo function of the
+/// same project. `names` limits the search to those repo function names
+/// (empty = none).
 pub fn promotions_for_names(conn: &Connection, names: &[String]) -> Result<Vec<Promotion>> {
     let mut out: Vec<Promotion> = Vec::new();
     if names.is_empty() {
         return Ok(out);
     }
-    let mut stmt = conn.prepare(
-        "SELECT r.name, r.file, s.file, COALESCE(ss.session_id, ''), COALESCE(ss.created_at, '')
-         FROM code_nodes r
-         JOIN code_nodes s ON s.name = r.name AND s.body_hash = r.body_hash
-                          AND s.kind = r.kind
-         LEFT JOIN scratch_scripts ss ON ss.file = s.file
-         WHERE r.name = ?1
-           AND r.kind IN ('function', 'method')
-           AND r.file NOT LIKE 'scratch/%'
-           AND s.file LIKE 'scratch/%'
-         ORDER BY ss.created_at ASC
-         LIMIT 3",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT r.name, r.file, s.file, COALESCE(ss.session_id, ''), COALESCE(ss.created_at, ''),
+                {FOLLOWED_SCRATCH}
+         {PROMOTION_PAIRS}
+           AND r.name = ?1
+         ORDER BY 6 DESC, ss.created_at ASC
+         LIMIT 3"
+    ))?;
     for name in names {
         let rows = stmt.query_map(params![name], |row| {
             let session: String = row.get(3)?;
@@ -558,6 +677,7 @@ pub fn promotions_for_names(conn: &Connection, names: &[String]) -> Result<Vec<P
                 scratch_file: row.get(2)?,
                 session8: session.chars().filter(|c| *c != '-').take(8).collect(),
                 date: created.chars().take(10).collect(),
+                followed_scratch: row.get::<_, i64>(5)? == 1,
             })
         })?;
         for row in rows {
@@ -581,7 +701,8 @@ pub struct ScratchStatus {
     pub by_language: BTreeMap<String, i64>,
     /// Most-used imports across scratch scripts, most frequent first.
     pub top_imports: Vec<(String, i64)>,
-    /// Scratch functions that later appeared verbatim in a repo file.
+    /// Scratch functions that later appeared verbatim in a repo function of
+    /// the same project (the repo function first seen after the scratch ran).
     pub became_final: i64,
 }
 
@@ -620,10 +741,7 @@ pub fn status(conn: &Connection) -> Result<ScratchStatus> {
         out.top_imports.push(row?);
     }
     out.became_final = conn.query_row(
-        "SELECT COUNT(DISTINCT s.id) FROM code_nodes s
-         JOIN code_nodes r ON r.name = s.name AND r.body_hash = s.body_hash AND r.kind = s.kind
-         WHERE s.file LIKE 'scratch/%' AND r.file NOT LIKE 'scratch/%'
-           AND s.kind IN ('function','method')",
+        &format!("SELECT COUNT(DISTINCT s.id) {PROMOTION_PAIRS} AND {FOLLOWED_SCRATCH} = 1"),
         [],
         |r| r.get(0),
     )?;
@@ -778,39 +896,91 @@ mod tests {
         assert_eq!(has_fn, 1);
     }
 
-    #[test]
-    fn became_final_receipt_and_status_table() {
-        let (dir, storage) = temp_storage();
-        let body =
-            "import json\nimport sqlite3\ndef load_rows(p):\n    return json.load(open(p))\n";
-        let path = write_transcript(
-            dir.path(),
-            &[("t1", &format!("python3 - <<'EOF'\n{body}EOF"))],
-        );
-        index_transcript(&storage, &path, "conv-a", "proj").unwrap();
+    const ROWS_BODY: &str =
+        "import json\nimport sqlite3\ndef load_rows(p):\n    return json.load(open(p))\n";
 
-        // The same function lands in a repo file.
+    /// Index `ROWS_BODY` as a scratch script (conv-a, 2026-09-30T10:00:00Z) and
+    /// land the same function in a repo file of `repo_project`, first seen in
+    /// conversation `conv-b`.
+    fn scratch_then_repo(dir: &Path, storage: &Storage, repo_project: &str) {
+        let path = write_transcript(
+            dir,
+            &[("t1", &format!("python3 - <<'EOF'\n{ROWS_BODY}EOF"))],
+        );
+        index_transcript(storage, &path, "conv-a", "proj").unwrap();
         let frag = crate::extraction::codegraph::extract_graph_fragment_for_file(
-            body,
+            ROWS_BODY,
             "src/rows.py",
-            "proj",
-            "proj",
+            repo_project,
+            repo_project,
             "conv-b",
             "sess-b",
         );
         for n in &frag.nodes {
             storage.upsert_code_node(n).unwrap();
         }
-        let promos = storage
+    }
+
+    fn conv_b_starts_at(storage: &Storage, timestamp: &str) {
+        let chunk = crate::import::ConversationChunk {
+            id: "chunk-b".into(),
+            conversation_id: "conv-b".into(),
+            project_name: "proj".into(),
+            timestamp: timestamp.into(),
+            content: "landing load_rows in src/rows.py".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+    }
+
+    fn promos(storage: &Storage) -> Vec<Promotion> {
+        storage
             .with_connection(|c| promotions_for_names(c, &["load_rows".to_string()]))
-            .unwrap();
-        assert_eq!(promos.len(), 1, "{promos:?}");
-        assert_eq!(promos[0].repo_file, "src/rows.py");
-        assert_eq!(promos[0].session8, "abcd1234");
-        assert_eq!(promos[0].date, "2026-09-30");
-        assert!(promos[0]
+            .unwrap()
+    }
+
+    #[test]
+    fn same_body_is_only_claimed_as_final_when_the_repo_function_came_after() {
+        let (dir, storage) = temp_storage();
+        scratch_then_repo(dir.path(), &storage, "proj");
+
+        // The repo function's first conversation has no record of when it
+        // began: the bodies match, the order is unknown.
+        let unknown = promos(&storage);
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(!unknown[0].followed_scratch);
+        assert_eq!(unknown[0].repo_file, "src/rows.py");
+        assert_eq!(unknown[0].session8, "abcd1234");
+        assert_eq!(unknown[0].date, "2026-09-30");
+        let line = unknown[0].line();
+        assert!(line.starts_with("same body as load_rows"), "{line}");
+        assert!(!line.contains("became final"), "{line}");
+        assert_eq!(storage.with_connection(status).unwrap().became_final, 0);
+
+        // The repo function came first: still only the same body.
+        conv_b_starts_at(&storage, "2026-09-29T09:00:00Z");
+        let before = promos(&storage);
+        assert!(!before[0].followed_scratch, "{before:?}");
+        assert!(!before[0].line().contains("became final"));
+        assert_eq!(storage.with_connection(status).unwrap().became_final, 0);
+    }
+
+    #[test]
+    fn a_repo_function_first_seen_after_the_scratch_became_final() {
+        let (dir, storage) = temp_storage();
+        scratch_then_repo(dir.path(), &storage, "proj");
+        conv_b_starts_at(&storage, "2026-10-02T09:00:00Z");
+
+        let after = promos(&storage);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0].followed_scratch);
+        assert!(after[0]
             .line()
-            .contains("drafted as scratch in session abcd1234 on 2026-09-30"));
+            .contains("became final: load_rows in src/rows.py was drafted as scratch in session abcd1234 on 2026-09-30"));
         assert!(storage
             .with_connection(|c| promotions_for_names(c, &["other".to_string()]))
             .unwrap()
@@ -838,5 +1008,69 @@ mod tests {
             "{:?}",
             st.top_imports
         );
+    }
+
+    #[test]
+    fn a_repo_function_of_another_project_never_matches_the_scratch() {
+        let (dir, storage) = temp_storage();
+        scratch_then_repo(dir.path(), &storage, "other-project");
+        conv_b_starts_at(&storage, "2026-10-02T09:00:00Z");
+        assert!(promos(&storage).is_empty());
+        assert_eq!(storage.with_connection(status).unwrap().became_final, 0);
+    }
+
+    #[test]
+    fn a_closing_quote_after_an_escaped_quote_and_unicode_does_not_panic() {
+        // The unescaped body is shorter than the text it came from: advancing
+        // by its length landed inside the multi-byte `é`.
+        let cmd = "python3 -c \"print('\\\"') # é\"\nnode -e 'function ünï(){return 1}'";
+        let s = extract_scripts(cmd);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!(s[0].body, "print('\"') # é");
+        assert!(s[1].body.contains("ünï"));
+        // and a lone escaped quote followed by wide characters, many times over
+        let many = "python3 -c \"print('\\\"') # 日本語é\"\n".repeat(50);
+        let _ = extract_scripts(&many);
+        let _ = extract_scripts("python3 -c \"é\\\"");
+    }
+
+    #[test]
+    fn shift_expressions_inside_a_quoted_script_open_no_heredoc_and_cost_one_pass() {
+        let mut body = String::from("x = 1\n");
+        for _ in 0..8_000 {
+            body.push_str("x = x << 1\n");
+        }
+        let cmd = format!("python3 -c \"{body}print(x)\"\ncat > /tmp/b.py <<'EOF'\ndef later():\n    return 3\nEOF");
+        let lines = cmd.lines().count();
+        let (heredocs, steps) = scan_heredocs(&cmd);
+        assert_eq!(heredocs.len(), 1, "only the real heredoc");
+        assert!(heredocs[0].body.contains("def later"));
+        assert!(steps <= lines + 8, "{steps} steps for {lines} lines");
+        assert!(extract_scripts(&cmd).iter().any(|x| x.label == "b"));
+    }
+
+    #[test]
+    fn unquoted_shifts_and_repeated_unclosed_markers_stay_linear() {
+        // Unquoted `<< 1` shifts open nothing that closes. The first failed
+        // search proves every later one for that marker fails too.
+        let cmd = "echo $((x << 1))\n".repeat(8_000);
+        let lines = cmd.lines().count();
+        let (heredocs, steps) = scan_heredocs(&cmd);
+        assert!(heredocs.is_empty());
+        assert!(steps <= 2 * lines + 8, "{steps} steps for {lines} lines");
+        // distinct unclosed markers are still bounded by the global step cap
+        let many: String = (0..30_000).map(|i| format!("cat <<M{i}\n")).collect();
+        let (_, steps) = scan_heredocs(&many);
+        assert!(steps <= MAX_SCAN_STEPS + 1, "{steps}");
+    }
+
+    #[test]
+    fn an_oversized_heredoc_is_skipped_without_hiding_the_next_one() {
+        let big = "x = 1\n".repeat(MAX_BODY_BYTES / 6 + 10);
+        let cmd =
+            format!("python3 - <<'A'\n{big}A\ncat > /tmp/ok.py <<'B'\ndef ok():\n    return 1\nB");
+        let s = extract_scripts(&cmd);
+        assert_eq!(s.len(), 1, "{}", s.len());
+        assert_eq!(s[0].label, "ok");
     }
 }
