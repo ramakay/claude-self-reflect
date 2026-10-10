@@ -1001,7 +1001,7 @@ mod tests {
     fn global_gate_publishes_a_unique_winner_with_two_receipts_and_stakes() {
         let winner = candidate(
             "release gate stuck",
-            &["csr", "cc-enhance"],
+            &["csr", "companion-app"],
             &[
                 ("sess-a", "2026-08-10", true),
                 ("sess-b", "2026-08-12", false),
@@ -1046,7 +1046,7 @@ mod tests {
         );
         let b = candidate(
             "theme b",
-            &["cc-enhance"],
+            &["companion-app"],
             &[
                 ("sess-c", "2026-08-10", true),
                 ("sess-d", "2026-08-11", false),
@@ -1128,7 +1128,7 @@ mod tests {
                 false,
             ),
             open_item(
-                "cc-enhance",
+                "companion-app",
                 "b",
                 "blocker",
                 "sess-b",
@@ -1162,7 +1162,7 @@ mod tests {
         assert_eq!(candidates[0].receipts.len(), 2);
         assert_eq!(
             candidates[0].projects,
-            vec!["csr".to_string(), "cc-enhance".to_string()]
+            vec!["csr".to_string(), "companion-app".to_string()]
         );
     }
 

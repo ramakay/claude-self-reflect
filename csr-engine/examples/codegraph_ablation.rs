@@ -25,7 +25,7 @@
 //! Query set (optional — external gold/query file):
 //!   By default this harness runs the hardcoded 20-query set below (Q1-Q12 + A1-A8),
 //!   byte-identical to prior runs. To run a different query set (e.g. eval-kit/ag's
-//!   Anukriti gold), pass its path as CLI arg 1 or via CSR_ABLATION_QUERIES:
+//!   private-app gold), pass its path as CLI arg 1 or via CSR_ABLATION_QUERIES:
 //!
 //!   CSR_ABLATION_DB=... CSR_ABLATION_PROJECTS=... CSR_ABLATION_OUT=... \
 //!     cargo run --release --example codegraph_ablation -- /path/to/queries_or_gold.json
@@ -175,35 +175,35 @@ const QUERIES: &[(&str, &str)] = &[
     ),
     (
         "A1",
-        "why did sign in switch from Clerk Core 3 finalize to legacy setActive in the expo app",
+        "why did the example client switch to the older authentication flow",
     ),
     (
         "A2",
-        "why does the expo app defer sign in with an auth intent service instead of prompting immediately",
+        "why does the example client defer authentication instead of prompting immediately",
     ),
     (
         "A3",
-        "why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load",
+        "why does the example dashboard cache report data in a snapshot instead of calling the APIs live on page load",
     ),
     (
         "A4",
-        "why do returning user and anonymous user counts differ in the posthog numbers on the command center",
+        "why do two user counts differ in the analytics numbers on the example dashboard",
     ),
     (
         "A5",
-        "why was score save instrumented with observability across multiple app runtime versions",
+        "why was the save action instrumented with observability across multiple client versions",
     ),
     (
         "A6",
-        "why does the whats running section exist on the command center and what does it monitor",
+        "why does the status section exist on the example dashboard and what does it monitor",
     ),
     (
         "A7",
-        "why was the radio reel video built as a remotion composition with a root of multiple scenes",
+        "why was the promo video built as a composition with a root of multiple scenes",
     ),
     (
         "A8",
-        "why does the lessons page pull lesson analytics from posthog instead of supabase",
+        "why does the progress page pull its analytics from one backend instead of another",
     ),
 ];
 

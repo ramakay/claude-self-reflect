@@ -8,11 +8,11 @@
  "Q9": {"origin": "02d270b9-f48d-4bb4-bd03-9017e1723fa3", "alt": "8b266e91-292b-4e39-bdaa-29d32b9e22f5", "confidence": "low-medium", "notes": "earliest 'never block'+hook cluster May 15/20 = v8 hook build era; matches owner latency description"},
  "Q10": {"origin": "0b68eace-3e21-4841-9567-58d038cd89d7", "alt": "fc16f91d-7f9c-44ca-b19b-237bbc3a3c6b", "confidence": "medium", "notes": "Jul 7 fix session (20 MEMORY_MANIFEST hits) matches memory-file date; fc16f91d Jun 11 has 8 earlier mentions — earlier-origin possibility flagged"},
  "Q12": {"origin": "8b266e91-292b-4e39-bdaa-29d32b9e22f5", "alt": null, "confidence": "medium", "notes": "earliest MAIN fts5 session May 20"},
- "A3": {"origin": "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e", "alt": null, "confidence": "low-medium", "notes": "earliest Meta rate-limit conv May 28 meta-campaigns; snapshot.ts lives in command-center — cross-project origin plausible but weak"},
- "A5": {"origin": "46d2386b-c3e9-4f09-a695-ca7de9e7ae84", "alt": "e6e599b6-4875-4604-8d3e-bb50ded8b3f2", "confidence": "medium", "notes": "first substantial score_save session May 20 (7 hits); May 19 single-hit precursor as alt"},
- "A6": {"origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2", "alt": "5931a5c9-5a2e-4f37-9946-bcc50a4a20be", "confidence": "medium", "notes": "May 14 dashboard-build session (earliest); May 20 heavy-build session (42 hits) as alt"},
- "A7": {"origin": "a3e84413-c8f2-481e-8661-8086accd8fcc", "alt": "9312ad1c-0ad0-4f05-a832-e3aa4452fe39", "confidence": "low", "notes": "owner flagged referent ambiguity; earliest Anukriti-Campaigns radio-reel conv May 16; treat with ambiguity disclosure"},
- "A8": {"origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2", "alt": null, "confidence": "medium", "notes": "May 14 session has 8 usePosthogLessons hits, earliest"}
+ "A3": {"origin": "71b8d18d-450b-4cd1-aba5-6db7fdcfae6e", "alt": null, "confidence": "low-medium", "notes": "[private note]"},
+ "A5": {"origin": "46d2386b-c3e9-4f09-a695-ca7de9e7ae84", "alt": "e6e599b6-4875-4604-8d3e-bb50ded8b3f2", "confidence": "medium", "notes": "[private note]"},
+ "A6": {"origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2", "alt": "5931a5c9-5a2e-4f37-9946-bcc50a4a20be", "confidence": "medium", "notes": "[private note]"},
+ "A7": {"origin": "a3e84413-c8f2-481e-8661-8086accd8fcc", "alt": "9312ad1c-0ad0-4f05-a832-e3aa4452fe39", "confidence": "low", "notes": "[private note]"},
+ "A8": {"origin": "92fcab9e-a193-405e-92f6-34c72edc9cd2", "alt": null, "confidence": "medium", "notes": "[private note]"}
 },
 "unmapped_unresolved": ["Q1", "Q3", "Q7", "Q11", "A1", "A2", "A4"],
 "out_of_corpus": {"Q2": {"impl_candidate": "grade-2: rerank.rs implementation session ~2026-07-07; concept conv owner-claimed pre-v8, unmappable"}}

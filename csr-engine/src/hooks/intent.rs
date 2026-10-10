@@ -77,7 +77,7 @@ const INTENT_EXEMPLARS: &[(Intent, &[&str])] = &[
         &[
             "where is the code for this feature",
             "which files implement the bottom sheet",
-            "map the radio code surface",
+            "map the audio code surface",
             "how does the player handle channel switching",
             "find the implementation of the ring navigation",
             "what code handles authentication here",

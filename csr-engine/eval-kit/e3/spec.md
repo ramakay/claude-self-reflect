@@ -1,4 +1,4 @@
-# E3 Controlled Contamination — Five-Part Spec (grok-implementer executes end-to-end)
+# E3 Controlled Contamination — Five-Part Spec (executed end-to-end by an implementation lane)
 
 ## 1. OBJECTIVE
 Measure how corpus contamination (eval-design transcript, sham transcript, scripted re-ask
@@ -26,7 +26,7 @@ the independent variable is corpus CONTENT only.
 - c0: pristine copy of the backup DB. Empty projects dir (no import).
 - c1: copy + import of ONLY the a4635d59 transcript (place it under projects/<same dir name as its real parent dir>/).
 - csham: copy + import of ONE unrelated transcript, size-matched: pick a .jsonl from
-  $HOME/.claude/projects/-Users-USER-projects-cc-enhance/ (or anukriti-website dir if cc-enhance has no fit) whose byte size is 70-130% of the c1 payload AND which contains ZERO occurrences of any of the 8 query texts below (grep -c each, all must be 0). Report the chosen file + size ratio.
+  $HOME/.claude/projects/-Users-USER-projects-companion-app/ (or private-app-website dir if companion-app has no fit) whose byte size is 70-130% of the c1 payload AND which contains ZERO occurrences of any of the 8 query texts below (grep -c each, all must be 0). Report the chosen file + size ratio.
 - c5: copy + import of 5 synthetic re-ask transcripts you generate: files
   SCRATCH/e3/c5_transcripts/c5cycle{1..5}-e3000000-0000-4000-8000-00000000000{1..5}.jsonl.
   Each mimics real JSONL structure (copy the line-shape of a real transcript: lines with
@@ -68,11 +68,11 @@ Header line: {"meta":{"db":"...","chunks":N,"imported":M}}.
 Q5 "why does import skip conversations that start with CSR agent prompts"
 Q9 "why do hooks use catch-all wrappers so they never block claude code"
 Q12 "why was fts5 keyword fallback added when semantic scores are low"
-A3 "why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load"
-A5 "why was score save instrumented with observability across multiple app runtime versions"
-A6 "why does the whats running section exist on the command center and what does it monitor"
-A7 "why was the radio reel video built as a remotion composition with a root of multiple scenes"
-A8 "why does the lessons page pull lesson analytics from posthog instead of supabase"
+A3 "why does the example dashboard cache report data in a snapshot instead of calling the APIs live on page load"
+A5 "why was the save action instrumented with observability across multiple client versions"
+A6 "why does the status section exist on the example dashboard and what does it monitor"
+A7 "why was the promo video built as a composition with a root of multiple scenes"
+A8 "why does the progress page pull its analytics from one backend instead of another"
 
 ## 4. CONSTRAINTS
 - Only repo file touched: examples/saga_contamination.rs. No src/**, no Cargo.toml edits,

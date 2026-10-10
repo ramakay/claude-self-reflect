@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Paired bootstrap for the AG (Anukriti-gold) codegraph ablation (5 arms, see
+"""Paired bootstrap for the AG (private-app-gold) codegraph ablation (5 arms, see
 examples/codegraph_ablation.rs and eval-kit/ag/score.py). Adapted from
-eval-kit/h1/bootstrap.py per .plans/2026-08-01-anukriti-gold-prereg.md rule 4: same
+eval-kit/h1/bootstrap.py per .plans/2026-08-01-private-app-gold-prereg.md rule 4: same
 harness, same arms, same controls as E1b — only the seed changes (new pre-registration,
 new gold corpus) and the default results path points at eval-kit/ag.
 

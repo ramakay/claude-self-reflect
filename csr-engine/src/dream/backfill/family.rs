@@ -9,9 +9,9 @@
 //! `claude-self-reflect` (episodes + 16k ledger rows) alongside
 //! `claude-self-reflect-csr-engine` (8.1k ledger rows, 244 funerals, ZERO
 //! episodes — sessions started inside the `csr-engine/` subdir), plus
-//! worktree-cwd keys (`csr-theme-wt`, `anukriti-command-center-worktrees`)
-//! and even case variants (`Anukriti-Campaigns` vs an `anukriti` ledger key
-//! holding files under `Anukriti-Campaigns/`). Stage 2's generators joined
+//! worktree-cwd keys (`csr-theme-wt`, `private-app-dashboard-worktrees`)
+//! and even case variants (`Private-App-Campaigns` vs an `private-app` ledger key
+//! holding files under `Private-App-Campaigns/`). Stage 2's generators joined
 //! episodes to witness verdicts on the EXACT key, so every funeral recorded
 //! under a sibling key was invisible.
 //!
@@ -19,9 +19,9 @@
 //!
 //! The first version of this module grouped keys by NAME: two keys merged
 //! when, case-insensitively, they were equal or one was a hyphen-boundary
-//! prefix of the other (`anukriti` + `anukriti-command-center`). That
+//! prefix of the other (`private-app` + `private-app-dashboard`). That
 //! heuristic is now known to be a **false-positive generator**: on the live
-//! corpus `anukriti` and `anukriti-website` are two genuinely unrelated git
+//! corpus `private-app` and `private-app-website` are two genuinely unrelated git
 //! repositories (different toplevels, different origin remotes) that
 //! happen to share a hyphen-delimited name root — the old rule silently
 //! merged them, attributing one repo's funerals and relapses to the other.
@@ -43,8 +43,8 @@
 //! This correctly reunites `claude-self-reflect` with
 //! `claude-self-reflect-csr-engine` (a session's cwd sitting one directory
 //! deeper inside the SAME repo resolves to the SAME `git
-//! rev-parse --show-toplevel`), while correctly keeping `anukriti` and
-//! `anukriti-website` apart (two different toplevels, two different
+//! rev-parse --show-toplevel`), while correctly keeping `private-app` and
+//! `private-app-website` apart (two different toplevels, two different
 //! origins, sharing nothing but a name root).
 //!
 //! See [`group_keys`] for the exact union-find rule and
@@ -573,27 +573,27 @@ mod tests {
 
     #[test]
     fn shared_hyphen_prefix_with_different_toplevel_never_merges() {
-        // anukriti vs anukriti-website: two DIFFERENT real repos that merely
+        // private-app vs private-app-website: two DIFFERENT real repos that merely
         // share a hyphen-delimited name root. The old heuristic merged
         // these; A-c must not.
         let fams = fam_names(vec![
             (
-                "anukriti",
-                ri(Some("/repo/anukriti"), Some("host/org/anukriti")),
+                "private-app",
+                ri(Some("/repo/private-app"), Some("host/org/private-app")),
             ),
             (
-                "anukriti-website",
+                "private-app-website",
                 ri(
-                    Some("/repo/anukriti-website"),
-                    Some("host/org/anukriti-website"),
+                    Some("/repo/private-app-website"),
+                    Some("host/org/private-app-website"),
                 ),
             ),
         ]);
         assert_eq!(fams.len(), 2);
         assert!(fams
             .iter()
-            .find(|(_, m)| m.contains(&"anukriti".to_string()))
-            .is_some_and(|(_, m)| !m.contains(&"anukriti-website".to_string())));
+            .find(|(_, m)| m.contains(&"private-app".to_string()))
+            .is_some_and(|(_, m)| !m.contains(&"private-app-website".to_string())));
     }
 
     #[test]
@@ -882,18 +882,18 @@ mod tests {
     fn family_containing_prefers_membership_over_a_colliding_family_name() {
         let families = vec![
             Family {
-                name: "anukriti".into(),
+                name: "private-app".into(),
                 members: vec!["ghost-key".into()],
             },
             Family {
-                name: "real-anukriti-repo".into(),
-                members: vec!["anukriti".into()],
+                name: "real-private-app-repo".into(),
+                members: vec!["private-app".into()],
             },
         ];
 
         assert_eq!(
-            family_containing(&families, "ANUKRITI").map(|family| family.name.as_str()),
-            Some("real-anukriti-repo")
+            family_containing(&families, "PRIVATE-APP").map(|family| family.name.as_str()),
+            Some("real-private-app-repo")
         );
     }
 
@@ -976,9 +976,9 @@ mod tests {
         assert!(commit_all(&repo_a));
 
         // repo_b and repo_c are two UNRELATED repos that happen to share
-        // the "anukriti" hyphen-prefix name root — must never merge.
-        let repo_b = tmp.path().join("anukriti_checkout");
-        let repo_c = tmp.path().join("anukriti_website_checkout");
+        // the "private-app" hyphen-prefix name root — must never merge.
+        let repo_b = tmp.path().join("private-app_checkout");
+        let repo_c = tmp.path().join("private-app_website_checkout");
         assert!(init_repo(&repo_b));
         assert!(init_repo(&repo_c));
         std::fs::write(repo_b.join("a.rs"), "fn a() {}\n").unwrap();
@@ -994,8 +994,8 @@ mod tests {
             "claude-self-reflect-csr-engine",
             &repo_a.join("csr-engine/src/x.rs"),
         );
-        seed_witness_file(&conn, "anukriti", &repo_b.join("a.rs"));
-        seed_witness_file(&conn, "anukriti-website", &repo_c.join("b.rs"));
+        seed_witness_file(&conn, "private-app", &repo_b.join("a.rs"));
+        seed_witness_file(&conn, "private-app-website", &repo_c.join("b.rs"));
 
         let families = compute_families(&conn).unwrap();
 
@@ -1007,14 +1007,14 @@ mod tests {
             "cwd-subdir key must merge via shared toplevel: {csr:?}"
         );
 
-        let ak = family_containing(&families, "anukriti").expect("anukriti resolves");
-        let akw =
-            family_containing(&families, "anukriti-website").expect("anukriti-website resolves");
+        let ak = family_containing(&families, "private-app").expect("private-app resolves");
+        let akw = family_containing(&families, "private-app-website")
+            .expect("private-app-website resolves");
         assert_ne!(
             ak.name, akw.name,
             "two unrelated repos sharing a name root must stay distinct"
         );
-        assert!(!ak.members.contains(&"anukriti-website".to_string()));
-        assert!(!akw.members.contains(&"anukriti".to_string()));
+        assert!(!ak.members.contains(&"private-app-website".to_string()));
+        assert!(!akw.members.contains(&"private-app".to_string()));
     }
 }

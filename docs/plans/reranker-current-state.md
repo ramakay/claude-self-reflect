@@ -37,10 +37,10 @@ everywhere; no LLM in any labeling/grading/gating seat.
 ## Review arc (all findings line-verified before acceptance)
 
 1. Codex xhigh designed + implemented v1 (`.plans/trained-reranker-design.md` (local planning notes, untracked)).
-2. Ox Alpha (stealth 1M-ctx model, OpenRouter free preview) whole-context review #1, ~207k
+2. A long-context model (free preview) whole-context review #1, ~207k
    tokens one prompt: 14 findings, 2 blockers (curated veto dev-machine-only; gate winnable by
    popularity replay), 4 majors. All top-5 confirmed in code.
-3. Codex fix round → Ox review #2: 1 CLOSED, 5 NARROWED, 14 new findings; verified subset
+3. Codex fix round → review #2: 1 CLOSED, 5 NARROWED, 14 new findings; verified subset
    (R2-1..6) fixed in round 3 (epsilon-from-constant, full-edge 4h bound, classifier-hash
    binding, session floors, atomic cadence write; 3 research-grade items documented in design
    doc §13 "Known limitations (v1)").

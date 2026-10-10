@@ -8,7 +8,7 @@
 //! they can propose anything. A family whose sessions never populated
 //! `episode_index` (or whose code was never git-witnessed at all) has no
 //! such verdicts and is invisible to every one of them, no matter how much
-//! real work happened there. `anukriti-website` is exactly this shape on
+//! real work happened there. `private-app-website` is exactly this shape on
 //! the live corpus: 914 `history.jsonl` prompts, effectively zero episode
 //! coverage.
 //!

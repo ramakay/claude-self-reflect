@@ -362,18 +362,18 @@ mod tests {
             "never bypass verification checks",
             "2026-08-01T00:00:00Z",
         );
-        exact.project = "anukriti".into();
+        exact.project = "private-app".into();
         let mut sibling = event(
             "bbbbbbbb-2",
             2,
             "bypass verification checks",
             "2026-08-02T00:00:00Z",
         );
-        sibling.project = "Anukriti-Campaigns".into();
+        sibling.project = "Private-App-Campaigns".into();
         storage.insert_intent_events(&[exact, sibling]).unwrap();
 
         assert_eq!(
-            super::handle(&storage, "anukriti", None, 2, true).unwrap(),
+            super::handle(&storage, "private-app", None, 2, true).unwrap(),
             "[]"
         );
     }

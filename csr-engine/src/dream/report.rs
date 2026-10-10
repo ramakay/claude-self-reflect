@@ -4661,8 +4661,8 @@ mod tests {
             "review https://github.com/ramakay/csr then merge"
         );
         assert_eq!(
-            first_sentence("upscale saadhana-v6-480p.mp4 to 4k. Done overnight."),
-            "upscale saadhana-v6-480p.mp4 to 4k."
+            first_sentence("upscale routine-v6-480p.mp4 to 4k. Done overnight."),
+            "upscale routine-v6-480p.mp4 to 4k."
         );
         assert_eq!(first_sentence("ends exactly here."), "ends exactly here.");
     }
