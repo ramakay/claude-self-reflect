@@ -958,6 +958,7 @@ class Session:
         self.talk = []  # (time, words) the person typed or Claude wrote, newest last; no tool output
         self.title = None
         self.summaries = []  # (time, text) of each compaction summary, oldest first
+        self.typed = []  # (time, words) of each prompt the person typed, oldest first
 
     def read_transcript(self):
         if not self.path:
@@ -1014,6 +1015,7 @@ class Session:
                     self.prompts.append(when)
                     if not entry.get('isSidechain'):
                         self.talk.append((when, own_words('\n'.join(texts))))
+                        self.typed.append(self.talk[-1])
             elif kind == 'user' and when and entry.get('isCompactSummary'):
                 content = (entry.get('message') or {}).get('content')
                 text = content if isinstance(content, str) else '\n'.join(
@@ -1064,7 +1066,7 @@ class Session:
         replies = sorted(self.replies.values())
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
                     compacts=sorted(self.compacts), compact_sizes=self.compact_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
-                    lost=lost_found(self.summaries),
+                    lost=lost_found(self.summaries, self.typed),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last))
 
@@ -2713,6 +2715,8 @@ OWED = re.compile(r"\b(wait|waiting|await|awaiting|confirm|verify|check|update|r
 BOOKKEEPING = re.compile(r"^(?:(?:send|write|give|post|deliver)\b.{0,40}\b(?:final|brief|short|settle)\b.{0,30}\b(?:reply|report|summary|message)|"
                          r"(?:brief|short|final)\b.{0,20}\b(?:reply|report|summary)|report\b.*\bto the user|"
                          r"(?:tell|let) the user\b|report\b|confirm the background|responding to\b|(?:the )?messages after this summary)", re.I)
+APPROVED = re.compile(r"^\W*(?:go|yes|yep|ok|okay|install|proceed|approved?|do it|ship it|push it)\b|\bis a go\b", re.I)
+REMINDERS = re.compile(r'reminders from csr', re.I)  # what prep-compact asks the summary to keep: never a task
 IGNORED = {'the', 'and', 'for', 'with', 'then', 'that', 'this', 'when', 'its', 'are', 'was', 'from', 'into', 'not', 'has',
            'have', 'will', 'any', 'all', 'one', 'new', 'now', 'yet', 'but', 'you', 'your', 'user'}
 
@@ -2722,18 +2726,32 @@ def plain(text):
     return ' '.join(re.sub(r'\*\*|__|`', '', text).split())
 
 
+def stem(word):
+    """A word without its common ending, so "installing" and "install" count as one."""
+    for end in ('ing', 'ed', 'es', 's'):
+        if len(word) > len(end) + 3 and word.endswith(end):
+            return word[:-len(end)]
+    return word
+
+
 def words_of(text):
-    return {w for w in re.findall(r'[a-z0-9_]+', text.lower()) if len(w) > 2 and w not in IGNORED}
+    return {stem(w) for w in re.findall(r'[a-z0-9_]+', text.lower()) if len(w) > 2 and w not in IGNORED}
 
 
 def same_words(a, b):
-    return bool(a and b) and len(a & b) / len(a | b) >= SAME_THREAD
+    """One thread in two wordings: most of all their words match, or most of the shorter one's do."""
+    if not (a and b):
+        return False
+    shared = len(a & b)
+    return shared / len(a | b) >= SAME_THREAD or (shared >= 3 and shared / min(len(a), len(b)) >= 0.6)
 
 
 def summary_section(text, name):
     """The lines of one numbered section ("7. Pending Tasks:") of a compaction summary, up to the next."""
     lines, found = [], False
     for line in text.splitlines():
+        if found and REMINDERS.search(line):
+            break  # prep-compact's reminders: what you set aside, not what is owed
         if NUMBERED.match(line.strip()) and not line.startswith(' '):
             if found:
                 break
@@ -2778,10 +2796,12 @@ def summary_items(text):
     return items
 
 
-def lost_threads(summaries):
+def lost_threads(summaries, typed=()):
     """The threads across a session's compaction summaries [(time, text)], ranked: lost and waiting on you,
     lost, open and waiting, open. A thread is open while the newest summary still carries it and lost once
-    it dropped out; the same thread in two summaries is two items sharing most of their words."""
+    it dropped out; the same thread in two summaries is two items sharing most of their words. A thread that
+    dropped out right after you said go is answered, not lost; one that showed once and never waited on you
+    faded (most of those were done in passing)."""
     summaries = sorted(summaries)
     threads = []
     for index, (when, text) in enumerate(summaries):
@@ -2799,7 +2819,12 @@ def lost_threads(summaries):
     for t in threads:
         state = 'open' if max(t['carried']) == len(summaries) - 1 else 'lost'
         waiting = bool(WAITING.search(' '.join([t['text']] + t['nested'])))
-        rank = (0 if waiting else 1) if state == 'lost' else (2 if waiting else 3)
+        after = [words for when, words in sorted(typed) if when > t['last']][:2]
+        if state == 'lost' and any(APPROVED.search(words or '') for words in after):
+            state = 'answered'
+        elif state == 'lost' and not waiting and len(t['carried']) < 2:
+            state = 'faded'
+        rank = {'lost': 0 if waiting else 1, 'open': 2 if waiting else 3}.get(state, 4)
         out.append(dict(text=t['text'], detail=t['nested'], first_seen=t['first'], last_seen=t['last'],
                         times=len(t['carried']), state=state, waiting=waiting, rank=rank,
                         key=hashlib.sha1(t['first_words'].encode()).hexdigest()[:12]))
@@ -2828,13 +2853,15 @@ def keep_lost(key, answer, at):
         handle.write(json.dumps(dict(key=key, answer=answer, at=at)) + '\n')
 
 
-def lost_found(summaries):
-    """The threads, each marked hidden: "drop" for good, "later" until the next compaction."""
-    threads, said = lost_threads(summaries), lost_log()
+def lost_found(summaries, typed=()):
+    """The threads, each marked hidden: "drop" for good, "later" until the next compaction. A thread set
+    aside for later is also the one thing prep-compact hands the summary, as a reminder."""
+    threads, said = lost_threads(summaries, typed), lost_log()
     newest = max((when for when, _ in summaries), default=0)
     for t in threads:
         answer, at = said.get(t['key'], (None, 0))
         t['hidden'] = answer if answer == 'drop' or (answer == 'later' and at > newest) else None
+        t['later'] = answer == 'later'
     return threads
 
 
@@ -2844,7 +2871,8 @@ def lost_json(session_id):
     session = Session(session_id) if session_id else None
     if session:
         session.read_transcript()
-    return [t for t in lost_found(session.summaries if session else []) if t['hidden'] != 'drop']
+    return [t for t in lost_found(session.summaries if session else [], session.typed if session else [])
+            if t['hidden'] != 'drop']
 
 
 def lost_asks(thread):

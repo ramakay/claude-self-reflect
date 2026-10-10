@@ -1,9 +1,12 @@
-// Prep-compact: before a compaction, the threads still open or gone quiet are handed to the summarizer, so
-// they land in the summary's Pending Tasks instead of dropping out of it. The pane finds them (pane.py --lost).
+// Prep-compact: before a compaction, the threads you set aside for later ("later" in the pane's Lost and
+// found) are handed to the summarizer as reminders, in a section of their own. Never into Pending Tasks:
+// that list is how Lost and found sees a thread go quiet, and Claude reads it as its to-do list.
 
-export type Thread = { text: string; state: string; waiting?: boolean; hidden?: string | null }
+export type Thread = { text: string; state: string; waiting?: boolean; hidden?: string | null; later?: boolean }
 
-const HEAD = 'Carry these open threads into Pending Tasks, one line each, unless the conversation closed them:'
+const HEAD =
+  "After the summary, add a section headed 'Reminders from CSR (not tasks)' and list these lines verbatim. " +
+  'The person set them aside for later; do not act on them unless the person asks:'
 export const CARRY_MAX = 8
 export const CARRY_CHARS = 1200
 
@@ -13,8 +16,8 @@ export function carryBlock(threads: Thread[]): string | null {
   const lines: string[] = []
   let room = CARRY_CHARS - HEAD.length
   for (const thread of threads) {
-    if (lines.length >= CARRY_MAX || thread.hidden === 'drop') continue
-    const flag = thread.waiting ? ' (waiting on the user)' : ''
+    if (lines.length >= CARRY_MAX || thread.hidden === 'drop' || !thread.later) continue
+    const flag = ''
     const text = thread.text.replace(/\s+/g, ' ').trim()
     const line = `- ${text}${flag}`
     if (room < 40) break // no room for a line worth reading

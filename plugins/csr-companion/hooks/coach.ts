@@ -3,7 +3,6 @@
 
 export const BAND_WINDOW_MS = 30_000 // a bare digit this soon after a band note showed is a hotkey miss
 export const AGAIN_MS = 10_000 // the same digit sent again this soon goes through
-export const PUSH_OK_MS = 60_000 // "push" in a prompt lets an identical git push through this long
 
 // A prompt that is only one digit: what a band hotkey would have been.
 export const isBareDigit = (text: string): boolean => /^\s*\d\s*$/.test(text)
@@ -32,7 +31,6 @@ export type GitVerdict = { kind: 'deny'; reason: string } | { kind: 'ask' } | nu
 
 export const NO_VERIFY = '--no-verify skips the pre-commit gate. Fix what the gate flags instead.'
 export const RELEASE = 'Pushing release/v* publishes to npm. Push a backport/... branch instead, or ask the person to push it.'
-export const SAY_PUSH = 'git push needs the person first. Say push to allow it: the identical command goes through for 60 s after.'
 
 // A heredoc's body is text, not commands: cut from the line after `<<EOF` to the line that ends it.
 function withoutHeredocs(src: string): string {
@@ -149,13 +147,9 @@ function skipsHooks(rest: string[]): boolean {
 
 // Whether a prompt gives the word to push: it says push, and not as "don't push", "do not push", "never
 // push", "no push", "not ... push" or "without pushing" a few words before.
-export function saysPush(text: string): boolean {
-  if (!/\bpush\b/i.test(text)) return false
-  return !/\b(?:don[\'’]?t|do not|never|not|no|without|stop|hold off(?: on)?)\b[^.!?\n]{0,24}\bpush/i.test(text)
-}
 
 // What a git push should come to: never for --no-verify and for release/v* (a push there publishes to
-// npm), ask for any other push, null for no push at all.
+// npm), "ask" for any other push (the hook lets it through), null for no push at all.
 export function gitVerdict(command: string, depth = 0): GitVerdict {
   let worst: GitVerdict = null
   for (const words of commands(command)) {

@@ -7,7 +7,7 @@ import type { Thread } from './carry'
 import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
 import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, hasNews, mayLook, median, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
-import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, PUSH_OK_MS, SAY_PUSH, saysPush } from './coach'
+import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit } from './coach'
 
 // CSR beside Claude, patterned on Claude Code's own "You should know".
 //
@@ -423,24 +423,13 @@ export const register: Register = (on, options) => {
 
   let held: { text: string; at: number } | null = null // a bare digit kept back, for 10 s
   let bandAt = 0 // when another band (You should know's) last drew a question
-  let pushPromptAt = -Infinity // when a prompt last said push
-  let pushDenied = '' // the git push that asked for it
 
-  // The push guard: --no-verify and release/v* never; any other git push waits for the person's word.
-  // The tool.call result has no ask form, so a push is denied with what to say, and the identical
-  // command goes through for 60 s after a prompt that says push.
+  // The push guard, kept to the two rules that are never right: --no-verify (it skips the pre-commit gate)
+  // and a push to release/v* (it publishes to npm). Every other git push goes through untouched.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const verdict = gitVerdict(e.command)
     if (!verdict) return next(e)
-    if (verdict.kind === 'deny') return { deny: verdict.reason }
-    const said = (await $.clock.now()) - pushPromptAt <= PUSH_OK_MS // the person said push, lately
-    if (said && (!pushDenied || pushDenied === e.command)) {
-      pushDenied = ''
-      pushPromptAt = -Infinity // one word, one push: the next push asks again
-      return next(e)
-    }
-    if (!said) pushDenied = e.command // the one the person is being asked about
-    return { deny: SAY_PUSH }
+    return verdict.kind === 'deny' ? { deny: verdict.reason } : next(e)
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
 
   on('tool.call', async ($, e, next) => {
@@ -458,7 +447,6 @@ export const register: Register = (on, options) => {
     // sent on if the same digit comes again within 10 s. A held digit is not counted as typed past a note.
     const at = await $.clock.now()
     const yours = e.origin.kind === 'composer' || e.origin.kind === 'bridge' // you typed it, not a peer or a plugin
-    if (yours && saysPush(e.text)) pushPromptAt = at
     if (yours && isBareDigit(e.text)) {
       const digit = e.text.trim()
       const up = await read($, view)
@@ -706,7 +694,7 @@ export const register: Register = (on, options) => {
     return { text: `${where === 'herdr' ? 'CSR pane opened beside this one' : 'CSR pane opened'} (${counts}). ${await dreamsText($, dreamsOn)}` }
   })
 
-  // Prep-compact: the threads still open or gone quiet go into the summarizer's instructions. A failure, or
+  // Prep-compact: the threads you set aside for later go to the summarizer as reminders. A failure, or
   // a pane.py that takes over two seconds, lets the compaction run as it was. It names its triggers: the
   // engine refuses two session.compact hooks that both match every one, and the chapter hook above is one.
   on('session.compact', { trigger: /^(manual|auto|plugin|precompute)$/ }, async ($, e, next) => {

@@ -824,5 +824,58 @@ class LostAndFound(unittest.TestCase):
         for text, _ in pane.lost_rows(section['items'][0], 40, {}, False):
             self.assertLessEqual(len(re.sub(r'\x1b\[[0-9;]*m', '', text[0])), 40)
 
+class LostAndFoundAnswered(unittest.TestCase):
+    """What only looks lost: a thread you said go to, one that showed once, prep-compact's own reminders."""
+    WAIT = summary("   - Awaiting the user's go on the story refresh.\n   - Tidy the scratch directory, not started.")
+    DONE = summary("   - Rebuild the index.")
+
+    def setUp(self):
+        self.keep = pane.KEEP, pane.LOST_LOG
+        self.folder = tempfile.mkdtemp()
+        pane.KEEP, pane.LOST_LOG = self.folder, os.path.join(self.folder, 'lost-found.jsonl')
+
+    def tearDown(self):
+        pane.KEEP, pane.LOST_LOG = self.keep
+        shutil.rmtree(self.folder)
+
+    def states(self, typed):
+        return {t['text'][:12]: t['state'] for t in pane.lost_found([(1000.0, self.WAIT), (2000.0, self.DONE)], typed)}
+
+    def test_a_thread_you_said_go_to_right_after_is_answered_not_lost(self):
+        self.assertEqual(self.states([(1500.0, 'i think story is a go')])['Awaiting the'], 'answered')
+        self.assertEqual(self.states([(1500.0, 'install')])['Awaiting the'], 'answered')
+        # a go that came long after, past your next two prompts, answers nothing
+        late = [(1100.0, 'show me the pane'), (1200.0, 'and the dreams'), (1300.0, 'go')]
+        self.assertEqual(self.states(late)['Awaiting the'], 'lost')
+
+    def test_a_thread_seen_once_that_never_waited_on_you_faded(self):
+        self.assertEqual(self.states([])['Tidy the scr'], 'faded')
+        shown = pane.lost_sections({'lost': pane.lost_found([(1000.0, self.WAIT), (2000.0, self.DONE)])}, 5000.0)
+        titles = [i['title'] for s in shown for i in s['items']]
+        self.assertFalse(any('Tidy' in title for title in titles))
+
+    def test_one_thread_in_two_wordings_is_one(self):
+        a = summary("   - Installing the csr-companion plugin for all sessions needs approval.")
+        b = summary("   - Install csr-companion for every session; awaiting the user.")
+        threads = pane.lost_found([(1000.0, a), (2000.0, b), (3000.0, self.DONE)])
+        installs = [t for t in threads if 'csr-companion' in t['text']]
+        self.assertEqual((len(installs), installs[0]['times']), (1, 2))
+
+    def test_prep_compacts_reminders_never_count_as_owed(self):
+        reminded = summary("   - Rebuild the index.\n   - Reminders from CSR (not tasks):\n"
+                           "     - Awaiting the user's go on the story refresh.")
+        threads = pane.lost_found([(1000.0, self.WAIT), (2000.0, reminded)], [])
+        story = next(t for t in threads if 'story refresh' in t['text'])
+        self.assertEqual((story['state'], story['times']), ('lost', 1))
+
+    def test_a_thread_set_aside_for_later_is_marked_for_the_reminders(self):
+        threads = pane.lost_found([(1000.0, self.WAIT), (2000.0, self.DONE)])
+        key = next(t['key'] for t in threads if 'story refresh' in t['text'])
+        pane.keep_lost(key, 'later', 2500.0)
+        marked = {t['key']: t['later'] for t in pane.lost_found([(1000.0, self.WAIT), (2000.0, self.DONE)])}
+        self.assertEqual(sum(marked.values()), 1)
+        self.assertTrue(marked[key])
+
+
 if __name__ == '__main__':
     unittest.main()

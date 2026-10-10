@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
 import { facts, freshChapter, median, spacing } from '../hooks/pace'
-import { addTerm, commands, gitVerdict, isBareDigit, NO_VERIFY, RELEASE, SAY_PUSH, saysPush } from '../hooks/coach'
+import { addTerm, commands, gitVerdict, isBareDigit, NO_VERIFY, RELEASE } from '../hooks/coach'
 
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -872,7 +872,7 @@ test('a digit sent again after 10 s is held again; more than a digit, or no band
   expect((await $.prompt.submit({ text: '3', origin: HUMAN } as never)).drop).toBeUndefined()
 })
 
-test('the push guard: --no-verify and release/v* are denied; other pushes wait for the word push', async ($, on) => {
+test('the push guard: --no-verify and release/v* are denied; every other push goes through', async ($, on) => {
   const clock = { now: NOW }
   host(on, { herdr: false, repo: true, clock })
   const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as never) as Promise<{ deny?: string; result?: unknown }>
@@ -882,19 +882,9 @@ test('the push guard: --no-verify and release/v* are denied; other pushes wait f
   expect((await bash('git status')).deny).toBeUndefined()
   expect((await bash('echo "git push origin main"')).deny).toBeUndefined()
 
-  const push = 'git push origin main'
-  expect((await bash(push)).deny).toBe(SAY_PUSH)
-  expect((await bash(push)).deny).toBe(SAY_PUSH) // saying nothing does not change it
-  await $.prompt.submit({ text: 'push', origin: { kind: 'peer' } } as never) // a peer's word is not yours
-  expect((await bash(push)).deny).toBe(SAY_PUSH)
-  await $.prompt.submit({ text: 'ok push it', origin: HUMAN } as never)
-  clock.now = NOW + 30_000
-  expect((await bash('git push --force origin other')).deny).toBe(SAY_PUSH) // not the command that was asked about
-  expect((await bash(push)).deny).toBeUndefined() // the identical command, within 60 s of the word
+  expect((await bash('git push origin main')).deny).toBeUndefined() // no word needed: Claude's work is never held
+  expect((await bash('git push -u origin feat/x')).deny).toBeUndefined()
   expect((await bash('git push origin HEAD:release/v9')).deny).toBe(RELEASE) // release/v* is never let through
-
-  clock.now = NOW + 120_000 // a minute after the word
-  expect((await bash(push)).deny).toBe(SAY_PUSH)
 })
 
 test('gitVerdict reads git as a command word, not git in words', () => {
@@ -930,22 +920,6 @@ test('commit -n is read as git reads it: in a cluster, never inside an option va
     expect(kind(c)).toBe(null)
 })
 
-test('the word push: "don\'t push" and the like are not the word, and one word lets one push through', async ($, on) => {
-  for (const text of ['push', 'ok push it', 'you have my approval to push', 'Push.']) expect(saysPush(text)).toBe(true)
-  for (const text of ["don't push yet", 'do not push', 'never push to main', 'commit but no push', 'without pushing', 'pushed already', 'pushy'])
-    expect(saysPush(text)).toBe(false)
-
-  const clock = { now: NOW }
-  host(on, { herdr: false, repo: true, clock })
-  const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as never) as Promise<{ deny?: string }>
-  const push = 'git push origin main'
-  await $.prompt.submit({ text: "don't push yet", origin: HUMAN } as never)
-  expect((await bash(push)).deny).toBe(SAY_PUSH)
-  await $.prompt.submit({ text: 'push', origin: HUMAN } as never)
-  expect((await bash(push)).deny).toBeUndefined()
-  expect((await bash(push)).deny).toBe(SAY_PUSH) // spent: the next push asks again
-})
-
 test('a CLAUDE.md that is there but cannot be read is never written over', async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, coach: [TERM_NOTE], files: { [CLAUDE_MD]: '# Prefs\n' }, unreadable: [CLAUDE_MD] })
   const band = await $.ui.mount(BAND)
@@ -960,28 +934,32 @@ test('a CLAUDE.md that is there but cannot be read is never written over', async
 const THREADS = [
   { text: 'Awaiting the user’s go on the push guard.', state: 'lost', waiting: true },
   { text: 'Fix the importer: remove the old cache.', state: 'open', waiting: false },
+  { text: 'Try the cache countdown in the masthead.', state: 'lost', waiting: false, later: true },
 ]
+const REMINDERS = "After the summary, add a section headed 'Reminders from CSR (not tasks)'"
 
-test('prep-compact adds the open and lost threads to the compaction instructions', async ($, on) => {
+test('prep-compact hands the summary only what you set aside for later, as reminders, never as tasks', async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, lost: THREADS })
   await $.session.start(START as never)
   await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: MESSAGES } as never)
   const told = seen.compacted.at(-1) ?? ''
-  expect(told.startsWith('keep the plan\n\nCarry these open threads into Pending Tasks, one line each, unless the conversation closed them:')).toBe(true)
-  expect(told).toContain('- Awaiting the user’s go on the push guard. (waiting on the user)')
-  expect(told).toContain('- Fix the importer: remove the old cache.')
+  expect(told.startsWith(`keep the plan\n\n${REMINDERS.slice(0, -1)}`)).toBe(true)
+  expect(told).toContain('- Try the cache countdown in the masthead.')
+  expect(told).not.toContain('push guard') // open and lost threads stay out: Lost and found must see them drop
+  expect(told).not.toContain('Fix the importer')
+  expect(told).not.toContain('Pending Tasks')
   const asked = seen.runs.find(run => run.includes('--lost'))
   expect(asked).toEqual(expect.arrayContaining(['python3', '-I', '--repo', '/repo', '--lost', '--sid', 'sess-1']))
 })
 
 test('prep-compact holds the block to eight threads and 1200 characters', async ($, on) => {
-  const many = Array.from({ length: 20 }, (_, k) => ({ text: `Thread ${k} ${'x'.repeat(200)}`, state: 'lost', waiting: false }))
+  const many = Array.from({ length: 20 }, (_, k) => ({ text: `Thread ${k} ${'x'.repeat(200)}`, state: 'lost', waiting: false, later: true }))
   const seen = host(on, { herdr: false, repo: true, lost: many })
   await $.session.start(START as never)
   await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never)
   const told = seen.compacted.at(-1) ?? ''
   expect(told.length).toBeLessThanOrEqual(1200)
-  expect(told.split('\n').length - 1).toBeLessThanOrEqual(8)
+  expect(told.split('\n').length - 1).toBeLessThanOrEqual(9) // the heading takes two lines, then eight threads at most
   expect(told).toContain('Thread 0 ')
 })
 
@@ -1020,5 +998,5 @@ test('prep-compact also carries the threads into a compaction made ahead of time
   const seen = host(on, { herdr: false, repo: true, lost: THREADS })
   await $.session.start(START as never)
   await $.session.compact({ trigger: 'precompute', messages: MESSAGES } as never)
-  expect(seen.compacted.at(-1) ?? '').toContain('Carry these open threads into Pending Tasks')
+  expect(seen.compacted.at(-1) ?? '').toContain('Reminders from CSR (not tasks)')
 })
