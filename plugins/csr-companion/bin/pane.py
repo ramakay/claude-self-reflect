@@ -1524,7 +1524,8 @@ class Lines(list):
 
 
 CONTROL = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')  # C0 and C1 controls: ESC, Ctrl-C, CSI as one byte...
-SGR = re.compile(r'\x1b\[[0-9;:]*m')  # ...where a colour is the one escape the pane writes inside a line
+SGR = re.compile(r'\x1b\[[0-9;:]*m|\x1b\[K')  # ...where a colour, and erase-to-end (a tinted row), are the
+# escapes the pane writes inside a line
 
 
 def one_line(text, most=700):

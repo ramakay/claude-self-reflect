@@ -1060,6 +1060,8 @@ class AstraFindings(CarryOver):
         self.assertNotIn('\x03', line)
         self.assertNotIn('\x9b', line)
         self.assertIn(pane.ink('you'), line)  # the pane's own colour stays
+        tinted = pane.tinted('row', '\x1b[48;2;1;2;3m')
+        self.assertEqual(pane.safe_line(tinted), tinted)  # and so does a tinted row's erase-to-end
         sent = []
         saved = pane.herdr
         pane.herdr = lambda *args: sent.append(args) or ''
