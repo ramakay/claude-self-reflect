@@ -111,9 +111,9 @@ Keep the labels dream: and explain:, and the word none, exactly as written. Writ
 
 // A dream reaches the person only when it stands on another session: a session or commit receipt the
 // brief carries, other than this session's own. An echo of today's work, or a question about CSR's
-// own pane or dreamer, never does.
+// own pane or dreamer, never does. Only those: dreams, the dream cycle and a herdr pane are real work.
 const RECEIPT = /\b(?:session|commit)\s+([0-9a-f]{7,8})\b/gi
-const ABOUT_THE_TOOL = /\b(?:pane|dreamer|dreams?|side agents?)\b/i
+const ABOUT_THE_TOOL = /\b(?:the|this|CSR(?:'s)?|side) pane\b|\bdreamer\b|\bside agents?\b/i
 
 export function standsOnThePast(dream: Dream, brief: string, session: string): boolean {
   if (ABOUT_THE_TOOL.test(`${dream.line} ${dream.title}`)) return false

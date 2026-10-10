@@ -405,6 +405,16 @@ test('a dream answered in the pane leaves the band, and is never counted as type
   expect(seen.store.get('answers')).toEqual(expect.arrayContaining([expect.objectContaining({ id, answer: 'helpful' })]))
 })
 
+test("a dream about CSR's own dream cycle still reaches you: only the pane and the dreamer are off limits", ON, async ($, on) => {
+  const work = DREAM_REPLY.replace('What if the notes also read', 'What if the dream cycle also read')
+  const seen = host(on, { herdr: false, repo: true, replies: [work] })
+  const band = await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(async () => (await band.find({ text: /What if the dream cycle also read/ })) !== undefined)
+  expect(await band.find({ text: /What if the dream cycle also read/ })).toBeDefined()
+  expect(seen.kept.filter(record => record.kind === 'dream').length).toBe(1)
+})
+
 test('the dim 4 on a dream turns dreams off, after a second press', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   const band = await $.ui.mount(BAND)
