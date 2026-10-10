@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { On, SettingsSource } from 'claude-code'
 
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -45,7 +45,21 @@ const DREAM_REPLY = [
 ].join('\n')
 const USAGE = { input_tokens: 900, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 40_000 }
 
-type World = { herdr: boolean; repo: boolean; notes?: unknown[]; box?: string; replies?: string[]; brief?: string; youShouldKnow?: boolean }
+type World = {
+  herdr: boolean
+  repo: boolean
+  notes?: unknown[]
+  box?: string
+  replies?: string[]
+  brief?: string
+  youShouldKnow?: boolean
+  // A file system and settings of the test's own: nothing here reaches the real ones.
+  files?: Record<string, string>
+  sources?: Partial<Record<SettingsSource, Record<string, unknown>>>
+  configDir?: string
+  noNode?: boolean
+}
+const HOME = '/home/u'
 
 function host(on: On, world: World) {
   const runs: string[][] = []
@@ -56,6 +70,8 @@ function host(on: On, world: World) {
   const kept: Array<Record<string, unknown>> = []
   const configured: Array<{ key: string; value: unknown }> = []
   const store = new Map<string, unknown>()
+  const files = new Map<string, string>(Object.entries(world.files ?? {}))
+  const writes: string[] = []
   const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
@@ -68,6 +84,22 @@ function host(on: On, world: World) {
     store.set(e.key, e.value)
     return { value: undefined }
   })
+  on('store.delete', async (_$, e) => {
+    store.delete(e.key)
+    return { value: undefined }
+  })
+  on('fs.read', async (_$, e) => {
+    if (e.path.endsWith('/csr-companion/bin/statusline.cjs')) return { value: SHIPPED } // the plugin's own copy
+    const text = files.get(e.path)
+    return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
+  })
+  on('fs.exists', async (_$, e) => ({ value: files.has(e.path) }))
+  on('fs.write', async (_$, e) => {
+    files.set(e.path, e.text)
+    writes.push(e.path)
+    return { value: undefined }
+  })
+  on('settings.read', async (_$, e) => ({ value: world.sources?.[e.source ?? 'user'] ?? {} }))
   on('prompt.read', async () => ({ value: { text: world.box ?? '', cursor: 0 } }))
   on('prompt.fill', async (_$, e) => {
     filled.push(e.text)
@@ -98,10 +130,13 @@ function host(on: On, world: World) {
   on('env.get', async (_$, e) => {
     if (world.herdr && e.name === 'HERDR_PANE_ID') return { value: 'w2:p1' }
     if (world.herdr && e.name === 'HERDR_BIN_PATH') return { value: '/bin/herdr' }
+    if (e.name === 'HOME') return { value: HOME }
+    if (e.name === 'CLAUDE_CONFIG_DIR') return { value: world.configDir }
     return { value: undefined }
   })
   on('process.run', async (_$, e) => {
     runs.push([...e.argv])
+    if (e.argv[0] === 'node' && world.noNode) return { value: { exitCode: 127, stdout: '', stderr: 'node: not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'python3' && e.argv.includes('--note')) return ok(JSON.stringify(world.notes ?? []))
     if (e.argv[0] === 'python3' && e.argv.includes('--brief')) return ok(world.brief ?? BRIEF)
     if (e.argv[0] === 'python3' && e.argv.includes('--keep')) {
@@ -128,7 +163,7 @@ function host(on: On, world: World) {
     opened.push(e.id)
     return { value: { isPlaced: true } }
   })
-  return { runs, statuses, opened, filled, forks, kept, store, configured }
+  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes }
 }
 
 async function settle(done: () => boolean | Promise<boolean>) {
@@ -378,4 +413,161 @@ test('a dream waits while You should know asks, so its 4 can never turn the othe
   await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
   expect(await band.find({ key: 'Disable' })).toBeDefined()
   expect(await band.find({ key: 'ysk-disable' })).toBeUndefined()
+})
+
+// ---------------------------------------------------------------- /csr statusline
+
+const USER = `${HOME}/.claude/settings.json`
+const STABLE = `${HOME}/.claude-self-reflect/csr-companion/statusline.cjs`
+const BACKUP = `${HOME}/.claude-self-reflect/csr-companion/settings.before-statusline.json`
+const SHIPPED = '#!/usr/bin/env node\n// the wrapper, as this version ships it\n'
+const ORIGINAL = 'node "/x/y.js"'
+const WRAPPED = `node "${STABLE}" --sh 'node "/x/y.js"'`
+// statusLine sits between other keys, 4-space as a hand-kept file may be: the
+// rewrite keeps every key in its place and writes 2-space JSON.
+const settingsOf = (statusLine?: Record<string, unknown>) => ({
+  model: 'opus',
+  ...(statusLine ? { statusLine } : {}),
+  hooks: { Stop: [] },
+  theme: 'dark',
+})
+const fileOf = (statusLine?: Record<string, unknown>) => `${JSON.stringify(settingsOf(statusLine), null, 4)}\n`
+const lineOf = (command: string) => ({ type: 'command', command, padding: 0 })
+const written = (statusLine?: Record<string, unknown>) => `${JSON.stringify(settingsOf(statusLine), null, 2)}\n`
+
+async function csr($: Engine, args: string): Promise<string> {
+  const ran = await $.command.run({ command: 'csr', args, origin: { kind: 'human' } } as never)
+  return ran.text ?? ''
+}
+
+test('/csr statusline previews the change and writes nothing', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf(lineOf(ORIGINAL)) } })
+  const said = await csr($, 'statusline')
+
+  expect(said).toContain(`  ${ORIGINAL}\n`)
+  expect(said).toContain(`  ${WRAPPED}\n`)
+  expect(said).toContain('No project, local, --settings or policy statusLine wins over yours.')
+  expect(said).toContain('Next: /csr statusline on')
+  expect(seen.writes).toEqual([])
+  expect(seen.files.get(USER)).toBe(fileOf(lineOf(ORIGINAL)))
+  expect(seen.store.has('statusline')).toBe(false)
+})
+
+test('/csr statusline on copies the wrapper out of the plugin, backs up the file, wraps only the command', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf(lineOf(ORIGINAL)) } })
+  const said = await csr($, 'statusline on')
+
+  expect(said).toContain(`now runs:\n  ${WRAPPED}`)
+  expect(seen.files.get(STABLE)).toBe(SHIPPED)
+  expect(seen.files.get(BACKUP)).toBe(fileOf(lineOf(ORIGINAL))) // the raw text, as it was
+  expect(seen.files.get(USER)).toBe(written(lineOf(WRAPPED)))
+  expect(Object.keys(JSON.parse(seen.files.get(USER) ?? '{}'))).toEqual(['model', 'statusLine', 'hooks', 'theme'])
+  expect(seen.writes).toEqual([STABLE, BACKUP, USER])
+  expect(seen.writes.some(path => path.includes('/csr-companion/bin/'))).toBe(false) // never into the plugin's folder
+  expect(seen.store.get('statusline')).toEqual({ original: ORIGINAL, wrapped: WRAPPED })
+})
+
+test('/csr statusline on without node changes nothing: the line would go blank', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, noNode: true, files: { [USER]: fileOf(lineOf(ORIGINAL)) } })
+  const said = await csr($, 'statusline on')
+
+  expect(said).toContain("node didn't run here. Nothing changed.")
+  expect(seen.writes).toEqual([])
+  expect(seen.files.get(USER)).toBe(fileOf(lineOf(ORIGINAL)))
+})
+
+test('/csr statusline on twice changes nothing the second time', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf(lineOf(ORIGINAL)) } })
+  await csr($, 'statusline on')
+  const after = new Map(seen.files)
+  const writes = seen.writes.length
+
+  const said = await csr($, 'statusline on')
+  expect(said).toContain('already wrapped')
+  expect(seen.writes.length).toBe(writes)
+  expect(seen.files).toEqual(after)
+  expect(await csr($, 'statusline')).toContain('already wrapped') // the preview says so too
+})
+
+test('/csr statusline off puts the exact original back', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf(lineOf(ORIGINAL)) } })
+  await csr($, 'statusline on')
+  const said = await csr($, 'statusline off')
+
+  expect(said).toContain(`runs your command again:\n  ${ORIGINAL}`)
+  expect(seen.files.get(USER)).toBe(written(lineOf(ORIGINAL)))
+  expect(seen.store.has('statusline')).toBe(false)
+
+  const writes = seen.writes.length
+  expect(await csr($, 'statusline off')).toContain("isn't wrapped") // not wrapped now: nothing to undo
+  expect(seen.writes.length).toBe(writes)
+})
+
+test('no statusLine, or no settings file: nothing to move, nothing written', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf() } })
+  expect(await csr($, 'statusline')).toContain('nothing to move')
+  expect(await csr($, 'statusline on')).toContain('nothing to move')
+  expect(await csr($, 'statusline off')).toContain('nothing to put back')
+  seen.files.set(USER, fileOf({ type: 'command', padding: 0 }))
+  expect(await csr($, 'statusline on')).toContain('nothing to move')
+  seen.files.delete(USER)
+  expect(await csr($, 'statusline on')).toContain('nothing to move')
+  expect(seen.writes).toEqual([])
+  expect(seen.store.has('statusline')).toBe(false)
+})
+
+test('a statusLine in project settings is reported: it wins over the user one', async ($, on) => {
+  const project = { statusLine: { type: 'command', command: 'bash .claude/statusline.sh' } }
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf(lineOf(ORIGINAL)) }, sources: { project } })
+  const said = await csr($, 'statusline')
+
+  expect(said).toContain('wins over the user settings')
+  expect(said).toContain('project settings (.claude/settings.json): bash .claude/statusline.sh')
+  expect(said).not.toContain('No project')
+  expect(seen.writes).toEqual([])
+  expect(await csr($, 'statusline on')).toContain('project settings (.claude/settings.json): bash .claude/statusline.sh')
+})
+
+test('a command with single quotes survives on and off, from the store or read back off the command', async ($, on) => {
+  const quoted = `printf '%s|%s' "it's" b`
+  const wrapped = String.raw`node "/home/u/.claude-self-reflect/csr-companion/statusline.cjs" --sh 'printf '\''%s|%s'\'' "it'\''s" b'`
+  const seen = host(on, { herdr: false, repo: true, files: { [USER]: fileOf(lineOf(quoted)) } })
+
+  await csr($, 'statusline on')
+  expect(JSON.parse(seen.files.get(USER) ?? '{}').statusLine.command).toBe(wrapped)
+  await csr($, 'statusline off')
+  expect(seen.files.get(USER)).toBe(written(lineOf(quoted)))
+
+  await csr($, 'statusline on')
+  seen.store.delete('statusline') // a store that lost it: the --sh word is unquoted instead
+  await csr($, 'statusline off')
+  expect(seen.files.get(USER)).toBe(written(lineOf(quoted)))
+})
+
+test('off also unwraps the argv form set up by hand, in a CLAUDE_CONFIG_DIR settings file', async ($, on) => {
+  const config = `${HOME}/alt`
+  const real = `node "${HOME}/.claude/hooks/statusline.js"`
+  const byHand = `node "${HOME}/.claude/hooks/csr-pane-statusline.js" ${real}`
+  const seen = host(on, { herdr: false, repo: true, configDir: config, files: { [`${config}/settings.json`]: fileOf(lineOf(byHand)) } })
+
+  expect(await csr($, 'statusline on')).toContain('already wrapped')
+  expect(await csr($, 'statusline off')).toContain(real)
+  expect(seen.files.get(`${config}/settings.json`)).toBe(written(lineOf(real)))
+  await csr($, 'statusline on')
+  expect(JSON.parse(seen.files.get(`${config}/settings.json`) ?? '{}').statusLine.command).toBe(`node "${STABLE}" --sh '${real}'`)
+  expect(seen.files.has(USER)).toBe(false)
+})
+
+test('session start brings a stale stable wrapper up to date, and never makes one', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  await $.session.start(START as never)
+  await settle(() => seen.opened.length > 0)
+  await settle(() => false)
+  expect(seen.writes).toEqual([])
+
+  seen.files.set(STABLE, '// an older wrapper\n')
+  await $.session.start(START as never)
+  await settle(() => seen.files.get(STABLE) === SHIPPED)
+  expect(seen.files.get(STABLE)).toBe(SHIPPED)
+  expect(seen.writes).toEqual([STABLE])
 })

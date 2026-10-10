@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register, Settings, SettingsSource } from 'claude-code'
 
 import type { Note, NoteView, Shift, ShiftsData } from '../types'
 import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
@@ -444,8 +444,10 @@ export const register: Register = (on, options) => {
     $.ui.status(undefined) // CSR pins no line under the prompt: the pane carries what it knows
     await $.command.register({
       name: 'csr',
-      description: 'Open the CSR pane beside Claude; "/csr dreams" says how the dreamer is pacing itself',
+      description:
+        'Open the CSR pane beside Claude; "/csr dreams" says how the dreamer is pacing itself; "/csr statusline" moves your status line into the pane',
     })
+    void refreshWrapper($).catch(() => undefined) // never blocks or fails the start
     void (async () => {
       const fresh = await refresh($, e.cwd)
       if (fresh?.repo) await openPane($, e.cwd)
@@ -455,7 +457,11 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'csr' }, async ($, e) => {
-    if (e.args.trim().split(/\s+/)[0] === 'dreams') return { text: await dreamsText($, dreamsOn) }
+    const [sub, choice] = e.args.trim().split(/\s+/)
+    if (sub === 'dreams') return { text: await dreamsText($, dreamsOn) }
+    if (sub === 'statusline') {
+      return { text: await statusline($, choice).catch((error: unknown) => `/csr statusline: ${String(error)}`) }
+    }
     const cwd = await $.session.cwd()
     const fresh = await refresh($, cwd)
     const where = await openPane($, cwd)
@@ -549,6 +555,175 @@ async function openPane($: EngineInterface, cwd: string): Promise<'herdr' | 'pan
   if (await openHerdrPane($, cwd)) return 'herdr'
   void $.ui.open({ id: PANE, title: LABEL })
   return 'pane'
+}
+
+// ---------------------------------------------------------------- /csr statusline
+
+// Claude's own status line moves into the CSR pane only when you ask: the user
+// settings' statusLine.command is wrapped in bin/statusline.cjs, which passes the
+// line through unless a CSR pane is open beside the session. Settings point at a
+// stable copy of the wrapper, never into the plugin's folder: that path changes
+// on every update, and the line has to keep working after an uninstall.
+const shippedWrapper = ($: EngineInterface) => `${$.plugin.root}/bin/statusline.cjs`
+const IS_WRAPPED = /csr-companion\/statusline\.c?js|csr-pane-statusline\.js/
+const WRAPPING = 'statusline' // $.store: { original, wrapped }, what "off" puts back
+// The settings that win over the user's, lowest first.
+const OVER_USER: Array<[SettingsSource, string]> = [
+  ['project', 'project settings (.claude/settings.json)'],
+  ['local', 'local settings (.claude/settings.local.json)'],
+  ['flag', '--settings'],
+  ['policy', 'managed policy settings'],
+]
+
+type Places = { settings: string; wrapper: string; backup: string }
+type UserSettings = { raw: string; json: Record<string, unknown> }
+type Wrapping = { original: string; wrapped: string }
+
+async function places($: EngineInterface): Promise<Places | null> {
+  const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+  if (!home) return null
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR'))?.replace(/\/+$/, '')
+  const keep = `${home}/.claude-self-reflect/csr-companion`
+  return {
+    settings: `${config || `${home}/.claude`}/settings.json`,
+    wrapper: `${keep}/statusline.cjs`,
+    backup: `${keep}/settings.before-statusline.json`,
+  }
+}
+
+// The user settings file as written, or why there is none to edit.
+async function userSettings($: EngineInterface, path: string): Promise<UserSettings | 'missing' | 'not JSON'> {
+  if (!(await $.fs.exists(path))) return 'missing'
+  const raw = await $.fs.read(path)
+  try {
+    const json: unknown = JSON.parse(raw)
+    if (json && typeof json === 'object' && !Array.isArray(json)) return { raw, json: json as Record<string, unknown> }
+  } catch {}
+  return 'not JSON'
+}
+
+function commandOf(settings: Settings): string | undefined {
+  const line = settings.statusLine as { command?: unknown } | undefined
+  return line && typeof line === 'object' && typeof line.command === 'string' && line.command.trim() ? line.command : undefined
+}
+
+// Only statusLine.command changes: every other key keeps its place; 2-space
+// JSON, ending in a newline when the file did.
+async function writeCommand($: EngineInterface, path: string, settings: UserSettings, command: string): Promise<void> {
+  const statusLine = { ...(settings.json.statusLine as Record<string, unknown>), command }
+  const text = JSON.stringify({ ...settings.json, statusLine }, null, 2)
+  await $.fs.write(path, settings.raw.endsWith('\n') ? `${text}\n` : text)
+}
+
+// Claude Code runs a statusLine command through a shell: the original rides as one single-quoted word.
+const shellWord = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`
+const wrapCommand = (wrapper: string, original: string) => `node "${wrapper}" --sh ${shellWord(original)}`
+
+// The command a wrapped one runs: --sh's word unquoted, or in the argv form set
+// up by hand (node csr-pane-statusline.js <command...>) the words after the wrapper.
+function unwrapCommand(command: string): string | null {
+  const sh = /\s--sh\s+([\s\S]*)$/.exec(command)
+  if (sh) return unquote((sh[1] ?? '').trim())
+  const argv = /^\s*node\s+("[^"]*"|'[^']*'|\S+)\s+([\s\S]+)$/.exec(command)
+  return argv && IS_WRAPPED.test(argv[1] ?? '') ? (argv[2] ?? '').trim() || null : null
+}
+
+// One shell word back to its text: '...' runs, \-escapes and bare characters; null for anything else.
+function unquote(word: string): string | null {
+  let text = ''
+  for (let i = 0; i < word.length; i++) {
+    const c = word.charAt(i)
+    if (c === "'") {
+      const end = word.indexOf("'", i + 1)
+      if (end < 0) return null
+      text += word.slice(i + 1, end)
+      i = end
+    } else if (c === '\\' && i + 1 < word.length) text += word.charAt(++i)
+    else if (/\s/.test(c)) return null // a second word: not what "on" wrote
+    else text += c
+  }
+  return text || null
+}
+
+// Each statusLine set where it wins over the user's, as "where: command".
+async function overrides($: EngineInterface): Promise<string[]> {
+  const found: string[] = []
+  for (const [source, label] of OVER_USER) {
+    const settings = await $.settings.read({ source }).catch((): Settings => ({}))
+    if (settings.statusLine !== undefined) found.push(`${label}: ${commandOf(settings) ?? '(no command)'}`)
+  }
+  return found
+}
+
+const overrideText = (found: string[]) =>
+  `Set where it wins over the user settings, so Claude Code runs it instead of yours:\n${found.map(line => `  ${line}`).join('\n')}`
+
+// "/csr statusline": a preview that writes nothing; "on" wraps the command; "off" puts it back.
+async function statusline($: EngineInterface, choice: string | undefined): Promise<string> {
+  if (choice && choice !== 'on' && choice !== 'off') {
+    return `/csr statusline ${choice}: unknown. "/csr statusline" shows what would change, "on" moves the line into the CSR pane, "off" puts it back.`
+  }
+  const where = await places($)
+  if (!where) return "/csr statusline: HOME isn't set, so there is no user settings file to read. Nothing changed."
+  const settings = await userSettings($, where.settings)
+  if (settings === 'not JSON') return `${where.settings} is not a JSON object CSR can edit. Nothing changed.`
+  const command = typeof settings === 'string' ? undefined : commandOf(settings.json)
+  if (!command || typeof settings === 'string') {
+    return `Your user settings (${where.settings}) have no statusLine command: there is nothing to ${choice === 'off' ? 'put back' : 'move'}. Nothing changed.`
+  }
+  if (choice === 'off') return unwrapStatusline($, where, settings, command)
+  if (IS_WRAPPED.test(command)) {
+    return `Your status line is already wrapped for the CSR pane:\n  ${command}\nNothing changed. "/csr statusline off" puts the original back.`
+  }
+  const wrapped = wrapCommand(where.wrapper, command)
+  const found = await overrides($)
+  if (choice !== 'on') {
+    return [
+      `Your status line, from ${where.settings}:`,
+      `  ${command}`,
+      '"/csr statusline on" would change it to:',
+      `  ${wrapped}`,
+      'That runs your command as now. Its line shows in the CSR pane while one is open beside the session, and under the prompt otherwise. Settings point at a copy of the wrapper outside the plugin, so the line keeps working after an update or an uninstall.',
+      found.length ? overrideText(found) : 'No project, local, --settings or policy statusLine wins over yours.',
+      'Nothing changed. Next: /csr statusline on',
+    ].join('\n')
+  }
+  // The wrapper runs under node: without one on PATH the status line would go blank.
+  const node = await $.process.run(['node', '--version'], { timeoutMs: 5_000 }).catch(() => null)
+  if (!node || node.exitCode !== 0) {
+    return `"/csr statusline on" runs your status line through a small node script, and node didn't run here. Nothing changed.`
+  }
+  await $.fs.write(where.wrapper, await $.fs.read(shippedWrapper($)))
+  await $.fs.write(where.backup, settings.raw)
+  await writeCommand($, where.settings, settings, wrapped)
+  await $.store.set(WRAPPING, { original: command, wrapped } satisfies Wrapping)
+  return [
+    `Status line wrapped for the CSR pane. ${where.settings} now runs:`,
+    `  ${wrapped}`,
+    `The settings as they were are saved at ${where.backup}. "/csr statusline off" puts your command back.`,
+    ...(found.length ? [overrideText(found)] : []),
+  ].join('\n')
+}
+
+async function unwrapStatusline($: EngineInterface, where: Places, settings: UserSettings, command: string): Promise<string> {
+  if (!IS_WRAPPED.test(command)) return `Your status line isn't wrapped for the CSR pane:\n  ${command}\nNothing changed.`
+  const kept = (await $.store.get(WRAPPING).catch(() => undefined)) as Partial<Wrapping> | undefined
+  // The kept original while settings still hold what "on" wrote; otherwise it is read off the command.
+  const original = kept?.wrapped === command && typeof kept.original === 'string' ? kept.original : unwrapCommand(command)
+  if (!original) {
+    return `Couldn't find the original command in:\n  ${command}\nNothing changed. Edit statusLine.command in ${where.settings} by hand.`
+  }
+  await writeCommand($, where.settings, settings, original)
+  await $.store.delete(WRAPPING).catch(() => undefined)
+  return `Status line back under the prompt. ${where.settings} runs your command again:\n  ${original}`
+}
+
+// The stable copy follows the wrapper the plugin ships. Only "/csr statusline on" makes one.
+async function refreshWrapper($: EngineInterface): Promise<void> {
+  const where = await places($)
+  if (!where || !(await $.fs.exists(where.wrapper))) return
+  const shipped = await $.fs.read(shippedWrapper($))
+  if (shipped !== (await $.fs.read(where.wrapper))) await $.fs.write(where.wrapper, shipped)
 }
 
 function byCommit(shifts: Shift[]): Array<[string, Shift[]]> {
