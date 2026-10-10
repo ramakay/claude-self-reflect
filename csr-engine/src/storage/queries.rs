@@ -500,6 +500,26 @@ pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<
     }
 }
 
+/// The session that ran the conversation `conversation_id`, as its chunks'
+/// provenance records it (`source_conv_id`): for a subagent's `agent-` id, the
+/// parent session. `None` when no chunk of it carries one.
+pub fn parent_session_of_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.source_conv_id
+         FROM chunks c JOIN chunk_provenance p ON p.chunk_id = c.id
+         WHERE c.conversation_id = ?1 AND p.source_conv_id <> ''
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![conversation_id])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
 /// A reflection row: (id, content, tags, timestamp).
 pub type ReflectionRow = (String, String, Vec<String>, String);
 
