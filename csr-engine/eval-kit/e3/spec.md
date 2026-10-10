@@ -1,4 +1,4 @@
-# E3 Controlled Contamination — Five-Part Spec (grok-implementer executes end-to-end)
+# E3 Controlled Contamination — Five-Part Spec (executed end-to-end by an implementation lane)
 
 ## 1. OBJECTIVE
 Measure how corpus contamination (eval-design transcript, sham transcript, scripted re-ask
@@ -26,7 +26,7 @@ the independent variable is corpus CONTENT only.
 - c0: pristine copy of the backup DB. Empty projects dir (no import).
 - c1: copy + import of ONLY the a4635d59 transcript (place it under projects/<same dir name as its real parent dir>/).
 - csham: copy + import of ONE unrelated transcript, size-matched: pick a .jsonl from
-  $HOME/.claude/projects/-Users-USER-projects-cc-enhance/ (or anukriti-website dir if cc-enhance has no fit) whose byte size is 70-130% of the c1 payload AND which contains ZERO occurrences of any of the 8 query texts below (grep -c each, all must be 0). Report the chosen file + size ratio.
+  $HOME/.claude/projects/-Users-USER-projects-companion-app/ (or private-app-website dir if companion-app has no fit) whose byte size is 70-130% of the c1 payload AND which contains ZERO occurrences of any of the 8 query texts below (grep -c each, all must be 0). Report the chosen file + size ratio.
 - c5: copy + import of 5 synthetic re-ask transcripts you generate: files
   SCRATCH/e3/c5_transcripts/c5cycle{1..5}-e3000000-0000-4000-8000-00000000000{1..5}.jsonl.
   Each mimics real JSONL structure (copy the line-shape of a real transcript: lines with

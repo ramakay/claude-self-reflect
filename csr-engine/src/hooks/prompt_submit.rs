@@ -1442,7 +1442,10 @@ mod tests {
     #[test]
     fn test_project_scope_reflection_filter_logic() {
         // Reflections tagged for a different project should be filtered
-        let tags_other = ["project_anukriti".to_string(), "session_story".to_string()];
+        let tags_other = [
+            "project_private-app".to_string(),
+            "session_story".to_string(),
+        ];
         let project = "csr";
         let project_tag = format!("project_{}", project);
         let has_project_tags = tags_other.iter().any(|t| t.starts_with("project_"));

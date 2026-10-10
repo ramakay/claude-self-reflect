@@ -1,5 +1,5 @@
 {
-  "csr_db": "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db",
+  "csr_db": "/Users/dev/.claude-self-reflect/csr-engine.db",
   "first_tag": "v1.0.0",
   "labels": [
     {
@@ -3924,5 +3924,5 @@
       "release_tag": "v9.5.0"
     }
   ],
-  "repo": "/Users/ramakrishnanannaswamy/projects/claude-self-reflect"
+  "repo": "/Users/dev/projects/claude-self-reflect"
 }

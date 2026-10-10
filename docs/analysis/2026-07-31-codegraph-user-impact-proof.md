@@ -106,7 +106,7 @@ channel     = git          source = a190db66…         ts = 2026-07-07T20:44:13
 
 Two channels, ten days apart, agreeing on *what* while disagreeing on *when* — because the session did the work on 06-27 and the commit squashed on 07-07. Both values are stored; neither overwrites the other.
 
-**Repo identity (the H8 fix, R4).** Before: `code_nodes.project` split one repo into two labels — `claude-self-reflect-csr-engine` (1,583 nodes) and `claude-self-reflect` (1,254) — because `project` is the *session cwd*, not the repository. Every "how did this repo evolve" query silently answered about half the repo. After: both carry `repo_root = /Users/ramakrishnanannaswamy/projects/claude-self-reflect` (2,837 nodes) while `project` is preserved as its own signal. The `code_evolution` ledger is likewise now repo-keyed (894 CSR rows; 1,027 rows still null where the file was outside any git tree).
+**Repo identity (the H8 fix, R4).** Before: `code_nodes.project` split one repo into two labels — `claude-self-reflect-csr-engine` (1,583 nodes) and `claude-self-reflect` (1,254) — because `project` is the *session cwd*, not the repository. Every "how did this repo evolve" query silently answered about half the repo. After: both carry `repo_root = /Users/dev/projects/claude-self-reflect` (2,837 nodes) while `project` is preserved as its own signal. The `code_evolution` ledger is likewise now repo-keyed (894 CSR rows; 1,027 rows still null where the file was outside any git tree).
 
 **Language census across all indexed repos** — the honest denominator for "how much Rust": rust 2,890 · tsx 1,571 · typescript 1,479 · javascript 826 · python 219, of 6,985 nodes. Rust kinds: function 2,657 / type 167 / module 66.
 
@@ -250,10 +250,10 @@ The new coverage gate quantifies exactly this, live, on every eval run:
 structural_file_coverage (informational, H8 innovation, not gated):
   overall = 400/1737 (23.0%); repo_roots measured=7, skipped(enumeration failed)=0
   claude-self-reflect      66/108  (61.1%)
-  anukriti-command-center  92/169  (54.4%)
-  procsolve-website        67/172  (39.0%)
-  anukriti                137/610  (22.5%)
-  anukriti-ota-rls-template 2/537  (0.4%)
+  private-app-command-center  92/169  (54.4%)
+  company-website             67/172  (39.0%)
+  private-app                 137/610  (22.5%)
+  private-app-ota-rls-template 2/537  (0.4%)
 ```
 
 `decay.rs` is one of the 42 CSR files in the missing 39%. Before this branch that gap was invisible — you could not distinguish "CSR has no evidence" from "CSR wasn't asked."
@@ -309,7 +309,7 @@ These systems store conversation-derived memory — Mem0 extracts and consolidat
 
 **The two channels agree less than the headline.** Live: of the 2,174 dual-channel nodes, 1,611 (74.1%) agree within 48h. R8's H6 sample reported 1,103/1,342 = 82.2%; the denominators differ (H6 sampled symbols with clean spans; the live table includes everything backfilled), and I am reporting mine as measured, not reconciling it to the receipt. Roughly a quarter of dual-channel symbols disagree by more than two days — mostly squash artifacts (`624e7229` alone attributes 792 symbols, `4a4729e6` another 415), which is why coarseness is labeled rather than hidden.
 
-**Structural coverage is 23.0% and is not gated.** 400 of 1,737 enumerated supported files. Best repo 61.1% (claude-self-reflect), worst 0.4% (anukriti-ota-rls-template, a template repo nobody edits). This is by design — the corpus is edit-observed — but it means "CSR has no record" is a frequent and legitimate answer, and the gate stays *informational* until the next corpus version rather than being promoted to a bar it would fail.
+**Structural coverage is 23.0% and is not gated.** 400 of 1,737 enumerated supported files. Best repo 61.1% (claude-self-reflect), worst 0.4% (private-app-ota-rls-template, a template repo nobody edits). This is by design — the corpus is edit-observed — but it means "CSR has no record" is a frequent and legitimate answer, and the gate stays *informational* until the next corpus version rather than being promoted to a bar it would fail.
 
 **The resolution gate fails on purpose.** `csr-engine eval --codegraph --live` on this branch: **11/12 passed**, with `[FAIL] Resolution rate 4499/16007 = 28.1%` against a 70% threshold. R5/H3 established that bar is unreachable — the ceiling is 46.1%, and even that is inflated by generic-name collisions (`path`, `log`, `prepare`). The failing line is kept visible rather than adjusted to pass. The gates that do pass are the integrity ones: witness closure 98.0% (bar 90), internal binding 85.4% (bar 70), drifted=0, project attribution 0/6985 unscoped, no placeholder leak in injection. (These are this document's live 2026-07-31 run on the growing production DB; the paper's 98.1%/86.4% come from the sealed truth-pass receipt run — the DB gained rows between the two, so both are shown per the both-numbers rule rather than reconciled.)
 

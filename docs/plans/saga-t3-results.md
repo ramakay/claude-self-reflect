@@ -2,8 +2,10 @@
 
 **Run date:** 2026-07-27. Pre-registration: `saga-t3-preregistration.md`
 (committed 2302de0 with sealed 27-question roster before any arm ran).
-Corpus snapshot sha256 `1d2b9923…`; question seal `1b331d35…`;
-mechanical roster 396 receipt-class pairs (sha `5e03eb25…`).
+Corpus snapshot sha256 `1d2b9923…`; question seal `2c05e2fa…`;
+mechanical roster 396 receipt-class pairs (sha `998c4b13…`).
+2026-10-10: re-sealed after removing private repository names and commit subjects; row count, hashes and gold columns unchanged.
+Previous seals: question seal `1b331d35…` → `2c05e2fa…`; mechanical roster `5e03eb25…` → `998c4b13…`.
 
 ## Headline (pre-committed interpretation applies)
 

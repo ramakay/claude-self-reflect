@@ -81,19 +81,19 @@
  },
  {
   "task_id": "t3-21",
-  "prompt": "The Saadhana feature's epic plan, BRD/TDD doc, and Phase-0 instrumentation task were all recorded in a session under the marketing-analytics project's directory \u2014 does the mobile app repo's own documentation explain why its feature work would be tracked there?"
+  "prompt": "The Routine feature's epic plan, BRD/TDD doc, and Phase-0 instrumentation task were all recorded in a session under the marketing-analytics project's directory \u2014 does the mobile app repo's own documentation explain why its feature work would be tracked there?"
  },
  {
   "task_id": "t3-22",
-  "prompt": "The Japa-engagement analytics module and the active-release resolver were tracked as completed in a session dated 2026-06-27 \u2014 does the commit that actually contains those files carry the same date?"
+  "prompt": "The Counter-engagement analytics module and the active-release resolver were tracked as completed in a session dated 2026-06-27 \u2014 does the commit that actually contains those files carry the same date?"
  },
  {
   "task_id": "t3-23",
-  "prompt": "The audio production for the Guru Brahma and Jagannathashtakam radio tracks, and their release into specific app stations, happened on the same calendar day \u2014 did both halves happen in the same repository?"
+  "prompt": "The audio production for the first and second radio tracks, and their release into specific app stations, happened on the same calendar day \u2014 did both halves happen in the same repository?"
  },
  {
   "task_id": "t3-24",
-  "prompt": "A set of \"capture\" tasks for practice/feedback-hero, japa, calendar, streak, and radio screenshots was logged in the mobile app repo's task history as never completed \u2014 were those specific captures ever actually produced, and if so, where does the evidence live?"
+  "prompt": "A set of \"capture\" tasks for practice/feedback-hero, counter, calendar, streak, and radio screenshots was logged in the mobile app repo's task history as never completed \u2014 were those specific captures ever actually produced, and if so, where does the evidence live?"
  },
  {
   "task_id": "t3-25",
