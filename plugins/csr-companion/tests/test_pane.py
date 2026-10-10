@@ -1,11 +1,13 @@
 """The pane script's counting, without a live CSR: python3 -m unittest discover -s tests -p 'test_*.py'"""
 import glob
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import types
 import unittest
@@ -1983,6 +1985,164 @@ class Hold(unittest.TestCase):
             self.assertIn('CACHE 33m', plain(lines[1]))  # live at the second frame, not 50m from the first
         finally:
             pane.page_main = real
+
+
+class InfoDays(unittest.TestCase):
+    def test_the_i_page_names_the_day_of_a_reset_that_is_not_today(self):  # finding 7
+        late = pane.datetime(2027, 1, 15, 23, 0).timestamp()
+        data = dict(claude_fields=dict(rate_limits=dict(
+            five_hour=dict(used_percentage=80, resets_at=late + 8 * 3600),
+            seven_day=dict(used_percentage=50, resets_at=late + 3600 * 25))))
+        values = {label: value for label, value, _ in pane.info_rows(data, dict(id='x'), late)}
+        self.assertEqual(values['5H LIMIT'], '80% ↻ ' + pane.datetime.fromtimestamp(late + 8 * 3600).strftime('%a 07:00'))
+        self.assertTrue(re.fullmatch(r'50% ↻ \w{3} \d\d:\d\d', values['7D LIMIT']), values['7D LIMIT'])
+        morning = pane.datetime(2027, 1, 15, 9, 0).timestamp()
+        data['claude_fields']['rate_limits']['five_hour']['resets_at'] = morning + 3600
+        values = {label: value for label, value, _ in pane.info_rows(data, dict(id='x'), morning)}
+        self.assertEqual(values['5H LIMIT'], '80% ↻ 10:00')
+
+
+class Findings(unittest.TestCase):
+    """Defects the review of the default view found, each reproduced first."""
+    setUp, tearDown = DefaultView.setUp, DefaultView.tearDown
+    live, write, fresh, facts, thread, intent_db = (DefaultView.live, DefaultView.write, DefaultView.fresh,
+                                                    DefaultView.facts, DefaultView.thread, DefaultView.intent_db)
+
+    def patch(self, **attrs):
+        for name, value in attrs.items():
+            self.addCleanup(setattr, pane, name, getattr(pane, name))
+            setattr(pane, name, value)
+
+    def pane_over(self, s, **more):
+        data = dict(repo='/tmp/r', total=0, dreams_on=False, dreams=[], recalled=0)
+        self.patch(load=lambda *a, **k: dict(data), load_dream_log=lambda root=None: [], last_look=lambda root=None: None,
+                   last_chapter=lambda *a: None, claude_status=lambda *a: None, session_story=lambda sid: None,
+                   compacting_info=lambda *a, **k: None, how_claude_read=lambda sid: [], connect=self.intent_db,
+                   PIXELS=False, **more)
+        box = pane.Pane('/tmp/r', 10, None)
+        box.session = types.SimpleNamespace(id=s['id'], path=None, load=lambda: s)
+        return box
+
+    def frame(self, box, force=True):
+        out, real = io.StringIO(), sys.stdout
+        sys.stdout = out
+        try:
+            box.frame(force)
+        finally:
+            sys.stdout = real
+        return out.getvalue()
+
+    def test_a_source_that_raises_never_blanks_the_pane(self):  # finding 1
+        def boom(*a, **k):
+            raise RuntimeError('bad source')
+        box = self.pane_over(self.fresh(), kept_status=boom, account_limits=boom, csr_status=boom)
+        out = self.frame(box)
+        self.assertNotIn('could not read csr-engine', out)
+        self.assertIn(' CTX ▕', flat(out))  # the cockpit drew, with those three sources empty
+        self.assertEqual(box.data['sts'], dict(sev=None, inop=[]))
+        self.assertEqual((box.data['limits'], box.data['claude_fields']), ({}, {}))
+
+    def test_a_pane_that_opens_while_claude_is_busy_never_holds_its_empty_page(self):  # finding 3
+        self.patch(connect=self.intent_db, PIXELS=False)
+        data = dict(repo='/tmp/x', dreams=[], chapter=dict(at=1000.0, of=5), dreams_on=True, look=None, story=None,
+                    claude_fields={}, claude_at=None, limits={}, sts=None)
+        shell = types.SimpleNamespace(hold=None)
+        draw = lambda s, now: '\n'.join(flat(line) for line in pane.Pane.draw_main_held(shell, data, s, 50, 24, now, {})[0])
+        waiting = self.fresh(busy=True, last_session=None, told=None, lost=[])  # the carry has not landed
+        self.assertIn('Reading the session before this one', draw(waiting, 1_800_000_000.0))
+        self.assertIsNone(shell.hold)  # nothing to hold
+        landed = dict(waiting, last_session=self.facts())
+        text = draw(landed, 1_800_000_005.0)  # still busy
+        self.assertIn('Last session', text)
+        self.assertNotIn('First session here', text)
+        self.assertEqual(shell.hold['quiet'], 'First session here: no earlier session in this project to carry over.')
+        self.assertEqual([x['name'] for x in shell.hold['sections']], ['last'])  # held now: it has something
+        # a page that goes empty again is let go, not kept stale
+        draw(dict(landed, busy=False, last_session={}), 1_800_000_010.0)
+        self.assertIsNone(shell.hold)
+
+    def test_the_record_of_a_session_that_died_is_no_record_and_never_busy(self):  # finding 4
+        import subprocess
+        done = subprocess.Popen(['true'])
+        done.wait()
+        put(os.path.join(pane.SESSIONS, 'dead.json'),
+            dict(pid=done.pid, sessionId=LIVE_ID, cwd=self.cwd, startedAt=1_800_000_000_000, status='busy'))
+        self.assertIsNone(pane.session_record(LIVE_ID))
+        record = os.path.join(pane.SESSIONS, 'alive.json')
+        put(record, dict(pid=os.getpid(), sessionId=LIVE_ID, cwd=self.cwd, startedAt=1_800_000_000_000, status='busy'))
+        self.assertTrue(pane.session_record(LIVE_ID)['busy'])
+        put(os.path.join(pane.SESSIONS, 'alive.json'), dict(pid=1, sessionId=LIVE_ID, cwd=self.cwd,  # alive, not ours
+                                                             startedAt=1_800_000_000_000, status='busy'))
+        self.assertTrue(pane.session_record(LIVE_ID)['busy'])
+        put(os.path.join(pane.SESSIONS, 'alive.json'), dict(pid=10 ** 30, sessionId=LIVE_ID, cwd=self.cwd,
+                                                             startedAt=1_800_000_000_000, status='busy'))
+        self.assertIsNone(pane.session_record(LIVE_ID))
+
+    def test_a_record_that_goes_away_stops_the_session_being_busy(self):  # finding 4
+        self.patch(carry_into=lambda session: None)
+        record = os.path.join(pane.SESSIONS, 'gone.json')
+        put(record, dict(pid=os.getpid(), sessionId=LIVE_ID, cwd=self.cwd, startedAt=1_800_000_000_000, status='busy'))
+        session = pane.Session(LIVE_ID)
+        self.assertTrue(session.load()['busy'])
+        os.remove(record)
+        after = session.load()
+        self.assertFalse(after['busy'])
+        self.assertEqual(after['cwd'], self.cwd)  # what was known stays known
+
+    def test_the_pane_redraws_when_the_carry_lands_not_a_minute_later(self):  # finding 5
+        s = self.fresh(last_session=None, told=None, lost=[], todos=[], turn_end=0.0)
+        box = self.pane_over(s)
+        self.assertIn('Reading the session before this one', self.frame(box))
+        self.assertEqual(self.frame(box, force=False), '')  # nothing changed: nothing written
+        s['last_session'] = self.facts()  # the carry thread lands
+        self.assertIn('Last session', self.frame(box, force=False))
+        s['told'] = dict(at=1_800_000_000.0, source='startup', text=TOLD)  # the recap is read from the transcript
+        self.assertIn('CSR told Claude', self.frame(box, force=False))
+        s['todos'] = [dict(subject='ship it', status='pending')]
+        self.assertIn('Todos left', self.frame(box, force=False))
+        self.assertEqual(self.frame(box, force=False), '')
+        s['turn_end'] = 1_800_000_100.0  # the first turn ended: the sig moves, so the view can be re-chosen
+        self.assertNotEqual(self.frame(box, force=False), '')
+
+    def test_the_spare_rows_go_to_lost_and_found_first_and_the_order_stays(self):  # finding 8
+        item = lambda text: dict(key=text, title=text, lines=1)
+        story = dict(name='story', title='Story', right='', items=[item(f'story item {k}') for k in range(4)], empty='')
+        lost = dict(name='lost', title='Left over', right='', items=[item(f'thread {k}') for k in range(4)], empty='')
+        head = page()['head']
+        got = dict(head=head, quiet='', sections=[story, lost])
+        text = '\n'.join(flat(line) for line in pane.page_lines(got, 50, 12, {}))  # two spare rows
+        self.assertIn('thread 2', text)  # the spare rows went to Left over...
+        self.assertNotIn('story item 1', text)  # ...not to the Story above it
+        self.assertLess(text.index('Story'), text.index('Left over'))  # the page order is unchanged
+        plenty = '\n'.join(flat(line) for line in pane.page_lines(got, 50, 40, {}))
+        self.assertIn('story item 3', plenty)
+        self.assertIn('thread 3', plenty)
+
+    def test_what_csr_wrote_into_the_recap_never_reaches_a_row_as_a_control(self):  # finding 9
+        evil = (TOLD.replace('Dreamt: format_session_start_tier0 went stale (2026-09-21, fdaba23).', 'Dreamt: a\x1b[2Jb\x1b]52;c;QQ==\x07c')
+                .replace('Dreamt: a second dream line.', 'Dreamt: d\x1b[Ke')
+                .replace('ANCHORS: 12 intact, 0 modified since checkpoint', 'ANCHORS: 1\x1b[31m2')
+                .replace('Full state: csr_reflect_on_past("conv_1e0e1cf4-1fcf-4c30-919c-a4177f734813")', 'Full state: f\x1b[Kg\x9b31m'))
+        section = pane.told_section(self.fresh(told=dict(at=1_800_000_000.0, source='startup', text=evil)))
+        item = section['items'][0]
+        everything = '\n'.join([item['title'], item['send']] + item['body'] + item['detail'])
+        self.assertNotIn('\x1b', everything)
+        self.assertNotIn('\x9b', everything)
+        self.assertIn('Dreamt: a[2Jb', item['body'][0])  # the words stay, the escape goes
+        self.assertEqual(item['detail'][0], 'Dreamt: d[Ke')
+
+    def test_a_task_or_todo_whose_words_are_not_text_is_not_a_todo(self):  # finding 10
+        folder = os.path.join(pane.TASKS, PREV_ID)
+        os.makedirs(folder)
+        put(os.path.join(folder, '1.json'), dict(subject=['x'], status='pending'))
+        put(os.path.join(folder, '2.json'), dict(subject=5, status='pending'))
+        put(os.path.join(folder, '3.json'), dict(subject={'a': 1}, status='in_progress'))
+        put(os.path.join(folder, '4.json'), dict(subject='a real one', status='pending'))
+        self.assertEqual(pane.left_todos(PREV_ID), [dict(subject='a real one', status='pending')])
+        shutil.rmtree(folder)
+        con = csr_db(todos=[dict(content=['x'], status='pending'), dict(content=7, status='pending'),
+                            dict(content='a real todo', status='pending')])
+        self.assertEqual(pane.left_todos(PREV_ID, con), [dict(subject='a real todo', status='pending')])
 
 
 if __name__ == '__main__':

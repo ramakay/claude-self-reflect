@@ -201,8 +201,10 @@ class Cockpit(unittest.TestCase):
         self.assertIn(sgr('normal') + 'CACHE 5m' + pane.OFF, self.rows(fields_of(cache=dict(warm=True, ttl='5m')))[1])
         row3 = self.rows(fields_of(limits=limits_of(95, 75)))[2]
         reset = datetime.fromtimestamp(NOW + 3 * 86400).strftime('%a %H:%M')
+        soon = datetime.fromtimestamp(NOW + 7200)  # the time alone only when that is today, else the weekday too
+        soon = soon.strftime('%H:%M' if soon.date() == datetime.fromtimestamp(NOW).date() else '%a %H:%M')
         self.assertIn(sgr('amber') + f'7D 75% ↻{reset}' + pane.OFF, row3)
-        self.assertIn(sgr('red') + '5H 95% ↻' + datetime.fromtimestamp(NOW + 7200).strftime('%H:%M') + pane.OFF, row3)
+        self.assertIn(sgr('red') + '5H 95% ↻' + soon + pane.OFF, row3)
         low = self.rows(fields_of(limits=limits_of(8, 12)))[2]
         self.assertIn(sgr('normal') + '5H 8%' + pane.OFF, low)
         self.assertNotIn('↻', low)
@@ -517,6 +519,62 @@ class Wrapper(unittest.TestCase):
             g = pane.gauges(fields, None, {}, 1_800_000_000.0)
             self.assertEqual(g['cache']['text'], 'CACHE 50m')
             self.assertEqual(plain(pane.cockpit(g, 49))[1].strip(), '♻ >15t' + ' ' * 33 + 'CACHE 50m')
+
+
+class ReviewFindings(unittest.TestCase):
+    """Defects the review of the cockpit found, each reproduced first."""
+
+    def test_a_plist_that_is_not_xml_is_skipped_and_the_others_still_read(self):  # finding 1
+        import plistlib
+        with tempfile.TemporaryDirectory() as tmp:
+            agents = os.path.join(tmp, 'agents')
+            os.makedirs(agents)
+            with open(os.path.join(agents, 'com.x.csr-engine.broken.plist'), 'w') as handle:
+                handle.write('<plist><dict><key>EnvironmentVariables')  # an ExpatError, which is no ValueError
+            with open(os.path.join(agents, 'com.x.csr-engine.binary.plist'), 'wb') as handle:
+                handle.write(b'bplist00garbage')
+            with open(os.path.join(agents, 'com.x.csr-engine.daemon.plist'), 'wb') as handle:
+                plistlib.dump({'EnvironmentVariables': {'CSR_NO_RECAP': '1'}}, handle)
+            lock = os.path.join(tmp, 'daemon.lock')
+            with open(lock, 'w') as handle:
+                handle.write(str(os.getpid()))
+            got = pane.csr_status(NOW, agents, lock, os.path.join(tmp, 'none.json'))
+            self.assertEqual([row[0] for row in got['inop']], ['RECAP'])
+
+    def test_a_daemon_lock_with_an_absurd_number_is_a_daemon_that_is_down(self):  # finding 2
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = os.path.join(tmp, 'daemon.lock')
+            for text in ('9' * 30, '-' + '9' * 30, '9' * 5000):
+                with open(lock, 'w') as handle:
+                    handle.write(text)
+                got = pane.csr_status(NOW + len(text), os.path.join(tmp, 'x'), lock, os.path.join(tmp, 'none.json'))
+                self.assertEqual((got['sev'], got['inop'][0][0]), ('amber', 'DAEMON'), text[:10])
+
+    def test_a_threshold_set_to_zero_never_divides_by_zero(self):  # finding 6
+        saved = {k: os.environ.get(k) for k in ('CC_CTX_RED_TOKENS', 'CC_CTX_AMBER_TOKENS')}
+        try:
+            for red, amber in (('0', '0'), ('-5', '-1'), ('abc', 'x')):
+                os.environ.update(CC_CTX_RED_TOKENS=red, CC_CTX_AMBER_TOKENS=amber)
+                loaded = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(loaded)
+                self.assertGreaterEqual(loaded.CTX_RED, 1)
+                self.assertGreaterEqual(loaded.CTX_AMBER, 1)
+                g = loaded.gauges(fields_of(150_000), None, session(), NOW)
+                self.assertEqual(len(loaded.cockpit(g, 49)), 3)  # tape_row divides by CTX_RED
+        finally:
+            for key, value in saved.items():
+                os.environ.pop(key, None) if value is None else os.environ.__setitem__(key, value)
+
+    def test_a_reset_tomorrow_names_its_day_even_under_a_day_away(self):  # finding 7
+        window = lambda at: dict(used_percentage=80, resets_at=at)
+        late = datetime(2027, 1, 15, 23, 0).timestamp()
+        tomorrow = late + 8 * 3600  # 07:00 the next morning: 8 hours away, but not today
+        self.assertEqual(pane.quota_slot('7D', window(tomorrow), late)['text'],
+                         '7D 80% ↻' + datetime.fromtimestamp(tomorrow).strftime('%a 07:00'))
+        morning = datetime(2027, 1, 15, 9, 0).timestamp()
+        self.assertEqual(pane.quota_slot('5H', window(morning + 8 * 3600), morning)['text'], '5H 80% ↻17:00')  # today: time only
+        self.assertEqual(pane.reset_label(tomorrow, late), datetime.fromtimestamp(tomorrow).strftime('%a 07:00'))
+        self.assertEqual(pane.reset_label(morning + 3600, morning), '10:00')
 
 
 if __name__ == '__main__':

@@ -377,14 +377,22 @@ def _env_int(name, default):
         return default
 
 
-CTX_AMBER = _env_int('CC_CTX_AMBER_TOKENS', 100_000)  # the status line's own thresholds and env names
-CTX_RED = _env_int('CC_CTX_RED_TOKENS', 400_000)  # also the bar's full scale
+CTX_AMBER = max(1, _env_int('CC_CTX_AMBER_TOKENS', 100_000))  # the status line's own thresholds and env names
+CTX_RED = max(1, _env_int('CC_CTX_RED_TOKENS', 400_000))  # also the bar's full scale: never 0, it divides
 FLOOR_ROWS = 5  # the status line's FLOOR_ROWS: the floor is the median of this many newest compactions
 LAUNCH_AGENTS = os.path.join(HOME, 'Library', 'LaunchAgents')
 DAEMON_LOCK = os.path.join(HOME, '.claude-self-reflect', 'daemon.lock')
 SETTINGS = os.path.join(HOME, '.claude', 'settings.json')
 SESSIONS = os.path.join(HOME, '.claude', 'sessions')  # Claude Code: <pid>.json per live session
 _RECORD = {}  # session id -> the <pid>.json path last found for it
+
+
+def fail_open(call, empty, *args):
+    """call(*args), or empty when it raises: a source that cannot be read draws as if it were absent."""
+    try:
+        return call(*args)
+    except Exception:
+        return empty
 
 
 def kept_status(session_id, now):
@@ -488,6 +496,12 @@ def cache_info(cache, now):
     return dict(text=f'CACHE {span(left)}', sev='normal' if left >= 300 else 'amber', long=f'WARM · {span(left)} left')
 
 
+def reset_label(resets, now):
+    """When a window resets: the time alone when that is today (local date), else with the weekday."""
+    when = datetime.fromtimestamp(resets)
+    return when.strftime('%H:%M' if when.date() == datetime.fromtimestamp(now).date() else '%a %H:%M')
+
+
 def quota_slot(code, window, now):
     """One plan window for the masthead: dict(code, text, sev, used, resets, stale). A window that rolled over
     since the status line last ran is '--' in amber (it was a value and is invalid now); one never reported is
@@ -501,7 +515,7 @@ def quota_slot(code, window, now):
     text = f'{code} {round(used)}%'
     if used > 70 and resets is not None:
         try:
-            text += ' ↻' + datetime.fromtimestamp(resets).strftime('%H:%M' if resets - now < 86400 else '%a %H:%M')
+            text += ' ↻' + reset_label(resets, now)
         except (OverflowError, OSError, ValueError):
             pass  # a reset time this machine cannot show: the percentage alone
     return dict(code=code, text=text, sev='red' if used >= 90 else 'amber' if used > 70 else 'normal',
@@ -579,8 +593,8 @@ def csr_plist_switches(agents):
         try:
             with open(path, 'rb') as handle:
                 env = plistlib.load(handle).get('EnvironmentVariables')
-        except (OSError, ValueError, AttributeError):
-            continue  # plistlib.InvalidFileException is a ValueError
+        except Exception:
+            continue  # a plist that is not XML raises ExpatError, which is no ValueError: any one that fails is skipped
         out += [(k, v, 'daemon') for k, v in (env.items() if isinstance(env, dict) else ())]
     return out
 
@@ -608,8 +622,8 @@ def csr_status(now, agents=LAUNCH_AGENTS, lock=DAEMON_LOCK, settings=SETTINGS):
             pass  # alive, and not ours
         stamp_ns = mtime(lock)
         daemon = dict(up=True, pid=pid, since=stamp_ns / 1e9 if stamp_ns else None)
-    except (OSError, ValueError):
-        pass  # no lock, a garbled lock, or no such process (ProcessLookupError is an OSError)
+    except (OSError, ValueError, OverflowError):
+        pass  # no lock, a garbled or absurd one, or no such process (ProcessLookupError is an OSError)
     if not daemon['up']:
         inop.append(('DAEMON', 'DOWN · no live pid in daemon.lock', 'amber'))
     switches = csr_plist_switches(agents)
@@ -1155,6 +1169,13 @@ def read_record(path, session_id):
             kept = json.load(handle)
         if kept.get('sessionId') != session_id or not kept.get('cwd'):
             return None
+        if kept.get('pid') is not None:  # the record of a session that died is left behind: its pid must be alive
+            try:
+                os.kill(int(kept['pid']), 0)
+            except PermissionError:
+                pass  # alive, and not ours
+            except (OSError, OverflowError):
+                return None
         return dict(cwd=str(kept['cwd']), started=float(kept['startedAt']) / 1000, busy=kept.get('status') == 'busy')
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
@@ -1337,7 +1358,7 @@ class Session:
 
     def load(self):
         self.read_transcript()
-        self.record = session_record(self.id) or self.record
+        self.record = session_record(self.id) or (self.record and dict(self.record, busy=False))  # gone: not busy
         if self.carried is None and (self.path or self.record):  # once: the session before this one is done being written
             self.carried = []
             threading.Thread(target=carry_into, args=(self,), daemon=True).start()
@@ -2658,6 +2679,9 @@ def told_section(s):
     parts = told_lines(told['text']) if told else None
     if not parts or not parts['recap']:
         return None
+    parts = dict(parts, dreamt=[one_line(x, 300) for x in parts['dreamt']],
+                 anchors=one_line(parts['anchors'], 300) if parts['anchors'] else None,
+                 full=one_line(parts['full'], 300) if parts['full'] else None)  # transcript text: no control reaches a row
     anchors = ' · '.join(x for x in (parts['anchors'], f"{parts['index']} earlier threads" if parts['index'] else '') if x)
     source = str(told.get('source') or 'startup')
     when = datetime.fromtimestamp(told['at']).strftime('%H:%M') if told.get('at') else ''
@@ -2871,9 +2895,13 @@ def page_lines(page, width, rows, ui):
     if not built:
         return out.put([''] + [' ' + ink('faint') + l + OFF for l in wrap(page.get('quiet') or '', width - 2, 3)])
     left = rows - 1 - len(out) - sum(base for *_, base, _ in built)
-    for section, blocks, base, want in built:
-        room = base + max(0, min(want - base, left))
-        left -= room - base
+    rooms = {}
+    for k in sorted(range(len(built)), key=lambda k: built[k][0]['name'] != 'lost'):  # the spare rows: Lost and found first
+        _, _, base, want = built[k]
+        rooms[k] = base + max(0, min(want - base, left))
+        left -= rooms[k] - base
+    for k, (section, blocks, base, want) in enumerate(built):
+        room = rooms[k]
         name = section['name']
         part = Lines([heading(name, section['title'], section['right'], width)])
         fit_blocks(part, blocks, room - 1, ui, tail=False)
@@ -2924,7 +2952,7 @@ def draw_page(page, cols, rows, ui):
     return lines, pictures
 
 
-def draw_main(data, s, cols, rows, now, ui=None, hold=None):
+def draw_main(data, s, cols, rows, now, ui=None, hold=None, hold_quiet=None):
     """The main page. A session with nothing of its own yet gets the default view; hold, the sections as last
     drawn, replaces the sections while Claude works (the masthead stays live)."""
     if s is None:
@@ -2935,8 +2963,9 @@ def draw_main(data, s, cols, rows, now, ui=None, hold=None):
         page = page_default(page, data, s, now, (ui or {}).get('rows', rows))
     if hold is not None:
         page['sections'] = hold
+        page['quiet'] = hold_quiet if hold_quiet is not None else page.get('quiet')
     lines, pictures = draw_page(page, cols, rows, ui or {})
-    lines.sections = page['sections']
+    lines.sections, lines.quiet = page['sections'], page.get('quiet')
     return lines, pictures
 
 
@@ -3301,7 +3330,7 @@ PAPER_INK = dict(normal='you', data='you', advisory='ctx', amber='dream', red='t
 
 def reset_text(resets, now):
     try:
-        return datetime.fromtimestamp(resets).strftime('%H:%M' if resets - now < 86400 else '%a %H:%M')
+        return reset_label(resets, now)
     except (OverflowError, OSError, ValueError):
         return ''
 
@@ -3564,9 +3593,11 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
-            self.data['claude_fields'], self.data['claude_at'] = kept_status(self.session and self.session.id, now)
-            self.data['limits'] = account_limits(now)
-            self.data['sts'] = csr_status(now)
+            # each of these reads a file of someone else's: one that fails is empty, it never blanks the pane
+            self.data['claude_fields'], self.data['claude_at'] = fail_open(
+                kept_status, ({}, None), self.session and self.session.id, now)
+            self.data['limits'] = fail_open(account_limits, {}, now)
+            self.data['sts'] = fail_open(csr_status, dict(sev=None, inop=[]), now)
             self.data['compacting'] = compacting_info(self.session and self.session.id, now, self.data)
             if self.view == 'summary':
                 self.data['summary'] = newest_summary(self.session and self.session.path)
@@ -3595,6 +3626,8 @@ class Pane:
                           self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')),
+                          s and [s.get('last_session') is not None, bool(s.get('told')), s.get('turn_end'),
+                                 len(s.get('todos') or [])],
                           s and [(t['key'], t['hidden'], t['state']) for t in s['lost']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
@@ -3637,9 +3670,9 @@ class Pane:
         stays live), so nothing jumps under your eye; an idle frame, or a held one past HOLD_MAX, draws fresh
         and keeps what it drew."""
         held = held_sections(self.hold, bool(s and s.get('busy')), now)
-        lines, pictures = draw_main(data, s, cols, rows, now, ui, hold=held)
-        if held is None:
-            self.hold = dict(sections=lines.sections, at=now)
+        lines, pictures = draw_main(data, s, cols, rows, now, ui, hold=held, hold_quiet=(self.hold or {}).get('quiet'))
+        if held is None:  # an empty page is never held: it may only be waiting for the carry to land
+            self.hold = dict(sections=lines.sections, quiet=lines.quiet, at=now) if lines.sections else None
         return lines, pictures
 
     def scroll(self, step):
@@ -4025,7 +4058,7 @@ def left_todos(session_id, con=None, tasks=None):
         try:
             with open(os.path.join(tasks, session_id, name), encoding='utf-8') as handle:
                 task = json.load(handle)
-            if task.get('status') in OPEN_TASK and str(task.get('subject') or '').strip():
+            if task.get('status') in OPEN_TASK and isinstance(task.get('subject'), str) and task['subject'].strip():
                 found.append((int(stem), dict(subject=one_line(task['subject'], 300), status=task['status'])))
         except (OSError, ValueError, AttributeError):
             continue
@@ -4034,7 +4067,8 @@ def left_todos(session_id, con=None, tasks=None):
             row = con.execute("select content from reflections where tags like '%session_episode%' and tags like ? "
                               "order by timestamp desc limit 1", (f'%conv_{session_id}%',)).fetchone()
             for k, todo in enumerate(json.loads(row[0]).get('todos') or [] if row else []):
-                if isinstance(todo, dict) and todo.get('status') in OPEN_TASK and str(todo.get('content') or '').strip():
+                if isinstance(todo, dict) and todo.get('status') in OPEN_TASK and isinstance(todo.get('content'), str) \
+                        and todo['content'].strip():
                     found.append((k, dict(subject=one_line(todo['content'], 300), status=todo['status'])))
         except (sqlite3.Error, ValueError, AttributeError, TypeError):
             return []
