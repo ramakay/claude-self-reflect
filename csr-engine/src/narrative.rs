@@ -63,17 +63,144 @@ fn headless_keeps_user_settings() -> bool {
 /// that predates an option rejects it outright, which would fail every call.
 pub fn isolation_args() -> Vec<String> {
     static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    ARGS.get_or_init(|| {
-        let help = std::process::Command::new("claude")
-            .arg("--help")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default();
-        isolation_args_for(&help, headless_keeps_user_settings())
-    })
-    .clone()
+    if let Some(args) = ARGS.get() {
+        return args.clone();
+    }
+    let mut probe = std::process::Command::new("claude");
+    probe.arg("--help");
+    match run_with_deadline(probe, HELP_PROBE_DEADLINE) {
+        Some(stdout) => ARGS
+            .get_or_init(|| {
+                isolation_args_for(
+                    &String::from_utf8_lossy(&stdout),
+                    headless_keeps_user_settings(),
+                )
+            })
+            .clone(),
+        // A hung, missing or failing CLI: nothing is learnt, so nothing is
+        // cached; the next call probes again.
+        None => isolation_args_for("", headless_keeps_user_settings()),
+    }
+}
+
+/// How long `claude --help` may run before it is killed.
+const HELP_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `cmd` (stdin closed) and return its stdout if it exits successfully
+/// within `deadline`. On timeout the child is killed AND reaped before this
+/// returns, so no process outlives the call. Stdout is drained on its own
+/// thread so a full pipe cannot stall the child and with it the deadline poll.
+pub(crate) fn run_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf).ok().map(|_| buf)
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    // After a kill the reader is not joined: a grandchild holding the pipe
+    // would stall the caller past its deadline. The thread ends with the pipe.
+    let status = status?;
+    let output = reader.join().ok().flatten();
+    status.success().then_some(output).flatten()
+}
+
+/// How an async headless run ended.
+#[derive(Debug)]
+pub enum HeadlessRun {
+    Output(std::process::Output),
+    /// The deadline passed: the child was killed and reaped.
+    TimedOut,
+    /// The program could not be started.
+    SpawnFailed,
+}
+
+/// Run `cmd` with `stdin_bytes` on its stdin, bounded by `deadline` for the
+/// whole exchange (writing, reading, exiting). On timeout the child is killed
+/// and reaped BEFORE this returns: a caller holding a lock around the call
+/// never releases it while the child lives, and a dropped future also kills it.
+pub async fn run_headless(
+    mut cmd: tokio::process::Command,
+    stdin_bytes: &[u8],
+    deadline: std::time::Duration,
+) -> HeadlessRun {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut child = match cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // Piped intentionally: model-not-found detection reads stderr.
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return HeadlessRun::SpawnFailed,
+    };
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let exchange = async {
+        let write = async {
+            if let Some(mut pipe) = stdin.take() {
+                let _ = pipe.write_all(stdin_bytes).await;
+            }
+        };
+        let read_out = async {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stdout.as_mut() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let read_err = async {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stderr.as_mut() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let (_, out, err) = tokio::join!(write, read_out, read_err);
+        let status = child.wait().await.ok()?;
+        Some(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(Some(output)) => HeadlessRun::Output(output),
+        Ok(None) => {
+            let _ = child.kill().await;
+            HeadlessRun::TimedOut
+        }
+        Err(_) => {
+            // `kill` signals and then waits: the child is reaped on return.
+            let _ = child.kill().await;
+            HeadlessRun::TimedOut
+        }
+    }
 }
 
 /// [`isolation_args`] for a given `claude --help` text. No option is
@@ -459,5 +586,86 @@ mod tests {
             0,
             "claude -p call sites need zero MCP servers"
         );
+    }
+
+    #[test]
+    fn a_hung_sync_probe_is_killed_and_reaped_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > {}; exec sleep 30", pidfile.display()));
+        let started = std::time::Instant::now();
+        assert!(run_with_deadline(cmd, std::time::Duration::from_millis(300)).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_process_gone(&pidfile);
+    }
+
+    #[test]
+    fn a_sync_probe_that_finishes_returns_its_stdout() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("printf '%s' '--setting-sources'");
+        assert_eq!(
+            run_with_deadline(cmd, std::time::Duration::from_secs(10)).unwrap(),
+            b"--setting-sources"
+        );
+        let mut failing = std::process::Command::new("sh");
+        failing.arg("-c").arg("echo x; exit 3");
+        assert!(run_with_deadline(failing, std::time::Duration::from_secs(10)).is_none());
+    }
+
+    /// `kill -0` succeeds on a zombie, so a failure proves the child was reaped.
+    fn assert_process_gone(pidfile: &std::path::Path) {
+        let pid = std::fs::read_to_string(pidfile).expect("child wrote its pid");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "pid {} still exists after the deadline", pid.trim());
+    }
+
+    #[tokio::test]
+    async fn an_async_narrator_past_its_deadline_is_killed_and_reaped_before_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > {}; exec sleep 30", pidfile.display()));
+        let started = std::time::Instant::now();
+        let run = run_headless(cmd, b"prompt", std::time::Duration::from_millis(400)).await;
+        assert!(matches!(run, HeadlessRun::TimedOut), "{run:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_process_gone(&pidfile);
+    }
+
+    #[tokio::test]
+    async fn an_async_narrator_that_never_reads_its_stdin_still_hits_the_deadline() {
+        // A prompt bigger than the pipe buffer, to a child that ignores stdin.
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("exec sleep 30");
+        let run = run_headless(cmd, &big, std::time::Duration::from_millis(400)).await;
+        assert!(matches!(run, HeadlessRun::TimedOut), "{run:?}");
+    }
+
+    #[tokio::test]
+    async fn an_async_narrator_that_answers_in_time_returns_stdout_and_stderr() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("cat; echo oops >&2");
+        match run_headless(cmd, b"hello", std::time::Duration::from_secs(10)).await {
+            HeadlessRun::Output(out) => {
+                assert!(out.status.success());
+                assert_eq!(out.stdout, b"hello");
+                assert_eq!(out.stderr, b"oops\n");
+            }
+            other => panic!("{other:?}"),
+        }
+        let missing = tokio::process::Command::new("/nonexistent/claude");
+        assert!(matches!(
+            run_headless(missing, b"", std::time::Duration::from_secs(1)).await,
+            HeadlessRun::SpawnFailed
+        ));
     }
 }
