@@ -491,8 +491,26 @@ struct TranscriptLine<'a> {
     is_meta: Option<bool>,
     #[serde(rename = "isCompactSummary")]
     is_compact_summary: Option<bool>,
+    #[serde(rename = "isSidechain")]
+    is_sidechain: Option<bool>,
+    #[serde(rename = "userType")]
+    user_type: Option<&'a str>,
+    entrypoint: Option<&'a str>,
     #[serde(borrow)]
     message: Option<TranscriptMessage<'a>>,
+}
+
+/// A line the person did not write as this session's own turn: Claude briefing a
+/// subagent (every line of a subagent transcript is a sidechain line), a headless
+/// run's scripted prompt (an `sdk-*` entrypoint), or a sender that is not a person.
+/// "No, not that" there is Claude instructing a helper, not the person correcting
+/// Claude, so it is read as injected: never a correction, redirect or abandonment.
+fn is_foreign(record: &TranscriptLine<'_>) -> bool {
+    record.is_sidechain == Some(true)
+        || record.user_type.is_some_and(|kind| kind != "external")
+        || record
+            .entrypoint
+            .is_some_and(|entry| entry.starts_with("sdk"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -643,6 +661,7 @@ fn source_texts(path: &Path) -> Result<SourceTexts> {
             .collect();
         let is_injected = record.is_meta == Some(true)
             || record.is_compact_summary == Some(true)
+            || is_foreign(&record)
             || (role == Role::User
                 && joined
                     .starts_with("This session is being continued from a previous conversation"));
@@ -742,6 +761,7 @@ fn source_texts_tail(raw: &str, starting_turn: u32) -> SourceTexts {
             .collect();
         let is_injected = record.is_meta == Some(true)
             || record.is_compact_summary == Some(true)
+            || is_foreign(&record)
             || (role == Role::User
                 && joined
                     .starts_with("This session is being continued from a previous conversation"));
@@ -905,7 +925,10 @@ fn marker_scan_text(text: &str) -> String {
     String::from_utf8(masked).expect("masking preserves UTF-8")
 }
 
+// `pasted_content` is a block the person pasted, often another agent's words
+// ("Do not send this to grok-advisor…" was Grok's): never their correction.
 const WRAPPER_TAGS: &[&str] = &[
+    "pasted_content",
     "system-reminder",
     "command-message",
     "command-name",
@@ -1763,6 +1786,50 @@ mod tests {
             &bytes[events[0].byte_start..events[0].byte_end],
             events[0].quote.as_bytes()
         );
+    }
+
+    #[test]
+    fn a_pasted_block_is_never_the_persons_correction() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        // After the opening prompt, a reaction in a pasted block (another agent's words), then the person's own.
+        let raw = concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Build the first approach\"}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"check this <pasted_content id=\\\"3b47\\\">\\nNo, do not send this to grok-advisor.\\n</pasted_content>\"}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No, use OtherThing\"}]}}\n",
+        );
+        std::fs::write(&transcript, raw).unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| {
+            Some(Reaction::Correction)
+        })
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].quote, "No, use OtherThing");
+    }
+
+    #[test]
+    fn claude_briefing_a_subagent_or_a_headless_prompt_is_never_a_correction() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("session.jsonl");
+        // The person's opening prompt first: a reaction needs one before it.
+        let raw = concat!(
+            "{\"type\":\"user\",\"isSidechain\":false,\"userType\":\"external\",\"entrypoint\":\"cli\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Build the first approach\"}]}}\n",
+            "{\"type\":\"user\",\"isSidechain\":true,\"userType\":\"external\",\"entrypoint\":\"cli\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Do not push.\"}]}}\n",
+            "{\"type\":\"user\",\"entrypoint\":\"sdk-cli\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No, summarize only.\"}]}}\n",
+            "{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"We are dropping `OldParser` instead of changing it.\"}]}}\n",
+            "{\"type\":\"user\",\"isSidechain\":false,\"userType\":\"external\",\"entrypoint\":\"cli\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No, use OtherThing\"}]}}\n",
+        );
+        std::fs::write(&transcript, raw).unwrap();
+
+        let events = extract_with_classifier(&transcript, "s", "p", |_text, _prior| {
+            Some(Reaction::Correction)
+        })
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].quote, "No, use OtherThing");
     }
 
     #[test]
