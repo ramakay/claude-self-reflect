@@ -1347,7 +1347,7 @@ mod tests {
     fn persisted_supersession_carries_audited_subagent_receipts() {
         let temp = tempfile::tempdir().unwrap();
         let projects_root = temp.path().join("projects");
-        let project_dir = "-Users-rama-projects-repo";
+        let project_dir = "-Users-dev-projects-repo";
         let subagents = projects_root
             .join(project_dir)
             .join("parent-a")

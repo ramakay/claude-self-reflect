@@ -6,7 +6,8 @@
 
   Install (macOS):
     mkdir -p ~/.claude-self-reflect/logs
-    cp scripts/launchd/com.ramakay.csr-engine.daemon.plist ~/Library/LaunchAgents/
+    sed "s#/Users/YOUR_USER#$HOME#g" scripts/launchd/com.ramakay.csr-engine.daemon.plist \
+      > ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
   Stop / remove:
     launchctl bootout gui/$(id -u)/com.ramakay.csr-engine.daemon
@@ -32,7 +33,7 @@
     <!-- launchd starts with a bare PATH; the claude CLI (narratives, ratification,
          strategy dreams) lives under ~/.local/bin on this machine. -->
     <key>PATH</key>
-    <string>/Users/ramakrishnanannaswamy/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <string>/Users/YOUR_USER/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <!-- Without this launchd runs the daemon from `/`. Its headless `claude -p`
        children inherit that cwd, so Claude Code's seatbelt profile is scoped at
@@ -40,7 +41,7 @@
        under it (Desktop, Documents, Photos, Media Library, Network Volumes).
        Scoping cwd to the CSR data dir keeps the profile off personal data. -->
   <key>WorkingDirectory</key>
-  <string>/Users/ramakrishnanannaswamy/.claude-self-reflect</string>
+  <string>/Users/YOUR_USER/.claude-self-reflect</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -55,8 +56,8 @@
   <key>Nice</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/ramakrishnanannaswamy/.claude-self-reflect/logs/daemon.out.log</string>
+  <string>/Users/YOUR_USER/.claude-self-reflect/logs/daemon.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/ramakrishnanannaswamy/.claude-self-reflect/logs/daemon.err.log</string>
+  <string>/Users/YOUR_USER/.claude-self-reflect/logs/daemon.err.log</string>
 </dict>
 </plist>

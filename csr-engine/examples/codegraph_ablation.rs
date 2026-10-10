@@ -25,7 +25,7 @@
 //! Query set (optional — external gold/query file):
 //!   By default this harness runs the hardcoded 20-query set below (Q1-Q12 + A1-A8),
 //!   byte-identical to prior runs. To run a different query set (e.g. eval-kit/ag's
-//!   Anukriti gold), pass its path as CLI arg 1 or via CSR_ABLATION_QUERIES:
+//!   private-app gold), pass its path as CLI arg 1 or via CSR_ABLATION_QUERIES:
 //!
 //!   CSR_ABLATION_DB=... CSR_ABLATION_PROJECTS=... CSR_ABLATION_OUT=... \
 //!     cargo run --release --example codegraph_ablation -- /path/to/queries_or_gold.json

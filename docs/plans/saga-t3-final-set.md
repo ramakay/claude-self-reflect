@@ -1,10 +1,10 @@
 # T3 Multi-Hop Retrieval Eval — Final Set (27 questions)
 
-Merged from `candidates.md` (38, CSR/csr-engine repo) and `candidates_anukriti.md` (30,
-Anukriti family), filtered against `pairs_typed.csv` (529 mechanical commit-pairs) for
+Merged from `candidates.md` (38, CSR/csr-engine repo) and `candidates_private-app.md` (30,
+private-app family), filtered against `pairs_typed.csv` (529 mechanical commit-pairs) for
 redundancy. See `drops.md` for every excluded/re-typed candidate and why.
 
-Corpus split: CSR 11/27 (41%), Anukriti 16/27 (59%). Multi-hop (hop=multi): 14/27, of
+Corpus split: CSR 11/27 (41%), private-app 16/27 (59%). Multi-hop (hop=multi): 14/27, of
 which 12 are D-type or audited-multi-hop-C-type (meets the ≥12 D+C floor). Abandonment/
 supersession-themed: 9/27 (meets ≥6 floor).
 
@@ -83,104 +83,104 @@ traceability back to the source files.
 
 ---
 
-## Anukriti family (16)
+## private-app family (16)
 
 ### 12 (orig #39)
 **Q:** Why did the paywall get redesigned into a bottom sheet with benefit copy and price preview, instead of keeping the settings/collection buttons calling the purchase flow directly?
-**Type:** A · **Hop:** single · **Corpus:** Anukriti
-**Ground truth key:** Plan `woolly-skipping-wreath.md` §Context: ~1% conversion at paywall; 99% bail happens at the Apple StoreKit sheet — entry points called `purchaseSubscription(null)` directly, cold StoreKit with no value screen. Shipped as `anukriti` commit `67d02b7` (2026-07-20) "feat(paywall): gold bottom-sheet paywall v2 + entry rewires + settings restyle".
+**Type:** A · **Hop:** single · **Corpus:** private-app
+**Ground truth key:** Plan `woolly-skipping-wreath.md` §Context: ~1% conversion at paywall; 99% bail happens at the Apple StoreKit sheet — entry points called `purchaseSubscription(null)` directly, cold StoreKit with no value screen. Shipped as `private-app` commit `67d02b7` (2026-07-20) "feat(paywall): gold bottom-sheet paywall v2 + entry rewires + settings restyle".
 **Grading note:** Correct answer names the cold-StoreKit-with-no-value-screen problem as the reason for the new `subscription-sheet.tsx` route. Wrong answer: attributes the redesign to a generic "modernization" motivation without the conversion-funnel diagnosis.
 
 ### 13 (orig #42)
 **Q:** Why was the paywall-v2 build split into exactly three parallel implementer lanes with disjoint file ownership, instead of one sequential pass?
-**Type:** A · **Hop:** single · **Corpus:** Anukriti
-**Ground truth key:** Plan `woolly-skipping-wreath.md` §Execution: "3 parallel grok-implementer lanes (architect pattern, dynamic supervision) ... No file overlaps between lanes." Lane A owns the new sheet file only, Lane B owns analytics/service exports, Lane C owns route registration + entry rewires.
+**Type:** A · **Hop:** single · **Corpus:** private-app
+**Ground truth key:** Plan `woolly-skipping-wreath.md` §Execution: "3 parallel implementation lanes (architect pattern, dynamic supervision) ... No file overlaps between lanes." Lane A owns the new sheet file only, Lane B owns analytics/service exports, Lane C owns route registration + entry rewires.
 **Grading note:** Correct answer connects disjoint ownership to enabling safe parallelism (no merge conflicts), plus the plan's own memory note that "lanes have reverted uncommitted work" in the past, hence the pre-step safety commit. Wrong answer: says lanes were split for speed alone without the conflict-avoidance/prior-incident reasoning.
 
 ### 14 (orig #46)
 **Q:** Why did the settings screen's active-subscription card need "Restore Purchases" removed from it specifically?
-**Type:** A · **Hop:** single · **Corpus:** Anukriti
-**Ground truth key:** Task session `a30221b5` (2026-07-21): "BUG: Restore Purchases shown to already-premium users" (completed 2026-07-21T03:26:55Z). Shipped as `anukriti` commit `a47269f` (author time 2026-07-21T03:26:50Z — same minute as task completion) "fix(settings): drop Restore Purchases from active-subscription card".
+**Type:** A · **Hop:** single · **Corpus:** private-app
+**Ground truth key:** Task session `a30221b5` (2026-07-21): "BUG: Restore Purchases shown to already-premium users" (completed 2026-07-21T03:26:55Z). Shipped as `private-app` commit `a47269f` (author time 2026-07-21T03:26:50Z — same minute as task completion) "fix(settings): drop Restore Purchases from active-subscription card".
 **Grading note:** Correct answer says the action was surfaced to users who already had an active subscription, where it made no sense — not a general removal of the restore-purchases feature. Wrong answer: says Restore Purchases was removed app-wide, or misses the already-premium-user targeting.
 
 ### 15 (orig #47)
 **Q:** Did the goal-aware rewrite of the ad-campaign grading logic (installs as the north star, sample-size guards, stripped hardcoded numbers) actually reach the live command-center dashboard?
-**Type:** B · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `819028e3` (2026-07-15, dir `anukriti-meta-campaigns`): "Add installs/registrations to ad-trend data layer," "Goal-aware CampaignFacts + lowSample flags," "CPI-aware gradeCampaign," "Strip stale hardcoded numbers," "Verify + deploy per CC DoD" (completed 2026-07-15T18:34:32Z). Shipped as `anukriti-command-center` commit `b1188c4` (2026-07-15 18:31:24Z) "Make AI verdicts goal-aware: installs/CPI for SKAN, sample guards, stale prompt numbers stripped."
-**Grading note:** Correct answer: yes, shipped same day, in `anukriti-command-center`, not in `anukriti-meta-campaigns` itself — requires recognizing the task session's project directory and the shipped code's actual repo are different (cross-repo, timestamp-matched). Wrong answer: assumes the code lives in the meta-campaigns repo, or can't find the shipping commit at all.
+**Type:** B · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `819028e3` (2026-07-15, dir `private-app-meta-campaigns`): "Add installs/registrations to ad-trend data layer," "Goal-aware CampaignFacts + lowSample flags," "CPI-aware gradeCampaign," "Strip stale hardcoded numbers," "Verify + deploy per CC DoD" (completed 2026-07-15T18:34:32Z). Shipped as `private-app-command-center` commit `b1188c4` (2026-07-15 18:31:24Z) "Make AI verdicts goal-aware: installs/CPI for SKAN, sample guards, stale prompt numbers stripped."
+**Grading note:** Correct answer: yes, shipped same day, in `private-app-command-center`, not in `private-app-meta-campaigns` itself — requires recognizing the task session's project directory and the shipped code's actual repo are different (cross-repo, timestamp-matched). Wrong answer: assumes the code lives in the meta-campaigns repo, or can't find the shipping commit at all.
 
 ### 16 (orig #49)
 **Q:** Did the anonymous-browsing-channel group id backfilled for the 2026-07-24 radio-monetization OTA still appear in the release-train manifest as of the most recent commit touching that file?
-**Type:** B · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** `anukriti` commit `45bfdf5` (2026-07-24) backfills `anonymous-browsing: 4cc839de-...` for runtime 1.5.1. Commit `c1d156b` (2026-07-27) replaces that entry with `c6fce820-...`, while leaving the `production` entry (`6d4b2a3c...`, 2026-07-24) byte-for-byte untouched.
+**Type:** B · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** `private-app` commit `45bfdf5` (2026-07-24) backfills `anonymous-browsing: 4cc839de-...` for runtime 1.5.1. Commit `c1d156b` (2026-07-27) replaces that entry with `c6fce820-...`, while leaving the `production` entry (`6d4b2a3c...`, 2026-07-24) byte-for-byte untouched.
 **Grading note:** Correct answer: no, `4cc839de` is gone from the current file — but that is the *intended* behavior (each channel keeps only its latest publish, per the plan's explicit deferral of a rolling history log), not a regression re-introducing the earlier flat-key-wipe bug. Must also note the production entry survived untouched across the anon-only publish. Wrong answer: flags the replacement itself as a bug/regression, or misses that production was unaffected.
 
 ### 17 (orig #54)
 **Q:** Was the "Manage Subscription" button in settings — reported dead the same day as two other subscription-related bugs — actually fixed with a code change?
-**Type:** C · **Hop:** multi · **Corpus:** Anukriti
+**Type:** C · **Hop:** multi · **Corpus:** private-app
 **Ground truth key:** Task session `a30221b5`, "BUG: Manage Subscription button dead in settings" (created 2026-07-21T03:24:06Z, completed 71 seconds later at 03:25:17Z). `git log --all -S"handleManageSubscriptionPress"` shows the handler was last touched by commit `23a8975` (well before this date) and untouched by anything in the following 24h of commits.
 **Grading note:** Correct answer: no shipped code change is evidence-able for this specific bug in this window — the 71-second task duration and absence of any matching commit suggests it was investigated and found already-working (or fixed via an untracked change), not a verified shipped fix. Wrong answer: cites a specific commit as "the fix" when none exists for this handler in this window.
 
 ### 18 (orig #55)
 **Q:** Did the OpenAI Ads pixel integration described in its own plan (loader component, tracking wrapper, conversion events on store-badge clicks) ever get committed to version control?
-**Type:** C · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** In `anukriti-website` (a repo outside the family's four originally-scoped repos): `lib/oaiq.ts` and `components/shared/OaiqPixel.tsx` exist on disk, but `git log --oneline --all -- lib/oaiq.ts components/shared/OaiqPixel.tsx` returns nothing; `git status --short` shows six related files modified-but-uncommitted and the two new files untracked.
+**Type:** C · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** In `private-app-website` (a repo outside the family's four originally-scoped repos): `lib/oaiq.ts` and `components/shared/OaiqPixel.tsx` exist on disk, but `git log --oneline --all -- lib/oaiq.ts components/shared/OaiqPixel.tsx` returns nothing; `git status --short` shows six related files modified-but-uncommitted and the two new files untracked.
 **Grading note:** Correct answer: implemented in the working tree exactly per the plan's file list, but never committed — by any git-log-only measure it has not shipped. Requires first locating the correct (unlisted) repo. Wrong answer: cites a commit hash for this work (none exists), or says the work was never done at all (it exists, just uncommitted).
 
 ### 19 (orig #56)
 **Q:** A plan for next-OTA-cycle ANR mitigation on the 1.5.5 binary was logged as a task and then never touched again in the tracker — did the underlying ANR problem it targeted get fixed anyway?
-**Type:** C · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `f8564b36`, "ANR mitigation plan for 1.5.5 binary — grok consult + inspect ANR groups" (created 2026-07-11T23:52:21Z, `final_status=created-only`, 0 updates). `anukriti` commit `7acf8a0` (2026-07-12) "fix(anr): eliminate native OTA launch wait (fallbackToCacheTimeout 4000→0)", followed same day by `78b06ae` registering the 1.5.5 store submission (vc68, ANR fix).
+**Type:** C · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `f8564b36`, "ANR mitigation plan for 1.5.5 binary — external consult + inspect ANR groups" (created 2026-07-11T23:52:21Z, `final_status=created-only`, 0 updates). `private-app` commit `7acf8a0` (2026-07-12) "fix(anr): eliminate native OTA launch wait (fallbackToCacheTimeout 4000→0)", followed same day by `78b06ae` registering the 1.5.5 store submission (vc68, ANR fix).
 **Grading note:** Correct answer: yes, a fix shipped the next day — but the task-lifecycle row for the *planning* task itself was never updated to reflect that, so a system relying only on task-completion status would wrongly conclude the ANR work was dropped. Wrong answer: says the ANR problem was never addressed because the tracked task looks abandoned.
 
 ### 20 (orig #57)
 **Q:** The "fb4a Meta install influx" investigation was logged as a single completed task in the meta-campaigns session history — did it leave behind any retrievable written finding or code change in these repos?
-**Type:** C · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `11a0057f` (2026-07-10), "Deep dive: fb4a Meta install influx — new or always-there missed opportunity" (completed). `grep -ri "fb4a"` across `anukriti-meta-campaigns` and `anukriti-command-center` returns no hits; no matching doc or commit anywhere.
+**Type:** C · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `11a0057f` (2026-07-10), "Deep dive: fb4a Meta install influx — new or always-there missed opportunity" (completed). `grep -ri "fb4a"` across `private-app-meta-campaigns` and `private-app-command-center` returns no hits; no matching doc or commit anywhere.
 **Grading note:** Correct answer says no artifact is found in the repos for this specific investigation, and does not fabricate a conclusion the investigation reached. Wrong answer: confidently states "what the influx turned out to be" — that cannot be grounded from these sources.
 
 ### 21 (orig #59)
-**Q:** The Saadhana feature's epic plan, BRD/TDD doc, and Phase-0 instrumentation task were all recorded in a session under the marketing-analytics project's directory — does the mobile app repo's own documentation explain why its feature work would be tracked there?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `226b4165` (dir `anukriti-meta-campaigns`, 2026-07-26): task "Phase 0: instrument JapaTabContent..." completed 2026-07-26T20:12:46.775Z ↔ `anukriti` commit `8b7fa33` authored 20:12:38Z (same session, same minute, different repo). `grep -rn "meta-campaigns" anukriti/CLAUDE.md anukriti/AGENTS.md` returns nothing.
+**Q:** The Routine feature's epic plan, BRD/TDD doc, and Phase-0 instrumentation task were all recorded in a session under the marketing-analytics project's directory — does the mobile app repo's own documentation explain why its feature work would be tracked there?
+**Type:** D · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `226b4165` (dir `private-app-meta-campaigns`, 2026-07-26): task "Phase 0: instrument CounterTabContent..." completed 2026-07-26T20:12:46.775Z ↔ `private-app` commit `8b7fa33` authored 20:12:38Z (same session, same minute, different repo). `grep -rn "meta-campaigns" private-app/CLAUDE.md private-app/AGENTS.md` returns nothing.
 **Grading note:** Correct answer identifies this as the *same session* operating across two different working directories/repos, evidenced only by matching timestamps across the task-lifecycle CSV and the app repo's git log — no doc in either repo states this happens, so a fully correct answer flags it as an observed pattern, not a documented convention. Wrong answer: claims either repo's docs formally describe this cross-repo tracking, or treats the two as unrelated/coincidental sessions.
 
 ### 22 (orig #60)
-**Q:** The Japa-engagement analytics module and the active-release resolver were tracked as completed in a session dated 2026-06-27 — does the commit that actually contains those files carry the same date?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `962b9d0e` (dir `anukriti-meta-campaigns`), tasks completed 2026-06-27T02:47-05:56Z. The only `anukriti-command-center` commit containing `usePosthogJapa.ts`/`JapaEngagement.tsx` is `58328e0`, authored 2026-07-07 — roughly 10 days later. `git log --all --since=2026-06-26 --until=2026-06-28` in that repo returns zero commits.
+**Q:** The Counter-engagement analytics module and the active-release resolver were tracked as completed in a session dated 2026-06-27 — does the commit that actually contains those files carry the same date?
+**Type:** D · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `962b9d0e` (dir `private-app-meta-campaigns`), tasks completed 2026-06-27T02:47-05:56Z. The only `private-app-command-center` commit containing `usePosthogCounter.ts`/`CounterEngagement.tsx` is `58328e0`, authored 2026-07-07 — roughly 10 days later. `git log --all --since=2026-06-26 --until=2026-06-28` in that repo returns zero commits.
 **Grading note:** Correct answer: no — the commit lands about 10 days after the session that recorded the work as completed; there is no command-center commit on 2026-06-27 at all. Task-completion timestamp does not equal commit-landing timestamp. Wrong answer: assumes the two dates match, or can't locate the actual landing commit.
 
 ### 23 (orig #61)
-**Q:** The audio production for the Guru Brahma and Jagannathashtakam radio tracks, and their release into specific app stations, happened on the same calendar day — did both halves happen in the same repository?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** `Anukriti-Campaigns` commit `99abee8` (2026-07-17, lyrics-pipeline fix) plus `output/guru-brahma/`, `output/jagannathashtakam/` artifacts; `anukriti` commits `378f3df`/`23d2305` (both 2026-07-17) for the station release + OTA registration — a different repo.
-**Grading note:** Correct answer: no — audio/lyrics production happened in `Anukriti-Campaigns`, station assignment and OTA release happened in `anukriti`. Wrong answer: assumes a same-repo answer because both landed the same day.
+**Q:** The audio production for the first and second radio tracks, and their release into specific app stations, happened on the same calendar day — did both halves happen in the same repository?
+**Type:** D · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** `private-app-campaigns` commit `99abee8` (2026-07-17, lyrics-pipeline fix) plus `output/track-one/`, `output/track-two/` artifacts; `private-app` commits `378f3df`/`23d2305` (both 2026-07-17) for the station release + OTA registration — a different repo.
+**Grading note:** Correct answer: no — audio/lyrics production happened in `private-app-campaigns`, station assignment and OTA release happened in `private-app`. Wrong answer: assumes a same-repo answer because both landed the same day.
 
 ### 24 (orig #62)
-**Q:** A set of "capture" tasks for practice/feedback-hero, japa, calendar, streak, and radio screenshots was logged in the mobile app repo's task history as never completed — were those specific captures ever actually produced, and if so, where does the evidence live?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `d35e4adb` (dir `anukriti`), capture tasks created 2026-07-07T14:54:40-53Z, all `final_status=created-only`. Concurrently, `Anukriti-Campaigns` task session `ff5e27f6`, "Integrate app UI captures (practice/feedback hero, japa, calendar, streak, radio)" — created ~2 minutes earlier (14:52:55Z), completed 2026-07-07T16:34:31Z.
+**Q:** A set of "capture" tasks for practice/feedback-hero, counter, calendar, streak, and radio screenshots was logged in the mobile app repo's task history as never completed — were those specific captures ever actually produced, and if so, where does the evidence live?
+**Type:** D · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `d35e4adb` (dir `private-app`), capture tasks created 2026-07-07T14:54:40-53Z, all `final_status=created-only`. Concurrently, `private-app-campaigns` task session `ff5e27f6`, "Integrate app UI captures (practice/feedback hero, counter, calendar, streak, radio)" — created ~2 minutes earlier (14:52:55Z), completed 2026-07-07T16:34:31Z.
 **Grading note:** Correct answer notes the app-repo capture tasks were never marked done in that repo's own tracked history, yet a same-day, near-simultaneous session in the campaigns repo records using exactly those capture categories as already-integrated inputs — implying the captures were taken through some other, untracked path. Wrong answer: a one-repo-only "the captures were never done" conclusion that misses the cross-repo evidence the content existed and got used.
 
 ### 25 (orig #63)
 **Q:** Is the OpenAI Ads pixel work findable anywhere as a committed change in the repository its own plan file names as the deployment target?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** The plan's file paths (`app/layout.tsx`, `components/shared/StoreBadges.tsx`, etc.) only resolve inside `anukriti-website`, not among the family's four originally-scoped repos. Files exist there uncommitted (see #18's evidence); grep for `OaiqPixel`/`oaiq(` across the four scoped repos returns nothing.
-**Grading note:** Correct answer must first correctly locate `anukriti-website` as the only place the plan's file paths resolve, and report the work as present-but-uncommitted there — not committed and not "not found at all." Wrong answer: searches only the four originally-scoped repos and concludes the work never happened.
+**Type:** D · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** The plan's file paths (`app/layout.tsx`, `components/shared/StoreBadges.tsx`, etc.) only resolve inside `private-app-website`, not among the family's four originally-scoped repos. Files exist there uncommitted (see #18's evidence); grep for `OaiqPixel`/`oaiq(` across the four scoped repos returns nothing.
+**Grading note:** Correct answer must first correctly locate `private-app-website` as the only place the plan's file paths resolve, and report the work as present-but-uncommitted there — not committed and not "not found at all." Wrong answer: searches only the four originally-scoped repos and concludes the work never happened.
 
 ### 26 (orig #64)
 **Q:** The "production-submit invariant" hardening idea (rejecting anon-profile builds from production submission) was raised in the same session as a real production release — did it, or an equivalent guard, ever land in any of the four core repos, under any name?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
-**Ground truth key:** Task session `a30221b5`, "Hardening: production-submit invariant (reject anon-profile builds)" — `final_status=created-only`, 0 updates. Broadened search `git log --all --grep="anon.*profile\|invariant" -i` across `anukriti` surfaces only unrelated hits (an `android-anonymous` build-profile feature, staging-RLS invariants) — none reject anon-profile builds from production submission. No hits at all in the other three repos.
+**Type:** D · **Hop:** multi · **Corpus:** private-app
+**Ground truth key:** Task session `a30221b5`, "Hardening: production-submit invariant (reject anon-profile builds)" — `final_status=created-only`, 0 updates. Broadened search `git log --all --grep="anon.*profile\|invariant" -i` across `private-app` surfaces only unrelated hits (an `android-anonymous` build-profile feature, staging-RLS invariants) — none reject anon-profile builds from production submission. No hits at all in the other three repos.
 **Grading note:** Correct answer: no, not found under any name in any of the four repos — the closest-sounding hits are unrelated. Wrong answer: treats a superficially similar "anonymous" hit as fulfilling this task.
 
 ### 27 (orig #67)
 **Q:** The plan for the release-train dual-OTA-group fix said the writer/helper/test files it built would live in an "unversioned" location outside any project repo — is that still an accurate description of where those files live today?
-**Type:** D · **Hop:** multi · **Corpus:** Anukriti
+**Type:** D · **Hop:** multi · **Corpus:** private-app
 **Ground truth key:** Commit `45bfdf5`'s body: "Writer, helpers and the 10-case regression suite live in the unversioned release-train-conductor skill dir; only the manifest and this design doc are in-repo." Direct check: `~/.claude/skills/release-train-conductor` is itself a git working tree (`git rev-parse --is-inside-work-tree` → true).
 **Grading note:** Correct answer: the skill directory is in fact its own git repository (separately version-controlled), even though the app-repo commit describes it as "unversioned" relative to *that* repo — a nuance worth surfacing rather than a flat yes/no. Wrong answer: takes the commit's "unversioned" framing at face value without checking, or claims the skill dir doesn't exist/isn't checked in anywhere.
 
 ---
 
-File: /private/tmp/claude-501/-Users-ramakrishnanannaswamy-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/final_set.md
+File: /tmp/scratch/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/final_set.md

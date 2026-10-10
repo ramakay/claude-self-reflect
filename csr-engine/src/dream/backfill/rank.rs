@@ -393,7 +393,7 @@ pub fn gate_family(
     // family of N keys gets N windows' worth — otherwise merging keys
     // would silently shrink the total queue budget the same corpus had
     // before the 2026-08-26 family ruling (measured on the live corpus:
-    // one 12-slot window over the merged anukriti family margin-shrank to
+    // one 12-slot window over the merged private-app family margin-shrank to
     // 2 queued where the split keys had queued 16). Single-member
     // families ([`Family::single`], the golden fixture) are byte-identical
     // to the pre-family behavior.

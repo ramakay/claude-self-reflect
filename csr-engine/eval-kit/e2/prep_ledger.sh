@@ -8,9 +8,9 @@ echo '{"git": {'
 first_repo=1
 for repo in \
   $HOME/projects/claude-self-reflect \
-  $HOME/projects/anukriti \
-  $HOME/projects/anukriti-command-center \
-  $HOME/projects/Anukriti-Campaigns
+  $HOME/projects/private-app \
+  $HOME/projects/private-app-command-center \
+  $HOME/projects/private-app-campaigns
 do
   [ -d "$repo/.git" ] || continue
   [ $first_repo -eq 0 ] && echo ','
@@ -39,7 +39,7 @@ echo '"tags": {'
 first_repo=1
 for repo in \
   $HOME/projects/claude-self-reflect \
-  $HOME/projects/anukriti
+  $HOME/projects/private-app
 do
   [ -d "$repo/.git" ] || continue
   [ $first_repo -eq 0 ] && echo ','
@@ -56,7 +56,7 @@ echo ','
 echo -n '"release_train": '
 python3 -c '
 import json, os
-path = os.path.expandvars("$HOME/projects/anukriti/anukriti-mvp-expo/release-train.yaml")
+path = os.path.expandvars("$HOME/projects/private-app/private-app-mvp-expo/release-train.yaml")
 try:
     import yaml
     d = yaml.safe_load(open(path))

@@ -28,7 +28,7 @@ exactly that scope.
 
 - **Deep set**: saga-t3-final-set.md — 27 questions (filter pass over 68
   git-grounded candidates; 14 multi-hop, 9 abandonment/supersession, corpus
-  split CSR 11 / Anukriti 16; drop log in saga-t3-drops.md). Roster frozen
+  split CSR 11 / private-app 16; drop log in saga-t3-drops.md). Roster frozen
   in the same commit as this document; no post-hoc exclusion.
   Generation was blind to the retrieval system: question miners were forbidden
   CSR MCP tools and the reflection DB; ground truth derives from git history,
@@ -100,8 +100,10 @@ One corpus snapshot, constructed once, used by all arms:
 4. **Mechanical roster freeze**: 27 of 529 pairs' receipt-gold conversations
    fall inside the corpus-freeze exclusion (benchmark-construction sessions);
    the frozen mechanical roster is the remaining **396 receipt-class pairs**
-   (eval-kit/t3/mech_pairs.frozen.csv, sha256 5e03eb25…). Citation-only pairs
+   (eval-kit/t3/mech_pairs.frozen.csv, sha256 998c4b13…). Citation-only pairs
    are excluded from Gate M as pre-specified (receipt-class primary).
+   2026-10-10: re-sealed after removing private repository names and commit subjects; row count, hashes and gold columns unchanged.
+   (Previous seal for the roster: 5e03eb25…; question seal in eval-kit/t3/SEAL.sha256 was 1b331d35….)
 5. **Snapshot identity**: sha256 1d2b9923c79b078d3e923fa4987ca0c712e0851068b4edef726dd317e174fa18
    (t3-frozen-20260727/csr.db); 119 conversations excluded; leak check clean;
    37 ledger verdicts and 48 plan chunks present.

@@ -690,7 +690,7 @@ v7.0.0 introduces AI-powered conversation narratives that transform raw conversa
 ### Documentation
 - Added docs/SECURITY.md with standalone vs shared deployment security model
 - Updated .env.example with batch automation configuration
-- All documentation sanitized (replaced /Users/ramakrishnanannaswamy with /Users/username)
+- All documentation sanitized (replaced the author's home directory with /Users/username)
 - UTF-8 encoding documented for all file operations
 
 ### Fixed

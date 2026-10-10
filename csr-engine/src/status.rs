@@ -2736,7 +2736,7 @@ mod tests {
             mem.join("reference_x.md"),
             r#"---
 name: reference-email-sending-domain-dns
-description: "Email sending domain email.anukriti.ai — DNS legs"
+description: "Email sending domain email.private-app.example — DNS legs"
 metadata:
   node_type: memory
   type: reference

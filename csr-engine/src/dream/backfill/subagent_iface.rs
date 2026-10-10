@@ -314,10 +314,10 @@ mod tests {
 
     #[test]
     fn attribute_transcript_path_parses_a_real_subagent_path() {
-        let path = "/Users/rama/.claude/projects/-Users-rama-projects-anukriti-website/\
+        let path = "/Users/dev/.claude/projects/-Users-dev-projects-private-app-website/\
                     41c4b58d-8480-4dec-ba05-05d119d66c66/subagents/agent-explore-1.jsonl";
         let a = attribute_transcript_path(path).expect("must parse");
-        assert_eq!(a.project_dir, "-Users-rama-projects-anukriti-website");
+        assert_eq!(a.project_dir, "-Users-dev-projects-private-app-website");
         assert_eq!(a.session_id, "41c4b58d-8480-4dec-ba05-05d119d66c66");
         assert_eq!(a.cluster_id, "41c4b58d-8480-4dec-ba05-05d119d66c66");
         assert_eq!(a.role, Role::Subagent);
@@ -329,7 +329,7 @@ mod tests {
         // IS <session>.jsonl directly under the project dir. Without the
         // .jsonl strip this would wrongly report a cluster id ending in
         // ".jsonl".
-        let path = "/Users/rama/.claude/projects/-Users-rama-projects-csr/\
+        let path = "/Users/dev/.claude/projects/-Users-dev-projects-csr/\
                     8f07c97c-2184-44eb-a315-5e89c394c7ac.jsonl";
         let a = attribute_transcript_path(path).expect("must parse");
         assert_eq!(a.session_id, "8f07c97c-2184-44eb-a315-5e89c394c7ac");

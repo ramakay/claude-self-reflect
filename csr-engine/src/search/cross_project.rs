@@ -50,7 +50,7 @@ pub(crate) fn same_project_family_at_root(
 ///
 /// A hyphenated namespace is an alias only when the shorter project directory
 /// exists under `~/projects` and the longer name does not. This keeps genuine
-/// sibling repositories such as `anukriti-meta-campaigns` separate.
+/// sibling repositories such as `private-app-meta-campaigns` separate.
 pub fn same_project_family(current: &str, candidate: &str) -> bool {
     if current == candidate {
         return true;
@@ -239,20 +239,20 @@ mod tests {
     #[test]
     fn real_hyphenated_project_is_not_swallowed_by_prefix_project() {
         let projects = tempfile::tempdir().unwrap();
-        std::fs::create_dir(projects.path().join("anukriti-meta-campaigns")).unwrap();
+        std::fs::create_dir(projects.path().join("private-app-meta-campaigns")).unwrap();
 
         assert!(!same_project_family_at_root_with(
-            "anukriti",
-            "anukriti-meta-campaigns",
+            "private-app",
+            "private-app-meta-campaigns",
             projects.path(),
             |path| path.is_dir()
         ));
 
-        std::fs::remove_dir(projects.path().join("anukriti-meta-campaigns")).unwrap();
-        std::fs::create_dir(projects.path().join("anukriti")).unwrap();
+        std::fs::remove_dir(projects.path().join("private-app-meta-campaigns")).unwrap();
+        std::fs::create_dir(projects.path().join("private-app")).unwrap();
         assert!(same_project_family_at_root_with(
-            "anukriti",
-            "anukriti-meta-campaigns",
+            "private-app",
+            "private-app-meta-campaigns",
             projects.path(),
             |path| path.is_dir()
         ));

@@ -18,9 +18,9 @@
  "A2": {"stratum": "UNRESOLVED", "memory": null, "cued": "conversion data driven - funnel/drop-off numbers"},
  "A3": {"stratum": "MEMORY", "memory": "there was frequent rate limiting by Meta", "cued": null},
  "A4": {"stratum": "UNRESOLVED", "memory": null, "cued": "owner questioned mismatched dashboard numbers"},
- "A5": {"stratum": "MEMORY", "memory": "for anukriti command center to measure how many users reach score state", "cued": null},
+ "A5": {"stratum": "MEMORY", "memory": "for private-app command center to measure how many users reach score state", "cued": null},
  "A6": {"stratum": "MEMORY", "memory": "what boosts/api retargets are running; later also youtube and other promotions for budget + current boost state", "cued": null},
- "A7": {"stratum": "MEMORY_AMBIGUOUS", "memory": "not sure which radio reel; remotion for app store promo video; japa and radio features would have been single scene", "cued": null},
+ "A7": {"stratum": "MEMORY_AMBIGUOUS", "memory": "not sure which radio reel; remotion for app store promo video; counter and radio features would have been single scene", "cued": null},
  "A8": {"stratum": "MEMORY", "memory": "UI actions sometimes are not in supabase", "cued": null}
 }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""AG scorer: ablation.jsonl (5 arms x N queries) vs an external gold file (Anukriti
-gold, per .plans/2026-08-01-anukriti-gold-prereg.md, or any file in the same shape).
+"""AG scorer: ablation.jsonl (5 arms x N queries) vs an external gold file (private-app
+gold, per .plans/2026-08-01-private-app-gold-prereg.md, or any file in the same shape).
 Adapted from eval-kit/h1/score.py — the only differences are (a) the gold file is a
 single external JSON path taken from a CLI arg (mirroring eval-kit/e2's per-query
 {origin, grades} data, folded into one file instead of e2's split
@@ -61,7 +61,7 @@ G = {}  # qid -> {"items": {conv: {"grade": n}}}  (same shape as e2/grades.json'
 ORIGIN = {}  # qid -> origin conv id or None
 
 if isinstance(gold_queries, dict):
-    # Anukriti-gold shape (Lane A builder, gold['queries'] keyed by qid) per
+    # private-app-gold shape (Lane A builder, gold['queries'] keyed by qid) per
     # meta.score_py_adapter_note: 'items' is grades.json's per-key-compatible field
     # name for 'grades', and 'origin' is mapping.json's M['mapped'][qid]['origin']
     # folded in directly (no separate mapping file to fall back on).

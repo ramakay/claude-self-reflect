@@ -29,6 +29,8 @@ ledgers, with sealed pre-registration. Results: `docs/plans/saga-e2-results.md`
 | `grade.py` | Grading: acts × ledger corroboration → grades 0-3; grade 3 requires a sealed, mapped origin |
 | `mapping.json` / `grades.json` / `pools.json` | Outputs: origin map (owner-audited), per-item grades (204 items), pools. Conversation IDs only — no transcript content |
 
+2026-10-10: re-sealed after removing private repository names and commit subjects; row count, commit hashes and gold columns unchanged. (The `gold.json` seal is a commit reference, not a content hash.)
+
 Rules that made it credible: extraction never sees rank lists; ledgers corroborate but
 never mint the top grade; UNRESOLVED strata excluded from origin metrics; owner audit
 of every disputed mapping.

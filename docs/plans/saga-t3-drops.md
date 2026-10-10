@@ -35,13 +35,13 @@ verification, multi-hop audit, mechanical dedupe) but lost out in the final bala
 - **#37** — budget cut: solid plan-grounded design-rationale question, but the two plans it draws on are already represented via kept #1/#7/#9.
 - **#38** — budget cut: good multi-commit-sequence synthesis (not mech-redundant — spans 4 commits), but release-CI theme is already represented via kept #28 (orig)/final #10.
 
-## Anukriti / candidates_anukriti.md (14 dropped, of 30)
+## private-app / candidates_private-app.md (14 dropped, of 30)
 
 - **#40** — budget cut: redundant with kept #49; #49 tests the actual outcome/invariant (a richer question) on the same OTA-group-id feature.
 - **#41** — budget cut: redundant with kept #67 (same skill-directory subject); #67's finding (it's secretly its own git repo) is the sharper, more surprising question. Also, #41 has no git artifact to check at all.
 - **#43** — mech-redundant: full answer (ticket-vs-receipt distinction, 696-vs-305 numbers) stated in single commit `20e2cec`'s own body.
 - **#44** — budget cut: third question on the same OpenAI-Ads-pixel plan; kept #55/#63 already test the harder "shipped or not / which repo" angles on this material.
-- **#45** — mech-redundant AND leakage-adjacent: the commit *subject line itself* ("Saadhana tab replaces Japa tab behind kill-switch") already states the full answer verbatim — trivially retrievable, and risks leaking the answer into any grep-based search.
+- **#45** — mech-redundant AND leakage-adjacent: the commit *subject line itself* ("Routine tab replaces Counter tab behind kill-switch") already states the full answer verbatim — trivially retrievable, and risks leaking the answer into any grep-based search.
 - **#48** — budget cut: fourth question on the OpenAI-Ads plan; redundant with kept #55/#63.
 - **#50** — budget cut: valid B-type but least distinctive among the B-bucket candidates; kept #47/#49 instead.
 - **#51** — REDUNDANT (duplicate evidence): ground truth key is explicitly the same dataset as kept #61 ("See #51/#61's evidence" in the source file). Kept #61 as the sharper, more surprising framing (cross-repo split) over #51's simpler "did it ship" framing.
@@ -66,4 +66,4 @@ No candidates were dropped for LEAKAGE (criterion 1) or vague KEY VERIFICATION (
 the only leakage issue found (orig #30, a directly-quoted task ID) was fixed by rewording rather
 than dropped; it is kept as final #11.
 
-File: /private/tmp/claude-501/-Users-ramakrishnanannaswamy-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/drops.md
+File: /tmp/scratch/t3-eval/drops.md

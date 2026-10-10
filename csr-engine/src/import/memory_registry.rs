@@ -520,7 +520,7 @@ mod tests {
     fn good_frontmatter() -> &'static str {
         r#"---
 name: reference-email-sending-domain-dns
-description: "Email sending domain email.anukriti.ai — DNS legs"
+description: "Email sending domain email.private-app.example — DNS legs"
 metadata:
   node_type: memory
   type: reference
@@ -547,7 +547,7 @@ Body text with a [[some-slug]] wikilink and more prose.
         assert_eq!(row.slug, "reference-email-sending-domain-dns");
         assert_eq!(
             row.description.as_deref(),
-            Some("Email sending domain email.anukriti.ai — DNS legs")
+            Some("Email sending domain email.private-app.example — DNS legs")
         );
         assert_eq!(row.mem_type.as_deref(), Some("reference"));
         assert_eq!(
