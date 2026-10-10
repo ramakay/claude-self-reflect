@@ -3,14 +3,16 @@
 //! Flow: SQLite retrieves context → Haiku formats it into a 2-3 sentence story → stored as reflection.
 //! Graceful degradation: returns None if claude CLI unavailable or times out.
 
-use std::process::Stdio;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use regex::Regex;
 use tokio::sync::RwLock;
 
 use crate::embeddings::EmbeddingEngine;
 use crate::engine::Engine;
+use crate::import;
 use crate::search::cross_project::resolve_project_from_cwd;
 use crate::search::SearchEngine;
 use crate::storage::Storage;
@@ -32,6 +34,36 @@ pub struct RelatedSession {
 const HAIKU_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSCRIPT_SAMPLE_MSGS: usize = 20;
 const TRANSCRIPT_CHAR_CAP: usize = 30_000;
+/// Numbers a session's story: `story_rev_1` is its first.
+const STORY_REV_TAG: &str = "story_rev_";
+/// The last messages a Haiku story reads beside Claude Code's summary.
+const TAIL_MSGS: usize = 20;
+/// How much of Claude Code's compaction summary a story keeps: what was asked, then where it
+/// stood.
+const ASKED_STORY_CHARS: usize = 420;
+const STOOD_STORY_CHARS: usize = 420;
+
+/// How a story comes to be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryMode {
+    /// A session's first story, by Haiku: skipped when it has one.
+    First,
+    /// After a compaction, from the summary Claude Code wrote of the session. Opted in, Haiku
+    /// writes it from that summary and the last messages; otherwise CSR extracts it, with no
+    /// model call. Either way every compaction refreshes it.
+    FromCompaction,
+    /// At the session's end, opted in: Haiku rewrites the story to take in what came after the
+    /// last one, when the person asked something since.
+    Rewrite,
+}
+
+/// Opt-in (`CSR_STORY_REWRITES=1`): Haiku writes the session's story, one metered call each time:
+/// after every compaction, and at the session's end when the person asked something since.
+pub fn story_rewrites_enabled() -> bool {
+    std::env::var("CSR_STORY_REWRITES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// Call `claude -p` (model chain: env override → haiku alias → CLI default)
 /// to generate a curated session story.
@@ -92,84 +124,157 @@ fn build_prompt(ctx: &StoryContext) -> String {
     prompt
 }
 
+/// The story Haiku writes from Claude Code's compaction summary, which carries the session's
+/// whole arc, and its last messages, which the summary never saw (Claude Code keeps them verbatim
+/// after it). Of five ways to tell a long session, blind judges ranked this first on four of five
+/// sessions (2026-10-10): the summary alone reported finished work as still open, and a sample of
+/// the first and last messages lost the middle.
+fn summary_story_prompt(summary: &str, tail: &str) -> String {
+    format!(
+        "You are summarizing a coding session for future context restoration after memory compaction.\n\n\
+         CLAUDE CODE'S SUMMARY OF THE SESSION (written at its latest compaction, from the whole \
+         conversation except its last messages):\n{summary}\n\n\
+         THE LAST MESSAGES (the summary did not see these; they show where the work actually \
+         stood):\n{tail}\n\n\
+         Write 3-4 sentences: what the session was about across its whole life and its main \
+         threads, the key files/tools used, and where the work stood at the end \
+         (done/in-progress/blocked). Where the last messages and the summary differ, trust the last \
+         messages. Be specific about technical details. Keep it under 800 characters. No preamble, \
+         no markdown headers."
+    )
+}
+
 /// Invoke `claude -p` (model chain: env override → haiku alias → CLI default)
 /// with prompt piped via stdin (avoids OS arg length limits).
 async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNarrative> {
-    use tokio::io::AsyncWriteExt;
+    call_claude_headless_with("claude", prompt, crate::narrative::minimal_mcp_config()).await
+}
 
-    // The transcript is embedded in `prompt`, so the analyst needs NO tools. Without
-    // an explicit empty MCP config this subprocess inherits the user's full MCP set
-    // and blows the context window on tool schemas alone (HTTP 400 prompt_too_long),
-    // failing every call before inference. See narrative::minimal_mcp_config.
-    let mcp_config_path = crate::narrative::minimal_mcp_config()
-        .inspect_err(|e| {
-            tracing::warn!(
-                "minimal MCP config unavailable; this call inherits the user's MCP set \
-                 and may fail with prompt_too_long: {e}"
-            )
-        })
-        .ok();
+/// [`call_claude_headless`] with the program and the empty MCP config
+/// supplied. The transcript is embedded in `prompt`, so the analyst needs NO
+/// tools. Without an explicit empty MCP config the child inherits the user's
+/// full MCP set (blowing the context window on tool schemas alone, and handing
+/// a text summariser live tools). So when that config cannot be created the
+/// narrator does not run at all: callers fall back to CSR's own extract.
+async fn call_claude_headless_with(
+    program: &str,
+    prompt: &str,
+    mcp_config: anyhow::Result<std::path::PathBuf>,
+) -> Option<crate::narrative::ParsedNarrative> {
+    let mcp_config_path = match mcp_config {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("empty MCP config unavailable; narrator not run: {e}");
+            return None;
+        }
+    };
 
     for candidate in crate::narrative::model_candidates() {
-        let attempt = tokio::time::timeout(HAIKU_TIMEOUT, async {
-            let mut cmd = tokio::process::Command::new("claude");
-            // Nested sessions inherit the user's hook config — without this guard
-            // every narrative call fires all 6 CSR hooks and its Stop hook stores
-            // the analyst transcript as a session_episode (meta-episode pollution).
-            cmd.env("CSR_DISABLE_RECURSIVE_HOOKS", "1");
-            if let Some(model) = &candidate {
-                cmd.args(["--model", model]);
-            }
-            // `--tools ""`: a print-mode child otherwise inherits every
-            // built-in tool (Bash, Edit, Write, Agent) under the user's
-            // permission mode; this call is a pure text summary.
-            cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
-            // Must come LAST: --mcp-config is variadic in the claude CLI and would
-            // consume any positional arg that followed it.
-            if let Some(path) = &mcp_config_path {
-                cmd.args(["--strict-mcp-config", "--mcp-config"]);
-                cmd.arg(path);
-            }
-            let mut child = match cmd
-                .stdout(Stdio::piped())
-                // Piped intentionally — required for model-not-found detection on the failure path; do not revert to null().
-                .stderr(Stdio::piped())
-                .stdin(Stdio::piped())
-                .spawn()
-            {
-                Ok(c) => c,
-                Err(_) => return None, // claude CLI not found — no point walking the chain
+        let mut cmd = tokio::process::Command::new(program);
+        // Nested sessions inherit the user's hook config — without this guard
+        // every narrative call fires all 6 CSR hooks and its Stop hook stores
+        // the analyst transcript as a session_episode (meta-episode pollution).
+        cmd.env("CSR_DISABLE_RECURSIVE_HOOKS", "1");
+        if let Some(model) = &candidate {
+            cmd.args(["--model", model]);
+        }
+        // `--tools ""`: a print-mode child otherwise inherits every
+        // built-in tool (Bash, Edit, Write, Agent) under the user's
+        // permission mode; this call is a pure text summary.
+        cmd.args(["-p", "-", "--output-format", "json", "--tools", ""]);
+        // No user settings (plugins, SessionStart hooks) and no transcript
+        // left behind for the watcher to re-import.
+        cmd.args(crate::narrative::isolation_args());
+        // Must come LAST: --mcp-config is variadic in the claude CLI and would
+        // consume any positional arg that followed it.
+        cmd.args(["--strict-mcp-config", "--mcp-config"]);
+        cmd.arg(&mcp_config_path);
+
+        // The deadline covers the whole exchange and, when it passes, the
+        // child is killed and reaped before this returns: the story lock is
+        // never released while a narrator lives.
+        let output =
+            match crate::narrative::run_headless(cmd, prompt.as_bytes(), HAIKU_TIMEOUT).await {
+                crate::narrative::HeadlessRun::Output(output) => output,
+                // timeout or spawn failure (claude CLI not found): no point walking the chain
+                _ => return None,
             };
-
-            // Write prompt to stdin then close it
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(prompt.as_bytes()).await;
-                drop(stdin);
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        match crate::narrative::classify_attempt(output.status.success(), &stdout, &stderr) {
+            crate::narrative::AttemptOutcome::Parsed(mut parsed) => {
+                // Cap at 1000 chars — stories should be concise
+                parsed.text = parsed.text.chars().take(1000).collect();
+                return Some(parsed);
             }
-
-            child.wait_with_output().await.ok()
-        })
-        .await;
-
-        match attempt {
-            Ok(Some(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                match crate::narrative::classify_attempt(output.status.success(), &stdout, &stderr)
-                {
-                    crate::narrative::AttemptOutcome::Parsed(mut parsed) => {
-                        // Cap at 1000 chars — stories should be concise
-                        parsed.text = parsed.text.chars().take(1000).collect();
-                        return Some(parsed);
-                    }
-                    crate::narrative::AttemptOutcome::ModelNotFound => continue,
-                    crate::narrative::AttemptOutcome::Failed(_) => return None,
-                }
-            }
-            _ => return None, // timeout or spawn failure
+            crate::narrative::AttemptOutcome::ModelNotFound => continue,
+            crate::narrative::AttemptOutcome::Failed(_) => return None,
         }
     }
     None
+}
+
+/// One transcript line: `[role]: first 500 characters`.
+fn render_message(msg: &serde_json::Value) -> String {
+    let data = crate::extraction::get_message_data(msg);
+    let role = data
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("system");
+    let content = crate::extraction::content_to_lower(&data);
+    // Take first 500 chars per message to keep prompt manageable
+    let preview: String = content.chars().take(500).collect();
+    format!("[{}]: {}\n", role, preview)
+}
+
+/// `messages` in order, no gap, as many whole lines as fit in `char_cap`
+/// (always at least one), and how many that is. What the narrator was shown is
+/// exactly this prefix, so only it may be recorded as covered.
+fn tail_transcript(messages: &[serde_json::Value], char_cap: usize) -> (String, usize) {
+    let mut result = String::new();
+    let mut shown = 0;
+    for msg in messages {
+        let line = render_message(msg);
+        if shown > 0 && result.len() + line.len() > char_cap {
+            break;
+        }
+        result.push_str(&line);
+        shown += 1;
+    }
+    (result, shown)
+}
+
+/// What a story written beside Claude Code's summary (the message at `at`)
+/// reads, and how many of the session's leading messages that covers.
+///
+/// The summary was written from everything except the last messages Claude
+/// Code kept verbatim: the `TAIL_MSGS` just before it. So the narrator reads
+/// those, which can differ from the summary ("blocked" there, "completed"
+/// here) - after a compaction, and again at the session's end together with
+/// everything typed after the summary, so a later rewrite cannot restore the
+/// summary's stale account. Coverage reaches only as far as the narrator
+/// read: a request it did not see is still owed a story.
+fn story_input(mode: StoryMode, messages: &[serde_json::Value], at: usize) -> (String, usize) {
+    let at = at.min(messages.len().saturating_sub(1));
+    let from = at.saturating_sub(TAIL_MSGS);
+    let preserved = &messages[from..at];
+    let mut segment: Vec<serde_json::Value> = preserved.to_vec();
+    if mode == StoryMode::Rewrite {
+        segment.extend(messages[at + 1..].iter().cloned());
+    }
+    let (text, shown) = tail_transcript(&segment, TRANSCRIPT_CHAR_CAP);
+    let covered = if shown <= preserved.len() {
+        // The summary itself is the only thing read beyond the preserved
+        // messages; a cut inside them leaves the summary unread too.
+        if shown == preserved.len() {
+            at + 1
+        } else {
+            from + shown
+        }
+    } else {
+        at + 1 + (shown - preserved.len())
+    };
+    (text, covered)
 }
 
 /// Sample a transcript: first N + last N messages, capped at char_cap.
@@ -187,15 +292,7 @@ pub fn sample_transcript(messages: &[serde_json::Value], n: usize, char_cap: usi
 
     let mut result = String::new();
     for msg in &selected {
-        let data = crate::extraction::get_message_data(msg);
-        let role = data
-            .get("role")
-            .and_then(|v| v.as_str())
-            .unwrap_or("system");
-        let content = crate::extraction::content_to_lower(&data);
-        // Take first 500 chars per message to keep prompt manageable
-        let preview: String = content.chars().take(500).collect();
-        result.push_str(&format!("[{}]: {}\n", role, preview));
+        result.push_str(&render_message(msg));
 
         if result.len() >= char_cap {
             result.truncate(result.floor_char_boundary(char_cap));
@@ -204,6 +301,224 @@ pub fn sample_transcript(messages: &[serde_json::Value], n: usize, char_cap: usi
         }
     }
     result
+}
+
+/// What the person typed in these messages, oldest first: their own words, never tool
+/// results, compaction summaries, harness rows or CSR's emissions. The last `n`, each cut to
+/// `chars`.
+pub fn typed_prompts(messages: &[serde_json::Value], n: usize, chars: usize) -> Vec<String> {
+    let flag =
+        |m: &serde_json::Value, key: &str| m.get(key).and_then(|v| v.as_bool()) == Some(true);
+    let mut asked: Vec<String> = messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.get("type").and_then(|v| v.as_str()),
+                Some("user" | "human")
+            )
+        })
+        .filter(|m| !flag(m, "isCompactSummary") && !flag(m, "isMeta"))
+        .filter_map(|m| {
+            let data = crate::extraction::get_message_data(m);
+            let typed = match data.get("content")? {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Array(blocks) => {
+                    fn kind(block: &serde_json::Value) -> Option<&str> {
+                        block.get("type").and_then(|v| v.as_str())
+                    }
+                    if blocks.iter().any(|b| kind(b) == Some("tool_result")) {
+                        return None;
+                    }
+                    blocks
+                        .iter()
+                        .filter(|b| kind(b) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+                _ => return None,
+            };
+            let words = crate::extraction::provenance::extractable(&typed)?;
+            Some(
+                words
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(chars)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string(),
+            )
+        })
+        .collect();
+    let older = asked.len().saturating_sub(n);
+    asked.drain(..older);
+    asked
+}
+
+/// The story a session already has.
+#[derive(Debug, Default)]
+pub struct PriorStory {
+    /// Every stored copy, so a rewrite replaces them all.
+    pub ids: Vec<String>,
+    /// How many times the story has been written.
+    pub rev: usize,
+    /// The session's message count when it was written; None for a story from before the
+    /// count was kept.
+    pub covered: Option<usize>,
+}
+
+fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
+    let rows = storage
+        .get_reflections_by_two_tags("session_story", &format!("conv_{conv_id}"), 10)
+        .ok()?;
+    rows.first()?;
+    let rev = rows
+        .iter()
+        .flat_map(|(_, _, tags, _)| tags.iter())
+        .filter_map(|tag| tag.strip_prefix(STORY_REV_TAG)?.parse::<usize>().ok())
+        .max()
+        .unwrap_or(1);
+    Some(PriorStory {
+        ids: rows.iter().map(|(id, _, _, _)| id.clone()).collect(),
+        rev,
+        covered: storage.story_messages_covered(conv_id).ok().flatten(),
+    })
+}
+
+/// Whether to write the session's story now. `messages` is the session's message count;
+/// `summary_at` is where Claude Code's newest compaction summary sits among them; `asked_since`
+/// counts what the person typed after the last story.
+///
+/// - First: only when the session has no story.
+/// - FromCompaction: whenever there is a summary the story has not taken in yet. Nothing caps
+///   it: one story per compaction.
+/// - Rewrite: when the person asked something since the last story. Recent work decides, not a
+///   count or a share of the session, so a long session's ending reaches its story too.
+pub fn story_due(
+    mode: StoryMode,
+    prior: Option<&PriorStory>,
+    messages: usize,
+    summary_at: Option<usize>,
+    asked_since: usize,
+) -> Result<(), String> {
+    match (mode, prior) {
+        (StoryMode::FromCompaction, _) => match (summary_at, prior.and_then(|p| p.covered)) {
+            (None, _) => Err("skip:no_compaction_summary".into()),
+            (Some(at), Some(covered)) if covered >= at => Err(format!("skip:summary_told({at})")),
+            _ => Ok(()),
+        },
+        (_, None) => Ok(()),
+        (StoryMode::First, Some(_)) => Err("skip:story_exists".into()),
+        (StoryMode::Rewrite, Some(prior)) => match prior.covered {
+            Some(covered) if covered >= messages || asked_since == 0 => {
+                Err(format!("skip:nothing_asked_since({covered}/{messages})"))
+            }
+            _ => Ok(()),
+        },
+    }
+}
+
+/// What the person typed after the story covering the first `covered` messages.
+fn asked_since(messages: &[serde_json::Value], prior: Option<&PriorStory>) -> usize {
+    let covered = prior
+        .and_then(|p| p.covered)
+        .unwrap_or(0)
+        .min(messages.len());
+    typed_prompts(&messages[covered..], usize::MAX, 1).len()
+}
+
+/// Claude Code's own summary at the session's newest compaction: where it sits among the
+/// messages, and its text.
+pub fn newest_compaction_summary(messages: &[serde_json::Value]) -> Option<(usize, String)> {
+    let at = messages
+        .iter()
+        .rposition(|m| m.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true))?;
+    let data = crate::extraction::get_message_data(&messages[at]);
+    let text = crate::hooks::stop::extract_text_from_content(data.get("content")?);
+    (!text.trim().is_empty()).then_some((at, text))
+}
+
+/// A story from Claude Code's compaction summary, with no model call: what was asked, then
+/// where the work stood. The summary follows Claude Code's numbered template ("1. Primary
+/// Request and Intent:" … "8. Current Work:"); one that does not is read from its start. The
+/// bool says whether the template was found.
+pub fn story_from_compaction_summary(summary: &str) -> Option<(String, bool)> {
+    static HEADING: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*\d+\.\s+([A-Z][A-Za-z ]+?):?\s*$").unwrap());
+    let body = summary
+        .split_once("Summary:")
+        .map_or(summary, |(_, rest)| rest);
+    let headings: Vec<_> = HEADING.captures_iter(body).collect();
+    let section = |name: &str| {
+        let at = headings.iter().position(|c| c[1].starts_with(name))?;
+        let start = headings[at].get(0)?.end();
+        let end = headings
+            .get(at + 1)
+            .and_then(|c| c.get(0))
+            .map_or(body.len(), |m| m.start());
+        Some(plain(&body[start..end]))
+    };
+    let (story, templated) = match (section("Primary Request"), section("Current Work")) {
+        (Some(asked), Some(stood)) => {
+            let asked = sentences(&asked, ASKED_STORY_CHARS);
+            // Claude wrote the summary: its "I" is Claude to whoever reads the story later
+            static CLAUDE_SAID_I: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"(^|[.!?]\s+)I ").unwrap());
+            let stood = CLAUDE_SAID_I
+                .replace_all(&sentences(&stood, STOOD_STORY_CHARS), "${1}Claude ")
+                .into_owned();
+            (
+                [asked, stood]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" Where it stood: "),
+                true,
+            )
+        }
+        _ => (
+            sentences(&plain(body), ASKED_STORY_CHARS + STOOD_STORY_CHARS),
+            false,
+        ),
+    };
+    let story = crate::extraction::provenance::extractable(&story)?;
+    (!crate::extraction::provenance::is_csr_emission(&story)).then_some((story, templated))
+}
+
+/// Prose from a markdown section: no emphasis, code ticks, bullets or headings, one line.
+fn plain(markdown: &str) -> String {
+    static MARKS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*(?:[-*+]|\d+\.|#+)\s+|\*\*|__|`").unwrap());
+    MARKS
+        .replace_all(markdown, "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whole sentences from the start of `text`, as many as fit in `cap` characters; the first
+/// alone, cut, when it is longer.
+fn sentences(text: &str, cap: usize) -> String {
+    static END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[.!?](?:\s|$)").unwrap());
+    let mut kept = 0;
+    for end in END.find_iter(text) {
+        let stop = end.start() + 1;
+        if text[..stop].chars().count() > cap {
+            break;
+        }
+        kept = stop;
+    }
+    if kept == 0 {
+        let cut: String = text.chars().take(cap).collect();
+        return if cut.len() < text.len() {
+            format!("{}…", cut.trim_end())
+        } else {
+            cut
+        };
+    }
+    text[..kept].to_string()
 }
 
 /// Build story context by retrieving data from the engine's DB + search index.
@@ -299,8 +614,9 @@ async fn find_related_sessions(
 /// Maximum time to wait for the story lock before giving up.
 const STORY_LOCK_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// CLI entrypoint for `csr-engine generate-story`. Called as a detached process from SessionEnd.
-/// Reads transcript, builds context, calls Haiku, stores reflection, exits.
+/// CLI entrypoint for `csr-engine generate-story`, run as a detached process: from SessionEnd
+/// (a first story, or the opt-in rewrite) and from SessionStart after a compaction (the story
+/// from Claude Code's summary). Reads the transcript, decides whether a story is due, writes it.
 ///
 /// Uses an advisory file lock to serialize concurrent Haiku calls — when multiple sessions end
 /// simultaneously, processes queue up instead of competing for the `claude` CLI.
@@ -308,6 +624,7 @@ pub async fn generate_story_cli(
     engine: &Engine,
     transcript: &std::path::Path,
     cwd: &str,
+    mode: StoryMode,
 ) -> anyhow::Result<()> {
     let conv_id = transcript
         .file_stem()
@@ -321,7 +638,7 @@ pub async fn generate_story_cli(
         return Ok(());
     }
 
-    let messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
+    let mut messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
     if messages.len() < 5 {
         log_story_event(
             &project,
@@ -330,14 +647,29 @@ pub async fn generate_story_cli(
         );
         return Ok(());
     }
-
-    // Skip if this conversation already has a story (idempotent — handles retries and races)
-    if engine
-        .storage()
-        .is_conversation_enriched(&conv_id, "session_story")
-        .unwrap_or(false)
-    {
-        log_story_event(&project, &conv_id, "skip:story_exists");
+    let mut prior = prior_story(engine.storage(), &conv_id);
+    let mut due = story_due(
+        mode,
+        prior.as_ref(),
+        messages.len(),
+        newest_compaction_summary(&messages).map(|(at, _)| at),
+        asked_since(&messages, prior.as_ref()),
+    );
+    if mode == StoryMode::FromCompaction && due.is_err() {
+        // SessionStart can run a moment before the summary reaches the transcript: read it again once
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
+        prior = prior_story(engine.storage(), &conv_id);
+        due = story_due(
+            mode,
+            prior.as_ref(),
+            messages.len(),
+            newest_compaction_summary(&messages).map(|(at, _)| at),
+            asked_since(&messages, prior.as_ref()),
+        );
+    }
+    if let Err(skip) = due {
+        log_story_event(&project, &conv_id, &skip);
         return Ok(());
     }
 
@@ -360,8 +692,83 @@ pub async fn generate_story_cli(
     }
     log_story_event(&project, &conv_id, "lock_acquired");
 
-    // Lock held — generate story (Haiku call happens here)
-    let result = generate_and_store(engine, transcript, cwd, &conv_id, &project, &messages).await;
+    // Again under the lock: retries and races
+    let prior = prior_story(engine.storage(), &conv_id);
+    let summary = newest_compaction_summary(&messages);
+    if let Err(skip) = story_due(
+        mode,
+        prior.as_ref(),
+        messages.len(),
+        summary.as_ref().map(|(at, _)| *at),
+        asked_since(&messages, prior.as_ref()),
+    ) {
+        log_story_event(&project, &conv_id, &skip);
+        return Ok(());
+    }
+
+    let result = match (mode, summary) {
+        (StoryMode::First, _) | (StoryMode::Rewrite, None) => {
+            // Lock held — generate story (Haiku call happens here)
+            generate_and_store(engine, cwd, &conv_id, &project, &messages, prior.as_ref()).await
+        }
+        (StoryMode::FromCompaction, None) => Ok(()), // story_due refused it already
+        (_, Some((at, text))) => {
+            // Beside the summary, Haiku reads what it never saw: the messages just before it after
+            // a compaction, everything after it at the session's end
+            let by_haiku = mode == StoryMode::Rewrite || story_rewrites_enabled();
+            let (tail, covered) = story_input(mode, &messages, at);
+            let mut told = None;
+            if by_haiku {
+                told = haiku_story(
+                    engine,
+                    &summary_story_prompt(&text, &tail),
+                    &project,
+                    &conv_id,
+                )
+                .await
+                .map(|story| (story, "story_by_haiku"));
+            }
+            if told.is_none() && mode == StoryMode::FromCompaction {
+                // Not opted in, or Haiku failed: CSR's own extract, no model call
+                told = story_from_compaction_summary(&text).map(|(story, templated)| {
+                    if !templated {
+                        log_story_event(&project, &conv_id, "aux_schema_miss:compaction_summary");
+                    }
+                    (story, "story_extracted")
+                });
+            }
+            match told {
+                Some((story, how)) => {
+                    // CSR's own extract read only the summary; Haiku read the
+                    // messages beside it too.
+                    let covered = if how == "story_by_haiku" {
+                        covered
+                    } else {
+                        at + 1
+                    };
+                    let mut tags = vec![how.to_string()];
+                    if mode == StoryMode::FromCompaction {
+                        tags.push("story_from_compaction".to_string());
+                    }
+                    store_story(
+                        engine,
+                        cwd,
+                        &conv_id,
+                        &project,
+                        &story,
+                        prior.as_ref(),
+                        covered,
+                        tags,
+                    )
+                    .await
+                }
+                None => {
+                    log_story_event(&project, &conv_id, "skip:summary_unusable");
+                    Ok(())
+                }
+            }
+        }
+    };
 
     // Release lock (drop closes the file, releasing the advisory lock)
     drop(lock_file);
@@ -369,78 +776,125 @@ pub async fn generate_story_cli(
     result
 }
 
+/// One metered Haiku call for a story: its text, or None when narratives are off or the call
+/// failed. A failed call is metered too.
+async fn haiku_story(
+    engine: &Engine,
+    prompt: &str,
+    project: &str,
+    conv_id: &str,
+) -> Option<String> {
+    if crate::narrative::narratives_disabled() {
+        log_story_event(project, conv_id, "skip:narratives_disabled");
+        return None;
+    }
+    let parsed = call_claude_headless(prompt).await;
+    let row = match &parsed {
+        Some(parsed) => crate::storage::NarrativeUsageRow {
+            call_site: "story".into(),
+            model: parsed.model.clone(),
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            cache_read_tokens: parsed.cache_read_tokens,
+            cache_creation_tokens: parsed.cache_creation_tokens,
+            duration_ms: 0, // HAIKU_TIMEOUT bounds it; wall-clock not tracked on this path
+            success: true,
+        },
+        None => crate::storage::NarrativeUsageRow {
+            call_site: "story".into(),
+            model: "unknown".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            duration_ms: 0,
+            success: false,
+        },
+    };
+    let _ = engine.storage().record_narrative_usage(&row);
+    if parsed.is_none() {
+        log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
+    }
+    parsed.map(|parsed| parsed.text)
+}
+
 /// Generate story and store it. Separated so the lock scope is clear.
 async fn generate_and_store(
     engine: &Engine,
-    _transcript: &std::path::Path,
     cwd: &str,
     conv_id: &str,
     project: &str,
     messages: &[serde_json::Value],
+    prior: Option<&PriorStory>,
 ) -> anyhow::Result<()> {
     let ctx = build_story_context(engine, cwd, messages).await;
-
-    let story = match generate_session_story(&ctx).await {
-        Some((text, parsed)) => {
-            let _ = engine
-                .storage()
-                .record_narrative_usage(&crate::storage::NarrativeUsageRow {
-                    call_site: "story".into(),
-                    model: parsed.model.clone(),
-                    input_tokens: parsed.input_tokens,
-                    output_tokens: parsed.output_tokens,
-                    cache_read_tokens: parsed.cache_read_tokens,
-                    cache_creation_tokens: parsed.cache_creation_tokens,
-                    duration_ms: 0, // HAIKU_TIMEOUT bounds it; wall-clock not tracked on this path
-                    success: true,
-                });
-            text
-        }
-        None => {
-            if crate::narrative::narratives_disabled() {
-                log_story_event(project, conv_id, "skip:narratives_disabled");
-            } else {
-                let _ =
-                    engine
-                        .storage()
-                        .record_narrative_usage(&crate::storage::NarrativeUsageRow {
-                            call_site: "story".into(),
-                            model: "unknown".into(),
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            cache_read_tokens: 0,
-                            cache_creation_tokens: 0,
-                            duration_ms: 0,
-                            success: false,
-                        });
-                log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
-            }
-            return Ok(());
-        }
+    let Some(story) = haiku_story(engine, &build_prompt(&ctx), project, conv_id).await else {
+        return Ok(());
     };
+    store_story(
+        engine,
+        cwd,
+        conv_id,
+        project,
+        &story,
+        prior,
+        messages.len(),
+        Vec::new(),
+    )
+    .await
+}
 
+/// Store a session's story in place of the one it had, and how many of its messages it covers.
+#[allow(clippy::too_many_arguments)]
+async fn store_story(
+    engine: &Engine,
+    cwd: &str,
+    conv_id: &str,
+    project: &str,
+    story: &str,
+    prior: Option<&PriorStory>,
+    covered: usize,
+    extra_tags: Vec<String>,
+) -> anyhow::Result<()> {
     let reflection_id = format!("story_{}", conv_id);
-    let tags = vec![
+    let rev = prior.map_or(1, |p| p.rev + 1);
+    let project_name = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());
+    let mut tags = vec![
         "session_story".to_string(),
-        format!("project_{}", ctx.project_name),
+        format!("project_{project_name}"),
         format!("conv_{}", conv_id),
+        format!("{STORY_REV_TAG}{rev}"),
     ];
+    tags.extend(extra_tags);
 
-    crate::mcp::tools::store_reflection(
+    crate::mcp::tools::store_reflection_internal(
         engine.storage(),
         engine.embeddings(),
         engine.search(),
-        &story,
+        story,
         &tags,
     )
     .await?;
 
-    // Mark as completed so retries and races skip this conversation
+    // The new story replaces the old: one story per session, the latest
+    if let Some(prior) = prior {
+        let mut idx = engine.search().write().await;
+        for old in &prior.ids {
+            let _ = engine.storage().delete_reflection(old);
+            idx.remove_reflection(old);
+        }
+    }
+
+    // Record how much of the session it covers: what the next story is measured against
     let _ = engine
         .storage()
-        .mark_enrichment_completed(conv_id, "session_story", &reflection_id);
+        .mark_story_written(conv_id, &reflection_id, covered);
 
-    log_story_event(project, conv_id, &format!("stored:{}chars", story.len()));
+    log_story_event(
+        project,
+        conv_id,
+        &format!("stored:rev{rev}:{}chars", story.len()),
+    );
     eprintln!("CSR: stored session story ({} chars)", story.len());
     Ok(())
 }
@@ -468,8 +922,8 @@ fn acquire_lock_with_timeout(file: &std::fs::File, timeout: Duration) -> bool {
 
 /// Spawn a detached `csr-engine generate-story` process. Returns immediately.
 /// The child process outlives the caller — safe for SessionEnd.
-pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
-    if crate::narrative::narratives_disabled() {
+pub fn spawn_detached_story_generation(transcript: &str, cwd: &str, mode: StoryMode) {
+    if mode != StoryMode::FromCompaction && crate::narrative::narratives_disabled() {
         return;
     }
     let project = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());
@@ -488,15 +942,25 @@ pub fn spawn_detached_story_generation(transcript: &str, cwd: &str) {
         }
     };
 
-    match std::process::Command::new(exe)
-        .args(["generate-story", "--transcript", transcript, "--cwd", cwd])
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["generate-story", "--transcript", transcript, "--cwd", cwd]);
+    match mode {
+        StoryMode::First => {}
+        StoryMode::FromCompaction => {
+            cmd.arg("--from-compaction");
+        }
+        StoryMode::Rewrite => {
+            cmd.arg("--rewrite");
+        }
+    }
+    match cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit()) // keep stderr for debug logs
         .spawn()
     {
         Ok(_) => {
-            log_story_event(&project, &conv_id, "spawned");
+            log_story_event(&project, &conv_id, &format!("spawned:{mode:?}"));
             eprintln!("CSR: spawned background story generation");
         }
         Err(e) => {
@@ -524,9 +988,36 @@ pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Res
             None => continue, // phantom reference
         };
 
+        // Derived from `import_state.file_path` via the same attribution
+        // function the importer uses, not from `chunks.project_name`: a
+        // sidechain transcript's chunk row can be permanently stuck on the
+        // daemon-side rescope target ("subagents") once its source file is
+        // gone, because `rescope_sidechain_conversation` only runs when the
+        // file is (re)discovered. Falls back to the chunk row when no
+        // recorded import path resolves (e.g. a synthetic/test conversation)
+        // OR when the recorded path resolves to "unknown" (a path outside
+        // `projects_dir`) — see `project_for_conversation_or_attribution`'s
+        // doc for why a bare `.map(...).or_else(...)` was not enough.
         let project = engine
             .storage()
-            .get_project_for_conversation(conv_id)?
+            .import_paths_for_conversations(std::slice::from_ref(conv_id), 1)?
+            .get(conv_id)
+            .and_then(|paths| paths.first())
+            .map(|path| {
+                import::project_for_conversation_or_attribution(
+                    engine.storage(),
+                    engine.projects_dir(),
+                    Path::new(path),
+                    conv_id,
+                )
+            })
+            .or_else(|| {
+                engine
+                    .storage()
+                    .get_project_for_conversation(conv_id)
+                    .ok()
+                    .flatten()
+            })
             .unwrap_or_else(|| "unknown".to_string());
 
         let story = if enrichment_type == "extracted_v3" {
@@ -547,7 +1038,7 @@ pub async fn backfill_stories_cli(engine: &Engine, dry_run: bool) -> anyhow::Res
                     format!("project_{}", project),
                     format!("conv_{}", conv_id),
                 ];
-                crate::mcp::tools::store_reflection(
+                crate::mcp::tools::store_reflection_internal(
                     engine.storage(),
                     engine.embeddings(),
                     engine.search(),
@@ -639,6 +1130,232 @@ mod tests {
         assert!(!prompt.contains("RELATED PAST SESSIONS"));
     }
 
+    fn prior(rev: usize, covered: Option<usize>) -> PriorStory {
+        PriorStory {
+            rev,
+            covered,
+            ..PriorStory::default()
+        }
+    }
+
+    #[test]
+    fn a_first_story_is_written_once() {
+        assert_eq!(story_due(StoryMode::First, None, 6, None, 0), Ok(()));
+        assert_eq!(
+            story_due(StoryMode::First, Some(&prior(1, None)), 4736, None, 3),
+            Err("skip:story_exists".into())
+        );
+    }
+
+    #[test]
+    fn every_compaction_retells_the_story_and_nothing_caps_it() {
+        let mode = StoryMode::FromCompaction;
+        assert_eq!(
+            story_due(mode, None, 900, None, 0),
+            Err("skip:no_compaction_summary".into())
+        );
+        assert_eq!(story_due(mode, None, 900, Some(880), 0), Ok(()));
+        // a story from before the count was kept has not taken any summary in
+        assert_eq!(
+            story_due(mode, Some(&prior(1, None)), 900, Some(880), 0),
+            Ok(())
+        );
+        // the twelfth compaction is told like the second
+        assert_eq!(
+            story_due(mode, Some(&prior(11, Some(4200))), 4736, Some(4700), 0),
+            Ok(())
+        );
+        // the same summary is never told twice (a resumed session, a retry)
+        assert_eq!(
+            story_due(mode, Some(&prior(12, Some(4736))), 4736, Some(4700), 0),
+            Err("skip:summary_told(4700)".into())
+        );
+    }
+
+    #[test]
+    fn haiku_retells_the_ending_only_when_the_person_asked_something_since() {
+        let mode = StoryMode::Rewrite;
+        assert_eq!(story_due(mode, None, 900, None, 0), Ok(()));
+        // 4736 of 4800 told, but a new ask came after: the ending is due, however small a share
+        assert_eq!(
+            story_due(mode, Some(&prior(12, Some(4736))), 4800, None, 1),
+            Ok(())
+        );
+        // the agent worked on, nothing new was asked: the story stands
+        assert_eq!(
+            story_due(mode, Some(&prior(12, Some(4736))), 4800, None, 0),
+            Err("skip:nothing_asked_since(4736/4800)".into())
+        );
+        assert_eq!(
+            story_due(mode, Some(&prior(3, Some(4800))), 4800, None, 2),
+            Err("skip:nothing_asked_since(4800/4800)".into())
+        );
+        assert_eq!(
+            story_due(mode, Some(&prior(1, None)), 4000, None, 0),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn asked_since_counts_only_what_came_after_the_story() {
+        let user = |text: &str| serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+        let messages = vec![user("old ask"), user("told ask"), user("new ask")];
+        assert_eq!(asked_since(&messages, None), 3);
+        assert_eq!(asked_since(&messages, Some(&prior(1, Some(2)))), 1);
+        assert_eq!(asked_since(&messages, Some(&prior(1, Some(9)))), 0);
+    }
+
+    #[test]
+    fn a_haiku_story_reads_the_summary_and_the_messages_it_never_saw() {
+        let prompt = summary_story_prompt(
+            "1. Primary Request and Intent: build the reel",
+            "[user]: ship v8",
+        );
+        let at = |needle: &str| prompt.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("build the reel") < at("THE LAST MESSAGES"));
+        assert!(at("THE LAST MESSAGES") < at("ship v8"));
+        assert!(prompt.contains("trust the last messages"));
+        assert!(prompt.contains("under 800 characters"));
+    }
+
+    const SUMMARY: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+   - The user asked to **refresh** the session story at each compaction in `summarizer.rs`. They want it smart, not capped.
+   - A second ask about the pane.
+
+2. Key Technical Concepts:
+   - enrichment_state holds coverage.
+
+8. Current Work:
+   I was wiring the `--from-compaction` mode into SessionStart. Tests pass. I ran them twice.
+
+9. Optional Next Step:
+   Install the binary.
+";
+
+    #[test]
+    fn a_compaction_summary_becomes_what_was_asked_and_where_it_stood() {
+        let (story, templated) = story_from_compaction_summary(SUMMARY).unwrap();
+        assert!(templated);
+        assert_eq!(
+            story,
+            "The user asked to refresh the session story at each compaction in summarizer.rs. They want it smart, not capped. A second ask about the pane. Where it stood: Claude was wiring the --from-compaction mode into SessionStart. Tests pass. Claude ran them twice."
+        );
+    }
+
+    #[test]
+    fn a_summary_without_the_template_is_read_from_its_start() {
+        let (story, templated) = story_from_compaction_summary(
+            "Summary:\nWe built the **feed**. It works. "
+                .repeat(80)
+                .as_str(),
+        )
+        .unwrap();
+        assert!(!templated);
+        assert!(story.starts_with("We built the feed. It works."));
+        assert!(story.chars().count() <= ASKED_STORY_CHARS + STOOD_STORY_CHARS);
+        // a first sentence longer than the room is cut, not dropped
+        let long = format!("Summary:\n{}", "word ".repeat(400));
+        let (story, _) = story_from_compaction_summary(&long).unwrap();
+        assert!(story.ends_with('…'));
+    }
+
+    #[test]
+    fn the_newest_compaction_summary_is_found_with_its_place() {
+        let row = |text: &str, summary: bool| {
+            let mut row =
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
+            if summary {
+                row["isCompactSummary"] = true.into();
+            }
+            row
+        };
+        let messages = vec![
+            row("ask", false),
+            row("old summary", true),
+            row("ask again", false),
+            row("new summary", true),
+            row("after", false),
+        ];
+        assert_eq!(
+            newest_compaction_summary(&messages),
+            Some((3, "new summary".to_string()))
+        );
+        assert_eq!(newest_compaction_summary(&messages[..1]), None);
+    }
+
+    #[test]
+    fn only_what_the_person_typed_counts_as_asked() {
+        let user = |content: serde_json::Value| serde_json::json!({"type": "user", "message": {"role": "user", "content": content}});
+        let mut summary = user(serde_json::json!(
+            "This session is being continued from a previous conversation"
+        ));
+        summary["isCompactSummary"] = true.into();
+        let mut meta = user(serde_json::json!(
+            "<local-command-caveat>caveat</local-command-caveat>"
+        ));
+        meta["isMeta"] = true.into();
+        let messages = vec![
+            user(serde_json::json!("first   ask\n with  spaces")),
+            summary,
+            meta,
+            user(
+                serde_json::json!([{"type": "tool_result", "tool_use_id": "t", "content": "cargo test ok"}]),
+            ),
+            serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": "done"}}),
+            user(serde_json::json!([{"type": "text", "text": "second ask"}])),
+            user(serde_json::json!("third ask is long enough to cut")),
+        ];
+        assert_eq!(
+            typed_prompts(&messages, 10, 15),
+            vec!["first ask with", "second ask", "third ask is lo"]
+        );
+        // the newest ones when there are more than it reads
+        assert_eq!(
+            typed_prompts(&messages, 1, 300),
+            vec!["third ask is long enough to cut"]
+        );
+    }
+
+    #[test]
+    fn the_story_a_session_has_is_its_newest_with_the_highest_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&tmp.path().join("csr.db")).unwrap();
+        assert!(prior_story(&storage, "conv-a").is_none());
+        let tags = |extra: &[&str]| {
+            let mut tags = vec!["session_story".to_string(), "conv_conv-a".to_string()];
+            tags.extend(extra.iter().map(|t| t.to_string()));
+            tags
+        };
+        storage
+            .insert_reflection("old", "first story", &tags(&[]), &[0.0; 384])
+            .unwrap();
+        storage
+            .insert_reflection(
+                "other",
+                "another session",
+                &["session_story".into(), "conv_conv-b".into()],
+                &[0.0; 384],
+            )
+            .unwrap();
+        let found = prior_story(&storage, "conv-a").unwrap();
+        assert_eq!((found.rev, found.covered, found.ids.len()), (1, None, 1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        storage
+            .insert_reflection("new", "second story", &tags(&["story_rev_2"]), &[0.0; 384])
+            .unwrap();
+        storage
+            .mark_story_written("conv-a", "story_conv-a", 640)
+            .unwrap();
+        let found = prior_story(&storage, "conv-a").unwrap();
+        assert_eq!((found.rev, found.covered), (2, Some(640)));
+        let mut ids = found.ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["new", "old"]);
+    }
+
     #[test]
     fn test_sample_transcript_small() {
         let messages: Vec<serde_json::Value> = (0..5)
@@ -694,5 +1411,139 @@ mod tests {
             .collect();
         let result = sample_transcript(&messages, 20, 500);
         assert!(result.len() <= 520); // cap + "... (truncated)"
+    }
+
+    fn row(role: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({"type": role, "message": {"role": role, "content": text}})
+    }
+
+    /// `n` ordinary messages, then Claude Code's summary (index `n`), then the
+    /// `after` messages.
+    fn session(n: usize, summary: &str, after: &[(&str, String)]) -> Vec<serde_json::Value> {
+        let mut messages: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                row(
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &format!("message {i}"),
+                )
+            })
+            .collect();
+        messages[n - 2] = row(
+            "assistant",
+            "COMPLETED: the migration landed and the tests pass",
+        );
+        let mut summary = row("user", summary);
+        summary["isCompactSummary"] = true.into();
+        messages.push(summary);
+        for (role, text) in after {
+            messages.push(row(role, text));
+        }
+        messages
+    }
+
+    #[test]
+    fn a_compaction_story_covers_only_what_its_narrator_read() {
+        let after: Vec<(&str, String)> = vec![
+            ("user", "please rename the flag".into()),
+            ("assistant", "renamed it".into()),
+            ("user", "now add a changelog line".into()),
+            ("assistant", "added".into()),
+        ];
+        let messages = session(30, "summary: the migration is blocked", &after);
+        let at = 30;
+        let (tail, covered) = story_input(StoryMode::FromCompaction, &messages, at);
+        assert_eq!(
+            covered,
+            at + 1,
+            "through the summary, not the {} messages",
+            messages.len()
+        );
+        assert!(tail.contains("the migration landed"), "{tail}");
+        assert!(!tail.contains("rename the flag"), "{tail}");
+
+        // The requests typed after the summary are still owed a story at the end.
+        let prior = PriorStory {
+            covered: Some(covered),
+            ..PriorStory::default()
+        };
+        assert_eq!(asked_since(&messages, Some(&prior)), 2);
+        assert_eq!(
+            story_due(
+                StoryMode::Rewrite,
+                Some(&prior),
+                messages.len(),
+                Some(at),
+                2
+            ),
+            Ok(())
+        );
+        // The old accounting (the whole transcript) would have skipped them.
+        let wrong = PriorStory {
+            covered: Some(messages.len()),
+            ..PriorStory::default()
+        };
+        assert!(story_due(
+            StoryMode::Rewrite,
+            Some(&wrong),
+            messages.len(),
+            Some(at),
+            0
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_ending_rewrite_reads_the_preserved_segment_beside_the_new_requests() {
+        let after: Vec<(&str, String)> = vec![("user", "unrelated: rename the flag".into())];
+        let messages = session(30, "summary: the migration is blocked", &after);
+        let (tail, covered) = story_input(StoryMode::Rewrite, &messages, 30);
+        // The preserved pre-summary message that says "completed" is read, so
+        // the rewrite cannot restore the summary's stale "blocked".
+        assert!(tail.contains("completed: the migration landed"), "{tail}");
+        assert!(tail.contains("rename the flag"), "{tail}");
+        assert_eq!(covered, messages.len());
+    }
+
+    #[test]
+    fn a_rewrite_that_cannot_read_everything_records_only_what_it_read() {
+        let after: Vec<(&str, String)> = (0..200)
+            .map(|i| ("user", format!("request {i}: {}", "x".repeat(480))))
+            .collect();
+        let messages = session(30, "summary: s", &after);
+        let (tail, covered) = story_input(StoryMode::Rewrite, &messages, 30);
+        assert!(tail.len() <= TRANSCRIPT_CHAR_CAP + 600, "{}", tail.len());
+        assert!(
+            covered > 31,
+            "some post-summary requests were read: {covered}"
+        );
+        assert!(covered < messages.len(), "the rest were not: {covered}");
+        // exactly the post-summary messages shown, no more
+        let shown_requests = tail.matches("request ").count();
+        assert_eq!(covered, 31 + shown_requests);
+    }
+
+    #[tokio::test]
+    async fn the_narrator_is_not_run_when_its_empty_mcp_config_cannot_be_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let program = dir.path().join("fake-claude");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch {}\ncat >/dev/null\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let none = call_claude_headless_with(
+            program.to_str().unwrap(),
+            "prompt",
+            Err(anyhow::anyhow!("disk full")),
+        )
+        .await;
+        assert!(none.is_none());
+        assert!(!marker.exists(), "the narrator ran without MCP isolation");
     }
 }

@@ -15,6 +15,7 @@
 //! Always returns Ok(()) — never blocks Claude Code (catch-all wrapper).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::path::Path;
 
 use anyhow::Result;
@@ -53,57 +54,213 @@ const MAX_CHUNK_AGE_DAYS: i64 = 21;
 /// Handle the prompt-submit hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
-    if let Err(e) = handle_inner(input, engine, cwd).await {
-        eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e);
+    match render(input, engine, cwd).await {
+        Ok(output) => print!("{output}"),
+        Err(e) => eprintln!("CSR: prompt-submit hook error (non-fatal): {}", e),
     }
 
     // Chunk the active transcript after injection is printed to stdout.
     // Incremental: mtime check makes this a no-op when nothing changed (~0ms).
     // When new content exists: ~30-50ms for 1-2 chunks (well under perceptible lag).
     // Content becomes searchable by the next prompt submit.
+    // Injection is done; from here nothing may touch stdout. Indexing inserts
+    // HNSW points, and hnsw_rs prints to stdout on insert, which would land in
+    // the model's context as fake retrieved memory. See super::suppress_stdout.
+    super::suppress_stdout();
     super::import_current_transcript(input, engine, cwd).await;
 
     Ok(()) // Always succeed
 }
 
+/// Upper bound on `code_nodes_by_name` probes per prompt in `build_graph_slices`.
+/// Without it, cost scales with prompt word count.
+const MAX_SYMBOL_PROBES: usize = 12;
+
 /// Maximum age (in minutes) to apply continuity boost.
 const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 
-async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
-    // Extract prompt from input
-    let prompt = match input.prompt.as_deref() {
-        Some(p) if !p.is_empty() => p,
-        _ => return Ok(()), // No prompt → silent exit
+/// Render the complete injection without touching process stdout or importing a
+/// transcript. Both the legacy handler and the daemon use this exact pipeline.
+pub async fn render(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<String> {
+    Ok(prepare(input, engine, cwd).await?.delivered())
+}
+
+pub(super) struct PreparedPrompt {
+    pub text: String,
+    effects: PendingEffects,
+}
+
+impl PreparedPrompt {
+    pub fn delivered(mut self) -> String {
+        self.effects.commit();
+        self.text
+    }
+}
+
+/// Exposure bookkeeping is committed only after the hook acknowledges a full
+/// response. A timeout must not teach the reranker that undelivered text was seen.
+pub(super) async fn prepare(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+) -> Result<PreparedPrompt> {
+    let mut prepared = PreparedPrompt {
+        text: String::new(),
+        effects: PendingEffects {
+            storage: engine.storage().clone(),
+            impressions: Vec::new(),
+            retrievals: Vec::new(),
+            dream_claims: Vec::new(),
+        },
     };
+    handle_inner(
+        input,
+        engine,
+        cwd,
+        &mut prepared.text,
+        &mut prepared.effects,
+    )
+    .await?;
+    Ok(prepared)
+}
 
-    // Route A pickup: "continue"-class prompts are shorter than
-    // MIN_PROMPT_LENGTH and carry zero searchable signal — yet they are the
-    // one case where memory IS the task. No content to correlate, so recency
-    // picks the episode. Emit it imperatively, adjacent to the prompt (the
-    // position the model reliably reads), instead of silently skipping. Live
-    // failure 2026-07-07: the previous session advertised "just say continue"
-    // and this hook dropped that exact prompt.
-    if is_continuation_prompt(prompt) {
-        if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
-            emit_pickup(
-                &ep,
-                &age,
-                "the user asked to continue; the episode below is the work being resumed.",
-            );
-            record_episode_exposure(input, engine, cwd, prompt, None, "continue", &ep, None);
+struct PendingImpression {
+    session: Option<String>,
+    project: String,
+    surface: String,
+    query: Option<String>,
+    embedding: Option<Vec<f32>>,
+    intent: String,
+    items: Vec<ExposureItem>,
+}
+
+struct PendingEffects {
+    storage: std::sync::Arc<crate::storage::Storage>,
+    impressions: Vec<PendingImpression>,
+    retrievals: Vec<(String, String, String)>,
+    dream_claims: Vec<(String, Option<String>)>,
+}
+
+impl PendingEffects {
+    #[allow(clippy::too_many_arguments)]
+    fn record_impression(
+        &mut self,
+        session: Option<&str>,
+        project: &str,
+        surface: &str,
+        query: Option<&str>,
+        embedding: Option<&[f32]>,
+        intent: &str,
+        items: Vec<ExposureItem>,
+    ) {
+        self.impressions.push(PendingImpression {
+            session: session.map(str::to_owned),
+            project: project.into(),
+            surface: surface.into(),
+            query: query.map(str::to_owned),
+            embedding: embedding.map(ToOwned::to_owned),
+            intent: intent.into(),
+            items,
+        });
+    }
+
+    fn commit(&mut self) {
+        // The claims are now receipts and must survive this value's drop.
+        self.dream_claims.clear();
+        for (id, source, session) in self.retrievals.drain(..) {
+            let _ = self
+                .storage
+                .log_retrieval_event(&id, &source, "prompt_submit", &session);
         }
-        return Ok(());
+        for item in self.impressions.drain(..) {
+            super::exposure::record_impression(
+                &self.storage,
+                item.session.as_deref(),
+                &item.project,
+                &item.surface,
+                item.query.as_deref(),
+                item.embedding.as_deref(),
+                &item.intent,
+                item.items,
+            );
+        }
     }
+}
 
-    // Fast-path: skip slash commands
-    if prompt.starts_with('/') {
-        return Ok(());
+impl Drop for PendingEffects {
+    fn drop(&mut self) {
+        // Only claims won by this render are listed. Keep the claim throughout
+        // rendering to preserve cross-process dedupe, but release it if no full
+        // response was acknowledged. On the daemon this always runs on its one
+        // blocking render worker, with the admission permits still held.
+        for (id, session) in self.dream_claims.drain(..) {
+            let _ = self.storage.with_connection(|conn| {
+                conn.execute("DELETE FROM dream_deliveries WHERE dream_id = ?1 AND channel = 'prompt' AND session_id IS ?2",
+                    rusqlite::params![id, session])?;
+                Ok(())
+            });
+        }
     }
+}
 
-    // Bare acknowledgments ("ok", "y") carry no intent signal worth an
-    // embedding pass.
-    if prompt.trim().len() < 3 {
-        return Ok(());
+#[cfg(test)]
+#[test]
+fn undelivered_dream_claim_is_released_but_acknowledged_claim_survives() {
+    use crate::storage::dream_delivery::{already_delivered, claim_delivery, DeliveryChannel};
+    let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+    for delivered in [false, true] {
+        assert!(claim_delivery(
+            &storage,
+            "dream",
+            DeliveryChannel::Prompt,
+            Some("session")
+        ));
+        let mut pending = PendingEffects {
+            storage: storage.clone(),
+            impressions: Vec::new(),
+            retrievals: Vec::new(),
+            dream_claims: vec![("dream".into(), Some("session".into()))],
+        };
+        if delivered {
+            pending.commit();
+        }
+        drop(pending);
+        assert_eq!(
+            storage
+                .with_connection(|conn| {
+                    Ok(already_delivered(conn, "dream", DeliveryChannel::Prompt))
+                })
+                .unwrap(),
+            delivered
+        );
+    }
+}
+
+async fn handle_inner(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    output: &mut String,
+    effects: &mut PendingEffects,
+) -> Result<()> {
+    // Every exit that needs neither an embedding nor the index is decided in
+    // `early_exit`, which also picks the engine this process was built with.
+    let prompt = input.prompt.as_deref().unwrap_or_default();
+    match early_exit(prompt) {
+        Some(EarlyExit::Silent) => return Ok(()),
+        Some(EarlyExit::LineagePickup) => {
+            if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
+                emit_pickup(
+                    output,
+                    &ep,
+                    &age,
+                    "the user asked to continue; the episode below is the work being resumed.",
+                );
+                record_episode_exposure(input, effects, cwd, prompt, None, "continue", &ep, None);
+            }
+            return Ok(());
+        }
+        None => {}
     }
 
     let embeddings = engine.embeddings();
@@ -145,13 +302,14 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     classified_intent = "continue";
                     if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
+                            output,
                             &ep,
                             &age,
                             "the user asked to continue; the episode below is the work being resumed.",
                         );
                         record_episode_exposure(
                             input,
-                            engine,
+                            effects,
                             cwd,
                             prompt,
                             Some(&query_vec),
@@ -166,13 +324,14 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     classified_intent = "state_recall";
                     if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
                         emit_pickup(
+                            output,
                             &ep,
                             &age,
                             "the prompt asks for the state of recent work; the episode below is the most recent session (picked by recency, not similarity).",
                         );
                         record_episode_exposure(
                             input,
-                            engine,
+                            effects,
                             cwd,
                             prompt,
                             Some(&query_vec),
@@ -220,10 +379,10 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                     .await;
                     if let Some((ep, age, _score)) = &corr {
                         if let Some(map) = format_code_map(ep, age) {
-                            println!("{}", map);
+                            writeln!(output, "{}", map)?;
                             record_episode_exposure(
                                 input,
-                                engine,
+                                effects,
                                 cwd,
                                 prompt,
                                 Some(&query_vec),
@@ -259,9 +418,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             prompt,
             input.session_id.as_deref(),
         ) {
-            println!("{line}");
-            super::exposure::record_impression(
-                engine.storage(),
+            effects
+                .dream_claims
+                .push((dream_id.clone(), input.session_id.clone()));
+            writeln!(output, "{line}")?;
+            effects.record_impression(
                 input.session_id.as_deref(),
                 &project,
                 "prompt_submit",
@@ -292,12 +453,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             let names: Vec<(String, String)> =
                 rows.into_iter().map(|(sid, a)| (sid, a.name)).collect();
             if let Some((sid, name)) = symbol_overlap(prompt, &names) {
-                println!(
+                writeln!(output,
                     "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
                     name, sid
-                );
-                super::exposure::record_impression(
-                    engine.storage(),
+                )?;
+                effects.record_impression(
                     input.session_id.as_deref(),
                     &project,
                     "prompt_submit",
@@ -337,8 +497,15 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // 1. Search for anti-patterns (highest priority)
     // Anti-patterns use a modified query ("failed approach don't retry: ...") so keep separate embedding.
     // TODO: scope anti-patterns by project once outcome reflections carry project tags (Codex H-1)
-    let anti_matches =
-        anti_pattern::find_anti_pattern_matches(storage, embeddings, search, prompt, 0.5, 2).await;
+    // Opt-out: this stage costs a second full embedding pass (the query is
+    // rewritten to "failed approach don't retry: ..."), which the upstream
+    // comment above keeps deliberately separate from the main query vector.
+    // Set CSR_NO_ANTI_PATTERNS=1 to trade that recall for latency.
+    let anti_matches = if std::env::var("CSR_NO_ANTI_PATTERNS").as_deref() == Ok("1") {
+        Vec::new()
+    } else {
+        anti_pattern::find_anti_pattern_matches(storage, embeddings, search, prompt, 0.5, 2).await
+    };
     let anti_exposures: Vec<Option<ExposureItem>> = anti_matches
         .iter()
         .map(|matched| {
@@ -384,18 +551,33 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     };
     let mut preface_exposures = Vec::new();
     if let Some((ep, age, score)) = correlated {
-        print!("{}", format_semantic_pickup(&ep, &age, score));
+        output.push_str(&format_semantic_pickup(&ep, &age, score));
         preface_exposures.push(episode_exposure_item(&ep, Some(f64::from(score))));
     }
 
     // 2. Search chunks (past conversations) — scoped to current project
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
-    let chunk_results =
-        search_chunks_with_vec(engine, &query_vec, 15, 0.55, &current_project).await;
+    let chunk_results = search_chunks_with_vec(
+        engine,
+        &query_vec,
+        15,
+        0.55,
+        &current_project,
+        input.session_id.as_deref(),
+        cwd,
+    )
+    .await;
 
     // 3. Search reflections (stored insights) — scoped to current project
-    let reflection_results =
-        search_reflections_with_vec(engine, &query_vec, 10, 0.45, &current_project).await;
+    let reflection_results = search_reflections_with_vec(
+        engine,
+        &query_vec,
+        10,
+        0.45,
+        &current_project,
+        input.session_id.as_deref(),
+    )
+    .await;
 
     // 4. Combine and score results (with continuity boost for recent session)
     let current_files: Vec<String> = extract_file_paths_from_prompt(prompt);
@@ -500,7 +682,15 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // existing PROMPT_TOKEN_BUDGET (Codex #5: no separate budget). Surfaces the
     // 1-hop neighborhood of files/symbols named in the prompt, with provenance.
     let mut review_exposures = vec![None; review_items.len()];
-    for slice in build_graph_slices_with_ids(storage, prompt, &current_files, &current_project) {
+    // Opt-out: graph slices issue one SQLite query per qualifying prompt token
+    // (now bounded by MAX_SYMBOL_PROBES) plus a file-ledger read. Set
+    // CSR_NO_GRAPH_SLICES=1 to skip the stage entirely.
+    let graph_slices = if std::env::var("CSR_NO_GRAPH_SLICES").as_deref() == Ok("1") {
+        Vec::new()
+    } else {
+        build_graph_slices_with_ids(storage, prompt, &current_files, &current_project)
+    };
+    for slice in graph_slices {
         review_items.push(InjectionItem {
             content: slice.content,
             score: 0.88,
@@ -561,7 +751,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
         let item = InjectionItem {
             content: result.content.clone(),
             score: result.final_score,
-            source: format!("{}|{}", result.source, result.min_trust),
+            source: handoff_label(result),
         };
 
         ctx.winning_strategies.push(item);
@@ -571,7 +761,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     if ctx.is_empty() {
         record_prompt_exposure(
             input,
-            engine,
+            effects,
             cwd,
             prompt,
             &query_vec,
@@ -583,9 +773,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
     let formatted = ctx.format_with_receipt(PROMPT_TOKEN_BUDGET);
     if !formatted.text.is_empty() {
-        // stdout injection: Claude Code prepends this to the system prompt.
-        // Uses print! (not println!) to avoid double-newline — formatter output ends with \n.
-        print!("{}", formatted.text);
+        output.push_str(&formatted.text);
     }
 
     let rendered_exposures = super::exposure::rendered_exposure_items(
@@ -598,18 +786,17 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // TAD: Log retrieval events only for actually-injected items (not filtered-out ones)
     if let Some(ref session_id) = input.session_id {
         for item in &rendered_exposures {
-            let _ = engine.storage().log_retrieval_event(
-                &item.memory_id,
-                &item.source_type,
-                "prompt_submit",
-                session_id,
-            );
+            effects.retrievals.push((
+                item.memory_id.clone(),
+                item.source_type.clone(),
+                session_id.clone(),
+            ));
         }
     }
     preface_exposures.extend(rendered_exposures);
     record_prompt_exposure(
         input,
-        engine,
+        effects,
         cwd,
         prompt,
         &query_vec,
@@ -686,7 +873,7 @@ fn scored_exposure_item(result: &predictor::ScoredResult) -> Option<ExposureItem
 #[allow(clippy::too_many_arguments)]
 fn record_prompt_exposure(
     input: &HookInput,
-    engine: &Engine,
+    effects: &mut PendingEffects,
     cwd: &Path,
     prompt: &str,
     query_vec: &[f32],
@@ -699,8 +886,7 @@ fn record_prompt_exposure(
         item.rank = rank as i64;
     }
     let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_default();
-    super::exposure::record_impression(
-        engine.storage(),
+    effects.record_impression(
         input.session_id.as_deref(),
         &project,
         "prompt_submit",
@@ -714,7 +900,7 @@ fn record_prompt_exposure(
 #[allow(clippy::too_many_arguments)]
 fn record_episode_exposure(
     input: &HookInput,
-    engine: &Engine,
+    effects: &mut PendingEffects,
     cwd: &Path,
     prompt: &str,
     query_vec: Option<&[f32]>,
@@ -723,8 +909,7 @@ fn record_episode_exposure(
     score: Option<f64>,
 ) {
     let project = resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_default();
-    super::exposure::record_impression(
-        engine.storage(),
+    effects.record_impression(
         input.session_id.as_deref(),
         &project,
         "prompt_submit",
@@ -750,6 +935,75 @@ fn ancestry_releases_for_prompt(
                 .map(|releases| (chunk_id.clone(), releases))
         })
         .collect()
+}
+
+/// How a prompt leaves `handle_inner` before anything embeds it or queries
+/// the index.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EarlyExit {
+    /// Nothing to inject.
+    Silent,
+    /// Route A pickup by recency: SQLite only, no embedding, no index.
+    LineagePickup,
+}
+
+/// The exits that run before the first embedding or index query, in order.
+/// One definition serves both the handler and [`exits_before_search`], so the
+/// engine choice made before startup cannot drift from what the handler does.
+/// Anything added here must stay index-free: these prompts run on an engine
+/// whose index is empty.
+pub(super) fn early_exit(prompt: &str) -> Option<EarlyExit> {
+    // No prompt → silent exit
+    if prompt.is_empty() {
+        return Some(EarlyExit::Silent);
+    }
+
+    // Nobody typed a harness turn, so nothing in it is a re-asked question.
+    // Live failure 2026-09-19: background-task notifications and
+    // cross-session messages each drew a PICKUP for an unrelated episode at
+    // 0.55-0.62 similarity, plus raw `<task-notification>` chunks as "past
+    // context". Silence is the only honest output here.
+    if is_harness_turn(prompt) {
+        return Some(EarlyExit::Silent);
+    }
+
+    // Route A pickup: "continue"-class prompts are shorter than
+    // MIN_PROMPT_LENGTH and carry zero searchable signal — yet they are the
+    // one case where memory IS the task. No content to correlate, so recency
+    // picks the episode. Emit it imperatively, adjacent to the prompt (the
+    // position the model reliably reads), instead of silently skipping. Live
+    // failure 2026-07-07: the previous session advertised "just say continue"
+    // and this hook dropped that exact prompt.
+    if is_continuation_prompt(prompt) {
+        return Some(EarlyExit::LineagePickup);
+    }
+
+    // Fast-path: skip slash commands
+    if prompt.starts_with('/') {
+        return Some(EarlyExit::Silent);
+    }
+
+    // Bare acknowledgments ("ok", "y") carry no intent signal worth an
+    // embedding pass.
+    if prompt.trim().len() < 3 {
+        return Some(EarlyExit::Silent);
+    }
+
+    None
+}
+
+/// Whether this prompt is answered without the vector index, so the hook
+/// process can skip loading it (see `hooks::hook_needs_index`).
+pub(crate) fn exits_before_search(prompt: Option<&str>) -> bool {
+    early_exit(prompt.unwrap_or_default()).is_some()
+}
+
+/// A turn the harness wrote, not the user: task/system notifications and
+/// local-command echoes (the steer filter's own predicate — one definition,
+/// not a second list to drift) plus messages relayed from another session.
+fn is_harness_turn(prompt: &str) -> bool {
+    crate::transcript::instrumentation::is_noisy_steer_text(prompt)
+        || prompt.contains("<cross-session-message")
 }
 
 /// Detect the most recent session's conversation_id if it ended recently.
@@ -785,13 +1039,16 @@ fn is_continuation_prompt(prompt: &str) -> bool {
 /// imperative. Used only by Route A lineage pickup (is_continuation_prompt /
 /// Continue / StateRecall) — the CONTINUUM banner is reserved for the active
 /// conversation lineage, never for a Route-B topic match.
-fn emit_pickup(ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
-    println!("CSR PICKUP — {}", reason);
-    print!(
-        "{}",
-        crate::hooks::session_start::format_tier0_block(ep, &[], age)
+fn emit_pickup(output: &mut String, ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
+    output.push_str(&format!("CSR PICKUP — {}\n", reason));
+    output.push_str(&crate::hooks::session_start::format_tier0_block(
+        ep,
+        &[],
+        age,
+    ));
+    output.push_str(
+        "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.\n",
     );
-    println!("Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.");
 }
 
 /// Minimum length (both sides) before a prompt/episode-request containment
@@ -933,7 +1190,9 @@ async fn correlate_episode(
         let Some(conv_id) = tags.iter().find_map(|t| t.strip_prefix("conv_")) else {
             continue;
         };
-        if Some(conv_id) == current_session || !seen_convs.insert(conv_id.to_string()) {
+        if is_own_conversation(engine.storage(), conv_id, current_session)
+            || !seen_convs.insert(conv_id.to_string())
+        {
             continue;
         }
         let Some((ep, ts)) = episode_for_conversation(engine, conv_id) else {
@@ -1020,14 +1279,105 @@ fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
     Some(session.conversation_id)
 }
 
+/// Openings of blocks the harness writes into the user channel. A chunk that
+/// starts with one renders as nothing but that block in a 300-char excerpt.
+const HARNESS_BLOCK_OPENINGS: [&str; 4] = [
+    "<task-notification>",
+    "[SYSTEM NOTIFICATION",
+    "<cross-session-message",
+    "Another Claude session sent a message:",
+];
+
+/// A chunk the hook must never hand back as "past context": the session that
+/// is asking (its own last turns are already in the model's context, and the
+/// watcher indexes them within minutes), or a harness block indexed before the
+/// importer learnt to drop those rows.
+fn is_self_echo(chunk: &crate::import::ConversationChunk, current_session: Option<&str>) -> bool {
+    if current_session.is_some_and(|session| session == chunk.conversation_id) {
+        return true;
+    }
+    let opening = chunk.content.trim_start();
+    HARNESS_BLOCK_OPENINGS
+        .iter()
+        .any(|block| opening.starts_with(block))
+}
+
+/// Whether the conversation `conversation_id` is the asking session itself or
+/// one of its own subagents (an `agent-` id whose recorded parent is the
+/// session). Handing a session its own words, or its subagents', back as memory
+/// is an echo, whichever retrieval path (raw chunk, derived reflection or
+/// context cache) carried them.
+fn is_own_conversation(
+    storage: &crate::storage::Storage,
+    conversation_id: &str,
+    current_session: Option<&str>,
+) -> bool {
+    let Some(session) = current_session else {
+        return false;
+    };
+    conversation_id == session
+        || (conversation_id.starts_with("agent-")
+            && storage
+                .parent_session_of_conversation(conversation_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(session))
+}
+
+/// A chunk one of this session's own subagents wrote: filed under the subagent's `agent-` id, with the
+/// session that ran it as its parent in provenance. `is_self_echo` catches the session's own chunks by
+/// id; these slip past it, and handing a session its own subagents' words back is the same echo.
+fn is_own_subagent(
+    chunk: &crate::import::ConversationChunk,
+    current_session: Option<&str>,
+    parent: impl FnOnce() -> Option<String>,
+) -> bool {
+    match current_session {
+        Some(session) if chunk.conversation_id.starts_with("agent-") => {
+            parent().as_deref() == Some(session)
+        }
+        _ => false,
+    }
+}
+
 /// Search chunks using a pre-computed embedding vector (P-1 optimization).
-/// Scoped to `project` — chunks from other projects are filtered out.
+/// Scoped to `project` — chunks from other projects are filtered out, and so
+/// is anything `is_self_echo` names.
 async fn search_chunks_with_vec(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
     project: &str,
+    current_session: Option<&str>,
+    cwd: &Path,
+) -> Vec<RawResult> {
+    search_chunks_with_vec_core(
+        engine,
+        query_vec,
+        limit,
+        min_score,
+        project,
+        current_session,
+        |paths| super::scope_folder::conversations_in_asker_repo(paths, engine.projects_dir(), cwd),
+    )
+    .await
+}
+
+/// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
+/// decide which conversations widen without a filesystem or `git`. `same_repo`
+/// is called at most once, and only when some candidate's label differs from
+/// `project` and has a recorded transcript path. A prompt whose candidates all
+/// match by label costs nothing; any other costs one batched query first.
+async fn search_chunks_with_vec_core(
+    engine: &Engine,
+    query_vec: &[f32],
+    limit: usize,
+    min_score: f32,
+    project: &str,
+    current_session: Option<&str>,
+    same_repo: impl FnOnce(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -1039,13 +1389,82 @@ async fn search_chunks_with_vec(
 
     let now = chrono::Utc::now();
     let mut raw_results = Vec::new();
+
+    // Batch the row fetch. `get_chunks_by_ids` already takes a slice, but was
+    // being called once per hit via `from_ref`, making this N+1 over the HNSW
+    // result set. Fetch once and index by id, preserving the original result
+    // order (and therefore score order) when rebuilding.
+    let chunk_ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
+    // The batch fails as a unit, so one undecodable row would drop every hit.
+    // On error fall back to per-id lookups, which lose only the bad row.
+    let fetched = storage
+        .get_chunks_by_ids_with_provenance(&chunk_ids)
+        .unwrap_or_else(|_| {
+            chunk_ids
+                .iter()
+                .filter_map(|id| {
+                    storage
+                        .get_chunks_by_ids_with_provenance(std::slice::from_ref(id))
+                        .ok()
+                })
+                .flatten()
+                .collect()
+        });
+    // A candidate filed under another label can still be this repository: a
+    // session started in a subdirectory is labelled after that subdirectory's
+    // folder. See `scope_folder` for the rule. A failed lookup widens nothing.
+    let mut mismatched: Vec<String> = Vec::new();
+    if !project.is_empty() {
+        for chunk in fetched.iter().filter(|c| c.project_name != project) {
+            if !mismatched.contains(&chunk.conversation_id) {
+                mismatched.push(chunk.conversation_id.clone());
+            }
+        }
+    }
+    let widened = if mismatched.is_empty() {
+        HashMap::new()
+    } else {
+        match storage.import_paths_for_conversations(
+            &mismatched,
+            super::scope_folder::MAX_PATHS_PER_CONVERSATION,
+        ) {
+            Ok(paths) if !paths.is_empty() => same_repo(paths),
+            Ok(_) => HashMap::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "import_state lookup failed; exact project match only");
+                HashMap::new()
+            }
+        }
+    };
+
+    let mut chunk_by_id: std::collections::HashMap<String, _> =
+        fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
+
     for result in &results {
-        if let Ok(chunks) =
-            storage.get_chunks_by_ids_with_provenance(std::slice::from_ref(&result.id))
         {
-            if let Some(chunk) = chunks.into_iter().next() {
-                // Project scope filter: skip chunks from other projects
-                if !project.is_empty() && chunk.project_name != project {
+            if let Some(chunk) = chunk_by_id.remove(&result.id) {
+                // Project scope filter: the label matches, or the conversation
+                // was filed from inside the asker's repository and this chunk
+                // carries the label of the folder it was filed under.
+                if !project.is_empty()
+                    && chunk.project_name != project
+                    && !widened
+                        .get(&chunk.conversation_id)
+                        .is_some_and(|labels| labels.contains(&chunk.project_name))
+                {
+                    continue;
+                }
+
+                if is_self_echo(&chunk, current_session) {
+                    continue;
+                }
+                if is_own_subagent(&chunk, current_session, || {
+                    storage
+                        .get_chunk_provenance(&result.id)
+                        .ok()
+                        .flatten()
+                        .map(|provenance| provenance.source_conv_id)
+                }) {
                     continue;
                 }
 
@@ -1083,13 +1502,16 @@ async fn search_chunks_with_vec(
 
 /// Search reflections using a pre-computed embedding vector (P-1 optimization).
 /// Scoped to `project` — reflections tagged for other projects are filtered out.
-/// Legacy reflections without project tags are allowed through.
+/// Legacy reflections without project tags are allowed through. A reflection
+/// derived from the asking session, or from one of its own subagents (its
+/// `conv_<id>` tag), is dropped like the raw chunks it was made from.
 async fn search_reflections_with_vec(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
     project: &str,
+    current_session: Option<&str>,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -1110,6 +1532,14 @@ async fn search_reflections_with_vec(
                 if has_project_tags && !tags.contains(&project_tag) {
                     continue;
                 }
+            }
+
+            if tags
+                .iter()
+                .filter_map(|t| t.strip_prefix("conv_"))
+                .any(|conv| is_own_conversation(storage, conv, current_session))
+            {
+                continue;
             }
 
             // Episode reflections are structured JSON surfaced via the Tier-0
@@ -1341,7 +1771,16 @@ fn build_graph_slices_with_ids(
     }
 
     // Symbol-anchored slice: callees of a symbol named in the prompt.
+    //
+    // Each qualifying token costs one `code_nodes_by_name` query, and the loop
+    // only breaks once a token actually yields a slice. A long prompt whose
+    // words match no graph node therefore issues one SQLite query per word with
+    // no upper bound. Cap the probes so worst-case cost is fixed.
+    let mut symbol_probes = 0usize;
     for word in prompt.split_whitespace() {
+        if symbol_probes >= MAX_SYMBOL_PROBES {
+            break;
+        }
         let token: String = word
             .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
@@ -1349,6 +1788,7 @@ fn build_graph_slices_with_ids(
         if token.len() < 6 {
             continue;
         }
+        symbol_probes += 1;
         // Ask for 2 so an ambiguous name (multiple definitions sharing the
         // same name) is detectable instead of silently picking one.
         let nodes = match storage.code_nodes_by_name(&token, project, 2) {
@@ -1550,9 +1990,178 @@ pub fn symbol_overlap(
         .cloned()
 }
 
+/// The bracket label of one handed line: its source and cached trust floor, then the short id of
+/// the past session it came from. Without the id Claude cannot open that session (the line was all
+/// it had); with it, `get_full_conversation` finds it, as it matches an id by substring. A
+/// subagent's chunk names no session Claude could open, so it carries none.
+fn handoff_label(result: &crate::injection::predictor::ScoredResult) -> String {
+    let session = result
+        .conversation_id
+        .as_deref()
+        .filter(|id| !id.starts_with("agent-"))
+        .and_then(|id| id.get(..8));
+    match session {
+        Some(id) => format!("{}|{}|session {id}", result.source, result.min_trust),
+        None => format!("{}|{}", result.source, result.min_trust),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handed(conversation_id: Option<&str>) -> crate::injection::predictor::ScoredResult {
+        crate::injection::predictor::ScoredResult {
+            content: "the import reuses the upload queue".into(),
+            raw_score: 0.8,
+            final_score: 0.8,
+            source: "conversation".into(),
+            signals: Vec::new(),
+            memory_id: Some("chunk-1".into()),
+            conversation_id: conversation_id.map(str::to_owned),
+            timestamp: None,
+            author: None,
+            min_trust: crate::provenance::TrustTier::Unknown,
+        }
+    }
+
+    #[test]
+    fn this_sessions_own_subagents_are_never_handed_back_to_it() {
+        let chunk = |conversation_id: &str| crate::import::ConversationChunk {
+            id: "c".into(),
+            conversation_id: conversation_id.into(),
+            project_name: "csr-engine".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: "the pane reads the dream log".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: true,
+        };
+        let parent = |id: &str| {
+            let id = id.to_owned();
+            move || Some(id)
+        };
+        let ours = chunk("agent-a3dd7b830b8b7fa52");
+        assert!(is_own_subagent(&ours, Some("6ca2a4d5"), parent("6ca2a4d5")));
+        // another session's subagent is memory, and so is a chunk with no parent on record
+        assert!(!is_own_subagent(
+            &ours,
+            Some("6ca2a4d5"),
+            parent("11110005")
+        ));
+        assert!(!is_own_subagent(&ours, Some("6ca2a4d5"), || None));
+        // not a subagent: its parent is never looked up
+        let plain = chunk("11110005-1111-4222-8333-444455556666");
+        assert!(!is_own_subagent(&plain, Some("6ca2a4d5"), || panic!(
+            "looked up"
+        )));
+        assert!(!is_own_subagent(&ours, None, || panic!("looked up")));
+    }
+
+    #[tokio::test]
+    async fn reflections_derived_from_this_sessions_own_subagents_are_never_handed_back() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        // A subagent's chunk records the session that ran it as its parent.
+        for (conv, parent) in [("agent-ours", "sess-1"), ("agent-theirs", "sess-2")] {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("chunk-{conv}"),
+                conversation_id: conv.into(),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: "subagent words".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: 0,
+                is_sidechain: true,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::Assistant,
+                        source_conv_id: parent.into(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+        }
+        for (id, conv) in [
+            ("refl-own-child", "agent-ours"),
+            ("refl-own-session", "sess-1"),
+            ("refl-other-child", "agent-theirs"),
+            ("refl-other-session", "sess-9"),
+        ] {
+            storage
+                .insert_reflection(
+                    id,
+                    &format!("derived from {conv}"),
+                    &[
+                        "narrative_extracted_v3".into(),
+                        format!("conv_{conv}"),
+                        "project_project".into(),
+                    ],
+                    &[1.0, 0.0],
+                )
+                .unwrap();
+            search.insert_reflection(id.into(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+
+        let ids = |results: Vec<RawResult>| {
+            let mut ids: Vec<String> = results.into_iter().filter_map(|r| r.memory_id).collect();
+            ids.sort();
+            ids
+        };
+        let mine = ids(search_reflections_with_vec(
+            &engine,
+            &[1.0, 0.0],
+            10,
+            0.0,
+            "project",
+            Some("sess-1"),
+        )
+        .await);
+        assert_eq!(mine, ["refl-other-child", "refl-other-session"]);
+        // another session sees its own subagent's words as memory, and ours too
+        let other = ids(search_reflections_with_vec(
+            &engine,
+            &[1.0, 0.0],
+            10,
+            0.0,
+            "project",
+            Some("sess-2"),
+        )
+        .await);
+        assert_eq!(
+            other,
+            ["refl-other-session", "refl-own-child", "refl-own-session"]
+        );
+        // no session known: nothing is excluded
+        let anon =
+            ids(search_reflections_with_vec(&engine, &[1.0, 0.0], 10, 0.0, "project", None).await);
+        assert_eq!(anon.len(), 4);
+    }
+
+    #[test]
+    fn a_handed_line_names_the_session_claude_can_open() {
+        let label = handoff_label(&handed(Some("11110004-1111-4222-8333-444455556666")));
+        assert!(label.starts_with("conversation|"), "{label}");
+        assert!(label.ends_with("|session 11110004"), "{label}");
+        // a subagent's chunk, or none at all: no id to open
+        assert!(!handoff_label(&handed(Some("agent-a1b2c3d4e5"))).contains("session"));
+        assert!(!handoff_label(&handed(None)).contains("session"));
+    }
 
     #[tokio::test]
     async fn chunk_search_reads_cached_floor_without_provenance_event_tables() {
@@ -1591,13 +2200,302 @@ mod tests {
             root.path().to_path_buf(),
         );
 
-        let results = search_chunks_with_vec(&engine, &[1.0, 0.0], 1, 0.0, "project").await;
+        let results =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 1, 0.0, "project", None, |_| {
+                HashMap::new()
+            })
+            .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].min_trust,
             crate::provenance::TrustTier::UserHistory
         );
+    }
+
+    #[tokio::test]
+    async fn chunk_search_never_echoes_the_asking_session_or_a_harness_block() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let rows = [
+            ("own-turn", "live-session", "grep output from two minutes ago"),
+            (
+                "harness-block",
+                "older-session",
+                "<task-notification>\n<task-id>a0b2</task-id>\n<status>completed</status>\n</task-notification>\nRead the output file.",
+            ),
+            ("past-work", "older-session", "we moved the index load out of the hook"),
+        ];
+        for (id, conversation_id, content) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+
+        let recalled = |session: Option<&'static str>| {
+            let engine = &engine;
+            async move {
+                let mut ids: Vec<String> = search_chunks_with_vec_core(
+                    engine,
+                    &[1.0, 0.0],
+                    10,
+                    0.0,
+                    "project",
+                    session,
+                    |_| HashMap::new(),
+                )
+                .await
+                .into_iter()
+                .filter_map(|result| result.memory_id)
+                .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        assert_eq!(recalled(Some("live-session")).await, ["past-work"]);
+        // Another session asking still sees that turn; the harness block never returns.
+        assert_eq!(
+            recalled(Some("someone-else")).await,
+            ["own-turn", "past-work"]
+        );
+        assert_eq!(recalled(None).await, ["own-turn", "past-work"]);
+    }
+
+    /// Engine over three chunks filed under three labels, with the transcript
+    /// paths `import_state` would hold for them. Returns the recalled ids and
+    /// the path map `same_repo` was handed (`None` when it was never called).
+    async fn recall_across_labels(
+        project: &str,
+        import_rows: &[(&str, &str)],
+        widen: &[(&str, &str)],
+    ) -> (Vec<String>, Option<HashMap<String, Vec<String>>>) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, conversation_id, label) in [
+            ("root-chunk", "root-session", "repo"),
+            ("sub-chunk", "sub-session", "repo-sub"),
+            ("other-chunk", "other-session", "other"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: label.into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: format!("work recorded under {label}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        for (file_path, conversation_id) in import_rows {
+            storage
+                .upsert_import_state_explicit(file_path, conversation_id, 1, "0")
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let seen = std::cell::RefCell::new(None);
+        let mut ids: Vec<String> =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 10, 0.0, project, None, |paths| {
+                *seen.borrow_mut() = Some(paths.clone());
+                widen
+                    .iter()
+                    .map(|(id, label)| (id.to_string(), HashSet::from([label.to_string()])))
+                    .collect()
+            })
+            .await
+            .into_iter()
+            .filter_map(|result| result.memory_id)
+            .collect();
+        ids.sort();
+        (ids, seen.into_inner())
+    }
+
+    const IMPORT_ROWS: [(&str, &str); 3] = [
+        (
+            "/cc/projects/-u-projects-repo/root-session.jsonl",
+            "root-session",
+        ),
+        (
+            "/cc/projects/-u-projects-repo-sub/sub-session.jsonl",
+            "sub-session",
+        ),
+        (
+            "/cc/projects/-u-projects-other/other-session.jsonl",
+            "other-session",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn a_conversation_the_repository_test_accepts_is_recalled_under_another_label() {
+        let (ids, seen) =
+            recall_across_labels("repo", &IMPORT_ROWS, &[("sub-session", "repo-sub")]).await;
+        assert_eq!(ids, ["root-chunk", "sub-chunk"]);
+        // Only the candidates whose label differs are put to the test, with
+        // every path recorded for them; the exact match never is.
+        let seen = seen.expect("same_repo is consulted when a label differs");
+        let mut asked: Vec<&String> = seen.keys().collect();
+        asked.sort();
+        assert_eq!(asked, ["other-session", "sub-session"]);
+        assert_eq!(
+            seen["sub-session"],
+            ["/cc/projects/-u-projects-repo-sub/sub-session.jsonl"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_widened_conversation_admits_only_the_label_of_its_folder() {
+        // import_state is written after the chunks, so a chunk overwritten by a
+        // same-stem file from elsewhere can sit under a conversation whose
+        // recorded path passes. Its label is that other file's, and it stays out.
+        let (ids, _) =
+            recall_across_labels("repo", &IMPORT_ROWS, &[("sub-session", "something-else")]).await;
+        assert_eq!(ids, ["root-chunk"]);
+    }
+
+    /// Through the production adapter: a real repository on disk, real `git`,
+    /// decode from `/`, several `import_state` rows for one id.
+    #[tokio::test]
+    async fn the_production_rule_recalls_a_subdirectory_session_of_a_real_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let (repo, tools) = (root.join("projects/repo"), root.join("projects/repo-tools"));
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let git_init = |dir: &Path| {
+            let mut cmd = std::process::Command::new("git");
+            for (k, _) in std::env::vars_os() {
+                if k.to_string_lossy().starts_with("GIT_") {
+                    cmd.env_remove(&k);
+                }
+            }
+            cmd.arg("init")
+                .arg("-q")
+                .arg(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !git_init(&repo) || !git_init(&tools) {
+            return; // git unavailable in this environment
+        }
+        let projects_dir = root.join("cc");
+        let folder = |dir: &Path| {
+            crate::search::cross_project::encode_project_folder(&dir.to_string_lossy())
+        };
+        let in_sub = |name: &str| {
+            format!(
+                "{}/{}/{name}",
+                projects_dir.display(),
+                folder(&repo.join("sub"))
+            )
+        };
+        let in_tools = |name: &str| format!("{}/{}/{name}", projects_dir.display(), folder(&tools));
+
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, conversation_id, label) in [
+            ("root-chunk", "s-root", "repo"),
+            ("sub-chunk", "s-sub", "repo-sub"),
+            ("overwritten-chunk", "s-sub", "elsewhere"),
+            ("tools-chunk", "s-tools", "repo-tools"),
+            ("shared-stem-chunk", "journal", "repo-sub"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation_id.into(),
+                project_name: label.into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: format!("work recorded under {label}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(chunk.id.clone(), vec![1.0, 0.0]);
+        }
+        for (file_path, conversation_id) in [
+            (in_sub("s-sub.jsonl"), "s-sub"),
+            (in_tools("s-tools.jsonl"), "s-tools"),
+            (in_sub("w1/journal.jsonl"), "journal"),
+            (in_tools("w2/journal.jsonl"), "journal"),
+        ] {
+            storage
+                .upsert_import_state_explicit(&file_path, conversation_id, 1, "0")
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            projects_dir,
+        );
+        let mut ids: Vec<String> = search_chunks_with_vec(
+            &engine,
+            &[1.0, 0.0],
+            10,
+            0.0,
+            "repo",
+            None,
+            &repo.join("sub"),
+        )
+        .await
+        .into_iter()
+        .filter_map(|result| result.memory_id)
+        .collect();
+        ids.sort();
+        assert_eq!(ids, ["root-chunk", "sub-chunk"]);
+    }
+
+    #[tokio::test]
+    async fn a_conversation_the_repository_test_rejects_stays_out() {
+        let (ids, _) = recall_across_labels("repo", &IMPORT_ROWS, &[]).await;
+        assert_eq!(ids, ["root-chunk"]);
+    }
+
+    #[tokio::test]
+    async fn no_recorded_transcript_path_means_no_repository_test_at_all() {
+        // Differing labels but nothing in import_state: nothing to decide on.
+        let (ids, seen) = recall_across_labels("repo", &[], &[("sub-session", "repo-sub")]).await;
+        assert_eq!(ids, ["root-chunk"]);
+        assert!(seen.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_search_never_consults_the_repository_test() {
+        let (ids, seen) = recall_across_labels("", &IMPORT_ROWS, &[]).await;
+        assert_eq!(ids, ["other-chunk", "root-chunk", "sub-chunk"]);
+        assert!(seen.is_none());
     }
 
     #[test]
@@ -1783,6 +2681,55 @@ mod tests {
     // Route A only handles no-signal prompts recency-style; content prompts
     // are covered by Route B semantic correlation, so these asserts test the
     // boundary (hijack prevention), not the phrase list.
+
+    #[test]
+    fn harness_turns_are_recognised_and_typed_prompts_are_not() {
+        for harness in [
+            "<system-reminder>\n[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>\n</system-reminder>",
+            "[SYSTEM NOTIFICATION - NOT USER INPUT] background job finished",
+            "[queued] [SYSTEM NOTIFICATION - NOT USER INPUT] background job finished",
+            "<local-command-caveat>Caveat: generated by local commands</local-command-caveat>",
+            "<cross-session-message from=\"uds:/tmp/x.sock\" from-name=\"peer\">feedback for you</cross-session-message>",
+        ] {
+            assert!(is_harness_turn(harness), "{harness}");
+        }
+        for typed in [
+            "why does the task notification hook fire twice?",
+            "fix the statusline badge count",
+            "continue",
+        ] {
+            assert!(!is_harness_turn(typed), "{typed}");
+        }
+    }
+
+    #[test]
+    fn early_exits_skip_the_index_and_searchable_prompts_do_not() {
+        assert_eq!(early_exit(""), Some(EarlyExit::Silent));
+        assert_eq!(
+            early_exit("<task-notification>\n<status>completed</status>\n</task-notification>"),
+            Some(EarlyExit::Silent)
+        );
+        assert_eq!(early_exit("/compact"), Some(EarlyExit::Silent));
+        assert_eq!(early_exit("ok"), Some(EarlyExit::Silent));
+        assert_eq!(early_exit("continue"), Some(EarlyExit::LineagePickup));
+        // A harness turn that happens to open with a continuation phrase stays silent.
+        assert_eq!(
+            early_exit("continue <task-notification>done</task-notification>"),
+            Some(EarlyExit::Silent)
+        );
+        assert!(exits_before_search(None));
+        assert!(exits_before_search(Some("continue")));
+        // Short but not a stock phrase: the intent classifier may route it to
+        // the Explore arm, which searches reflections.
+        for searched in [
+            "where is auth?",
+            "keep at it",
+            "fix the statusline badge count",
+        ] {
+            assert_eq!(early_exit(searched), None, "{searched}");
+            assert!(!exits_before_search(Some(searched)), "{searched}");
+        }
+    }
 
     #[test]
     fn continuation_prompt_boundaries() {

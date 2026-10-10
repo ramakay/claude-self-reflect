@@ -52,6 +52,14 @@ Everything else falls through to multi-signal scoring:
 
 500-token budget. Skips trivial prompts and slash commands.
 
+## Session story — kept current at each compaction
+
+A session's story is the short account later sessions read about it. After each compaction, SessionStart starts a detached `csr-engine generate-story --from-compaction`, which rebuilds the story from the summary Claude Code writes as it compacts. The new story replaces the old one, and CSR records how many of the session's messages it covers.
+
+By default CSR extracts the story from that summary: what was asked, then where the work stood. There is no model call. The summary has a blind spot, though. Claude Code keeps the last few messages verbatim after it, so the summary never sees how the work ended.
+
+Set `CSR_STORY_REWRITES=1` and Haiku writes the story instead. It reads the summary for the session's whole arc and the last 20 messages for where it stood. At SessionEnd it runs again, if you asked something since the last story, so the ending reaches the story too. Each is one metered `claude -p` call, about $0.003. On five long sessions, two blind judges ranked this telling first. The other four were the free extract, Haiku over a sample of messages, Haiku rewriting the earlier story, and Haiku over the summary alone.
+
 ## SessionEnd — Automatic Narrative
 
 Imports final transcript, runs V3 extraction, synthesizes session story locally (free), falls back to an AI narrative via `claude -p` if needed (model chain: `CSR_NARRATIVE_MODEL` → `haiku` → CLI default; every call metered, `CSR_NO_AI_NARRATIVES=1` disables).

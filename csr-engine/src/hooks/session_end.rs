@@ -70,8 +70,21 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             if !synthesized {
                 // Fallback: spawn detached Haiku story generation
                 let cwd_str = cwd.to_string_lossy().to_string();
-                crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
+                crate::summarizer::spawn_detached_story_generation(
+                    tp,
+                    &cwd_str,
+                    crate::summarizer::StoryMode::First,
+                );
             }
+        } else if has_story && !is_meta_session && crate::summarizer::story_rewrites_enabled() {
+            // Opt-in: Haiku takes in the work after the last compaction, if the story has
+            // fallen behind (the detached process decides)
+            let cwd_str = cwd.to_string_lossy().to_string();
+            crate::summarizer::spawn_detached_story_generation(
+                tp,
+                &cwd_str,
+                crate::summarizer::StoryMode::Rewrite,
+            );
         }
     }
 

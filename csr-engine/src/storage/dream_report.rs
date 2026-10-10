@@ -6,6 +6,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use super::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use crate::transcript::instrumentation::{ErrorEvent, SessionInstrumentation, SteerEvent};
 
 /// Bound on how many sessions a single shared-identity artifact carries in
@@ -362,20 +363,21 @@ pub(crate) fn load_story_sessions(conn: &Connection) -> Result<Vec<StorySession>
     }
 
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT ea.session_id, ea.project, ea.file, ea.name, ea.created_at,
                     COALESCE(julianday(ea.created_at), 0.0),
                     (SELECT v.receipt_oid
                      FROM witness_verdicts v
                      JOIN witness_ledger wl ON wl.id = v.witness_id
                      WHERE v.verdict = 'superseded_by'
+                       AND v.id > {LIVE_EVENT_FLOOR_SQL}
                        AND wl.project = ea.project
                        AND wl.file = ea.file
                        AND wl.symbol = ea.name
                      ORDER BY v.id DESC LIMIT 1)
              FROM episode_anchors ea
-             ORDER BY ea.created_at DESC, ea.id DESC",
-        )?;
+             ORDER BY ea.created_at DESC, ea.id DESC"
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -921,6 +923,46 @@ mod tests {
         assert!(sessions[0].artifacts.iter().any(|artifact| {
             artifact.file == "/repo/src/extra.rs" && artifact.symbol.is_none()
         }));
+    }
+
+    #[test]
+    fn story_artifact_receipts_ignore_events_at_or_below_the_floor() {
+        let conn = memory_db();
+        conn.execute_batch(
+            r#"
+            INSERT INTO episode_anchors
+                (session_id, project, file, node_kind, name, body_hash, created_at)
+            VALUES ('s1', 'proj', '/repo/src/lib.rs', 'function_item',
+                    'old_symbol', 'hash', '2026-01-03 01:00:00');
+            INSERT INTO witness_ledger
+                (project, file, symbol, span_start, span_end, stamp, tier,
+                 at_oid, source_kind, source_id)
+            VALUES ('proj', '/repo/src/lib.rs', 'old_symbol', 1, 3, 'b3:old',
+                    'committed', 'oldoid', 'backfill', 'oldoid');
+            INSERT INTO witness_verdicts
+                (witness_id, verdict, receipt_oid, observed_head_oid, created_at)
+            VALUES (1, 'superseded_by', '1234567890abcdef', 'head',
+                    '2026-01-03 02:00:00');
+            "#,
+        )
+        .unwrap();
+        let receipt = |conn: &Connection| {
+            load_story_sessions(conn).unwrap()[0]
+                .artifacts
+                .iter()
+                .find(|a| a.symbol.as_deref() == Some("old_symbol"))
+                .and_then(|a| a.superseded_receipt.clone())
+        };
+        assert_eq!(receipt(&conn).as_deref(), Some("1234567890abcdef"));
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        assert_eq!(receipt(&conn), None);
     }
 
     /// Regression for finding 7: two sessions sharing an anchor identity

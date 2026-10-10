@@ -23,10 +23,36 @@ const CREATE_CHUNKS_FTS_TRIGGERS: &str = "
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
     END;
-    CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+    CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
         INSERT INTO chunks_fts(chunks_fts, rowid, content)
         VALUES ('delete', old.rowid, old.content);
         INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+    END;
+";
+
+/// Keyword channel for reflections. `csr_reflect_on_past` fuses semantic and
+/// FTS5 ranks (RRF); with only `chunks_fts` on the keyword side a stored
+/// reflection could never earn a keyword rank and lost the fusion to any chunk
+/// present in both lists, even at cosine 1.0 (2026-09-22 probe, three
+/// `memory-archive` rows). A standard FTS5 table keyed by id, not an
+/// external-content one: `INSERT OR REPLACE` on `reflections` never fires the
+/// delete trigger for the row it replaces, so the triggers delete by id first.
+const CREATE_REFLECTIONS_FTS: &str = "
+    CREATE VIRTUAL TABLE IF NOT EXISTS reflections_fts USING fts5(
+        id UNINDEXED,
+        content,
+        tokenize='porter unicode61'
+    );
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_ai AFTER INSERT ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = new.id;
+        INSERT INTO reflections_fts(id, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_ad AFTER DELETE ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = old.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS reflections_fts_au AFTER UPDATE OF content ON reflections BEGIN
+        DELETE FROM reflections_fts WHERE id = old.id;
+        INSERT INTO reflections_fts(id, content) VALUES (new.id, new.content);
     END;
 ";
 
@@ -150,6 +176,58 @@ fn migrate_chunks_fts(conn: &Connection) -> Result<()> {
     verify_chunks_fts(conn)
 }
 
+fn chunks_fts_au_trigger_sql(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn is_content_scoped_au_trigger(sql: &str) -> bool {
+    let compact: String = sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.contains("afterupdateofcontenton")
+}
+
+/// Recreate `chunks_fts_au` scoped to `UPDATE OF content` if an
+/// already-migrated database still has the unscoped `AFTER UPDATE ON chunks`
+/// definition. `migrate_chunks_fts` above short-circuits once the
+/// external-content schema and a trigger COUNT of 3 already hold, so it never
+/// revisits an existing trigger's exact definition — this is a narrower,
+/// always-checked follow-up that does.
+///
+/// An unscoped trigger fires the delete+reinsert `chunks_fts` pair on every
+/// `UPDATE` to `chunks`, including timestamp-only restamps that never touch
+/// `content`. Measured on a `/tmp` clone: 280,775 timestamp-only restamp
+/// UPDATEs (`restamp_chunk_timestamp_if_content_matches`) grew
+/// `chunks_fts_data` from 51,745 blocks / 202.5 MB to 65,764 blocks /
+/// 257.2 MB (+54.6 MB, +27%) purely from re-inserting unchanged content.
+fn migrate_chunks_fts_au_content_scoped(conn: &Connection) -> Result<()> {
+    let Some(sql) = chunks_fts_au_trigger_sql(conn)? else {
+        // No chunks_fts_au trigger yet — migrate_chunks_fts (run earlier in
+        // `run()`) is responsible for creating the correct one from scratch.
+        return Ok(());
+    };
+    if is_content_scoped_au_trigger(&sql) {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "DROP TRIGGER chunks_fts_au;
+         CREATE TRIGGER chunks_fts_au AFTER UPDATE OF content ON chunks BEGIN
+             INSERT INTO chunks_fts(chunks_fts, rowid, content)
+             VALUES ('delete', old.rowid, old.content);
+             INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+         END;",
+    )?;
+    Ok(())
+}
+
 fn main_database_path(conn: &Connection) -> Result<Option<std::path::PathBuf>> {
     let path: String = conn.query_row(
         "SELECT file FROM pragma_database_list WHERE name = 'main'",
@@ -254,6 +332,59 @@ fn finish_chunks_fts_compaction(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Set the `witness_verdicts` v2 epoch floor exactly once.
+///
+/// Every event already in the table when the first binary with the fixed
+/// dream join opens a database was minted by the old buggy join (branch
+/// flapping, project-keyed anchors, one event per observed HEAD). The table is
+/// append-only, so those events stay, but the floor
+/// (`COALESCE(MAX(id), 0)` at that moment) retires them from every live
+/// reader — see `witness_verdicts::LIVE_EVENT_FLOOR_SQL`. A fresh database
+/// gets floor 0.
+///
+/// CHECK-THEN-INSERT: when the key already exists this performs a single
+/// read and NO write. Migrations that write on every open took the write lock
+/// in read-only hook processes and surfaced 'database is locked' (the
+/// a55e868 trigger-race fix); this must never regress into that shape.
+fn ensure_witness_verdicts_v2_floor(conn: &Connection) -> Result<()> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM meta WHERE key = ?1",
+            [super::witness_verdicts::LIVE_FLOOR_META_KEY],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+    // OR IGNORE: two processes racing the first open must not clobber each
+    // other (or fail) — whoever lands first sets the floor.
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value)
+         SELECT ?1, CAST(COALESCE(MAX(id), 0) AS TEXT) FROM witness_verdicts",
+        [super::witness_verdicts::LIVE_FLOOR_META_KEY],
+    )?;
+    Ok(())
+}
+
+/// Add `witness_verdicts.receipt_committed_at`: the receipt commit's
+/// committer time as RFC 3339 in the committer's OWN offset
+/// (`2026-09-12T22:57:11-07:00`), so a delivered conclusion can say when the
+/// change HAPPENED rather than when the dreamer noticed (`created_at`), dated
+/// the way `git log` dates it (first 10 chars). NULL on every event written
+/// before the column existed. Text order is NOT time order across offsets;
+/// `julianday()` normalizes the `+-HH:MM` suffix, so compare through it.
+///
+/// CHECK-THEN-ALTER: when the column exists this is one `pragma_table_info`
+/// read and NO write (see `ensure_witness_verdicts_v2_floor`).
+fn ensure_witness_verdicts_receipt_committed_at(conn: &Connection) -> Result<()> {
+    if !has_column(conn, "witness_verdicts", "receipt_committed_at")? {
+        conn.execute_batch("ALTER TABLE witness_verdicts ADD COLUMN receipt_committed_at TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Run all database migrations.
 pub fn run(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -304,6 +435,8 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON import_state(conversation_id);
         ",
     )?;
+
+    super::embedding_changes::migrate(conn)?;
 
     // Enrichment state — tracks per-conversation progressive enrichment
     conn.execute_batch(
@@ -405,6 +538,20 @@ pub fn run(conn: &Connection) -> Result<()> {
             supersedes     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_chunk_provenance_author ON chunk_provenance(author);
+
+        -- W3-B1 review#2 (HIGH): the transcript's own `entrypoint` field
+        -- (`cli`, `sdk-cli`, `sdk-*`, `claude-desktop`, ...), recorded once
+        -- per conversation at import time. Replaces
+        -- `session_registry`-absence as the headless signal for
+        -- `queries::filter_unregistered_conversation_rows` — registry
+        -- absence only ever meant \"never typed a prompt through
+        -- history.jsonl\", which is also true of a real interactive session
+        -- history.jsonl never recorded. Missing here (never populated, or
+        -- pre-dates this column) means \"unknown\", not \"headless\".
+        CREATE TABLE IF NOT EXISTS conversation_entrypoint (
+            conversation_id TEXT PRIMARY KEY,
+            entrypoint      TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS derivation_ledger (
             id           TEXT NOT NULL,
@@ -781,6 +928,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
     migrate_chunks_fts(conn)?;
+    migrate_chunks_fts_au_content_scoped(conn)?;
 
     // Engine metadata KV — caches expensive computed state (e.g. integrity_check
     // results, which cost ~10s on multi-GB DBs and must not run per status call).
@@ -855,6 +1003,20 @@ pub fn run(conn: &Connection) -> Result<()> {
         if !already_purged {
             conn.execute_batch("DELETE FROM session_instrumentation;")?;
             crate::storage::queries::set_meta(conn, "steer_noise_filter_v2", "1")?;
+        }
+    }
+
+    // Keyword index over reflections (see `CREATE_REFLECTIONS_FTS`). One-shot
+    // per database: create the table and triggers, then backfill every row
+    // that already exists; the triggers keep it current from then on.
+    {
+        let installed = crate::storage::queries::get_meta(conn, "reflections_fts_v1")?.is_some();
+        if !installed {
+            conn.execute_batch(CREATE_REFLECTIONS_FTS)?;
+            conn.execute_batch(
+                "INSERT INTO reflections_fts(id, content) SELECT id, content FROM reflections;",
+            )?;
+            crate::storage::queries::set_meta(conn, "reflections_fts_v1", "1")?;
         }
     }
 
@@ -1101,8 +1263,14 @@ pub fn run(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_witness_ledger_identity ON witness_ledger (project, file, COALESCE(symbol,''), COALESCE(span_start,-1), COALESCE(span_end,-1), stamp, tier, COALESCE(at_oid,''), source_kind, COALESCE(source_id,''));
-        CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);",
+        CREATE INDEX IF NOT EXISTS idx_witness_ledger_lookup ON witness_ledger(project, file, symbol);
+        CREATE INDEX IF NOT EXISTS idx_witness_ledger_file_symbol ON witness_ledger(file, symbol, at_oid);",
     )?;
+    // `idx_witness_ledger_file_symbol` serves the project-agnostic anchor
+    // probes (the HEAD-stamp / intact lookups and the correlated EXISTS in
+    // the verdict-state readers): they match on (file, symbol[, at_oid])
+    // with no project, and both indexes above lead with `project`, so
+    // without it each probe scanned the whole ledger.
 
     // Mutable publication bookkeeping for append-only witness evidence.
     // `witness_ledger` itself remains immutable: a re-derivation run first
@@ -1144,23 +1312,28 @@ pub fn run(conn: &Connection) -> Result<()> {
     // (both close the same class of "accidental new state, never validated"
     // bug at the DB layer, not just by convention). `successor_witness_id` is
     // set only for `superseded_by` (the OLDER witness's replacement); NULL for
-    // `anchor_obsolete`/`anchor_reinstated`. `receipt_oid` is the commit proving
-    // the verdict (the successor's `at_oid` for `superseded_by`, else the HEAD
-    // oid observed when the dream cycle ran). `observed_head_oid` is NOT NULL —
+    // `anchor_obsolete`/`anchor_reinstated`. `receipt_oid` is the commit that
+    // MADE the change, found in git history by `dream::receipt` (the first
+    // commit that deleted the symbol / changed its normalized content / restored
+    // it) -- never the observed HEAD and never the successor witness's `at_oid`.
+    // Events minted before the v2 epoch floor used those stand-ins and are
+    // retired (see `witness_verdicts::LIVE_EVENT_FLOOR_SQL`). `observed_head_oid` is NOT NULL —
     // every event is anchored to the HEAD commit the dream cycle that minted it
     // saw (per-repo HEAD when a run visits multiple repos), never wall-clock
     // time.
     //
     // Idempotency is APP-SIDE ONLY (`witness_verdicts::insert_verdict_if_changed`):
-    // before inserting, the writer reads the LATEST event for that witness and
-    // skips iff the candidate is identical in (verdict, successor_witness_id,
-    // receipt_oid, observed_head_oid). There is deliberately NO UNIQUE identity
+    // before inserting, the writer reads the LATEST live event for that witness
+    // and skips iff the candidate has the same VERDICT KIND (event identity is
+    // the verdict kind only: the same conclusion at a newer observed_head_oid,
+    // receipt_oid or successor is not a new event). There is deliberately NO UNIQUE identity
     // index on this table: event history legitimately re-visits earlier states
     // (B -> A -> B: superseded, reinstated, superseded again with the exact
     // same fields as the first event) and a UNIQUE index would silently swallow
     // the third event via `INSERT OR IGNORE`, freezing the witness's state at
     // "reinstated" forever. Only the LATEST event per witness matters, so
-    // "skip iff identical to latest" is the whole idempotency contract.
+    // "skip iff the latest has the same verdict kind" is the whole idempotency
+    // contract.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS witness_verdicts (
             id INTEGER PRIMARY KEY,
@@ -1182,6 +1355,9 @@ pub fn run(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_witness_chunk_bindings_chunk
             ON witness_chunk_bindings(chunk_id);",
     )?;
+
+    ensure_witness_verdicts_receipt_committed_at(conn)?;
+    ensure_witness_verdicts_v2_floor(conn)?;
 
     // Recap normalizes SQLite and RFC3339 timestamps through julianday(). This
     // partial covering index matches that expression and the feed's newest-
@@ -1672,11 +1848,20 @@ pub fn run(conn: &Connection) -> Result<()> {
              ADD COLUMN distinct_session_count INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
-    conn.execute(
-        "UPDATE rerank_models SET curated_veto_epsilon = ?1
-         WHERE curated_veto_epsilon IS NULL",
-        [super::trained_rerank::CURATED_VETO_EPSILON],
+    // Probe first: an UPDATE takes the write lock even when no row matches,
+    // and this runs on every storage open.
+    let unset_epsilon: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rerank_models WHERE curated_veto_epsilon IS NULL)",
+        [],
+        |row| row.get(0),
     )?;
+    if unset_epsilon {
+        conn.execute(
+            "UPDATE rerank_models SET curated_veto_epsilon = ?1
+             WHERE curated_veto_epsilon IS NULL",
+            [super::trained_rerank::CURATED_VETO_EPSILON],
+        )?;
+    }
 
     // Dream backfill (`.plans/dream-backfill-design.md`, Stage 0 + the D3/D4
     // round-2 deltas in its §8, which bind over §3-6 wherever they conflict)
@@ -1849,6 +2034,44 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_identity_v2(conn)?;
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
+    migrate_strip_memory_tag_from_derived_reflections(conn)?;
+    crate::import::scratch::migrate(conn)?;
+
+    // Reaction-judge shadow mode (src/reaction_shadow.rs): per-transcript scan
+    // state and one row per (human turn, model build). Written by the daemon
+    // only; nothing in the hook, search or injection path reads these tables.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS reaction_shadow_files (
+            path       TEXT PRIMARY KEY,
+            mtime_ns   INTEGER NOT NULL,
+            size       INTEGER NOT NULL,
+            entrypoint TEXT,
+            models     TEXT NOT NULL,
+            pairs      INTEGER NOT NULL DEFAULT 0,
+            complete   INTEGER NOT NULL DEFAULT 0,
+            scanned_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reaction_shadow_scores (
+            turn_uuid              TEXT NOT NULL,
+            model                  TEXT NOT NULL,
+            model_sha256           TEXT NOT NULL,
+            session_id             TEXT NOT NULL,
+            project_dir            TEXT NOT NULL,
+            ts                     TEXT,
+            p_correction           REAL NOT NULL,
+            p_acceptance           REAL NOT NULL,
+            n_tokens               INTEGER NOT NULL,
+            previous_human_request TEXT NOT NULL,
+            assistant_tail         TEXT NOT NULL,
+            human_turn             TEXT NOT NULL,
+            scored_at              TEXT NOT NULL,
+            PRIMARY KEY (turn_uuid, model_sha256)
+        );
+        CREATE INDEX IF NOT EXISTS idx_reaction_shadow_session
+            ON reaction_shadow_scores(session_id);
+        CREATE INDEX IF NOT EXISTS idx_reaction_shadow_ts
+            ON reaction_shadow_scores(ts);",
+    )?;
 
     finish_chunks_fts_compaction(conn)?;
 
@@ -2078,11 +2301,14 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
             BEFORE DELETE ON provenance_events WHEN OLD.channel='user_confirmation'
             BEGIN SELECT RAISE(ABORT,'confirmation events are immutable'); END;"
     )?;
-    // Only this cache may change. The complete preexisting intent payload and
-    // its transcript identity remain append-only, including nullable fields.
-    conn.execute_batch(
-        "DROP TRIGGER IF EXISTS intent_events_no_update;
-        CREATE TRIGGER intent_events_no_update BEFORE UPDATE ON intent_events
+    migrate_intent_events_no_update_scoped(conn)
+}
+
+/// Only the `min_trust` cache may change. The complete preexisting intent
+/// payload and its transcript identity remain append-only, including nullable
+/// fields.
+const INTENT_EVENTS_NO_UPDATE_SCOPED: &str =
+    "CREATE TRIGGER intent_events_no_update BEFORE UPDATE ON intent_events
         WHEN NEW.id IS NOT OLD.id OR NEW.session_id IS NOT OLD.session_id
           OR NEW.project IS NOT OLD.project OR NEW.turn IS NOT OLD.turn
           OR NEW.kind IS NOT OLD.kind OR NEW.quote IS NOT OLD.quote
@@ -2093,8 +2319,115 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
           OR NEW.ts IS NOT OLD.ts OR NEW.created_at IS NOT OLD.created_at
           OR NEW.detector IS NOT OLD.detector OR NEW.classifier_score IS NOT OLD.classifier_score
           OR NEW.marker IS NOT OLD.marker
-        BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END;",
+        BEGIN SELECT RAISE(ABORT,'intent_events is append-only'); END";
+
+fn intent_events_no_update_is_scoped(conn: &Connection) -> Result<bool> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'intent_events_no_update'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let compact = |sql: &str| -> String { sql.split_whitespace().collect() };
+    Ok(sql.is_some_and(|sql| compact(&sql) == compact(INTENT_EVENTS_NO_UPDATE_SCOPED)))
+}
+
+/// Replace the blanket `intent_events_no_update` with the column-scoped one,
+/// once. Every hook process runs these migrations on open, several at a time
+/// at session start, so this must be a pure read on a database that already
+/// has the scoped trigger: an unconditional DROP+CREATE here raced between
+/// concurrent opens ("trigger intent_events_no_update already exists") and
+/// made every open wait for the write lock behind the daemon ("database is
+/// locked"). The rewrite itself runs under `BEGIN IMMEDIATE` and re-checks the
+/// shape once it holds the lock, so concurrent first upgrades serialize and
+/// only the first one writes.
+fn migrate_intent_events_no_update_scoped(conn: &Connection) -> Result<()> {
+    if intent_events_no_update_is_scoped(conn)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let rewrite = (|| -> Result<()> {
+        if intent_events_no_update_is_scoped(conn)? {
+            return Ok(());
+        }
+        conn.execute_batch(&format!(
+            "DROP TRIGGER IF EXISTS intent_events_no_update;
+             {INTENT_EVENTS_NO_UPDATE_SCOPED};"
+        ))?;
+        Ok(())
+    })();
+    match rewrite {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Meta key gating [`migrate_strip_memory_tag_from_derived_reflections`] so it
+/// scans `reflections` once rather than on every startup.
+const STRIP_MEMORY_TAG_FROM_DERIVED_KEY: &str = "strip_csr_memory_tag_from_derived_reflections_v1";
+
+/// One-shot repair for the bug where `store_reflection`'s explicit-memory
+/// stamp (`csr:memory`) leaked onto pipeline-derived reflections (stories,
+/// episodes, briefings, cache rows, `narrative_*` extractions) because they
+/// shared the same insert path. A derived tag on a row means it was never a
+/// deliberate memory write; strip the stamp so `is_explicit_memory` /
+/// `reflection_recall_standing` stop granting it unearned user standing (the
+/// live 2026-09-22 case: reflection `3e4c5285`, tagged `session_story` +
+/// `csr:memory`, scored `adj 0.994 = cos 0.494 + user 0.50`).
+///
+/// Gated by [`STRIP_MEMORY_TAG_FROM_DERIVED_KEY`] so the scan runs once, not
+/// on every `migrations::run`. Also naturally idempotent: a second run (e.g.
+/// after a manual meta-row reset) only ever re-examines rows that still
+/// contain the literal tag string, and stripping an already-stripped tag is a
+/// no-op.
+fn migrate_strip_memory_tag_from_derived_reflections(conn: &Connection) -> Result<()> {
+    let already_done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [STRIP_MEMORY_TAG_FROM_DERIVED_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_done.is_some() {
+        return Ok(());
+    }
+    let memory_tag = crate::mcp::tools::EXPLICIT_MEMORY_TAG;
+    let mut stmt =
+        conn.prepare("SELECT id, tags FROM reflections WHERE tags LIKE '%' || ?1 || '%'")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([memory_tag], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut repaired = 0i64;
+    for (id, tags_json) in rows {
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if !crate::mcp::tools::has_derived_reflection_tag(&tags) {
+            continue;
+        }
+        let stripped: Vec<String> = tags.into_iter().filter(|t| t != memory_tag).collect();
+        let stripped_json = serde_json::to_string(&stripped)?;
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = ?2",
+            rusqlite::params![stripped_json, id],
+        )?;
+        repaired += 1;
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![STRIP_MEMORY_TAG_FROM_DERIVED_KEY, repaired.to_string()],
     )?;
+    if repaired > 0 {
+        tracing::info!(
+            repaired,
+            "migrate_strip_memory_tag_from_derived_reflections: stripped csr:memory from derived rows"
+        );
+    }
     Ok(())
 }
 
@@ -2323,6 +2656,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(trigger_count, 3);
+    }
+
+    fn chunks_fts_data_block_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM chunks_fts_data", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn timestamp_only_update_does_not_touch_chunks_fts() {
+        // Break caught: an `AFTER UPDATE ON chunks` (any column) trigger
+        // fires the delete+reinsert pair into chunks_fts on every UPDATE,
+        // including ones that never touch `content` — e.g. the WP-A
+        // timestamp-restamp backfill. Scoping the trigger to
+        // `UPDATE OF content` must leave chunks_fts_data's block count
+        // unchanged across a timestamp-only UPDATE.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 ('c1', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta gamma delta', 1);",
+        )
+        .unwrap();
+        let before = chunks_fts_data_block_count(&conn);
+
+        conn.execute(
+            "UPDATE chunks SET timestamp = ?1 WHERE id = 'c1'",
+            ["2026-09-01T00:00:00Z"],
+        )
+        .unwrap();
+
+        let after = chunks_fts_data_block_count(&conn);
+        assert_eq!(
+            before, after,
+            "a timestamp-only UPDATE must not touch chunks_fts_data"
+        );
+        // Content still searchable and matches exactly once — the row
+        // itself was never deleted, just left alone.
+        assert_eq!(matching_live_ids(&conn, "alpha").len(), 1);
+
+        // A content UPDATE, by contrast, SHOULD still resync the index.
+        conn.execute(
+            "UPDATE chunks SET content = 'epsilon zeta' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "alpha").is_empty());
+        assert_eq!(matching_live_ids(&conn, "epsilon").len(), 1);
+    }
+
+    #[test]
+    fn legacy_unscoped_au_trigger_is_upgraded_to_content_scoped() {
+        // Simulates a database migrated before this fix: chunks_fts_au fires
+        // on ANY update. A later `run()` (which always calls
+        // migrate_chunks_fts_au_content_scoped, unlike migrate_chunks_fts
+        // itself, which short-circuits once the schema+trigger COUNT already
+        // match) must recreate it scoped to `UPDATE OF content` without
+        // losing FTS sync.
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER chunks_fts_au;
+             CREATE TRIGGER chunks_fts_au AFTER UPDATE ON chunks BEGIN
+                 INSERT INTO chunks_fts(chunks_fts, rowid, content)
+                 VALUES ('delete', old.rowid, old.content);
+                 INSERT INTO chunks_fts(rowid, content) VALUES (new.rowid, new.content);
+             END;",
+        )
+        .unwrap();
+        let legacy_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!is_content_scoped_au_trigger(&legacy_sql));
+
+        run(&conn).unwrap();
+
+        let upgraded_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'chunks_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            is_content_scoped_au_trigger(&upgraded_sql),
+            "sql was: {upgraded_sql}"
+        );
+
+        // Still functionally correct after the upgrade: content updates stay synced.
+        conn.execute_batch(
+            "INSERT INTO chunks
+                 (id, conversation_id, project_name, timestamp, content, message_count)
+             VALUES
+                 ('c1', 'conv-a', 'p', '2026-08-12T00:00:00Z', 'alpha beta', 1);",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE chunks SET content = 'gamma delta' WHERE id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert!(matching_live_ids(&conn, "alpha").is_empty());
+        assert_eq!(matching_live_ids(&conn, "gamma").len(), 1);
     }
 
     #[test]
@@ -2684,6 +3125,89 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    // ---- migrations on an up-to-date database write nothing ----------------
+    //
+    // Every hook process opens storage, so `run` executes several times at
+    // session start (session-start, session-briefing, the MCP server) and on
+    // every prompt. An unconditional DROP+CREATE of `intent_events_no_update`
+    // made each of those opens a schema write: concurrent opens raced between
+    // the DROP and the CREATE ("trigger intent_events_no_update already
+    // exists"), and any open behind a long daemon write waited out the busy
+    // timeout and died with "database is locked".
+
+    #[test]
+    fn rerunning_migrations_on_a_migrated_database_leaves_the_schema_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("csr.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        run(&conn).unwrap();
+        let schema_version = |conn: &Connection| -> i64 {
+            conn.query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = schema_version(&conn);
+        run(&conn).unwrap();
+        assert_eq!(schema_version(&conn), before);
+    }
+
+    #[test]
+    fn migrations_on_a_migrated_database_do_not_wait_for_another_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("csr.db");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        run(&writer).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let opener = rusqlite::Connection::open(&path).unwrap();
+        opener.busy_timeout(std::time::Duration::ZERO).unwrap();
+        run(&opener).expect("an up-to-date database must migrate without the write lock");
+        writer.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn concurrent_upgrades_of_the_intent_trigger_all_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("csr.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+            run(&conn).unwrap();
+            // The pre-provenance shape every existing database starts from.
+            conn.execute_batch(
+                "DROP TRIGGER intent_events_no_update;
+                 CREATE TRIGGER intent_events_no_update
+                    BEFORE UPDATE ON intent_events
+                    BEGIN SELECT RAISE(ABORT, 'intent_events is append-only'); END;",
+            )
+            .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    conn.busy_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    barrier.wait();
+                    run(&conn).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().expect("concurrent migrations::run");
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("INSERT INTO intent_events(session_id,project,turn,kind,quote,transcript_path,byte_start,byte_end,classifier_hash,ts) VALUES('s','p',1,'correction','no','/a',0,2,'h','now');").unwrap();
+        conn.execute("UPDATE intent_events SET min_trust=3", [])
+            .expect("the upgraded trigger lets the trust cache change");
+        assert!(conn
+            .execute("UPDATE intent_events SET quote='yes'", [])
+            .is_err());
     }
 
     #[test]
@@ -3190,6 +3714,70 @@ mod tests {
         assert_eq!(count, 1, "verdict events must survive a migration rerun");
     }
 
+    fn floor_value(conn: &rusqlite::Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = 'witness_verdicts_v2_floor'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn insert_verdicts(conn: &rusqlite::Connection, n: usize) {
+        for _ in 0..n {
+            conn.execute(
+                "INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid) \
+                 VALUES (1, 'anchor_obsolete', 'deadbeef')",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn witness_verdicts_v2_floor_is_zero_on_a_fresh_database() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        assert_eq!(floor_value(&conn).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn witness_verdicts_v2_floor_is_set_once_to_the_max_event_id() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        // Simulate a pre-fix database: events exist, the key does not.
+        insert_verdicts(&conn, 3);
+        conn.execute(
+            "DELETE FROM meta WHERE key = 'witness_verdicts_v2_floor'",
+            [],
+        )
+        .unwrap();
+        run(&conn).unwrap();
+        assert_eq!(floor_value(&conn).as_deref(), Some("3"));
+
+        // Later events and later opens never move the floor.
+        insert_verdicts(&conn, 2);
+        run(&conn).unwrap();
+        assert_eq!(floor_value(&conn).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn witness_verdicts_v2_floor_step_performs_no_write_when_the_key_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        insert_verdicts(&conn, 2);
+        let before = conn.total_changes();
+        ensure_witness_verdicts_v2_floor(&conn).unwrap();
+        ensure_witness_verdicts_v2_floor(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "an existing floor must be read, never rewritten"
+        );
+        assert_eq!(floor_value(&conn).as_deref(), Some("0"));
+    }
+
     #[test]
     fn witness_verdicts_verdict_check_constraint_rejects_invalid_verdict() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -3661,5 +4249,126 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("No.".into(), "/tmp/child.jsonl".into(), None));
+    }
+
+    #[test]
+    fn strip_memory_tag_from_derived_reflections_repairs_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE reflections (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                tags TEXT DEFAULT '[]',
+                timestamp TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        let story_tags =
+            serde_json::to_string(&["session_story", "project_x", "csr:memory"]).unwrap();
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp)
+             VALUES ('story_1', 'a story', ?1, '2026-01-01T00:00:00Z')",
+            [&story_tags],
+        )
+        .unwrap();
+        let memory_tags = serde_json::to_string(&["acmecorp", "csr:memory"]).unwrap();
+        conn.execute(
+            "INSERT INTO reflections (id, content, tags, timestamp)
+             VALUES ('mem_1', 'a memory', ?1, '2026-01-01T00:00:00Z')",
+            [&memory_tags],
+        )
+        .unwrap();
+
+        migrate_strip_memory_tag_from_derived_reflections(&conn).unwrap();
+
+        let story_after: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='story_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let tags: Vec<String> = serde_json::from_str(&story_after).unwrap();
+        assert!(
+            !tags.iter().any(|t| t == "csr:memory"),
+            "derived row must lose the explicit-memory stamp: {tags:?}"
+        );
+        assert!(tags.iter().any(|t| t == "session_story"), "{tags:?}");
+
+        let memory_after: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='mem_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let memory_tags_after: Vec<String> = serde_json::from_str(&memory_after).unwrap();
+        assert!(
+            memory_tags_after.iter().any(|t| t == "csr:memory"),
+            "an explicit memory (no derived tag) must keep its stamp: {memory_tags_after:?}"
+        );
+
+        // Idempotency: re-adding the tag by hand and re-running must be a
+        // no-op — the meta key gates the scan to once.
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = 'story_1'",
+            [&story_tags],
+        )
+        .unwrap();
+        migrate_strip_memory_tag_from_derived_reflections(&conn).unwrap();
+        let story_after_second: String = conn
+            .query_row("SELECT tags FROM reflections WHERE id='story_1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            story_after_second, story_tags,
+            "second run is gated by the meta key and must not rescan"
+        );
+    }
+
+    #[test]
+    fn witness_verdicts_receipt_committed_at_is_added_to_an_old_table_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // A table as it existed before the column.
+        conn.execute_batch(
+            "CREATE TABLE witness_verdicts (
+                id INTEGER PRIMARY KEY,
+                witness_id INTEGER NOT NULL,
+                verdict TEXT NOT NULL,
+                successor_witness_id INTEGER,
+                receipt_oid TEXT,
+                observed_head_oid TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            INSERT INTO witness_verdicts (witness_id, verdict, observed_head_oid)
+            VALUES (1, 'anchor_obsolete', 'head');",
+        )
+        .unwrap();
+        assert!(!has_column(&conn, "witness_verdicts", "receipt_committed_at").unwrap());
+        ensure_witness_verdicts_receipt_committed_at(&conn).unwrap();
+        assert!(has_column(&conn, "witness_verdicts", "receipt_committed_at").unwrap());
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT receipt_committed_at FROM witness_verdicts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(existing, None, "old events stay NULL, never backfilled");
+    }
+
+    #[test]
+    fn witness_verdicts_receipt_committed_at_step_performs_no_write_when_the_column_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        assert!(has_column(&conn, "witness_verdicts", "receipt_committed_at").unwrap());
+        let before = conn.total_changes();
+        ensure_witness_verdicts_receipt_committed_at(&conn).unwrap();
+        ensure_witness_verdicts_receipt_committed_at(&conn).unwrap();
+        run(&conn).unwrap();
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "an existing column is only read"
+        );
     }
 }

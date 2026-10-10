@@ -657,7 +657,7 @@ fn build_transcript_index(
 /// Resolve `file`'s path relative to `repo_root`. `None` when `file` is not
 /// actually rooted under `repo_root` (e.g. a stale/mismatched `repo_root`
 /// value) — never a guess.
-fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
+pub(crate) fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
     Path::new(file)
         .strip_prefix(Path::new(repo_root))
         .ok()
@@ -671,7 +671,7 @@ fn relpath_in_repo(repo_root: &str, file: &str) -> Option<String> {
 /// linked worktree), an inherited `GIT_DIR` would silently override `-C`
 /// and point the command at the WRONG repository. This backfill always
 /// targets the explicit `repo_root` it resolved — never ambient state.
-fn git_at(repo_root: &str) -> Command {
+pub(crate) fn git_at(repo_root: &str) -> Command {
     let mut cmd = Command::new("git");
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("GIT_") {
@@ -1071,6 +1071,63 @@ fn qualify_one_symbol(containers: &[ContainerSpan], start: i64, end: i64, name: 
     }
 }
 
+/// AST-derived, container-qualified symbol spans of one committed file.
+/// `nodes[i]` is qualified as `symbols[i]`.
+pub(crate) struct RederivedSpans {
+    pub nodes: Vec<NodeRow>,
+    /// Exact `[start, end)` byte range of `nodes[i]`'s AST node.
+    pub byte_ranges: Vec<(usize, usize)>,
+    pub symbols: Vec<String>,
+    pub disambiguated: usize,
+}
+
+/// Re-derive a file's CURRENT symbol spans from its committed bytes with
+/// the production extractor, naming each one exactly as the HEAD
+/// stamp-spans pass names the `witness_ledger.symbol` it mints
+/// ([`qualify_witness_symbols`]). This is the single implementation behind
+/// both the HEAD pass and `dream::receipt` (which must look the same
+/// symbol up at arbitrary commits), so the two cannot drift.
+///
+/// `None` when the language is unsupported, the bytes are not UTF-8, or the
+/// parse is not clean — the caller must then treat the symbol's state as
+/// unknown, never as absent. Module sentinels are always dropped. `keep`
+/// filters the remaining nodes BEFORE qualification (the HEAD pass limits
+/// itself to `(kind,name)` anchors the code graph knows; `|_| true` keeps
+/// every definition).
+pub(crate) fn rederive_symbol_spans(
+    source_bytes: &[u8],
+    file: &str,
+    repo_root: &str,
+    project: &str,
+    at_oid: &str,
+    keep: &dyn Fn(&NodeRow) -> bool,
+) -> Option<RederivedSpans> {
+    let source = std::str::from_utf8(source_bytes).ok()?;
+    lang_from_path_str(file)?;
+    let fragment =
+        extract_graph_fragment_for_file(source, file, repo_root, project, at_oid, at_oid);
+    if !fragment.parse_clean {
+        return None;
+    }
+    let (nodes, byte_ranges): (Vec<NodeRow>, Vec<(usize, usize)>) = fragment
+        .nodes
+        .into_iter()
+        .zip(fragment.node_byte_ranges)
+        .filter(|(node, _)| node.kind != "module" && keep(node))
+        .unzip();
+    let defs: Vec<(String, String, i64, i64)> = nodes
+        .iter()
+        .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
+        .collect();
+    let (symbols, disambiguated) = qualify_witness_symbols(&defs, &fragment.containers);
+    Some(RederivedSpans {
+        nodes,
+        byte_ranges,
+        symbols,
+        disambiguated,
+    })
+}
+
 /// Open (discover) the git repository at `repo_root` and resolve its HEAD
 /// commit, once. `None` on any failure — not a git repository, `repo_root`
 /// no longer exists, or the repo has no commits yet (unborn HEAD) — the
@@ -1250,48 +1307,47 @@ fn stamp_spans_into_cancellable_with(
                 continue;
             }
         };
-        let source = std::str::from_utf8(&source_bytes).ok();
-        let lang = lang_from_path_str(&file);
         let anchor_keys: BTreeSet<(String, String)> = file_nodes
             .iter()
             .filter(|node| node.kind != "module")
             .map(|node| (node.kind.clone(), node.name.clone()))
             .collect();
-        let rederived = source.zip(lang).and_then(|(src, _)| {
-            let fragment = extract_graph_fragment_for_file(
-                src,
-                &file,
-                &repo_root,
-                &project,
-                &at_oid_str,
-                &at_oid_str,
-            );
-            fragment.parse_clean.then(|| {
-                let nodes = fragment
-                    .nodes
-                    .into_iter()
-                    .filter(|node| {
-                        node.kind != "module"
-                            && anchor_keys.contains(&(node.kind.clone(), node.name.clone()))
-                    })
-                    .collect::<Vec<_>>();
-                (nodes, fragment.containers)
-            })
-        });
-        let (stamp_nodes, containers, source_kind, is_rederived): (
+        // The `(kind,name)` filter to graph-known anchors lives HERE (it is a
+        // HEAD-pass policy); the extraction + qualification is the shared
+        // `rederive_symbol_spans`, which `dream::receipt` calls too so the
+        // symbol names it looks up are byte-identical to the ones minted.
+        let rederived = rederive_symbol_spans(
+            &source_bytes,
+            &file,
+            &repo_root,
+            &project,
+            &at_oid_str,
+            &|node| anchor_keys.contains(&(node.kind.clone(), node.name.clone())),
+        );
+        let (stamp_nodes, qualified_symbols, disambiguated, source_kind, is_rederived): (
             Vec<NodeRow>,
-            Vec<ContainerSpan>,
+            Vec<String>,
+            usize,
             &str,
             bool,
         ) = match rederived {
-            Some((nodes, containers)) => (nodes, containers, "backfill_rederived_v2", true),
-            None => (file_nodes.clone(), Vec::new(), "backfill", false),
+            Some(r) => (
+                r.nodes,
+                r.symbols,
+                r.disambiguated,
+                "backfill_rederived_v2",
+                true,
+            ),
+            None => {
+                let nodes = file_nodes.clone();
+                let defs: Vec<(String, String, i64, i64)> = nodes
+                    .iter()
+                    .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
+                    .collect();
+                let (symbols, disambiguated) = qualify_witness_symbols(&defs, &[]);
+                (nodes, symbols, disambiguated, "backfill", false)
+            }
         };
-        let defs: Vec<(String, String, i64, i64)> = stamp_nodes
-            .iter()
-            .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
-            .collect();
-        let (qualified_symbols, disambiguated) = qualify_witness_symbols(&defs, &containers);
         stats.disambiguated_symbols += disambiguated;
         let attribution_node_ids: Vec<Option<String>> = stamp_nodes
             .iter()
@@ -2390,6 +2446,33 @@ mod tests {
         );
         assert_eq!(symbols, ["left.shared", "right.shared"]);
         assert_eq!(disambiguated, 0);
+    }
+
+    #[test]
+    fn rederive_symbol_spans_qualifies_methods_and_abstains_when_unparseable() {
+        let src = b"struct Ab;\n\nimpl Ab {\n    fn is_empty(&self) -> bool {\n        true\n    }\n}\n\nfn free() {}\n";
+        let all = rederive_symbol_spans(src, "/r/a.rs", "/r", "p", "abc", &|_| true)
+            .expect("clean rust parse");
+        assert_eq!(all.nodes.len(), all.symbols.len());
+        assert!(
+            all.symbols.iter().any(|s| s == "Ab::is_empty"),
+            "{:?}",
+            all.symbols
+        );
+        assert!(all.symbols.iter().any(|s| s == "free"), "{:?}", all.symbols);
+        let only_free =
+            rederive_symbol_spans(src, "/r/a.rs", "/r", "p", "abc", &|n| n.name == "free").unwrap();
+        assert_eq!(only_free.symbols, ["free"]);
+        assert!(rederive_symbol_spans(src, "/r/notes.txt", "/r", "p", "abc", &|_| true).is_none());
+        assert!(rederive_symbol_spans(
+            &[0xff, 0xfe, 0x00, 0x01, 0x02],
+            "/r/a.rs",
+            "/r",
+            "p",
+            "abc",
+            &|_| true
+        )
+        .is_none());
     }
 
     #[test]

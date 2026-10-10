@@ -82,38 +82,116 @@ pub fn adjusted_score(c: &RankCandidate) -> f32 {
 
 /// Adjusted score for one candidate under `policy`. Higher ranks first.
 pub fn adjusted_score_with(c: &RankCandidate, policy: RankPolicy) -> f32 {
-    let mut s = c.cosine;
+    score_breakdown(c, policy).total
+}
 
-    if policy == RankPolicy::Recall && c.min_trust >= TrustTier::UserHistory {
-        s += W_USER;
-    }
-    if c.provenance
+/// Per-term decomposition of [`adjusted_score_with`], for diagnostics (WP-A's
+/// stage probe) that need to show WHY one candidate outranked another, not
+/// just the final number. `total` always equals what `adjusted_score_with`
+/// would return for the same `(candidate, policy)` — the primacy term is
+/// list-level (depends on every candidate, via [`primacy_conv`]) and is
+/// deliberately NOT part of this per-candidate breakdown; callers that need
+/// it should read it separately off `rerank_with`'s output.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreBreakdown {
+    pub cosine: f32,
+    /// `W_USER` when `policy == Recall` and the candidate clears the
+    /// UserHistory trust floor, else 0.
+    pub user_boost: f32,
+    /// `W_SUPERSEDES` when the candidate's provenance names a superseded
+    /// chunk, else 0.
+    pub supersedes_boost: f32,
+    /// `-W_MECHANIC_PENALTY` when `policy == Recall` and the content reads as
+    /// tool-mechanic plumbing (`[Edit:]`/`[Bash:]` etc.), else 0.
+    pub mechanic_penalty: f32,
+    /// `-W_SCAFFOLD_PENALTY` when the content reads as machine-assembled
+    /// prompt scaffolding, else 0.
+    pub scaffold_penalty: f32,
+    /// `-W_POISON_PENALTY` when a structurally-known below-user-floor
+    /// candidate asserts a correction/decision it has no standing to make,
+    /// else 0.
+    pub poison_penalty: f32,
+    /// Sum of every term above — identical to `adjusted_score_with`'s return
+    /// value for the same inputs (excludes the list-level primacy bonus).
+    pub total: f32,
+}
+
+/// Per-term breakdown of `adjusted_score_with(c, policy)`. See
+/// [`ScoreBreakdown`] for what each field means and what it excludes.
+pub fn score_breakdown(c: &RankCandidate, policy: RankPolicy) -> ScoreBreakdown {
+    let user_boost = if policy == RankPolicy::Recall && c.min_trust >= TrustTier::UserHistory {
+        W_USER
+    } else {
+        0.0
+    };
+    let supersedes_boost = if c
+        .provenance
         .as_ref()
         .and_then(|p| p.supersedes.as_deref())
         .is_some()
     {
-        s += W_SUPERSEDES;
-    }
-    if policy == RankPolicy::Recall && is_mechanic_text(&c.content) {
-        s -= W_MECHANIC_PENALTY;
-    }
-    if is_scaffold_text(&c.content) {
-        s -= W_SCAFFOLD_PENALTY;
-    }
+        W_SUPERSEDES
+    } else {
+        0.0
+    };
+    let mechanic_penalty = if policy == RankPolicy::Recall && is_mechanic_text(&c.content) {
+        -W_MECHANIC_PENALTY
+    } else {
+        0.0
+    };
+    let scaffold_penalty = if is_scaffold_text(&c.content) {
+        -W_SCAFFOLD_PENALTY
+    } else {
+        0.0
+    };
     // A structurally known below-user row asserting a correction/decision is
     // claiming authority it does not have. Unknown artifacts receive no user
     // boost, but C1 does not broaden this legacy text penalty to them.
-    if has_known_non_user_floor(c.min_trust) && is_authority_claim(&c.content) {
-        s -= W_POISON_PENALTY;
+    let poison_penalty = if has_known_non_user_floor(c.min_trust) && is_authority_claim(&c.content)
+    {
+        -W_POISON_PENALTY
+    } else {
+        0.0
+    };
+    let total = c.cosine
+        + user_boost
+        + supersedes_boost
+        + mechanic_penalty
+        + scaffold_penalty
+        + poison_penalty;
+    ScoreBreakdown {
+        cosine: c.cosine,
+        user_boost,
+        supersedes_boost,
+        mechanic_penalty,
+        scaffold_penalty,
+        poison_penalty,
+        total,
     }
-    s
+}
+
+/// The `W_PRIMACY` bonus `rerank_with` would add for `c`, given the
+/// conversation `origin` returned by [`primacy_conv`] over the same
+/// candidate set — 0 when `c` isn't in the origin conversation, isn't
+/// user-authored, or `origin` is `None`. Exposed (alongside `primacy_conv`)
+/// so diagnostics can report the full per-term score, list-level primacy
+/// term included, without reimplementing `rerank_with`'s scoring closure.
+pub fn primacy_boost(c: &RankCandidate, origin: Option<&str>) -> f32 {
+    match (origin, c.provenance.as_ref()) {
+        (Some(origin), Some(p))
+            if p.source_conv_id == origin && c.min_trust >= TrustTier::UserHistory =>
+        {
+            W_PRIMACY
+        }
+        _ => 0.0,
+    }
 }
 
 /// The conversation that gets the primacy boost, if any: among user-authored,
 /// non-scaffold candidates whose cosine sits within `PRIMACY_BAND` of the best
 /// cosine in the set, the conversation of the earliest chunk. That is the
 /// origin utterance; later comparably-relevant user chunks are restatements.
-fn primacy_conv(cands: &[RankCandidate]) -> Option<String> {
+pub fn primacy_conv(cands: &[RankCandidate]) -> Option<String> {
     // The band is anchored at the best ELIGIBLE candidate, not the best raw
     // cosine: scaffold echoes and unattributed chunks (provenance not yet
     // enriched — e.g. the currently-running session) routinely carry the top
@@ -154,15 +232,8 @@ pub fn rerank(cands: Vec<RankCandidate>) -> Vec<RankCandidate> {
 /// Re-rank candidates by adjusted score under `policy`, descending. Stable.
 pub fn rerank_with(mut cands: Vec<RankCandidate>, policy: RankPolicy) -> Vec<RankCandidate> {
     let origin = primacy_conv(&cands);
-    let score = |c: &RankCandidate| {
-        let mut s = adjusted_score_with(c, policy);
-        if let (Some(origin), Some(p)) = (origin.as_deref(), c.provenance.as_ref()) {
-            if p.source_conv_id == origin && c.min_trust >= TrustTier::UserHistory {
-                s += W_PRIMACY;
-            }
-        }
-        s
-    };
+    let score =
+        |c: &RankCandidate| adjusted_score_with(c, policy) + primacy_boost(c, origin.as_deref());
     cands.sort_by(|a, b| {
         score(b)
             .partial_cmp(&score(a))
@@ -292,6 +363,78 @@ mod tests {
 
         assert_eq!(adjusted_score(&aggregate_user), 0.5);
         assert!(adjusted_score(&trusted_row) > adjusted_score(&aggregate_user));
+    }
+
+    #[test]
+    fn score_breakdown_total_matches_adjusted_score_and_terms_are_individually_attributed() {
+        // WP-A's stage probe needs to show WHY one candidate outranked
+        // another (W_USER, mechanic, scaffold, poison), not just the final
+        // number — `total` must never drift from `adjusted_score_with`.
+        let decision = user_decision("d", 0.40);
+        let decision_breakdown = score_breakdown(&decision, RankPolicy::Recall);
+        assert_eq!(
+            decision_breakdown.total,
+            adjusted_score_with(&decision, RankPolicy::Recall)
+        );
+        assert_eq!(decision_breakdown.cosine, 0.40);
+        assert_eq!(decision_breakdown.user_boost, W_USER);
+        assert_eq!(decision_breakdown.supersedes_boost, W_SUPERSEDES);
+        assert_eq!(decision_breakdown.mechanic_penalty, 0.0);
+        assert_eq!(decision_breakdown.scaffold_penalty, 0.0);
+        assert_eq!(decision_breakdown.poison_penalty, 0.0);
+
+        let mechanic_cand = mechanic("m", 0.60);
+        let mechanic_breakdown = score_breakdown(&mechanic_cand, RankPolicy::Recall);
+        assert_eq!(
+            mechanic_breakdown.total,
+            adjusted_score_with(&mechanic_cand, RankPolicy::Recall)
+        );
+        assert_eq!(mechanic_breakdown.user_boost, 0.0);
+        assert_eq!(mechanic_breakdown.mechanic_penalty, -W_MECHANIC_PENALTY);
+        // Provenance policy skips the mechanic demotion entirely (defense-only).
+        let mechanic_provenance = score_breakdown(&mechanic_cand, RankPolicy::Provenance);
+        assert_eq!(mechanic_provenance.mechanic_penalty, 0.0);
+
+        let poison_cand = poison("p", 0.55);
+        let poison_breakdown = score_breakdown(&poison_cand, RankPolicy::Recall);
+        assert_eq!(poison_breakdown.poison_penalty, -W_POISON_PENALTY);
+        assert_eq!(
+            poison_breakdown.total,
+            adjusted_score_with(&poison_cand, RankPolicy::Recall)
+        );
+    }
+
+    #[test]
+    fn primacy_boost_matches_the_bonus_rerank_with_actually_applies() {
+        // `primacy_boost` is a public escape hatch so diagnostics can report
+        // the list-level primacy term per candidate without reimplementing
+        // rerank_with's scoring closure — it must return exactly the bonus
+        // that sorting order reflects.
+        let earlier = RankCandidate {
+            timestamp: Some("2026-01-01T00:00:00Z".into()),
+            ..user_decision("earlier", 0.50)
+        };
+        let mut later = user_decision("later", 0.52);
+        later.timestamp = Some("2026-01-02T00:00:00Z".into());
+        later.provenance = Some(ChunkProvenance {
+            author: Speaker::User,
+            source_conv_id: "later-conv".into(),
+            supersedes: None,
+        });
+
+        let cands = vec![earlier.clone(), later.clone()];
+        let origin = primacy_conv(&cands);
+        assert_eq!(origin.as_deref(), Some("0bab445f")); // earlier's source_conv_id
+
+        assert_eq!(primacy_boost(&earlier, origin.as_deref()), W_PRIMACY);
+        assert_eq!(primacy_boost(&later, origin.as_deref()), 0.0);
+        assert_eq!(primacy_boost(&earlier, None), 0.0);
+
+        let reranked = rerank(cands);
+        assert_eq!(
+            reranked[0].id, "earlier",
+            "primacy_boost must agree with rerank's own ordering"
+        );
     }
 
     fn user_decision(id: &str, cosine: f32) -> RankCandidate {

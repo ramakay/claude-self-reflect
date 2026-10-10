@@ -45,6 +45,205 @@ fn flush_is_due(last_flush: Option<Instant>, now: Instant) -> bool {
     }
 }
 
+/// Backoff schedule (seconds) for a file whose import keeps failing with
+/// `database is locked`/`database is busy`. Index is `attempts - 1`; once
+/// `attempts` exceeds this schedule's length the file is dropped with a WARN
+/// instead of retried again — a session's final append must eventually be
+/// declared lost rather than retried forever against a database another
+/// process holds indefinitely.
+const BUSY_RETRY_BACKOFF_SECS: [u64; 5] = [5, 15, 45, 120, 300];
+
+/// Meta counter keys surfaced by `csr-engine status`. See `Storage::bump_meta_counter_by`.
+pub(crate) const BUSY_RETRIES_COUNTER: &str = "watcher_import_busy_retries";
+pub(crate) const BUSY_GAVE_UP_COUNTER: &str = "watcher_import_busy_gave_up";
+
+/// Per-file retry bookkeeping for the watcher's busy-import backoff.
+///
+/// `next_at` deliberately uses `tokio::time::Instant`, not `std::time::Instant`
+/// (unlike `last_flush`/`flush_is_due` elsewhere in this file): it is compared
+/// against and slept on via `tokio::time::sleep_until` in the same select loop,
+/// and using tokio's clock end-to-end is what lets `tokio::time::pause` +
+/// `advance` drive both the sleep and the due-check deterministically in
+/// tests, instead of racing a paused virtual clock against the real OS clock.
+#[derive(Debug, Clone)]
+pub(crate) struct RetryState {
+    /// Number of busy failures seen for this path so far.
+    attempts: u32,
+    /// When this path becomes due for its next retry attempt.
+    next_at: tokio::time::Instant,
+}
+
+/// Outcome of one `process_batch` pass, for the caller to persist counters
+/// and log — kept structured rather than side-effecting so the function stays
+/// unit-testable without a `Storage`.
+#[derive(Debug, Default)]
+pub(crate) struct BatchOutcome {
+    /// Paths that imported successfully this pass (including ones that had
+    /// previously been retried).
+    pub imported: Vec<PathBuf>,
+    /// Busy-failure count observed this pass (may exceed `imported.len()` +
+    /// `gave_up.len()` since a path can fail more than once across the whole
+    /// retry lifetime, just not within a single pass).
+    pub busy_retries: u64,
+    /// Paths that exhausted `BUSY_RETRY_BACKOFF_SECS` and were dropped.
+    pub gave_up: Vec<PathBuf>,
+}
+
+/// Import every path in `paths` via `import`, applying the busy-retry
+/// backoff policy to `retry_map`. A path that fails with
+/// `scrub::is_database_busy` is requeued with exponential backoff (see
+/// `BUSY_RETRY_BACKOFF_SECS`) instead of being dropped on first failure — the
+/// bug this closes: a sidechain's last append hitting `SQLITE_BUSY` used to
+/// be gone for good, because no later notify event would ever re-trigger it.
+/// Any other error keeps the previous log-and-drop behaviour.
+///
+/// `import` is injected so this is testable without spinning up a real
+/// `Storage`/`EmbeddingEngine`/`SearchEngine` — the production caller passes
+/// `|path| self.import_file(&path)`.
+pub(crate) async fn process_batch<F, Fut>(
+    paths: impl IntoIterator<Item = PathBuf>,
+    mut import: F,
+    retry_map: &mut HashMap<PathBuf, RetryState>,
+) -> BatchOutcome
+where
+    F: FnMut(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut outcome = BatchOutcome::default();
+    for path in paths {
+        match import(path.clone()).await {
+            Ok(()) => {
+                retry_map.remove(&path);
+                outcome.imported.push(path);
+            }
+            Err(e) if crate::import::scrub::is_database_busy(&e) => {
+                outcome.busy_retries += 1;
+                let entry = retry_map.entry(path.clone()).or_insert(RetryState {
+                    attempts: 0,
+                    next_at: tokio::time::Instant::now(),
+                });
+                entry.attempts += 1;
+                if entry.attempts as usize > BUSY_RETRY_BACKOFF_SECS.len() {
+                    tracing::warn!(
+                        file = %path.display(),
+                        attempts = entry.attempts,
+                        "giving up on busy import after max retries"
+                    );
+                    retry_map.remove(&path);
+                    outcome.gave_up.push(path);
+                } else {
+                    let backoff = BUSY_RETRY_BACKOFF_SECS[entry.attempts as usize - 1];
+                    entry.next_at = tokio::time::Instant::now() + Duration::from_secs(backoff);
+                    tracing::debug!(
+                        file = %path.display(),
+                        attempts = entry.attempts,
+                        backoff_secs = backoff,
+                        "requeueing import after database busy"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "failed to import file"
+                );
+                retry_map.remove(&path);
+            }
+        }
+    }
+    outcome
+}
+
+/// The earliest `next_at` across every path still pending retry, or `None`
+/// when nothing is queued — the watcher loop's `tokio::select!` sleeps until
+/// this so a due retry runs even without a fresh notify event.
+fn earliest_retry(retry_map: &HashMap<PathBuf, RetryState>) -> Option<tokio::time::Instant> {
+    retry_map.values().map(|state| state.next_at).min()
+}
+
+/// Sleep until `deadline`, or block forever when `None` — lets the watcher's
+/// `tokio::select!` treat "no retries pending" and "waiting for a real
+/// retry" uniformly against the same branch.
+async fn sleep_until_or_pending(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Waits for either a fresh notify event (then collects more within the
+/// `DEBOUNCE_SECS` window) or the earliest due busy-retry deadline, then
+/// merges any `retry_map` paths whose `next_at` has elapsed into the
+/// returned batch — including when no fresh notify event arrived at all.
+///
+/// This merge-on-wake is the mechanism that lets a busy retry fire without a
+/// new file write (the gap-G1 bug: a session's last append hitting
+/// `SQLITE_BUSY` used to be gone for good, because nothing else would ever
+/// touch that file again to re-trigger the notify path). Factored out of
+/// `run` so it is unit-testable under `tokio::time::pause` without a real
+/// `notify::Watcher` — see `wake_on_retry_without_new_notify_event` below.
+///
+/// Returns `None` when the notify channel has closed (the caller should
+/// stop the watcher loop).
+async fn wait_for_batch(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+    retry_map: &HashMap<PathBuf, RetryState>,
+) -> Option<HashSet<PathBuf>> {
+    let mut pending: HashSet<PathBuf> = HashSet::new();
+
+    // Wait for the first event OR the earliest due busy-retry — a retry
+    // must run even when no new notify event ever arrives.
+    let retry_deadline = earliest_retry(retry_map);
+    tokio::select! {
+        received = rx.recv() => {
+            match received {
+                Some(path) => {
+                    pending.insert(path);
+
+                    // Collect more events within the debounce window
+                    let deadline = tokio::time::Instant::now()
+                        + tokio::time::Duration::from_secs(DEBOUNCE_SECS);
+                    loop {
+                        let timeout = tokio::time::timeout_at(deadline, rx.recv());
+                        match timeout.await {
+                            Ok(Some(path)) => {
+                                pending.insert(path);
+                            }
+                            Ok(None) => {
+                                // Channel closed
+                                break;
+                            }
+                            Err(_) => {
+                                // Timeout — debounce window expired
+                                break;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    tracing::info!("file watcher channel closed, stopping");
+                    return None;
+                }
+            }
+        }
+        _ = sleep_until_or_pending(retry_deadline) => {
+            // Woken purely to service a due retry — merged in below.
+        }
+    }
+
+    // Merge in any busy-retry paths that are due now, whether or not a
+    // fresh event also arrived this iteration.
+    let now_instant = tokio::time::Instant::now();
+    for (path, state) in retry_map {
+        if state.next_at <= now_instant {
+            pending.insert(path.clone());
+        }
+    }
+
+    Some(pending)
+}
+
 /// Watches the Claude projects directory for new JSONL files and auto-imports them.
 pub struct FileWatcher {
     projects_dir: PathBuf,
@@ -121,39 +320,11 @@ impl FileWatcher {
 
         // Debounce loop: collect changed files over DEBOUNCE_SECS, then process
         let mut last_flush: Option<Instant> = None;
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
         loop {
-            let mut pending: HashSet<PathBuf> = HashSet::new();
-
-            // Wait for the first event
-            match rx.recv().await {
-                Some(path) => {
-                    pending.insert(path);
-                }
-                None => {
-                    tracing::info!("file watcher channel closed, stopping");
-                    break;
-                }
-            }
-
-            // Collect more events within the debounce window
-            let deadline =
-                tokio::time::Instant::now() + tokio::time::Duration::from_secs(DEBOUNCE_SECS);
-            loop {
-                let timeout = tokio::time::timeout_at(deadline, rx.recv());
-                match timeout.await {
-                    Ok(Some(path)) => {
-                        pending.insert(path);
-                    }
-                    Ok(None) => {
-                        // Channel closed
-                        break;
-                    }
-                    Err(_) => {
-                        // Timeout — debounce window expired
-                        break;
-                    }
-                }
-            }
+            let Some(pending) = wait_for_batch(&mut rx, &retry_map).await else {
+                break;
+            };
 
             // Process all pending files
             if !pending.is_empty() {
@@ -162,13 +333,26 @@ impl FileWatcher {
                     None => None,
                 };
                 tracing::info!(count = pending.len(), "processing new/modified JSONL files");
-                for file_path in &pending {
-                    if let Err(e) = self.import_file(file_path).await {
-                        tracing::warn!(
-                            file = %file_path.display(),
-                            error = %e,
-                            "failed to import file"
-                        );
+                let outcome = process_batch(
+                    pending.iter().cloned(),
+                    |path| async move { self.import_file(&path).await },
+                    &mut retry_map,
+                )
+                .await;
+                if outcome.busy_retries > 0 {
+                    if let Err(e) = self
+                        .storage
+                        .bump_meta_counter_by(BUSY_RETRIES_COUNTER, outcome.busy_retries)
+                    {
+                        tracing::warn!(error = %e, "failed to persist watcher busy-retry counter");
+                    }
+                }
+                if !outcome.gave_up.is_empty() {
+                    if let Err(e) = self
+                        .storage
+                        .bump_meta_counter_by(BUSY_GAVE_UP_COUNTER, outcome.gave_up.len() as u64)
+                    {
+                        tracing::warn!(error = %e, "failed to persist watcher busy-gave-up counter");
                     }
                 }
 
@@ -212,185 +396,223 @@ impl FileWatcher {
     }
 
     /// Import a single JSONL file: parse → embed → store → index.
+    ///
+    /// Thin wrapper over [`import_file_content_diff`] — see that function's
+    /// docs for why the diff shape matters (gap-G1 high finding: the
+    /// catch-up sweep must use this exact path, not `Engine::import_file`'s
+    /// count-incremental one, or a busy-dropped final append that only grows
+    /// the last chunk gets stamped as reimported without ever being
+    /// re-embedded).
     async fn import_file(&self, file_path: &Path) -> Result<()> {
-        // Security: resolve symlinks and verify the file is within our projects directory
-        let canonical = file_path
-            .canonicalize()
-            .context("failed to canonicalize import path")?;
-        let canonical_base = self
-            .projects_dir
-            .canonicalize()
-            .context("failed to canonicalize projects dir")?;
-        if !canonical.starts_with(&canonical_base) {
-            tracing::warn!(
-                file = %file_path.display(),
-                resolved = %canonical.display(),
-                "refusing to import file outside projects directory (symlink or traversal)"
-            );
-            return Ok(());
-        }
-
-        let attribution =
-            import::derive_conversation_attribution_canonical(&canonical_base, &canonical);
-        let conv_id = file_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if let Some(parent) = attribution.parent_conversation_id.as_deref() {
-            self.storage.rescope_sidechain_conversation(
-                &conv_id,
-                &attribution.project_name,
-                parent,
-            )?;
-        }
-
-        // Skip if already imported
-        if self.storage.is_file_imported(file_path)? {
-            return Ok(());
-        }
-
-        let parent_context = attribution
-            .parent_conversation_id
-            .as_deref()
-            .map(|parent_id| {
-                let message_key = import::sidechain_parent_message_key(file_path);
-                self.storage
-                    .parent_provenance_context(parent_id, message_key.as_deref())
-            })
-            .transpose()?;
-        let parsed = import::parse_jsonl_file_with_stats_and_parent(
+        import_file_content_diff(
+            &self.storage,
+            &self.embeddings,
+            &self.search,
+            &self.projects_dir,
             file_path,
-            &attribution.project_name,
-            parent_context.as_ref(),
-        )?;
-        let import::ParsedConversation {
-            chunks,
-            suppression,
-            evidence,
-        } = parsed;
-        if chunks.is_empty() {
-            // Record the skip so this file isn't re-parsed every watcher pass
-            // and import_percent counts it as processed.
-            self.storage
-                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
-            return Ok(());
-        }
-
-        let chunk_count = chunks.len();
-
-        // Journal v4 P4b: bind any pasted dream prompt to the dream that
-        // produced it (same contract as `engine::import_file_with_attribution`
-        // — marker present or nothing is written).
-        import::dream_marker::bind_markers(&self.storage, &conv_id, &chunks);
-
-        // Batch embed and store — but only what actually changed.
-        //
-        // This is the live path, and it has no tail arithmetic: `is_file_imported`
-        // returns false on any mtime change, and Claude Code appends to the session
-        // JSONL after every message, so `parse_jsonl_file_with_stats` above re-derives
-        // EVERY chunk of the file every ~5s (DEBOUNCE_SECS) for the whole life of a
-        // session. Re-deriving is cheap; re-embedding and rewriting all N chunks is
-        // not, and it grows with the session. Only chunks that differ from the row
-        // already stored need work — appends change the final partial chunk and add
-        // new ones, leaving every earlier chunk byte-identical.
-        //
-        // Compared fields are the ones that decide what search returns: `content`
-        // (the indexed text), plus `project_name`/`is_sidechain`, which scope it.
-        // `summary`/`seq`/`timestamp` are deterministic re-derivations of the same
-        // prefix bytes, so they cannot drift without `content` drifting too.
-        let mut reindexed = 0usize;
-        let mut unchanged = 0usize;
-        for batch in chunks.chunks(BATCH_SIZE) {
-            let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
-            let stored: HashMap<String, ConversationChunk> = self
-                .storage
-                .get_chunks_by_ids(&ids)?
-                .into_iter()
-                .map(|chunk| (chunk.id.clone(), chunk))
-                .collect();
-            let pending: Vec<&ConversationChunk> = batch
-                .iter()
-                .filter(|chunk| needs_reindex(chunk, stored.get(&chunk.id)))
-                .collect();
-            unchanged += batch.len() - pending.len();
-            reindexed += pending.len();
-            if pending.is_empty() {
-                continue;
-            }
-
-            let texts: Vec<String> = pending.iter().map(|c| c.content.clone()).collect();
-            let emb = self.embeddings.clone();
-            let embeddings = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                emb.embed(&refs)
-            })
-            .await??;
-
-            let mut idx = self.search.write().await;
-            for (chunk, embedding) in pending.iter().zip(embeddings) {
-                self.storage
-                    .insert_chunk_with_source(chunk, &embedding, attribution.source)?;
-                if let Err(error) = self.storage.insert_chunk_provenance(
-                    &chunk.id,
-                    &crate::provenance::ChunkProvenance {
-                        author: chunk.author,
-                        source_conv_id: attribution
-                            .parent_conversation_id
-                            .clone()
-                            .unwrap_or_else(|| chunk.conversation_id.clone()),
-                        supersedes: None,
-                    },
-                ) {
-                    tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
-                }
-                if let Some(chunk_evidence) = evidence.get(&chunk.id) {
-                    self.storage.replace_chunk_evidence(chunk_evidence)?;
-                }
-                idx.insert_chunk(chunk.id.clone(), embedding);
-            }
-        }
-
-        self.storage
-            .mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
-        self.storage.relink_conversation(&conv_id)?;
-
-        // Layer 1: Heuristic enrichment (inline, instant, free)
-        if !self
-            .storage
-            .is_conversation_enriched(&conv_id, "heuristic")
-            .unwrap_or(false)
-        {
-            if let Err(e) = crate::extraction::heuristic::enrich_conversation(
-                file_path,
-                &conv_id,
-                &attribution.project_name,
-                &self.storage,
-                &self.embeddings,
-                &self.search,
-            )
-            .await
-            {
-                tracing::warn!(
-                    conv = %conv_id,
-                    error = %e,
-                    "heuristic enrichment failed (non-fatal)"
-                );
-            }
-        }
-
-        tracing::info!(
-            file = %file_path.display(),
-            chunks = chunk_count,
-            reindexed,
-            unchanged,
-            project = %attribution.project_name,
-            source = attribution.source,
-            "auto-imported conversation"
-        );
-
-        Ok(())
+        )
+        .await
     }
+}
+
+/// Import a single JSONL file: parse → embed → store → index, diffing every
+/// parsed chunk against what is already stored (see [`needs_reindex`])
+/// rather than trusting a stored chunk *count*.
+///
+/// This is deliberately a free function, not a method on `FileWatcher`: it is
+/// also the closure the daemon's `catchup_loop` calls per stale file (see
+/// `daemon::mod::catchup_loop`). Sharing this exact function is what makes
+/// the catch-up sweep safe to reimport a file whose last busy-dropped write
+/// only grew the transcript's final chunk — `Engine::import_file`'s
+/// `chunks[prev_count..]` incremental path treats `chunks.len() <= prev_count`
+/// as "nothing new" and just rewrites `file_mtime`, permanently stamping the
+/// stale row as current without ever re-embedding the grown tail. Diffing by
+/// content instead of count catches that case, because a grown final chunk's
+/// `id` (`uuid_v5(conversation_id, seq)`) is unchanged but its `content` is
+/// not — exactly what `needs_reindex` checks.
+pub(crate) async fn import_file_content_diff(
+    storage: &Storage,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    projects_dir: &Path,
+    file_path: &Path,
+) -> Result<()> {
+    // Security: resolve symlinks and verify the file is within our projects directory
+    let canonical = file_path
+        .canonicalize()
+        .context("failed to canonicalize import path")?;
+    let canonical_base = projects_dir
+        .canonicalize()
+        .context("failed to canonicalize projects dir")?;
+    if !canonical.starts_with(&canonical_base) {
+        tracing::warn!(
+            file = %file_path.display(),
+            resolved = %canonical.display(),
+            "refusing to import file outside projects directory (symlink or traversal)"
+        );
+        return Ok(());
+    }
+
+    let attribution =
+        import::derive_conversation_attribution_canonical(&canonical_base, &canonical);
+    let conv_id = file_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if let Some(parent) = attribution.parent_conversation_id.as_deref() {
+        storage.rescope_sidechain_conversation(&conv_id, &attribution.project_name, parent)?;
+    }
+
+    // Skip if already imported
+    if storage.is_file_imported(file_path)? {
+        return Ok(());
+    }
+
+    let parent_context = attribution
+        .parent_conversation_id
+        .as_deref()
+        .map(|parent_id| {
+            let message_key = import::sidechain_parent_message_key(file_path);
+            storage.parent_provenance_context(parent_id, message_key.as_deref())
+        })
+        .transpose()?;
+    let parsed = import::parse_jsonl_file_with_stats_and_parent(
+        file_path,
+        &attribution.project_name,
+        parent_context.as_ref(),
+    )?;
+    let import::ParsedConversation {
+        chunks,
+        suppression,
+        evidence,
+        entrypoint,
+    } = parsed;
+    if let Some(ep) = entrypoint.as_deref() {
+        storage.set_conversation_entrypoint(&conv_id, ep)?;
+    }
+    // Scratch scripts from Bash tool calls (never fatal to the import).
+    if let Err(e) =
+        import::scratch::index_transcript(storage, file_path, &conv_id, &attribution.project_name)
+    {
+        tracing::warn!(error = %e, "scratch script indexing failed");
+    }
+    if chunks.is_empty() {
+        // Record the skip so this file isn't re-parsed every watcher pass
+        // and import_percent counts it as processed.
+        storage.mark_file_imported_with_suppression(file_path, 0, suppression)?;
+        return Ok(());
+    }
+
+    let chunk_count = chunks.len();
+
+    // Journal v4 P4b: bind any pasted dream prompt to the dream that
+    // produced it (same contract as `engine::import_file_with_attribution`
+    // — marker present or nothing is written).
+    import::dream_marker::bind_markers(storage, &conv_id, &chunks);
+
+    // Batch embed and store — but only what actually changed.
+    //
+    // This is the live path, and it has no tail arithmetic: `is_file_imported`
+    // returns false on any mtime change, and Claude Code appends to the session
+    // JSONL after every message, so `parse_jsonl_file_with_stats` above re-derives
+    // EVERY chunk of the file every ~5s (DEBOUNCE_SECS) for the whole life of a
+    // session. Re-deriving is cheap; re-embedding and rewriting all N chunks is
+    // not, and it grows with the session. Only chunks that differ from the row
+    // already stored need work — appends change the final partial chunk and add
+    // new ones, leaving every earlier chunk byte-identical.
+    //
+    // Compared fields are the ones that decide what search returns: `content`
+    // (the indexed text), plus `project_name`/`is_sidechain`, which scope it.
+    // `summary`/`seq`/`timestamp` are deterministic re-derivations of the same
+    // prefix bytes, so they cannot drift without `content` drifting too.
+    let mut reindexed = 0usize;
+    let mut unchanged = 0usize;
+    for batch in chunks.chunks(BATCH_SIZE) {
+        let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
+        let stored: HashMap<String, ConversationChunk> = storage
+            .get_chunks_by_ids(&ids)?
+            .into_iter()
+            .map(|chunk| (chunk.id.clone(), chunk))
+            .collect();
+        let pending: Vec<&ConversationChunk> = batch
+            .iter()
+            .filter(|chunk| needs_reindex(chunk, stored.get(&chunk.id)))
+            .collect();
+        unchanged += batch.len() - pending.len();
+        reindexed += pending.len();
+        if pending.is_empty() {
+            continue;
+        }
+
+        let texts: Vec<String> = pending.iter().map(|c| c.content.clone()).collect();
+        let emb = Arc::clone(embeddings);
+        let embeddings_out = tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            emb.embed(&refs)
+        })
+        .await??;
+
+        let mut idx = search.write().await;
+        for (chunk, embedding) in pending.iter().zip(embeddings_out) {
+            storage.insert_chunk_with_source(chunk, &embedding, attribution.source)?;
+            if let Err(error) = storage.insert_chunk_provenance(
+                &chunk.id,
+                &crate::provenance::ChunkProvenance {
+                    author: chunk.author,
+                    source_conv_id: attribution
+                        .parent_conversation_id
+                        .clone()
+                        .unwrap_or_else(|| chunk.conversation_id.clone()),
+                    supersedes: None,
+                },
+            ) {
+                tracing::warn!(error = %error, chunk = %chunk.id, "chunk provenance persist failed");
+            }
+            if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                storage.replace_chunk_evidence(chunk_evidence)?;
+            }
+            idx.insert_chunk(chunk.id.clone(), embedding);
+        }
+    }
+
+    storage.mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
+    storage.relink_conversation(&conv_id)?;
+
+    // Layer 1: Heuristic enrichment (inline, instant, free)
+    if !storage
+        .is_conversation_enriched(&conv_id, "heuristic")
+        .unwrap_or(false)
+    {
+        if let Err(e) = crate::extraction::heuristic::enrich_conversation(
+            file_path,
+            &conv_id,
+            &attribution.project_name,
+            storage,
+            embeddings,
+            search,
+        )
+        .await
+        {
+            tracing::warn!(
+                conv = %conv_id,
+                error = %e,
+                "heuristic enrichment failed (non-fatal)"
+            );
+        }
+    }
+
+    tracing::info!(
+        file = %file_path.display(),
+        chunks = chunk_count,
+        reindexed,
+        unchanged,
+        project = %attribution.project_name,
+        source = attribution.source,
+        "auto-imported conversation"
+    );
+
+    Ok(())
 }
 
 /// Does this freshly parsed chunk need to be embedded and written again?
@@ -508,5 +730,168 @@ mod tests {
         let mut parsed = chunk("a", "hello");
         parsed.is_sidechain = true;
         assert!(needs_reindex(&parsed, Some(&stored)));
+    }
+
+    /// Matches `import::scrub`'s own busy-error test fixture exactly, so a
+    /// future change to what counts as "busy" can't silently drift between
+    /// the two call sites.
+    fn busy_error() -> anyhow::Error {
+        anyhow::Error::from(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        ))
+    }
+
+    /// The bug this item closes: an import that fails with `SQLITE_BUSY` on
+    /// a session's last write used to be dropped for good, because no later
+    /// notify event would ever re-trigger it. Simulates three watcher passes
+    /// (busy, busy, ok) over the same path and asserts the file eventually
+    /// imports with exactly two recorded busy retries and an empty retry map.
+    ///
+    /// Deleting the requeue branch in `process_batch` (treating a busy error
+    /// like any other and dropping the path on first failure) makes this
+    /// fail: the third pass never runs because nothing re-adds the path to
+    /// `pending`, so `imported` stays empty.
+    #[tokio::test]
+    async fn busy_import_is_retried_then_succeeds() {
+        let path = PathBuf::from("/tmp/csr-watcher-test/conv.jsonl");
+        let calls = std::cell::Cell::new(0u32);
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+        let mut total_busy_retries = 0u64;
+        let mut imported = false;
+
+        for _pass in 0..3 {
+            let outcome = process_batch(
+                [path.clone()],
+                |_p| {
+                    let n = calls.get();
+                    calls.set(n + 1);
+                    async move {
+                        if n < 2 {
+                            Err(busy_error())
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                &mut retry_map,
+            )
+            .await;
+            total_busy_retries += outcome.busy_retries;
+            if outcome.imported.contains(&path) {
+                imported = true;
+                break;
+            }
+        }
+
+        assert!(imported, "file must eventually import once busy clears");
+        assert_eq!(total_busy_retries, 2);
+        assert!(
+            retry_map.is_empty(),
+            "successful import must clear the retry entry"
+        );
+    }
+
+    /// A non-busy error (e.g. malformed JSONL) keeps the original
+    /// log-and-drop behaviour: no retry entry, no further attempts.
+    #[tokio::test]
+    async fn non_busy_error_is_not_retried() {
+        let path = PathBuf::from("/tmp/csr-watcher-test/broken.jsonl");
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+
+        let outcome = process_batch(
+            [path.clone()],
+            |_p| async move { Err(anyhow::anyhow!("malformed jsonl")) },
+            &mut retry_map,
+        )
+        .await;
+
+        assert!(outcome.imported.is_empty());
+        assert_eq!(outcome.busy_retries, 0);
+        assert!(outcome.gave_up.is_empty());
+        assert!(retry_map.is_empty());
+    }
+
+    /// After exhausting `BUSY_RETRY_BACKOFF_SECS`, the path is dropped
+    /// (WARN + gave_up) rather than retried forever.
+    #[tokio::test]
+    async fn busy_import_gives_up_after_max_retries() {
+        let path = PathBuf::from("/tmp/csr-watcher-test/stuck.jsonl");
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+
+        for attempt in 1..=BUSY_RETRY_BACKOFF_SECS.len() {
+            let outcome = process_batch(
+                [path.clone()],
+                |_p| async move { Err(busy_error()) },
+                &mut retry_map,
+            )
+            .await;
+            assert_eq!(outcome.busy_retries, 1);
+            assert!(
+                outcome.gave_up.is_empty(),
+                "attempt {attempt} gave up early"
+            );
+        }
+
+        // One more failure exceeds the schedule: give up.
+        let outcome = process_batch(
+            [path.clone()],
+            |_p| async move { Err(busy_error()) },
+            &mut retry_map,
+        )
+        .await;
+        assert_eq!(outcome.gave_up, vec![path.clone()]);
+        assert!(retry_map.is_empty());
+    }
+
+    /// The actual gap-G1 mechanism: `wait_for_batch` must wake and re-hand
+    /// back a busy path once its backoff elapses, with **no new notify
+    /// event** sent on `tx` — the exact scenario that used to lose a
+    /// session's final append for good, because nothing else would ever
+    /// write to that file again to trigger a fresh event.
+    ///
+    /// Runs under `start_paused` so the 5s backoff resolves via tokio's
+    /// auto-advance rather than a real sleep. Deleting the "merge in any
+    /// busy-retry paths that are due now" loop inside `wait_for_batch` makes
+    /// this fail: the second `wait_for_batch` call would return an empty
+    /// `HashSet` instead of `{path}`, because nothing else is ever sent to
+    /// `tx` in this test.
+    #[tokio::test(start_paused = true)]
+    async fn wake_on_retry_without_new_notify_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+        let path = PathBuf::from("/tmp/csr-watcher-test/wake.jsonl");
+        let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
+
+        // Pass 1: a real notify event arrives, import fails busy once.
+        tx.send(path.clone()).unwrap();
+        let pending = wait_for_batch(&mut rx, &retry_map)
+            .await
+            .expect("channel still open");
+        assert_eq!(pending, HashSet::from([path.clone()]));
+
+        let outcome = process_batch(
+            pending,
+            |_p| async move { Err(busy_error()) },
+            &mut retry_map,
+        )
+        .await;
+        assert_eq!(outcome.busy_retries, 1);
+        assert!(retry_map.contains_key(&path), "must be scheduled to retry");
+
+        // Pass 2: nothing is ever sent to `tx` again — `wait_for_batch` must
+        // still wake on its own once the 5s backoff (BUSY_RETRY_BACKOFF_SECS[0])
+        // elapses, and must merge the due path into the batch.
+        let pending = wait_for_batch(&mut rx, &retry_map)
+            .await
+            .expect("channel still open");
+        assert_eq!(
+            pending,
+            HashSet::from([path.clone()]),
+            "retry must be merged in purely from the backoff deadline, no notify event sent"
+        );
+
+        let outcome = process_batch(pending, |_p| async move { Ok(()) }, &mut retry_map).await;
+        assert!(outcome.imported.contains(&path));
+        assert!(retry_map.is_empty(), "successful import clears the entry");
     }
 }

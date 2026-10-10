@@ -38,9 +38,18 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub db_path: String,
     pub healthy: bool,
-    /// True when a live MCP server is running an older build than the binary now
-    /// on disk — the connection must be re-established for the upgrade to apply.
+    /// True when any live `mcp_stdio` process in [`stale_processes`] is
+    /// running a superseded binary. Derived from the run registry (one
+    /// record per process — see `binary_identity`), not a single
+    /// last-writer-wins stamp, so it reflects every live session rather
+    /// than only the most recently started one. Says nothing about any
+    /// particular session, so it stays out of the statusline.
     pub mcp_binary_stale: bool,
+    /// Every live process (`csr-engine daemon` or an `mcp_stdio` server)
+    /// whose recorded exe identity differs from the binary on disk right
+    /// now — i.e. still running a build an install has since superseded.
+    /// See `binary_identity::stale_processes`.
+    pub stale_processes: Vec<crate::binary_identity::StaleProcess>,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
     /// Native memory-file spine (`~/.claude/projects/*/memory/*.md`) — metadata
@@ -59,6 +68,34 @@ pub struct StatusReport {
     /// See `gather_backfill`.
     pub backfill: BackfillStatus,
     pub dreaming: Option<DreamingView>,
+    /// Codex-rollout timestamp restamp + harness-strip re-import receipts.
+    /// See [`CodexBackfillStatus`].
+    pub codex_backfill: CodexBackfillStatus,
+    /// Watcher busy-retry backoff + daemon catch-up sweep receipts (gap-G1).
+    /// See [`ImportWatcherStatus`].
+    pub import_watcher: ImportWatcherStatus,
+    /// Scratch scripts indexed from Bash tool calls: language and import
+    /// frequency table, no model. See `import::scratch`.
+    pub scratch: crate::import::scratch::ScratchStatus,
+}
+
+/// Receipts for the watcher's `database is locked` retry backoff
+/// (`import::watcher::process_batch`) and the daemon's idle-gated
+/// reconciliation sweep (`import::catchup::catchup_sweep`). Every field is
+/// `None` — reported as unknown, not zero — until the corresponding
+/// mechanism has actually run at least once; a real zero and "never ran" are
+/// different facts and collapsing them hid gap-G1 in the first place.
+#[derive(Serialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImportWatcherStatus {
+    /// Cumulative busy-retry attempts across every watcher batch
+    /// (`watcher::BUSY_RETRIES_COUNTER`).
+    pub watcher_import_busy_retries: Option<i64>,
+    /// Cumulative files the watcher gave up on after exhausting the backoff
+    /// schedule (`watcher::BUSY_GAVE_UP_COUNTER`).
+    pub watcher_import_busy_gave_up: Option<i64>,
+    /// Cumulative files the daemon's catch-up sweep re-imported
+    /// (`catchup::CATCHUP_REIMPORTED_COUNTER`).
+    pub import_catchup_reimported: Option<i64>,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -324,8 +361,8 @@ impl DreamBudgetUsage {
 /// Statusline badge state (delivery channel (a)).
 #[derive(Serialize, Debug, PartialEq, Eq, Default)]
 pub struct DreamBadgeStatus {
-    /// Dreams measured as undelivered by the last pass, minus those
-    /// delivered since. `None` until a pass has measured a baseline — the
+    /// Dreams the journal page lists as active that the last pass measured
+    /// as undelivered, minus those delivered since. `None` until a pass has measured a baseline — the
     /// statusline then shows no badge at all rather than a fabricated zero.
     pub unread: Option<i64>,
     /// When that baseline was measured.
@@ -548,6 +585,70 @@ pub struct MemoryRegistryStatus {
     pub schema_misses: i64,
 }
 
+/// Codex-rollout chunk-timestamp restamp (`crate::import::codex_rollout::
+/// restamp_codex_chunk_timestamps`) — versioned, bounded-retry one-shot.
+/// Read from `RESTAMP_META_KEY` / `RESTAMP_PROGRESS_META_KEY`; see that
+/// function's doc for what each count means. Harness-polluted conversations
+/// are skipped by design (see `conversations_skipped_polluted`) — that
+/// pollution is [`CodexHarnessStripStatus`]'s job, not this restamp's.
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct CodexRestampStatus {
+    /// `RESTAMP_META_KEY` is set: a pass has left zero unmatched
+    /// conversations/chunks. Never un-set once true.
+    pub done: bool,
+    /// This attempt count is bounded by `RESTAMP_MAX_ATTEMPTS`.
+    pub attempts: usize,
+    /// `RESTAMP_MAX_ATTEMPTS` reached with `done` still `false` — the
+    /// daemon has stopped retrying a permanently drifted file, but the
+    /// corpus is not considered clean.
+    pub attempts_exhausted: bool,
+    pub conversations_considered: usize,
+    pub conversations_updated: usize,
+    pub conversations_unmatched: usize,
+    pub conversations_missing_file: usize,
+    pub conversations_skipped_polluted: usize,
+    pub conversations_pending_import: usize,
+    pub chunks_updated: usize,
+    pub chunks_unmatched: usize,
+}
+
+/// Daemon-owned codex harness-strip re-import
+/// (`crate::import::codex_rollout::harness_strip_batch`) — idle-gated,
+/// batched, resumable, keyed `codex_harness_strip_v2`. Read from
+/// `HARNESS_STRIP_V2_META_KEY` / `HARNESS_STRIP_V2_PROGRESS_META_KEY`.
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct CodexHarnessStripStatus {
+    /// `HARNESS_STRIP_V2_META_KEY` is set: zero file-having polluted
+    /// conversations remain. Conversations whose source file is gone stay
+    /// polluted forever and never block this.
+    pub done: bool,
+    /// File-having polluted conversations left to reimport, as of the most
+    /// recent batch. `Some(0)` once `done`; `None` when no batch has run yet
+    /// (genuinely unknown — never fabricated as zero). Read straight from
+    /// the persisted [`crate::import::codex_rollout::HarnessStripProgress`]
+    /// — never a live query, so this never adds cost to `csr-engine status`
+    /// (including the `--compact` statusline refresh).
+    pub polluted_remaining: Option<usize>,
+    pub reimported: usize,
+    pub missing_file: usize,
+    pub failed: usize,
+    pub last_batch_at: Option<String>,
+    pub last_batch_chunks: usize,
+    pub last_batch_secs: f64,
+    /// `last_batch_chunks / last_batch_secs` from the most recent batch —
+    /// `None` before any batch has run, or when that batch's timing was too
+    /// small to divide by meaningfully.
+    pub throughput_chunks_per_sec: Option<f64>,
+}
+
+/// Combined codex-rollout backfill status block — see
+/// [`CodexRestampStatus`] and [`CodexHarnessStripStatus`].
+#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+pub struct CodexBackfillStatus {
+    pub restamp: CodexRestampStatus,
+    pub harness_strip: CodexHarnessStripStatus,
+}
+
 #[derive(Serialize, Default)]
 pub struct EnrichmentBreakdown {
     pub heuristic_completed: usize,
@@ -601,10 +702,79 @@ pub fn handle(
     Ok(())
 }
 
+/// `csr-engine status --stale` — a DB-free fast path that ONLY reads the run
+/// registry (`~/.claude-self-reflect/run/*.json`) and does a `kill(0)`
+/// liveness check per pid: milliseconds, no SQLite open, no DB gather at
+/// all. Prints one line per stale process, `pid <n> (<role>, started <ts>,
+/// parent <p>)`; nothing when there are none.
+///
+/// Exists because the full `status` gather can take 8-31s on a large, busy
+/// DB (measured on a 563k-chunk corpus under concurrent load) — installers
+/// call `status` right after writing a fresh binary, when codesign
+/// verification and a cold page cache make the first exec of that binary
+/// even slower, so a short fixed timeout around the full command frequently
+/// fires and the installer silently drops the stale-process report spec 2e
+/// asks for (gap-G2 review finding 2). Plain per-line text rather than JSON
+/// so `install.sh` (POSIX `sh`, no `jq`) can consume it without a parser,
+/// and so it can never be truncated the way `grep -A3` on pretty JSON was
+/// (gap-G2 review finding 3).
+pub fn handle_stale() -> Result<()> {
+    for line in format_stale_processes(&gather_stale_processes()) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Pure formatting for [`handle_stale`]: one `pid <n> (<role>, started <ts>,
+/// parent <p>)` line per entry, `parent` omitted when unknown. Extracted so
+/// the exact text both installers grep/print (`installer/postinstall.js`,
+/// `scripts/install.sh`) is directly unit-testable without depending on
+/// `~/.claude-self-reflect/run` (this process's real, unoverridable
+/// `HOME`) — see `format_stale_processes_matches_the_pid_role_started_parent_contract`.
+fn format_stale_processes(stale: &[crate::binary_identity::StaleProcess]) -> Vec<String> {
+    stale
+        .iter()
+        .map(|p| {
+            format!(
+                "pid {} ({}, started {}{})",
+                p.pid,
+                p.role,
+                p.started_at,
+                match &p.parent {
+                    Some(parent) => format!(", parent {parent}"),
+                    None => String::new(),
+                }
+            )
+        })
+        .collect()
+}
+
 /// Public wrapper for `gather_status` — used by the telemetry module to embed
 /// a fresh status snapshot in its report without re-implementing the gather logic.
 pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<StatusReport> {
     gather_status(db_path, projects_dir, false)
+}
+
+/// Every live process (daemon or MCP stdio server) whose recorded exe
+/// identity differs from the binary on disk right now. Best-effort: an
+/// unreadable current identity (can't resolve `current_exe`) or a missing
+/// run dir (nothing has ever registered) both report no stale processes
+/// rather than erroring the whole status gather.
+fn gather_stale_processes() -> Vec<crate::binary_identity::StaleProcess> {
+    let (Some(current), Some(run_dir)) = (
+        crate::binary_identity::current_exe_identity(),
+        crate::binary_identity::default_run_dir(),
+    ) else {
+        return Vec::new();
+    };
+    crate::binary_identity::stale_processes(&run_dir, &current)
+}
+
+/// True when any live MCP stdio server is running a superseded binary (gap-G2
+/// review finding 5: derive this from the multi-process registry, not the
+/// retired single last-writer-wins stamp).
+fn mcp_binary_stale_from(stale: &[crate::binary_identity::StaleProcess]) -> bool {
+    stale.iter().any(|p| p.role == "mcp_stdio")
 }
 
 /// Gather status data from SQLite and disk.
@@ -615,11 +785,14 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     });
     // Count total JSONL files on disk
     let total_jsonl = count_jsonl_files(projects_dir);
+    let stale_processes = gather_stale_processes();
+    let mcp_binary_stale = mcp_binary_stale_from(&stale_processes);
 
     // If DB doesn't exist yet, return empty report
     if !db_path.exists() {
         return Ok(StatusReport {
-            mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
+            mcp_binary_stale,
+            stale_processes,
             conversations: 0,
             projects: 0,
             chunks: 0,
@@ -649,6 +822,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
             dreaming,
+            codex_backfill: CodexBackfillStatus::default(),
+            import_watcher: ImportWatcherStatus::default(),
+            scratch: Default::default(),
         });
     }
 
@@ -747,9 +923,12 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let memory_registry = gather_memory_registry(&storage);
     let trained_rerank = gather_trained_rerank(&storage);
     let backfill = gather_backfill(&storage);
+    let codex_backfill = gather_codex_backfill(&storage);
+    let import_watcher = gather_import_watcher(&storage);
 
     Ok(StatusReport {
-        mcp_binary_stale: crate::binary_stamp::serving_binary_is_stale(),
+        mcp_binary_stale,
+        stale_processes,
         conversations,
         projects,
         chunks,
@@ -776,7 +955,103 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         trained_rerank,
         backfill,
         dreaming,
+        codex_backfill,
+        import_watcher,
+        scratch: storage
+            .with_connection(crate::import::scratch::status)
+            .unwrap_or_default(),
     })
+}
+
+/// Assemble the codex-rollout backfill status block. Fail-soft to defaults
+/// on any read/parse error — a malformed or absent progress-meta JSON value
+/// must never break `csr-engine status`.
+fn gather_import_watcher(storage: &Storage) -> ImportWatcherStatus {
+    use crate::import::catchup::CATCHUP_REIMPORTED_COUNTER;
+    use crate::import::watcher::{BUSY_GAVE_UP_COUNTER, BUSY_RETRIES_COUNTER};
+
+    ImportWatcherStatus {
+        watcher_import_busy_retries: storage
+            .get_meta_counter(BUSY_RETRIES_COUNTER)
+            .unwrap_or(None),
+        watcher_import_busy_gave_up: storage
+            .get_meta_counter(BUSY_GAVE_UP_COUNTER)
+            .unwrap_or(None),
+        import_catchup_reimported: storage
+            .get_meta_counter(CATCHUP_REIMPORTED_COUNTER)
+            .unwrap_or(None),
+    }
+}
+
+fn gather_codex_backfill(storage: &Storage) -> CodexBackfillStatus {
+    use crate::import::codex_rollout::{
+        HarnessStripProgress, RestampProgress, HARNESS_STRIP_V2_META_KEY,
+        HARNESS_STRIP_V2_PROGRESS_META_KEY, RESTAMP_META_KEY, RESTAMP_PROGRESS_META_KEY,
+    };
+
+    let restamp_done = storage.get_meta(RESTAMP_META_KEY).unwrap_or(None).is_some();
+    let restamp_progress: RestampProgress = storage
+        .get_meta(RESTAMP_PROGRESS_META_KEY)
+        .unwrap_or(None)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let restamp = CodexRestampStatus {
+        done: restamp_done,
+        attempts: restamp_progress.attempts,
+        attempts_exhausted: !restamp_done
+            && restamp_progress.attempts >= crate::import::codex_rollout::RESTAMP_MAX_ATTEMPTS,
+        conversations_considered: restamp_progress.conversations_considered,
+        conversations_updated: restamp_progress.conversations_updated,
+        conversations_unmatched: restamp_progress.conversations_unmatched,
+        conversations_missing_file: restamp_progress.conversations_missing_file,
+        conversations_skipped_polluted: restamp_progress.conversations_skipped_polluted,
+        conversations_pending_import: restamp_progress.conversations_pending_import,
+        chunks_updated: restamp_progress.chunks_updated,
+        chunks_unmatched: restamp_progress.chunks_unmatched,
+    };
+
+    let harness_strip_done = storage
+        .get_meta(HARNESS_STRIP_V2_META_KEY)
+        .unwrap_or(None)
+        .is_some();
+    let harness_progress: HarnessStripProgress = storage
+        .get_meta(HARNESS_STRIP_V2_PROGRESS_META_KEY)
+        .unwrap_or(None)
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let throughput_chunks_per_sec = if harness_progress.last_batch_secs > 0.001 {
+        Some(harness_progress.last_batch_chunks as f64 / harness_progress.last_batch_secs)
+    } else {
+        None
+    };
+    // Persisted count from the most recent batch — never a live query here.
+    // `polluted_codex_rows_by_file_presence` is a full `chunks` scan; running
+    // it on every `csr-engine status` call (the `--compact` statusline
+    // refresh shells out on a tight interval) cost 2x+ the warm status
+    // latency for a value the compact line doesn't even print. `Some(0)`
+    // once `done`, `None` (unknown, not fabricated as zero) before the first
+    // batch has ever run.
+    let polluted_remaining = if harness_strip_done {
+        Some(0)
+    } else {
+        harness_progress.polluted_remaining
+    };
+    let harness_strip = CodexHarnessStripStatus {
+        done: harness_strip_done,
+        polluted_remaining,
+        reimported: harness_progress.reimported_total,
+        missing_file: harness_progress.missing_file_total,
+        failed: harness_progress.failed_total,
+        last_batch_at: harness_progress.last_batch_at,
+        last_batch_chunks: harness_progress.last_batch_chunks,
+        last_batch_secs: harness_progress.last_batch_secs,
+        throughput_chunks_per_sec,
+    };
+
+    CodexBackfillStatus {
+        restamp,
+        harness_strip,
+    }
 }
 
 fn empty_trained_rerank_status() -> TrainedRerankStatus {
@@ -1605,7 +1880,8 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
         ));
     }
     let dream_total = report.dream.dreams.total();
-    if dream_total > 0 || report.dream.corrections_7d > 0 {
+    let dream_segment_open = dream_total > 0 || report.dream.corrections_7d > 0;
+    if dream_segment_open {
         out.push_str(&format!(" | ☾ {dream_total} dreams"));
         if report.dream.corrections_7d > 0 {
             out.push_str(&format!(" · {} corrections", report.dream.corrections_7d));
@@ -1624,11 +1900,17 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     // them. `None` (no pass has ever measured a baseline) prints nothing at
     // all — a `0` here would claim "nothing new" on evidence nobody
     // gathered. A measured 0 is also silent: the badge exists to point at
-    // something unread.
+    // something unread. It joins the dreams segment when one is open — one
+    // moon per line, not two.
     if let Some(unread) = report.dream.badge.unread.filter(|&count| count > 0) {
-        match report.dream.server.url.as_deref() {
-            Some(url) => out.push_str(&format!(" | ☾ {unread} unread {url}")),
-            None => out.push_str(&format!(" | ☾ {unread} unread")),
+        out.push_str(if dream_segment_open {
+            " · "
+        } else {
+            " | ☾ "
+        });
+        out.push_str(&format!("{unread} unread"));
+        if let Some(url) = report.dream.server.url.as_deref() {
+            out.push_str(&format!(" {url}"));
         }
     }
     // v10 "dreaming" Full channel: only speak up when there's something to
@@ -1651,12 +1933,12 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             report.contamination.conversations
         ));
     }
-    // A newer binary is installed but the live MCP server predates it. Say so
-    // on the statusline the user already watches, rather than leaving them to
-    // discover it from stale behaviour.
-    if report.mcp_binary_stale {
-        out.push_str(" | ⟳ reconnect mcp");
-    }
+    // `mcp_binary_stale` is deliberately not rendered here. The stamp behind it
+    // is one file shared by every session's MCP server, last writer wins, so
+    // the marker lit up in every session on each local reinstall and cleared
+    // in all of them the moment any one reconnected, while the rest still ran
+    // the old build. A statusline prompt has to be true for the session
+    // showing it; this one could not be. It stays in the JSON report.
     out
 }
 
@@ -1671,6 +1953,47 @@ fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- gap-G2 review findings 2/3: `status --stale`'s output format is
+    // the contract both installers depend on (`pid <n> (<role>, started
+    // <ts>, parent <p>)`, one line per entry, no truncation). ---
+
+    #[test]
+    fn format_stale_processes_matches_the_pid_role_started_parent_contract() {
+        let stale = vec![
+            crate::binary_identity::StaleProcess {
+                pid: 1234,
+                role: "mcp_stdio".to_string(),
+                started_at: "2026-09-22T10:06:00Z".to_string(),
+                parent: Some("/Applications/Claude.app".to_string()),
+            },
+            crate::binary_identity::StaleProcess {
+                pid: 23450,
+                role: "daemon".to_string(),
+                started_at: "2026-09-22T09:00:00Z".to_string(),
+                parent: None,
+            },
+        ];
+        let lines = format_stale_processes(&stale);
+        assert_eq!(
+            lines,
+            vec![
+                "pid 1234 (mcp_stdio, started 2026-09-22T10:06:00Z, parent /Applications/Claude.app)"
+                    .to_string(),
+                "pid 23450 (daemon, started 2026-09-22T09:00:00Z)".to_string(),
+            ],
+            "every entry (not just the first, and not just its first 3 \
+             fields) must appear on its own complete line — a `grep -A3` \
+             over pretty JSON on a 2-entry list used to print only the \
+             array opener plus 3 lines of the FIRST entry (gap-G2 review \
+             finding 3)"
+        );
+    }
+
+    #[test]
+    fn format_stale_processes_is_empty_for_no_stale_processes() {
+        assert!(format_stale_processes(&[]).is_empty());
+    }
 
     #[test]
     fn test_compact_includes_narratives() {
@@ -1713,6 +2036,7 @@ mod tests {
     fn base_report() -> StatusReport {
         StatusReport {
             mcp_binary_stale: false,
+            stale_processes: Vec::new(),
             conversations: 909,
             projects: 3,
             chunks: 5000,
@@ -1739,6 +2063,9 @@ mod tests {
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
             dreaming: None,
+            codex_backfill: CodexBackfillStatus::default(),
+            import_watcher: ImportWatcherStatus::default(),
+            scratch: Default::default(),
         }
     }
 
@@ -1836,6 +2163,9 @@ mod tests {
                 trained_ndcg5: 0.5,
                 outcome: "win".into(),
             }];
+        let scratch = serde_json::to_value(&report.scratch).unwrap();
+        assert_eq!(scratch["scripts"], 0);
+        assert!(scratch["by_language"].is_object());
         let value = serde_json::to_value(report).unwrap();
         assert_eq!(value["trained_rerank"]["gate_status"], "failed");
         assert_eq!(value["trained_rerank"]["cluster_wins"], 4);
@@ -2033,16 +2363,15 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_dream_segment_coexists_with_stale_marker() {
+    fn test_compact_never_asks_for_an_mcp_reconnect() {
         let mut report = base_report();
         report.dream.dreams.unfinished = 2;
         report.mcp_binary_stale = true;
         let line = format_compact(&report, 0);
-        let dreams = line.find("☾ 2 dreams").expect("dreams segment present");
-        let stale = line.find("⟳ reconnect mcp").expect("stale marker present");
+        assert!(line.contains("☾ 2 dreams"), "{line:?}");
         assert!(
-            dreams < stale,
-            "dreams renders before stale marker: {line:?}"
+            !line.contains("reconnect"),
+            "the stamp is shared across sessions, so it must not prompt any one of them: {line:?}"
         );
     }
 
@@ -2062,6 +2391,160 @@ mod tests {
         assert_eq!(report.chunks, 0);
         assert!(report.healthy); // empty DB passes integrity check
         assert_eq!(report.import_percent, 0.0);
+        assert!(!report.codex_backfill.restamp.done);
+        assert!(!report.codex_backfill.harness_strip.done);
+    }
+
+    #[test]
+    fn status_surfaces_codex_backfill_receipts() {
+        use crate::import::codex_rollout::{
+            HarnessStripProgress, RestampProgress, HARNESS_STRIP_V2_META_KEY,
+            HARNESS_STRIP_V2_PROGRESS_META_KEY, RESTAMP_PROGRESS_META_KEY,
+        };
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        let restamp_progress = RestampProgress {
+            attempts: 3,
+            conversations_considered: 10,
+            conversations_updated: 7,
+            conversations_unmatched: 1,
+            conversations_missing_file: 0,
+            conversations_skipped_polluted: 2,
+            conversations_pending_import: 0,
+            chunks_updated: 500,
+            chunks_unmatched: 4,
+        };
+        storage
+            .set_meta(
+                RESTAMP_PROGRESS_META_KEY,
+                &serde_json::to_string(&restamp_progress).unwrap(),
+            )
+            .unwrap();
+        // RESTAMP_META_KEY is deliberately left unset — this pass is not done.
+
+        let harness_progress = HarnessStripProgress {
+            reimported_total: 25,
+            missing_file_total: 1,
+            failed_total: 0,
+            last_batch_at: Some("2026-09-22T00:00:00Z".to_string()),
+            last_batch_chunks: 500,
+            last_batch_secs: 2.5,
+            polluted_remaining: Some(0),
+        };
+        storage
+            .set_meta(
+                HARNESS_STRIP_V2_PROGRESS_META_KEY,
+                &serde_json::to_string(&harness_progress).unwrap(),
+            )
+            .unwrap();
+        storage
+            .set_meta(HARNESS_STRIP_V2_META_KEY, "2026-09-22T00:00:00Z")
+            .unwrap();
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+
+        assert!(!report.codex_backfill.restamp.done);
+        assert!(!report.codex_backfill.restamp.attempts_exhausted);
+        assert_eq!(report.codex_backfill.restamp.attempts, 3);
+        assert_eq!(report.codex_backfill.restamp.conversations_considered, 10);
+        assert_eq!(report.codex_backfill.restamp.conversations_unmatched, 1);
+        assert_eq!(
+            report.codex_backfill.restamp.conversations_skipped_polluted,
+            2
+        );
+        assert_eq!(report.codex_backfill.restamp.chunks_unmatched, 4);
+
+        assert!(report.codex_backfill.harness_strip.done);
+        assert_eq!(
+            report.codex_backfill.harness_strip.polluted_remaining,
+            Some(0),
+            "done must report zero remaining without paying for a live query"
+        );
+        assert_eq!(report.codex_backfill.harness_strip.reimported, 25);
+        assert_eq!(report.codex_backfill.harness_strip.missing_file, 1);
+        assert_eq!(
+            report
+                .codex_backfill
+                .harness_strip
+                .throughput_chunks_per_sec,
+            Some(200.0)
+        );
+    }
+
+    /// W3-R medium finding: `gather_codex_backfill` used to run a live
+    /// `SELECT DISTINCT conversation_id, summary FROM chunks WHERE
+    /// source='codex_rollout'` on every `csr-engine status` call (including
+    /// the tight-interval `--compact` statusline refresh) until the
+    /// harness-strip done key was written — a cost that can persist for
+    /// days on a live corpus. It must instead read the value the daemon's
+    /// last batch already persisted. Proven here by seeding a DB with zero
+    /// polluted codex chunks (a live query would find 0) but a persisted
+    /// `polluted_remaining: Some(42)` from a prior batch — status must
+    /// report the persisted 42, not a freshly recomputed 0.
+    #[test]
+    fn codex_backfill_polluted_remaining_reads_persisted_progress_not_a_live_query() {
+        use crate::import::codex_rollout::{
+            HarnessStripProgress, HARNESS_STRIP_V2_PROGRESS_META_KEY,
+        };
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        let storage = Storage::open(&db_path).unwrap();
+        // No codex chunks in this DB at all — a live re-scan would find 0
+        // polluted conversations. The persisted progress says otherwise.
+        let harness_progress = HarnessStripProgress {
+            reimported_total: 3,
+            missing_file_total: 0,
+            failed_total: 0,
+            last_batch_at: Some("2026-09-22T00:00:00Z".to_string()),
+            last_batch_chunks: 10,
+            last_batch_secs: 0.1,
+            polluted_remaining: Some(42),
+        };
+        storage
+            .set_meta(
+                HARNESS_STRIP_V2_PROGRESS_META_KEY,
+                &serde_json::to_string(&harness_progress).unwrap(),
+            )
+            .unwrap();
+        // HARNESS_STRIP_V2_META_KEY deliberately left unset — not done.
+        drop(storage);
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert!(!report.codex_backfill.harness_strip.done);
+        assert_eq!(
+            report.codex_backfill.harness_strip.polluted_remaining,
+            Some(42),
+            "must report the daemon's last persisted count, not a fresh live-query 0"
+        );
+    }
+
+    /// Before the harness-strip job has ever run a batch, `polluted_remaining`
+    /// must read as unknown (`None`), never fabricated as `0` — a `0` would
+    /// misread as "nothing to fix" for a corpus that has never been scanned.
+    #[test]
+    fn codex_backfill_polluted_remaining_is_none_before_any_batch_has_run() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let _storage = Storage::open(&db_path).unwrap();
+
+        let report = gather_status(&db_path, &projects_dir, false).unwrap();
+        assert!(!report.codex_backfill.harness_strip.done);
+        assert_eq!(report.codex_backfill.harness_strip.polluted_remaining, None);
     }
 
     #[test]
@@ -2203,6 +2686,21 @@ mod tests {
         report.dream.server.url = Some("http://127.0.0.1:7373/".into());
         let line = format_compact(&report, 0);
         assert!(line.contains("☾ 3 unread http://127.0.0.1:7373/"), "{line}");
+    }
+
+    #[test]
+    fn compact_badge_joins_the_dreams_segment_instead_of_adding_a_second_moon() {
+        let mut report = base_report();
+        report.dream.dreams.unfinished = 5;
+        report.dream.corrections_7d = 4;
+        report.dream.badge.unread = Some(6);
+        report.dream.server.url = Some("http://127.0.0.1:7373/".into());
+        let line = format_compact(&report, 0);
+        assert!(
+            line.contains("☾ 5 dreams · 4 corrections · 6 unread http://127.0.0.1:7373/"),
+            "{line}"
+        );
+        assert_eq!(line.matches('☾').count(), 1, "{line}");
     }
 
     #[test]

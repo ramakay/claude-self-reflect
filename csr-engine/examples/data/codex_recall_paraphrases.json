@@ -1,0 +1,6 @@
+{
+  "_comment": "Format example for examples/probe_codex_recall.rs --paraphrases: a map from conversation_id to a hand-written paraphrase of that conversation's own first message (never the harness-boilerplate proxy). Reword it so it shares no long verbatim run with the source chunk (the probe enforces this at load time with shares_long_ngram(_, _, 8)). The ids below are placeholders; build a real set from your own corpus. Keep personal prompts out of this file.",
+  "codex:00000000-0000-7000-8000-000000000001": "Look over the small change set in the mobile app's analytics module and flag anything incorrect or any edge case we missed.",
+  "codex:00000000-0000-7000-8000-000000000002": "Write a tiny JavaScript helper that adds two numbers together, just the code please.",
+  "00000000-0000-4000-8000-000000000003": "Acting only from your knowledge of this repo's history, and without checking any live file or git state, answer the question that follows using the background notes supplied."
+}

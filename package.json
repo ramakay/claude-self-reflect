@@ -28,6 +28,7 @@
   },
   "files": [
     "installer/cli.js",
+    "installer/lib.js",
     "installer/postinstall.js",
     "installer/statusline-setup.js",
     "README.md",

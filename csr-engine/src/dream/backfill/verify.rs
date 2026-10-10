@@ -40,6 +40,7 @@
 //! records the reason and the raw response, per the design's own framing of
 //! that table ("Stage 5 verify-failure audit log").
 
+use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
@@ -471,17 +472,22 @@ fn git_oid_exists(repo_root: &str, oid: &str) -> bool {
 /// grouping is prefix-transitive through the shortest key). Unrelated
 /// projects still never match — that is exactly what P9 protects.
 fn oid_in_ledger(conn: &Connection, project: &str, oid: &str) -> Result<bool> {
+    // Verdict events below the epoch floor came out of the retired v1 join:
+    // a receipt that exists only there is not evidence.
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM (
-            SELECT 1 FROM witness_ledger
-             WHERE at_oid = ?1
-               AND (lower(project) = lower(?2) OR lower(project) LIKE lower(?2) || '-%')
-            UNION ALL
-            SELECT 1 FROM witness_verdicts v
-              JOIN witness_ledger w ON w.id = v.witness_id
-             WHERE (v.receipt_oid = ?1 OR v.observed_head_oid = ?1)
-               AND (lower(w.project) = lower(?2) OR lower(w.project) LIKE lower(?2) || '-%')
-         )",
+        &format!(
+            "SELECT COUNT(*) FROM (
+                SELECT 1 FROM witness_ledger
+                 WHERE at_oid = ?1
+                   AND (lower(project) = lower(?2) OR lower(project) LIKE lower(?2) || '-%')
+                UNION ALL
+                SELECT 1 FROM witness_verdicts v
+                  JOIN witness_ledger w ON w.id = v.witness_id
+                 WHERE (v.receipt_oid = ?1 OR v.observed_head_oid = ?1)
+                   AND v.id > {LIVE_EVENT_FLOOR_SQL}
+                   AND (lower(w.project) = lower(?2) OR lower(w.project) LIKE lower(?2) || '-%')
+             )"
+        ),
         params![oid, project],
         |r| r.get(0),
     )?;
@@ -1583,5 +1589,41 @@ mod tests {
             matches!(outcome, VerifyOutcome::Failed("fake_oid")),
             "an OID recorded only in ANOTHER project's ledger must not validate this project's citation"
         );
+    }
+
+    #[test]
+    fn oid_in_ledger_ignores_a_receipt_that_exists_only_in_a_retired_event() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::storage::migrations::run(&conn).unwrap();
+        let seed = |stamp: &str, receipt: &str| {
+            conn.execute(
+                "INSERT INTO witness_ledger (project, file, symbol, stamp, tier, at_oid, source_kind)
+                 VALUES ('proj', '/f.rs', ?1, ?1, 'committed', 'ledgeroid', 'backfill')",
+                [stamp],
+            )
+            .unwrap();
+            let wid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO witness_verdicts (witness_id, verdict, receipt_oid, observed_head_oid)
+                 VALUES (?1, 'anchor_obsolete', ?2, 'head')",
+                rusqlite::params![wid, receipt],
+            )
+            .unwrap();
+        };
+        seed("old", "retired_receipt");
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        seed("new", "live_receipt");
+
+        assert!(!oid_in_ledger(&conn, "proj", "retired_receipt").unwrap());
+        assert!(oid_in_ledger(&conn, "proj", "live_receipt").unwrap());
+        // The ledger evidence itself is not an event and is unaffected.
+        assert!(oid_in_ledger(&conn, "proj", "ledgeroid").unwrap());
     }
 }

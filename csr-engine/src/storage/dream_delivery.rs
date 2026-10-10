@@ -26,29 +26,39 @@
 //!   ever written a baseline, [`badge_unread`] returns `None` and the
 //!   statusline drops the segment — it never renders `0`, which would claim
 //!   "nothing new" on evidence nobody gathered.
+//! * The badge counts **dreams, in the unit the journal page lists them**:
+//!   active consequence clusters whose receipt-bearing conclusion was never
+//!   delivered. It used to count every receipted per-symbol verdict across
+//!   every project — 12,326 on a corpus whose journal page showed 6 dreams,
+//!   growing ~10x faster than the one-per-session channels could drain it.
+//!   A number the reader cannot find at the URL printed next to it is not a
+//!   badge.
 //! * A delivery row proves the user was shown something. Its absence proves
 //!   nothing, so nothing is ever inferred from it beyond "do not repeat".
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
+
+use super::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use sha2::{Digest, Sha256};
 
 use super::Storage;
 
-/// `meta` key: number of undelivered conclusions counted by the last pass.
+/// `meta` key: number of unread dreams counted by the last pass. Kept for
+/// `status` consumers; the arithmetic runs on [`META_BADGE_IDS`].
 pub const META_BADGE_TOTAL: &str = "dream_badge_total";
+/// `meta` key: JSON array of the conclusion ids behind [`META_BADGE_TOTAL`],
+/// bounded by the journal's active-cluster cap. Its presence is also the
+/// unit marker: a baseline written before the badge counted dreams has a
+/// total but no id list, and [`badge_unread`] refuses to render it.
+pub const META_BADGE_IDS: &str = "dream_badge_ids";
 /// `meta` key: RFC3339 timestamp of the pass that wrote
 /// [`META_BADGE_TOTAL`] — reported by `status` so the badge can say *when*
-/// it was measured. It is never used for the arithmetic itself (see
-/// [`META_BADGE_CURSOR`]).
+/// it was measured. It is never used for the arithmetic itself: unread is
+/// "which of the measured ids still have no delivery row", which needs no
+/// timestamp and cannot double-count a delivery written in the same second
+/// as the baseline.
 pub const META_BADGE_AT: &str = "dream_badge_at";
-/// `meta` key: `MAX(dream_deliveries.id)` at the moment the baseline was
-/// measured. Deliveries are subtracted by **id**, not by timestamp:
-/// `delivered_at` is `datetime('now')` at one-second granularity, so a
-/// delivery written in the same second as the baseline could otherwise be
-/// counted on both sides of the subtraction. An autoincrement id cannot
-/// alias.
-pub const META_BADGE_CURSOR: &str = "dream_badge_cursor";
 
 /// Which surface showed a dream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +89,10 @@ pub struct DreamHeadline {
     pub verdict: String,
     /// Never empty — a headline without a receipt is not constructed.
     pub receipt_oid: String,
+    /// When the change happened: the receipt commit's committer time (RFC 3339
+    /// in the committer's own offset) when the event recorded it, else when the dreamer recorded the event
+    /// (`witness_verdicts.created_at`). Presentation only: list order is the
+    /// recorded time, see [`receipted_conclusions`].
     pub witnessed_at: String,
     /// `YYYY-MM-DD` slice of `witnessed_at`, or the whole value when it is
     /// shorter. Presentation only.
@@ -161,22 +175,34 @@ fn headline_from_parts(
     })
 }
 
-/// Every receipt-bearing conclusion for `project`, newest witnessed first.
+/// Every receipt-bearing CURRENT conclusion for `project`, newest witnessed
+/// first. Only each witness's LATEST live event is considered: a witness
+/// whose latest event is `anchor_reinstated` no longer surfaces its earlier
+/// `anchor_obsolete` — delivery shows what is true now, not the history.
 /// Adverse verdicts (`anchor_obsolete`, `superseded_by`) sort ahead of
 /// restorative ones at equal date, mirroring `dream_clusters`'s tier 2 —
 /// this is the same priority order, applied to a single row rather than a
 /// cluster.
 pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<DreamHeadline>> {
-    let mut stmt = conn.prepare(
-        "SELECT l.file, l.symbol, v.verdict, v.receipt_oid, MAX(v.created_at) AS witnessed_at
+    // `learned_at` (when the dreamer recorded it) orders the list, so fresh
+    // conclusions surface first; `committed_at` (when the receipt commit was
+    // made, NULL for events written before that was recorded) is what the
+    // headline DISPLAYS.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT l.file, l.symbol, v.verdict, v.receipt_oid,
+                MAX(v.created_at) AS learned_at,
+                MAX(v.receipt_committed_at) AS committed_at
          FROM witness_verdicts v
          JOIN witness_ledger l ON l.id = v.witness_id
          WHERE l.project = ?1
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
            AND v.receipt_oid IS NOT NULL
            AND TRIM(v.receipt_oid) != ''
          GROUP BY l.file, l.symbol, v.verdict, v.receipt_oid
-         ORDER BY witnessed_at DESC",
-    )?;
+         ORDER BY learned_at DESC"
+    ))?;
     let rows = stmt
         .query_map(params![project], |row| {
             Ok((
@@ -185,31 +211,38 @@ pub fn receipted_conclusions(conn: &Connection, project: &str) -> Result<Vec<Dre
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut out: Vec<DreamHeadline> = rows
+    let mut out: Vec<(String, DreamHeadline)> = rows
         .into_iter()
-        .filter_map(|(file, symbol, verdict, receipt_oid, witnessed_at)| {
-            headline_from_parts(
-                project.to_string(),
-                file,
-                symbol,
-                verdict,
-                receipt_oid,
-                witnessed_at,
-            )
-        })
+        .filter_map(
+            |(file, symbol, verdict, receipt_oid, learned_at, committed_at)| {
+                let displayed = committed_at
+                    .filter(|at| !at.trim().is_empty())
+                    .unwrap_or_else(|| learned_at.clone());
+                headline_from_parts(
+                    project.to_string(),
+                    file,
+                    symbol,
+                    verdict,
+                    receipt_oid,
+                    displayed,
+                )
+                .map(|headline| (learned_at, headline))
+            },
+        )
         .collect();
-    out.sort_by(|a, b| {
-        b.witnessed_date
-            .cmp(&a.witnessed_date)
+    out.sort_by(|(learned_a, a), (learned_b, b)| {
+        date_of(learned_b)
+            .cmp(&date_of(learned_a))
             .then_with(|| verdict_rank(&a.verdict).cmp(&verdict_rank(&b.verdict)))
-            .then_with(|| b.witnessed_at.cmp(&a.witnessed_at))
+            .then_with(|| learned_b.cmp(learned_a))
             .then_with(|| a.id.cmp(&b.id))
     });
-    Ok(out)
+    Ok(out.into_iter().map(|(_, headline)| headline).collect())
 }
 
 /// Lower sorts first: adverse before restorative before anything unknown.
@@ -222,17 +255,22 @@ fn verdict_rank(verdict: &str) -> u8 {
     }
 }
 
-/// Cheap existence probe: does this project have any receipt-bearing verdict
-/// at all? Hooks call this before doing any real work, so a project with no
+/// Cheap existence probe: does this project have any receipt-bearing CURRENT
+/// verdict (a witness's latest live event) at all? Hooks call this before doing any real work, so a project with no
 /// dreams costs one indexed count.
 pub fn has_receipted_conclusion(conn: &Connection, project: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*)
-         FROM witness_verdicts v
-         JOIN witness_ledger l ON l.id = v.witness_id
-         WHERE l.project = ?1
-           AND v.receipt_oid IS NOT NULL
-           AND TRIM(v.receipt_oid) != ''",
+        &format!(
+            "SELECT COUNT(*)
+             FROM witness_verdicts v
+             JOIN witness_ledger l ON l.id = v.witness_id
+             WHERE l.project = ?1
+               AND v.id > {LIVE_EVENT_FLOOR_SQL}
+               AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                           WHERE v2.witness_id = v.witness_id)
+               AND v.receipt_oid IS NOT NULL
+               AND TRIM(v.receipt_oid) != ''"
+        ),
         params![project],
         |row| row.get(0),
     )?;
@@ -282,85 +320,86 @@ pub fn claim_delivery(
         .unwrap_or(false)
 }
 
-/// Count distinct dreams delivered after row id `cursor`.
-fn deliveries_after(conn: &Connection, cursor: i64) -> Result<i64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT dream_id) FROM dream_deliveries WHERE id > ?1",
-        params![cursor],
-        |row| row.get(0),
-    )?;
-    Ok(count)
-}
-
-/// Highest delivery row id, or 0 when nothing has ever been delivered.
-fn delivery_cursor(conn: &Connection) -> Result<i64> {
-    let cursor: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(id), 0) FROM dream_deliveries",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(cursor)
-}
-
-/// Count the receipt-bearing conclusions that have never been delivered on
-/// any channel. Run at the end of a pass, not on a hot path.
-pub fn count_undelivered(conn: &Connection) -> Result<i64> {
-    let mut projects = conn.prepare("SELECT DISTINCT project FROM witness_ledger")?;
-    let names: Vec<String> = projects
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut undelivered = 0_i64;
-    for project in names {
-        for headline in receipted_conclusions(conn, &project)? {
-            let delivered: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM dream_deliveries WHERE dream_id = ?1",
-                params![headline.id],
-                |row| row.get(0),
-            )?;
-            if delivered == 0 {
-                undelivered += 1;
-            }
+/// Conclusion ids of the dreams the journal page lists as active and that no
+/// channel has delivered yet. Run at the end of a pass, not on a hot path —
+/// the cluster feed parses every v2 episode.
+///
+/// Only a receipt-bearing conclusion counts (honesty rule 1), and the list is
+/// bounded by the feed's own per-partition cap, so the badge can never exceed
+/// what the reader finds at the journal URL.
+pub fn unread_dream_ids(conn: &Connection) -> Result<Vec<String>> {
+    let feed = super::dream_clusters::load_dream_clusters(conn, None)?;
+    let mut ids: Vec<String> = Vec::new();
+    for cluster in &feed.active {
+        let conclusion = &cluster.conclusion;
+        let Some(receipt) = conclusion
+            .receipt_oid
+            .as_deref()
+            .map(str::trim)
+            .filter(|receipt| !receipt.is_empty())
+        else {
+            continue;
+        };
+        let id = conclusion_id(
+            &cluster.project,
+            &conclusion.file,
+            conclusion.symbol.as_deref(),
+            &conclusion.verdict,
+            receipt,
+        );
+        if !ids.contains(&id) && !delivered_on_any_channel(conn, &id)? {
+            ids.push(id);
         }
     }
-    Ok(undelivered)
+    Ok(ids)
+}
+
+fn delivered_on_any_channel(conn: &Connection, dream_id: &str) -> Result<bool> {
+    let delivered: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM dream_deliveries WHERE dream_id = ?1",
+        params![dream_id],
+        |row| row.get(0),
+    )?;
+    Ok(delivered > 0)
 }
 
 /// Recompute the statusline badge baseline. Called at the end of a completed
 /// pass; fail-soft, since a badge is never worth failing a cycle over.
 pub fn refresh_badge_baseline(storage: &Storage) {
-    let total = match storage.with_connection(count_undelivered) {
-        Ok(total) => total,
+    let ids = match storage.with_connection(unread_dream_ids) {
+        Ok(ids) => ids,
         Err(error) => {
             tracing::debug!(%error, "dream badge baseline unavailable (non-fatal)");
             return;
         }
     };
-    let cursor = storage.with_connection(delivery_cursor).unwrap_or(0);
-    let _ = storage.set_meta(META_BADGE_TOTAL, &total.to_string());
-    let _ = storage.set_meta(META_BADGE_CURSOR, &cursor.to_string());
+    let Ok(encoded) = serde_json::to_string(&ids) else {
+        return;
+    };
+    let _ = storage.set_meta(META_BADGE_IDS, &encoded);
+    let _ = storage.set_meta(META_BADGE_TOTAL, &ids.len().to_string());
     let _ = storage.set_meta(META_BADGE_AT, &chrono::Utc::now().to_rfc3339());
 }
 
-/// Unread dream count for the statusline: the last pass's measured baseline
-/// minus the dreams delivered since that pass. `None` when no pass has
-/// written a baseline — the caller must then render nothing at all, never a
-/// zero.
+/// Unread dream count for the statusline: the dreams the last pass measured
+/// as unread, minus those delivered since. `None` when no pass has written a
+/// baseline **in this unit** — the caller must then render nothing at all,
+/// never a zero, and never a total measured in the old per-verdict unit.
 pub fn badge_unread(storage: &Storage) -> Option<i64> {
-    let total = storage
-        .get_meta(META_BADGE_TOTAL)
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())?;
-    let cursor = storage
-        .get_meta(META_BADGE_CURSOR)
-        .ok()
-        .flatten()
-        .and_then(|raw| raw.trim().parse::<i64>().ok())
-        .unwrap_or(0);
-    let delivered = storage
-        .with_connection(|conn| deliveries_after(conn, cursor))
-        .unwrap_or(0);
-    Some((total - delivered).max(0))
+    let raw = storage.get_meta(META_BADGE_IDS).ok().flatten()?;
+    let ids: Vec<String> = serde_json::from_str(&raw).ok()?;
+    let still_unread = storage
+        .with_connection(|conn| {
+            let mut unread = 0_i64;
+            for id in &ids {
+                if !delivered_on_any_channel(conn, id)? {
+                    unread += 1;
+                }
+            }
+            Ok(unread)
+        })
+        .ok()?;
+    Some(still_unread)
 }
 
 /// When the badge baseline was measured, for `status`. `None` until a pass
@@ -411,6 +450,146 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Retire every event currently in the table behind the v2 epoch floor.
+    fn raise_floor_to_max_event(storage: &Storage) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO meta(key, value)
+                     VALUES ('witness_verdicts_v2_floor',
+                             (SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) FROM witness_verdicts))
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn delivery_readers_ignore_events_at_or_below_the_floor() {
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "proj", "src/a.rs", "old_fn", Some("1111111"));
+        assert!(storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+        assert_eq!(
+            storage
+                .with_connection(|conn| receipted_conclusions(conn, "proj"))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        raise_floor_to_max_event(&storage);
+        assert!(!storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+        assert!(storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap()
+            .is_empty());
+
+        seed(&storage, "proj", "src/b.rs", "new_fn", Some("2222222"));
+        let live = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].symbol.as_deref(), Some("new_fn"));
+    }
+
+    #[test]
+    fn a_reinstated_witness_does_not_surface_its_earlier_obsolete_verdict() {
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "proj", "src/a.rs", "flip", Some("1111111"));
+        seed(&storage, "proj", "src/b.rs", "still_gone", Some("3333333"));
+        let witness_id: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT id FROM witness_ledger WHERE symbol = 'flip'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id,
+                        verdict: VerdictKind::AnchorReinstated,
+                        successor_witness_id: None,
+                        receipt_oid: Some("2222222".into()),
+                        observed_head_oid: "head2".into(),
+                    },
+                )
+            })
+            .unwrap();
+
+        let conclusions = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let flip: Vec<_> = conclusions
+            .iter()
+            .filter(|c| c.symbol.as_deref() == Some("flip"))
+            .collect();
+        assert_eq!(
+            flip.len(),
+            1,
+            "only the latest event surfaces: {conclusions:?}"
+        );
+        assert_eq!(flip[0].verdict, "anchor_reinstated");
+        assert_eq!(flip[0].receipt_oid, "2222222");
+        assert!(
+            conclusions.iter().any(
+                |c| c.symbol.as_deref() == Some("still_gone") && c.verdict == "anchor_obsolete"
+            ),
+            "a witness whose latest event is still negative keeps surfacing"
+        );
+
+        // The existence probe is latest-only too: with the only other
+        // witness retired behind the floor, a project whose sole remaining
+        // witness is reinstated still has a (restorative) conclusion.
+        assert!(storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+    }
+
+    #[test]
+    fn existence_probe_counts_only_each_witness_latest_event() {
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "proj", "src/a.rs", "flip", Some("1111111"));
+        // Latest event has NO receipt: the earlier receipted obsolete is no
+        // longer the current state, so nothing receipt-bearing is current.
+        let witness_id: i64 = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT id FROM witness_ledger", [], |row| row.get(0))?)
+            })
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                witness_verdicts::insert_verdict_if_changed(
+                    conn,
+                    &WitnessVerdictRow {
+                        witness_id,
+                        verdict: VerdictKind::AnchorReinstated,
+                        successor_witness_id: None,
+                        receipt_oid: None,
+                        observed_head_oid: "head2".into(),
+                    },
+                )
+            })
+            .unwrap();
+        assert!(!storage
+            .with_connection(|conn| has_receipted_conclusion(conn, "proj"))
+            .unwrap());
+        assert!(storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -533,21 +712,81 @@ mod tests {
         );
     }
 
+    /// One open todo whose session touched `file` — enough for the cluster
+    /// feed to raise one active dream once `file` carries a verdict.
+    fn seed_open_item(storage: &Storage, project: &str, session: &str, file: &str) {
+        let json = format!(
+            r#"{{"schema":"v2","session_id":"{session}","project":"{project}","timestamp":"2026-01-01T00:00:00Z","todos":[{{"content":"finish the leftover work from {session}","status":"pending"}}],"files_modified":["{file}"]}}"#
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES (?1, ?2, '[]', '2026-01-01T00:00:00Z')",
+                    params![format!("ep-{session}"), json],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
     #[test]
-    fn badge_counts_undelivered_conclusions_and_falls_as_they_are_delivered() {
+    fn badge_counts_journal_dreams_not_raw_verdicts() {
         let storage = Storage::open_memory().unwrap();
-        seed(&storage, "proj", "src/a.rs", "alpha_fn", Some("abc1234"));
-        seed(&storage, "proj", "src/b.rs", "beta_fn", Some("def5678"));
+        // Three receipted verdicts, but only one of them sits under an open
+        // item — the journal page lists ONE dream, so the badge says 1.
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/a.rs",
+            "alpha_fn",
+            Some("abc1234"),
+        );
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/b.rs",
+            "beta_fn",
+            Some("def5678"),
+        );
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/c.rs",
+            "gamma_fn",
+            Some("0123abc"),
+        );
+        seed_open_item(&storage, "proj", "sess-1", "/repo/src/a.rs");
+        refresh_badge_baseline(&storage);
+        assert_eq!(badge_unread(&storage), Some(1));
+    }
+
+    #[test]
+    fn badge_falls_as_a_dream_is_delivered() {
+        let storage = Storage::open_memory().unwrap();
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/a.rs",
+            "alpha_fn",
+            Some("abc1234"),
+        );
+        seed(
+            &storage,
+            "proj",
+            "/repo/src/b.rs",
+            "beta_fn",
+            Some("def5678"),
+        );
+        seed_open_item(&storage, "proj", "sess-1", "/repo/src/a.rs");
+        seed_open_item(&storage, "proj", "sess-2", "/repo/src/b.rs");
         refresh_badge_baseline(&storage);
         assert_eq!(badge_unread(&storage), Some(2));
 
-        let first = storage
-            .with_connection(|conn| receipted_conclusions(conn, "proj"))
-            .unwrap()
-            .remove(0);
+        let first = storage.with_connection(unread_dream_ids).unwrap().remove(0);
         assert!(claim_delivery(
             &storage,
-            &first.id,
+            &first,
             DeliveryChannel::Prompt,
             Some("s1")
         ));
@@ -557,24 +796,222 @@ mod tests {
             "a delivered dream stops being unread"
         );
 
+        // A delivery of something the badge never counted changes nothing.
+        assert!(claim_delivery(
+            &storage,
+            "not-a-journal-dream",
+            DeliveryChannel::Recap,
+            Some("s1")
+        ));
+        assert_eq!(badge_unread(&storage), Some(1));
+
         // A pass re-measuring after the delivery agrees with the arithmetic.
         refresh_badge_baseline(&storage);
         assert_eq!(badge_unread(&storage), Some(1));
     }
 
     #[test]
-    fn badge_never_goes_negative() {
+    fn a_baseline_in_the_old_per_verdict_unit_is_never_rendered() {
         let storage = Storage::open_memory().unwrap();
-        storage.set_meta(META_BADGE_TOTAL, "1").unwrap();
-        storage.set_meta(META_BADGE_CURSOR, "0").unwrap();
-        for id in ["a", "b", "c"] {
-            assert!(claim_delivery(
-                &storage,
-                id,
-                DeliveryChannel::Prompt,
-                Some("s")
-            ));
-        }
-        assert_eq!(badge_unread(&storage), Some(0));
+        storage.set_meta(META_BADGE_TOTAL, "12326").unwrap();
+        storage
+            .set_meta(META_BADGE_AT, "2026-09-20T03:11:38Z")
+            .unwrap();
+        assert_eq!(
+            badge_unread(&storage),
+            None,
+            "a total with no id list was measured in verdicts, not dreams"
+        );
+    }
+
+    /// Insert a receipted `anchor_obsolete` for `symbol` with an explicit
+    /// recorded time and (optionally) a receipt commit time.
+    fn seed_dated(
+        storage: &Storage,
+        symbol: &str,
+        receipt: &str,
+        created_at: &str,
+        committed_at: Option<&str>,
+    ) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO witness_ledger
+                        (project, file, symbol, stamp, tier, at_oid, source_kind)
+                     VALUES ('proj', '/repo/a.rs', ?1, ?2, 'committed', 'aaaa111', 'test')",
+                    params![symbol, format!("b3:{symbol}")],
+                )?;
+                let witness_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO witness_verdicts
+                        (witness_id, verdict, receipt_oid, observed_head_oid,
+                         created_at, receipt_committed_at)
+                     VALUES (?1, 'anchor_obsolete', ?2, 'head', ?3, ?4)",
+                    params![witness_id, receipt, created_at, committed_at],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn delivered_headline_carries_the_commit_date_not_the_dream_date() {
+        let storage = Storage::open_memory().unwrap();
+        seed_dated(
+            &storage,
+            "SampleVow",
+            "0145628",
+            "2026-10-08 01:00:00",
+            Some("2026-09-12 14:30:00"),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].witnessed_date, "2026-09-12");
+        assert_eq!(rows[0].witnessed_at, "2026-09-12 14:30:00");
+        // The conclusion id does not depend on either date.
+        assert_eq!(
+            rows[0].id,
+            conclusion_id(
+                "proj",
+                "/repo/a.rs",
+                Some("SampleVow"),
+                "anchor_obsolete",
+                "0145628"
+            )
+        );
+        // ...and the recap clause shows the same date.
+        let clause = storage
+            .recap_top_dream_with("proj", crate::storage::recap_feeds::ConsumptionMode::Full)
+            .unwrap()
+            .expect("an undelivered dream");
+        assert_eq!(clause.date, "2026-09-12");
+    }
+
+    #[test]
+    fn a_row_without_a_commit_time_falls_back_to_the_recorded_date() {
+        let storage = Storage::open_memory().unwrap();
+        seed_dated(&storage, "old_row", "abc1234", "2026-08-11 10:00:00", None);
+        seed_dated(
+            &storage,
+            "blank",
+            "def5678",
+            "2026-08-12 10:00:00",
+            Some("  "),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let date_of_label = |label: &str| {
+            rows.iter()
+                .find(|row| row.label() == label)
+                .map(|row| row.witnessed_date.clone())
+                .unwrap()
+        };
+        assert_eq!(date_of_label("old_row"), "2026-08-11");
+        assert_eq!(date_of_label("blank"), "2026-08-12");
+    }
+
+    #[test]
+    fn ordering_follows_when_the_dreamer_learned_it_not_the_commit_date() {
+        let storage = Storage::open_memory().unwrap();
+        // Learned later, but the change itself is much older.
+        seed_dated(
+            &storage,
+            "learned_last",
+            "1111111",
+            "2026-10-08 09:00:00",
+            Some("2026-06-01 00:00:00"),
+        );
+        // Learned earlier, committed more recently.
+        seed_dated(
+            &storage,
+            "learned_first",
+            "2222222",
+            "2026-10-01 09:00:00",
+            Some("2026-09-30 00:00:00"),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let labels: Vec<&str> = rows.iter().map(|row| row.label()).collect();
+        assert_eq!(labels, ["learned_last", "learned_first"]);
+        assert_eq!(rows[0].witnessed_date, "2026-06-01");
+    }
+
+    #[test]
+    fn an_offset_commit_time_is_dated_locally_and_julianday_normalizes_it() {
+        let storage = Storage::open_memory().unwrap();
+        // 22:57 on 09-12 at -07:00 is 05:57 on 09-13 UTC.
+        seed_dated(
+            &storage,
+            "west",
+            "1111111",
+            "2026-10-08 01:00:00",
+            Some("2026-09-12T22:57:11-07:00"),
+        );
+        // 00:10 on 09-13 at +05:30 is 18:40 on 09-12 UTC.
+        seed_dated(
+            &storage,
+            "east",
+            "2222222",
+            "2026-10-07 01:00:00",
+            Some("2026-09-13T00:10:00+05:30"),
+        );
+        let rows = storage
+            .with_connection(|conn| receipted_conclusions(conn, "proj"))
+            .unwrap();
+        let date_of_label = |label: &str| {
+            rows.iter()
+                .find(|row| row.label() == label)
+                .map(|row| row.witnessed_date.clone())
+                .unwrap()
+        };
+        assert_eq!(date_of_label("west"), "2026-09-12");
+        assert_eq!(date_of_label("east"), "2026-09-13");
+
+        // julianday() accepts the +-HH:MM suffix and normalizes to UTC, so
+        // comparisons against `created_at` (SQLite UTC text) stay correct
+        // where plain text comparison would not.
+        let (same_instant, before_created, after_created, text_order_wrong): (i64, i64, i64, i64) =
+            storage
+                .with_connection(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT
+                            ABS(julianday('2026-09-12T22:57:11-07:00')
+                                - julianday('2026-09-13 05:57:11')) < 1e-9,
+                            julianday('2026-09-12T22:57:11-07:00') < julianday('2026-09-13 05:57:12'),
+                            julianday('2026-09-12T22:57:11-07:00') > julianday('2026-09-13 05:57:10'),
+                            -- text says the commit is older than 09-13 01:00Z;
+                            -- the instants say it is newer
+                            ('2026-09-12T22:57:11-07:00' < '2026-09-13 01:00:00')
+                            AND julianday('2026-09-12T22:57:11-07:00')
+                                > julianday('2026-09-13 01:00:00')",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )?)
+                })
+                .unwrap();
+        assert_eq!(same_instant, 1);
+        assert_eq!(before_created, 1);
+        assert_eq!(after_created, 1);
+        assert_eq!(text_order_wrong, 1);
+
+        // The column itself, read back through julianday(), orders by instant.
+        let ordered: Vec<String> = storage
+            .with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT receipt_oid FROM witness_verdicts
+                     ORDER BY julianday(receipt_committed_at)",
+                )?;
+                let out = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(out)
+            })
+            .unwrap();
+        // east = 09-12 18:40Z, west = 09-13 05:57Z
+        assert_eq!(ordered, ["2222222", "1111111"]);
     }
 }

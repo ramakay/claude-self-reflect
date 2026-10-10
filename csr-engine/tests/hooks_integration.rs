@@ -5,6 +5,292 @@
 
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn searching_hook_startup_cannot_publish_a_rebuilt_index() {
+    let dir = TempDir::new().unwrap();
+    let index = dir.path().join("index");
+    std::fs::create_dir(&index).unwrap();
+    std::fs::write(index.join("manifest.json"), "invalid cache sentinel").unwrap();
+    let engine = csr_engine::engine::Engine::new_for_hook(
+        &dir.path().join("test.db"),
+        &dir.path().join("projects"),
+    )
+    .unwrap();
+    engine.flush_index().await;
+    assert_eq!(
+        std::fs::read_to_string(index.join("manifest.json")).unwrap(),
+        "invalid cache sentinel"
+    );
+    assert_eq!(std::fs::read_dir(index).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+mod prompt_process {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn command(dir: &std::path::Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        command
+            .args(["hook", "prompt-submit", "--db-path"])
+            .arg(dir.join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.join("projects"))
+            .env("CSR_TIMING_LOG", dir.join("timing.log"))
+            .env("CSR_HOOK_TIMING_PROBE", "1")
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn payload(dir: &std::path::Path) -> Vec<u8> {
+        serde_json::to_vec(
+            &serde_json::json!({"prompt": "fix the authentication timeout regression",
+            "cwd": dir, "session_id": "latency-test"}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cold_process_ignores_large_index_and_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index");
+        std::fs::create_dir(&index).unwrap();
+        // Sparse poison files: loading even the manifest would fail. The hook
+        // must not create a DB, rebuild the index, or touch any of these files.
+        for (name, size) in [
+            ("chunks.hnsw.data", 956_000_000),
+            ("chunks.hnsw.graph", 296_000_000),
+            ("manifest.json", 26_600_000),
+        ] {
+            std::fs::File::create(index.join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        for _ in 0..5 {
+            let started = Instant::now();
+            let mut child = command(dir.path()).spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&payload(dir.path()))
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+            assert!(started.elapsed() < Duration::from_secs(3));
+        }
+        assert!(!dir.path().join("csr-engine.db").exists());
+        assert_eq!(
+            std::fs::metadata(index.join("manifest.json"))
+                .unwrap()
+                .len(),
+            26_600_000
+        );
+        assert_eq!(std::fs::read_dir(index).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn cold_process_emits_only_complete_validated_reply() {
+        for valid in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = csr_engine::hooks::prompt_transport::socket_path(dir.path());
+            std::fs::create_dir(path.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).unwrap();
+                let mut request = vec![0; u32::from_be_bytes(header) as usize];
+                stream.read_exact(&mut request).unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(json["input"]["session_id"], "latency-test");
+                assert_eq!(json["database"], "csr-engine.db");
+                let body =
+                    serde_json::to_vec(&serde_json::json!({"version": if valid {1} else {0},
+                    "injection": "CSR PICKUP — exact bytes\nsecond line\n"}))
+                    .unwrap();
+                stream
+                    .write_all(&(body.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            let mut child = command(dir.path()).spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&payload(dir.path()))
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                if valid {
+                    b"CSR PICKUP \xe2\x80\x94 exact bytes\nsecond line\n".as_slice()
+                } else {
+                    b""
+                }
+            );
+            assert!(!dir.path().join("csr-engine.db").exists());
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cold_process_deadline_covers_stalled_stdin_and_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep stdin open: the 2s library stdin timeout would exceed the hook
+        // target, so only the independent process watchdog can pass this test.
+        let parent_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let started = Instant::now();
+        let mut child = command(dir.path()).spawn().unwrap();
+        let spawn_elapsed = started.elapsed();
+        let held_stdin = child.stdin.take().unwrap();
+        let output = child.wait_with_output().unwrap();
+        eprintln!(
+            "CSR timing-probe parent_unix_ns={parent_ns} spawn_ms={} wall_ms={} stderr={}",
+            spawn_elapsed.as_millis(),
+            started.elapsed().as_millis(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(held_stdin);
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let probe = |key: &str| -> u128 {
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("missing timing probe {key}: {stderr}"))
+                .parse()
+                .unwrap()
+        };
+        let main_ns = probe("CSR timing-probe main_unix_ns=");
+        let watchdog_ms = probe("CSR timing-probe deadline_total_ms=");
+        let before_main = Duration::from_nanos(main_ns.saturating_sub(parent_ns) as u64);
+        // Repeated macOS launches can spend seconds before main even without
+        // relinking (measured spawn itself takes 1–3ms).
+        // The watchdog cannot preempt that OS phase. Preserve wall diagnostics,
+        // but assert the code-controlled interval rather than claiming a 3s
+        // process-start cap that this executable cannot enforce in-process.
+        assert!(watchdog_ms < 1500, "watchdog={watchdog_ms}ms; {stderr}");
+        assert!(
+            started.elapsed().saturating_sub(before_main) < Duration::from_secs(3),
+            "wall={:?} before_main={before_main:?} spawn={spawn_elapsed:?} stderr={stderr}",
+            started.elapsed()
+        );
+        // Prove the watchdog itself beat the 2s stdin timeout:
+        // that fallback would have created the timing log before returning.
+        assert!(!dir.path().join("timing.log").exists());
+
+        let path = csr_engine::hooks::prompt_transport::socket_path(dir.path());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let started = Instant::now();
+        let mut child = command(dir.path()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&payload(dir.path()))
+            .unwrap();
+        let (_stream, _) = listener.accept().unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn watchdog_exits_even_when_stdout_is_full_and_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = csr_engine::hooks::prompt_transport::socket_path(dir.path());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let body = serde_json::to_vec(
+                &serde_json::json!({"version":1,"injection":"x".repeat(240_000)}),
+            )
+            .unwrap();
+            stream
+                .write_all(&(body.len() as u32).to_be_bytes())
+                .unwrap();
+            let _ = stream.write_all(&body);
+        });
+        let parent_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let started = Instant::now();
+        let mut child = command(dir.path()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&payload(dir.path()))
+            .unwrap();
+        // Intentionally do not drain stdout: wait_with_output would hide the
+        // watchdog's stdio-cleanup deadlock. The 10s bound only catches a real
+        // hang; the deadline itself is asserted below from the probes.
+        let wall = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break started.elapsed();
+            }
+            if started.elapsed() >= Duration::from_secs(10) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("watchdog blocked on stdout cleanup");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        let probe = |key: &str| -> u128 {
+            stderr
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or_else(|| panic!("missing timing probe {key}: {stderr}"))
+                .parse()
+                .unwrap()
+        };
+        let main_ns = probe("CSR timing-probe main_unix_ns=");
+        let watchdog_ms = probe("CSR timing-probe deadline_total_ms=");
+        let before_main = Duration::from_nanos(main_ns.saturating_sub(parent_ns) as u64);
+        // Same split as the stalled-stdin test: the OS phase before main is
+        // outside the watchdog's reach, the code-controlled interval is not.
+        assert!(watchdog_ms < 1500, "watchdog={watchdog_ms}ms; {stderr}");
+        assert!(
+            wall.saturating_sub(before_main) < Duration::from_secs(3),
+            "wall={wall:?} before_main={before_main:?} stderr={stderr}"
+        );
+        peer.join().unwrap();
+    }
+}
+
 // ─── HookInput Parsing ───
 
 #[test]

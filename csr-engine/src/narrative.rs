@@ -37,6 +37,191 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
+/// Opt-out for [`isolation_args`]: keep loading the user's settings files in
+/// headless children. For installs whose credentials live there (`apiKeyHelper`,
+/// an `env` block selecting Bedrock or Vertex); hooks are still switched off.
+fn headless_keeps_user_settings() -> bool {
+    std::env::var("CSR_HEADLESS_USER_SETTINGS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Argv that cuts a headless `claude -p` child off from the machine's Claude
+/// Code setup. Every CSR spawn site passes it.
+///
+/// * `--setting-sources ""` loads no user, project or local settings, so the
+///   child runs none of the user's plugins and none of their SessionStart
+///   hooks. Measured 2026-09-19 on one machine, same Haiku call: 7.1s and
+///   8,741 prompt tokens with settings loaded, 1.5s and 6,336 without. A
+///   month of ratification children had fired one plugin's SessionStart hook
+///   21,116 times.
+/// * `--no-session-persistence` writes no transcript. Those transcripts were
+///   14,186 files in one project directory, re-imported by the watcher as if
+///   they were conversations, and 19,852 of 20,159 re-ranker harvest sources.
+///
+/// Both are checked against `claude --help` once per process (~55ms): a CLI
+/// that predates an option rejects it outright, which would fail every call.
+pub fn isolation_args() -> Vec<String> {
+    static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    if let Some(args) = ARGS.get() {
+        return args.clone();
+    }
+    let mut probe = std::process::Command::new("claude");
+    probe.arg("--help");
+    match run_with_deadline(probe, HELP_PROBE_DEADLINE) {
+        Some(stdout) => ARGS
+            .get_or_init(|| {
+                isolation_args_for(
+                    &String::from_utf8_lossy(&stdout),
+                    headless_keeps_user_settings(),
+                )
+            })
+            .clone(),
+        // A hung, missing or failing CLI: nothing is learnt, so nothing is
+        // cached; the next call probes again.
+        None => isolation_args_for("", headless_keeps_user_settings()),
+    }
+}
+
+/// How long `claude --help` may run before it is killed.
+const HELP_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run `cmd` (stdin closed) and return its stdout if it exits successfully
+/// within `deadline`. On timeout the child is killed AND reaped before this
+/// returns, so no process outlives the call. Stdout is drained on its own
+/// thread so a full pipe cannot stall the child and with it the deadline poll.
+pub(crate) fn run_with_deadline(
+    mut cmd: std::process::Command,
+    deadline: std::time::Duration,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf).ok().map(|_| buf)
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    // After a kill the reader is not joined: a grandchild holding the pipe
+    // would stall the caller past its deadline. The thread ends with the pipe.
+    let status = status?;
+    let output = reader.join().ok().flatten();
+    status.success().then_some(output).flatten()
+}
+
+/// How an async headless run ended.
+#[derive(Debug)]
+pub enum HeadlessRun {
+    Output(std::process::Output),
+    /// The deadline passed: the child was killed and reaped.
+    TimedOut,
+    /// The program could not be started.
+    SpawnFailed,
+}
+
+/// Run `cmd` with `stdin_bytes` on its stdin, bounded by `deadline` for the
+/// whole exchange (writing, reading, exiting). On timeout the child is killed
+/// and reaped BEFORE this returns: a caller holding a lock around the call
+/// never releases it while the child lives, and a dropped future also kills it.
+pub async fn run_headless(
+    mut cmd: tokio::process::Command,
+    stdin_bytes: &[u8],
+    deadline: std::time::Duration,
+) -> HeadlessRun {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut child = match cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        // Piped intentionally: model-not-found detection reads stderr.
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return HeadlessRun::SpawnFailed,
+    };
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let exchange = async {
+        let write = async {
+            if let Some(mut pipe) = stdin.take() {
+                let _ = pipe.write_all(stdin_bytes).await;
+            }
+        };
+        let read_out = async {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stdout.as_mut() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let read_err = async {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stderr.as_mut() {
+                let _ = pipe.read_to_end(&mut buf).await;
+            }
+            buf
+        };
+        let (_, out, err) = tokio::join!(write, read_out, read_err);
+        let status = child.wait().await.ok()?;
+        Some(std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(Some(output)) => HeadlessRun::Output(output),
+        Ok(None) => {
+            let _ = child.kill().await;
+            HeadlessRun::TimedOut
+        }
+        Err(_) => {
+            // `kill` signals and then waits: the child is reaped on return.
+            let _ = child.kill().await;
+            HeadlessRun::TimedOut
+        }
+    }
+}
+
+/// [`isolation_args`] for a given `claude --help` text. No option is
+/// variadic, so the result can sit anywhere before `--mcp-config`.
+fn isolation_args_for(help: &str, keep_user_settings: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if keep_user_settings {
+        if help.contains("--settings ") {
+            args.push("--settings".to_string());
+            args.push(r#"{"disableAllHooks":true}"#.to_string());
+        }
+    } else if help.contains("--setting-sources") {
+        args.push("--setting-sources".to_string());
+        args.push(String::new());
+    }
+    if help.contains("--no-session-persistence") {
+        args.push("--no-session-persistence".to_string());
+    }
+    args
+}
+
 /// Path to an EMPTY MCP config, for use with `--strict-mcp-config` so a
 /// `claude -p` subprocess loads ZERO MCP servers.
 ///
@@ -53,11 +238,15 @@ pub fn model_candidates() -> Vec<Option<String>> {
 /// `--strict-mcp-config` also avoids spawning a recursive csr-engine MCP server
 /// and gives the fastest possible `claude -p` startup.
 pub fn minimal_mcp_config() -> anyhow::Result<std::path::PathBuf> {
-    let config = serde_json::json!({ "mcpServers": {} });
     let dir = dirs::home_dir()
         .map(|h| h.join(".claude-self-reflect"))
         .ok_or_else(|| anyhow::anyhow!("no home dir"))?;
-    std::fs::create_dir_all(&dir).ok();
+    minimal_mcp_config_in(&dir)
+}
+
+fn minimal_mcp_config_in(dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let config = serde_json::json!({ "mcpServers": {} });
+    std::fs::create_dir_all(dir).ok();
     let path = dir.join("briefing-mcp.json");
 
     // Atomic write. All three call sites can run concurrently, so a plain
@@ -190,6 +379,42 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HELP_CURRENT: &str = "  --no-session-persistence   Disable session persistence\n  --setting-sources <sources>   Comma-separated list\n  --settings <file-or-json>   Path to a settings JSON file\n";
+
+    #[test]
+    fn isolation_drops_settings_and_the_transcript() {
+        assert_eq!(
+            isolation_args_for(HELP_CURRENT, false),
+            ["--setting-sources", "", "--no-session-persistence"]
+        );
+    }
+
+    #[test]
+    fn isolation_never_passes_an_option_the_cli_does_not_list() {
+        // An unknown option fails the whole call, so an old CLI (or no CLI:
+        // empty help) gets nothing rather than a guess.
+        assert!(isolation_args_for("", false).is_empty());
+        assert!(isolation_args_for("", true).is_empty());
+        assert_eq!(
+            isolation_args_for("  --setting-sources <sources>\n", false),
+            ["--setting-sources", ""]
+        );
+        // `--setting-sources` must not be mistaken for `--settings`.
+        assert!(isolation_args_for("  --setting-sources <sources>\n", true).is_empty());
+    }
+
+    #[test]
+    fn keeping_user_settings_still_switches_hooks_off() {
+        assert_eq!(
+            isolation_args_for(HELP_CURRENT, true),
+            [
+                "--settings",
+                r#"{"disableAllHooks":true}"#,
+                "--no-session-persistence"
+            ]
+        );
+    }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/claude_p_result.json");
 
@@ -351,7 +576,8 @@ mod tests {
 
     #[test]
     fn test_minimal_mcp_config_is_empty() {
-        let path = minimal_mcp_config().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = minimal_mcp_config_in(dir.path()).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let servers = v["mcpServers"].as_object().unwrap();
@@ -360,5 +586,86 @@ mod tests {
             0,
             "claude -p call sites need zero MCP servers"
         );
+    }
+
+    #[test]
+    fn a_hung_sync_probe_is_killed_and_reaped_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > {}; exec sleep 30", pidfile.display()));
+        let started = std::time::Instant::now();
+        assert!(run_with_deadline(cmd, std::time::Duration::from_millis(300)).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_process_gone(&pidfile);
+    }
+
+    #[test]
+    fn a_sync_probe_that_finishes_returns_its_stdout() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("printf '%s' '--setting-sources'");
+        assert_eq!(
+            run_with_deadline(cmd, std::time::Duration::from_secs(10)).unwrap(),
+            b"--setting-sources"
+        );
+        let mut failing = std::process::Command::new("sh");
+        failing.arg("-c").arg("echo x; exit 3");
+        assert!(run_with_deadline(failing, std::time::Duration::from_secs(10)).is_none());
+    }
+
+    /// `kill -0` succeeds on a zombie, so a failure proves the child was reaped.
+    fn assert_process_gone(pidfile: &std::path::Path) {
+        let pid = std::fs::read_to_string(pidfile).expect("child wrote its pid");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "pid {} still exists after the deadline", pid.trim());
+    }
+
+    #[tokio::test]
+    async fn an_async_narrator_past_its_deadline_is_killed_and_reaped_before_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("echo $$ > {}; exec sleep 30", pidfile.display()));
+        let started = std::time::Instant::now();
+        let run = run_headless(cmd, b"prompt", std::time::Duration::from_millis(400)).await;
+        assert!(matches!(run, HeadlessRun::TimedOut), "{run:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_process_gone(&pidfile);
+    }
+
+    #[tokio::test]
+    async fn an_async_narrator_that_never_reads_its_stdin_still_hits_the_deadline() {
+        // A prompt bigger than the pipe buffer, to a child that ignores stdin.
+        let big = vec![b'x'; 4 * 1024 * 1024];
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("exec sleep 30");
+        let run = run_headless(cmd, &big, std::time::Duration::from_millis(400)).await;
+        assert!(matches!(run, HeadlessRun::TimedOut), "{run:?}");
+    }
+
+    #[tokio::test]
+    async fn an_async_narrator_that_answers_in_time_returns_stdout_and_stderr() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg("cat; echo oops >&2");
+        match run_headless(cmd, b"hello", std::time::Duration::from_secs(10)).await {
+            HeadlessRun::Output(out) => {
+                assert!(out.status.success());
+                assert_eq!(out.stdout, b"hello");
+                assert_eq!(out.stderr, b"oops\n");
+            }
+            other => panic!("{other:?}"),
+        }
+        let missing = tokio::process::Command::new("/nonexistent/claude");
+        assert!(matches!(
+            run_headless(missing, b"", std::time::Duration::from_secs(1)).await,
+            HeadlessRun::SpawnFailed
+        ));
     }
 }

@@ -500,6 +500,26 @@ pub fn get_chunk_provenance(conn: &Connection, chunk_id: &str) -> Result<Option<
     }
 }
 
+/// The session that ran the conversation `conversation_id`, as its chunks'
+/// provenance records it (`source_conv_id`): for a subagent's `agent-` id, the
+/// parent session. `None` when no chunk of it carries one.
+pub fn parent_session_of_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.source_conv_id
+         FROM chunks c JOIN chunk_provenance p ON p.chunk_id = c.id
+         WHERE c.conversation_id = ?1 AND p.source_conv_id <> ''
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![conversation_id])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
 /// A reflection row: (id, content, tags, timestamp).
 pub type ReflectionRow = (String, String, Vec<String>, String);
 
@@ -645,6 +665,62 @@ pub fn rescope_sidechain_conversation(
     Ok(())
 }
 
+/// Rewrite a reflection's cached `project_<old>` tag to `project_<new>` for
+/// every reflection tied to `conversation_id` (via an exact `conv_<id>` tag)
+/// that still carries the old value — the derived-narrative counterpart to
+/// `rescope_sidechain_conversation`'s chunk-row rewrite. Reflections are
+/// looked up by a `LIKE` prefilter (no index on the tags JSON blob) but only
+/// ever mutated on an exact tag match, so a conversation id or project name
+/// that happens to be a substring of another's never causes a false rewrite.
+pub fn repair_reflection_project_tag(
+    conn: &Connection,
+    conversation_id: &str,
+    old_project: &str,
+    new_project: &str,
+) -> Result<usize> {
+    let conv_tag = format!("conv_{conversation_id}");
+    let old_tag = format!("project_{old_project}");
+    let new_tag = format!("project_{new_project}");
+    let mut stmt = conn.prepare(
+        "SELECT id, tags FROM reflections
+         WHERE tags LIKE '%' || ?1 || '%' AND tags LIKE '%' || ?2 || '%'",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![conv_tag, old_tag], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let mut repaired = 0usize;
+    for (id, tags_json) in rows {
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if !tags.iter().any(|t| t == &conv_tag) {
+            continue; // the LIKE prefilter matched a substring, not the tag itself
+        }
+        let mut changed = false;
+        let rewritten: Vec<String> = tags
+            .into_iter()
+            .map(|t| {
+                if t == old_tag {
+                    changed = true;
+                    new_tag.clone()
+                } else {
+                    t
+                }
+            })
+            .collect();
+        if !changed {
+            continue;
+        }
+        conn.execute(
+            "UPDATE reflections SET tags = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&rewritten)?, id],
+        )?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
 /// Delete a whole conversation's chunks + their embeddings, FTS rows, and provenance
 /// edges. Aux-source adapters (plans, tasks, ...) reimport a whole document on content
 /// change, and the document can shrink — overwriting by deterministic chunk id alone
@@ -672,6 +748,90 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
         params![conversation_id],
     )?;
     Ok(())
+}
+
+/// Remove the state of a conversation that should never have been corpus (a
+/// CSR agent transcript): its chunks with their embeddings, FTS rows, spans and
+/// provenance edges, and its enrichment and ratification rows with the
+/// ratification receipts, which are keyed by conversation id. Reflections and
+/// their receipts go separately (`purge_reflections`), only once nothing kept
+/// cites them. Append-only history (`provenance_events`, retrieval and exposure
+/// logs) stays as recorded. Returns the number of chunks removed.
+pub fn purge_conversation(conn: &Connection, conversation_id: &str) -> Result<usize> {
+    let chunks: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    )?;
+    delete_chunks_for_conversation(conn, conversation_id)?;
+    conn.execute(
+        "DELETE FROM artifact_derivations WHERE artifact_kind = 'ratification' AND artifact_id = ?1",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM ratification_scores WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM enrichment_state WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    Ok(chunks as usize)
+}
+
+/// `(conversation id, reflection id)` for every enrichment row that produced
+/// a reflection.
+pub fn enrichment_reflection_refs(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT conversation_id, reflection_id FROM enrichment_state WHERE reflection_id IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// `(reflection id, conversation ids)` for every reflection carrying at least
+/// one `conv_<id>` tag, the tag each conversation-derived reflection is stored
+/// with (episodes, V3 extractions, heuristics, stories).
+pub fn reflection_conversation_tags(conn: &Connection) -> Result<Vec<(String, Vec<String>)>> {
+    let mut stmt = conn.prepare("SELECT id, tags FROM reflections WHERE tags LIKE '%\"conv_%'")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut tagged = Vec::new();
+    for row in rows {
+        let (id, tags) = row?;
+        let conversations: Vec<String> = serde_json::from_str::<Vec<String>>(&tags)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|tag| tag.strip_prefix("conv_").map(str::to_string))
+            .collect();
+        if !conversations.is_empty() {
+            tagged.push((id, conversations));
+        }
+    }
+    Ok(tagged)
+}
+
+/// Delete reflections with their embeddings and derivation receipts. A
+/// reflection some enrichment row still cites is left alone: the caller removes
+/// the rows of the conversations it purges first, so a surviving citation
+/// belongs to a conversation that is being kept. Returns the number deleted.
+pub fn purge_reflections(conn: &Connection, ids: &[String]) -> Result<usize> {
+    let cited = enrichment_reflection_refs(conn)?
+        .into_iter()
+        .map(|(_, reflection_id)| reflection_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut deleted = 0;
+    for id in ids.iter().filter(|id| !cited.contains(*id)) {
+        conn.execute(
+            "DELETE FROM artifact_derivations WHERE artifact_kind = 'reflection' AND artifact_id = ?1",
+            params![id],
+        )?;
+        delete_reflection(conn, id)?;
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 pub fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
@@ -880,38 +1040,792 @@ pub fn get_chunks_by_project(
 
 // ─── Temporal queries ───
 
-/// Get recent chunks ordered by timestamp descending.
-/// Returns one representative chunk per unique conversation (the most recent chunk),
-/// ensuring the limit applies to distinct conversations, not raw chunks.
+/// True for a project namespace that is a headless workflow cwd namespace —
+/// a scratchpad/cleanroom directory a subagent or workflow harness worked
+/// in, never a session a person typed into. These share the family's
+/// hyphenated prefix (same repo, different working directory), so
+/// `same_project_family` legitimately puts them in the family, but recent
+/// work should never surface them ahead of a real interactive session.
+/// Substring match, not a suffix check: the namespace can carry more path
+/// after the marker (e.g. a nested worktree id).
+fn is_headless_scratchpad_namespace(project_name: &str) -> bool {
+    project_name.contains("-scratchpad-")
+}
+
+/// Project namespaces in the same family as `project` (per
+/// `cross_project::same_project_family_at_root`), plus `project` itself,
+/// resolved against `projects_root`. Hermetic seam for tests only — the
+/// production entry point is `recent_work_family_projects`, which goes
+/// through the crate's cached `same_project_family` instead of this
+/// uncached, explicit-root variant (see that function's doc comment).
+/// Mirrors the pattern in `storage::codegraph::family_projects`.
+#[cfg(test)]
+fn recent_work_family_projects_at_root(
+    conn: &Connection,
+    project: &str,
+    projects_root: &Path,
+) -> Result<Vec<String>> {
+    let mut projects = list_project_names(conn, "", i64::MAX as usize)?;
+    projects.retain(|candidate| {
+        crate::search::cross_project::same_project_family_at_root(project, candidate, projects_root)
+            && !is_headless_scratchpad_namespace(candidate)
+    });
+    if !projects.iter().any(|p| p == project) {
+        projects.push(project.to_string());
+    }
+    Ok(projects)
+}
+
+/// `home`-parameterized double of `recent_work_family_projects`. Uses the
+/// cached-`is_dir`, explicit-root `same_project_family_at_cached_root` (same
+/// process-lifetime memo, same performance characteristics as the crate's
+/// global `same_project_family`) instead of delegating to the global
+/// `dirs::home_dir()`-reading `same_project_family` directly, so the
+/// no-resolvable-home branch can be exercised deterministically in a test
+/// regardless of this machine's real `$HOME`. If there is no resolvable home
+/// directory, an explicit `projects_root` can't be formed at all, so this
+/// returns exact scope only — never falls back to a CWD-relative "projects"
+/// directory, which would let an unrelated directory in the process's
+/// current working directory leak into the family.
+fn recent_work_family_projects_with_home(
+    conn: &Connection,
+    project: &str,
+    home: Option<&Path>,
+) -> Result<Vec<String>> {
+    if home.is_none() {
+        return Ok(vec![project.to_string()]);
+    }
+    let projects_root = home.unwrap().join("projects");
+    let mut projects = list_project_names(conn, "", i64::MAX as usize)?;
+    projects.retain(|candidate| {
+        crate::search::cross_project::same_project_family_at_cached_root(
+            project,
+            candidate,
+            &projects_root,
+        ) && !is_headless_scratchpad_namespace(candidate)
+    });
+    if !projects.iter().any(|p| p == project) {
+        projects.push(project.to_string());
+    }
+    Ok(projects)
+}
+
+/// Production entry point. Threads the real `dirs::home_dir()` into
+/// `recent_work_family_projects_with_home` — see that function's doc for why
+/// the no-home-dir case is a seam parameter rather than an inline check.
+fn recent_work_family_projects(conn: &Connection, project: &str) -> Result<Vec<String>> {
+    recent_work_family_projects_with_home(conn, project, dirs::home_dir().as_deref())
+}
+
+/// Row shape for `get_recent_chunks_in_projects`: the representative (first)
+/// chunk of a conversation, its source adapter, and the raw first-chunk
+/// timestamp (used only for headless codex burst detection — display/ordering
+/// use `chunk.timestamp`, which this sets to the conversation's
+/// *last-activity* timestamp, not the first chunk's).
+struct RecentChunkRow {
+    chunk: ConversationChunk,
+    source: String,
+    first_chunk_ts: String,
+}
+
+/// UTC-second bucket of an RFC3339-ish timestamp (`YYYY-MM-DDTHH:MM:SS`).
+/// Fallback grouping key when a timestamp doesn't parse as RFC3339.
+fn burst_second(ts: &str) -> &str {
+    if ts.len() >= 19 {
+        &ts[..19]
+    } else {
+        ts
+    }
+}
+
+/// Same-UTC-second grouping under-collapses real headless bursts: parallel
+/// codex spawns commonly land a few seconds apart, not in the same second.
+/// Anything within this many seconds of the burst's head timestamp counts as
+/// the same burst.
+const CODEX_BURST_WINDOW_SECS: i64 = 10;
+
+fn within_burst_window(head_ts: &str, candidate_ts: &str) -> bool {
+    match (
+        head_ts.parse::<chrono::DateTime<chrono::Utc>>(),
+        candidate_ts.parse::<chrono::DateTime<chrono::Utc>>(),
+    ) {
+        (Ok(head), Ok(candidate)) => {
+            (head - candidate).num_seconds().abs() <= CODEX_BURST_WINDOW_SECS
+        }
+        // Unparsable timestamps: fall back to the old same-second prefix
+        // rather than silently never collapsing.
+        _ => burst_second(head_ts) == burst_second(candidate_ts),
+    }
+}
+
+/// Best-effort spawn time embedded in a UUIDv7-shaped Codex conversation id
+/// (`codex:<uuid>`) — the first 48 bits of the UUID, which UUIDv7 defines as
+/// a big-endian Unix millisecond timestamp. `None` for a legacy or malformed
+/// id (not a well-formed 32-hex-digit UUID, or the version nibble isn't
+/// `7`), so callers fall back to a chunk-derived timestamp instead.
+fn codex_spawn_time_from_id(conversation_id: &str) -> Option<String> {
+    let uuid_part = conversation_id.strip_prefix("codex:")?;
+    let hex: String = uuid_part.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    // UUIDv7 version nibble: 13th hex digit (0-indexed 12) is always `7`.
+    if hex.as_bytes()[12] != b'7' {
+        return None;
+    }
+    let ms = u64::from_str_radix(&hex[..12], 16).ok()?;
+    let secs = (ms / 1000) as i64;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
+}
+
+/// Effective burst-grouping timestamp for a codex conversation: the id's own
+/// embedded UUIDv7 spawn time when available, falling back to
+/// `first_chunk_ts` for a legacy/malformed id.
+///
+/// The id's timestamp is used in preference to `first_chunk_ts` because
+/// `restamp_codex_chunk_timestamps` (`codex_rollout_chunk_ts_restamp_v1`)
+/// rewrites stored chunk timestamps to the *message* time, not the
+/// rollout's spawn time. On a restamped corpus, `first_chunk_ts`
+/// (`MIN(timestamp)` per conversation) no longer approximates when parallel
+/// spawns actually happened, and two rollouts spawned 100ms apart via
+/// `thread_spawn` can show first messages minutes apart. A UUIDv7's
+/// embedded timestamp survives the restamp untouched.
+fn codex_burst_key_ts(conversation_id: &str, first_chunk_ts: &str) -> String {
+    codex_spawn_time_from_id(conversation_id).unwrap_or_else(|| first_chunk_ts.to_string())
+}
+
+/// Exact count of `codex_rollout` conversations (non-sidechain, in scope)
+/// whose `codex_burst_key_ts` falls within `CODEX_BURST_WINDOW_SECS` of
+/// `head_ts` (inclusive, looking backward only — matching `within_burst_window`
+/// when scanning a descending-timestamp list). Used only as a fallback when
+/// the fetched row window ends mid-burst and the window-based scan in
+/// `collapse_codex_bursts` can't see past its own edge. `Ok(None)`
+/// (unparsable `head_ts`) leaves the caller's window-based count as-is
+/// rather than reporting a bogus one.
+fn count_codex_burst_members(
+    conn: &Connection,
+    projects: &[String],
+    head_ts: &str,
+) -> Result<Option<usize>> {
+    if head_ts.parse::<chrono::DateTime<chrono::Utc>>().is_err() {
+        return Ok(None);
+    }
+    // Fetch each in-scope codex conversation's id and first-chunk timestamp
+    // (the fallback when the id isn't a UUIDv7) and filter by *parsed*
+    // comparison in Rust, not a SQL string BETWEEN. Timestamps in this table
+    // are RFC3339 text written by different adapters/call sites that don't
+    // agree on a UTC-offset suffix ("Z" vs "+00:00"): a string BETWEEN
+    // against a chrono-formatted bound silently excludes the exact-equality
+    // case whenever the suffixes differ (was observed undercounting the
+    // burst's own head row by one). This set is bounded by the in-scope
+    // project's own codex conversation count, not the corpus, so an
+    // in-memory filter is cheap.
+    let sql = if projects.is_empty() {
+        "SELECT conversation_id, MIN(timestamp) AS first_ts FROM chunks \
+         WHERE source = 'codex_rollout' AND is_sidechain = 0 GROUP BY conversation_id"
+            .to_string()
+    } else {
+        format!(
+            "SELECT conversation_id, MIN(timestamp) AS first_ts FROM chunks \
+             WHERE project_name IN ({}) AND source = 'codex_rollout' AND is_sidechain = 0 \
+             GROUP BY conversation_id",
+            string_placeholders(projects.len()),
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<(String, String)> = if projects.is_empty() {
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        let qparams: Vec<&dyn rusqlite::ToSql> =
+            projects.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+        stmt.query_map(qparams.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let count = rows
+        .iter()
+        .filter(|(id, first_ts)| within_burst_window(head_ts, &codex_burst_key_ts(id, first_ts)))
+        .count();
+    Ok(Some(count))
+}
+
+/// Collapse consecutive `codex_rollout` conversations whose first-chunk
+/// timestamps land within `CODEX_BURST_WINDOW_SECS` of the burst's head row
+/// into a single row annotated with `+N parallel`, honouring `limit` on the
+/// *collapsed* row count. Rows must already be ordered by last-activity
+/// descending, so siblings in a burst are adjacent.
+///
+/// `rows` is a bounded fetch window, not the whole corpus. When a burst's
+/// member scan runs all the way to the end of `rows` without hitting a
+/// non-member (i.e. the fetch window itself, not the burst, is what stopped
+/// the scan), the window-based `extra` count is a lower bound, not the true
+/// count — the burst may have more siblings past the window edge. This can
+/// happen even when the collapsed output already satisfies `limit` (a solo
+/// row ahead of an oversized burst fills `limit` before the burst is fully
+/// walked), so the caller's widening retry never gets a chance to fetch a
+/// wider window. Run an exact follow-up count in that case rather than
+/// reporting a partial one.
+fn collapse_codex_bursts(
+    conn: &Connection,
+    projects: &[String],
+    rows: Vec<RecentChunkRow>,
+    limit: usize,
+) -> Result<Vec<ConversationChunk>> {
+    const CODEX_SOURCE: &str = "codex_rollout";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() && out.len() < limit {
+        let row = &rows[i];
+        if row.source == CODEX_SOURCE {
+            let head_ts = codex_burst_key_ts(&row.chunk.conversation_id, &row.first_chunk_ts);
+            let mut j = i + 1;
+            let mut extra = 0usize;
+            while j < rows.len()
+                && rows[j].source == CODEX_SOURCE
+                && within_burst_window(
+                    &head_ts,
+                    &codex_burst_key_ts(&rows[j].chunk.conversation_id, &rows[j].first_chunk_ts),
+                )
+            {
+                extra += 1;
+                j += 1;
+            }
+            if j == rows.len() {
+                if let Some(exact) = count_codex_burst_members(conn, projects, &head_ts)? {
+                    extra = extra.max(exact.saturating_sub(1));
+                }
+            }
+            let mut chunk = row.chunk.clone();
+            if extra > 0 {
+                chunk.content = format!("[+{extra} parallel] {}", chunk.content);
+            }
+            out.push(chunk);
+            i = j;
+        } else {
+            out.push(row.chunk.clone());
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Distinct non-sidechain conversation ids, ordered by last-activity
+/// (`MAX(timestamp)`) descending. Dispatches on whether the call is scoped to
+/// a project family (`projects` non-empty) — the two shapes want different
+/// indexes and neither is a good plan for the other:
+///
+/// - Unscoped (`projects` empty): drives entirely off `idx_chunks_timestamp`
+///   via `recent_conversation_ids_by_activity_unscoped`, widening the window
+///   until enough distinct conversations are found. A `GROUP BY` here would
+///   force a full-table aggregation (553k+ rows on the live DB) for every
+///   call.
+/// - Scoped: a `GROUP BY ... WHERE project_name IN (...)` driven off
+///   `idx_chunks_project` (`recent_conversation_ids_by_activity_scoped`).
+///   This used to also go through the timestamp-index widening scan, which
+///   is fast for the dominant project but forces a full
+///   `idx_chunks_timestamp` walk (doubling on every retry) for any
+///   non-dominant one — measured up to 1.95s cold for a 1-chunk project vs
+///   0.0009s for the old `GROUP BY`/`idx_chunks_project` plan. `GROUP BY`
+///   costs proportional to the project's own row count, not the whole
+///   corpus, and needs no widening loop: the aggregate already found every
+///   matching conversation's true last-activity timestamp in one pass.
+fn recent_conversation_ids_by_activity(
+    conn: &Connection,
+    projects: &[String],
+    target: usize,
+) -> Result<Vec<(String, String)>> {
+    if projects.is_empty() {
+        recent_conversation_ids_by_activity_unscoped(conn, target)
+    } else {
+        recent_conversation_ids_by_activity_scoped(conn, projects, target)
+    }
+}
+
+/// Scoped branch of `recent_conversation_ids_by_activity`: exact,
+/// single-pass `GROUP BY` over `idx_chunks_project`. See that function's doc
+/// comment for why this and the unscoped branch use different plans.
+fn recent_conversation_ids_by_activity_scoped(
+    conn: &Connection,
+    projects: &[String],
+    target: usize,
+) -> Result<Vec<(String, String)>> {
+    let sql = format!(
+        "SELECT conversation_id, MAX(timestamp) AS last_ts \
+         FROM chunks INDEXED BY idx_chunks_project \
+         WHERE project_name IN ({}) AND is_sidechain = 0 \
+         GROUP BY conversation_id ORDER BY last_ts DESC LIMIT ?{}",
+        string_placeholders(projects.len()),
+        projects.len() + 1,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let target_i64 = target as i64;
+    let mut qparams: Vec<&dyn rusqlite::ToSql> =
+        projects.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    qparams.push(&target_i64);
+    let ids = stmt
+        .query_map(qparams.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// Unscoped branch of `recent_conversation_ids_by_activity`: adaptive
+/// `idx_chunks_timestamp` scan, widening until enough distinct conversations
+/// are found or the table is exhausted. See that function's doc comment.
+fn recent_conversation_ids_by_activity_unscoped(
+    conn: &Connection,
+    target: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut window = target.max(64);
+    loop {
+        let sql = "SELECT conversation_id, timestamp FROM chunks INDEXED BY idx_chunks_timestamp \
+             WHERE is_sidechain = 0 ORDER BY timestamp DESC LIMIT ?1";
+        let mut stmt = conn.prepare(sql)?;
+        let window_i64 = window as i64;
+        let raw_rows: Vec<(String, String)> = stmt
+            .query_map(params![window_i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let fetched = raw_rows.len();
+        let mut seen = std::collections::HashSet::with_capacity(target);
+        let mut ids = Vec::with_capacity(target.min(fetched));
+        for (conv_id, ts) in raw_rows {
+            if seen.insert(conv_id.clone()) {
+                ids.push((conv_id, ts));
+            }
+        }
+
+        let exhausted = fetched < window;
+        if ids.len() >= target || exhausted {
+            ids.truncate(target);
+            return Ok(ids);
+        }
+        window = window.saturating_mul(2);
+    }
+}
+
+/// How many of a conversation's earliest-by-rowid chunks are considered as
+/// preview candidates in `recent_chunk_rows_for`. Bounded so the query stays
+/// cheap regardless of conversation size. Raised from 8 (W3-B1 review#2,
+/// MEDIUM): a still-polluted Codex rollout's harness block routinely spans
+/// well past 8 stored chunks (CSR's chunker has no idea the source text was
+/// boilerplate, so it keeps splitting it at its normal char budget) — a live
+/// case measured the real prompt landing at seq 12. 32 covers that with
+/// margin while staying a small, bounded `rowid <` range.
+const PREVIEW_CANDIDATE_WINDOW: i64 = 32;
+
+/// True when `content` is harness/plumbing noise that must never win as a
+/// conversation's recent-work preview, even when it is the technically
+/// first-by-rowid chunk:
+/// - a Codex harness-boilerplate item (`is_harness_context_item`) — the
+///   pre-strip `<recommended_plugins>` etc. block a still-polluted rollout
+///   carries as chunk 0 until it's reimported through the harness-marker-
+///   stripping adapter.
+/// - a Claude Code local-command wrapper (`<local-command-caveat>`,
+///   `<local-command-stdout>`, `<command-name>`) — the harness's own echo of
+///   a typed `/login`, `/model`, etc., never anything a person wrote.
+fn is_noisy_preview(source: &str, content: &str) -> bool {
+    if source == "codex_rollout" && crate::import::codex_rollout::is_harness_context_item(content) {
+        return true;
+    }
+    content.starts_with("<local-command-caveat>")
+        || content.starts_with("<local-command-stdout>")
+        || content.starts_with("<command-name>")
+}
+
+/// Open/close tag pairs for the harness blocks `import::codex_rollout`'s
+/// (private) `CODEX_HARNESS_MARKERS` can open, observed on real rollouts.
+/// Used to track a running *nesting depth* across a Codex rollout's harness
+/// preamble rather than a plain "have we seen any closing tag yet" flag: on
+/// the live corpus, multiple blocks are packed back-to-back inside ONE
+/// original message with no chunk-boundary alignment — a live case has
+/// `<recommended_plugins>`'s closing tag and the *next* block's
+/// (`<INSTRUCTIONS>`, the body of "# AGENTS.md instructions") opening tag
+/// landing in the very same stored chunk. A "first closing tag ends the
+/// span" rule reopens the pick right there, on that next block's own
+/// boilerplate body, instead of staying closed until IT closes too. Net
+/// depth (total opens minus total closes, accumulated chunk by chunk) stays
+/// open across exactly that case, however many blocks are chained.
+const CODEX_HARNESS_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<recommended_plugins>", "</recommended_plugins>"),
+    ("<INSTRUCTIONS>", "</INSTRUCTIONS>"),
+    ("<environment_context>", "</environment_context>"),
+    ("<user_instructions>", "</user_instructions>"),
+    ("<permissions instructions>", "</permissions instructions>"),
+    ("<codex_internal_context>", "</codex_internal_context>"),
+    ("<skills_instructions>", "</skills_instructions>"),
+];
+
+/// Net harness-tag depth contributed by one chunk's content: total opening
+/// occurrences minus total closing occurrences, summed across every pair in
+/// `CODEX_HARNESS_TAG_PAIRS`. Can be negative (a chunk holding only a
+/// closing tag with no open of its own — the common case for the chunk that
+/// finally ends a multi-chunk span).
+fn harness_tag_depth_delta(content: &str) -> i32 {
+    CODEX_HARNESS_TAG_PAIRS
+        .iter()
+        .map(|(open, close)| {
+            content.matches(open).count() as i32 - content.matches(close).count() as i32
+        })
+        .sum()
+}
+
+/// Index of the first candidate in `candidates` (ordered ascending by rowid,
+/// i.e. import order) that is a real recent-work preview — skipping not just
+/// individually-noisy chunks (`is_noisy_preview`) but a whole open Codex
+/// harness span once one starts, tracked as a running tag-nesting `depth`
+/// (see `harness_tag_depth_delta`) so a span that closes one block and opens
+/// the next within the same chunk stays open, not reset. Falls back to `0`
+/// (the group's true first chunk) when every candidate in the window is
+/// noise/span, so a preview is never lost outright.
+fn pick_preview_index(candidates: &[(ConversationChunk, String, String)]) -> usize {
+    let mut depth: i32 = 0;
+    for (i, (chunk, source, _)) in candidates.iter().enumerate() {
+        let is_codex = source == "codex_rollout";
+        let opens_here =
+            is_codex && crate::import::codex_rollout::is_harness_context_item(&chunk.content);
+        if depth > 0 || opens_here {
+            if is_codex {
+                depth = (depth + harness_tag_depth_delta(&chunk.content)).max(0);
+            }
+            continue;
+        }
+        if is_noisy_preview(source, &chunk.content) {
+            continue;
+        }
+        return i;
+    }
+    0
+}
+
+/// Resolve each conversation's representative chunk plus its source
+/// adapter, keyed off already-resolved `(conversation_id,
+/// last_activity_timestamp)` pairs. One bounded `IN (...)` query rather than
+/// a point query per id; ordering of the input pairs is preserved on output.
+///
+/// The representative chunk is the first (by `seq`, i.e. the conversation's
+/// true message order — see the `ROW_NUMBER()` window below) among the
+/// first `PREVIEW_CANDIDATE_WINDOW` chunks that isn't `is_noisy_preview` —
+/// not simply the earliest chunk — so a harness-marker-polluted Codex
+/// rollout or a Claude session that opens with `/login` previews its first
+/// real content instead of boilerplate. Falls back to the group's very
+/// first chunk when every candidate in the window is noise, so a preview is
+/// never lost outright. `first_chunk_ts` (used only for headless codex
+/// burst detection) always stays the conversation's true first-chunk
+/// timestamp regardless of which chunk wins as the preview.
+///
+/// W3-B1 review#2 (LOW): bounds by `seq < N`, not a `rowid <` range.
+/// `rowid` is insertion order, not conversation order — the watcher imports
+/// incrementally and interleaves conversations, so two chunks of the *same*
+/// conversation can land dozens of rows apart, and a `rowid <` window sized
+/// for contiguous rowids can end up holding a single chunk of a session that
+/// legitimately has more. `seq` (written on every insert — see
+/// `insert_chunk_with_source`) is the session's own message order and has
+/// none of that interleaving; every conversation's true first chunk is
+/// always `seq = 0` (`push_chunk` in `import/mod.rs` assigns it as the
+/// chunk's own index within a full from-scratch re-parse of the file, never
+/// a running total across incremental passes), so — unlike `rowid`, whose
+/// per-conversation minimum genuinely varies and has to be looked up — the
+/// bound is the plain literal `?`, no correlated subquery needed on that
+/// branch. The `rowid` branch (and its `MIN(rowid)` lookup) stays only as
+/// the fallback for the sliver of rows written before the nullable `seq`
+/// column existed and were never backfilled (see that migration's comment);
+/// per-row short-circuit evaluation means the subquery only ever runs for
+/// those legacy rows, so this keeps the original query's performance
+/// characteristics for every row that already has `seq`.
+fn recent_chunk_rows_for(
+    conn: &Connection,
+    ids: &[(String, String)],
+) -> Result<Vec<RecentChunkRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = string_placeholders(ids.len());
+    let sql = format!(
+        "SELECT c.id, c.conversation_id, c.project_name, c.content, c.message_count, \
+                c.summary, c.is_sidechain, c.source, c.timestamp \
+         FROM chunks c \
+         WHERE c.conversation_id IN ({placeholders}) \
+           AND ( \
+                 (c.seq IS NOT NULL AND c.seq < ?{}) \
+              OR (c.seq IS NULL AND c.rowid < (SELECT MIN(rowid) FROM chunks INDEXED BY idx_chunks_conversation \
+                                                 WHERE conversation_id = c.conversation_id) + ?{}) \
+           ) \
+         ORDER BY c.conversation_id, COALESCE(c.seq, c.rowid)",
+        ids.len() + 1,
+        ids.len() + 2,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut qparams: Vec<&dyn rusqlite::ToSql> = ids
+        .iter()
+        .map(|(id, _)| id as &dyn rusqlite::ToSql)
+        .collect();
+    qparams.push(&PREVIEW_CANDIDATE_WINDOW);
+    qparams.push(&PREVIEW_CANDIDATE_WINDOW);
+    let candidate_rows = stmt
+        .query_map(qparams.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                ConversationChunk {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    project_name: row.get(2)?,
+                    timestamp: String::new(), // patched below to last-activity
+                    content: row.get(3)?,
+                    message_count: row.get::<_, i64>(4)? as usize,
+                    summary: row.get(5)?,
+                    author: crate::provenance::Speaker::ToolResult,
+                    seq: 0,
+                    is_sidechain: row.get::<_, i64>(6)? != 0,
+                },
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Group candidate rows by conversation, preserving the SQL's `ORDER BY
+    // rowid` (ascending, so index 0 is always the true first chunk).
+    let mut by_id: HashMap<String, Vec<(ConversationChunk, String, String)>> = HashMap::new();
+    for (conv_id, chunk, source, ts) in candidate_rows {
+        by_id.entry(conv_id).or_default().push((chunk, source, ts));
+    }
+
+    let mut out = Vec::with_capacity(ids.len());
+    for (conv_id, last_ts) in ids {
+        let Some(mut candidates) = by_id.remove(conv_id) else {
+            continue;
+        };
+        let first_chunk_ts = candidates[0].2.clone();
+        let pick = pick_preview_index(&candidates);
+        let (mut chunk, source, _) = candidates.swap_remove(pick);
+        chunk.timestamp = last_ts.clone();
+        out.push(RecentChunkRow {
+            chunk,
+            source,
+            first_chunk_ts,
+        });
+    }
+    Ok(out)
+}
+
+/// Entrypoint values (`sdk-cli`, `sdk-headless`, any other `sdk-*` variant)
+/// that are a *positive* signal a conversation was never driven by a typed
+/// prompt — the harness only ever stamps these on a headless `claude -p`
+/// (SDK) invocation, never on an interactive session. `cli` and
+/// `claude-desktop` (and anything else) are real, human-facing entrypoints
+/// and must never be treated as headless here.
+fn is_headless_entrypoint(entrypoint: &str) -> bool {
+    entrypoint.starts_with("sdk-")
+}
+
+/// `conversation_id -> entrypoint` for every id in `candidates` that has a
+/// row in `conversation_entrypoint` (see that table's migration comment).
+/// Ids absent from the map are "unknown", not "headless" — callers must
+/// fail open on absence, never treat it as the positive signal.
+fn conversation_entrypoints(
+    conn: &Connection,
+    candidates: &[String],
+) -> Result<HashMap<String, String>> {
+    if candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // Batched ≤500 candidates per statement — see `known_session_ids`'s doc
+    // for why (SQLITE_MAX_VARIABLE_NUMBER on large transcript dirs).
+    const BATCH: usize = 500;
+    let mut out = HashMap::new();
+    for batch in candidates.chunks(BATCH) {
+        let placeholders = string_placeholders(batch.len());
+        let sql = format!(
+            "SELECT conversation_id, entrypoint FROM conversation_entrypoint \
+             WHERE conversation_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let qparams: Vec<&dyn rusqlite::ToSql> =
+            batch.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let rows = stmt.query_map(qparams.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, ep) = row?;
+            out.insert(id, ep);
+        }
+    }
+    Ok(out)
+}
+
+/// Persist (or overwrite) `conversation_id`'s transcript `entrypoint`. Called
+/// once per import (live watcher + batch importer) right after parsing —
+/// see `import::ParsedConversation::entrypoint`'s doc comment for where the
+/// value comes from.
+pub fn set_conversation_entrypoint(
+    conn: &Connection,
+    conversation_id: &str,
+    entrypoint: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO conversation_entrypoint (conversation_id, entrypoint) VALUES (?1, ?2)
+         ON CONFLICT(conversation_id) DO UPDATE SET entrypoint = excluded.entrypoint",
+        params![conversation_id, entrypoint],
+    )?;
+    Ok(())
+}
+
+/// The recorded `conversation_entrypoint` value for one conversation, or
+/// `None` when never recorded.
+pub fn get_conversation_entrypoint(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT entrypoint FROM conversation_entrypoint WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Batch of `(file_path, conversation_id)` pairs from `import_state` that
+/// have never had a `conversation_entrypoint` row recorded, ordered by
+/// `file_path` past `after_file_path` (exclusive) — the resumable-cursor
+/// shape `import::entrypoint_backfill` walks in bounded batches. A `LEFT
+/// JOIN ... WHERE entrypoint IS NULL` rather than a `NOT IN` subquery so a
+/// growing `conversation_entrypoint` table never turns this into a
+/// correlated-subquery-per-row scan.
+pub fn pending_entrypoint_backfill_batch(
+    conn: &Connection,
+    after_file_path: &str,
+    limit: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.file_path, i.conversation_id
+         FROM import_state i
+         LEFT JOIN conversation_entrypoint e ON e.conversation_id = i.conversation_id
+         WHERE e.conversation_id IS NULL
+           AND i.conversation_id IS NOT NULL
+           AND i.file_path > ?1
+         ORDER BY i.file_path
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![after_file_path, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Drop `source = 'conversation'` rows that carry a *positive* headless
+/// signal — never rows that merely lack one. Two signals, checked in order:
+///
+/// 1. `conversation_entrypoint` (recorded at import from the transcript's
+///    own `"entrypoint"` field): `is_headless_entrypoint` on it is
+///    conclusive either way — a real `cli`/`claude-desktop` entrypoint keeps
+///    the row even when the conversation is missing from `session_registry`
+///    entirely, and an `sdk-*` entrypoint drops it even when the row is
+///    otherwise indistinguishable from a real session.
+/// 2. When no entrypoint was ever recorded (pre-dates this column, or the
+///    file no longer exists for a backfill to read), fall back to
+///    `provenance::is_csr_emission` on the row's own preview content — CSR's
+///    own formatter output/headers echoed back is excluded on that basis
+///    alone, exactly as it would be for any other extraction path.
+///
+/// Anything left is unknown, not headless, and is kept — the previous
+/// mechanism (treating absence from `session_registry`, which is built from
+/// `history.jsonl` and does not record every interactive session, as proof
+/// of headlessness) hid real sessions whenever the registry missed them.
+/// Every other source (`codex_rollout`, `plan`, ...) has its own provenance
+/// and is left untouched here.
+fn filter_unregistered_conversation_rows(
+    conn: &Connection,
+    rows: Vec<RecentChunkRow>,
+) -> Result<Vec<RecentChunkRow>> {
+    const CONVERSATION_SOURCE: &str = "conversation";
+    let candidates: Vec<String> = rows
+        .iter()
+        .filter(|row| row.source == CONVERSATION_SOURCE)
+        .map(|row| row.chunk.conversation_id.clone())
+        .collect();
+    if candidates.is_empty() {
+        return Ok(rows);
+    }
+    let entrypoints = conversation_entrypoints(conn, &candidates)?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            if row.source != CONVERSATION_SOURCE {
+                return true;
+            }
+            match entrypoints.get(&row.chunk.conversation_id) {
+                Some(ep) => !is_headless_entrypoint(ep),
+                None => !crate::extraction::provenance::is_csr_emission(&row.chunk.content),
+            }
+        })
+        .collect())
+}
+
+/// Get recent chunks ordered by last-activity timestamp descending, scoped to
+/// an already-resolved list of project namespaces (empty = unscoped/all
+/// projects — same convention as `get_chunk_ids_for_projects`). Returns one
+/// representative chunk per unique conversation (the first chunk, for a
+/// stable preview), excludes sidechain conversations, excludes headless
+/// `source='conversation'` rows that never registered as an interactive
+/// session (`filter_unregistered_conversation_rows`), and collapses headless
+/// codex sibling bursts into one row each.
+///
+/// Unscoped calls (`projects` empty) drive off `idx_chunks_timestamp` with
+/// adaptive window widening; scoped calls drive off a `GROUP BY` on
+/// `idx_chunks_project`. See `recent_conversation_ids_by_activity`'s doc
+/// comment for why the two shapes need different plans.
+pub fn get_recent_chunks_in_projects(
+    conn: &Connection,
+    limit: usize,
+    projects: &[String],
+) -> Result<Vec<ConversationChunk>> {
+    // Overfetch so headless bursts can be collapsed without shrinking the
+    // number of distinct slots returned; widen further below if collapsing
+    // still leaves fewer than `limit` rows and more conversations exist.
+    let mut target = limit.saturating_mul(4).max(limit + 8);
+    const MAX_WIDENINGS: usize = 8;
+    for _ in 0..MAX_WIDENINGS {
+        let ids = recent_conversation_ids_by_activity(conn, projects, target)?;
+        let exhausted = ids.len() < target;
+        let rows = recent_chunk_rows_for(conn, &ids)?;
+        let rows = filter_unregistered_conversation_rows(conn, rows)?;
+        let collapsed = collapse_codex_bursts(conn, projects, rows, limit)?;
+        if collapsed.len() >= limit || exhausted {
+            return Ok(collapsed);
+        }
+        target = target.saturating_mul(2);
+    }
+    // Fell through the widening cap (pathological burst density) — return the
+    // best effort from the last, widest fetch rather than looping forever.
+    let ids = recent_conversation_ids_by_activity(conn, projects, target)?;
+    let rows = recent_chunk_rows_for(conn, &ids)?;
+    let rows = filter_unregistered_conversation_rows(conn, rows)?;
+    collapse_codex_bursts(conn, projects, rows, limit)
+}
+
+/// Get recent chunks ordered by last-activity timestamp descending, scoped to
+/// the project *family* (see `cross_project::same_project_family`) rather
+/// than an exact project-name match. `project = None` or `Some("all")` is
+/// unscoped. See `get_recent_chunks_in_projects` for the query shape.
 pub fn get_recent_chunks(
     conn: &Connection,
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<ConversationChunk>> {
-    // Pick one representative chunk per conversation (first chunk = best summary)
-    // and order by last-activity timestamp.
-    let mut stmt;
-    let rows = if let Some(p) = project.filter(|p| *p != "all") {
-        stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
-             FROM chunks c
-             WHERE c.project_name = ?1
-               AND c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
-             ORDER BY c.timestamp DESC LIMIT ?2",
-        )?;
-        stmt.query_map(params![p, limit as i64], row_to_chunk)?
-    } else {
-        stmt = conn.prepare(
-            "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content, c.message_count, c.summary, c.is_sidechain
-             FROM chunks c
-             WHERE c.rowid = (SELECT MIN(c2.rowid) FROM chunks c2 WHERE c2.conversation_id = c.conversation_id)
-             ORDER BY c.timestamp DESC LIMIT ?1",
-        )?;
-        stmt.query_map(params![limit as i64], row_to_chunk)?
+    let projects = match project.filter(|p| *p != "all") {
+        Some(p) => recent_work_family_projects(conn, p)?,
+        None => Vec::new(),
     };
-
-    let chunks: Vec<ConversationChunk> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(chunks)
+    get_recent_chunks_in_projects(conn, limit, &projects)
 }
 
 /// Get chunks within a time range, optionally filtered by project.
@@ -965,15 +1879,11 @@ pub fn get_chunk_ids_in_timerange(
 // ─── FTS5 full-text search ───
 
 /// Search chunks using FTS5 full-text search (for file path lookup etc.).
-pub fn fts5_search(
-    conn: &Connection,
-    query: &str,
-    limit: usize,
-    project: Option<&str>,
-) -> Result<Vec<(ConversationChunk, usize, f64)>> {
-    // Sanitize for FTS5: split into OR-joined quoted words
-    // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
-    // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
+/// FTS5 MATCH expression for a free-text query: OR-joined quoted words, so
+/// "Apify runaway cost" becomes '"apify" OR "runaway" OR "cost"' (any word
+/// matches) and hyphens/special characters never parse as FTS5 operators.
+/// `None` when no word survives sanitizing.
+pub fn fts5_match_expr(query: &str) -> Option<String> {
     let words: Vec<String> = query
         .split_whitespace()
         .map(|w| {
@@ -984,13 +1894,133 @@ pub fn fts5_search(
         .filter(|w| w.len() >= 2)
         .collect();
     if words.is_empty() {
+        return None;
+    }
+    Some(
+        words
+            .iter()
+            .map(|w| format!("\"{}\"", w))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
+/// Keyword hits over `reflections_fts`: `(reflection_id, ordinal, bm25)` in
+/// bm25 order (more negative is better), the same shape `fts5_search` returns
+/// for chunks so both lists fuse in one RRF pass.
+pub fn fts5_search_reflections(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(String, usize, f64)>> {
+    let Some(fts_query) = fts5_match_expr(query) else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn.prepare(
+        "SELECT id, bm25(reflections_fts)
+         FROM reflections_fts
+         WHERE reflections_fts MATCH ?1
+         ORDER BY rank
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+    let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(hits
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, (id, bm25))| (id, ordinal, bm25))
+        .collect())
+}
+
+/// A prefix shorter than this many characters, or with fewer than this many
+/// whitespace-separated tokens, is not specific enough to promote: a common
+/// single word (`we`, `Session`) matches hundreds of unrelated rows — see
+/// [`fts5_reflection_prefix_matches`]'s doc.
+const MIN_PROMOTABLE_PREFIX_CHARS: usize = 12;
+const MIN_PROMOTABLE_PREFIX_TOKENS: usize = 2;
+
+/// A prefix matching more rows than this is not specific enough to force to
+/// the front of the page either — let bm25/RRF fusion decide instead.
+const MAX_PROMOTED_PREFIX_MATCHES: usize = 3;
+
+/// Ids of reflections whose stored content starts with `query` verbatim
+/// (case-insensitive) at a word boundary, newest first. An exact-prefix hit
+/// is a stronger keyword signal than an OR-of-terms bm25 match — bm25
+/// compares corpus statistics across the whole `reflections` table, so a
+/// project name that recurs in many rows (a common shape for a
+/// `MEMORY-ARCHIVE <slug>` memory: the slug also appears in unrelated
+/// stories/extractions) can bury the literal prefix match under rows that
+/// merely mention one of its words. Callers merge this ahead of the
+/// OR-of-terms ranking so an exact opening match always wins the keyword
+/// channel, not just competes on bm25.
+///
+/// Guarded on both ends against over-promotion (Opus review, W3-K spec (e)):
+/// a short or single-token prefix (`we`, `Session`) matches hundreds of
+/// unrelated rows, and even a specific prefix that still matches more than
+/// [`MAX_PROMOTED_PREFIX_MATCHES`] rows is not promoted — both return an
+/// empty list rather than let `promote_exact_prefix_reflections` shove every
+/// hit to the front of the page. LIKE metacharacters (`%`, `_`) in `query`
+/// are escaped so they match literally, and a hit only counts if the
+/// character immediately after the prefix is non-alphanumeric or the
+/// content ends there (a query for "...campaign" must not match
+/// "...campaigns").
+pub fn fts5_reflection_prefix_matches(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let trimmed = query.trim();
+    if trimmed.chars().count() < MIN_PROMOTABLE_PREFIX_CHARS
+        || trimmed.split_whitespace().count() < MIN_PROMOTABLE_PREFIX_TOKENS
+    {
         return Ok(Vec::new());
     }
-    let fts_query = words
-        .iter()
-        .map(|w| format!("\"{}\"", w))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let escaped = trimmed
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    // Fetch one row past the promotion cap so "exactly at the cap" can be
+    // told apart from "over the cap" without a second COUNT query, and at
+    // least `limit` rows so a legitimately small match set is never cut
+    // short before the boundary filter below runs.
+    let fetch_limit = (MAX_PROMOTED_PREFIX_MATCHES + 1).max(limit);
+    let mut stmt = conn.prepare(
+        "SELECT id, content FROM reflections WHERE content LIKE ?1 || '%' ESCAPE '\\' \
+         ORDER BY timestamp DESC LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![escaped, fetch_limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let prefix_char_len = trimmed.chars().count();
+    let matches: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, content)| {
+            content
+                .chars()
+                .nth(prefix_char_len)
+                .is_none_or(|c| !c.is_alphanumeric())
+        })
+        .map(|(id, _)| id)
+        .collect();
+    if matches.len() > MAX_PROMOTED_PREFIX_MATCHES {
+        return Ok(Vec::new());
+    }
+    Ok(matches.into_iter().take(limit).collect())
+}
+
+pub fn fts5_search(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+    let Some(fts_query) = fts5_match_expr(query) else {
+        return Ok(Vec::new());
+    };
 
     let chunks_with_bm25 = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
@@ -1179,6 +2209,39 @@ pub fn mark_enrichment_completed(
          ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
              status = 'completed', reflection_id = ?3, updated_at = datetime('now')",
         params![conversation_id, enrichment_type, reflection_id],
+    )?;
+    Ok(())
+}
+
+/// How many messages a conversation had when its story was last written. None when it has no
+/// story, or one written before the count was kept.
+pub fn story_messages_covered(conn: &Connection, conversation_id: &str) -> Result<Option<usize>> {
+    let covered = conn
+        .query_row(
+            "SELECT chunk_count FROM enrichment_state
+             WHERE conversation_id = ?1 AND enrichment_type = 'session_story' AND status = 'completed'",
+            params![conversation_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(covered.map(|n| n.max(0) as usize))
+}
+
+/// Record a story written over the conversation's first `messages` messages.
+pub fn mark_story_written(
+    conn: &Connection,
+    conversation_id: &str,
+    reflection_id: &str,
+    messages: usize,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state
+             (conversation_id, enrichment_type, status, reflection_id, chunk_count, updated_at)
+         VALUES (?1, 'session_story', 'completed', ?2, ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'completed', reflection_id = ?2, chunk_count = ?3, updated_at = datetime('now')",
+        params![conversation_id, reflection_id, messages as i64],
     )?;
     Ok(())
 }
@@ -1614,6 +2677,42 @@ pub(crate) fn mark_file_imported_with_suppression(
     Ok(())
 }
 
+/// The `import_state.file_path` rows recorded for each of `conversation_ids`,
+/// for ids that have at most `max_paths_per_id` of them. An id with no row, or
+/// with more rows than that, is absent from the map. The id is a transcript
+/// file stem, which is not unique (`journal.jsonl`, a copied `agent-*.jsonl`):
+/// one id can carry several paths and the caller has to account for all of
+/// them, while a stem shared by millions of files must not cost a prompt
+/// millions of rows. Each id reads at most `max_paths_per_id + 1` index
+/// entries: no count, no sort, so the work is bounded by the id list alone.
+pub fn import_paths_for_conversations(
+    conn: &Connection,
+    conversation_ids: &[String],
+    max_paths_per_id: usize,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stmt =
+        conn.prepare("SELECT file_path FROM import_state WHERE conversation_id = ?1 LIMIT ?2")?;
+    let mut asked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for conversation_id in conversation_ids {
+        if !asked.insert(conversation_id.as_str()) {
+            continue;
+        }
+        let mut paths = stmt
+            .query_map(
+                params![conversation_id, (max_paths_per_id + 1) as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if paths.is_empty() || paths.len() > max_paths_per_id {
+            continue;
+        }
+        paths.sort();
+        out.insert(conversation_id.clone(), paths);
+    }
+    Ok(out)
+}
+
 /// Read the stored mtime for an import_state row keyed by an arbitrary `file_path`
 /// string. Aux-source adapters (plans, tasks, ...) key `import_state` by a synthetic
 /// id (e.g. `"plan:<slug>"`) that isn't a real filesystem path, so `is_file_imported`
@@ -1644,6 +2743,98 @@ pub fn upsert_import_state_explicit(
         params![file_path, conversation_id, chunks as i64, mtime],
     )?;
     Ok(())
+}
+
+/// Distinct `codex_rollout` conversation ids whose stored `summary` starts
+/// with `predicate` on any content it holds (checked by the caller — this
+/// just hands back every distinct `(conversation_id, summary)` pair so the
+/// caller can apply its own marker check without duplicating it in SQL).
+/// `summary` is set once per conversation (from the first classified user
+/// message) and stamped identically onto every chunk, so one row per
+/// conversation is representative.
+pub fn codex_conversation_summaries(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT conversation_id, summary FROM chunks WHERE source = 'codex_rollout'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Distinct `codex_rollout` conversation ids where *any* stored chunk's
+/// `content` (not just the conversation's cached `summary`, which is only
+/// ever the first chunk's content) starts with one of `markers`. A resumed
+/// or multi-turn Codex session can have a real, non-harness first user
+/// message but still carry a harness-injected block
+/// (`<recommended_plugins>`/`<environment_context>`/etc.) re-injected on a
+/// later turn — a `summary`-only scan is blind to that row entirely. One
+/// full pass over the same `chunks` slice `codex_conversation_summaries`
+/// already scans (`source = 'codex_rollout'`), so this costs the same order
+/// of work. `markers` is caller-supplied (not hardcoded here) so this
+/// storage-layer helper stays independent of `CODEX_HARNESS_MARKERS`'s
+/// definition in the import layer.
+pub fn codex_conversations_with_harness_content(
+    conn: &Connection,
+    markers: &[&str],
+) -> Result<Vec<String>> {
+    if markers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let clause = markers
+        .iter()
+        .map(|_| "content LIKE ? ESCAPE '\\'")
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!(
+        "SELECT DISTINCT conversation_id FROM chunks
+         WHERE source = 'codex_rollout' AND ({clause})"
+    );
+    let patterns: Vec<String> = markers
+        .iter()
+        .map(|marker| format!("{}%", escape_like(marker)))
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(patterns.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Force the next `discover_rollouts` pass to re-import `file_path` by
+/// clearing its stored mtime — an empty string can never equal a real
+/// filesystem mtime, so the next scan's `stored_mtime(key) == current_mtime`
+/// check always fails for this row. Leaves `conversation_id`/`chunks_imported`
+/// untouched; `import_rollout`'s delete+reinsert (keyed off the parsed
+/// conversation id, not this row) overwrites them on the next successful
+/// import. A no-op (0 rows affected, not an error) if the row doesn't exist.
+pub fn invalidate_import_state_mtime(conn: &Connection, file_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE import_state SET file_mtime = '' WHERE file_path = ?1",
+        params![file_path],
+    )?;
+    Ok(())
+}
+
+/// Mark every stored chunk of `conversation_id` as a sidechain
+/// (`is_sidechain = 1`). Used by the Codex subagent-sidechain backfill (see
+/// `import::codex_rollout::backfill_codex_subagent_sidechain`): a
+/// `thread_spawn` (or other subagent) rollout stored before the forward-fix
+/// has all its chunks at `is_sidechain = 0`, which lets it take its own
+/// recent-work slot next to its parent instead of being excluded the way
+/// every other sidechain conversation is. Returns the number of rows
+/// actually flipped (0 for an already-correct or unknown conversation).
+pub fn mark_conversation_chunks_sidechain(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<usize> {
+    let changed = conn.execute(
+        "UPDATE chunks SET is_sidechain = 1 WHERE conversation_id = ?1 AND is_sidechain = 0",
+        params![conversation_id],
+    )?;
+    Ok(changed)
 }
 
 // ─── Session registry queries (multi-source corpus, v9.4) ───
@@ -2325,6 +3516,27 @@ pub fn list_project_names(conn: &Connection, prefix: &str, limit: usize) -> Resu
     let rows = stmt.query_map(params![pattern, limit as i64], |row| row.get(0))?;
     rows.collect::<std::result::Result<Vec<String>, _>>()
         .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// `(file_path, conversation_id)` pairs from `import_state` whose
+/// `conversation_id` starts with `prefix` (e.g. `"codex:"`). Unbounded — this
+/// feeds the codex-rollout chunk-timestamp restamp, a single deliberate pass
+/// over the whole adapter's corpus, not a hot-path query.
+pub fn import_state_rows_for_conversation_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<(String, String)>> {
+    let pattern = format!("{}%", escape_like(prefix));
+    let mut stmt = conn.prepare(
+        "SELECT file_path, conversation_id FROM import_state
+         WHERE conversation_id LIKE ?1 ESCAPE '\\'
+         ORDER BY file_path",
+    )?;
+    let rows = stmt.query_map(params![pattern], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 /// List distinct file paths from import_state matching a prefix.
@@ -3027,6 +4239,78 @@ pub fn sessions_for_file_in_projects(
         .map_err(Into::into)
 }
 
+/// Backfill UPDATE: re-stamp one chunk's `timestamp` in place, gated on the
+/// chunk's conversation id AND content still matching what the caller just
+/// re-derived from the source file. The content guard is what makes this
+/// safe against drift — a rollout that changed on disk since the original
+/// import (different content at the same seq) is silently left alone rather
+/// than cross-stamped. Returns whether a row was actually touched.
+pub fn restamp_chunk_timestamp_if_content_matches(
+    conn: &Connection,
+    chunk_id: &str,
+    conversation_id: &str,
+    content: &str,
+    new_timestamp: &str,
+) -> Result<bool> {
+    let updated = conn.execute(
+        "UPDATE chunks SET timestamp = ?1 WHERE id = ?2 AND conversation_id = ?3 AND content = ?4",
+        params![new_timestamp, chunk_id, conversation_id, content],
+    )?;
+    Ok(updated > 0)
+}
+
+/// Batched form of [`restamp_chunk_timestamp_if_content_matches`]: every
+/// `(chunk_id, conversation_id, content, new_timestamp)` row runs in ONE
+/// transaction instead of autocommitting per row. Each timestamp-only UPDATE
+/// still fires `chunks_fts_au` once per row (see the migration that scopes
+/// that trigger to `UPDATE OF content` — with the trigger fixed the batching
+/// here is purely a transaction-count/latency win, not an FTS-bloat fix by
+/// itself); batching is about not paying SQLite's fsync-per-autocommit cost
+/// 280,775 times on a corpus-wide backfill. Returns
+/// `(rows_matched, rows_unmatched)`. On error the whole batch rolls back —
+/// callers doing a best-effort backfill should call this per-conversation
+/// (a few thousand rows at most) rather than for the whole corpus in one
+/// call, so one drifted file can't roll back every other conversation's
+/// otherwise-clean restamp.
+pub fn restamp_chunk_timestamps_batch(
+    conn: &Connection,
+    updates: &[(String, String, String, String)],
+) -> Result<(usize, usize)> {
+    if updates.is_empty() {
+        return Ok((0, 0));
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<(usize, usize)> {
+        let mut matched = 0usize;
+        let mut unmatched = 0usize;
+        {
+            let mut stmt = conn.prepare(
+                "UPDATE chunks SET timestamp = ?1 WHERE id = ?2 AND conversation_id = ?3 AND content = ?4",
+            )?;
+            for (chunk_id, conversation_id, content, new_timestamp) in updates {
+                let updated =
+                    stmt.execute(params![new_timestamp, chunk_id, conversation_id, content])?;
+                if updated > 0 {
+                    matched += 1;
+                } else {
+                    unmatched += 1;
+                }
+            }
+        }
+        Ok((matched, unmatched))
+    })();
+    match result {
+        Ok(counts) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(counts)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Backfill UPDATE: set seq/is_sidechain on an existing chunk row by id.
 pub fn set_chunk_saga_columns(
     conn: &Connection,
@@ -3045,6 +4329,21 @@ pub fn set_chunk_saga_columns(
 pub fn list_all_import_state_file_paths(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT file_path FROM import_state")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// `(file_path, file_mtime)` for every `import_state` row with a recorded
+/// mtime — the reconciliation set `import::catchup::catchup_sweep` diffs
+/// against the live filesystem. Rows with a NULL `file_mtime` (synthetic
+/// aux-source paths that predate a real filesystem file) are excluded: they
+/// have no on-disk mtime to compare against and are not this sweep's concern.
+pub fn list_import_state_entries(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT file_path, file_mtime FROM import_state WHERE file_mtime IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -3640,6 +4939,246 @@ mod tests {
     }
 
     #[test]
+    fn fts5_search_reflections_returns_bm25_order_with_zero_based_ordinals() {
+        let conn = mem();
+        insert_reflection(&conn, "dense", "needle needle needle", &[], &[0.1; 4]).unwrap();
+        insert_reflection(
+            &conn,
+            "sparse",
+            "needle with several unrelated filler words",
+            &[],
+            &[0.2; 4],
+        )
+        .unwrap();
+        insert_reflection(&conn, "miss", "nothing relevant here", &[], &[0.3; 4]).unwrap();
+
+        let hits = fts5_search_reflections(&conn, "needle", 10).unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, "dense");
+        assert_eq!(hits[0].1, 0);
+        assert_eq!(hits[1].0, "sparse");
+        assert_eq!(hits[1].1, 1);
+        assert!(
+            hits[0].2 <= hits[1].2,
+            "bm25 must be ascending (better first)"
+        );
+        assert!(fts5_search_reflections(&conn, "!!", 10).unwrap().is_empty());
+    }
+
+    /// Opus review finding (high, W3-K spec (e)): a short or single-token
+    /// prefix matches hundreds of unrelated rows and must not be promoted —
+    /// live receipts: `Session` alone matched 129 reflections, `we` matched
+    /// 5 unrelated stories opening with "We ..."/"we ...". Below the
+    /// specificity floor (min tokens, min chars) the matcher must return
+    /// nothing rather than let `promote_exact_prefix_reflections` shove
+    /// every hit to the front of the page.
+    #[test]
+    fn short_or_single_token_prefix_is_not_promoted() {
+        let conn = mem();
+        for i in 0..5 {
+            insert_reflection(
+                &conn,
+                &format!("session-{i}"),
+                &format!("Session note number {i} about something"),
+                &[],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        assert!(
+            fts5_reflection_prefix_matches(&conn, "Session", 10)
+                .unwrap()
+                .is_empty(),
+            "a single-token 7-char prefix must not promote 5 unrelated rows"
+        );
+        for (i, opener) in ["We integrated manychat", "we are seeing wild swings"]
+            .iter()
+            .enumerate()
+        {
+            insert_reflection(
+                &conn,
+                &format!("we-{i}"),
+                &format!("{opener} across the campaign"),
+                &[],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        assert!(
+            fts5_reflection_prefix_matches(&conn, "we", 10)
+                .unwrap()
+                .is_empty(),
+            "a 2-char prefix must not promote"
+        );
+    }
+
+    /// Same finding: a prefix that clears the specificity floor but still
+    /// matches more than the small promotion cap must not be promoted either
+    /// — let bm25/RRF fusion decide instead of forcing every match to the
+    /// front of the page.
+    #[test]
+    fn specific_prefix_over_the_promotion_cap_is_not_promoted() {
+        let conn = mem();
+        for i in 0..6 {
+            insert_reflection(
+                &conn,
+                &format!("archive-{i}"),
+                &format!("MEMORY-ARCHIVE common project note number {i}"),
+                &[],
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        assert!(
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE common project", 10)
+                .unwrap()
+                .is_empty(),
+            "6 matches is over the small promotion cap"
+        );
+    }
+
+    /// The positive case this guard must not break: a specific, multi-token,
+    /// long-enough prefix with a small number of matches is still promoted,
+    /// newest first — the exact shape
+    /// `exact_prefix_reflection_reaches_page_one_over_many_keyword_matching_chunks`
+    /// (mcp::tools) depends on.
+    #[test]
+    fn specific_prefix_within_the_cap_is_promoted_newest_first() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "older",
+            "MEMORY-ARCHIVE project-x-y-z memory number 0",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "newer",
+            "MEMORY-ARCHIVE project-x-y-z memory number 1",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE reflections SET timestamp = '2020-01-01T00:00:00Z' WHERE id = 'older'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE reflections SET timestamp = '2026-01-01T00:00:00Z' WHERE id = 'newer'",
+            [],
+        )
+        .unwrap();
+        let matches =
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE project-x-y-z", 10).unwrap();
+        assert_eq!(matches, vec!["newer".to_string(), "older".to_string()]);
+    }
+
+    /// A prefix containing LIKE metacharacters must not act as a wildcard —
+    /// `%` alone must never match every reflection.
+    #[test]
+    fn like_metacharacters_in_the_prefix_are_escaped() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "literal-percent",
+            "% is a literal opener here for this specific memory note",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "unrelated",
+            "this row has nothing to do with the prefix at all",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        // Below specificity floor by itself, so wrap it to reach the char
+        // minimum while still testing that '%' is escaped rather than
+        // acting as a wildcard: a literal-prefix query starting with '%'
+        // must not match the unrelated row.
+        let matches = fts5_reflection_prefix_matches(&conn, "% is a literal opener", 10).unwrap();
+        assert_eq!(matches, vec!["literal-percent".to_string()]);
+    }
+
+    /// Word-boundary guard: a prefix must not match mid-token. The query is
+    /// a strict string-prefix of `mid-token`'s content ("campaign" is a
+    /// prefix of "campaigns") but stops inside the word, so it must not
+    /// count as a match; `exact` ends exactly at a word boundary (a space)
+    /// and must.
+    #[test]
+    fn prefix_match_requires_a_word_boundary() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "exact",
+            "MEMORY-ARCHIVE acmecorp-meta-campaign notes here",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        insert_reflection(
+            &conn,
+            "mid-token",
+            "MEMORY-ARCHIVE acmecorp-meta-campaigns notes here",
+            &[],
+            &[0.1; 4],
+        )
+        .unwrap();
+        let matches =
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE acmecorp-meta-campaign", 10)
+                .unwrap();
+        assert_eq!(matches, vec!["exact".to_string()]);
+    }
+
+    #[test]
+    fn reflections_fts_follows_replace_and_delete() {
+        // `INSERT OR REPLACE` never fires the delete trigger for the row it
+        // replaces, so the keyword index must be keyed by id, not rowid.
+        let conn = mem();
+        insert_reflection(&conn, "r1", "alpha beta", &[], &[0.1; 4]).unwrap();
+        assert_eq!(
+            fts5_search_reflections(&conn, "alpha", 10).unwrap().len(),
+            1
+        );
+
+        insert_reflection(&conn, "r1", "gamma delta", &[], &[0.1; 4]).unwrap();
+        assert!(fts5_search_reflections(&conn, "alpha", 10)
+            .unwrap()
+            .is_empty());
+        let after = fts5_search_reflections(&conn, "gamma", 10).unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "replacement must not leave a duplicate keyword row"
+        );
+
+        conn.execute(
+            "DELETE FROM reflection_embeddings WHERE reflection_id = 'r1'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM reflections WHERE id = 'r1'", [])
+            .unwrap();
+        assert!(fts5_search_reflections(&conn, "gamma", 10)
+            .unwrap()
+            .is_empty());
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'reflections_fts_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 3);
+    }
+
+    #[test]
     fn fts5_search_returns_bm25_order_with_zero_based_ordinals() {
         let conn = mem();
         insert_chunk(
@@ -3903,6 +5442,20 @@ mod tests {
         let map = get_ratification_scores(&conn, &["c1".into(), "missing".into()]).unwrap();
         assert_eq!(map.get("c1"), Some(&0.6));
         assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn a_story_remembers_how_much_of_the_session_it_covered() {
+        let conn = mem();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), None);
+        // a story written before the count was kept covers an unknown part
+        mark_enrichment_completed(&conn, "conv-s", "session_story", "story_conv-s").unwrap();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), None);
+        mark_story_written(&conn, "conv-s", "story_conv-s", 300).unwrap();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), Some(300));
+        mark_story_written(&conn, "conv-s", "story_conv-s", 640).unwrap();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), Some(640));
+        assert!(is_conversation_enriched(&conn, "conv-s", "session_story").unwrap());
     }
 
     #[test]
@@ -4225,5 +5778,1103 @@ mod tests {
             .unwrap();
         assert_eq!(a, 0);
         assert_eq!(b, 1);
+    }
+
+    /// An id keeps its paths only while it has few of them. The per-id read
+    /// stops one row past the cap, so a stem with any number of files costs
+    /// the same as one with nine.
+    #[test]
+    fn import_paths_are_returned_only_for_ids_with_few_of_them() {
+        let conn = mem();
+        let file = |stem: &str, n: usize| {
+            for i in 0..n {
+                let path = format!("/cc/projects/-f{i}/{stem}.jsonl");
+                upsert_import_state_explicit(&conn, &path, stem, 1, "0").unwrap();
+            }
+        };
+        file("one", 1);
+        file("eight", 8);
+        file("nine", 9);
+        file("journal", 500);
+
+        let ids: Vec<String> = [
+            "one", "eight", "nine", "journal", "absent", "one", "journal", "absent",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = import_paths_for_conversations(&conn, &ids, 8).unwrap();
+        let mut keys: Vec<&String> = got.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["eight", "one"]);
+        assert_eq!(got["one"], ["/cc/projects/-f0/one.jsonl"]);
+        assert_eq!(got["eight"].len(), 8);
+        assert!(got["eight"].windows(2).all(|w| w[0] < w[1]));
+    }
+
+    // ─── get_recent_chunks ───
+
+    fn recent_chunk(
+        conv_id: &str,
+        project: &str,
+        ts: &str,
+        content: &str,
+        is_sidechain: bool,
+    ) -> ConversationChunk {
+        ConversationChunk {
+            id: format!("{conv_id}-c0"),
+            conversation_id: conv_id.into(),
+            project_name: project.into(),
+            timestamp: ts.into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::ToolResult,
+            seq: 0,
+            is_sidechain,
+        }
+    }
+
+    fn insert_recent(
+        conn: &Connection,
+        conv_id: &str,
+        project: &str,
+        ts: &str,
+        content: &str,
+        is_sidechain: bool,
+        source: &str,
+    ) {
+        let chunk = recent_chunk(conv_id, project, ts, content, is_sidechain);
+        insert_chunk_with_source(conn, &chunk, &[0.1, 0.2], source).unwrap();
+    }
+
+    #[test]
+    fn recent_chunks_include_family_namespace_and_exclude_unrelated_sibling() {
+        // Hermetic: resolves family membership against a tempdir root instead
+        // of the real `$HOME/projects`, so this passes regardless of what
+        // exists on the machine running it (was previously gated on
+        // `$HOME/projects/claude-self-reflect` genuinely existing, which
+        // fails on CI runners — see a review finding on the original check).
+        let projects_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(projects_root.path().join("claude-self-reflect")).unwrap();
+        // A genuine sibling repo whose directory exists stays out of family —
+        // this is the case the family gate exists for, unlike an exact-match
+        // query (which would also exclude it, trivially, since the name
+        // differs outright).
+        std::fs::create_dir(projects_root.path().join("claude-self-reflect-sibling")).unwrap();
+
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "conv-family",
+            "claude-self-reflect-csr-engine",
+            "2026-09-20T10:00:00Z",
+            "family member content",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "conv-sibling",
+            "claude-self-reflect-sibling",
+            "2026-09-20T11:00:00Z",
+            "unrelated sibling content",
+            false,
+            "conversation",
+        );
+
+        let projects =
+            recent_work_family_projects_at_root(&conn, "claude-self-reflect", projects_root.path())
+                .unwrap();
+        assert!(
+            projects
+                .iter()
+                .any(|p| p == "claude-self-reflect-csr-engine"),
+            "family member must resolve into the project family: {projects:?}"
+        );
+        assert!(
+            !projects.iter().any(|p| p == "claude-self-reflect-sibling"),
+            "sibling repo whose directory exists must not leak into the family: {projects:?}"
+        );
+
+        let chunks = get_recent_chunks_in_projects(&conn, 10, &projects).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            ids.contains(&"conv-family"),
+            "family member must be included: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"conv-sibling"),
+            "unrelated sibling must not leak in: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_exclude_sidechains_and_order_by_last_activity() {
+        let conn = mem();
+        // Started earliest but touched most recently -> must rank first.
+        insert_recent(
+            &conn,
+            "conv-old-start",
+            "proj-recent",
+            "2026-09-01T00:00:00Z",
+            "first message",
+            false,
+            "conversation",
+        );
+        conn.execute(
+            "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, is_sidechain, source)
+             VALUES ('conv-old-start-c1', 'conv-old-start', 'proj-recent', '2026-09-20T00:00:00Z', 'later message', 1, 0, 'conversation')",
+            [],
+        )
+        .unwrap();
+        insert_recent(
+            &conn,
+            "conv-newer-start",
+            "proj-recent",
+            "2026-09-10T00:00:00Z",
+            "started later, never touched again",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "agent-sidechain",
+            "proj-recent",
+            "2026-09-21T00:00:00Z",
+            "subagent chatter",
+            true,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 10, Some("proj-recent")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+
+        assert!(
+            !ids.contains(&"agent-sidechain"),
+            "sidechain conversation must be excluded: {ids:?}"
+        );
+        assert_eq!(
+            ids[0], "conv-old-start",
+            "ordering must follow last activity (max timestamp), not first-chunk start: {ids:?}"
+        );
+        // Preview stays the *first* chunk's content even though the display
+        // timestamp is last-activity.
+        let top = &chunks[0];
+        assert_eq!(top.content, "first message");
+        assert_eq!(top.timestamp, "2026-09-20T00:00:00Z");
+    }
+
+    #[test]
+    fn recent_chunks_collapse_same_second_codex_burst_and_count_limit_once() {
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "codex-a",
+            "proj-burst",
+            "2026-09-20T10:00:00Z",
+            "burst member a",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "codex-b",
+            "proj-burst",
+            "2026-09-20T10:00:00.500Z",
+            "burst member b",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "codex-c",
+            "proj-burst",
+            "2026-09-20T10:00:00.900Z",
+            "burst member c",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "solo-later",
+            "proj-burst",
+            "2026-09-20T11:00:00Z",
+            "solo conversation",
+            false,
+            "conversation",
+        );
+
+        // limit=2 must still return both slots: the solo row and the
+        // collapsed burst, not truncate the burst away.
+        let chunks = get_recent_chunks(&conn, 2, Some("proj-burst")).unwrap();
+        assert_eq!(chunks.len(), 2, "collapsed burst must count as one slot");
+        assert_eq!(chunks[0].conversation_id, "solo-later");
+        assert!(
+            chunks[1].content.starts_with("[+2 parallel]"),
+            "burst of 3 same-second codex rows collapses to +2: {}",
+            chunks[1].content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_collapse_codex_burst_spanning_several_seconds() {
+        // Reproduces the live-DB 01a0bc57 burst: 4 rollouts at
+        // 2026-09-20T01:04:05.6xx plus one at 01:04:00.802 — 5 seconds
+        // apart, so the old same-UTC-second rule saw it as two rows.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "codex-head",
+            "proj-burst2",
+            "2026-09-20T01:04:00.802Z",
+            "burst head",
+            false,
+            "codex_rollout",
+        );
+        for (i, ms) in ["05.601", "05.622", "05.640", "05.658"].iter().enumerate() {
+            insert_recent(
+                &conn,
+                &format!("codex-sibling-{i}"),
+                "proj-burst2",
+                &format!("2026-09-20T01:04:{ms}Z"),
+                "burst sibling",
+                false,
+                "codex_rollout",
+            );
+        }
+        insert_recent(
+            &conn,
+            "solo-later",
+            "proj-burst2",
+            "2026-09-20T02:00:00Z",
+            "solo conversation",
+            false,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-burst2")).unwrap();
+        assert_eq!(
+            chunks.len(),
+            2,
+            "the whole 5-row burst plus the solo conversation must collapse to 2 rows: {:?}",
+            chunks
+                .iter()
+                .map(|c| &c.conversation_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(chunks[0].conversation_id, "solo-later");
+        assert!(
+            chunks[1].content.starts_with("[+4 parallel]"),
+            "5-row burst spanning 5s collapses to +4: {}",
+            chunks[1].content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_burst_tail_truncated_by_fetch_window_gets_exact_count() {
+        // Solo rows are newer than the 25-member burst, so limit=4 (3 solos +
+        // 1 collapsed burst row) is already satisfied by the *first* fetch
+        // window (target=16: 3 solo + 13 burst rows) — the widening retry in
+        // get_recent_chunks_in_projects never fires because `collapsed.len()
+        // >= limit` is already true. Before the follow-up-count fix, the
+        // burst's window-based scan stopped at the fetch-window edge (13
+        // members captured of 25) and reported "[+12 parallel]" instead of
+        // the true "[+24 parallel]" — this is the regression this test
+        // guards (finding on queries.rs `collapse_codex_bursts`). Contrast
+        // with `recent_chunks_widening_retry_pulls_solos_behind_head_burst`
+        // below, which puts the burst ahead of the solos so the widening
+        // retry itself is what gets exercised.
+        let conn = mem();
+        let burst_len = 25;
+        for i in 0..burst_len {
+            // Sub-second spacing: the whole burst sits well inside the
+            // collapse window regardless of chaining order.
+            insert_recent(
+                &conn,
+                &format!("codex-big-{i}"),
+                "proj-bigburst",
+                &format!("2026-09-20T03:00:00.{:03}Z", i * 30),
+                "burst member",
+                false,
+                "codex_rollout",
+            );
+        }
+        for i in 0..3 {
+            insert_recent(
+                &conn,
+                &format!("solo-{i}"),
+                "proj-bigburst",
+                &format!("2026-09-20T04:0{i}:00Z"),
+                "solo conversation",
+                false,
+                "conversation",
+            );
+        }
+
+        let chunks = get_recent_chunks(&conn, 4, Some("proj-bigburst")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert_eq!(
+            chunks.len(),
+            4,
+            "limit must still be honoured despite an oversized burst filling the first window: {ids:?}"
+        );
+        assert!(
+            chunks[..3]
+                .iter()
+                .all(|c| c.conversation_id.starts_with("solo-")),
+            "the 3 solo rows (last-activity order) must surface ahead of the collapsed burst: {ids:?}"
+        );
+        assert_eq!(
+            chunks[3].content, "[+24 parallel] burst member",
+            "the burst must report its exact true size (25 members = +24), not just the 13 \
+             that fit inside the first fetch window"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_widening_retry_pulls_solos_behind_head_burst() {
+        // The burst is *newer* than the solo rows this time, so the first
+        // fetch window (target=16 for limit=4) is entirely burst members and
+        // collapses to a single row (1 < limit=4) — this is what actually
+        // forces get_recent_chunks_in_projects's widening retry to run and
+        // fetch a wider window that reaches the solo rows behind the burst.
+        // (The sibling test above, with solos ahead, satisfies `limit`
+        // before the retry ever fires — it does not exercise this path.)
+        let conn = mem();
+        let burst_len = 25;
+        for i in 0..burst_len {
+            insert_recent(
+                &conn,
+                &format!("codex-big-{i}"),
+                "proj-headburst",
+                &format!("2026-09-20T04:00:00.{:03}Z", i * 30),
+                "burst member",
+                false,
+                "codex_rollout",
+            );
+        }
+        for i in 0..3 {
+            insert_recent(
+                &conn,
+                &format!("solo-{i}"),
+                "proj-headburst",
+                &format!("2026-09-20T03:0{i}:00Z"),
+                "solo conversation",
+                false,
+                "conversation",
+            );
+        }
+
+        let chunks = get_recent_chunks(&conn, 4, Some("proj-headburst")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert_eq!(
+            chunks.len(),
+            4,
+            "limit must be honoured once the widening retry pulls in the solo rows: {ids:?}"
+        );
+        for i in 0..3 {
+            let want = format!("solo-{i}");
+            assert!(
+                ids.contains(&want.as_str()),
+                "solo-{i} must be reached by the widening retry: {ids:?}"
+            );
+        }
+        let burst_row = chunks
+            .iter()
+            .find(|c| c.conversation_id.starts_with("codex-big-"))
+            .expect("the collapsed burst row must still be present");
+        assert_eq!(
+            burst_row.content, "[+24 parallel] burst member",
+            "the full 25-member burst must be counted exactly once the retry fetches it whole"
+        );
+    }
+
+    fn insert_registered_session(
+        conn: &Connection,
+        session_id: &str,
+        project: &str,
+        first_ts: &str,
+        last_ts: &str,
+    ) {
+        upsert_session_registry_batch(
+            conn,
+            &[SessionRegistryRow {
+                session_id: session_id.to_string(),
+                project: project.to_string(),
+                first_prompt: Some("real prompt".to_string()),
+                first_ts: first_ts.to_string(),
+                last_ts: last_ts.to_string(),
+                prompt_count_delta: 1,
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recent_chunks_exclude_headless_sdk_cli_entrypoint_conversation() {
+        // W3-B1 review#2 (HIGH), 2nd pass: exclusion must be driven by a
+        // *positive* headless signal (the transcript's own `entrypoint`),
+        // never by absence from `session_registry` — the old mechanism hid
+        // real sessions `history.jsonl` never happened to record. A
+        // registered interactive session, an unregistered-but-real
+        // `entrypoint=cli` session, and a `entrypoint=sdk-cli` headless probe
+        // all coexist here; only the `sdk-cli` one is dropped.
+        let conn = mem();
+        insert_registered_session(
+            &conn,
+            "interactive-a",
+            "proj-registry",
+            "2026-09-20T09:00:00Z",
+            "2026-09-20T09:05:00Z",
+        );
+        insert_recent(
+            &conn,
+            "interactive-a",
+            "proj-registry",
+            "2026-09-20T10:00:00Z",
+            "real user prompt",
+            false,
+            "conversation",
+        );
+        set_conversation_entrypoint(&conn, "interactive-a", "cli").unwrap();
+
+        insert_recent(
+            &conn,
+            "probe-b",
+            "proj-registry",
+            "2026-09-20T09:03:00Z",
+            "Reply with exactly the word PROBE-DONE",
+            false,
+            "conversation",
+        );
+        set_conversation_entrypoint(&conn, "probe-b", "sdk-cli").unwrap();
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-registry")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+
+        assert!(
+            ids.contains(&"interactive-a"),
+            "a real cli-entrypoint session must still surface: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"probe-b"),
+            "a sdk-cli-entrypoint headless probe conversation must be excluded: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_surface_unregistered_cli_entrypoint_despite_nonempty_registry() {
+        // W3-B1 review#2 (HIGH): the exact regression the reviewer found live
+        // — `entrypoint=cli`, but `history.jsonl`/`session_registry` never
+        // recorded it (six real whats-next sessions did this). A non-empty
+        // registry (containing an unrelated session) must not make this one
+        // read as headless.
+        let conn = mem();
+        insert_registered_session(
+            &conn,
+            "some-other-registered-session",
+            "proj-registry-lag",
+            "2026-09-20T09:00:00Z",
+            "2026-09-20T09:05:00Z",
+        );
+        insert_recent(
+            &conn,
+            "brand-new-live",
+            "proj-registry-lag",
+            "2026-09-20T12:00:00Z",
+            "What directory are you operating on",
+            false,
+            "conversation",
+        );
+        set_conversation_entrypoint(&conn, "brand-new-live", "cli").unwrap();
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-registry-lag")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            ids.contains(&"brand-new-live"),
+            "an unregistered real cli-entrypoint session must surface despite a non-empty registry: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_fail_open_when_entrypoint_unknown() {
+        // No `conversation_entrypoint` row at all (pre-dates the column, or
+        // the source file is gone) must never be read as headless — only an
+        // explicit `sdk-*` value is a headless signal.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "conv-a",
+            "proj-empty-registry",
+            "2026-09-20T09:00:00Z",
+            "real user prompt",
+            false,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-empty-registry")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            ids.contains(&"conv-a"),
+            "a conversation with no recorded entrypoint must fail open, not be hidden: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_exclude_csr_emission_when_entrypoint_unknown() {
+        // W3-B1 review#2 (HIGH): the fallback net for rows with no recorded
+        // entrypoint at all — CSR's own emission echoed back must still be
+        // excluded on that basis, exactly as before.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "narrator-echo",
+            "proj-emission",
+            "2026-09-20T09:00:00Z",
+            "You are CSR Episode Analyst reviewing a transcript",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "conv-real",
+            "proj-emission",
+            "2026-09-20T09:01:00Z",
+            "real user prompt",
+            false,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-emission")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"narrator-echo"),
+            "a CSR-emission preview with no entrypoint recorded must still be excluded: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"conv-real"),
+            "a real session in the same batch must still surface: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn recent_work_family_excludes_headless_scratchpad_namespace() {
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "conv-main",
+            "myproj",
+            "2026-09-20T09:00:00Z",
+            "real content",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "conv-scratch",
+            "myproj-scratchpad-abc123",
+            "2026-09-20T10:00:00Z",
+            "headless workflow cwd content",
+            false,
+            "conversation",
+        );
+
+        // Only the base dir exists -- the scratchpad namespace is a runtime
+        // worktree/cwd alias, not a checked-out sibling repo, so it must
+        // pass the alias check (`is_alias_at_root`) on its own merits before
+        // the scratchpad filter even gets a chance to exclude it.
+        let projects_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(projects_root.path().join("myproj")).unwrap();
+
+        assert!(
+            crate::search::cross_project::same_project_family_at_root(
+                "myproj",
+                "myproj-scratchpad-abc123",
+                projects_root.path(),
+            ),
+            "sanity: the fixture must actually resolve as a family alias so this test can tell \
+             the scratchpad filter apart from the alias check itself"
+        );
+
+        let projects =
+            recent_work_family_projects_at_root(&conn, "myproj", projects_root.path()).unwrap();
+        assert!(
+            !projects.iter().any(|p| p.contains("-scratchpad-")),
+            "a headless scratchpad namespace must never join the family: {projects:?}"
+        );
+    }
+
+    #[test]
+    fn recent_work_family_projects_with_home_none_returns_exact_scope_only() {
+        // Deterministic regardless of this machine's real `$HOME`: a
+        // candidate that would otherwise be a plausible family member (same
+        // hyphenated prefix) must still be excluded when there is no
+        // resolvable home directory to form a projects root against.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "conv-a",
+            "myproj",
+            "2026-09-20T09:00:00Z",
+            "content",
+            false,
+            "conversation",
+        );
+        insert_recent(
+            &conn,
+            "conv-b",
+            "myproj-csr-engine",
+            "2026-09-20T09:00:00Z",
+            "content",
+            false,
+            "conversation",
+        );
+
+        let projects = recent_work_family_projects_with_home(&conn, "myproj", None).unwrap();
+        assert_eq!(
+            projects,
+            vec!["myproj".to_string()],
+            "no resolvable home directory must mean exact scope only: {projects:?}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_skips_codex_harness_boilerplate_first_chunk() {
+        // W3-B1 review#2 finding: a still-polluted Codex rollout's chunk 0 is
+        // harness boilerplate (`<recommended_plugins>...`); the preview must
+        // skip to the first real chunk instead of showing the boilerplate.
+        let conn = mem();
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "codex-polluted-c0".into(),
+                conversation_id: "codex-polluted".into(),
+                project_name: "proj-preview".into(),
+                timestamp: "2026-09-20T09:00:00Z".into(),
+                content: "<recommended_plugins>\nHere is a list of plugins\n</recommended_plugins>"
+                    .into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "codex_rollout",
+        )
+        .unwrap();
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "codex-polluted-c1".into(),
+                conversation_id: "codex-polluted".into(),
+                project_name: "proj-preview".into(),
+                timestamp: "2026-09-20T09:00:01Z".into(),
+                content: "real user request about the recall bug".into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 1,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "codex_rollout",
+        )
+        .unwrap();
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "codex-polluted")
+            .expect("the polluted conversation must still surface");
+        assert_eq!(
+            top.content, "real user request about the recall bug",
+            "the preview must skip the harness-boilerplate first chunk: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_skips_multi_chunk_codex_harness_span() {
+        // W3-B1 review#2 (MEDIUM), 2nd pass: the real `codex:01a0c5df` shape —
+        // only chunk 0 starts with a harness marker, but the injected block
+        // (CSR's chunker re-splits it at a flat char budget with no idea it
+        // was boilerplate) continues, unmarked, across several more chunks
+        // before its closing tag turns up, and only THEN does the real user
+        // prompt begin. A per-chunk-only noisy check (the old behaviour)
+        // picks the first unmarked continuation chunk — pure boilerplate —
+        // as the preview, exactly as it did live.
+        let conn = mem();
+        let mut rows: Vec<(String, usize, String)> = vec![(
+            "harness-span-c0".to_string(),
+            0,
+            "<recommended_plugins>\nHere is a list of plugins, continued below".to_string(),
+        )];
+        for seq in 1..11usize {
+            rows.push((
+                format!("harness-span-c{seq}"),
+                seq,
+                format!("- Consensus (app-{seq:x}…@openai-curated-remote) plugin entry"),
+            ));
+        }
+        rows.push((
+            "harness-span-c11".to_string(),
+            11,
+            "...the rest of the plugin list </recommended_plugins>".to_string(),
+        ));
+        rows.push((
+            "harness-span-c12".to_string(),
+            12,
+            "dont look at the literature install graphify".to_string(),
+        ));
+
+        for (id, seq, content) in &rows {
+            insert_chunk_with_source(
+                &conn,
+                &ConversationChunk {
+                    id: id.clone(),
+                    conversation_id: "harness-span".into(),
+                    project_name: "proj-preview".into(),
+                    timestamp: format!("2026-09-20T09:00:{seq:02}Z"),
+                    content: content.clone(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::ToolResult,
+                    seq: *seq,
+                    is_sidechain: false,
+                },
+                &[0.1, 0.2],
+                "codex_rollout",
+            )
+            .unwrap();
+        }
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "harness-span")
+            .expect("the polluted conversation must still surface");
+        assert_eq!(
+            top.content, "dont look at the literature install graphify",
+            "the preview must skip the whole multi-chunk harness span, not just chunk 0: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_survives_harness_block_closing_and_opening_in_same_chunk() {
+        // W3-B1 review#2 (MEDIUM), 3rd pass: the exact live `codex:01a0c5df`
+        // shape (verified on a clone of the production DB). Multiple harness
+        // blocks are packed back-to-back inside ONE original message with no
+        // chunk-boundary alignment: `</recommended_plugins>` (closing block
+        // A) and `<INSTRUCTIONS>` (opening block B, the "# AGENTS.md
+        // instructions" body) land in the very same stored chunk. A "first
+        // closing tag ends the span" rule reopens picking right there — on
+        // block B's own boilerplate body (which is CLAUDE.md content quoted
+        // as agent instructions, live) — instead of staying closed until
+        // block B's own `</INSTRUCTIONS>` shows up several chunks later.
+        let conn = mem();
+        let rows: Vec<(&str, usize, &str)> = vec![
+            ("c0", 0, "<recommended_plugins>\nplugin list starts here"),
+            ("c1", 1, "more plugins, no marker of its own"),
+            (
+                "c2",
+                2,
+                "</recommended_plugins>\n# AGENTS.md instructions\n<INSTRUCTIONS>\nCore prefs",
+            ),
+            ("c3", 3, "more instructions body, no marker of its own"),
+            ("c4", 4, "closing soon </INSTRUCTIONS>"),
+            ("c5", 5, "the real first prompt of the session"),
+        ];
+        for (id, seq, content) in &rows {
+            insert_chunk_with_source(
+                &conn,
+                &ConversationChunk {
+                    id: format!("same-chunk-{id}"),
+                    conversation_id: "same-chunk-span".into(),
+                    project_name: "proj-preview".into(),
+                    timestamp: format!("2026-09-20T09:00:{seq:02}Z"),
+                    content: content.to_string(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::ToolResult,
+                    seq: *seq,
+                    is_sidechain: false,
+                },
+                &[0.1, 0.2],
+                "codex_rollout",
+            )
+            .unwrap();
+        }
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "same-chunk-span")
+            .expect("the polluted conversation must still surface");
+        assert_eq!(
+            top.content, "the real first prompt of the session",
+            "closing one block and opening the next in the same chunk must not reopen picking early: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_skips_local_command_caveat_first_chunk() {
+        // A Claude session that opens with a slash command (`/login`) has a
+        // `<local-command-caveat>` wrapper as its first chunk (live-DB
+        // bd3294f7/d8fe3a96); the preview must skip that wrapper rather than
+        // showing the harness caveat text itself.
+        let conn = mem();
+        insert_registered_session(
+            &conn,
+            "conv-slash",
+            "proj-preview-claude",
+            "2026-09-20T09:00:00Z",
+            "2026-09-20T09:00:01Z",
+        );
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "conv-slash-c0".into(),
+                conversation_id: "conv-slash".into(),
+                project_name: "proj-preview-claude".into(),
+                timestamp: "2026-09-20T09:00:00Z".into(),
+                content: "<local-command-caveat>Caveat: The messages below were generated \
+                          by the user while running local commands. DO NOT respond\
+                          </local-command-caveat>"
+                    .into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "conversation",
+        )
+        .unwrap();
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "conv-slash-c1".into(),
+                conversation_id: "conv-slash".into(),
+                project_name: "proj-preview-claude".into(),
+                timestamp: "2026-09-20T09:00:01Z".into(),
+                content: "/login".into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 1,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "conversation",
+        )
+        .unwrap();
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview-claude")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "conv-slash")
+            .expect("the session must still surface");
+        assert_eq!(
+            top.content, "/login",
+            "the preview must skip the local-command-caveat wrapper: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_preview_survives_noncontiguous_rowids_between_own_chunks() {
+        // W3-B1 review#2 (LOW): the live-DB `d8fe3a96`/`356b2649` case — the
+        // watcher imports incrementally and interleaves conversations, so a
+        // session's own chunk 1 can land dozens of rowids after its chunk 0
+        // once other conversations' chunks are inserted in between. A
+        // `rowid <` range window sized for *contiguous* rowids then holds
+        // only chunk 0 (the caveat) and never even sees chunk 1, no matter
+        // how large the window is raised. Ranking by `seq` instead must
+        // still find chunk 1 regardless of how many unrelated rows separate
+        // the two by rowid.
+        let conn = mem();
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "conv-gap-c0".into(),
+                conversation_id: "conv-gap".into(),
+                project_name: "proj-preview-gap".into(),
+                timestamp: "2026-09-20T09:00:00Z".into(),
+                content: "<local-command-caveat>Caveat: The messages below were generated \
+                          by the user while running local commands. DO NOT respond\
+                          </local-command-caveat>"
+                    .into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 0,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "conversation",
+        )
+        .unwrap();
+        // 40 unrelated chunks from a different, unrelated conversation land
+        // in between by rowid — more than any realistic `rowid <` window,
+        // reproducing the live gap (21 rows) at a size that would defeat
+        // even the review's own suggested "raise the window" band-aid.
+        for i in 0..40 {
+            insert_chunk_with_source(
+                &conn,
+                &ConversationChunk {
+                    id: format!("filler-{i}"),
+                    conversation_id: "filler-conv".into(),
+                    project_name: "proj-preview-gap".into(),
+                    timestamp: format!("2026-09-20T08:{:02}:00Z", i % 60),
+                    content: "unrelated filler content".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::ToolResult,
+                    seq: i as usize,
+                    is_sidechain: false,
+                },
+                &[0.1, 0.2],
+                "conversation",
+            )
+            .unwrap();
+        }
+        insert_chunk_with_source(
+            &conn,
+            &ConversationChunk {
+                id: "conv-gap-c1".into(),
+                conversation_id: "conv-gap".into(),
+                project_name: "proj-preview-gap".into(),
+                timestamp: "2026-09-20T09:00:01Z".into(),
+                content: "the real first prompt of the session".into(),
+                message_count: 1,
+                summary: None,
+                author: Speaker::ToolResult,
+                seq: 1,
+                is_sidechain: false,
+            },
+            &[0.1, 0.2],
+            "conversation",
+        )
+        .unwrap();
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-preview-gap")).unwrap();
+        let top = chunks
+            .iter()
+            .find(|c| c.conversation_id == "conv-gap")
+            .expect("the session must still surface");
+        assert_eq!(
+            top.content, "the real first prompt of the session",
+            "the preview must find chunk 1 by seq despite a large rowid gap: {}",
+            top.content
+        );
+    }
+
+    #[test]
+    fn recent_chunks_exclude_codex_subagent_child_marked_sidechain() {
+        // Once the codex_rollout adapter correctly marks a `thread_spawn`
+        // child's chunks `is_sidechain = true` (see
+        // `import::codex_rollout::backfill_codex_subagent_sidechain`), the
+        // existing sidechain exclusion here must keep it from taking its own
+        // recent-work slot next to its parent.
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "codex:parent-thread",
+            "proj-subagent",
+            "2026-09-20T10:00:00Z",
+            "parent rollout",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "codex:child-thread",
+            "proj-subagent",
+            "2026-09-20T10:00:00.050Z",
+            "subagent child rollout",
+            true,
+            "codex_rollout",
+        );
+
+        let chunks = get_recent_chunks(&conn, 6, Some("proj-subagent")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert!(
+            ids.contains(&"codex:parent-thread"),
+            "the parent rollout must surface: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"codex:child-thread"),
+            "a subagent child marked is_sidechain must never take its own slot: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn codex_burst_key_ts_uses_uuidv7_spawn_time_not_restamped_first_chunk_ts() {
+        // Reproduces the live-DB 01a093d5 pair: two rollouts spawned 100ms
+        // apart via `thread_spawn` (per their UUIDv7 ids), but the
+        // chunk-timestamp restamp rewrote their first-chunk timestamps to
+        // the *message* time, 7 minutes apart. Burst grouping must use the
+        // id's embedded spawn time, not the restamped chunk timestamp.
+        let head_id = "codex:01935e3b-0000-7000-8000-000000000001";
+        let sibling_id = "codex:01935e3b-0064-7000-8000-000000000002"; // +0x64 = +100ms
+        let head_ts = codex_burst_key_ts(head_id, "2026-09-20T04:16:49.700Z");
+        let sibling_ts = codex_burst_key_ts(sibling_id, "2026-09-20T04:23:47.808Z");
+        assert!(
+            within_burst_window(&head_ts, &sibling_ts),
+            "two ids 100ms apart must be treated as the same burst even though their \
+             restamped first-chunk timestamps are 7 minutes apart: head={head_ts} sibling={sibling_ts}"
+        );
+    }
+
+    #[test]
+    fn recent_chunks_collapse_codex_burst_by_uuidv7_id_despite_restamped_gap() {
+        let conn = mem();
+        insert_recent(
+            &conn,
+            "codex:01935e3b-0000-7000-8000-000000000001",
+            "proj-uuidburst",
+            "2026-09-20T04:16:49.700Z",
+            "burst head",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "codex:01935e3b-0064-7000-8000-000000000002",
+            "proj-uuidburst",
+            "2026-09-20T04:23:47.808Z",
+            "burst sibling",
+            false,
+            "codex_rollout",
+        );
+        insert_recent(
+            &conn,
+            "solo-later",
+            "proj-uuidburst",
+            "2026-09-20T05:00:00Z",
+            "solo conversation",
+            false,
+            "conversation",
+        );
+
+        let chunks = get_recent_chunks(&conn, 4, Some("proj-uuidburst")).unwrap();
+        let ids: Vec<&str> = chunks.iter().map(|c| c.conversation_id.as_str()).collect();
+        assert_eq!(
+            chunks.len(),
+            2,
+            "the UUIDv7-adjacent pair must collapse into one row despite a 7-minute \
+             restamped first-chunk gap: {ids:?}"
+        );
+        assert_eq!(chunks[0].conversation_id, "solo-later");
+        assert!(
+            chunks[1].content.starts_with("[+1 parallel]"),
+            "the pair must report exactly one parallel sibling: {}",
+            chunks[1].content
+        );
     }
 }

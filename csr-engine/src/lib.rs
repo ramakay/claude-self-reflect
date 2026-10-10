@@ -1,5 +1,5 @@
 pub mod api;
-pub mod binary_stamp;
+pub mod binary_identity;
 pub mod daemon;
 pub mod dream;
 pub mod embeddings;
@@ -16,9 +16,11 @@ pub mod ledger;
 pub mod mcp;
 pub mod narrative;
 pub mod provenance;
+pub mod reaction_shadow;
 pub mod runtime;
 pub mod search;
 pub mod setup;
+pub mod shell;
 pub mod status;
 pub mod storage;
 pub mod summarizer;

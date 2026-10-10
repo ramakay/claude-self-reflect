@@ -15,7 +15,7 @@ git clone https://github.com/ramakay/claude-self-reflect.git
 cd claude-self-reflect/csr-engine
 cargo build --release
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo fmt -- --check
 ```
 
@@ -33,7 +33,7 @@ cargo test test_reflect_on_past      # Specific
 1. Create feature branch from `main`
 2. Make changes
 3. `cargo test` — all must pass
-4. `cargo clippy -- -D warnings` — zero warnings
+4. `cargo clippy --all-targets -- -D warnings` — zero warnings
 5. `cargo fmt` — clean formatting
 6. Submit PR
 

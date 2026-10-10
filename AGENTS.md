@@ -68,7 +68,7 @@ cargo test --test hooks_integration
 cargo test --test integration
 
 # Format + lint
-cargo fmt && cargo clippy
+cargo fmt && cargo clippy --release --all-targets -- -D warnings
 
 # Benchmarks
 cargo bench --bench spike_bench

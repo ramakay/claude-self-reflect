@@ -38,10 +38,19 @@ struct SearchProjectScope {
 }
 
 impl SearchProjectScope {
+    /// `current_project` (from `cross_project::resolve_current_project`,
+    /// `MCP_CLIENT_CWD` only) feeds *only* the `project="all"` family boost —
+    /// changing its source would silently change ranking for every explicit
+    /// `project="all"` call, which is out of scope here. `default_scope_project`
+    /// (from `cross_project::resolve_client_dir` + `resolve_project_from_cwd`,
+    /// `MCP_CLIENT_CWD` then `CLAUDE_PROJECT_DIR`) is what an *omitted* project
+    /// resolves to — see module docs on why `MCP_CLIENT_CWD` alone left every
+    /// Claude Code stdio search unscoped.
     fn resolve_with(
         storage: &Storage,
         requested_project: Option<&str>,
         current_project: Option<&str>,
+        default_scope_project: Option<&str>,
         projects_root_override: Option<&Path>,
     ) -> Result<Self> {
         let (effective_project, scope_label, current_project_for_all_scope) =
@@ -52,7 +61,7 @@ impl SearchProjectScope {
                 Some(project) if !project.is_empty() => {
                     (Some(project.to_string()), project.to_string(), None)
                 }
-                _ => match current_project {
+                _ => match default_scope_project {
                     Some(project) => (Some(project.to_string()), project.to_string(), None),
                     None => (None, "all".to_string(), None),
                 },
@@ -96,6 +105,50 @@ impl SearchProjectScope {
     }
 }
 
+/// Resolve a [`SearchProjectScope`] from the process environment: the single
+/// call point `reflect_on_past_with_vec_mode` and
+/// `get_more_results_with_vec_active` both use, so the two can't drift apart
+/// the way they did when each called `cross_project::resolve_default_scope_project()`
+/// independently (W3-S finding 3).
+fn resolve_search_scope(storage: &Storage, project: Option<&str>) -> Result<SearchProjectScope> {
+    resolve_search_scope_with(
+        storage,
+        project,
+        cross_project::resolve_current_project().as_deref(),
+        cross_project::resolve_client_dir().as_deref(),
+        None,
+    )
+}
+
+/// [`resolve_search_scope`] with the environment-derived values (and the
+/// projects root) passed in explicitly — the seam a test uses to pin the
+/// wiring without env var mutation/races or dependence on this machine's
+/// real `$HOME/projects` layout.
+fn resolve_search_scope_with(
+    storage: &Storage,
+    project: Option<&str>,
+    current_project: Option<&str>,
+    client_dir: Option<&str>,
+    projects_root_override: Option<&Path>,
+) -> Result<SearchProjectScope> {
+    let known_projects = storage.list_project_names("", i64::MAX as usize)?;
+    let default_scope_project = client_dir.and_then(|dir| match projects_root_override {
+        Some(root) => cross_project::resolve_verified_default_scope_project_at_root(
+            dir,
+            &known_projects,
+            root,
+        ),
+        None => cross_project::resolve_verified_default_scope_project(dir, &known_projects),
+    });
+    SearchProjectScope::resolve_with(
+        storage,
+        project,
+        current_project,
+        default_scope_project.as_deref(),
+        projects_root_override,
+    )
+}
+
 fn project_scope_multiplier(candidate: &str, scope: &SearchProjectScope) -> f32 {
     if scope.effective_project.is_some() {
         if scope.is_family(candidate) {
@@ -107,6 +160,251 @@ fn project_scope_multiplier(candidate: &str, scope: &SearchProjectScope) -> f32 
         CURRENT_PROJECT_ALL_SCOPE_BOOST
     } else {
         1.0
+    }
+}
+
+/// Chunk ids for every project in `project`'s family (itself plus any
+/// `<project>-<suffix>` alias directory, see `cross_project::same_project_family`).
+///
+/// `csr_reflect_on_past`/`csr_get_more` widen an explicit-or-defaulted project
+/// scope to the family via [`SearchProjectScope`]; `csr_search_insights` and
+/// `csr_search_by_concept` used to filter on an exact label match instead, so
+/// a family alias (e.g. `claude-self-reflect-csr-engine` under project
+/// `claude-self-reflect`) silently lost its chunks in those two tools while
+/// keeping them in `csr_reflect_on_past`. `csr_quick_check` already widened
+/// this way inline; this is that same logic, shared.
+fn family_chunk_ids(storage: &Storage, project: &str) -> Result<HashSet<String>> {
+    family_chunk_ids_at_root(storage, project, None)
+}
+
+/// [`family_chunk_ids`] with an injectable projects-root — the seam tests use
+/// (a tempdir) so alias resolution never depends on this machine's real
+/// `$HOME/projects` layout. `None` uses the real home directory, exactly like
+/// `family_chunk_ids`/`cross_project::same_project_family`.
+fn family_chunk_ids_at_root(
+    storage: &Storage,
+    project: &str,
+    projects_root_override: Option<&Path>,
+) -> Result<HashSet<String>> {
+    let family_projects = storage
+        .list_project_names("", i64::MAX as usize)?
+        .into_iter()
+        .filter(|candidate| match projects_root_override {
+            Some(root) => cross_project::same_project_family_at_root(project, candidate, root),
+            None => cross_project::same_project_family(project, candidate),
+        });
+    let mut ids = HashSet::new();
+    for family_project in family_projects {
+        ids.extend(storage.get_chunk_ids_for_project(&family_project)?);
+    }
+    ids.extend(storage.get_chunk_ids_for_project(project)?);
+    Ok(ids)
+}
+
+/// Tag `store_reflection` stamps on every explicit memory write so the recall
+/// policy can tell a deliberate memory from the derived narratives (stories,
+/// episodes, extractions) that share the `reflections` table.
+pub const EXPLICIT_MEMORY_TAG: &str = "csr:memory";
+
+/// Synthetic score for a reflection reached only through the keyword channel:
+/// the same undated floor `score_fts_candidate` gives a keyword-only chunk.
+const FTS_REFLECTION_SCORE: f32 = 0.40;
+
+/// Tags that mark a reflection row as pipeline-derived (a story, episode,
+/// briefing, cache or extraction) rather than a deliberate memory write. A
+/// derived tag always wins over [`EXPLICIT_MEMORY_TAG`]: the summarizer/story
+/// paths route through the same storage helper the MCP `store_reflection`
+/// tool uses, so a derived row can carry both tags, and standing must follow
+/// what the row actually is, not what it happens to be stamped with.
+const DERIVED_REFLECTION_TAGS: &[&str] = &[
+    "session_story",
+    "session_episode",
+    "session_briefing",
+    "context_cache",
+];
+
+pub(crate) fn has_derived_reflection_tag(tags: &[String]) -> bool {
+    tags.iter()
+        .any(|t| t.starts_with("narrative_") || DERIVED_REFLECTION_TAGS.contains(&t.as_str()))
+}
+
+/// Whether a reflection row is an explicit memory write (the `store_reflection`
+/// tool) rather than a pipeline-derived narrative. A derived tag
+/// (`session_story`/`session_episode`/`session_briefing`/`context_cache`/
+/// `narrative_*`) always disqualifies a row, even alongside
+/// [`EXPLICIT_MEMORY_TAG`] — see [`has_derived_reflection_tag`]. Absent a
+/// derived tag, rows carrying [`EXPLICIT_MEMORY_TAG`] are explicit by
+/// construction; rows written before the stamp existed are recognised by
+/// shape: a UUID id (every derived writer uses a `v3_` / `extracted` /
+/// `story_` / `heuristic` / `fact_` prefix).
+pub(crate) fn is_explicit_memory(id: &str, tags: &[String]) -> bool {
+    if has_derived_reflection_tag(tags) {
+        return false;
+    }
+    if tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
+        return true;
+    }
+    is_uuid(id)
+}
+
+/// Below this raw (pre-decay, pre-scope) cosine, an explicit memory does not
+/// clear the recall floor and must not be granted UserHistory standing — same
+/// floor `format::QUICK_CHECK_FLOOR` uses to call a match "weak": below it,
+/// cosine similarity on this corpus is not calibrated enough to trust as a
+/// relevance signal, let alone lift with a flat +0.50. Without this gate a
+/// legacy uuid-shaped reflection at cosine 0.12 outranked the actually
+/// relevant chunk for the query — measured live 2026-09-22, project
+/// SampleApp: `11110007` (raw 0.116, adj 0.616) and `11110008` (raw 0.114,
+/// adj 0.614) both outranked the target codex chunk at cosine 0.549.
+const EXPLICIT_MEMORY_STANDING_FLOOR: f32 = crate::format::QUICK_CHECK_FLOOR;
+
+/// Recall standing for a reflection candidate. Explicit memory writes that
+/// clear [`EXPLICIT_MEMORY_STANDING_FLOOR`] on raw cosine rank with
+/// user-history standing: `search::rerank` gives user-authored chunks a flat
+/// `W_USER` boost, and without equal standing an exact memory match (cosine
+/// 1.0) lost the page to any user chunk above cosine ~0.5 — measured live
+/// 2026-09-22: seven 0.63-cosine user chunks scored 1.13 against the memory's
+/// 1.00. Below the floor the boost does not apply — the row keeps its
+/// derived-narrative treatment (cached provenance floor, usually Unknown) —
+/// so a memory that is only weakly (or not at all) related to the query
+/// cannot use a raw cosine as low as `EXPLICIT_MEMORY_STANDING_FLOOR - 1` to
+/// jump above genuinely relevant content. `raw_cosine` is 0.0 for
+/// keyword-only reflection hits (no HNSW cosine exists), which conservatively
+/// keeps them off this boost too — their own keyword channel still surfaces
+/// them (see `fuse_rrf`). This is a ranking policy only: it never writes
+/// `reflections.min_trust`, and the row's provenance event stays Unknown
+/// (`reflection_tags_cannot_raise_its_observed_event_above_unknown`).
+fn reflection_recall_standing(
+    storage: &Storage,
+    id: &str,
+    tags: &[String],
+    raw_cosine: f32,
+) -> crate::provenance::TrustTier {
+    let tier = if is_explicit_memory(id, tags) {
+        crate::provenance::TrustTier::UserHistory
+    } else {
+        storage
+            .get_artifact_min_trust(
+                crate::storage::artifact_provenance::ArtifactKind::Reflection,
+                id,
+            )
+            .unwrap_or(crate::provenance::TrustTier::Unknown)
+    };
+    // The floor gates the flat `W_USER` standing boost regardless of which
+    // branch produced `tier`: a derived reflection's CACHED provenance floor
+    // can independently be `UserHistory` (or higher) without ever going
+    // through the explicit-memory path above, and that cached floor must not
+    // bypass the relevance gate either — see this fn's doc and the
+    // `weak_similarity_cached_user_history_reflection_does_not_outrank_relevant_chunk`
+    // test.
+    if raw_cosine < EXPLICIT_MEMORY_STANDING_FLOOR
+        && tier >= crate::provenance::TrustTier::UserHistory
+    {
+        crate::provenance::TrustTier::Unknown
+    } else {
+        tier
+    }
+}
+
+/// Determine a reflection's project from its tags: the pipeline writers stamp
+/// `project_<name>`; explicit memories usually carry the bare project name as
+/// a plain tag, which must not read as cross-project (a penalty, or under an
+/// explicit scope a sink below in-family rows — see [`reflection_in_family`]).
+/// Falls back to `"unknown"` when no tag identifies a project at all.
+fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> String {
+    // Prefer a `project_*` tag that already matches the scope's family: a
+    // memory-file reflection can carry several `project_*` slugs (one per
+    // source memory file) plus a bare family tag, and the *first* one found
+    // is not necessarily the one that keeps the row in scope — see
+    // `reflection_in_family`'s doc for the live shape this fixes.
+    tags.iter()
+        .filter_map(|t| t.strip_prefix("project_"))
+        .find(|candidate| scope.is_family(candidate))
+        .map(str::to_string)
+        .or_else(|| {
+            tags.iter()
+                .find(|t| t.starts_with("project_"))
+                .map(|t| t.trim_start_matches("project_").to_string())
+        })
+        .or_else(|| tags.iter().find(|t| scope.is_family(t)).cloned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Whether a reflection/story carrying `tags` is in the project family of
+/// `scope`. This is the in-family test `sink_out_of_family_under_explicit_scope`
+/// relies on; it does NOT exclude anything. Under an explicit project filter,
+/// an out-of-family (or `"unknown"`-project) reflection is kept as a candidate
+/// and sunk below every in-family row unless it clears the relevance floor or
+/// leads the reflection keyword ranking: a hard drop lost a real answer (a
+/// sibling-project story ranked 1 in the keyword index; 6cf8a2b). With no
+/// filter (`scope.effective_project` is `None`) every reflection is in family.
+///
+/// Checks EVERY tag (each `project_*` tag with the prefix stripped, plus
+/// every bare tag) against `scope.is_family`, not just whichever single tag
+/// [`resolve_reflection_project`] would pick to *display* — a memory-file
+/// reflection can carry several `project_*` slugs (one per source memory
+/// file) plus a bare family tag, and deciding from only the first `project_*`
+/// tag misclassified in-family rows whose first tag happened not to match
+/// (live 2026-09-22: `11110006`/`5eb5aebb`/`11110001`, each carrying a
+/// non-matching `project_*` slug alongside the matching bare tag
+/// `acmecorp-meta-campaigns`).
+fn reflection_in_family(tags: &[String], scope: &SearchProjectScope) -> bool {
+    scope.effective_project.is_none()
+        || tags.iter().any(|tag| {
+            let candidate = tag.strip_prefix("project_").unwrap_or(tag.as_str());
+            scope.is_family(candidate)
+        })
+}
+
+/// Result row for a reflection hit from either channel. `keyword` marks a hit
+/// that arrived through `reflections_fts` rather than the vector index, with
+/// the same `[keyword] ` prefix keyword-only chunks carry. It always builds a result row, it does not filter; out-of-family rows are
+/// handled by `sink_out_of_family_under_explicit_scope`.
+fn reflection_result(
+    id: &str,
+    score: f32,
+    content: &str,
+    tags: &[String],
+    timestamp: String,
+    scope: &SearchProjectScope,
+    keyword: bool,
+) -> EnrichedResult {
+    let project_name = resolve_reflection_project(tags, scope);
+    // Cross-project multiplicative penalty (soft): an out-of-family row under
+    // an explicit scope keeps the 0.3x arm and is then ordered by
+    // `sink_out_of_family_under_explicit_scope`, never dropped.
+    let final_score = score * project_scope_multiplier(&project_name, scope);
+    let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
+        "[episode] "
+    } else if tags.iter().any(|t| t == "session_story") {
+        "[story] "
+    } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
+        "[narrative] "
+    } else {
+        "[reflection] "
+    };
+    let channel_prefix = if keyword { "[keyword] " } else { "" };
+    EnrichedResult {
+        score: final_score,
+        chunk: crate::import::ConversationChunk {
+            id: id.to_string(),
+            conversation_id: id.to_string(),
+            project_name,
+            timestamp,
+            content: format!("{channel_prefix}{tag_prefix}{content}"),
+            message_count: 0,
+            summary: None,
+            // Reflections/episodes are derived narratives, not raw
+            // user-authored chunks — no authority boost from the author
+            // field; explicit memories earn theirs in
+            // `reflection_recall_standing`.
+            author: crate::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        },
+        resolution: None,
+        trust: crate::provenance::TrustTier::Unknown,
+        validity_demoted: false,
     }
 }
 
@@ -327,6 +625,61 @@ pub fn search_mode_from(value: Option<&str>) -> SearchMode {
     }
 }
 
+/// An out-of-family reflection keeps its fused rank under an explicit project
+/// filter when it is among the first K rows of the reflection keyword ranking.
+/// The keyword channel OR-joins single query words, so merely matching is weak
+/// evidence; leading the ranking is not. Measured live 2026-09-23: a real
+/// burst answer (a May story from the sibling Acmecorp-Campaigns project, only
+/// reachable as `[keyword] [story]`) and its narrative ranked 1 and 2, while
+/// the rows that leaked into project=SampleApp ranked 15, 21 and 24 (and 38 on
+/// the other query).
+const OUT_OF_FAMILY_KEYWORD_TOP_K: usize = 3;
+
+/// Stable partition under an explicit project filter: weak out-of-family
+/// reflections/stories sink below every other result, everything else keeps
+/// its fused order. Chunk search is already pre-filtered to the family, so
+/// only reflection rows can be out of family. A reflection is in family when
+/// its resolved project or ANY of its tags (bare, or with the `project_`
+/// prefix stripped) is in the family: explicit memories often carry the bare
+/// project name next to a topical `project_<topic>` tag. An out-of-family row
+/// keeps its place when its raw cosine clears `QUICK_CHECK_FLOOR` (a strong
+/// sibling-project answer, e.g. a May story tagged with a sibling project that
+/// a real burst query needed) and sinks when it does not (live 2026-09-23,
+/// project=SampleApp: an acmecorp story at 0.121 and an unknown-project
+/// reflection at 0.116 sat at ranks 5-6). A row at the very top of the
+/// reflection keyword ranking also keeps its place (see
+/// [`OUT_OF_FAMILY_KEYWORD_TOP_K`]). No-op without an explicit project.
+fn sink_out_of_family_under_explicit_scope(
+    enriched: &mut Vec<EnrichedResult>,
+    scope: &SearchProjectScope,
+    reflection_tags: &HashMap<String, Vec<String>>,
+    reflection_raw_cosine: &HashMap<String, f32>,
+    reflection_keyword_ids: &HashSet<&str>,
+) {
+    if scope.effective_project.is_none() {
+        return;
+    }
+    let in_family = |e: &EnrichedResult| {
+        if scope.is_family(&e.chunk.project_name) {
+            return true;
+        }
+        reflection_tags
+            .get(&e.chunk.id)
+            .is_some_and(|tags| reflection_in_family(tags, scope))
+    };
+    let strong = |e: &EnrichedResult| {
+        reflection_keyword_ids.contains(e.chunk.id.as_str())
+            || reflection_raw_cosine
+                .get(&e.chunk.id)
+                .is_some_and(|c| *c >= crate::format::QUICK_CHECK_FLOOR)
+    };
+    let (keep, sink): (Vec<_>, Vec<_>) = std::mem::take(enriched)
+        .into_iter()
+        .partition(|e| in_family(e) || strong(e));
+    enriched.extend(keep);
+    enriched.extend(sink);
+}
+
 fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<String> {
     let mut fused_order = Vec::with_capacity(semantic_order.len() + fts_order.len());
     let mut scores: HashMap<String, f64> = HashMap::new();
@@ -346,6 +699,29 @@ fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<St
 
     fused_order.sort_by(|left, right| scores[right].total_cmp(&scores[left]));
     fused_order
+}
+
+/// Move every id in `prefix_ids` that also appears in `order` to the front,
+/// in `prefix_ids`' own order, leaving every other id's relative order
+/// untouched. `prefix_ids` is small (a handful of exact-prefix reflection
+/// matches at most) so a linear scan per id is fine.
+fn promote_exact_prefix_reflections(order: Vec<String>, prefix_ids: &[String]) -> Vec<String> {
+    if prefix_ids.is_empty() {
+        return order;
+    }
+    let prefix_set: HashSet<&str> = prefix_ids.iter().map(String::as_str).collect();
+    let mut promoted: Vec<String> = Vec::with_capacity(order.len());
+    for id in prefix_ids {
+        if order.iter().any(|candidate| candidate == id) {
+            promoted.push(id.clone());
+        }
+    }
+    for id in order {
+        if !prefix_set.contains(id.as_str()) {
+            promoted.push(id);
+        }
+    }
+    promoted
 }
 
 /// Everything in `reflect_on_past` after query embedding — the seam the
@@ -444,9 +820,7 @@ pub(crate) async fn reflect_on_past_with_vec_mode(
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<String> {
-    let current_project = cross_project::resolve_current_project();
-    let scope =
-        SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
+    let scope = resolve_search_scope(storage, project)?;
     reflect_on_past_with_vec_in_scope_mode(
         storage,
         search,
@@ -522,7 +896,7 @@ pub(crate) async fn reflect_for_bench_with_vec(
     fetch: usize,
     mode: SearchMode,
 ) -> Result<Vec<BenchHit>> {
-    let scope = SearchProjectScope::resolve_with(storage, Some("csr-bench"), None, None)?;
+    let scope = SearchProjectScope::resolve_with(storage, Some("csr-bench"), None, None, None)?;
     let mut candidate_fetch = fetch.saturating_mul(4).max(20);
     let mut previous_candidates = HashSet::new();
     loop {
@@ -703,6 +1077,14 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         active_forgetting,
     );
 
+    if crate::mcp::stage_probe::is_active() {
+        let ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        crate::mcp::stage_probe::record_stage("final_page", &ranked);
+    }
+
     // TAD: log each RETURNED memory as an MCP-search retrieval event — after the
     // limit cut, so telemetry agrees with what the caller actually saw.
     // session_id="mcp" is a sentinel (MCP has no session id). Non-fatal.
@@ -839,6 +1221,32 @@ async fn reflect_gather_pass(
     let chunk_ids: Vec<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids(&chunk_ids)?;
 
+    if crate::mcp::stage_probe::is_active() {
+        let chunk_conv: HashMap<&str, &str> = chunks
+            .iter()
+            .map(|chunk| (chunk.id.as_str(), chunk.conversation_id.as_str()))
+            .collect();
+        let ranked: Vec<(String, String, f32)> = chunk_results
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    chunk_conv
+                        .get(r.id.as_str())
+                        .map(|c| c.to_string())
+                        .unwrap_or_default(),
+                    r.score,
+                )
+            })
+            .chain(
+                reflection_results
+                    .iter()
+                    .map(|r| (r.id.clone(), String::new(), r.score)),
+            )
+            .collect();
+        crate::mcp::stage_probe::record_stage("hnsw_fetch", &ranked);
+    }
+
     // v10 dream-verdict validity partition: resolve ONCE, early — one
     // batched query for the whole semantic candidate set (perf requirement)
     // — so both the TAD/decay scoring below and the rerank step further down
@@ -899,8 +1307,16 @@ async fn reflect_gather_pass(
         .get_retrieval_events_batch(&reflection_ids_for_tad)
         .unwrap_or_default();
 
-    // Enrich reflection results — convert to EnrichedResult using reflection content
+    // Enrich reflection results — convert to EnrichedResult using reflection
+    // content. Tags are kept per id so the rerank below can tell explicit
+    // memory writes from derived narratives (`reflection_recall_standing`).
+    // Raw (pre-decay, pre-scope) cosine is kept alongside so that function
+    // can gate the flat UserHistory standing by actual relevance instead of
+    // handing it out to every legacy-shaped memory regardless of similarity.
+    let mut reflection_tags: HashMap<String, Vec<String>> = HashMap::new();
+    let mut reflection_raw_cosine: HashMap<String, f32> = HashMap::new();
     for r in &reflection_results {
+        reflection_raw_cosine.insert(r.id.clone(), r.score);
         if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
             let decayed_score = if let Some(ts) = crate::temporal::parse_timestamp(&timestamp) {
                 let events = reflection_tad_events
@@ -911,43 +1327,16 @@ async fn reflect_gather_pass(
             } else {
                 r.score
             };
-            // Determine project from tags
-            let project_name = tags
-                .iter()
-                .find(|t| t.starts_with("project_"))
-                .map(|t| t.trim_start_matches("project_").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            // Cross-project multiplicative penalty
-            let final_score = decayed_score * project_scope_multiplier(&project_name, scope);
-            let tag_prefix = if tags.iter().any(|t| t == "session_episode") {
-                "[episode] "
-            } else if tags.iter().any(|t| t == "session_story") {
-                "[story] "
-            } else if tags.iter().any(|t| t.starts_with("narrative_v3")) {
-                "[narrative] "
-            } else {
-                "[reflection] "
-            };
-            enriched.push(EnrichedResult {
-                score: final_score,
-                chunk: crate::import::ConversationChunk {
-                    id: r.id.clone(),
-                    conversation_id: r.id.clone(),
-                    project_name,
-                    timestamp,
-                    content: format!("{}{}", tag_prefix, content),
-                    message_count: 0,
-                    summary: None,
-                    // Reflections/episodes are derived narratives, not raw
-                    // user-authored chunks — no authority boost.
-                    author: crate::provenance::Speaker::ToolResult,
-                    seq: 0,
-                    is_sidechain: false,
-                },
-                resolution: None,
-                trust: crate::provenance::TrustTier::Unknown,
-                validity_demoted: false,
-            });
+            enriched.push(reflection_result(
+                &r.id,
+                decayed_score,
+                &content,
+                &tags,
+                timestamp,
+                scope,
+                false,
+            ));
+            reflection_tags.insert(r.id.clone(), tags);
         }
     }
 
@@ -960,6 +1349,8 @@ async fn reflect_gather_pass(
         .collect();
 
     let mut fts_order = Vec::new();
+    let mut reflection_fts_hits: Vec<(String, usize, f64)> = Vec::new();
+    let mut reflection_prefix_ids: Vec<String> = Vec::new();
     // Hybrid always supplements semantic retrieval with FTS5. Vector mode
     // skips FTS entirely; FTS mode reaches this block with no semantic hits.
     if search_mode != SearchMode::Vector {
@@ -986,10 +1377,61 @@ async fn reflect_gather_pass(
                 .then_with(|| left.1.cmp(&right.1))
                 .then_with(|| left.0.id.cmp(&right.0.id))
         });
-        fts_order = fts_hits
-            .iter()
-            .map(|(chunk, _, _)| chunk.id.clone())
-            .collect();
+        // Reflections have their own keyword index (`reflections_fts`). Merge
+        // both families by bm25 into ONE keyword ranking, so a stored memory can
+        // earn a keyword rank in the RRF fusion below instead of always arriving
+        // semantic-only and losing to any chunk present in both lists.
+        reflection_fts_hits = storage
+            .fts5_search_reflections(query, fetch)
+            .unwrap_or_default();
+        // `reflections_fts` carries no project column (only the tags JSON
+        // does), so the keyword channel is unscoped: out-of-family hits are
+        // not dropped here — `sink_out_of_family_under_explicit_scope`
+        // decides (strong or keyword-top-K rows keep their rank, weak ones sink).
+        fts_window_full |= reflection_fts_hits.len() == fetch;
+        // Exact-prefix reflections: a memory whose content starts with the
+        // query verbatim is a stronger keyword signal than anything the
+        // OR-of-terms bm25 ranking can express (bm25 compares corpus stats
+        // across `reflections`, so a recurring project-name slug can bury
+        // the literal opener under rows that merely mention one of its
+        // words — live: `MEMORY-ARCHIVE acmecorp-meta-campaigns` never
+        // surfaced its 3 memories because 267 rows matched the OR terms).
+        // Prepended ahead of the bm25 merge so it always wins the keyword
+        // channel rather than just competing on bm25 scale.
+        reflection_prefix_ids = storage
+            .fts5_reflection_prefix_matches(query, fetch)
+            .unwrap_or_default();
+        fts_order = {
+            let mut keyword_ranking: Vec<(&str, usize, f64)> = fts_hits
+                .iter()
+                .map(|(chunk, ordinal, bm25)| (chunk.id.as_str(), *ordinal, *bm25))
+                .chain(
+                    reflection_fts_hits
+                        .iter()
+                        .map(|(id, ordinal, bm25)| (id.as_str(), *ordinal, *bm25)),
+                )
+                .collect();
+            keyword_ranking.sort_by(|left, right| {
+                left.2
+                    .total_cmp(&right.2)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.0.cmp(right.0))
+            });
+            let mut ordered: Vec<String> =
+                Vec::with_capacity(reflection_prefix_ids.len() + keyword_ranking.len());
+            let mut seen: HashSet<String> = HashSet::new();
+            for id in &reflection_prefix_ids {
+                if seen.insert(id.clone()) {
+                    ordered.push(id.clone());
+                }
+            }
+            for (id, _, _) in keyword_ranking {
+                if seen.insert(id.to_string()) {
+                    ordered.push(id.to_string());
+                }
+            }
+            ordered
+        };
         if !fts_hits.is_empty() {
             window_full |= fts_window_full;
             let existing_ids: HashSet<String> =
@@ -1070,6 +1512,54 @@ async fn reflect_gather_pass(
         }
     }
 
+    // Keyword-only reflections: reached through `reflections_fts` or the
+    // exact-prefix channel but not the vector window. No validity partition
+    // applies (verdicts bind to chunk ids).
+    if !reflection_fts_hits.is_empty() || !reflection_prefix_ids.is_empty() {
+        let present: HashSet<String> = enriched.iter().map(|e| e.chunk.id.clone()).collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let ids = reflection_prefix_ids
+            .iter()
+            .map(String::as_str)
+            .chain(reflection_fts_hits.iter().map(|(id, _, _)| id.as_str()));
+        for id in ids {
+            if present.contains(id) || !seen.insert(id) {
+                continue;
+            }
+            if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(id) {
+                enriched.push(reflection_result(
+                    id,
+                    FTS_REFLECTION_SCORE,
+                    &content,
+                    &tags,
+                    timestamp,
+                    scope,
+                    true,
+                ));
+                reflection_tags.insert(id.to_string(), tags);
+            }
+        }
+    }
+
+    // Only built while a stage probe is active: `enriched_conv` exists solely
+    // to feed the `rerank`/`fuse_rrf` stage-probe checkpoints further down
+    // (see their record_stage calls), never the production ranking itself.
+    let probe_active = crate::mcp::stage_probe::is_active();
+    let enriched_conv: Option<HashMap<String, String>> = probe_active.then(|| {
+        enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone()))
+            .collect()
+    });
+    if probe_active {
+        let mut ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+        crate::mcp::stage_probe::record_stage("decay_enriched", &ranked);
+    }
+
     // Provenance-aware re-rank (v9.3): authority + meaning layered on the decayed
     // score. A cached floor at UserHistory or above is boosted; lower-floor
     // authority claims and tool-mechanic build logs are demoted, so a founding decision out-ranks the
@@ -1094,12 +1584,32 @@ async fn reflect_gather_pass(
             cosine: e.score,
             content: e.chunk.content.clone(),
             provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
-            min_trust: storage
-                .get_chunk_min_trust(&e.chunk.id)
-                .unwrap_or(crate::provenance::TrustTier::Unknown),
+            // Reflection ids are not chunk ids: the chunk floor lookup would
+            // read Unknown for every one of them.
+            min_trust: match reflection_tags.get(&e.chunk.id) {
+                Some(tags) => reflection_recall_standing(
+                    storage,
+                    &e.chunk.id,
+                    tags,
+                    reflection_raw_cosine
+                        .get(&e.chunk.id)
+                        .copied()
+                        .unwrap_or(0.0),
+                ),
+                None => storage
+                    .get_chunk_min_trust(&e.chunk.id)
+                    .unwrap_or(crate::provenance::TrustTier::Unknown),
+            },
             timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();
+    // Captured before `candidates` is moved into `rerank`/trained-rerank
+    // below — only used by the stage probe's rerank-breakdown checkpoint.
+    let candidates_for_probe: Option<(Vec<crate::search::rerank::RankCandidate>, Option<String>)> =
+        probe_active.then(|| {
+            let origin = crate::search::rerank::primacy_conv(&candidates);
+            (candidates.clone(), origin)
+        });
     let mut raw_order = candidates.clone();
     raw_order.sort_by(|left, right| {
         right
@@ -1184,6 +1694,27 @@ async fn reflect_gather_pass(
         .into_iter()
         .map(|c| c.id)
         .collect();
+    if let Some(enriched_conv) = enriched_conv.as_ref() {
+        let ranked: Vec<(String, String, f32)> = order
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    enriched_conv.get(id).cloned().unwrap_or_default(),
+                    adjusted_scores.get(id).copied().unwrap_or(0.0),
+                )
+            })
+            .collect();
+        crate::mcp::stage_probe::record_stage("rerank", &ranked);
+        if let Some((candidates, origin)) = candidates_for_probe.as_ref() {
+            crate::mcp::stage_probe::record_rerank_breakdown(
+                candidates,
+                &order,
+                enriched_conv,
+                origin.as_deref(),
+            );
+        }
+    }
     let rerank_rank: HashMap<&str, usize> = order
         .iter()
         .enumerate()
@@ -1212,6 +1743,21 @@ async fn reflect_gather_pass(
         .filter(|id| semantic_candidate_ids.contains(*id))
         .cloned()
         .collect();
+    // Captured before `fts_order` is moved into `final_order` below (the
+    // `SearchMode::Fts` arm takes it by value) — only used by the stage
+    // probe's fuse_rrf checkpoint.
+    let fts_ranked_for_probe: Option<Vec<(String, String)>> =
+        enriched_conv.as_ref().map(|enriched_conv| {
+            fts_order
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        enriched_conv.get(id).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        });
     // This establishes the initial order for every mode. The validity
     // partition runs later: it preserves the valid section byte-for-byte,
     // while active forgetting may reorder only the demoted section by
@@ -1221,6 +1767,34 @@ async fn reflect_gather_pass(
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
+    // Exact-prefix reflections win the keyword channel outright (see where
+    // `reflection_prefix_ids` is built) — but RRF alone does not reliably
+    // surface a hit that is present in ONLY the keyword list ahead of items
+    // present (even weakly) in both the semantic AND keyword lists: with
+    // enough double-counted competition, position-only fusion still buries
+    // it. An exact opening match is strong enough evidence to skip fusion
+    // entirely and place it first, the same way an exact `conv_<uuid>`
+    // handle bypasses similarity ranking (`extract_conv_id`).
+    let final_order = promote_exact_prefix_reflections(final_order, &reflection_prefix_ids);
+    if let Some(enriched_conv) = enriched_conv.as_ref() {
+        let ranked: Vec<(String, String, f32)> = final_order
+            .iter()
+            .map(|id| {
+                (
+                    id.clone(),
+                    enriched_conv.get(id).cloned().unwrap_or_default(),
+                    adjusted_scores.get(id).copied().unwrap_or(0.0),
+                )
+            })
+            .collect();
+        crate::mcp::stage_probe::record_stage("fuse_rrf", &ranked);
+        // FTS-side rank is separate from the fused rank just recorded above:
+        // it's the target's position in the keyword ranking that RRF fused
+        // with the semantic ranking, not the post-fusion position.
+        if let Some(fts_ranked) = fts_ranked_for_probe.as_ref() {
+            crate::mcp::stage_probe::record_fts_rank(fts_ranked);
+        }
+    }
     let rank_of = |id: &str| {
         final_order
             .iter()
@@ -1228,6 +1802,26 @@ async fn reflect_gather_pass(
             .unwrap_or(usize::MAX)
     };
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+    // Under an explicit project filter, chunk search is already restricted to
+    // the project family, but reflections and stories are not: RRF places them
+    // by rank, so a cosine-0.12 story from another project could sit above
+    // in-family hits (measured live 2026-09-23, project=SampleApp: ranks 5-7
+    // were an acmecorp story, an unknown-project reflection and a subagent
+    // extraction). Sink out-of-family rows below every in-family row instead
+    // of dropping them: a hard drop lost the answer to a real burst query
+    // (a May story tagged with a sibling project name).
+    let reflection_keyword_ids: HashSet<&str> = reflection_fts_hits
+        .iter()
+        .filter(|(_, ordinal, _)| *ordinal < OUT_OF_FAMILY_KEYWORD_TOP_K)
+        .map(|(id, _, _)| id.as_str())
+        .collect();
+    sink_out_of_family_under_explicit_scope(
+        &mut enriched,
+        scope,
+        &reflection_tags,
+        &reflection_raw_cosine,
+        &reflection_keyword_ids,
+    );
 
     // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
     // ranked plan chunk survive while its origin conversation fell outside the
@@ -1263,6 +1857,14 @@ async fn reflect_gather_pass(
         .collect();
     format::dedupe_sidechain_origins(&mut enriched, &parent_of);
 
+    if crate::mcp::stage_probe::is_active() {
+        let ranked: Vec<(String, String, f32)> = enriched
+            .iter()
+            .map(|e| (e.chunk.id.clone(), e.chunk.conversation_id.clone(), e.score))
+            .collect();
+        crate::mcp::stage_probe::record_stage("dedupe", &ranked);
+    }
+
     let ancestry_candidates_used = enriched
         .iter()
         .filter(|result| ancestry_applied_ids.contains(&result.chunk.id))
@@ -1280,8 +1882,12 @@ async fn reflect_gather_pass(
     })
 }
 
-/// Store a reflection with embedding for future search.
-pub async fn store_reflection(
+/// Store a reflection with embedding for future search, with `tags` used
+/// verbatim (no explicit-memory stamp). Shared by the MCP `store_reflection`
+/// tool (which stamps first, see [`store_reflection`]) and every pipeline
+/// writer (stories, episodes, extractions) that must NOT get user standing —
+/// see `reflection_recall_standing` and `is_explicit_memory`.
+pub async fn store_reflection_internal(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
@@ -1307,6 +1913,27 @@ pub async fn store_reflection(
         "Reflection stored successfully.\nID: {}\nTags: {:?}",
         id, tags
     ))
+}
+
+/// Store an EXPLICIT memory write for future search: the MCP `store_reflection`
+/// tool's only entry point. Stamps [`EXPLICIT_MEMORY_TAG`] so recall can rank
+/// this row with user standing (`reflection_recall_standing`) without
+/// inferring it from shape. Pipeline writers (stories/episodes/extractions)
+/// must call [`store_reflection_internal`] directly instead — they are not
+/// deliberate memory writes and must not gain user standing by sharing this
+/// stamping path.
+pub async fn store_reflection(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    content: &str,
+    tags: &[String],
+) -> Result<String> {
+    let mut tags: Vec<String> = tags.to_vec();
+    if !tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG) {
+        tags.push(EXPLICIT_MEMORY_TAG.to_string());
+    }
+    store_reflection_internal(storage, embeddings, search, content, &tags).await
 }
 
 /// Record a resolution verdict for one or more chunks.
@@ -1371,16 +1998,9 @@ async fn quick_check_with_vec(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (effective_project, _) = cross_project::normalize_project_scope(storage, project)?;
     let results = if let Some(ref project) = effective_project {
-        let family_projects = storage
-            .list_project_names("", i64::MAX as usize)?
-            .into_iter()
-            .filter(|candidate| cross_project::same_project_family(project, candidate));
-        let mut ids = HashSet::new();
-        for family_project in family_projects {
-            ids.extend(storage.get_chunk_ids_for_project(&family_project)?);
-        }
+        let ids = family_chunk_ids(storage, project)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(query_vec, 2, min_score, &ids)
     } else {
@@ -1419,11 +2039,26 @@ pub async fn search_insights(
     query: &str,
     project: Option<&str>,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    search_insights_at_root(storage, embeddings, search, query, project, None).await
+}
+
+/// [`search_insights`] with an injectable projects-root — the seam a test
+/// uses to exercise family-alias widening (`family_chunk_ids_at_root`)
+/// without depending on this machine's real `$HOME/projects` layout.
+async fn search_insights_at_root(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    project: Option<&str>,
+    projects_root_override: Option<&Path>,
+) -> Result<String> {
+    let (effective_project, _) =
+        cross_project::normalize_project_scope_at_root(storage, project, projects_root_override)?;
     let query_vec = embed_query(embeddings, query).await?;
 
     let results = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+        let ids = family_chunk_ids_at_root(storage, p, projects_root_override)?;
         let idx = search.read().await;
         idx.search_chunks_filtered(&query_vec, 10, 0.0, &ids)
     } else {
@@ -1552,8 +2187,22 @@ pub async fn search_by_file(
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
-    let proj = effective_project.unwrap_or_default();
+    // The code-graph ledger (`code_nodes`/`code_evolution`/
+    // `code_graph_file_state`) filters by an exact `project` match — no
+    // family-alias widening like `family_chunk_ids` gives the chunk search
+    // tools. Defaulting an *omitted* project to the caller's
+    // `CLAUDE_PROJECT_DIR` family name the way those tools do would narrow
+    // this ledger down to just that one project name and silently drop
+    // everything filed under a family alias (e.g. `claude-self-reflect`'s
+    // `claude-self-reflect-csr-engine` code nodes) — strictly worse than
+    // before this tool was scoped at all, since an omitted project used to
+    // run fully unscoped. Only an *explicit, specific* project narrows the
+    // ledger; omitted or `"all"` stays global, exactly as before the
+    // CLAUDE_PROJECT_DIR default-scope fallback existed.
+    let proj = match project {
+        Some(p) if !p.is_empty() && !p.eq_ignore_ascii_case("all") => p.to_string(),
+        _ => String::new(),
+    };
 
     let mut ledger = storage.code_file_ledger(&proj, file_path)?;
     if !ledger.symbols.is_empty() || !ledger.timeline.is_empty() {
@@ -1826,7 +2475,7 @@ pub async fn why(
     project: Option<&str>,
     cfg: &crate::search::reinstatement::ReinstateConfig,
 ) -> Result<String> {
-    let (effective_project, _) = cross_project::normalize_project_scope(project);
+    let (effective_project, _) = cross_project::normalize_project_scope(storage, project)?;
 
     let reinstatement = crate::search::reinstatement::reinstate(
         storage,
@@ -1857,8 +2506,46 @@ pub async fn why(
     );
 
     append_memory_provenance_hop(storage, &ranking.items, &mut rendered)?;
+    append_scratch_hop(storage, query, &ranking.items, &mut rendered);
 
     Ok(rendered)
+}
+
+/// "Became final" hop: repo functions named in the query, or linked to the
+/// evidence chunks, whose name and body match a scratch function Claude drafted
+/// earlier. Adds nothing (and never fails the call) when there is no match.
+fn append_scratch_hop(
+    storage: &Arc<Storage>,
+    query: &str,
+    items: &[crate::search::reinstatement::EvidenceItem],
+    out: &mut String,
+) {
+    let mut names: Vec<String> = query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.len() >= 4)
+        .map(str::to_string)
+        .collect();
+    let _ = storage.with_connection(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT name FROM code_nodes
+             WHERE last_chunk_id = ?1 AND kind IN ('function', 'method')
+               AND file NOT LIKE 'scratch/%' LIMIT 5",
+        )?;
+        for item in items.iter().take(10) {
+            let rows = stmt.query_map([&item.chunk_id], |r| r.get::<_, String>(0))?;
+            names.extend(rows.flatten());
+        }
+        Ok(())
+    });
+    names.sort();
+    names.dedup();
+    names.truncate(40);
+    let promotions = storage
+        .with_connection(|conn| crate::import::scratch::promotions_for_names(conn, &names))
+        .unwrap_or_default();
+    for promotion in promotions.iter().take(3) {
+        out.push_str(&format!("\n{}", promotion.line()));
+    }
 }
 
 /// Read-only additive join: for each conversation the evidence resolved to,
@@ -2041,13 +2728,30 @@ pub async fn search_by_concept(
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
-    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
+    search_by_concept_at_root(storage, embeddings, search, concept, limit, project, None).await
+}
+
+/// [`search_by_concept`] with an injectable projects-root — same seam as
+/// [`search_insights_at_root`], for the same hermetic-alias-widening test
+/// reason.
+#[allow(clippy::too_many_arguments)]
+async fn search_by_concept_at_root(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    concept: &str,
+    limit: usize,
+    project: Option<&str>,
+    projects_root_override: Option<&Path>,
+) -> Result<String> {
+    let (effective_project, scope_label) =
+        cross_project::normalize_project_scope_at_root(storage, project, projects_root_override)?;
     let query_vec = embed_query(embeddings, concept).await?;
 
     // Overfetch + partition over the full candidate set + single adaptive
     // refetch + truncate — see `fetch_enrich_partition_adaptive`.
     let enriched = if let Some(ref p) = effective_project {
-        let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+        let ids = family_chunk_ids_at_root(storage, p, projects_root_override)?;
         let idx = search.read().await;
         fetch_enrich_partition_adaptive(
             storage,
@@ -2184,9 +2888,7 @@ async fn get_more_results_with_vec_active(
     // boost-adjusted — a family chunk boosted onto page one reappeared on
     // page two (raw order) while the chunk it displaced was skipped
     // entirely (certified live with a 0.89-family / 0.90-other pair).
-    let current_project = cross_project::resolve_current_project();
-    let scope =
-        SearchProjectScope::resolve_with(storage, project, current_project.as_deref(), None)?;
+    let scope = resolve_search_scope(storage, project)?;
     get_more_results_in_scope(
         storage,
         search,
@@ -2475,6 +3177,7 @@ pub fn transcript(
     json: bool,
     budget_chars: Option<usize>,
     sidechains: bool,
+    include_system: bool,
 ) -> Result<String> {
     use crate::transcript::{parse_turns_spec, RoleFilter, TranscriptRequest, ViewKind};
 
@@ -2520,6 +3223,7 @@ pub fn transcript(
             .unwrap_or(crate::transcript::DEFAULT_BUDGET_CHARS)
             .min(MCP_TRANSCRIPT_MAX_BUDGET_CHARS),
         sidechains,
+        include_system,
     };
 
     Ok(crate::transcript::run(projects_dir, &req))
@@ -3298,6 +4002,53 @@ fn apply_resolutions_before_limit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn why_appends_became_final_receipt_only_on_match() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let body = "def build_index(rows):\n    return {r: i for i, r in enumerate(rows)}\n";
+        let scratch = crate::extraction::codegraph::extract_graph_fragment_for_file(
+            body,
+            "scratch/abcd1234/inline-aaaa.py",
+            "scratch:p",
+            "scratch:p",
+            "c1",
+            "s1",
+        );
+        let repo = crate::extraction::codegraph::extract_graph_fragment_for_file(
+            body,
+            "src/index.py",
+            "p",
+            "p",
+            "c2",
+            "s2",
+        );
+        for n in scratch.nodes.iter().chain(repo.nodes.iter()) {
+            storage.upsert_code_node(n).unwrap();
+        }
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO scratch_scripts (id, session_id, conv_id, project, lang, file, body, created_at)
+                     VALUES ('i','abcd1234-0000','c1','p','py','scratch/abcd1234/inline-aaaa.py','x','2026-09-30T10:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut out = String::from("why");
+        append_scratch_hop(&storage, "why does build_index exist", &[], &mut out);
+        // The repo function's first conversation has no recorded start, so only
+        // the matching body is claimed, never that the scratch became final.
+        assert!(
+            out.contains("same body as build_index in src/index.py: drafted as scratch in session abcd1234 on 2026-09-30"),
+            "{out}"
+        );
+        assert!(!out.contains("became final"), "{out}");
+        let mut quiet = String::from("why");
+        append_scratch_hop(&storage, "unrelated question here", &[], &mut quiet);
+        assert_eq!(quiet, "why");
+    }
+
     use super::*;
     // Pure parsing seam — tests drive it by parameter instead of mutating
     // the process env, so the non-test build has no use for it.
@@ -3336,6 +4087,1165 @@ mod tests {
             engine.insert_chunk(chunk.id, vector.to_vec());
         }
         (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn stage_probe_records_every_stage_and_final_rank_matches_the_returned_page() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        for i in 0..5 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("stage-probe-{i}"),
+                conversation_id: format!("codex:stage-probe-conv-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("stage probe content {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            // Cosine similarity to the query decreases with i, so the target
+            // (i=2) lands at a known, non-trivial rank.
+            let vector = [1.0 - (i as f32) * 0.1, 0.05, 0.0, 0.0];
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector.to_vec());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let (output, samples) = crate::mcp::stage_probe::scope("codex:stage-probe-conv-2", || {
+            reflect_on_past_with_vec(
+                &storage,
+                &search,
+                &query,
+                "stage probe content",
+                6,
+                0.0,
+                None,
+                0,
+                false,
+                ConsumptionMode::Off,
+                false,
+            )
+        })
+        .await;
+        let output = output.unwrap();
+        assert!(
+            output.contains("stage-probe-2"),
+            "target chunk should be in the returned page: {output}"
+        );
+
+        let stage_names: Vec<&str> = samples.iter().map(|sample| sample.stage).collect();
+        assert_eq!(
+            stage_names,
+            vec![
+                "hnsw_fetch",
+                "decay_enriched",
+                "rerank",
+                "fuse_rrf",
+                "dedupe",
+                "final_page",
+            ],
+            "every documented stage must record exactly once, in pipeline order"
+        );
+        for sample in &samples {
+            assert!(
+                sample.target_rank.is_some(),
+                "target present at every stage with these fixtures: {} had none",
+                sample.stage
+            );
+        }
+        let final_page = samples.last().unwrap();
+        assert_eq!(
+            final_page.target_rank,
+            Some(2),
+            "target is the 3rd-most-similar of 5 chunks, 0-indexed rank 2"
+        );
+
+        let rerank_sample = samples
+            .iter()
+            .find(|sample| sample.stage == "rerank")
+            .unwrap();
+        assert!(
+            !rerank_sample.rerank_breakdown.is_empty(),
+            "rerank checkpoint must capture a per-term breakdown when the target survives to it"
+        );
+        let target_rows: Vec<_> = rerank_sample
+            .rerank_breakdown
+            .iter()
+            .filter(|row| row.is_target)
+            .collect();
+        assert_eq!(
+            target_rows.len(),
+            1,
+            "exactly one row should be flagged as the target's own best chunk"
+        );
+        assert_eq!(target_rows[0].chunk_id, "stage-probe-2");
+        assert!(target_rows[0].breakdown.total.is_finite());
+        let displacer_rows: Vec<_> = rerank_sample
+            .rerank_breakdown
+            .iter()
+            .filter(|row| !row.is_target)
+            .collect();
+        assert_eq!(
+            displacer_rows.len(),
+            rerank_sample.target_rank.unwrap(),
+            "displacer count must equal the target's own rerank rank (everyone ranked above it)"
+        );
+
+        let fuse_rrf_sample = samples
+            .iter()
+            .find(|sample| sample.stage == "fuse_rrf")
+            .unwrap();
+        assert!(
+            fuse_rrf_sample.target_fts_rank.is_some(),
+            "target's own content is FTS-matchable, so fuse_rrf must also \
+             record its keyword-side rank, not just its fused rank"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_probe_is_inert_outside_an_active_scope() {
+        // `is_active()` must be false with no `scope()` wrapper — the
+        // production hot path (MCP tool, hooks) never wraps calls in
+        // `scope`, so every `(String, String, f32)` vector build gated on it
+        // must be skipped there. Exercised indirectly here: a call outside
+        // `scope` returns zero samples via the same production code path
+        // that skips the vector builds.
+        assert!(!crate::mcp::stage_probe::is_active());
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let chunk = crate::import::ConversationChunk {
+            id: "no-scope-0".into(),
+            conversation_id: "codex:no-scope-conv".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "no scope active".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let vector = [1.0_f32, 0.0, 0.0, 0.0];
+        storage.insert_chunk(&chunk, &vector).unwrap();
+        engine.insert_chunk(chunk.id, vector.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+
+        // No `scope()` wrapper — this must succeed exactly like production
+        // callers, and `is_active()` must read false throughout.
+        let output = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &vector,
+            "no scope active",
+            6,
+            0.0,
+            None,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(output.contains("no-scope-0"));
+        assert!(!crate::mcp::stage_probe::is_active());
+    }
+
+    /// Two `scope()` calls interleaved via `tokio::join!` inside the SAME
+    /// task must not cross-contaminate: each records samples only for its
+    /// own target. `LocalKey::scope` sets/restores the task-local value
+    /// around each individual `poll()`, so sibling scoped futures polled in
+    /// turn never see each other's state — the property a naive
+    /// process-global `static` would not have.
+    #[tokio::test]
+    async fn stage_probe_scopes_do_not_cross_contaminate_concurrent_queries() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        for i in 0..3 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("concurrent-{i}"),
+                conversation_id: format!("codex:concurrent-conv-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("concurrent probe content {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            let vector = [1.0 - (i as f32) * 0.1, 0.05, 0.0, 0.0];
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            engine.insert_chunk(chunk.id, vector.to_vec());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let run = |target: &'static str| {
+            let storage = storage.clone();
+            let search = search.clone();
+            async move {
+                crate::mcp::stage_probe::scope(target, || {
+                    reflect_on_past_with_vec(
+                        &storage,
+                        &search,
+                        &query,
+                        "concurrent probe content",
+                        6,
+                        0.0,
+                        None,
+                        0,
+                        false,
+                        ConsumptionMode::Off,
+                        false,
+                    )
+                })
+                .await
+            }
+        };
+        let (first, second) = tokio::join!(
+            run("codex:concurrent-conv-0"),
+            run("codex:concurrent-conv-1")
+        );
+        let (_, first_samples) = first;
+        let (_, second_samples) = second;
+        assert_eq!(
+            first_samples.last().unwrap().target_rank,
+            Some(0),
+            "conv-0 probe must see its own target, not the other task's"
+        );
+        assert_eq!(
+            second_samples.last().unwrap().target_rank,
+            Some(1),
+            "conv-1 probe must see its own target, not the other task's"
+        );
+    }
+
+    #[test]
+    fn explicit_memory_is_told_apart_from_derived_reflections() {
+        let uuid = "22220000-0000-4000-8000-000000000001";
+        assert!(is_explicit_memory(
+            "story_x",
+            &[EXPLICIT_MEMORY_TAG.to_string()]
+        ));
+        assert!(is_explicit_memory(
+            uuid,
+            &["acmecorp".into(), "memory-archive".into()]
+        ));
+        assert!(is_explicit_memory(uuid, &[]));
+        assert!(!is_explicit_memory(
+            uuid,
+            &["session_story".into(), "conv_x".into()]
+        ));
+        assert!(!is_explicit_memory(uuid, &["session_episode".into()]));
+        assert!(!is_explicit_memory(
+            uuid,
+            &["session_briefing".into(), "schema_v1".into()]
+        ));
+        assert!(!is_explicit_memory(
+            uuid,
+            &["narrative_extracted_v3".into(), "status_partial".into()]
+        ));
+        assert!(!is_explicit_memory("v3_abc", &["context_cache".into()]));
+        assert!(!is_explicit_memory("extracted_1", &["free".into()]));
+    }
+
+    /// Regression for the live bug: `store_reflection`'s shared insert path
+    /// stamped `csr:memory` onto every derived narrative it wrote (stories,
+    /// episodes, ...), so a row could carry BOTH the stamp and a derived tag.
+    /// The derived tag must win — a pipeline narrative is never a deliberate
+    /// memory write, whatever it happens to be stamped with.
+    #[test]
+    fn derived_tag_overrides_explicit_memory_stamp() {
+        let uuid = "22220000-0000-4000-8000-000000000001";
+        assert!(
+            !is_explicit_memory(
+                uuid,
+                &["session_story".into(), EXPLICIT_MEMORY_TAG.to_string()]
+            ),
+            "a stamped session_story must not count as an explicit memory"
+        );
+        assert!(!is_explicit_memory(
+            uuid,
+            &[
+                "narrative_extracted_v3".into(),
+                EXPLICIT_MEMORY_TAG.to_string()
+            ]
+        ));
+    }
+
+    /// The bug this closes: `summarizer.rs` wrote stories through the same
+    /// `store_reflection` helper the MCP tool uses, so every story got the
+    /// `csr:memory` stamp and, via `reflection_recall_standing`, the flat
+    /// `W_USER` boost `derived_story_keeps_no_standing_against_user_chunks`
+    /// exists to forbid. That test only caught it for reflections written
+    /// directly through storage; this one exercises the actual write path a
+    /// story takes (`store_reflection_internal`) and proves it does NOT
+    /// stamp. Revert the split in `store_reflection`/`store_reflection_internal`
+    /// and this fails: the row would carry `csr:memory`.
+    #[tokio::test]
+    async fn summarizer_story_write_path_does_not_stamp_explicit_memory() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = SearchEngine::new(EmbeddingEngine::dimension());
+        let search = Arc::new(RwLock::new(engine));
+        let tags = vec![
+            "session_story".to_string(),
+            "project_test".to_string(),
+            "conv_abc".to_string(),
+        ];
+        let result = store_reflection_internal(
+            &storage,
+            &embeddings,
+            &search,
+            "a synthesized session story",
+            &tags,
+        )
+        .await
+        .unwrap();
+        let id = result
+            .lines()
+            .find_map(|l| l.strip_prefix("ID: "))
+            .expect("id line")
+            .to_string();
+        let (_, stored_tags, _) = storage.get_reflection_by_id(&id).unwrap().unwrap();
+        assert!(
+            !stored_tags.iter().any(|t| t == EXPLICIT_MEMORY_TAG),
+            "the summarizer's write path must not stamp explicit-memory standing: {stored_tags:?}"
+        );
+        assert!(!is_explicit_memory(&id, &stored_tags));
+    }
+
+    async fn first_cid_for_scope(project: &str, chunk_cos: f32, story_cos: f32) -> String {
+        first_cid_for_scope_tagged(
+            project,
+            chunk_cos,
+            story_cos,
+            &["session_story", "project_sinkscope-away"],
+        )
+        .await
+    }
+
+    async fn first_cid_for_scope_tagged(
+        project: &str,
+        chunk_cos: f32,
+        story_cos: f32,
+        story_tags: &[&str],
+    ) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk_vec = vec![chunk_cos, (1.0 - chunk_cos * chunk_cos).sqrt(), 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "in-family-chunk".into(),
+            conversation_id: "conv-in-family".into(),
+            project_name: "sinkscope-home".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "deploy notes for the home project".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &chunk_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), chunk_vec);
+        let story_vec = vec![story_cos, (1.0 - story_cos * story_cos).sqrt(), 0.0, 0.0];
+        storage
+            .insert_reflection(
+                "story_elsewhere",
+                "a story from a different project",
+                &story_tags.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story_elsewhere".to_string(), story_vec);
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "deploy notes",
+            2,
+            0.0,
+            Some(project),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        out[start..end].to_string()
+    }
+
+    // Vector mode already multiplies an out-of-family score by 0.3, so the
+    // story must beat the chunk after that multiplier for the sink to decide.
+    #[tokio::test]
+    async fn explicit_scope_sinks_weak_out_of_family_story_below_in_family_hits() {
+        // story 0.40 * 0.3 = 0.12 beats chunk 0.10 without the sink.
+        assert_eq!(
+            first_cid_for_scope("sinkscope-home", 0.10, 0.40).await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_a_strong_out_of_family_story_in_place() {
+        // story 0.95 clears QUICK_CHECK_FLOOR; 0.95 * 0.3 = 0.285 beats 0.20.
+        assert_ne!(
+            first_cid_for_scope("sinkscope-home", 0.20, 0.95).await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_family_tag_keeps_a_memory_with_a_topical_project_tag_in_family() {
+        // Live shape of 11110006: a bare project tag plus a topical project_
+        // tag that resolves the row's project elsewhere. It must not sink.
+        assert_ne!(
+            first_cid_for_scope_tagged(
+                "sinkscope-home",
+                0.10,
+                0.40,
+                &["sinkscope-home", "project_sinkscope-topic"],
+            )
+            .await,
+            "conv-in-family"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_scope_keeps_a_keyword_matched_out_of_family_story_in_place() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk_vec = vec![0.10_f32, (1.0_f32 - 0.01).sqrt(), 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "in-family-chunk".into(),
+            conversation_id: "conv-in-family".into(),
+            project_name: "sinkscope-home".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "unrelated deploy notes".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &chunk_vec).unwrap();
+        engine.insert_chunk(chunk.id.clone(), chunk_vec);
+        // Weak semantically (0.40, under the floor) but its text carries the
+        // query's own terms, so the keyword channel finds it.
+        let story_vec = vec![0.40_f32, (1.0_f32 - 0.16).sqrt(), 0.0, 0.0];
+        storage
+            .insert_reflection(
+                "story_sibling",
+                "morning mantras pronunciation comment on the reel",
+                &[
+                    "session_story".to_string(),
+                    "project_sinkscope-away".to_string(),
+                ],
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story_sibling".to_string(), story_vec);
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "morning mantras pronunciation",
+            2,
+            0.0,
+            Some("sinkscope-home"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_ne!(
+            &out[start..end],
+            "conv-in-family",
+            "a keyword-matched sibling-project story must keep its fused rank:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unscoped_search_keeps_the_better_out_of_family_story_first() {
+        assert_ne!(
+            first_cid_for_scope("all", 0.10, 0.40).await,
+            "conv-in-family"
+        );
+    }
+
+    /// Seven user-authored chunks at cosine 0.63 to the query (the live shape
+    /// measured 2026-09-22: one recap paragraph quoted into many sessions)
+    /// against one reflection at cosine 1.0. Returns the first `<cid>`.
+    async fn memory_vs_user_chunks_first_hit(memory_tags: &[&str]) -> String {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        for i in 0..7 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("user-{i}"),
+                conversation_id: format!("conv-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("follower growth recap quoted into session {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            let vector = vec![0.63_f32, 0.776_6, 0.0, 0.0];
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute("UPDATE chunks SET min_trust = 3 WHERE id = ?1", [&chunk.id])?;
+                    Ok(())
+                })
+                .unwrap();
+            engine.insert_chunk(chunk.id, vector);
+        }
+        let memory_id = "22220000-0000-4000-8000-000000000001";
+        let tags: Vec<String> = memory_tags.iter().map(|t| t.to_string()).collect();
+        storage
+            .insert_reflection(
+                memory_id,
+                "MEMORY-ARCHIVE follower growth tracking May 2026",
+                &tags,
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), query.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "follower growth memory",
+            1,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        out[start..end].to_string()
+    }
+
+    #[tokio::test]
+    async fn exact_explicit_memory_outranks_boosted_user_chunks() {
+        assert_eq!(
+            memory_vs_user_chunks_first_hit(&["acmecorp", "memory-archive"]).await,
+            "22220000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            memory_vs_user_chunks_first_hit(&["free-form", EXPLICIT_MEMORY_TAG]).await,
+            "22220000-0000-4000-8000-000000000001"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_story_keeps_no_standing_against_user_chunks() {
+        // Policy boundary: a pipeline story at cosine 1.0 still yields to
+        // user-authored history, exactly as before this fix.
+        // `<cid>` renders the conversation id: `conv-N` for the user chunks,
+        // the reflection's own id for the memory.
+        let first = memory_vs_user_chunks_first_hit(&["session_story", "conv_x"]).await;
+        assert!(first.starts_with("conv-"), "{first}");
+    }
+
+    /// Live 2026-09-22 defect (project SampleApp, query "codex blocked
+    /// revival..."): a legacy uuid-shaped reflection at raw cosine ~0.12 to
+    /// the query was still granted UserHistory standing, so `+0.50` lifted it
+    /// (adj 0.616) above the actually relevant chunk (cosine 0.549, no
+    /// boost). `EXPLICIT_MEMORY_STANDING_FLOOR` must gate the boost off for a
+    /// memory this weakly related, so the relevant chunk wins the page.
+    #[tokio::test]
+    async fn weak_similarity_memory_does_not_outrank_relevant_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        // Relevant chunk: cosine 0.55 to the query, no standing of its own.
+        let relevant_cosine = 0.55_f32;
+        let relevant_vector = vec![
+            relevant_cosine,
+            (1.0 - relevant_cosine * relevant_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let chunk = crate::import::ConversationChunk {
+            id: "relevant-chunk".into(),
+            conversation_id: "conv-relevant".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "the codex revival is blocked on the iOS deploy step".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &relevant_vector).unwrap();
+        engine.insert_chunk(chunk.id.clone(), relevant_vector);
+
+        // Legacy uuid-shaped memory: cosine 0.12, well under the floor.
+        let weak_cosine = 0.12_f32;
+        let weak_vector = vec![
+            weak_cosine,
+            (1.0 - weak_cosine * weak_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let memory_id = "11110007-0000-4000-8000-000000000001";
+        storage
+            .insert_reflection(
+                memory_id,
+                "an unrelated acmecorp campaign note",
+                &["acmecorp".to_string()],
+                &weak_vector,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), weak_vector);
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival 2026 iOS deploy blocker where stuck",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_eq!(
+            &out[start..end],
+            "conv-relevant",
+            "a cosine-0.12 memory must not outrank a cosine-0.55 relevant chunk:\n{out}"
+        );
+    }
+
+    /// Opus review finding (medium, W3-K): `EXPLICIT_MEMORY_STANDING_FLOOR`
+    /// gated the boost only on the explicit-memory branch of
+    /// `reflection_recall_standing`. A derived reflection (no
+    /// `csr:memory` stamp, not uuid-shaped) whose CACHED provenance floor is
+    /// already `UserHistory` skipped that gate entirely and still got the
+    /// flat `W_USER` boost at any cosine — live receipt: `extracted_v3_*`
+    /// rows scored `cos=0.535 user=+0.50 total=1.035`, the same shape as the
+    /// `11110007` bug this item was opened for. Same fixture as
+    /// `weak_similarity_memory_does_not_outrank_relevant_chunk`, but the
+    /// weak memory is a derived row with a pre-cached `UserHistory` floor
+    /// instead of an explicit `store_reflection` write.
+    #[tokio::test]
+    async fn weak_similarity_cached_user_history_reflection_does_not_outrank_relevant_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        let relevant_cosine = 0.55_f32;
+        let relevant_vector = vec![
+            relevant_cosine,
+            (1.0 - relevant_cosine * relevant_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let chunk = crate::import::ConversationChunk {
+            id: "relevant-chunk".into(),
+            conversation_id: "conv-relevant".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "the codex revival is blocked on the iOS deploy step".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &relevant_vector).unwrap();
+        engine.insert_chunk(chunk.id.clone(), relevant_vector);
+
+        // Derived reflection: no EXPLICIT_MEMORY_TAG, non-uuid id (so
+        // `is_explicit_memory` is false), cosine 0.12 (well under the
+        // floor), with a cached provenance floor already UserHistory —
+        // the shape `insert_derived_reflection` produces for a row whose
+        // support set includes a user message.
+        let weak_cosine = 0.12_f32;
+        let weak_vector = vec![
+            weak_cosine,
+            (1.0 - weak_cosine * weak_cosine).sqrt(),
+            0.0,
+            0.0,
+        ];
+        let derived_id = "extracted_v3_unrelated-conv";
+        storage
+            .insert_reflection(
+                derived_id,
+                "an unrelated extracted narrative",
+                &["narrative_extracted_v3".to_string()],
+                &weak_vector,
+            )
+            .unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE reflections SET min_trust = ?1 WHERE id = ?2",
+                    rusqlite::params![
+                        crate::provenance::TrustTier::UserHistory.as_i64(),
+                        derived_id
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        engine.insert_reflection(derived_id.to_string(), weak_vector);
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival 2026 iOS deploy blocker where stuck",
+            2,
+            0.0,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out.find("<cid>").expect("at least one result") + "<cid>".len();
+        let end = out[start..].find("</cid>").unwrap() + start;
+        assert_eq!(
+            &out[start..end],
+            "conv-relevant",
+            "a cosine-0.12 derived reflection with a cached UserHistory floor must not outrank \
+             a cosine-0.55 relevant chunk:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_project_tag_keeps_memory_in_family_under_a_scope() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "anchor".into(),
+            conversation_id: "conv-anchor".into(),
+            project_name: "meta-campaigns".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "campaign roster baseline".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.6, 0.8, 0.0, 0.0]).unwrap();
+        engine.insert_chunk(chunk.id.clone(), vec![0.6, 0.8, 0.0, 0.0]);
+        storage
+            .insert_reflection(
+                "memory-in-family",
+                "MEMORY-ARCHIVE campaign roster",
+                &["meta-campaigns".into(), EXPLICIT_MEMORY_TAG.into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("memory-in-family".into(), query.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "campaign roster memory",
+            2,
+            0.0,
+            Some("meta-campaigns"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        let start = out
+            .find("<cid>memory-in-family</cid>")
+            .expect("memory on the page");
+        let block_start = out[..start].rfind("<r rank=").expect("result block");
+        let block = &out[block_start..start];
+        let score: f32 = block
+            .split("<s")
+            .nth(1)
+            .and_then(|s| s.split('>').nth(1))
+            .and_then(|s| s.split("</s").next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("score");
+        assert!(
+            block.contains("<p>meta-campaigns</p>"),
+            "bare project tag must resolve to the scoped project:\n{out}"
+        );
+        assert!(
+            score > 0.9,
+            "no cross-project penalty expected, got {score}:\n{out}"
+        );
+    }
+
+    /// Spec (b): under an explicit project filter, reflections and stories
+    /// outside the family — including ones that resolve to "unknown" because
+    /// no tag names a project — are NOT dropped (6cf8a2b: a hard drop lost a
+    /// real sibling-project answer); they must rank after every in-family row
+    /// (`sink_out_of_family_under_explicit_scope` + the 0.3x cross-project
+    /// multiplier). Live 2026-09-22 defect (project SampleApp): an
+    /// unknown-project memory and an acmecorp story both out-ranked in-family
+    /// results. A bare project tag that matches the scope still keeps the row
+    /// in the family.
+    #[tokio::test]
+    async fn explicit_project_scope_sinks_out_of_family_and_unknown_reflections() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        // Out-of-family story: tagged to a different project, cosine 1.0.
+        storage
+            .insert_reflection(
+                "story-out-of-family",
+                "MEMORY-ARCHIVE acmecorp campaign story",
+                &["session_story".into(), "project_acmecorp".into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("story-out-of-family".into(), query.to_vec());
+
+        // Unknown-project explicit memory: no project tag at all, cosine 1.0.
+        storage
+            .insert_reflection(
+                "memory-unknown-project",
+                "MEMORY-ARCHIVE some note with no project tag",
+                &["free-form".into(), EXPLICIT_MEMORY_TAG.into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("memory-unknown-project".into(), query.to_vec());
+
+        // In-family explicit memory via a bare project tag, cosine 1.0.
+        storage
+            .insert_reflection(
+                "memory-in-family",
+                "MEMORY-ARCHIVE SampleApp roster note",
+                &["SampleApp".into(), EXPLICIT_MEMORY_TAG.into()],
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection("memory-in-family".into(), query.to_vec());
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "roster memory",
+            10,
+            0.0,
+            Some("SampleApp"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            out.contains("<cid>memory-in-family</cid>"),
+            "an in-family bare-tag memory must stay on the page:\n{out}"
+        );
+        let pos = |cid: &str| {
+            out.find(&format!("<cid>{cid}</cid>"))
+                .unwrap_or_else(|| panic!("{cid} must be present (sunk, not dropped):\n{out}"))
+        };
+        let in_family = pos("memory-in-family");
+        assert!(
+            pos("story-out-of-family") > in_family,
+            "an out-of-family story must rank after every in-family row:\n{out}"
+        );
+        assert!(
+            pos("memory-unknown-project") > in_family,
+            "an unknown-project memory must rank after every in-family row:\n{out}"
+        );
+    }
+
+    /// Opus review finding 1 (W3-K, high): a memory-file reflection carries a
+    /// `project_*` tag that does NOT itself resolve to the scope's family
+    /// (`project_meta_campaigns_setup` vs scope `acmecorp-meta-campaigns`)
+    /// alongside the bare family tag every `MEMORY-ARCHIVE` writer also
+    /// stamps (`acmecorp-meta-campaigns`). `reflection_in_family` must
+    /// accept the row on ANY tag clearing `scope.is_family`, not just the
+    /// first `project_*` tag found — before this fix it read only that first
+    /// tag, resolved to `meta_campaigns_setup`, failed `is_family`, and
+    /// dropped the row outright even though it plainly belongs to the
+    /// family. Live receipt: `11110006`/`5eb5aebb`/`11110001` all carry this
+    /// exact tag shape and vanished from `project=acmecorp-meta-campaigns`
+    /// scoped search.
+    #[tokio::test]
+    async fn family_bare_tag_keeps_memory_file_reflection_in_scope() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(4);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let id = "11110006-0000-4000-8000-000000000000";
+        let tags = vec![
+            "project_meta_campaigns_setup".to_string(),
+            "acmecorp-meta-campaigns".to_string(),
+            EXPLICIT_MEMORY_TAG.to_string(),
+        ];
+        storage
+            .insert_reflection(
+                id,
+                "MEMORY-ARCHIVE acmecorp-meta-campaigns paying customers may22",
+                &tags,
+                &query,
+            )
+            .unwrap();
+        engine.insert_reflection(id.to_string(), query.to_vec());
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "paying customers memory",
+            5,
+            0.0,
+            Some("acmecorp-meta-campaigns"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Vector,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.contains(&format!("<cid>{id}</cid>")),
+            "a memory-file reflection with a family bare tag must stay in scope even when its \
+             project_* tag alone would not resolve to the family:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_channel_reaches_reflections_in_hybrid_mode() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+        let chunk = crate::import::ConversationChunk {
+            id: "semantic-only".into(),
+            conversation_id: "conv-s".into(),
+            project_name: "test".into(),
+            timestamp: "2026-09-20T00:00:00Z".into(),
+            content: "unrelated words entirely".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &query).unwrap();
+        engine.insert_chunk(chunk.id.clone(), query.to_vec());
+        // Memory whose vector is orthogonal to the query: only the keyword
+        // channel can reach it.
+        let memory_id = "memory-keyword-only";
+        let orthogonal = vec![0.0_f32, 0.0, 0.0, 1.0];
+        storage
+            .insert_reflection(
+                memory_id,
+                "MEMORY-ARCHIVE follower growth archived",
+                &[EXPLICIT_MEMORY_TAG.to_string()],
+                &orthogonal,
+            )
+            .unwrap();
+        engine.insert_reflection(memory_id.to_string(), orthogonal);
+        let search = Arc::new(RwLock::new(engine));
+        let run = |mode: SearchMode| {
+            let storage = Arc::clone(&storage);
+            let search = Arc::clone(&search);
+            async move {
+                reflect_on_past_with_vec_mode(
+                    &storage,
+                    &search,
+                    &query,
+                    "MEMORY-ARCHIVE follower growth",
+                    5,
+                    0.1,
+                    Some("all"),
+                    0,
+                    false,
+                    ConsumptionMode::Off,
+                    false,
+                    "other",
+                    mode,
+                    RecallRerankMode::Baseline,
+                    false,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let hybrid = run(SearchMode::Hybrid).await;
+        assert!(
+            hybrid.contains("<cid>memory-keyword-only</cid>"),
+            "{hybrid}"
+        );
+        assert!(
+            hybrid.contains("[keyword] [reflection] MEMORY-ARCHIVE"),
+            "keyword-only reflections must carry the keyword marker:\n{hybrid}"
+        );
+        let vector = run(SearchMode::Vector).await;
+        assert!(
+            !vector.contains("<cid>memory-keyword-only</cid>"),
+            "{vector}"
+        );
+    }
+
+    /// Spec (e): an exact-prefix reflection must reach page 1 of the keyword
+    /// channel even when a common term in the query also appears in many
+    /// chunks. Live 2026-09-22: `reflections_fts` itself ranked 3
+    /// `MEMORY-ARCHIVE acmecorp-meta-campaigns` memories at bm25 8/9/10 of
+    /// 267 matches (the OR-of-terms query rewards any row mentioning
+    /// "acmecorp"), and the combined chunk+reflection bm25 merge buried them
+    /// under chunk hits entirely — none of the 3 made the final page.
+    #[tokio::test]
+    async fn exact_prefix_reflection_reaches_page_one_over_many_keyword_matching_chunks() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(256);
+        let query_vec = [1.0_f32, 0.0, 0.0, 0.0];
+        // Chunks sit at cosine 0.4 — weakly relevant, but above min_score, so
+        // they count on both the semantic and keyword channels (the real
+        // shape: generic background chatter that happens to mention the
+        // query terms). The memories are cosine 0.0 (excluded from the
+        // semantic channel entirely by `min_score`) — only the keyword
+        // channel, via the exact-prefix match, can reach them.
+        let chunk_vector = vec![0.4_f32, (1.0_f32 - 0.4 * 0.4).sqrt(), 0.0, 0.0];
+        let orthogonal = vec![0.0_f32, 1.0, 0.0, 0.0];
+        let min_score = 0.3_f32;
+
+        // 200 chunks that all match the OR-of-terms query (mention "x-y-z").
+        for i in 0..200 {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("chunk-{i}"),
+                conversation_id: format!("conv-chunk-{i}"),
+                project_name: "test".into(),
+                timestamp: "2026-09-20T00:00:00Z".into(),
+                content: format!("background note about project-x-y-z number {i}"),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &chunk_vector).unwrap();
+            engine.insert_chunk(chunk.id, chunk_vector.clone());
+        }
+
+        // 3 memories whose content starts with the query text verbatim.
+        let mut memory_ids = Vec::new();
+        for i in 0..3 {
+            let id = format!("memory-prefix-{i}");
+            storage
+                .insert_reflection(
+                    &id,
+                    &format!("MEMORY-ARCHIVE project-x-y-z memory number {i}"),
+                    &[EXPLICIT_MEMORY_TAG.to_string()],
+                    &orthogonal,
+                )
+                .unwrap();
+            engine.insert_reflection(id.clone(), orthogonal.clone());
+            memory_ids.push(id);
+        }
+
+        let search = Arc::new(RwLock::new(engine));
+        let out = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query_vec,
+            "MEMORY-ARCHIVE project-x-y-z",
+            5,
+            min_score,
+            Some("all"),
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Baseline,
+            false,
+        )
+        .await
+        .unwrap();
+
+        for id in &memory_ids {
+            assert!(
+                out.contains(&format!("<cid>{id}</cid>")),
+                "exact-prefix memory {id} must reach page 1 over 200 OR-matching chunks:\n{out}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3564,11 +5474,13 @@ mod tests {
         }
         let search = Arc::new(RwLock::new(engine));
         let without_current =
-            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some(&projects)).unwrap();
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, None, Some(&projects))
+                .unwrap();
         let with_current = SearchProjectScope::resolve_with(
             &storage,
             Some("all"),
             resolved_current.as_deref(),
+            None,
             Some(&projects),
         )
         .unwrap();
@@ -3623,6 +5535,269 @@ mod tests {
         assert!(
             boosted.find("alias-result").unwrap() < boosted.find("other-result").unwrap(),
             "boosted all-scope order:\n{boosted}"
+        );
+    }
+
+    // W3-S: default scope (project omitted) falls back to `CLAUDE_PROJECT_DIR`
+    // via `default_scope_project`, not just `MCP_CLIENT_CWD` (`current_project`).
+    // These exercise `SearchProjectScope::resolve_with` directly with injected
+    // values — no env var manipulation, so no race with other lib tests.
+
+    #[test]
+    fn default_scope_project_resolves_to_the_client_dirs_family_when_project_omitted() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope = SearchProjectScope::resolve_with(&storage, None, None, Some("SampleApp"), None)
+            .unwrap();
+        assert_eq!(scope.effective_project.as_deref(), Some("SampleApp"));
+        assert_eq!(scope.scope_label, "SampleApp");
+        assert!(scope.family_projects.contains("SampleApp"));
+    }
+
+    #[test]
+    fn explicit_all_scope_ignores_default_scope_project() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope =
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some("SampleApp"), None)
+                .unwrap();
+        assert_eq!(scope.effective_project, None);
+        assert_eq!(scope.scope_label, "all");
+    }
+
+    /// W3-S finding 3 receipt: putting the `CLAUDE_PROJECT_DIR` fallback in
+    /// `default_scope_project` (used only when `project` is omitted) rather
+    /// than in `current_project` (used for the `project="all"` same-family
+    /// boost) means an explicit `project="all"` call resolves to the exact
+    /// same candidate set with or without a client directory present.
+    /// Threading the fallback through `current_project` instead would make
+    /// this diverge: `with_client_dir.family_projects` would gain the
+    /// `SampleApp` family and its ranking boost would newly apply, changing
+    /// output for every Claude Code session that ever calls `project="all"`.
+    #[test]
+    fn explicit_all_scope_is_identical_with_and_without_a_client_dir() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let projects_root = tempfile::tempdir().unwrap();
+        let without_client_dir = SearchProjectScope::resolve_with(
+            &storage,
+            Some("all"),
+            None,
+            None,
+            Some(projects_root.path()),
+        )
+        .unwrap();
+        let with_client_dir = SearchProjectScope::resolve_with(
+            &storage,
+            Some("all"),
+            None,
+            Some("SampleApp"),
+            Some(projects_root.path()),
+        )
+        .unwrap();
+        assert_eq!(
+            without_client_dir.effective_project,
+            with_client_dir.effective_project
+        );
+        assert_eq!(without_client_dir.scope_label, with_client_dir.scope_label);
+        assert_eq!(
+            without_client_dir.current_project_for_all_scope,
+            with_client_dir.current_project_for_all_scope
+        );
+        assert_eq!(
+            without_client_dir.family_projects,
+            with_client_dir.family_projects
+        );
+        assert!(
+            !with_client_dir.family_projects.contains("SampleApp"),
+            "the default-scope-only fallback must not leak into project=\"all\": {:?}",
+            with_client_dir.family_projects
+        );
+    }
+
+    #[test]
+    fn no_default_scope_project_and_no_explicit_project_is_all() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let scope = SearchProjectScope::resolve_with(&storage, None, None, None, None).unwrap();
+        assert_eq!(scope.effective_project, None);
+        assert_eq!(scope.scope_label, "all");
+    }
+
+    /// W3-S finding 1 receipt: `CLAUDE_PROJECT_DIR=/private/tmp/csr-s1-proof`
+    /// (no `projects` path component) is imported by Claude Code as
+    /// `-private-tmp-csr-s1-proof` — its own dash-encoding of the full path —
+    /// not the last-path-component heuristic `resolve_project_from_cwd`
+    /// alone would give (`csr-s1-proof`). `resolve_search_scope_with` is the
+    /// single function both `reflect_on_past_with_vec_mode` and
+    /// `get_more_results_with_vec_active` call to resolve an omitted
+    /// project; this pins that it resolves to the *stored* name, not the
+    /// unverified heuristic one.
+    #[test]
+    fn resolve_search_scope_matches_the_importers_encoding_outside_projects_root() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let stored_project = "-private-tmp-csr-s1-proof";
+        let chunk = crate::import::ConversationChunk {
+            id: "seed".into(),
+            conversation_id: "conv-seed".into(),
+            project_name: stored_project.into(),
+            timestamp: "2026-09-18T00:00:00Z".into(),
+            content: "seed row so list_project_names knows this project".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage
+            .insert_chunk(&chunk, &[1.0f32, 0.0, 0.0, 0.0])
+            .unwrap();
+
+        let scope = resolve_search_scope_with(
+            &storage,
+            None,
+            None,
+            Some("/private/tmp/csr-s1-proof"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(scope.effective_project.as_deref(), Some(stored_project));
+        assert_eq!(scope.scope_label, stored_project);
+    }
+
+    /// Same receipt end to end through `reflect_on_past_with_vec_in_scope`:
+    /// a chunk stored under the importer-encoded project name is returned
+    /// when `project` is omitted and the client dir sits outside
+    /// `~/projects`. Before W3-S finding 1's fix, `default_scope_project`
+    /// resolved to `csr-s1-proof` (matches nothing) and this search returned
+    /// zero results.
+    #[tokio::test]
+    async fn defaulted_scope_outside_projects_root_returns_the_stored_project_chunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let stored_project = "-private-tmp-csr-s1-proof";
+        let chunk = crate::import::ConversationChunk {
+            id: "chunk-outside-projects-root".into(),
+            conversation_id: "conv-1".into(),
+            project_name: stored_project.into(),
+            timestamp: "2026-09-18T00:00:00Z".into(),
+            content: "rename the function foo to bar in a Python file".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let vector = vec![1.0f32, 0.0, 0.0, 0.0];
+        storage.insert_chunk(&chunk, &vector).unwrap();
+        let mut engine = SearchEngine::new(vector.len());
+        engine.insert_chunk(chunk.id.clone(), vector.clone());
+        let search = Arc::new(RwLock::new(engine));
+
+        let scope = resolve_search_scope_with(
+            &storage,
+            None,
+            None,
+            Some("/private/tmp/csr-s1-proof"),
+            None,
+        )
+        .unwrap();
+
+        let output = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &vector,
+            "rename the function foo to bar in a Python file",
+            8,
+            0.1,
+            &scope,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.contains("chunk-outside-projects-root"),
+            "expected the stored-project chunk in defaulted-scope output:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn defaulted_scope_excludes_a_higher_ranked_out_of_family_chunk() {
+        // The spec's receipt: with `project` omitted and `CLAUDE_PROJECT_DIR`
+        // resolving to `SampleApp`, an SampleApp-family chunk is returned and
+        // a higher-scoring out-of-family chunk is not — even though an
+        // unscoped ("all") search would put the out-of-family chunk first.
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mk = |id: &str, project: &str, content: &str| crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: project.into(),
+            timestamp: "2099-01-01T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        let rows = [
+            (
+                mk(
+                    "chunk-in-family",
+                    "SampleApp",
+                    "codex blocked revival deploy blocker",
+                ),
+                vec![0.80f32, 0.6, 0.0, 0.0],
+            ),
+            (
+                mk(
+                    "chunk-out-of-family",
+                    "some-other-project",
+                    "codex blocked revival deploy blocker, ranked higher",
+                ),
+                vec![1.0f32, 0.0, 0.0, 0.0],
+            ),
+        ];
+        let mut engine = SearchEngine::new(8);
+        for (chunk, vector) in &rows {
+            storage.insert_chunk(chunk, vector).unwrap();
+            engine.insert_chunk(chunk.id.clone(), vector.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+        // Explicit tempdir root so family resolution never touches this
+        // machine's real `$HOME/projects` layout.
+        let projects_root = tempfile::tempdir().unwrap();
+        let scope = SearchProjectScope::resolve_with(
+            &storage,
+            None,
+            None,
+            Some("SampleApp"),
+            Some(projects_root.path()),
+        )
+        .unwrap();
+        let query = [1.0f32, 0.0, 0.0, 0.0];
+
+        let output = reflect_on_past_with_vec_in_scope(
+            &storage,
+            &search,
+            &query,
+            "codex blocked revival deploy blocker",
+            8,
+            0.1,
+            &scope,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            output.contains("chunk-in-family") || output.contains("SampleApp"),
+            "expected the in-family chunk in defaulted-scope output:\n{output}"
+        );
+        assert!(
+            !output.contains("chunk-out-of-family") && !output.contains("ranked higher"),
+            "out-of-family chunk leaked into defaulted-scope output:\n{output}"
         );
     }
 
@@ -6379,7 +8554,7 @@ mod tests {
         }
         let search = Arc::new(RwLock::new(engine));
         let scope =
-            SearchProjectScope::resolve_with(&storage, Some("all"), Some("alpha-proj"), None)
+            SearchProjectScope::resolve_with(&storage, Some("all"), Some("alpha-proj"), None, None)
                 .unwrap();
         let q = [1.0f32, 0.0, 0.0, 0.0];
 
@@ -6890,6 +9065,192 @@ mod tests {
         assert!(
             rendered.contains("graph walks=1 accepted=1 surfaced=1"),
             "walked, accepted, and surfaced must be separate rendered counters:\n{rendered}"
+        );
+    }
+
+    /// W3-S finding 2: `csr_search_insights` used to filter on an exact
+    /// project-label match (`get_chunk_ids_for_project`), unlike
+    /// `csr_reflect_on_past`/`csr_quick_check` which widen to the project
+    /// family. A session under `claude-self-reflect` would silently lose its
+    /// `claude-self-reflect-csr-engine` chunks here while keeping them in
+    /// `csr_reflect_on_past`. Tempdir projects root (only the base project
+    /// dir present) keeps alias resolution off this machine's real `$HOME`.
+    /// Revert `family_chunk_ids_at_root` back to an exact-match id set and
+    /// this fails: `total_matches` drops from 2 to 1.
+    #[tokio::test]
+    async fn search_insights_widens_to_the_project_family() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "codex blocked revival deploy blocker";
+        let query_vec = embeddings.embed_single(query).unwrap();
+
+        let projects_root = tempfile::tempdir().unwrap();
+        let base_project = "acme-base";
+        let alias_project = "acme-base-csr-engine";
+        std::fs::create_dir_all(projects_root.path().join(base_project)).unwrap();
+        // alias_project's directory is deliberately absent: that's what makes
+        // it an alias rather than a genuine sibling repo.
+
+        let rows = [
+            ("base-chunk", base_project),
+            ("alias-chunk", alias_project),
+            ("unrelated-chunk", "unrelated-project"),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (id, project) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: project.into(),
+                timestamp: "2026-08-01T00:00:00Z".into(),
+                content: "codex blocked revival deploy blocker".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &query_vec).unwrap();
+            engine.insert_chunk(chunk.id, query_vec.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let xml = search_insights_at_root(
+            &storage,
+            &embeddings,
+            &search,
+            query,
+            Some(base_project),
+            Some(projects_root.path()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            xml.contains("<total_matches>2</total_matches>"),
+            "expected the base project plus its alias, not the unrelated project:\n{xml}"
+        );
+    }
+
+    /// Same finding as `search_insights_widens_to_the_project_family`, for
+    /// `csr_search_by_concept`.
+    #[tokio::test]
+    async fn search_by_concept_widens_to_the_project_family() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let query = "codex blocked revival deploy blocker";
+        let query_vec = embeddings.embed_single(query).unwrap();
+
+        let projects_root = tempfile::tempdir().unwrap();
+        let base_project = "acme-base";
+        let alias_project = "acme-base-csr-engine";
+        std::fs::create_dir_all(projects_root.path().join(base_project)).unwrap();
+
+        let rows = [
+            ("base-chunk", base_project),
+            ("alias-chunk", alias_project),
+            ("unrelated-chunk", "unrelated-project"),
+        ];
+        let mut engine = SearchEngine::new(query_vec.len());
+        for (id, project) in rows {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: project.into(),
+                timestamp: "2026-08-01T00:00:00Z".into(),
+                content: "codex blocked revival deploy blocker".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &query_vec).unwrap();
+            engine.insert_chunk(chunk.id, query_vec.clone());
+        }
+        let search = Arc::new(RwLock::new(engine));
+
+        let xml = search_by_concept_at_root(
+            &storage,
+            &embeddings,
+            &search,
+            query,
+            10,
+            Some(base_project),
+            Some(projects_root.path()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            xml.contains("alias-chunk"),
+            "family alias chunk missing from search_by_concept output:\n{xml}"
+        );
+        assert!(
+            !xml.contains("unrelated-chunk"),
+            "unrelated-project chunk leaked into search_by_concept output:\n{xml}"
+        );
+    }
+
+    /// W3-S finding 2: the code-graph ledger (`code_nodes`/`code_evolution`)
+    /// filters by an EXACT `project` match with no family-alias widening.
+    /// Before `project` defaulting existed, an omitted project meant `""`
+    /// (fully unscoped) — every project's nodes were visible. If an omitted
+    /// project were instead defaulted to a specific project name the way the
+    /// chunk-search tools now default (`resolve_search_scope`), this ledger
+    /// would silently narrow to just that literal name and drop every node
+    /// filed under a family alias. `search_by_file` deliberately does not
+    /// default an omitted/`"all"` project at all — it stays `""` — so this
+    /// pins that invariant: a node filed under an entirely different project
+    /// than any plausible default is still visible when `project` is
+    /// omitted.
+    #[tokio::test]
+    async fn search_by_file_omitted_project_is_not_narrowed_to_a_default_scope() {
+        use crate::storage::codegraph::NodeRow;
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        // Neither "claude-self-reflect" nor any of its aliases: stands in
+        // for "whatever project a CLAUDE_PROJECT_DIR default-scope
+        // resolution would have produced, which must not gate this ledger".
+        let stored_project = "claude-self-reflect-csr-engine";
+        storage
+            .upsert_code_node(&NodeRow {
+                id: "node-correlate-fts-hit".into(),
+                project: stored_project.into(),
+                file: "src/import/plans.rs".into(),
+                kind: "function".into(),
+                name: "correlate_fts_hit".into(),
+                ..NodeRow::default()
+            })
+            .unwrap();
+
+        let xml = search_by_file(&storage, "src/import/plans.rs", 10, None)
+            .await
+            .unwrap();
+        assert!(
+            xml.contains("correlate_fts_hit"),
+            "omitted project must not be narrowed to a default scope that \
+             can never match a family alias's exact project name:\n{xml}"
+        );
+
+        // "all" must behave identically to omitted.
+        let xml_all = search_by_file(&storage, "src/import/plans.rs", 10, Some("all"))
+            .await
+            .unwrap();
+        assert!(xml_all.contains("correlate_fts_hit"), "{xml_all}");
+
+        // An explicit, unrelated project still narrows exactly, unaffected.
+        let xml_explicit = search_by_file(
+            &storage,
+            "src/import/plans.rs",
+            10,
+            Some("some-other-project"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !xml_explicit.contains("correlate_fts_hit"),
+            "an explicit, non-matching project must still narrow the ledger:\n{xml_explicit}"
         );
     }
 

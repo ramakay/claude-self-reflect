@@ -32,6 +32,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
+
+use super::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use sha2::{Digest, Sha256};
 
 /// Which channel qualified a [`DreamItem`] — see the module doc's two-channel
@@ -359,18 +361,26 @@ pub(crate) struct VerdictGroupRow {
 /// to `(file, symbol, verdict, receipt_oid, MAX(created_at))` for one
 /// project — the shared evidence base channels A and B (and the anchor tree)
 /// match against.
+///
+/// Current state only: each witness contributes just its LATEST live event
+/// (same predicate as `dream_delivery::receipted_conclusions`), so a witness
+/// reinstated after an `anchor_obsolete` / `superseded_by` no longer feeds
+/// the journal clusters or the unread badge with its retracted verdict.
 pub(crate) fn verdict_rows_for_project(
     conn: &Connection,
     project: &str,
 ) -> Result<Vec<VerdictGroupRow>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT l.file, l.symbol, v.verdict, v.receipt_oid, MAX(v.created_at) AS witnessed_at
          FROM witness_verdicts v
          JOIN witness_ledger l ON l.id = v.witness_id
          WHERE l.project = ?1
+           AND v.id > {LIVE_EVENT_FLOOR_SQL}
+           AND v.id = (SELECT MAX(v2.id) FROM witness_verdicts v2
+                       WHERE v2.witness_id = v.witness_id)
          GROUP BY l.file, l.symbol, v.verdict, v.receipt_oid
-         ORDER BY witnessed_at DESC",
-    )?;
+         ORDER BY witnessed_at DESC"
+    ))?;
     let rows = stmt
         .query_map(params![project], |row| {
             Ok(VerdictGroupRow {
@@ -799,6 +809,108 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verdict_rows_ignore_events_at_or_below_the_floor() {
+        let conn = open();
+        insert_witness_with_verdict(
+            &conn,
+            "proj",
+            "/repo/src/a.rs",
+            Some("old_fn"),
+            "aaa",
+            "b3:1",
+            VerdictKind::SupersededBy,
+            "aaa",
+        );
+        assert_eq!(verdict_rows_for_project(&conn, "proj").unwrap().len(), 1);
+        conn.execute(
+            "INSERT INTO meta(key, value)
+             VALUES ('witness_verdicts_v2_floor',
+                     (SELECT CAST(MAX(id) AS TEXT) FROM witness_verdicts))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+        assert!(verdict_rows_for_project(&conn, "proj").unwrap().is_empty());
+        insert_witness_with_verdict(
+            &conn,
+            "proj",
+            "/repo/src/b.rs",
+            Some("new_fn"),
+            "bbb",
+            "b3:2",
+            VerdictKind::AnchorObsolete,
+            "bbb",
+        );
+        let rows = verdict_rows_for_project(&conn, "proj").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol.as_deref(), Some("new_fn"));
+    }
+
+    #[test]
+    fn verdict_rows_show_only_each_witnesss_latest_event() {
+        let conn = open();
+        insert_witness_with_verdict(
+            &conn,
+            "proj",
+            "/repo/src/a.rs",
+            Some("flip_fn"),
+            "aaa",
+            "b3:1",
+            VerdictKind::AnchorObsolete,
+            "aaa",
+        );
+        insert_witness_with_verdict(
+            &conn,
+            "proj",
+            "/repo/src/b.rs",
+            Some("gone_fn"),
+            "bbb",
+            "b3:2",
+            VerdictKind::AnchorObsolete,
+            "bbb",
+        );
+        let before = verdict_rows_for_project(&conn, "proj").unwrap();
+        assert_eq!(before.len(), 2, "both negative verdicts are current");
+
+        // flip_fn's witness is reinstated: its obsolete event is history.
+        let flip_witness: i64 = conn
+            .query_row(
+                "SELECT id FROM witness_ledger WHERE stamp = 'b3:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(witness_verdicts::insert_verdict_if_changed(
+            &conn,
+            &WitnessVerdictRow {
+                witness_id: flip_witness,
+                verdict: VerdictKind::AnchorReinstated,
+                successor_witness_id: None,
+                receipt_oid: Some("ccc".into()),
+                observed_head_oid: "ddd".into(),
+            },
+        )
+        .unwrap());
+
+        let after = verdict_rows_for_project(&conn, "proj").unwrap();
+        assert!(
+            !after
+                .iter()
+                .any(|r| r.symbol.as_deref() == Some("flip_fn") && r.verdict == "anchor_obsolete"),
+            "a reinstated witness must not surface its earlier negative verdict: {after:?}"
+        );
+        let flip: Vec<_> = after
+            .iter()
+            .filter(|r| r.symbol.as_deref() == Some("flip_fn"))
+            .collect();
+        assert_eq!(flip.len(), 1);
+        assert_eq!(flip[0].verdict, "anchor_reinstated");
+        assert!(after
+            .iter()
+            .any(|r| r.symbol.as_deref() == Some("gone_fn") && r.verdict == "anchor_obsolete"));
     }
 
     // ---- channel A: exact-token qualification ------------------------------
