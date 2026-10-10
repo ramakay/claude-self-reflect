@@ -569,8 +569,15 @@ async fn handle_inner(
     .await;
 
     // 3. Search reflections (stored insights) — scoped to current project
-    let reflection_results =
-        search_reflections_with_vec(engine, &query_vec, 10, 0.45, &current_project).await;
+    let reflection_results = search_reflections_with_vec(
+        engine,
+        &query_vec,
+        10,
+        0.45,
+        &current_project,
+        input.session_id.as_deref(),
+    )
+    .await;
 
     // 4. Combine and score results (with continuity boost for recent session)
     let current_files: Vec<String> = extract_file_paths_from_prompt(prompt);
@@ -1183,7 +1190,9 @@ async fn correlate_episode(
         let Some(conv_id) = tags.iter().find_map(|t| t.strip_prefix("conv_")) else {
             continue;
         };
-        if Some(conv_id) == current_session || !seen_convs.insert(conv_id.to_string()) {
+        if is_own_conversation(engine.storage(), conv_id, current_session)
+            || !seen_convs.insert(conv_id.to_string())
+        {
             continue;
         }
         let Some((ep, ts)) = episode_for_conversation(engine, conv_id) else {
@@ -1291,6 +1300,29 @@ fn is_self_echo(chunk: &crate::import::ConversationChunk, current_session: Optio
     HARNESS_BLOCK_OPENINGS
         .iter()
         .any(|block| opening.starts_with(block))
+}
+
+/// Whether the conversation `conversation_id` is the asking session itself or
+/// one of its own subagents (an `agent-` id whose recorded parent is the
+/// session). Handing a session its own words, or its subagents', back as memory
+/// is an echo, whichever retrieval path (raw chunk, derived reflection or
+/// context cache) carried them.
+fn is_own_conversation(
+    storage: &crate::storage::Storage,
+    conversation_id: &str,
+    current_session: Option<&str>,
+) -> bool {
+    let Some(session) = current_session else {
+        return false;
+    };
+    conversation_id == session
+        || (conversation_id.starts_with("agent-")
+            && storage
+                .parent_session_of_conversation(conversation_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(session))
 }
 
 /// A chunk one of this session's own subagents wrote: filed under the subagent's `agent-` id, with the
@@ -1470,13 +1502,16 @@ async fn search_chunks_with_vec_core(
 
 /// Search reflections using a pre-computed embedding vector (P-1 optimization).
 /// Scoped to `project` — reflections tagged for other projects are filtered out.
-/// Legacy reflections without project tags are allowed through.
+/// Legacy reflections without project tags are allowed through. A reflection
+/// derived from the asking session, or from one of its own subagents (its
+/// `conv_<id>` tag), is dropped like the raw chunks it was made from.
 async fn search_reflections_with_vec(
     engine: &Engine,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
     project: &str,
+    current_session: Option<&str>,
 ) -> Vec<RawResult> {
     let search = engine.search();
     let storage = engine.storage();
@@ -1497,6 +1532,14 @@ async fn search_reflections_with_vec(
                 if has_project_tags && !tags.contains(&project_tag) {
                     continue;
                 }
+            }
+
+            if tags
+                .iter()
+                .filter_map(|t| t.strip_prefix("conv_"))
+                .any(|conv| is_own_conversation(storage, conv, current_session))
+            {
+                continue;
             }
 
             // Episode reflections are structured JSON surfaced via the Tier-0
@@ -2015,6 +2058,99 @@ mod tests {
             "looked up"
         )));
         assert!(!is_own_subagent(&ours, None, || panic!("looked up")));
+    }
+
+    #[tokio::test]
+    async fn reflections_derived_from_this_sessions_own_subagents_are_never_handed_back() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        // A subagent's chunk records the session that ran it as its parent.
+        for (conv, parent) in [("agent-ours", "sess-1"), ("agent-theirs", "sess-2")] {
+            let chunk = crate::import::ConversationChunk {
+                id: format!("chunk-{conv}"),
+                conversation_id: conv.into(),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: "subagent words".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::Assistant,
+                seq: 0,
+                is_sidechain: true,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::Assistant,
+                        source_conv_id: parent.into(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+        }
+        for (id, conv) in [
+            ("refl-own-child", "agent-ours"),
+            ("refl-own-session", "sess-1"),
+            ("refl-other-child", "agent-theirs"),
+            ("refl-other-session", "sess-9"),
+        ] {
+            storage
+                .insert_reflection(
+                    id,
+                    &format!("derived from {conv}"),
+                    &[
+                        "narrative_extracted_v3".into(),
+                        format!("conv_{conv}"),
+                        "project_project".into(),
+                    ],
+                    &[1.0, 0.0],
+                )
+                .unwrap();
+            search.insert_reflection(id.into(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+
+        let ids = |results: Vec<RawResult>| {
+            let mut ids: Vec<String> = results.into_iter().filter_map(|r| r.memory_id).collect();
+            ids.sort();
+            ids
+        };
+        let mine = ids(search_reflections_with_vec(
+            &engine,
+            &[1.0, 0.0],
+            10,
+            0.0,
+            "project",
+            Some("sess-1"),
+        )
+        .await);
+        assert_eq!(mine, ["refl-other-child", "refl-other-session"]);
+        // another session sees its own subagent's words as memory, and ours too
+        let other = ids(search_reflections_with_vec(
+            &engine,
+            &[1.0, 0.0],
+            10,
+            0.0,
+            "project",
+            Some("sess-2"),
+        )
+        .await);
+        assert_eq!(
+            other,
+            ["refl-other-session", "refl-own-child", "refl-own-session"]
+        );
+        // no session known: nothing is excluded
+        let anon =
+            ids(search_reflections_with_vec(&engine, &[1.0, 0.0], 10, 0.0, "project", None).await);
+        assert_eq!(anon.len(), 4);
     }
 
     #[test]

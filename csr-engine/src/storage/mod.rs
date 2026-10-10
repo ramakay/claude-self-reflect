@@ -300,6 +300,13 @@ impl Storage {
         queries::get_chunk_provenance(&conn, chunk_id)
     }
 
+    /// The session that ran conversation `conversation_id` (a subagent's
+    /// parent), if provenance records one.
+    pub fn parent_session_of_conversation(&self, conversation_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::parent_session_of_conversation(&conn, conversation_id)
+    }
+
     /// Upsert a derivation-ledger entry (Pillar 1).
     pub fn upsert_ledger_entry(&self, entry: &crate::ledger::LedgerEntry) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
