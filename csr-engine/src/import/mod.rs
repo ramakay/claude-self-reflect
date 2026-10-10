@@ -63,6 +63,13 @@ pub fn contamination_reason(text: &str) -> Option<&'static str> {
 /// Remove exact wrapper spans and paragraphs that are themselves CSR output.
 /// `None` means the content was pure contamination and should be dropped.
 pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
+    // The companion dreamer's message is machine-owned from its first word to
+    // its last: drop it whole BEFORE paragraph scrubbing, which would remove
+    // only the attribution paragraph and keep the question and the quoted
+    // reasoning as the person's own words.
+    if crate::extraction::provenance::is_dreamer_prompt(text) {
+        return None;
+    }
     let without_wrappers = CSR_SYSTEM_REMINDER_RE.replace_all(text, "");
     let clean = without_wrappers
         .split("\n\n")
@@ -2111,6 +2118,104 @@ mod tests {
         assert!(!content.contains("SIDECHAIN CSR RESULT SECRET"));
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
     }
+    /// The text `askClaude` (plugins/csr-companion/hooks/dreamer.ts) sends: the
+    /// question, a blank line, the attribution, a blank line, the quoted reasoning.
+    const DREAMER_MESSAGE: &str = "What if the pane took its colours from pigment's nyt inks?\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> **Share the palette**\n>\n> Two surfaces already read the same inks.";
+
+    #[test]
+    fn the_companion_dreamers_whole_message_never_becomes_user_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("convo.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-10-10T10:00:00Z",
+                "message": {"role": "user", "content": "please fix the flaky retry test in the importer"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-10T10:00:01Z",
+                "message": {"content": [{"type": "text", "text": "Looking at the retry test now."}]}
+            }),
+            // string content, as the pane types it
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-10-10T10:00:02Z",
+                "message": {"role": "user", "content": DREAMER_MESSAGE}
+            }),
+            // array content, the other shape Claude Code stores
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-10-10T10:00:03Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": DREAMER_MESSAGE}]}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-10-10T10:00:04Z",
+                "message": {"content": [{"type": "text", "text": "The retry test needed a bounded backoff."}]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-10-10T10:00:05Z",
+                "message": {"role": "user", "content": "good, now run the whole importer suite"}
+            }),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+        let everything = format!(
+            "{}\n{:?}",
+            parsed
+                .chunks
+                .iter()
+                .map(|chunk| chunk.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            parsed.evidence
+        );
+        for dreamer_word in [
+            "colours",
+            "pigment",
+            "dreamer",
+            "Share the palette",
+            "same inks",
+        ] {
+            assert!(
+                !everything.contains(dreamer_word),
+                "dreamer text `{dreamer_word}` survived import: {everything}"
+            );
+        }
+        // no event, user_message or otherwise, was minted for either dreamer message
+        let seqs: Vec<usize> = parsed
+            .evidence
+            .values()
+            .flat_map(|e| e.events.iter().map(|event| event.seq))
+            .collect();
+        assert_eq!(
+            seqs,
+            [0, 1, 4, 5],
+            "events for messages 2 and 3 exist: {seqs:?}"
+        );
+        // the person's own words, and the assistant's, are untouched
+        for kept in ["flaky retry test", "bounded backoff", "importer suite"] {
+            assert!(everything.contains(kept), "`{kept}` was lost: {everything}");
+        }
+    }
+
+    #[test]
+    fn prose_that_merely_mentions_the_dreamer_is_kept() {
+        let kept = "what if the dreamer asked fewer questions while I work?";
+        assert_eq!(scrub_contaminated_text(kept).as_deref(), Some(kept));
+    }
+
     use crate::provenance::Speaker;
 
     #[test]
