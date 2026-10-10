@@ -53,7 +53,9 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
 /// - SessionStart continuity blocks (session_start.rs)
 /// - UserPromptSubmit context blocks (injection/formatter.rs)
 /// - agent prompts (AGENT_PROMPT_SIGNATURES, included via EMISSION_HEADERS)
-const EMISSION_HEADERS: [&str; 14] = [
+/// - the csr-companion dreamer's "ask Claude" prompt (plugins/csr-companion/hooks/dreamer.ts
+///   `askClaude`): sent as a user turn, but the dreamer's words, not the person's
+const EMISSION_HEADERS: [&str; 15] = [
     "CSR ENDLESS MEMORY ACTIVE",
     "CSR CONTINUUM [",
     "CSR PICKUP —",
@@ -68,6 +70,7 @@ const EMISSION_HEADERS: [&str; 14] = [
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
+    "CSR's dreamer asked this while you worked",
 ];
 
 /// Field tokens CSR emits inside blocks (Tier-0 fields, continuity lines).
@@ -372,6 +375,17 @@ mod tests {
         assert!(is_csr_emission("## Session Intelligence (CSR v9.2)\n..."));
         assert!(is_csr_emission("## CSR Memory Feedback — 2026-06-10"));
         assert!(is_csr_emission("You are CSR Episode Analyst. Summarize..."));
+    }
+
+    #[test]
+    fn emission_detects_the_dreamers_prompt_sent_as_a_user_turn() {
+        // The dreamer's question leads; its marker sentence follows within the header window.
+        let sent = "What if the pane took its colours from pigment's nyt inks?\n\n\
+                    CSR's dreamer asked this while you worked. Its reasoning:\n\n> **Share the palette**";
+        assert!(is_csr_emission(sent));
+        assert!(!is_csr_emission(
+            "what if the dreamer asked fewer questions while I work?"
+        ));
     }
 
     #[test]
