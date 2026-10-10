@@ -383,6 +383,8 @@ FLOOR_ROWS = 5  # the status line's FLOOR_ROWS: the floor is the median of this 
 LAUNCH_AGENTS = os.path.join(HOME, 'Library', 'LaunchAgents')
 DAEMON_LOCK = os.path.join(HOME, '.claude-self-reflect', 'daemon.lock')
 SETTINGS = os.path.join(HOME, '.claude', 'settings.json')
+SESSIONS = os.path.join(HOME, '.claude', 'sessions')  # Claude Code: <pid>.json per live session
+_RECORD = {}  # session id -> the <pid>.json path last found for it
 
 
 def kept_status(session_id, now):
@@ -1140,6 +1142,44 @@ def remembered_items(con, recalls, questions, session_id):
 
 # ---------------------------------------------------------------- this session
 
+# ---------------------------------------------------------------- where a live session is
+
+def project_folder(cwd):
+    """Claude Code's folder for a working directory: every character not A-Z, a-z, 0-9 becomes '-'."""
+    return os.path.join(HOME, '.claude', 'projects', re.sub(r'[^A-Za-z0-9]', '-', cwd)) if cwd else None
+
+
+def read_record(path, session_id):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            kept = json.load(handle)
+        if kept.get('sessionId') != session_id or not kept.get('cwd'):
+            return None
+        return dict(cwd=str(kept['cwd']), started=float(kept['startedAt']) / 1000, busy=kept.get('status') == 'busy')
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def session_record(session_id, folder=None):
+    """dict(cwd, started, busy) from the <pid>.json Claude Code keeps for a live session (receipt: sessionId,
+    cwd, startedAt in ms, status busy or idle); None when none matches or it cannot be read. The path found
+    last time is tried first, then the folder is searched."""
+    folder = folder or SESSIONS
+    if not session_id:
+        return None
+    path = _RECORD.get(session_id)
+    found = path and os.path.dirname(path) == folder and read_record(path, session_id)
+    if found:
+        return found
+    for path in sorted(glob.glob(os.path.join(folder, '*.json'))):
+        found = read_record(path, session_id)
+        if found:
+            _RECORD[session_id] = path
+            return found
+    _RECORD.pop(session_id, None)
+    return None
+
+
 INTERRUPTED = re.compile(r'\[Request interrupted by user')  # Claude Code's own marker, not words a person typed
 
 
@@ -1150,10 +1190,13 @@ class Session:
         self.id = session_id
         found = [path] if path else glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
         self.path = found[0] if found else None
+        self.record = None  # Claude Code's <pid>.json for this session while it lives: cwd, started, busy
         self.main = []  # (time, context) of each main-chain reply
         self._main_id = None  # the message the last of them came from: a reply written in parts is one
         self.model = None
         self.told = None  # what CSR injected at the newest SessionStart, as the transcript kept it
+        self.previous = None  # the session before this one, as previous_facts: None until read, {} when none
+        self.looked = 0.0  # when the transcript was last searched for
         self.offset = 0
         self.replies = {}  # message id -> (time, context tokens, output tokens)
         self.prompts, self.compacts, self.asked, self.questions = [], [], [], []
@@ -1170,7 +1213,28 @@ class Session:
         self.turn_end = 0.0  # when Claude last finished a turn (stop_reason end_turn)
         self.carried = None  # the session before this one's threads, once read (see carried_threads)
 
+    def guess(self):
+        """Where the transcript of a live session will be, from its record: the folder for its working directory."""
+        return os.path.join(project_folder(self.record['cwd']), f'{self.id}.jsonl') if self.record else None
+
+    def locate(self):
+        """Find this session's transcript. Claude Code writes it at the first prompt, so a pane opened before
+        that finds none: the live session's record names the folder, and the file is taken the moment it exists.
+        Failing that, the folders are searched, at most once every ten seconds."""
+        if self.path:
+            return
+        record = session_record(self.id)
+        folder = record and project_folder(record['cwd'])
+        guess = folder and os.path.join(folder, f'{self.id}.jsonl')
+        if guess and os.path.exists(guess):
+            self.path = guess
+        elif time.time() - self.looked >= 10:
+            self.looked = time.time()
+            found = glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{self.id}.jsonl'))
+            self.path = found[0] if found else None
+
     def read_transcript(self):
+        self.locate()
         if not self.path:
             return
         try:
@@ -1273,7 +1337,8 @@ class Session:
 
     def load(self):
         self.read_transcript()
-        if self.carried is None and self.path:  # once: the session before this one is done being written
+        self.record = session_record(self.id) or self.record
+        if self.carried is None and (self.path or self.record):  # once: the session before this one is done being written
             self.carried = []
             threading.Thread(target=carry_into, args=(self,), daemon=True).start()
         con = connect()
@@ -1305,10 +1370,12 @@ class Session:
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
                     compacts=sorted(self.compacts), compact_sizes=self.compact_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
                     lost=lost_found(self.summaries, self.typed, self.carried or (),
-                                    project_of(self.path)),
+                                    project_of(self.path or self.guess())),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last),
                     main=list(self.main), turn_end=self.turn_end, model=self.model, told=self.told,
+                    last_session=self.previous, todos=(self.previous or {}).get('todos') or [],
+                    busy=bool(self.record and self.record['busy']), cwd=(self.record or {}).get('cwd'),
                     transcript=bool(self.path))
 
 
@@ -1408,6 +1475,9 @@ SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆', story='§')  # where no pictures are drawn
 SECTION['coach'], GLYPH['coach'] = 'ctx', '→'  # How Claude read you
+SECTION['told'], GLYPH['told'] = 'recall', '↑'  # what CSR told Claude at the start
+SECTION['last'], GLYPH['last'] = 'ctx', '§'  # the session before this one
+SECTION['todos'], GLYPH['todos'] = 'sepia', '◆'  # its leftover todos
 DARK = (PIGMENT['payne'], PIGMENT['payne'])  # the masthead's ground: one flat payne, clear of a dark terminal's
 # own ground (herdr's is 40), so the masthead keeps its edge. dark_steps still blends the pair, for the pages
 # whose title rows step down.
@@ -1502,6 +1572,95 @@ def session_png(s, cols, cell, now, grounds=None):
     return shrink(image)
 
 
+_LAST_PNG = {}  # (id, mtime, size of the series, cols, rows, cell, ground) -> PNG bytes or None; the newest 8
+
+
+def last_png(facts, cols, rows, cell, ground):
+    """The last session in one figure, on `ground` (its row's tint): the context of every main-chain reply over
+    active time (Clock), broken at each compaction, as an INK['ctx'] hairline over a faint INK['ctx'] wash; a
+    dashed INK['quiet'] rule at the floor (or FLOOR_GUESS) drawn over the wash; an INK['faint'] hairline at each
+    compaction from its pre size down to the foot; one INK['you'] tick per prompt under the foot; an INK['turn']
+    dot at the peak. No text. None without Pillow, with fewer than 2 points, or on any exception."""
+    if not HAS_PIL:
+        return None
+    try:
+        series = facts.get('series') or []
+        key = (facts.get('id'), facts.get('mtime'), len(series), tuple(series[0]) if series else None,
+               tuple(series[-1]) if series else None, cols, rows, tuple(cell), tuple(ground))
+        if key not in _LAST_PNG:
+            try:
+                _LAST_PNG[key] = draw_last(facts, cols, rows, cell, ground)
+            except Exception:
+                _LAST_PNG[key] = None
+            while len(_LAST_PNG) > 8:
+                _LAST_PNG.pop(next(iter(_LAST_PNG)))
+        return _LAST_PNG[key]
+    except (AttributeError, TypeError):
+        return None
+
+
+def draw_last(facts, cols, rows, cell, ground):
+    from PIL import Image, ImageDraw
+    series = [(t, c) for t, c in facts.get('series') or ()]
+    if len(series) < 2:
+        return None
+    width, height = cols * cell[0] * SS, rows * cell[1] * SS
+    image = Image.new('RGBA', (width, height), tuple(ground[:3]) + (255,))
+    draw = ImageDraw.Draw(image, 'RGBA')  # blends: a wash over the ground, a rule over the wash
+    prompts = list(facts.get('prompt_times') or [])
+    clock = Clock([t for t, _ in series] + prompts, max([t for t, _ in series] + prompts))
+    pad, foot, top = 3 * SS, height - 5 * SS, 3 * SS  # the prompts' ticks sit under the foot rule
+    peak = max(c for _, c in series)
+    floor = facts.get('floor') or FLOOR_GUESS
+    scale = max(peak, floor) * 1.08
+    x = lambda t: pad + clock.at(t) * (width - 2 * pad)
+    y = lambda c: foot - (c / scale) * (foot - top)
+    draw.line([(0, foot), (width, foot)], fill=INK['hair'], width=SS)
+    for when, pre, _ in facts.get('compactions') or ():
+        draw.line([(x(when), y(pre or peak)), (x(when), foot)], fill=INK['faint'], width=SS)
+    cuts, runs, run, k = sorted(c[0] for c in facts.get('compactions') or ()), [], [], 0
+    for t, c in series:  # one run from each compaction to the next
+        while k < len(cuts) and t >= cuts[k]:
+            if run:
+                runs.append(run)
+            run, k = [], k + 1
+        run.append((x(t), y(c)))
+    if run:
+        runs.append(run)
+    for run in runs:
+        if len(run) > 1:
+            draw.polygon([(run[0][0], foot)] + run + [(run[-1][0], foot)], fill=INK['ctx'][:3] + (28,))
+    for run in runs:
+        if len(run) > 1:
+            draw.line(run, fill=INK['ctx'], width=max(SS, round(1.5 * SS)), joint='curve')
+    fy = y(floor)
+    for fx in range(0, width, 8 * SS):  # the floor: a dashed rule over the wash
+        draw.line([(fx, fy), (fx + 4 * SS, fy)], fill=INK['quiet'], width=SS)
+    for t in prompts:
+        draw.line([(x(t), foot + 1.5 * SS), (x(t), height - SS)], fill=INK['you'], width=SS)
+    when, tokens = max(series, key=lambda point: point[1])
+    r = 2.5 * SS
+    draw.ellipse([x(when) - r, y(tokens) - r, x(when) + r, y(tokens) + r], fill=INK['turn'])
+    return shrink(image)
+
+
+def last_sparkline(facts, width):
+    """The same series as one row of '▁▂▃▄▅▆▇█' (the most in each bin, carried forward); '' under 8 cells."""
+    series = facts.get('series') or []
+    if len(series) < 2 or width < 8:
+        return ''
+    first, last = series[0][0], series[-1][0]
+    bins = [0] * width
+    for t, c in series:
+        i = min(width - 1, int((t - first) / max(1, last - first) * width))
+        bins[i] = max(bins[i], c)
+    peak, level, out = max(bins) or 1, 0, []
+    for b in bins:
+        level = b or level
+        out.append('▁▂▃▄▅▆▇█'[min(7, int(level / peak * 7.999))] if level else ' ')
+    return ''.join(out)
+
+
 SYNC_ON, SYNC_OFF = '\x1b[?2026h', '\x1b[?2026l'  # a terminal that knows them shows the frame at once
 
 
@@ -1593,7 +1752,7 @@ def iso_icon(name):
         draw.line([at(*a), at(*b)], fill=fill, width=1)
 
     c, quiet = INK[SECTION[name]], INK['quiet']
-    if name in ('touching', 'story'):  # Claude's open files, or the session's story: a sheet on its folder
+    if name in ('touching', 'story', 'last'):  # Claude's open files, the session's story, the last session: a sheet on its folder
         box(-2, -2, 0, 14, 12, 2, c)
         box(0, 0, 2, 10, 8, 2, c, top=PAPER + (255,), left=PAGES + (255,), right=mix(PAGES, black, 0.12),
             more=lambda d: [line(d, (2, 2, 4), (8, 2, 4), mix(c, white, 0.2)),
@@ -1607,7 +1766,7 @@ def iso_icon(name):
         else:
             box(0, 0, 0, 8, 8, 6, quiet)
             box(4, 0, 6, 6, 6, 6, c)
-    elif name in ('rules', 'kept'):  # a rule book: its cover, its spine banded, its pages, a ribbon
+    elif name in ('rules', 'kept', 'todos'):  # a rule book: its cover, its spine banded, its pages, a ribbon
         box(0, 0, 0, 14, 10, 4, c, left=mix(c, black, 0.1), right=PAGES + (255,),
             more=lambda d: [line(d, (14, 0, 2), (14, 10, 2), mix(PAGES, black, 0.15)),
                             line(d, (2, 10, 0), (2, 10, 4), mix(c, white, 0.45)),
@@ -2469,6 +2628,127 @@ def page_main(data, s, now, ui=None):
                 sections=sections)
 
 
+# ---------------------------------------------------------------- the default view
+
+PIC = '\x1b[8m\x1b[28m'  # an invisible pair of colour codes: it marks a row a picture will cover
+PIC_MIN = 24  # fewer cells than this and a picture gives way to one row of block characters
+PIC_ROWS = lambda rows: 4 if rows >= 30 else 3
+HOLD_MAX = 120  # seconds the main page's sections stay as drawn while Claude works
+TOLD_WHEN = dict(startup='at start', resume='at resume', compact='after compact', clear='after clear')
+
+
+def told_lines(text):
+    """CSR's SessionStart block in the parts the pane shows: dict(recap, dreamt=[...], anchors, index, full).
+    recap is the 'recap [' line without its marker, else the first line that is not CSR's own preamble."""
+    lines = [line.strip() for line in str(text or '').splitlines()]
+    recap = next((re.sub(r'\s*\[\[CSR:RECAP\]\]\s*$', '', line) for line in lines if line.startswith('recap [')), None)
+    if recap is None:
+        recap = next((line for line in lines if line and not line.startswith(
+            ('CSR ENDLESS MEMORY ACTIVE', 'The blocks below are memory', 'Reflex:', '[briefing', '#', '**'))), None)
+    full = next((line[len('Full state:'):].strip() for line in lines if line.startswith('Full state:')), None)
+    at = next((k for k, line in enumerate(lines) if 'EPISODE INDEX' in line), None)
+    return dict(recap=recap, dreamt=[line for line in lines if line.startswith('Dreamt:')],
+                anchors=next((line for line in lines if line.startswith('ANCHORS:')), None),
+                index=sum(1 for line in lines[at + 1:] if line.startswith('- [')) if at is not None else 0, full=full)
+
+
+def told_section(s):
+    """"CSR told Claude": the recap CSR injected at the start, one item that opens to the rest."""
+    told = s.get('told')
+    parts = told_lines(told['text']) if told else None
+    if not parts or not parts['recap']:
+        return None
+    anchors = ' · '.join(x for x in (parts['anchors'], f"{parts['index']} earlier threads" if parts['index'] else '') if x)
+    source = str(told.get('source') or 'startup')
+    when = datetime.fromtimestamp(told['at']).strftime('%H:%M') if told.get('at') else ''
+    recap, full = one_line(parts['recap'], 600), parts['full']
+    item = dict(key='told:recap', title=recap, lines=3, plain_body=True,
+                body=[x for x in (parts['dreamt'][:1] + [anchors]) if x],
+                detail=parts['dreamt'][1:3] + ([full] if full else []),
+                send=one_line(f"CSR's recap at the start of this session: {recap}" + (f' The rest: {full}' if full else '')))
+    return dict(name='told', title='CSR told Claude', right=' '.join(x for x in (
+        TOLD_WHEN.get(source, f'at {one_line(source, 12)}'), when) if x), items=[item], empty='')
+
+
+def last_section(s, now, rows):
+    """"Last session": the session before this one in a picture and two rows of numbers."""
+    facts = s.get('last_session')
+    if not facts or not facts.get('id'):
+        return None
+    id8 = facts['id'][:8]
+    typed, said = facts.get('typed'), facts.get('said')
+    title = one_line(facts.get('title') or (typed and gist(typed[1])) or f'session {id8}', 200)
+    running = session_record(facts['id']) is not None
+    active, prompts, compacts = facts.get('active') or 0, facts.get('prompts') or 0, facts.get('compacts') or 0
+    learned, handed, peak, floor = facts.get('learned'), facts.get('handed'), facts.get('peak'), facts.get('floor')
+    first = [f'{span(active)} active', f'{prompts} prompts' if prompts else '', f'{compacts} compacts' if compacts else '']
+    second = [f'CSR learned {short(learned)}' if learned else '', '', f'peak {short(peak)}' if peak else '']
+    if handed:
+        second[1] = ('handed' if learned else 'CSR handed') + f' {handed}×'
+    body = [' · '.join(x for x in line if x) for line in (first, second)]
+    detail = [f"After a compaction the context settled near {short(floor)}, the median of the last "
+              f"{min(FLOOR_ROWS, compacts)}." if floor and compacts else '',
+              f'You last: {quoted(typed[1], 200)}' if typed else '', f'Claude last: {quoted(said[1], 200)}' if said else '']
+    item = dict(key='last:' + facts['id'], title=title, lines=1, fit_body=True,
+                picture=dict(facts=facts, rows=PIC_ROWS(rows)), body=[x for x in body if x],
+                detail=[x for x in detail if x],
+                send=one_line(f'Last session {id8} (“{title}”): {span(active)} active, {prompts} prompts, {compacts} '
+                              f'compactions, last row {hhmm(facts.get("last"))}. '
+                              f'The rest of it: csr_reflect_on_past("conv_{facts["id"]}")'))
+    right = f"{id8} · {'still running' if running else stamp(facts['last'], now)[0]}" if facts.get('last') else id8
+    return dict(name='last', title='Last session', right=right, items=[item], empty='')
+
+
+def todos_section(s):
+    """"Todos left": what the session before this one left open, one item each."""
+    facts = s.get('last_session') or {}
+    id8 = (facts.get('id') or '')[:8]
+    items = [dict(key=f'todo:{id8}:{k}', title=todo['subject'], lines=2,
+                  meta=f"{todo['status'].replace('_', ' ')} · from {id8}",
+                  send=one_line(f"Left over from session {id8}: “{todo['subject']}” ({todo['status']})."))
+             for k, todo in enumerate(s.get('todos') or [])]
+    return dict(name='todos', title='Todos left', right='', items=items, empty='') if items else None
+
+
+def default_view(page, s):
+    """True while the session has nothing of its own: it has an id and no turn has ended; or every section
+    that has items is 'rules' or 'lost', and every thread not set aside is one carried from the session before."""
+    if not (s or {}).get('id'):
+        return False
+    if not s.get('turn_end'):
+        return True
+    if not {section['name'] for section in page['sections'] if section['items']} <= {'rules', 'lost'}:
+        return False
+    return all(t['state'] == 'carried' for t in s.get('lost') or [] if not t['hidden'])
+
+
+def page_default(page, data, s, now, rows):
+    """The page with its sections replaced by what a fresh session can show from real data, the head (the
+    cockpit) kept: a dream waiting on you, what CSR told Claude, the last session, what it left over."""
+    own = {section['name']: section for section in page['sections']}
+    star = feed(data.get('dreams') or [], data.get('chapter'), s.get('id'))['star'] is not None
+    sections = [own['dreams']] if star and own.get('dreams') and own['dreams']['items'] else []
+    sections += [x for x in (told_section(s), last_section(s, now, rows)) if x]
+    lost = lost_sections(s, now)
+    if lost:
+        every = s.get('lost') or []
+        sections.append(dict(lost[0], title='Left over',
+                             right=f"{sum(1 for t in every if not t['hidden'] and t['waiting'])} waiting · f all {len(every)}"))
+    if todos_section(s):
+        sections.append(todos_section(s))
+    taken = {section['name'] for section in sections} | {'lost', 'story'}
+    sections += [section for section in page['sections'] if section['items'] and section['name'] not in taken]
+    quiet = 'Reading the session before this one…' if s.get('last_session') is None \
+        else 'First session here: no earlier session in this project to carry over.'
+    return dict(page, sections=sections, quiet=quiet)
+
+
+def held_sections(hold, busy, now):
+    """The sections to draw in place of fresh ones: the held ones while Claude works and they are under
+    HOLD_MAX seconds old; None to draw fresh. hold is dict(sections, at) or None."""
+    return hold['sections'] if hold and busy and now - hold['at'] < HOLD_MAX else None
+
+
 def page_log(data):
     """The l view: every commit that changed code your past sessions worked on."""
     commits = {}
@@ -2507,8 +2787,16 @@ def item_rows(item, name, width, is_open):
     title = wrap(title.replace('`', ''), room, item.get('open_lines', 6) if is_open else item.get('lines', 2))
     voice = ink('quiet') if item.get('quiet') else ink('you')  # lamp black: the page's own type
     rows = [' ' * ITEM + voice + line + OFF for line in title]
+    picture = item.get('picture')
+    if picture and PIXELS and room >= PIC_MIN:  # rows a picture will cover, marked for page_lines
+        rows += [' ' * ITEM + PIC] * picture['rows']
+    elif picture and room >= 8:  # no pictures, or too narrow for one: the same series in block characters
+        rows.append(' ' * ITEM + ink('ctx') + last_sparkline(picture['facts'], room) + OFF)
     for k, text in enumerate(item.get('body') or ()):
-        voice = ink('quiet') + (BOLD if k == 0 else '')
+        if item.get('fit_body'):
+            rows.append(' ' * ITEM + ink('quiet') + fit_pieces(text, room) + OFF)
+            continue
+        voice = ink('quiet') + (BOLD if k == 0 and not item.get('plain_body') else '')
         rows += [' ' * ITEM + voice + line + OFF for line in wrap(text, room, 1 if k == 0 else 2)]
     flag, meta = item.get('flag') or '', item.get('meta') or ''
     text = fit(' · '.join(x for x in (flag, meta) if x), room)
@@ -2565,7 +2853,7 @@ def page_lines(page, width, rows, ui):
             top.append('  ' + lanes_legend(s, width - 2, dark=True))
     grounds = dark_steps(len(top))  # one flat ground
     out = Lines([on_dark(line, ground) for line, ground in zip(top, grounds)])
-    out.heads = []
+    out.heads, out.wanted = [], []  # wanted: (first row, rows, facts, ground) of each picture to lay over blank rows
     out.lanes = None if lanes is None else (lanes, grounds[lanes:lanes + 3])  # the gauges' row, their grounds
     out.put(masthead_lip(rows))
     built = []
@@ -2600,6 +2888,18 @@ def page_lines(page, width, rows, ui):
         start = len(out)
         out.extend(part)
         out.acts.update({start + i: act for i, act in part.acts.items()})
+        i = 0
+        while i < len(part):  # each run of rows marked PIC is where one item's picture goes
+            if PIC not in part[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(part) and PIC in part[j + 1]:
+                j += 1
+            picture = (part.acts.get(i) or {}).get('picture')
+            if picture and picture['rows'] == j - i + 1:
+                out.wanted.append((start + i, j - i + 1, picture['facts'], shade[i]))
+            i = j + 1
     return out
 
 
@@ -2617,14 +2917,27 @@ def draw_page(page, cols, rows, ui):
             pictures.append((row, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time(), grounds)))
         pictures += [(row, 0, ICON[0], ICON[1], iso_png(name, cell, backs))
                      for row, name, backs in lines.heads if row + ICON[1] <= rows - 1]
+        for row, run, facts, ground in getattr(lines, 'wanted', ()):
+            png = last_png(facts, width - ITEM, run, cell, ground)
+            if png:
+                pictures.append((row, ITEM, width - ITEM, run, png))
     return lines, pictures
 
 
-def draw_main(data, s, cols, rows, now, ui=None):
+def draw_main(data, s, cols, rows, now, ui=None, hold=None):
+    """The main page. A session with nothing of its own yet gets the default view; hold, the sections as last
+    drawn, replaces the sections while Claude works (the masthead stays live)."""
     if s is None:
         s = dict(id=None, title=None, prompts=[], replies=[], compacts=[], gave=dict(recalls=[], carried=[], dreams=[]),
                  remembered=[], sessions=0, project=None, files={}, edited=[], shell={}, last={})
-    return draw_page(with_compacting(page_main(data, s, now, ui), data), cols, rows, ui or {})
+    page = with_compacting(page_main(data, s, now, ui), data)
+    if default_view(page, s):
+        page = page_default(page, data, s, now, (ui or {}).get('rows', rows))
+    if hold is not None:
+        page['sections'] = hold
+    lines, pictures = draw_page(page, cols, rows, ui or {})
+    lines.sections = page['sections']
+    return lines, pictures
 
 
 def draw_log(data, cols, rows, ui=None):
@@ -3234,6 +3547,7 @@ class Pane:
         self.held = None  # why an edit to this file was not loaded, until one is
         self.threads_top = 0  # the f page's first line shown
         self.info_top = 0  # the i page's first line shown
+        self.hold = None  # dict(sections, at): the main page's sections as last drawn, kept while Claude works
         self.main_top = 0  # the main page's first line shown, once scrolled or a row is opened
         self.anchor = None  # (row key, screen row) a click just opened: it stays where it was clicked
         self.tall = False  # the main page keeps its scrolled layout until Esc or another page
@@ -3271,7 +3585,7 @@ class Pane:
             self.sent = None
         if self.answered and now - self.answered[2] > 6:
             self.answered = None
-        ui = dict(open=self.open, sent=self.sent, answered=self.answered, folds=self.folds)
+        ui = dict(open=self.open, sent=self.sent, answered=self.answered, folds=self.folds, rows=rows)
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
                           self.answered,
                           self.data.get('claude_line'),
@@ -3280,7 +3594,7 @@ class Pane:
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
                           self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
-                          self.info_top,
+                          self.info_top, bool(s and s.get('busy')),
                           s and [(t['key'], t['hidden'], t['state']) for t in s['lost']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
@@ -3289,14 +3603,14 @@ class Pane:
         self.shown = sig
         self.tall = self.view == 'main' and bool(self.tall or self.main_top or self.open)
         if self.tall:  # laid out whole, the screen a window on it
-            lines, pictures = draw_main(self.data, s, cols, TALL, now, ui)
+            lines, pictures = self.draw_main_held(self.data, s, cols, TALL, now, ui)
             if self.anchor:
                 row = min((r for r, act in lines.acts.items() if act.get('key') == self.anchor[0]), default=None)
                 self.main_top = max(0, row - self.anchor[1]) if row is not None else self.main_top
                 self.anchor = None
             lines, pictures, self.main_top = window(lines, pictures, rows, self.main_top)
         elif self.view == 'main':
-            lines, pictures = draw_main(self.data, s, cols, rows, now, ui)
+            lines, pictures = self.draw_main_held(self.data, s, cols, rows, now, ui)
         elif self.view == 'summary':
             lines, pictures = draw_summary(self.data, cols, rows, ui)
         elif self.view == 'threads':
@@ -3317,6 +3631,16 @@ class Pane:
         sys.stdout.write(repaint(self.drawn, cols, rows, written, placed))
         sys.stdout.flush()
         self.drawn = (cols, rows, written, placed)
+
+    def draw_main_held(self, data, s, cols, rows, now, ui):
+        """The main page, one draw: while Claude is mid-turn it keeps the sections it last drew (the masthead
+        stays live), so nothing jumps under your eye; an idle frame, or a held one past HOLD_MAX, draws fresh
+        and keeps what it drew."""
+        held = held_sections(self.hold, bool(s and s.get('busy')), now)
+        lines, pictures = draw_main(data, s, cols, rows, now, ui, hold=held)
+        if held is None:
+            self.hold = dict(sections=lines.sections, at=now)
+        return lines, pictures
 
     def scroll(self, step):
         """The wheel, or j and k: the page in view moves, never past its top."""
@@ -3643,15 +3967,25 @@ def stopped_at(prev):
                 key=hashlib.sha1(f'stopped {prev.id}'.encode()).hexdigest()[:12])
 
 
-def carried_threads(path, started):
-    """What a restart would lose, read from the session before this one, no model: the threads its newest
-    summary carried or dropped with no answer, plus what came after that summary (stopped_at), which is
-    the newest work and the likeliest to be unanswered. A session that never compacted still gives that."""
+def previous_read(path, started):
+    """The Session before this one, its transcript read, or None (previous_session found none)."""
     before = previous_session(path, started)
     if not before:
-        return []
+        return None
     prev = Session(os.path.basename(before)[:-6], path=before)
     prev.read_transcript()
+    return prev
+
+
+def carried_threads(path, started, prev=None):
+    """What a restart would lose, read from the session before this one, no model: the threads its newest
+    summary carried or dropped with no answer, plus what came after that summary (stopped_at), which is
+    the newest work and the likeliest to be unanswered. A session that never compacted still gives that.
+    Given prev (a Session already read), nothing is read a second time."""
+    prev = prev or previous_read(path, started)
+    if not prev:
+        return []
+    before = prev.path
     said = lost_log(project_of(before))
     out = []
     # what that session itself carried in and nobody dropped: a second restart loses nothing either
@@ -3667,23 +4001,139 @@ def carried_threads(path, started):
     return out + ([tail] if tail else [])
 
 
-def carry_into(session):
-    """In the background, once per session: the session before this one's threads, kept for --lost too. A
-    carry already kept is read back, never worked out again: by now that earlier session may have been
-    resumed and no longer count as the one before. Kept first, then shown, so the two always agree."""
+PREVIOUS_DIR = 'previous'  # KEEP/previous/<session>.json: the facts of the session before, for the default view
+TASKS = os.path.join(HOME, '.claude', 'tasks')  # <session>/<N>.json: {subject, status}, as csr-engine's Stop hook reads
+OPEN_TASK = ('in_progress', 'pending')
+SERIES_MAX = 2000  # context points kept from the last session; more are thinned
+
+
+def left_todos(session_id, con=None, tasks=None):
+    """[dict(subject, status)] a session left open (status in OPEN_TASK), in_progress first, then by file
+    number: tasks/<id>/<N>.json, else the todos of the newest session_episode reflection csr-engine stored for it.
+    A file that cannot be read is skipped; no database, or no table, gives []."""
+    if not session_id or not re.fullmatch(r'[\w-]+', session_id):
+        return []
+    tasks, found = tasks or TASKS, []  # TASKS read now, so a stand-in folder can be put in its place
     try:
-        kept = read_carried(session.id)
-        if kept is None:
-            found = carried_threads(session.path, session.started)
-            os.makedirs(os.path.join(KEEP, CARRY_DIR), exist_ok=True)
-            temp = os.path.join(KEEP, CARRY_DIR, f'{session.id}.json.{os.getpid()}.tmp')
-            with open(temp, 'w', encoding='utf-8') as handle:
-                json.dump(found, handle)
-            os.replace(temp, os.path.join(KEEP, CARRY_DIR, f'{session.id}.json'))
-            kept = found
-        session.carried = kept
+        names = os.listdir(os.path.join(tasks, session_id))
+    except OSError:
+        names = []
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext != '.json' or not stem.isdigit():
+            continue
+        try:
+            with open(os.path.join(tasks, session_id, name), encoding='utf-8') as handle:
+                task = json.load(handle)
+            if task.get('status') in OPEN_TASK and str(task.get('subject') or '').strip():
+                found.append((int(stem), dict(subject=one_line(task['subject'], 300), status=task['status'])))
+        except (OSError, ValueError, AttributeError):
+            continue
+    if not found and con is not None:
+        try:
+            row = con.execute("select content from reflections where tags like '%session_episode%' and tags like ? "
+                              "order by timestamp desc limit 1", (f'%conv_{session_id}%',)).fetchone()
+            for k, todo in enumerate(json.loads(row[0]).get('todos') or [] if row else []):
+                if isinstance(todo, dict) and todo.get('status') in OPEN_TASK and str(todo.get('content') or '').strip():
+                    found.append((k, dict(subject=one_line(todo['content'], 300), status=todo['status'])))
+        except (sqlite3.Error, ValueError, AttributeError, TypeError):
+            return []
+    return [task for _, task in sorted(found, key=lambda f: (f[1]['status'] != 'in_progress', f[0]))]
+
+
+def thin_series(points, cuts, limit):
+    """At most limit points plus two per segment: every k-th point, and each segment's first and last (a
+    segment runs from one compaction to the next)."""
+    if len(points) <= limit:
+        return points
+    keep = set(range(0, len(points), -(-len(points) // limit)))
+    times = [p[0] for p in points]
+    edges = [0] + [bisect.bisect_left(times, c) for c in sorted(cuts)] + [len(points)]
+    for low, high in zip(edges, edges[1:]):
+        if high > low:
+            keep |= {low, high - 1}
+    return [points[i] for i in sorted(keep)]
+
+
+def previous_facts(prev):
+    """The facts the default view draws about the session before this one, JSON-safe, so the transcript (tens
+    of MB) is read once. dict(id, path, mtime, title, first, last, active, prompts, compacts, peak, floor,
+    learned, handed, asked, series [[t, context]], prompt_times, compactions [[t, pre, post]], todos,
+    said, typed). learned and handed are None when the database cannot be read."""
+    main = sorted(prev.main)
+    last = max([t for t, _ in main] + list(prev.prompts) + list(prev.compacts) + [prev.said[0] if prev.said else 0,
+                                                                                 prev.typed[-1][0] if prev.typed else 0])
+    floor, measured = floor_of(prev.compact_sizes)
+    try:
+        con = connect()
+        try:
+            sid = prev.id
+            learned = con.execute('select count(*) from chunks where conversation_id=?', (sid,)).fetchone()[0]
+            handed = handoffs([epoch(r[0]) for r in con.execute(
+                'select retrieved_at from retrieval_events where session_id=?', (sid,))]) \
+                + con.execute('select count(*) from correction_deliveries where target_session_id=?', (sid,)).fetchone()[0]
+            todos = left_todos(sid, con)
+        finally:
+            con.close()
+    except Exception:  # sqlite3.Error, or anything a stand-in raises: the facts without the database's counts
+        learned = handed = None
+        todos = left_todos(prev.id)
+    try:
+        mtime_ = os.stat(prev.path).st_mtime
+    except OSError:
+        mtime_ = 0
+    points = thin_series([[round(t, 1), c] for t, c in main], prev.compacts, SERIES_MAX)
+    cut = lambda pair: [pair[0], one_line(pair[1], 400)] if pair else None
+    return dict(id=prev.id, path=prev.path, mtime=mtime_, title=prev.title, first=prev.started, last=last,
+                active=Clock(list(prev.prompts) + [t for t, _ in main], last).total, prompts=len(prev.prompts),
+                compacts=len(prev.compacts), peak=max([c for _, c in main] + [0]), floor=floor if measured else None,
+                learned=learned, handed=handed, asked=len(prev.asked), series=points,
+                prompt_times=[round(t, 1) for t in prev.prompts],
+                compactions=[[t, pre, post] for t, (pre, post, _) in zip(prev.compacts, prev.compact_sizes)],
+                todos=todos, said=cut(prev.said), typed=cut(prev.typed[-1] if prev.typed else None))
+
+
+def read_previous(session_id):
+    """The facts kept for a session's previous session: a dict ({} when there was none), or None when none are kept."""
+    try:
+        with open(os.path.join(KEEP, PREVIOUS_DIR, f'{session_id}.json'), encoding='utf-8') as handle:
+            got = json.load(handle)
+        return got if isinstance(got, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def keep_json(folder, name, record):
+    os.makedirs(os.path.join(KEEP, folder), exist_ok=True)
+    temp = os.path.join(KEEP, folder, f'{name}.json.{os.getpid()}.tmp')
+    with open(temp, 'w', encoding='utf-8') as handle:
+        json.dump(record, handle)
+    os.replace(temp, os.path.join(KEEP, folder, f'{name}.json'))
+
+
+def carry_into(session):
+    """In the background, once per session: the session before this one, read once, gives its threads (kept for
+    --lost too) and the facts the default view draws. What is already kept is read back, never worked out
+    again: by now that earlier session may have been resumed and no longer count as the one before. Kept
+    first, then shown, so the two always agree. A pane opened before the first prompt has no transcript yet:
+    the live session's record gives the folder and the start."""
+    try:
+        record = session.record or {}
+        path = session.path or (os.path.join(project_folder(record['cwd']), f'{session.id}.jsonl') if record.get('cwd') else None)
+        started = session.started or record.get('started') or 0.0
+        carried, facts = read_carried(session.id), read_previous(session.id)
+        if carried is None or facts is None:
+            prev = previous_read(path, started)
+            if carried is None:
+                carried = carried_threads(path, started, prev) if prev else []
+                keep_json(CARRY_DIR, session.id, carried)
+            if facts is None:
+                facts = previous_facts(prev) if prev else {}
+                keep_json(PREVIOUS_DIR, session.id, facts)
+        session.carried, session.previous = carried, facts
     except Exception:  # a carry that fails leaves this session's own threads, as before
         session.carried = session.carried or []
+        session.previous = {}
 
 
 def read_carried(session_id):
@@ -3952,10 +4402,17 @@ def main():
         data['claude_line'] = claude_status(args.sid, now)
         os.makedirs(args.png, exist_ok=True)
         if args.sid:
-            s = Session(args.sid).load()
+            session = Session(args.sid)
+            session.record = session_record(args.sid)
+            carry_into(session)  # here, not in a thread: the picture needs the session before this one
+            s = session.load()
             open(os.path.join(args.png, 'session.png'), 'wb').write(session_png(s, 40, cell, now))
-            lines, _ = draw_main(data, s, 46, 30, now)
+            lines, pictures = draw_main(data, s, 46, 30, now)
             open(os.path.join(args.png, 'screen.txt'), 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+            if s.get('last_session'):
+                png = last_png(s['last_session'], 43, 3, cell, tint('last', ROW))
+                if png:
+                    open(os.path.join(args.png, 'last.png'), 'wb').write(png)
         print(args.png)
     else:
         if not root:
