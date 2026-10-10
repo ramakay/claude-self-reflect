@@ -415,6 +415,25 @@ test('a chapter holds five dreams: with none left there is no look until a compa
   expect(seen.forks.length).toBe(1)
 })
 
+test("each chapter's first look is taken even when CSR's notes hold nothing new; later ones wait for news", ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, replies: ['dream: none', 'dream: none', 'dream: none'] })
+  await $.ui.mount(BAND)
+  seen.store.set('briefFacts', facts(BRIEF)) // the dreamer has seen every note already
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 1)
+  expect(seen.forks.length).toBe(1) // the chapter's fresh look
+
+  const quiet = () => seen.kept.filter(record => record.outcome === 'quiet').length
+  await steps($, 30) // the next look is due at 34: nothing new, so no fork
+  await settle(() => quiet() >= 1)
+  expect(seen.forks.length).toBe(1)
+
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never)
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 2)
+  expect(seen.forks.length).toBe(2) // a new chapter: a fresh look again
+})
+
 test('a compaction folds the dream that is up: its context is gone', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   const band = await $.ui.mount(BAND)

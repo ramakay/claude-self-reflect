@@ -271,7 +271,8 @@ async function dream($: EngineInterface, lastStep: number, base: number): Promis
   const session = await $.session.id()
   const usual = await usualSteps($)
   let pace = await paceOf($)
-  if (!mayLook(await chapterOf($))) {
+  const opening = await chapterOf($)
+  if (!mayLook(opening)) {
     // The chapter's dreams are spent: no look until the next compaction starts a new one.
     return lookCameTo($, cwd, session, 'spent', await changeChapter($, spread(base, usual)), base)
   }
@@ -285,7 +286,10 @@ async function dream($: EngineInterface, lastStep: number, base: number): Promis
   const brief = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
   const now = facts(brief)
   const before = await strings($, 'briefFacts')
-  if (!hasNews(now, before)) return lookCameTo($, cwd, session, 'quiet', await changeChapter($, soon(base)), base) // 0 tokens
+  // A chapter's first look is always taken: after a compaction the work has moved on even when CSR's notes
+  // have not, and the feed must never wait on them forever. Later looks need a new note.
+  const fresh = opening.looks === 0
+  if (!fresh && !hasNews(now, before)) return lookCameTo($, cwd, session, 'quiet', await changeChapter($, soon(base)), base)
   const seen = await strings($, 'seenDreams')
   const known = await strings($, 'knownDreams')
   const reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known) })
