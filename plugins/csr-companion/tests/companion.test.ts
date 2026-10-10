@@ -303,6 +303,7 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   await steps($, 12, 'sub-1')
   await settle(() => false)
   expect(seen.forks).toEqual([])
+  expect(seen.kept).toEqual([expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, session: 'sess-1' })])
 
   await steps($, 6) // 12 steps: 1 in 12, within it
   await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
@@ -313,7 +314,7 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   expect(await band.find({ text: /Dream · / })).toBeDefined()
   expect(await band.find({ type: 'Button', text: 'Already thought of it' })).toBeDefined()
   expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 12 * LOOK, every: 6 }))
-  expect(seen.kept[0]).toEqual(expect.objectContaining({ kind: 'dream', line: DREAM_LINE, tokens: LOOK, session: 'sess-1' }))
+  expect(seen.kept[1]).toEqual(expect.objectContaining({ kind: 'dream', line: DREAM_LINE, tokens: LOOK, session: 'sess-1', outcome: 'dream' }))
 
   await band.press({ key: 'Learn more' })
   expect(await band.find({ text: 'Notes could follow side branches' })).toBeDefined()
@@ -338,11 +339,15 @@ test('a look that finds nothing doubles the wait, and with nothing new near the 
   expect(seen.forks.length).toBe(1)
   expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 1, dreams: 0, every: 12 }))
   expect(await band.find({ text: /Dream · / })).toBeUndefined()
-  expect(seen.kept).toEqual([])
+  expect(seen.kept).toEqual([ // step 6 waits for its share; step 12 looks and finds nothing
+    expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, tokens: 0 }),
+    expect.objectContaining({ kind: 'look', outcome: 'none', every: 12, tokens: LOOK }),
+  ])
 
   await steps($, 48) // affordable, but CSR's brief holds nothing the last look lacked
   await settle(() => false)
   expect(seen.forks.length).toBe(1)
+  expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'look', outcome: 'quiet', tokens: 0 }))
 
   world.brief = `${BRIEF}\n- 10-08 (csr-engine): “the import should retry” [session 3f2a91c0]`
   await steps($, 12)
@@ -388,6 +393,7 @@ test('a dream that only echoes this session, or asks about the pane, never reach
   await settle(() => false)
   expect(await band.find({ text: /What if the (notes|pane) also read/ })).toBeUndefined()
   expect(seen.kept.filter(record => record.kind === 'dream')).toEqual([])
+  expect(seen.kept.filter(record => record.kind === 'look').map(record => record.outcome)).toContain('ungrounded')
 })
 
 test('a dream answered in the pane leaves the band, and is never counted as typed past', ON, async ($, on) => {

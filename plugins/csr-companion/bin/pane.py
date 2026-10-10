@@ -310,11 +310,11 @@ def load(root, limit, session_id=None):
                                (session_id or '',)).fetchone()[0]
     finally:
         con.close()
-    dreams = load_dream_log(root)
+    dreams, look = load_dream_log(root), last_look(root)
     week = [d for d in dreams if d['at'] >= time.time() - 7 * 86400]
     return dict(repo=root, total=len(shifts), shifts=shifts[:limit], changes=changes, dreams_on=dreams_on(),
                 recalled=recalled, 
-                changes_total=len(changes), dreams=dreams, dreams_7d=len(week),
+                changes_total=len(changes), dreams=dreams, look=look, dreams_7d=len(week),
                 dream_tokens_7d=sum(d.get('tokens') or 0 for d in week),
                 corrections_carried_7d=carried, shifts_told_7d=told, reminded_7d=carried + told)
 
@@ -362,7 +362,7 @@ def public(data):
                     commits=c['commits'], shifts=[shift(s) for s in c['shifts']][:12])
                for c in data['changes'][:20]]
     dreams = [{k: d.get(k) for k in ('id', 'at', 'line', 'title', 'answer')} for d in data['dreams'][:20]]
-    return dict({k: v for k, v in data.items() if k not in ('shifts', 'changes', 'dreams')},
+    return dict({k: v for k, v in data.items() if k not in ('shifts', 'changes', 'dreams', 'look')},
                 shifts=[shift(s) for s in data['shifts']], changes=changes, dreams=dreams)
 
 
@@ -400,6 +400,37 @@ def load_dream_log(root=None):
                 dream['answer'] = record['answer']
     out = [d for d in dreams.values() if not root or not d.get('repo') or d['repo'] == root]
     return sorted(out, key=lambda d: d['at'], reverse=True)
+
+
+LOOKED = dict(  # what came of a look, as the pane says it
+    dream='it asked a new question',
+    quiet="nothing new in CSR's memory near this work, so no look",
+    none='nothing worth asking',
+    ungrounded='its question stood on no other session, so it was dropped',
+    repeat='its question had been asked before, so it was dropped',
+    budget="it waits: a look now would pass its share of Claude's tokens",
+    skip='it waits: backing off after a question you passed',
+)
+
+
+def last_look(root=None):
+    """The dreamer's latest look near this repo, from the dream log: when, what came of it, and how many
+    of Claude's steps until the next. None before its first."""
+    try:
+        with open(DREAM_LOG, encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get('kind') not in ('look', 'dream') or (root and record.get('repo') not in (None, root)):
+            continue
+        return dict(at=float(record.get('at') or 0), outcome=record.get('outcome') or 'dream',
+                    every=record.get('every'))
+    return None
 
 
 # How the person talks to the agent: the dreamer asks in the same voice.
@@ -466,7 +497,7 @@ def voice_and_lines(con, session_id, limit=4, floor=0.40):
 def brief(con, root, session_id):
     """What CSR remembers near this session, with receipts, for the dreamer's prompt."""
     session = Session(session_id)
-    session.read_transcript()
+    here = session.load()  # reads the transcript too
     touched = [path for path, _ in session.files.most_common(8)]
     files = [path for path in touched if path.startswith(root + '/')]
     out = []
@@ -497,6 +528,12 @@ def brief(con, root, session_id):
         out += ['', 'Corrections CSR recorded in this repo lately:']
         out += [f"- {short_date(epoch(ts)) if epoch(ts) else (ts or '')[:10]}: {quoted(quote, 200)} [session {sid[:8]}]"
                 for ts, quote, sid in corrections]
+    handed = [item for item in here['remembered']
+              if item['kind'] == 'recall' and re.fullmatch(r'[0-9a-f-]{36}', item['key'])][:5]
+    if handed:
+        out += ['', 'Past sessions CSR handed Claude during this session, newest first:']
+        out += [f"- {quoted(item['text'], 160)} ({', '.join(x for x in (short_date(item['when']) if item.get('when') else '', os.path.basename((item.get('project') or '').rstrip('/'))) if x)}) [session {item['key'][:8]}]"
+                for item in handed]
     counts, near = voice_and_lines(con, session_id)
     if near:
         out += ['', 'Lines the person wrote in past sessions that sit close to this work:']
@@ -1398,15 +1435,28 @@ def page_main(data, s, now):
 
     week = sum(1 for d in data['dreams'] if d['at'] >= now - 7 * 86400)
     dreams = []
-    for k, d in enumerate(data['dreams'][:3]):
+    newest = data['dreams'][0] if data['dreams'] else None
+    starred = bool(newest) and newest['answer'] in (None, 'ignored', 'dismiss', 'got_it')  # still yours to answer
+    look = data.get('look')
+    if data.get('dreams_on') and look and not starred:
+        when = stamp(look['at'], now)[0]
+        every = look.get('every')
+        dreams.append(dict(key='look', quiet=True, lines=2,
+                           title=f"No open question. Last look {'just now' if when == 'now' else when}: "
+                                 f"{LOOKED.get(look['outcome'], look['outcome'])}.",
+                           meta=f"next after {every} of Claude's steps, if CSR has something new" if every else '',
+                           detail=['The dreamer looks only when CSR remembers something new near this work, '
+                                   'waits longer each time it finds nothing, and asks only what stands on '
+                                   'another session.'],
+                           send='/shifts dreams'))
+    for k, d in enumerate(data['dreams'][:3 - len(dreams)]):
         reasons = [re.sub(r'^[*-]\s*', '', line) for line in (d.get('text') or '').splitlines() if line.strip()]
         send = one_line(f"{DREAMER_SAID}: “{d['line']}” Its reasoning: {d.get('title') or ''}. {' '.join(reasons[:3])}")
         meta = ' · '.join(x for x in (short_date(d['at']), ANSWER_WORD.get(d['answer'], '')) if x)
-        if k == 0:  # the star: its question whole, its reasoning shown, its answers a click away while it is open
-            is_open = d['answer'] in (None, 'ignored', 'dismiss', 'got_it')
+        if k == 0 and starred:  # the star: its question whole, its reasoning shown, its answers a click away
             dreams.append(dict(key='dream:' + d['id'], dream=d['id'], title=d['line'], lines=3,
-                               body=[d.get('title') or ''] + reasons[:1], meta='' if is_open else meta,
-                               answers=is_open, detail=reasons[1:3], send=send))
+                               body=[d.get('title') or ''] + reasons[:1], answers=True, detail=reasons[1:3],
+                               send=send))
         else:
             dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1, meta=meta,
                                detail=[d.get('title') or ''] + reasons[:2], send=send))
@@ -1476,7 +1526,8 @@ def item_rows(item, name, width, is_open):
     dream's reasoning, always shown), then what CSR knows about it, quiet, with a flag first in the risk ink."""
     room = width - ITEM
     title = wrap(item['title'].replace('`', ''), room, 6 if is_open else item.get('lines', 2))
-    rows = [' ' * ITEM + ink('you') + line + OFF for line in title]  # lamp black: the page's own type
+    voice = ink('quiet') if item.get('quiet') else ink('you')  # lamp black: the page's own type
+    rows = [' ' * ITEM + voice + line + OFF for line in title]
     for k, text in enumerate(item.get('body') or ()):
         voice = ink('quiet') + (BOLD if k == 0 else '')
         rows += [' ' * ITEM + voice + line + OFF for line in wrap(text, room, 1 if k == 0 else 2)]
@@ -1659,6 +1710,7 @@ class Pane:
             if self.data is None or now - self.loaded > 60:
                 self.data, self.loaded = load(self.root, self.limit, self.session and self.session.id), now
             self.data['dreams'] = load_dream_log(self.root)  # the mod appends while we watch
+            self.data['look'] = last_look(self.root)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             s = self.session.load() if self.session and self.view == 'main' else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
@@ -1676,7 +1728,7 @@ class Pane:
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
                           self.answered,
                           self.data.get('claude_line'),
-                          [(d['id'], d['answer']) for d in self.data['dreams']],
+                          [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
         if sig == self.shown and not force:
@@ -1796,7 +1848,7 @@ def main():
     args = parser.parse_args()
     if args.keep:
         record = json.loads(args.keep)
-        if record.get('kind') == 'dream':
+        if record.get('kind') in ('dream', 'look'):
             record['repo'] = repo_root(args.repo)
         keep(record)
         print('{}')

@@ -191,22 +191,29 @@ async function paceOf($: EngineInterface): Promise<Pace> {
 const tokensOf = (usage: ModelUsage) =>
   usage.input_tokens + usage.output_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
 
+// What came of a look, kept in the dream log: once you have answered the last dream, the pane shows it
+// in the dream's place, so a quiet dreamer reads as quiet, not as stuck.
+async function lookCameTo($: EngineInterface, cwd: string, session: string, outcome: string, every: number, tokens = 0) {
+  const at = await $.clock.now()
+  await run($, ['--repo', cwd, '--keep', JSON.stringify({ kind: 'look', at: at / 1000, session, outcome, every, tokens })])
+}
+
 // One look, when the pace allows it: a fork of this session asking for one "what if...?".
 async function dream($: EngineInterface, lastStep: number): Promise<void> {
+  const cwd = await $.session.cwd()
+  const session = await $.session.id()
+  let pace = await paceOf($)
   const skip = await count($, 'looksToSkip')
   if (skip > 0) {
     await $.store.set('looksToSkip', skip - 1)
-    return
+    return lookCameTo($, cwd, session, 'skip', pace.every)
   }
   if (await isBusy($)) return // a note is up: no question would be seen
-  let pace = await paceOf($)
-  if (!canAfford(pace, lastStep)) return
-  const cwd = await $.session.cwd()
-  const session = await $.session.id()
+  if (!canAfford(pace, lastStep)) return lookCameTo($, cwd, session, 'budget', pace.every)
   const brief = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
   const now = facts(brief)
   const before = await strings($, 'briefFacts')
-  if (!hasNews(now, before)) return // nothing new near this work since the last look: 0 tokens
+  if (!hasNews(now, before)) return lookCameTo($, cwd, session, 'quiet', pace.every) // nothing new near this work: 0 tokens
   const seen = await strings($, 'seenDreams')
   const known = await strings($, 'knownDreams')
   const reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known) })
@@ -215,9 +222,11 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
   pace = { ...(await paceOf($)), looks: pace.looks + 1, dreamer: pace.dreamer + used, lastLook: used || pace.lastLook }
   const parsed = reply.isAnswered ? parseDream(reply.text) : null
   const found = parsed && standsOnThePast(parsed, brief, session) ? parsed : null // another session under it
-  if (!found || [...seen, ...known].some(line => sameDream(line, found.line))) {
-    await $.store.set('pace', paceAfter(pace, 'none'))
-    return
+  const repeat = !!found && [...seen, ...known].some(line => sameDream(line, found.line))
+  if (!found || repeat) {
+    const slower = paceAfter(pace, 'none')
+    await $.store.set('pace', slower)
+    return lookCameTo($, cwd, session, !parsed ? 'none' : repeat ? 'repeat' : 'ungrounded', slower.every, used)
   }
   await $.store.set('pace', { ...pace, dreams: pace.dreams + 1 })
   const at = await $.clock.now()
@@ -239,6 +248,7 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
   await remember($, 'seenDreams', found.line, SEEN_KEPT)
   await run($, ['--repo', cwd, '--keep', JSON.stringify({
     kind: 'dream', id: note.id, at: at / 1000, session, line: note.line, title: note.title, text: note.text, tokens: used,
+    outcome: 'dream', every: pace.every, // the look that found it
     brief, // what the dreamer read: with the answer that settles this dream, one labelled example
   })])
   void refresh($, cwd)
