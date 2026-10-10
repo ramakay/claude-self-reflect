@@ -388,6 +388,23 @@ test('a dream that only echoes this session, or asks about the pane, never reach
   expect(seen.kept.filter(record => record.kind === 'dream')).toEqual([])
 })
 
+test('a dream answered in the pane leaves the band, and is never counted as typed past', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
+  const band = await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
+  const id = seen.kept.find(record => record.kind === 'dream')?.id
+  seen.files.set(`${HOME}/.claude-self-reflect/csr-companion/dreams.jsonl`,
+    `${JSON.stringify({ kind: 'dream', id, line: DREAM_LINE })}\n${JSON.stringify({ kind: 'answer', id, answer: 'helpful', at: 1, by: 'pane' })}\n`)
+
+  await $.prompt.submit({ text: 'one', origin: { kind: 'human' } } as never)
+  await settle(async () => (await band.find({ text: /What if the notes also read/ })) === undefined)
+  expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
+  expect(seen.kept.filter(record => record.kind === 'answer')).toEqual([]) // the pane logged it, once
+  expect(seen.store.get('looksToSkip') ?? 0).toBe(0)
+  expect(seen.store.get('answers')).toEqual(expect.arrayContaining([expect.objectContaining({ id, answer: 'helpful' })]))
+})
+
 test('the dim 4 on a dream turns dreams off, after a second press', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   const band = await $.ui.mount(BAND)
