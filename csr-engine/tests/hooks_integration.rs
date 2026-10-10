@@ -1183,7 +1183,7 @@ fn test_explore_prompt_never_fails() {
     // asserts the reachable path never panics/errors. Emission content is
     // covered by format_code_map's own unit tests elsewhere in the crate.
     let input = csr_engine::hooks::HookInput {
-        prompt: Some("where is the code for the radio bottom sheet feature".to_string()),
+        prompt: Some("where is the code for the audio bottom sheet feature".to_string()),
         ..Default::default()
     };
 
@@ -1207,15 +1207,15 @@ fn test_explore_prompt_never_fails() {
         session_id: "explore-fixture-session".into(),
         project: "tmp".into(),
         timestamp: "2026-07-11T12:00:00Z".into(),
-        request: "Investigate where the radio bottom sheet feature code lives".into(),
+        request: "Investigate where the audio bottom sheet feature code lives".into(),
         investigated: vec![],
-        completed: "Located and reviewed the radio bottom sheet implementation".into(),
+        completed: "Located and reviewed the audio bottom sheet implementation".into(),
         next_steps: None,
         blockers: None,
         outcome: "success".into(),
         error_signatures: vec![],
         tools_used: vec![],
-        files_modified: vec!["src/radio/RadioSheet.swift".into()],
+        files_modified: vec!["src/audio/AudioSheet.swift".into()],
         message_count: 0,
         duration_minutes: 0,
         todos: vec![],

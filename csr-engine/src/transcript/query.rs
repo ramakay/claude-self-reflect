@@ -891,7 +891,7 @@ mod tests {
         // turn 1: ordinary user prompt, so the file isn't ENTIRELY auxiliary content
         writeln!(
             f,
-            r#"{{"type":"user","timestamp":"2026-08-10T20:00:00Z","uuid":"u1","message":{{"role":"user","content":"start the radio spot work"}}}}"#
+            r#"{{"type":"user","timestamp":"2026-08-10T20:00:00Z","uuid":"u1","message":{{"role":"user","content":"start the audio spot work"}}}}"#
         )
         .unwrap();
 
@@ -930,7 +930,7 @@ mod tests {
         // system away_summary WITH content → must become turn 4, content preserved.
         writeln!(
             f,
-            r#"{{"parentUuid":null,"isSidechain":false,"type":"system","subtype":"away_summary","content":"Goal is shipping the radio spot; the soak test is running.","timestamp":"2026-08-10T20:00:04Z","uuid":"s1"}}"#
+            r#"{{"parentUuid":null,"isSidechain":false,"type":"system","subtype":"away_summary","content":"Goal is shipping the audio spot; the soak test is running.","timestamp":"2026-08-10T20:00:04Z","uuid":"s1"}}"#
         )
         .unwrap();
 
@@ -1021,7 +1021,7 @@ mod tests {
             .find(|e| e.text.contains("[system:away_summary]"))
             .expect("away_summary entry must exist");
         assert!(
-            summary.text.contains("Goal is shipping the radio spot"),
+            summary.text.contains("Goal is shipping the audio spot"),
             "away_summary's `content` must be preserved, not just the bare subtype label, got: {}",
             summary.text
         );

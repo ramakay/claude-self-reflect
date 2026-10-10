@@ -30,6 +30,7 @@ ledgers, with sealed pre-registration. Results: `docs/plans/saga-e2-results.md`
 | `mapping.json` / `grades.json` / `pools.json` | Outputs: origin map (owner-audited), per-item grades (204 items), pools. Conversation IDs only — no transcript content |
 
 2026-10-10: re-sealed after removing private repository names and commit subjects; row count, commit hashes and gold columns unchanged. (The `gold.json` seal is a commit reference, not a content hash.)
+Re-sealed again 2026-10-10 after withholding private task text (e2 `queries.json`, `gold.json`, `mapping.json`: text of the 8 app-corpus queries replaced by placeholders; ids, strata, origin ids and grades unchanged).
 
 Rules that made it credible: extraction never sees rank lists; ledgers corroborate but
 never mint the top grade; UNRESOLVED strata excluded from origin metrics; owner audit

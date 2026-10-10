@@ -475,7 +475,7 @@ fn npm_package_key(s: &str) -> &str {
 /// external by the X1 module-aware tier.
 ///
 /// `@/foo` is deliberately distinguished from a scoped npm package
-/// (`@scope/name`, e.g. `@clerk/expo`): an alias has NOTHING between `@` and
+/// (`@scope/name`, e.g. `@acme/mobile`): an alias has NOTHING between `@` and
 /// the following `/`, a scoped package always has a non-empty scope name
 /// there, so this check never swallows a genuine scoped dependency.
 pub fn is_relative_module(module: &str) -> bool {
@@ -972,14 +972,14 @@ tokio = "1"
     #[test]
     fn classify_module_scoped_npm_package_matches_full_two_segment_key() {
         let mut ns = builtins_only();
-        ns.js_deps.insert("@clerk/expo".to_string());
+        ns.js_deps.insert("@acme/mobile".to_string());
         assert!(
-            ns.classify_module("@clerk/expo"),
+            ns.classify_module("@acme/mobile"),
             "scoped package must match its full @scope/name key"
         );
         // A different package under the SAME scope must not false-positive
         // match just because the scope segment collides.
-        assert!(!ns.classify_module("@clerk/nextjs"));
+        assert!(!ns.classify_module("@acme/web"));
     }
 
     #[test]
@@ -1008,7 +1008,7 @@ tokio = "1"
         assert!(is_relative_module("@/components/Button"));
         // A genuine scoped npm package must NOT be treated as an alias — the
         // scope segment is non-empty between `@` and `/`.
-        assert!(!is_relative_module("@clerk/expo"));
+        assert!(!is_relative_module("@acme/mobile"));
         assert!(!is_relative_module("@expo/vector-icons"));
     }
 

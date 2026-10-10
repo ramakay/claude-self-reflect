@@ -9,7 +9,7 @@ first_repo=1
 for repo in \
   $HOME/projects/claude-self-reflect \
   $HOME/projects/private-app \
-  $HOME/projects/private-app-command-center \
+  $HOME/projects/private-app-dashboard \
   $HOME/projects/private-app-campaigns
 do
   [ -d "$repo/.git" ] || continue

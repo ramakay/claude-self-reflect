@@ -51,14 +51,14 @@ Project scoping: none (project=None → search_chunks unfiltered) — matches E2
 ### Queries (exact texts + targets; qid order fixed)
 Q1..Q12 = the 12 QUERIES in examples/saga_spike.rs lines 31-44 with same targets.
 A1..A8 (targets used only in output metadata, not retrieval):
-A1 "why did sign in switch from Clerk Core 3 finalize to legacy setActive in the expo app"
-A2 "why does the expo app defer sign in with an auth intent service instead of prompting immediately"
-A3 "why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load"
-A4 "why do returning user and anonymous user counts differ in the posthog numbers on the command center"
-A5 "why was score save instrumented with observability across multiple app runtime versions"
-A6 "why does the whats running section exist on the command center and what does it monitor"
-A7 "why was the radio reel video built as a remotion composition with a root of multiple scenes"
-A8 "why does the lessons page pull lesson analytics from posthog instead of supabase"
+A1 "why did the example client switch to the older authentication flow"
+A2 "why does the example client defer authentication instead of prompting immediately"
+A3 "why does the example dashboard cache report data in a snapshot instead of calling the APIs live on page load"
+A4 "why do two user counts differ in the analytics numbers on the example dashboard"
+A5 "why was the save action instrumented with observability across multiple client versions"
+A6 "why does the status section exist on the example dashboard and what does it monitor"
+A7 "why was the promo video built as a composition with a root of multiple scenes"
+A8 "why does the progress page pull its analytics from one backend instead of another"
 
 ### Output format (JSONL, serde_json to_string per line)
 {"arm":"b_full","qid":"Q1","convs":["<conv1>","<conv2>",...],

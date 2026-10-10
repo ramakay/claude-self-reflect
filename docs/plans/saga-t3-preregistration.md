@@ -103,7 +103,8 @@ One corpus snapshot, constructed once, used by all arms:
    (eval-kit/t3/mech_pairs.frozen.csv, sha256 998c4b13…). Citation-only pairs
    are excluded from Gate M as pre-specified (receipt-class primary).
    2026-10-10: re-sealed after removing private repository names and commit subjects; row count, hashes and gold columns unchanged.
-   (Previous seal for the roster: 5e03eb25…; question seal in eval-kit/t3/SEAL.sha256 was 1b331d35….)
+   (Previous seal for the roster: 5e03eb25…; question seal in eval-kit/t3/SEAL.sha256 was 1b331d35…, then 2c05e2fa…, now ac7f0cda….)
+   Re-sealed again 2026-10-10 after withholding private task text.
 5. **Snapshot identity**: sha256 1d2b9923c79b078d3e923fa4987ca0c712e0851068b4edef726dd317e174fa18
    (t3-frozen-20260727/csr.db); 119 conversations excluded; leak check clean;
    37 ledger verdicts and 48 plan chunks present.

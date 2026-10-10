@@ -1412,14 +1412,14 @@ output — this harness does not compute ground-truth coverage, only emits ranke
 
 A1..A8 (label qid "A1".."A8", in this order; these have no numeric/file target, just plain
 query text — targets are not used in this harness at all):
-- A1: "why did sign in switch from Clerk Core 3 finalize to legacy setActive in the expo app"
-- A2: "why does the expo app defer sign in with an auth intent service instead of prompting immediately"
-- A3: "why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load"
-- A4: "why do returning user and anonymous user counts differ in the posthog numbers on the command center"
-- A5: "why was score save instrumented with observability across multiple app runtime versions"
-- A6: "why does the whats running section exist on the command center and what does it monitor"
-- A7: "why was the radio reel video built as a remotion composition with a root of multiple scenes"
-- A8: "why does the lessons page pull lesson analytics from posthog instead of supabase"
+- A1: "why did the example client switch to the older authentication flow"
+- A2: "why does the example client defer authentication instead of prompting immediately"
+- A3: "why does the example dashboard cache report data in a snapshot instead of calling the APIs live on page load"
+- A4: "why do two user counts differ in the analytics numbers on the example dashboard"
+- A5: "why was the save action instrumented with observability across multiple client versions"
+- A6: "why does the status section exist on the example dashboard and what does it monitor"
+- A7: "why was the promo video built as a composition with a root of multiple scenes"
+- A8: "why does the progress page pull its analytics from one backend instead of another"
 
 ## OUTPUT FORMAT (JSONL via serde_json, one `writeln!` per line)
 First line (header, emitted once before any query results):

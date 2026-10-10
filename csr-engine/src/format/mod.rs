@@ -1676,18 +1676,18 @@ mod tests {
     fn quick_check_below_floor_suppresses_preview_and_count() {
         // Literal score of the weakest measured fabricated probe:
         // "onboarding call with the new backend contractor about payroll access"
-        // matched Clerk SMS OTP cost discussion at 0.456 — pre-fix this rendered
+        // matched Acme SMS OTP cost discussion at 0.456 — pre-fix this rendered
         // count=1 with a confident preview.
         let results = vec![quick_result(
             0.44,
-            "Clerk SMS OTP costs per verification in India",
+            "Acme SMS OTP costs per verification in India",
         )];
         let xml = format_quick_check(&results, "onboarding call about payroll access");
         assert!(xml.contains("<found>false</found>"), "got: {xml}");
         assert!(xml.contains("<count>0</count>"), "got: {xml}");
         assert!(!xml.contains("<count>1</count>"), "got: {xml}");
         assert!(!xml.contains("<preview>"), "got: {xml}");
-        assert!(!xml.contains("Clerk SMS OTP"), "got: {xml}");
+        assert!(!xml.contains("Acme SMS OTP"), "got: {xml}");
         assert!(
             xml.contains("<best_rejected_score>0.440</best_rejected_score>"),
             "got: {xml}"

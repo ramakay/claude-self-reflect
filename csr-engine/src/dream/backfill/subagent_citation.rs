@@ -597,7 +597,7 @@ mod tests {
                         "input": {
                             "file_path": "/repo/HomeScreen.tsx",
                             "old_string": "before",
-                            "new_string": "call ensureRadioAudioMode now"
+                            "new_string": "call ensureAudioMode now"
                         }
                     }]
                 }
@@ -619,7 +619,7 @@ mod tests {
 
         let citations = cite_subagents_for_symbol(
             std::slice::from_ref(&transcript),
-            "ensureRadioAudioMode",
+            "ensureAudioMode",
             "/repo/HomeScreen.tsx",
         );
 
@@ -628,9 +628,8 @@ mod tests {
         assert_eq!(citations[0].tool_name, "Edit");
         let stored = fs::read(&citations[0].transcript_path).unwrap();
         assert_eq!(
-            &stored
-                [citations[0].byte_offset..citations[0].byte_offset + "ensureRadioAudioMode".len()],
-            b"ensureRadioAudioMode"
+            &stored[citations[0].byte_offset..citations[0].byte_offset + "ensureAudioMode".len()],
+            b"ensureAudioMode"
         );
     }
 
@@ -645,7 +644,7 @@ mod tests {
                     "role": "assistant",
                     "content": [{
                         "type": "text",
-                        "text": "I found ensureRadioAudioMode"
+                        "text": "I found ensureAudioMode"
                     }]
                 }
             }),
@@ -660,20 +659,20 @@ mod tests {
                             "name": "Read",
                             "input": {
                                 "file_path": "/repo/HomeScreen.tsx",
-                                "description": "ensureRadioAudioMode"
+                                "description": "ensureAudioMode"
                             }
                         },
                         {
                             "type": "tool_use",
                             "id": "tool-grep",
                             "name": "Grep",
-                            "input": {"pattern": "ensureRadioAudioMode"}
+                            "input": {"pattern": "ensureAudioMode"}
                         },
                         {
                             "type": "tool_use",
                             "id": "tool-bash",
                             "name": "Bash",
-                            "input": {"command": "rg ensureRadioAudioMode"}
+                            "input": {"command": "rg ensureAudioMode"}
                         }
                     ]
                 }
@@ -684,7 +683,7 @@ mod tests {
         let evidence = build_dream_citation_evidence(
             &["parent-1".to_string()],
             "-repo",
-            "ensureRadioAudioMode",
+            "ensureAudioMode",
             "/repo/HomeScreen.tsx",
             &root,
         );
@@ -708,19 +707,16 @@ mod tests {
                     "name": "Edit",
                     "input": {
                         "file_path": "/repo/HomeScreen.tsx",
-                        "old_string": "ensureRadioAudioModeHelper",
-                        "new_string": "xensureRadioAudioMode"
+                        "old_string": "ensureAudioModeHelper",
+                        "new_string": "xensureAudioMode"
                     }
                 }]
             }
         })]);
         let transcript = fixture_transcript(&root, "-repo", "parent-1", "substring", &bytes);
 
-        let citations = cite_subagents_for_symbol(
-            &[transcript],
-            "ensureRadioAudioMode",
-            "/repo/HomeScreen.tsx",
-        );
+        let citations =
+            cite_subagents_for_symbol(&[transcript], "ensureAudioMode", "/repo/HomeScreen.tsx");
 
         assert!(citations.is_empty());
     }
@@ -741,7 +737,7 @@ mod tests {
                         "input": {
                             "file_path": "/repo/HomeScreen.tsx",
                             "old_string": "before",
-                            "new_string": "ensureRadioAudioMode"
+                            "new_string": "ensureAudioMode"
                         }
                     }]
                 }
@@ -761,11 +757,8 @@ mod tests {
         ]);
         let transcript = fixture_transcript(&root, "-repo", "parent-1", "failed", &bytes);
 
-        let citations = cite_subagents_for_symbol(
-            &[transcript],
-            "ensureRadioAudioMode",
-            "/repo/HomeScreen.tsx",
-        );
+        let citations =
+            cite_subagents_for_symbol(&[transcript], "ensureAudioMode", "/repo/HomeScreen.tsx");
 
         assert!(citations.is_empty());
     }
@@ -939,7 +932,7 @@ mod tests {
     fn malformed_jsonl_lines_are_skipped_without_corrupting_receipt_offset() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("projects");
-        let mut bytes = b"{malformed ensureRadioAudioMode}\n".to_vec();
+        let mut bytes = b"{malformed ensureAudioMode}\n".to_vec();
         bytes.extend(jsonl(&[serde_json::json!({
             "type": "assistant",
             "message": {
@@ -951,19 +944,19 @@ mod tests {
                     "input": {
                         "file_path": "/repo/file.rs",
                         "old_string": "before",
-                        "new_string": "ensureRadioAudioMode"
+                        "new_string": "ensureAudioMode"
                     }
                 }]
             }
         })]));
         let expected_offset = bytes
-            .windows(b"ensureRadioAudioMode".len())
-            .rposition(|window| window == b"ensureRadioAudioMode")
+            .windows(b"ensureAudioMode".len())
+            .rposition(|window| window == b"ensureAudioMode")
             .unwrap();
         let transcript = fixture_transcript(&root, "-repo", "parent-1", "malformed", &bytes);
 
         let citations =
-            cite_subagents_for_symbol(&[transcript], "ensureRadioAudioMode", "/repo/file.rs");
+            cite_subagents_for_symbol(&[transcript], "ensureAudioMode", "/repo/file.rs");
 
         assert_eq!(citations[0].byte_offset, expected_offset);
     }
@@ -1083,11 +1076,8 @@ mod tests {
         })]);
         let transcript = fixture_transcript(&root, "-repo", "parent-1", "abc", &bytes);
 
-        let citations = cite_subagents_for_symbol(
-            &[transcript],
-            "ensureRadioAudioMode",
-            "/repo/HomeScreen.tsx",
-        );
+        let citations =
+            cite_subagents_for_symbol(&[transcript], "ensureAudioMode", "/repo/HomeScreen.tsx");
 
         assert!(citations.is_empty());
     }
@@ -1135,7 +1125,7 @@ mod tests {
 
         let citations = cite_subagents_for_symbol(
             std::slice::from_ref(&transcript),
-            "ensureRadioAudioMode",
+            "ensureAudioMode",
             "/repo/HomeScreen.tsx",
         );
 

@@ -9,7 +9,7 @@
 //! `claude-self-reflect` (episodes + 16k ledger rows) alongside
 //! `claude-self-reflect-csr-engine` (8.1k ledger rows, 244 funerals, ZERO
 //! episodes — sessions started inside the `csr-engine/` subdir), plus
-//! worktree-cwd keys (`csr-theme-wt`, `private-app-command-center-worktrees`)
+//! worktree-cwd keys (`csr-theme-wt`, `private-app-dashboard-worktrees`)
 //! and even case variants (`Private-App-Campaigns` vs an `private-app` ledger key
 //! holding files under `Private-App-Campaigns/`). Stage 2's generators joined
 //! episodes to witness verdicts on the EXACT key, so every funeral recorded
@@ -19,7 +19,7 @@
 //!
 //! The first version of this module grouped keys by NAME: two keys merged
 //! when, case-insensitively, they were equal or one was a hyphen-boundary
-//! prefix of the other (`private-app` + `private-app-command-center`). That
+//! prefix of the other (`private-app` + `private-app-dashboard`). That
 //! heuristic is now known to be a **false-positive generator**: on the live
 //! corpus `private-app` and `private-app-website` are two genuinely unrelated git
 //! repositories (different toplevels, different origin remotes) that
