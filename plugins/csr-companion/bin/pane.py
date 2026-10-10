@@ -310,7 +310,8 @@ def dreams_on():
 
 
 def status_text(data):
-    dreams = f"{data['dreams_7d']} dreams this week" if data['dreams_on'] else 'dreams off'
+    n = data['dreams_7d']
+    dreams = f"{n} {'dream' if n == 1 else 'dreams'} this week" if data['dreams_on'] else 'dreams off'
     return f"☾ CSR remembered {data['recalled']}× this session · {dreams}"
 
 
