@@ -655,11 +655,14 @@ pub(crate) fn dream_join_cancellable(
             }
 
             let latest_for_w = witness_verdicts::latest_event(conn, w.id)?;
-            // A witness whose latest live event is a reinstatement had every
-            // earlier negative event cancelled: nothing at or before the
-            // commit that reinstatement observed may be reused as a
-            // successor or a receipt (see `reinstatement_boundary`).
-            let boundary = reinstatement_boundary(latest_for_w.as_ref());
+            // A witness that was ever reinstated had every earlier negative
+            // event cancelled: nothing at or before the HEAD its NEWEST
+            // reinstatement observed may be reused as a successor or a
+            // receipt - not even after a later negative verdict (A, B, A
+            // restored, deleted, B again: the last B is C5's work, never
+            // C2's).
+            let boundary_owned = witness_verdicts::latest_reinstatement_observed_head(conn, w.id)?;
+            let boundary = boundary_owned.as_deref();
             let boundary_oid = parse_oid(boundary);
 
             let candidate: Option<(WitnessVerdictRow, Option<&WitnessLedgerRow>)> = match h {
@@ -873,6 +876,7 @@ fn resolve_candidate_receipt(
             successor_oid: successor
                 .and_then(|s| s.at_oid.as_deref())
                 .ok_or(Abstain::Unparseable)?,
+            head: head_oid,
         },
         VerdictKind::AnchorReinstated => receipt::Claim::Reinstated {
             head: head_oid,
@@ -882,18 +886,6 @@ fn resolve_candidate_receipt(
         },
     };
     receipt::resolve_receipt(resolver, &subject, w_oid, boundary, &claim)
-}
-
-/// The HEAD a witness's latest live event was a reinstatement at, if it was:
-/// the earliest point a NEW negative conclusion about that witness may draw
-/// on. Everything before it was cancelled by the reinstatement, so a
-/// successor row or a receipt commit from that older era (A at C1, B at C2,
-/// A restored at C3, B again at C4: the second supersession is C4's, not
-/// C2's) must not be reused.
-fn reinstatement_boundary(latest: Option<&WitnessVerdictRow>) -> Option<&str> {
-    latest
-        .filter(|l| l.verdict == VerdictKind::AnchorReinstated)
-        .map(|l| l.observed_head_oid.as_str())
 }
 
 /// Search `head_stamp_rows` — the anchor's successor-candidate set,
@@ -2415,9 +2407,140 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_verdict_after_a_reinstatement_keeps_the_reinstatement_boundary() {
+        // C1=A, C2=B, C3=A restored (reinstated), C4 deletes foo (obsolete),
+        // C5=B again. The latest event at C5 is `anchor_obsolete`, but the C1
+        // witness was reinstated at C3: C2's row and commit belong to the
+        // cancelled era, so the new supersession is C5's work.
+        let repo = TestRepo::new();
+        let other = "fn other() {}\n";
+        repo.write("lib.rs", &foo_with("1", other));
+        let c1 = repo.commit("c1 A");
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1")]);
+        run_join(&storage, false);
+
+        repo.write("lib.rs", &foo_with("2", other));
+        let c2 = repo.commit("c2 B");
+        insert_rows(&storage, &file, &[(&c2, "b3:2")]);
+        run_join(&storage, false);
+        assert_eq!(
+            latest(&storage, &file, &c1).unwrap().receipt_oid.as_deref(),
+            Some(c2.as_str())
+        );
+
+        repo.write("lib.rs", &foo_with("1", other));
+        let c3 = repo.commit("c3 A restored");
+        insert_rows(&storage, &file, &[(&c3, "b3:1")]);
+        run_join(&storage, false);
+        assert_eq!(
+            latest(&storage, &file, &c1).unwrap().verdict,
+            VerdictKind::AnchorReinstated
+        );
+
+        repo.write("lib.rs", other);
+        let c4 = repo.commit("c4 foo deleted");
+        run_join(&storage, false);
+        let gone = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(gone.verdict, VerdictKind::AnchorObsolete);
+        assert_eq!(gone.receipt_oid.as_deref(), Some(c4.as_str()));
+
+        repo.write("lib.rs", &foo_with("2", other));
+        let c5 = repo.commit("c5 B again");
+        insert_rows(&storage, &file, &[(&c5, "b3:2")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_no_receipt, 0, "{stats:?}");
+
+        let again = latest(&storage, &file, &c1).unwrap();
+        assert_eq!(again.verdict, VerdictKind::SupersededBy);
+        assert_eq!(
+            again.receipt_oid.as_deref(),
+            Some(c5.as_str()),
+            "must be C5, not the cancelled C2 {c2}"
+        );
+        assert_eq!(
+            again.successor_witness_id,
+            Some(witness_at(&storage, &file, &c5)),
+            "successor must be the post-reinstatement row"
+        );
+    }
+
+    #[test]
+    fn siblings_with_unequal_line_ranges_do_not_share_a_stamp() {
+        // `foo` spans lines 0..2 and `bar` starts on foo's last line. Only
+        // `bar` changes. The ledger's whole-line stamps differ for BOTH, but
+        // `foo`'s own bytes did not change: it must not be superseded.
+        let repo = TestRepo::new();
+        repo.write(
+            "lib.rs",
+            "fn foo() {\n    1\n} fn bar() { 2 }\nfn other() {}\n",
+        );
+        let c1 = repo.commit("c1");
+        repo.write(
+            "lib.rs",
+            "fn foo() {\n    1\n} fn bar() { 3 }\nfn other() {}\n",
+        );
+        let c2 = repo.commit("c2 changes bar only");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+        insert_symbol_rows(&storage, &file, "bar", &[(&c1, "b3:1"), (&c2, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert!(
+            latest(&storage, &file, &c1).is_none(),
+            "foo never changed: {stats:?}"
+        );
+        assert_eq!(stats.abstained_same_content, 1, "{stats:?}");
+        let bar = storage
+            .latest_witness_verdict(witness_of(&storage, &file, "bar", &c1))
+            .unwrap()
+            .expect("bar did change");
+        assert_eq!(bar.verdict, VerdictKind::SupersededBy);
+        assert_eq!(bar.receipt_oid.as_deref(), Some(c2.as_str()));
+    }
+
+    #[test]
+    fn a_historical_successor_cannot_bypass_an_ambiguous_head_symbol() {
+        // foo=A at C1, B at C2, A restored at C3, then ANOTHER `foo` (= B) is
+        // inserted above the surviving original at C4. At C4 the bare name
+        // `foo` heads a collision group, so what the HEAD row names is
+        // unproven; the historical C2 row must not stand in for it.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1 A");
+        repo.write("lib.rs", &foo_src("2"));
+        let c2 = repo.commit("c2 B");
+        repo.write("lib.rs", &foo_src("1"));
+        let c3 = repo.commit("c3 A restored");
+        repo.write("lib.rs", &format!("{}{}", foo_src("2"), foo_src("1")));
+        let c4 = repo.commit("c4 new foo=B above the original");
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(
+            &storage,
+            &file,
+            &[(&c1, "b3:1"), (&c2, "b3:2"), (&c3, "b3:1"), (&c4, "b3:2")],
+        );
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 0, "{stats:?}");
+        assert!(
+            latest(&storage, &file, &c1).is_none(),
+            "the surviving original must not be superseded: {stats:?}"
+        );
+        assert!(stats.abstained_unparseable >= 1, "{stats:?}");
+    }
+
+    #[test]
     fn definitions_sharing_a_line_abstain_instead_of_sharing_a_stamp() {
         // `foo` and `bar` live on one line, so a change to `bar` changes
-        // `foo`'s line-span stamp. `foo` itself never changed.
+        // `foo`'s line-span ledger stamp. `foo` itself never changed: the
+        // receipt check hashes its exact bytes, finds the same content and
+        // abstains.
         let repo = TestRepo::new();
         repo.write(
             "lib.rs",
@@ -2437,7 +2560,7 @@ mod tests {
         let stats = run_join(&storage, false);
         assert_eq!(stats.superseded, 0, "{stats:?}");
         assert_eq!(stats.events_written, 0, "{stats:?}");
-        assert_eq!(stats.abstained_unparseable, 1, "{stats:?}");
+        assert_eq!(stats.abstained_same_content, 1, "{stats:?}");
         assert!(latest(&storage, &file, &c1).is_none());
     }
 

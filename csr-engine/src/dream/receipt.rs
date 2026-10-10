@@ -287,14 +287,17 @@ fn collision_base(symbol: &str) -> Option<&str> {
         .then(|| &symbol[..i])
 }
 
-/// Indices (into `spans`, inclusive `(start, end)` lines) of every span that
-/// overlaps another without one strictly containing the other. Identical
-/// ranges overlap. A span nested strictly inside another (a method in its
-/// class) is fine: the container's content legitimately includes it.
+/// Indices (into `spans`, inclusive `(start, end)` byte offsets of the AST
+/// nodes) of every span that overlaps another without one strictly containing
+/// the other. Identical ranges overlap. A span nested inside another (a
+/// method in its class) is fine: the container's content legitimately
+/// includes it.
 ///
-/// Why: a span stamp covers whole lines, so two definitions on the same
-/// line (or sharing a boundary line) share bytes - an edit to one changes
-/// the other's stamp, and a verdict about either would be about both.
+/// Why: two distinct definitions never share bytes unless the AST says one
+/// is inside the other, so a partial overlap or an identical range means the
+/// extractor named one piece of text twice - a verdict about either would be
+/// about both. (Line ranges cannot answer this: `fn foo() {\n 1\n} fn bar()
+/// { 2 }` has foo at lines 0-2 and bar at 2-2, which looks nested but is not.)
 fn ambiguous_spans(spans: &[(usize, usize)]) -> Vec<bool> {
     let mut order: Vec<usize> = (0..spans.len()).collect();
     // Start ascending, end descending: a container sorts before what it holds.
@@ -327,7 +330,7 @@ fn ambiguous_spans(spans: &[(usize, usize)]) -> Vec<bool> {
 /// unsupported, or a span does not fit the file (all of which are Unknown).
 ///
 /// A name whose state cannot be trusted maps to `None` (reads as Unknown):
-/// - its span overlaps a neighbour's without containing it ([`ambiguous_spans`]);
+/// - its AST byte range overlaps a neighbour's without containing it ([`ambiguous_spans`]);
 /// - it heads a collision group (`foo` while `foo#2` exists): the bare name
 ///   goes to the span-earliest duplicate, so a same-named definition added
 ///   above an unchanged `foo` silently renames the original to `foo#2`.
@@ -344,37 +347,17 @@ fn symbol_stamps(
         commit,
         &|_| true,
     )?;
-    let lines: Vec<&[u8]> = {
-        let mut lines: Vec<&[u8]> = if bytes.is_empty() {
-            Vec::new()
-        } else {
-            bytes.split(|&b| b == b'\n').collect()
-        };
-        if bytes.ends_with(b"\n") {
-            lines.pop();
-        }
-        lines
-    };
     let mut spans = Vec::with_capacity(derived.nodes.len());
     let mut stamps = Vec::with_capacity(derived.nodes.len());
-    for node in &derived.nodes {
-        // 0-based row span -> 1-based inclusive lines, the convention the
-        // HEAD pass hands to `Anchor::with_span`.
-        let (start, end) = (node.span_start, node.span_end);
-        if start < 0 || end < start {
+    // Hash the node's EXACT bytes, not whole lines: two definitions sharing
+    // a line (`} fn bar() { 2 }`) must not share, or leak edits through,
+    // each other's stamp.
+    for &(start, end) in &derived.byte_ranges {
+        if end <= start || end > bytes.len() {
             return None;
         }
-        let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
-        if end >= lines.len() {
-            return None;
-        }
-        let mut span = Vec::new();
-        for line in &lines[start..=end] {
-            span.extend_from_slice(line);
-            span.push(b'\n');
-        }
-        spans.push((start, end));
-        stamps.push(stamp_normalized(&span).as_str().to_string());
+        spans.push((start, end - 1));
+        stamps.push(stamp_normalized(&bytes[start..end]).as_str().to_string());
     }
     let overlapping = ambiguous_spans(&spans);
     let mut out: HashMap<String, Option<String>> = HashMap::with_capacity(derived.symbols.len());
@@ -532,8 +515,14 @@ pub(crate) enum Abstain {
 pub(crate) enum Claim<'a> {
     /// `W` went stale: gone at `head`.
     Obsolete { head: &'a str },
-    /// `W` was replaced by the witness minted at `successor_oid`.
-    Superseded { successor_oid: &'a str },
+    /// `W` was replaced by the witness minted at `successor_oid`; `head` is
+    /// the HEAD the join observed, where the symbol must itself still be
+    /// readable and unambiguous - a historical successor row never vouches
+    /// for a HEAD whose symbol cannot be told apart from a same-named one.
+    Superseded {
+        successor_oid: &'a str,
+        head: &'a str,
+    },
     /// `W` is back at `head`; the negative verdict it carried was observed
     /// at `negative_observed_head`.
     Reinstated {
@@ -584,11 +573,26 @@ pub(crate) fn resolve_receipt(
             }
             Ok(receipt)
         }
-        Claim::Superseded { successor_oid } => {
-            match resolver.state_at(subject, successor_oid) {
+        Claim::Superseded {
+            successor_oid,
+            head,
+        } => {
+            let successor = match resolver.state_at(subject, successor_oid) {
                 SymbolState::Unknown => return Err(Abstain::Unparseable),
                 SymbolState::Absent => return Err(Abstain::SuccessorAbsent),
                 s if is_base(&s) => return Err(Abstain::SameContent),
+                s @ SymbolState::Present(_) => s,
+            };
+            // The same checks at HEAD, whatever commit the successor row
+            // names: an ambiguous (collision-group) or unparseable HEAD
+            // symbol abstains, one that is gone is not a replacement, and
+            // one that differs from the successor is not the successor's
+            // content.
+            match resolver.state_at(subject, head) {
+                SymbolState::Unknown => return Err(Abstain::Unparseable),
+                SymbolState::Absent => return Err(Abstain::SuccessorAbsent),
+                s if is_base(&s) => return Err(Abstain::SameContent),
+                s if s != successor => return Err(Abstain::NoReceipt),
                 SymbolState::Present(_) => {}
             }
             // The change is the first commit that HAS the symbol with other

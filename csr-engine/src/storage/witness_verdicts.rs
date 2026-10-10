@@ -199,6 +199,26 @@ pub fn latest_event(conn: &Connection, witness_id: i64) -> Result<Option<Witness
     Ok(row)
 }
 
+/// The `observed_head_oid` of the newest LIVE `anchor_reinstated` event for
+/// `witness_id`, whatever events followed it. A negative verdict recorded
+/// after a reinstatement does not un-cancel the earlier era: the boundary a
+/// reinstatement drew stays drawn.
+pub fn latest_reinstatement_observed_head(
+    conn: &Connection,
+    witness_id: i64,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT observed_head_oid
+         FROM witness_verdicts
+         WHERE witness_id = ?1 AND verdict = 'anchor_reinstated'
+           AND id > {LIVE_EVENT_FLOOR_SQL}
+         ORDER BY id DESC LIMIT 1"
+    ))?;
+    Ok(stmt
+        .query_row(params![witness_id], |row| row.get(0))
+        .optional()?)
+}
+
 /// `true` when `candidate` would be a genuinely NEW conclusion relative to
 /// `latest` — i.e. there is no latest event, or the two differ in `verdict`
 /// kind. A different `observed_head_oid`, `receipt_oid` or

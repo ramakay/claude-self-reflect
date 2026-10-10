@@ -23,10 +23,18 @@ use sha2::{Digest, Sha256};
 use super::ast_analysis::{extract_name_from_def, func_kinds, import_kinds, type_kinds};
 use crate::storage::codegraph::{EdgeRow, NodeRow};
 
+/// `(id, start, end, AST-order)`: one physical definition within a parse.
+type NodeOccurrenceKey = (String, i64, i64, usize);
+
 /// A fragment of the code graph extracted from one file.
 #[derive(Debug, Clone, Default)]
 pub struct GraphFragment {
     pub nodes: Vec<NodeRow>,
+    /// Exact UTF-8 byte range `[start, end)` of each node's AST node in the
+    /// source, index-aligned with `nodes`. Unlike `span_start`/`span_end`
+    /// (whole lines), two definitions sharing a line have disjoint byte
+    /// ranges here.
+    pub node_byte_ranges: Vec<(usize, usize)>,
     pub edges: Vec<EdgeRow>,
     /// Lexical containers derived from the same AST root as `nodes`. Span
     /// stamping consumes this field to avoid parsing each committed file a
@@ -1725,7 +1733,7 @@ fn extract_inner(
     // the extraction boundary, in deterministic `(id,start,end,AST-order)`
     // order. The ordinal is necessary because distinct one-line definitions
     // can share the same persisted line span.
-    let mut nodes: BTreeMap<(String, i64, i64, usize), NodeRow> = BTreeMap::new();
+    let mut nodes: BTreeMap<NodeOccurrenceKey, (NodeRow, (usize, usize))> = BTreeMap::new();
     let mut node_occurrence = 0usize;
     let mut edges: BTreeMap<(String, String, String), EdgeRow> = BTreeMap::new();
     // X4 adversarial review, Finding 4; ALL-distinct-chains as of the Codex
@@ -1759,32 +1767,35 @@ fn extract_inner(
     let module_id = node_id(repo, file, "module", file);
     nodes.insert(
         (module_id.clone(), 0, 0, node_occurrence),
-        NodeRow {
-            id: module_id.clone(),
-            repo: repo.into(),
-            project: project.into(),
-            file: file.into(),
-            lang: lang_name.into(),
-            kind: "module".into(),
-            name: file.into(),
-            fqname: file.into(),
-            body_hash: file_hash.clone(),
-            span_start: 0,
-            span_end: 0,
-            first_conv_id: conv_id.into(),
-            last_conv_id: conv_id.into(),
-            last_session_id: session_id.into(),
-            // Extraction doesn't know repo identity — populated by the
-            // write-path caller (WP2 Stage 1; see
-            // `extraction::repo_root::repo_root_for_file`), never guessed
-            // here.
-            repo_root: None,
-            // Extracted definition node — always definition-backed.
-            name_only: false,
-            // Extraction doesn't know attribution either — populated by
-            // the WP2 Stage 2 backfill/hook write path.
-            attribution: String::new(),
-        },
+        (
+            NodeRow {
+                id: module_id.clone(),
+                repo: repo.into(),
+                project: project.into(),
+                file: file.into(),
+                lang: lang_name.into(),
+                kind: "module".into(),
+                name: file.into(),
+                fqname: file.into(),
+                body_hash: file_hash.clone(),
+                span_start: 0,
+                span_end: 0,
+                first_conv_id: conv_id.into(),
+                last_conv_id: conv_id.into(),
+                last_session_id: session_id.into(),
+                // Extraction doesn't know repo identity — populated by the
+                // write-path caller (WP2 Stage 1; see
+                // `extraction::repo_root::repo_root_for_file`), never guessed
+                // here.
+                repo_root: None,
+                // Extracted definition node — always definition-backed.
+                name_only: false,
+                // Extraction doesn't know attribution either — populated by
+                // the WP2 Stage 2 backfill/hook write path.
+                attribution: String::new(),
+            },
+            (0, source.len()),
+        ),
     );
 
     let grep = lang.ast_grep(source);
@@ -1869,7 +1880,11 @@ fn extract_inner(
                     let node = mk_node(canon, &name, &text, start, end);
                     let nid = node.id.clone();
                     node_occurrence += 1;
-                    nodes.insert((nid.clone(), start, end, node_occurrence), node);
+                    let range = n.range();
+                    nodes.insert(
+                        (nid.clone(), start, end, node_occurrence),
+                        (node, (range.start, range.end)),
+                    );
                     add_edge(module_id.clone(), nid, "defines", 1, "", "");
                 }
             }
@@ -1897,7 +1912,11 @@ fn extract_inner(
                 let node = mk_node("const", &name, &text, start, end);
                 let nid = node.id.clone();
                 node_occurrence += 1;
-                nodes.insert((nid.clone(), start, end, node_occurrence), node);
+                let range = n.range();
+                nodes.insert(
+                    (nid.clone(), start, end, node_occurrence),
+                    (node, (range.start, range.end)),
+                );
                 add_edge(module_id.clone(), nid, "defines", 1, "", "");
             }
         }
@@ -2045,8 +2064,11 @@ fn extract_inner(
     // `root` — see `tree_has_error`'s doc comment.
     let parse_clean = !tree_has_error(&root);
 
+    let (nodes, node_byte_ranges): (Vec<NodeRow>, Vec<(usize, usize)>) =
+        nodes.into_values().unzip();
     GraphFragment {
-        nodes: nodes.into_values().collect(),
+        nodes,
+        node_byte_ranges,
         edges: edges.into_values().collect(),
         containers,
         local_bindings,

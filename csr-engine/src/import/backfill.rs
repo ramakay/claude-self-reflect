@@ -1075,6 +1075,8 @@ fn qualify_one_symbol(containers: &[ContainerSpan], start: i64, end: i64, name: 
 /// `nodes[i]` is qualified as `symbols[i]`.
 pub(crate) struct RederivedSpans {
     pub nodes: Vec<NodeRow>,
+    /// Exact `[start, end)` byte range of `nodes[i]`'s AST node.
+    pub byte_ranges: Vec<(usize, usize)>,
     pub symbols: Vec<String>,
     pub disambiguated: usize,
 }
@@ -1107,11 +1109,12 @@ pub(crate) fn rederive_symbol_spans(
     if !fragment.parse_clean {
         return None;
     }
-    let nodes: Vec<NodeRow> = fragment
+    let (nodes, byte_ranges): (Vec<NodeRow>, Vec<(usize, usize)>) = fragment
         .nodes
         .into_iter()
-        .filter(|node| node.kind != "module" && keep(node))
-        .collect();
+        .zip(fragment.node_byte_ranges)
+        .filter(|(node, _)| node.kind != "module" && keep(node))
+        .unzip();
     let defs: Vec<(String, String, i64, i64)> = nodes
         .iter()
         .map(|n| (n.kind.clone(), n.name.clone(), n.span_start, n.span_end))
@@ -1119,6 +1122,7 @@ pub(crate) fn rederive_symbol_spans(
     let (symbols, disambiguated) = qualify_witness_symbols(&defs, &fragment.containers);
     Some(RederivedSpans {
         nodes,
+        byte_ranges,
         symbols,
         disambiguated,
     })
