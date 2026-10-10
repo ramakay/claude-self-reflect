@@ -50,6 +50,17 @@ const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 /// Handle the session-start hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    // After a compaction, the session's story is rewritten from the summary Claude Code just
+    // wrote: detached, and with no model call
+    if input.source.as_deref() == Some("compact") {
+        if let Some(ref tp) = input.transcript_path {
+            crate::summarizer::spawn_detached_story_generation(
+                tp,
+                &cwd.to_string_lossy(),
+                crate::summarizer::StoryMode::FromCompaction,
+            );
+        }
+    }
     if let Err(e) = handle_inner(input, engine, cwd).await {
         eprintln!("CSR: session-start hook error (non-fatal): {}", e);
         // Output minimal context so session gets SOMETHING rather than silent "Success"

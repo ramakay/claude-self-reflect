@@ -516,6 +516,21 @@ impl Storage {
         queries::mark_enrichment_completed(&conn, conversation_id, enrichment_type, reflection_id)
     }
 
+    pub fn story_messages_covered(&self, conversation_id: &str) -> Result<Option<usize>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::story_messages_covered(&conn, conversation_id)
+    }
+
+    pub fn mark_story_written(
+        &self,
+        conversation_id: &str,
+        reflection_id: &str,
+        messages: usize,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_story_written(&conn, conversation_id, reflection_id, messages)
+    }
+
     pub fn mark_enrichment_failed(
         &self,
         conversation_id: &str,

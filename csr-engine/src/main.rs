@@ -411,6 +411,14 @@ enum Commands {
         /// Current working directory (for project resolution)
         #[arg(long)]
         cwd: String,
+
+        /// Write the story from Claude Code's newest compaction summary (no model call)
+        #[arg(long, conflicts_with = "rewrite")]
+        from_compaction: bool,
+
+        /// Let Haiku rewrite a story that has fallen behind (opt-in: CSR_STORY_REWRITES=1)
+        #[arg(long)]
+        rewrite: bool,
     },
 }
 
@@ -1511,13 +1519,21 @@ async fn run(
     if let Some(Commands::GenerateStory {
         ref transcript,
         ref cwd,
+        from_compaction,
+        rewrite,
     }) = args.command
     {
+        use csr_engine::summarizer::StoryMode;
+        let mode = match (from_compaction, rewrite) {
+            (true, _) => StoryMode::FromCompaction,
+            (_, true) => StoryMode::Rewrite,
+            _ => StoryMode::First,
+        };
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        return csr_engine::summarizer::generate_story_cli(&eng, transcript, cwd).await;
+        return csr_engine::summarizer::generate_story_cli(&eng, transcript, cwd, mode).await;
     }
 
     if let Some(Commands::Hook { ref name, apply }) = args.command {

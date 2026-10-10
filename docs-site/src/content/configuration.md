@@ -19,6 +19,7 @@ Configured in `~/.claude/settings.json` via `csr-engine hook install --apply`.
 |----------|---------|-------------|
 | CSR_NARRATIVE_MODEL | — | Override model for AI narratives (falls back to `haiku`, then CLI default) |
 | CSR_NO_AI_NARRATIVES | — | Set to `1` to disable AI narrative generation entirely |
+| CSR_STORY_REWRITES | — | Opt-in. Set to `1` and, when a session ends, Haiku rewrites its story to take in the work after the last compaction. It runs only when that work is at least a quarter of the session. Each rewrite is one metered Haiku call (`claude -p`) |
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | Custom DB path |
 | CSR_TIMING_LOG | ~/.claude-self-reflect/hook-timing.log | Custom hook-timing log path (test runs redirect to a temp file automatically) |
 

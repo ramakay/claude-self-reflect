@@ -2193,6 +2193,39 @@ pub fn mark_enrichment_completed(
     Ok(())
 }
 
+/// How many messages a conversation had when its story was last written. None when it has no
+/// story, or one written before the count was kept.
+pub fn story_messages_covered(conn: &Connection, conversation_id: &str) -> Result<Option<usize>> {
+    let covered = conn
+        .query_row(
+            "SELECT chunk_count FROM enrichment_state
+             WHERE conversation_id = ?1 AND enrichment_type = 'session_story' AND status = 'completed'",
+            params![conversation_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(covered.map(|n| n.max(0) as usize))
+}
+
+/// Record a story written over the conversation's first `messages` messages.
+pub fn mark_story_written(
+    conn: &Connection,
+    conversation_id: &str,
+    reflection_id: &str,
+    messages: usize,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO enrichment_state
+             (conversation_id, enrichment_type, status, reflection_id, chunk_count, updated_at)
+         VALUES (?1, 'session_story', 'completed', ?2, ?3, datetime('now'))
+         ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
+             status = 'completed', reflection_id = ?2, chunk_count = ?3, updated_at = datetime('now')",
+        params![conversation_id, reflection_id, messages as i64],
+    )?;
+    Ok(())
+}
+
 /// Mark enrichment as failed with an error message.
 pub fn mark_enrichment_failed(
     conn: &Connection,
@@ -5389,6 +5422,20 @@ mod tests {
         let map = get_ratification_scores(&conn, &["c1".into(), "missing".into()]).unwrap();
         assert_eq!(map.get("c1"), Some(&0.6));
         assert!(!map.contains_key("missing"));
+    }
+
+    #[test]
+    fn a_story_remembers_how_much_of_the_session_it_covered() {
+        let conn = mem();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), None);
+        // a story written before the count was kept covers an unknown part
+        mark_enrichment_completed(&conn, "conv-s", "session_story", "story_conv-s").unwrap();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), None);
+        mark_story_written(&conn, "conv-s", "story_conv-s", 300).unwrap();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), Some(300));
+        mark_story_written(&conn, "conv-s", "story_conv-s", 640).unwrap();
+        assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), Some(640));
+        assert!(is_conversation_enriched(&conn, "conv-s", "session_story").unwrap());
     }
 
     #[test]

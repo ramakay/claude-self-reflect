@@ -1,8 +1,11 @@
-//! PreCompact hook — imports transcript + generates session story before compaction.
+//! PreCompact hook — imports the transcript before compaction.
 //!
 //! For ALL sessions:
 //! 1. Imports current transcript (so it's searchable post-compact)
-//! 2. Generates Haiku-curated session story (stored for SessionStart re-injection)
+//! 2. Triggers one dream cycle
+//!
+//! The session's story is written after the compaction instead, by SessionStart, from the
+//! summary Claude Code writes as it compacts: that needs no model call.
 //!
 //! Always exits 0 (never blocks compaction).
 
@@ -18,12 +21,6 @@ use crate::engine::Engine;
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     // Import transcript for ALL sessions before compaction destroys context
     super::import_current_transcript(input, engine, cwd).await;
-
-    // Spawn detached Haiku story generation before compaction (fire-and-forget)
-    if let Some(ref tp) = input.transcript_path {
-        let cwd_str = cwd.to_string_lossy().to_string();
-        crate::summarizer::spawn_detached_story_generation(tp, &cwd_str);
-    }
 
     // v10: a compaction is a natural consolidation boundary. Trigger exactly
     // one dream cycle over the just-imported transcript, detached and
