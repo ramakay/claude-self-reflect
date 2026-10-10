@@ -154,12 +154,13 @@ const DREAMS = { command: 'csr', args: 'dreams', origin: { kind: 'human' } } as 
 const ON = { options: { dreams: true } }
 const LOOK = 41_000 // USAGE, all four counts
 
-test('session start in herdr: status line, old pane closed, new split watches this session', async ($, on) => {
+test('session start in herdr: no status line, old pane closed, new split watches this session', async ($, on) => {
   const seen = host(on, { herdr: true, repo: true })
   await $.session.start(START as never)
   await settle(() => seen.runs.some(argv => argv.includes('--watch')))
 
-  expect(seen.statuses).toContain(SHIFTS.status)
+  expect(seen.statuses).toContain(undefined) // CSR pins no line under the prompt
+  expect(seen.statuses).not.toContain(SHIFTS.status)
   expect(seen.runs).toContainEqual(['/bin/herdr', 'pane', 'close', 'w2:p2'])
   expect(seen.runs.find(argv => argv[2] === 'split')).toEqual(expect.arrayContaining(['--pane', 'w2:p1', '--direction', 'right', '--no-focus']))
   expect(seen.runs).toContainEqual(['/bin/herdr', 'pane', 'rename', 'w2:p9', 'CSR'])

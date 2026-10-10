@@ -94,7 +94,6 @@ async function answered($: EngineInterface, note: Note, answer: string): Promise
 async function refresh($: EngineInterface, cwd: string): Promise<ShiftsData | null> {
   const fresh = await json<ShiftsData>($, ['--repo', cwd, '--json', '--limit', '60', '--sid', await $.session.id()])
   await update($, data, () => fresh)
-  $.ui.status(fresh?.status ?? undefined)
   return fresh
 }
 
@@ -437,11 +436,12 @@ export const register: Register = (on, options) => {
     ) : ours
   })
 
-  // ---------------------------------------------------------------- the pane, the status line, /csr
+  // ---------------------------------------------------------------- the pane, /csr
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     if (!e.isInteractive) return started
+    $.ui.status(undefined) // CSR pins no line under the prompt: the pane carries what it knows
     await $.command.register({
       name: 'csr',
       description: 'Open the CSR pane beside Claude; "/csr dreams" says how the dreamer is pacing itself',

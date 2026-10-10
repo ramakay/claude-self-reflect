@@ -55,6 +55,8 @@ SETUP = 'CSR is not set up yet: npx claude-self-reflect setup'
 IDLE = 15 * 60  # a gap longer than this is drawn as a break, not as time
 KEEP = os.path.join(HOME, '.claude-self-reflect', 'csr-companion')
 DREAM_LOG = os.path.join(KEEP, 'dreams.jsonl')  # the mod's own: csr-engine's DB stays read-only
+PANES = os.path.join(KEEP, 'panes')  # <session>.json: the pid of the pane open beside that session
+STATUS_LINES = os.path.join(KEEP, 'statusline')  # <session>.json: Claude's status line, moved into the pane
 
 
 def epoch(ts):
@@ -312,6 +314,22 @@ def load(root, limit, session_id=None):
                 changes_total=len(changes), dreams=dreams, dreams_7d=len(week),
                 dream_tokens_7d=sum(d.get('tokens') or 0 for d in week),
                 corrections_carried_7d=carried, shifts_told_7d=told, reminded_7d=carried + told)
+
+
+def kept_file(folder, session_id):
+    return os.path.join(folder, f'{session_id}.json') if session_id and re.fullmatch(r'[\w-]+', session_id) else None
+
+
+def claude_status(session_id, now):
+    """Claude's status line as its command last drew it, kept for this pane while it is open; None when
+    there is none, or it is older than ten minutes."""
+    try:
+        with open(kept_file(STATUS_LINES, session_id) or '', encoding='utf-8') as handle:
+            kept = json.load(handle)
+        line = str(kept.get('line') or '').strip('\n')
+        return line if line and now - float(kept.get('at') or 0) < 600 else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def dreams_on():
@@ -743,6 +761,11 @@ SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams
                changed='quiet', remembered='recall', kept='turn')
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆')  # where no pictures are drawn
+DARK = dict(claude=(36, 36, 35), facts=(26, 26, 25), gauges=(16, 16, 16))  # the masthead's grounds, a
+# shade apart: Claude's own status line, the session's facts, its gauges. Its lines read best dark.
+ON_DARK = dict(text=(236, 236, 231), label=(150, 150, 144), you=(236, 236, 231), ctx=(112, 164, 232),
+               learn=(96, 196, 146), recall=(96, 196, 146), turn=(240, 112, 82), dream=(226, 176, 64),
+               asked=(168, 156, 240), rule=(255, 255, 255, 40))
 TINT = 0.15  # an opened row: its section's ink at this strength on the paper
 ROW = 0.065  # every other row of a section
 SS = 2  # draw at twice the size, then shrink: PIL draws no anti-aliased edges
@@ -772,9 +795,13 @@ def shrink(image):
     return out.getvalue()
 
 
-def session_png(s, cols, cell, now):
-    """Three lanes over active session time: your prompts, Claude's context, CSR's memory at work."""
+def session_png(s, cols, cell, now, dark=False):
+    """Three lanes over active session time: your prompts, Claude's context, CSR's memory at work; on the
+    dark ground, in its lighter inks, the ground painted in."""
+    INK = ON_DARK if dark else globals()['INK']
     image, draw = canvas(cols, 3, cell)
+    if dark:
+        draw.rectangle([0, 0, image.width, image.height], fill=DARK['gauges'] + (255,))
     w, lane = image.width, image.height / 3
     learned, gave = s['learned'], s['gave']
     clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
@@ -784,9 +811,9 @@ def session_png(s, cols, cell, now):
     for b in clock.breaks:
         bx = 2 * SS + b / clock.total * (w - 4 * SS)
         for y in range(0, int(3 * lane), 6 * SS):
-            draw.line([(bx, y), (bx, y + 2 * SS)], fill=(0, 0, 0, 60), width=SS)
+            draw.line([(bx, y), (bx, y + 2 * SS)], fill=(255, 255, 255, 60) if dark else (0, 0, 0, 60), width=SS)
     for t in s['compacts']:
-        draw.line([(x(t), lane), (x(t), 2 * lane)], fill=(0, 0, 0, 90), width=SS)
+        draw.line([(x(t), lane), (x(t), 2 * lane)], fill=(255, 255, 255, 90) if dark else (0, 0, 0, 90), width=SS)
     # you: one tick per prompt
     for t in s['prompts']:
         draw.line([(x(t), lane * 0.2), (x(t), lane * 0.8)], fill=INK['you'], width=2 * SS)
@@ -968,6 +995,47 @@ def band(name, strength=TINT):
     return f'\x1b[48;2;{r};{g};{b}m'
 
 
+COLOUR = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def ansi_fit(text, width):
+    """text cut to width cells, its colours kept, an ellipsis where it was cut."""
+    if len(COLOUR.sub('', text)) <= width:
+        return text
+    out, n, at = [], 0, 0
+    for match in list(COLOUR.finditer(text)) + [None]:
+        chunk = text[at:match.start()] if match else text[at:]
+        if n + len(chunk) > width - 1:
+            return ''.join(out) + chunk[:width - 1 - n] + '…' + OFF
+        out.append(chunk)
+        n += len(chunk)
+        if not match:
+            break
+        out.append(match.group())
+        at = match.end()
+    return ''.join(out)
+
+
+def ansi_wrap(text, width, rows):
+    """A status line over as many rows as it needs, broken at its │ separators, colours kept."""
+    lines, line = [], ''
+    for part in text.split('│'):
+        joined = line + '│' + part if line else part
+        if line and len(COLOUR.sub('', joined).rstrip()) > width:
+            lines.append(line.rstrip())
+            line = part.lstrip(' ')
+        else:
+            line = joined
+    lines.append(line.rstrip())
+    return [ansi_fit(l, width) for l in lines if COLOUR.sub('', l).strip()][:rows]
+
+
+def on_dark(line, shade):
+    """A masthead row on its dark ground, run to the pane's edge, light type laid again after each reset."""
+    back, fg = '\x1b[48;2;%d;%d;%dm' % DARK[shade], '\x1b[38;2;%d;%d;%dm' % ON_DARK['text']
+    return back + fg + line.replace(OFF, OFF + back + fg) + '\x1b[K' + OFF
+
+
 def tinted(line, back):
     """The line on a background that runs to the pane's edge, laid again after each reset in it."""
     return back + line.replace(OFF, OFF + back) + '\x1b[K' + OFF
@@ -1140,13 +1208,15 @@ def heading(name, title, right, width):
 LANE = 9  # the lanes' labels, then their picture
 
 
-def lanes_legend(s, width):
-    parts = [(ink('learn') + '▮', f"{short(len(s['learned']['chunks']))} learned"),
-             (ink('recall') + '↑', f"{len(s['gave']['recalls']) + len(s['gave']['carried'])} handed to Claude"),
-             (ink('asked') + '●', f"{len(s['asked'])} asked")]
+def lanes_legend(s, width, dark=False):
+    hue = lambda name: '\x1b[38;2;%d;%d;%dm' % (ON_DARK if dark else INK)[name][:3]
+    parts = [(hue('learn') + '▮', f"{short(len(s['learned']['chunks']))} learned"),
+             (hue('recall') + '↑', f"{len(s['gave']['recalls']) + len(s['gave']['carried'])} handed to Claude"),
+             (hue('asked') + '●', f"{len(s['asked'])} asked")]
     while sum(2 + len(text) + 2 for _, text in parts) - 2 > width and len(parts) > 1:
         parts.pop()
-    return '  '.join(f"{mark}{OFF} {ink('quiet')}{text}{OFF}" for mark, text in parts)
+    words = hue('text') if dark else ink('quiet')
+    return '  '.join(f"{mark}{OFF} {words}{text}{OFF}" for mark, text in parts)
 
 
 def recall_act(item, now):
@@ -1331,7 +1401,8 @@ def page_main(data, s, now):
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
     if s['compacts']:
         facts.append(f"{len(s['compacts'])} compacts")
-    return dict(head=dict(facts=' · '.join(facts), session=s if s.get('learned') else None),
+    return dict(head=dict(facts=' · '.join(facts), session=s if s.get('learned') else None,
+                          status=data.get('claude_line')),
                 quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=[
         dict(name='touching', title='Touching now', right=f"{len(touching)} file{'s' if len(touching) != 1 else ''}" if touching else '', items=touching[:5],
@@ -1396,14 +1467,18 @@ def page_lines(page, width, rows, ui):
     with something to report, its rows in its own tint (every other one a shade deeper), a strip of paper
     between. Every section keeps its heading and first row; the room left goes to the earlier ones first."""
     head, s = page['head'], page['head'].get('session')
-    out = Lines([' ' + BOLD + fit(head['title'], width - 1) + OFF] if head.get('title') else [])
-    out.put([' ' + ink('quiet') + fit(head['facts'], width - 1) + OFF])
+    label = '\x1b[38;2;%d;%d;%dm' % ON_DARK['label']
+    top = [(' ' + line, 'claude') for line in ansi_wrap(head.get('status') or '', width - 1, 2)]  # its status line
+    if head.get('title'):
+        top.append((' ' + BOLD + fit(head['title'], width - 1) + OFF, 'facts'))
+    top.append((' ' + fit(head['facts'], width - 1), 'facts'))
+    out = Lines([on_dark(line, shade) for line, shade in top])
     out.heads, out.lanes = [], None
     if s:
         if PIXELS and width - LANE > 8:
             out.lanes = len(out)
-            out.put([' ' + ink('faint') + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')])
-        out.put(['  ' + lanes_legend(s, width - 2)])
+            out.put([on_dark(' ' + label + name.ljust(LANE - 1) + OFF, 'gauges') for name in ('you', 'context', 'memory')])
+        out.put([on_dark('  ' + lanes_legend(s, width - 2, dark=True), 'gauges')])
     built = []
     for section in page['sections']:
         blocks = []
@@ -1451,7 +1526,7 @@ def draw_page(page, cols, rows, ui):
         cell = cell_size()
         s = page['head'].get('session')
         if s and lines.lanes is not None:
-            pictures.append((lines.lanes, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time())))
+            pictures.append((lines.lanes, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time(), dark=True)))
         pictures += [(row, 0, ICON[0], ICON[1], iso_png(name, cell, backs))
                      for row, name, backs in lines.heads if row + ICON[1] <= rows - 1]
     return lines, pictures
@@ -1523,6 +1598,7 @@ class Pane:
             if self.data is None or now - self.loaded > 60:
                 self.data, self.loaded = load(self.root, self.limit, self.session and self.session.id), now
             self.data['dreams'] = load_dream_log(self.root)  # the mod appends while we watch
+            self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             s = self.session.load() if self.session and self.view == 'main' else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
             said = SETUP if not os.path.exists(DB) else f'could not read csr-engine: {error}'
@@ -1535,6 +1611,7 @@ class Pane:
             self.sent = None
         ui = dict(open=self.open, sent=self.sent)
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
+                          self.data.get('claude_line'),
                           [(d['id'], d['answer']) for d in self.data['dreams']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
@@ -1577,6 +1654,13 @@ def watch(root, limit, session_id, agent=None):
     pane = Pane(root, limit, session_id, agent)
     redraw = {'now': True}
     signal.signal(signal.SIGWINCH, lambda *_: redraw.update(now=True))
+    for ending in (signal.SIGTERM, signal.SIGHUP):  # closed or killed: still clear up below
+        signal.signal(ending, lambda *_: sys.exit(0))
+    mine = kept_file(PANES, session_id)
+    if mine:  # while this file names a live pid, Claude's status lines draw here, not under its prompt
+        os.makedirs(PANES, exist_ok=True)
+        with open(mine, 'w', encoding='utf-8') as handle:
+            json.dump(dict(pid=os.getpid()), handle)
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd) if os.isatty(fd) else None
     if saved:
@@ -1611,6 +1695,11 @@ def watch(root, limit, session_id, agent=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if mine:
+            try:
+                os.remove(mine)
+            except OSError:
+                pass
         if saved:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write('\x1b_Ga=d,d=A\x1b\\' + (MOUSE_OFF if saved else '') + GROUND_BACK + '\x1b[?25h\n')
