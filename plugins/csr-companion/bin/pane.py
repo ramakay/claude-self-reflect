@@ -1563,7 +1563,7 @@ def page_main(data, s, now):
     opened = sum(1 for item in s.get('remembered') or [] if item.get('opened'))
     if given:
         handed.append(dict(key='handed:all', quiet=True, lines=1,
-                           title=f"{given} handed · {f'{opened} opened' if opened else 'none opened'}",
+                           title=f"{given} handed" + (f" · {opened} opened" if opened else ''),  # a zero would measure the format
                            detail=passive[:5] or ['Nothing left to list.'],
                            send=one_line('CSR handed you these this session: ' + '; '.join(passive[:5]))))
 
