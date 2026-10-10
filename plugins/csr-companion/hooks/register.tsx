@@ -7,7 +7,7 @@ import type { Thread } from './carry'
 import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
 import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, hasNews, mayLook, median, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
-import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit } from './coach'
+import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, RELEASE, releaseFromGit } from './coach'
 
 // CSR beside Claude, patterned on Claude Code's own "You should know".
 //
@@ -51,6 +51,24 @@ type HerdrPane = { pane_id: string; tab_id?: string; workspace_id?: string; labe
 async function run($: EngineInterface, argv: string[]): Promise<string | null> {
   const ran = await $.process.run(['python3', '-I', script($), ...argv], { timeoutMs: 20_000 })
   return ran.exitCode === 0 ? ran.stdout : null
+}
+
+// Where a push that names no branch lands: the current branch, its upstream, any configured push refspec.
+async function landsOnRelease($: EngineInterface, dir: string): Promise<boolean> {
+  const git = async (...args: string[]) => {
+    try {
+      const ran = await $.process.run(['git', '-C', dir, ...args], { timeoutMs: 2_000 })
+      return ran.exitCode === 0 ? ran.stdout : ''
+    } catch {
+      return ''
+    }
+  }
+  const [branch, upstream, config] = await Promise.all([
+    git('symbolic-ref', '-q', '--short', 'HEAD'),
+    git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'),
+    git('config', '--get-regexp', '^remote\\..*\\.push$'),
+  ])
+  return releaseFromGit(branch, upstream, config)
 }
 
 async function json<T>($: EngineInterface, argv: string[]): Promise<T | null> {
@@ -217,7 +235,7 @@ async function newChapter($: EngineInterface, why: 'start' | 'compact' | 'two ho
     await $.store.set('chapterSteps', [...(Array.isArray(lengths) ? lengths : []), old.steps].slice(-CHAPTERS_KEPT))
   }
   const at = await $.clock.now()
-  const chapter = freshChapter(session, at)
+  const chapter = { ...freshChapter(session, at), gen: (old?.session === session ? old.gen ?? 0 : 0) + 1 }
   await $.store.set('chapter', chapter)
   await run($, ['--repo', await $.session.cwd(), '--keep', JSON.stringify({
     kind: 'chapter', at: at / 1000, session, why, left: dreamsLeft(chapter), of: allowance(chapter),
@@ -299,12 +317,21 @@ async function dream($: EngineInterface, lastStep: number, base: number): Promis
   const used = 'usage' in reply ? tokensOf(reply.usage) : 0
   await $.store.set('briefFacts', [...before.filter(line => !now.includes(line)), ...now].slice(-FACTS_KEPT))
   pace = { ...(await paceOf($)), looks: pace.looks + 1, dreamer: pace.dreamer + used, lastLook: used || pace.lastLook }
+  // A compaction that started a new chapter while the fork ran: this answer was about the old one, whose
+  // context is gone. Its tokens count; the new chapter is left as the compaction made it.
+  const same = (chapter: Chapter) =>
+    chapter.started === opening.started && chapter.session === opening.session && chapter.gen === opening.gen
+  const ours = (change: (chapter: Chapter) => Chapter) => (current: Chapter) => (same(current) ? change(current) : current)
+  if (!same(await chapterOf($))) {
+    await $.store.set('pace', pace)
+    return lookCameTo($, cwd, session, 'stale', await chapterOf($), base, used)
+  }
   // No grounding gate: one kept out the only dream acted on. The prompt asks for a receipt; you judge.
   const found = reply.isAnswered ? parseDream(reply.text) : null
   const repeat = !!found && [...seen, ...known].some(line => sameDream(line, found.line))
   if (!found || repeat) {
     await $.store.set('pace', pace)
-    const chapter = await changeChapter($, current => spread(base, usual)({ ...current, looks: current.looks + 1 }))
+    const chapter = await changeChapter($, ours(current => spread(base, usual)({ ...current, looks: current.looks + 1 })))
     return lookCameTo($, cwd, session, repeat ? 'repeat' : 'none', chapter, base, used)
   }
   await $.store.set('pace', { ...pace, dreams: pace.dreams + 1 })
@@ -324,8 +351,8 @@ async function dream($: EngineInterface, lastStep: number, base: number): Promis
     tokens: used,
   }
   const isShown = await show($, note, 'Dream')
-  const chapter = await changeChapter($, current =>
-    spread(base, usual)({ ...current, looks: current.looks + 1, shown: current.shown + (isShown ? 1 : 0) }))
+  const chapter = await changeChapter($, ours(current =>
+    spread(base, usual)({ ...current, looks: current.looks + 1, shown: current.shown + (isShown ? 1 : 0) })))
   if (!isShown) return
   await remember($, 'seenDreams', found.line, SEEN_KEPT)
   await run($, ['--repo', cwd, '--keep', JSON.stringify({
@@ -426,10 +453,15 @@ export const register: Register = (on, options) => {
 
   // The push guard, kept to the two rules that are never right: --no-verify (it skips the pre-commit gate)
   // and a push to release/v* (it publishes to npm). Every other git push goes through untouched.
+  // A push whose destination the words leave to the repository (bare `git push`, `git push origin HEAD`) is
+  // settled by asking git where it lands; a git that cannot answer lets the push go on.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const verdict = gitVerdict(e.command)
+    const cwd = await $.session.cwd()
+    const verdict = gitVerdict(e.command, 0, cwd)
     if (!verdict) return next(e)
-    return verdict.kind === 'deny' ? { deny: verdict.reason } : next(e)
+    if (verdict.kind === 'deny') return { deny: verdict.reason }
+    if (verdict.kind === 'check' && await landsOnRelease($, verdict.dir ?? cwd)) return { deny: RELEASE }
+    return next(e)
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
 
   on('tool.call', async ($, e, next) => {

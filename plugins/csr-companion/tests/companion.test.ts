@@ -65,6 +65,8 @@ type World = {
   sources?: Partial<Record<SettingsSource, Record<string, unknown>>>
   configDir?: string
   noNode?: boolean
+  forkGate?: Promise<void> // a fork that answers only once this settles
+  git?: Record<string, string> // what `git -C dir <args>` prints, keyed by the args; missing ones fail
   compactFails?: boolean
   lost?: unknown[] | string // what pane.py --lost prints (a string as is, 'hangs' a timeout); undefined makes it fail
 }
@@ -142,6 +144,7 @@ function host(on: On, world: World) {
   })
   on('model.fork', async (_$, e) => {
     forks.push(e.prompt)
+    if (world.forkGate) await world.forkGate
     const text = world.replies?.[forks.length - 1] ?? 'dream: none'
     return { value: { isAnswered: true, text, usage: USAGE } }
   })
@@ -163,6 +166,10 @@ function host(on: On, world: World) {
     if (e.argv[0] === 'rm') {
       for (const path of e.argv.slice(2)) files.delete(path)
       return ok('')
+    }
+    if (e.argv[0] === 'git') {
+      const said = world.git?.[e.argv.slice(3).join(' ')]
+      return said === undefined ? { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : ok(said)
     }
     if (e.argv[0] === 'node' && world.noNode) return { value: { exitCode: 127, stdout: '', stderr: 'node: not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'python3' && e.argv.includes('--note')) return ok(JSON.stringify(world.notes ?? []))
@@ -465,6 +472,23 @@ test("each chapter's first look is taken even when CSR's notes hold nothing new;
   await steps($, 12)
   await settle(() => seen.forks.length >= 2)
   expect(seen.forks.length).toBe(2) // a new chapter: a fresh look again
+})
+
+test('a look still running when a compaction starts the next chapter leaves that chapter alone', ON, async ($, on) => {
+  let open = () => undefined as void
+  const world = { herdr: false, repo: true, replies: [DREAM_REPLY], forkGate: new Promise<void>(done => (open = done)) }
+  const seen = host(on, world)
+  const band = await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 1)
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never)
+  await settle(() => seen.kept.some(record => record.kind === 'chapter' && record.why === 'compact'))
+  const fresh = seen.store.get('chapter')
+  open()
+  await settle(() => seen.kept.some(record => record.outcome === 'stale'))
+  expect(seen.store.get('chapter')).toEqual(fresh) // due, looks and shown as the compaction set them
+  expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
+  expect(seen.kept.find(record => record.outcome === 'stale')).toEqual(expect.objectContaining({ tokens: expect.any(Number) }))
 })
 
 test('a compaction folds the dream that is up: its context is gone', ON, async ($, on) => {
@@ -887,6 +911,28 @@ test('the push guard: --no-verify and release/v* are denied; every other push go
   expect((await bash('git push origin HEAD:release/v9')).deny).toBe(RELEASE) // release/v* is never let through
 })
 
+test('a push that names no branch is denied when git says it lands on release/v*', async ($, on) => {
+  const branch = { 'symbolic-ref -q --short HEAD': 'release/v10.1.0\n' }
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as never) as Promise<{ deny?: string }>
+  host(on, { herdr: false, repo: true, git: branch })
+  for (const c of ['git push', 'git push -u origin HEAD', 'git push origin']) expect((await bash(c)).deny).toBe(RELEASE)
+  expect((await bash('git push origin HEAD:feat/x')).deny).toBeUndefined() // the words name the branch
+})
+
+test('upstream and configured push refspecs count; a git that cannot answer lets the push go on', async ($, on) => {
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as never) as Promise<{ deny?: string }>
+  const world = { herdr: false, repo: true, git: { 'symbolic-ref -q --short HEAD': 'feat/x\n' } as Record<string, string> }
+  host(on, world)
+  expect((await bash('git push')).deny).toBeUndefined()
+  world.git['rev-parse --abbrev-ref --symbolic-full-name @{upstream}'] = 'origin/release/v9\n'
+  expect((await bash('git push')).deny).toBe(RELEASE)
+  delete world.git['rev-parse --abbrev-ref --symbolic-full-name @{upstream}']
+  world.git['config --get-regexp ^remote\\..*\\.push$'] = 'remote.origin.push refs/heads/*:refs/heads/*\n'
+  expect((await bash('git push')).deny).toBe(RELEASE)
+  world.git = {}
+  expect((await bash('git push')).deny).toBeUndefined()
+})
+
 test('gitVerdict reads git as a command word, not git in words', () => {
   const kind = (c: string) => gitVerdict(c)?.kind ?? null
   const reason = (c: string) => {
@@ -899,15 +945,27 @@ test('gitVerdict reads git as a command word, not git in words', () => {
     'git push origin release/v9.5.9', 'git push origin HEAD:release/v9', 'git push origin refs/heads/release/v9',
     'git push origin +HEAD:refs/heads/release/v9', 'git push --all', 'git push --mirror origin', 'git push -u origin release/v10',
     'git -C /repo push origin HEAD:release/v1', 'FOO=1 git push origin release/v2', 'bash -c "git push origin release/v3"',
+    "git push origin 'refs/heads/*:refs/heads/*'", 'git push --dry-run --no-dry-run origin HEAD:release/v1',
+    "sh -ce 'git push origin release/v1'", 'env -i git push origin release/v1', 'sudo -u me git push origin release/v1',
+    'echo "$(git push origin release/v1)"', "bash <<'EOF'\ngit push origin release/v1\nEOF",
+    "bash -o pipefail -c 'git push origin release/v1'", 'x=`git push origin release/v1`',
   ])
     expect(reason(c)).toBe(RELEASE)
-  for (const c of ['git push', 'git push origin main', 'git push -u origin feature/x', 'echo hi && git push origin backport/x', 'sudo git push origin main', '(git push origin main)', 'sh -c \'git push origin main\'', 'git push origin main 2>&1 | tail -3'])
+  for (const c of ['git commit --verify --no-verify -m x', 'git push -o ci.skip --no-verify origin main']) expect(reason(c)).toBe(NO_VERIFY)
+  // where it lands is the repository's to say: the hook asks git (see the next test)
+  for (const c of ['git push', 'git push origin', 'git push origin HEAD', 'git push -u origin HEAD', 'cd /r && git push'])
+    expect(kind(c)).toBe('check')
+  expect(gitVerdict('cd /r && git push', 0, '/elsewhere')).toEqual({ kind: 'check', dir: '/r', remote: null })
+  expect(gitVerdict('git -C sub push origin HEAD', 0, '/r')).toEqual({ kind: 'check', dir: '/r/sub', remote: 'origin' })
+  for (const c of ['git push origin main', 'git push -u origin feature/x', 'git push -o --dry-run origin main', 'echo hi && git push origin backport/x', 'sudo git push origin main', '(git push origin main)', 'sh -c \'git push origin main\'', 'git push origin main 2>&1 | tail -3'])
     expect(kind(c)).toBe('ask')
   for (const c of [
     'ls', 'git status', 'git log --oneline', 'git commit -m "git push --no-verify"', 'git commit -m "mention release/v9 push"',
     'echo git push origin main', 'echo "git push origin main"', 'grep "git push" notes.md', 'git push --dry-run origin main',
     "cat <<'EOF'\ngit push origin release/v9\ngit commit --no-verify\nEOF", 'echo hi # git push origin main',
     'git pull origin release/v9', 'git checkout release/v9', 'git commit -m "x" --amend', 'git stash push',
+    "echo sh -c 'git push origin release/v1'", 'git commit -m --no-verify', 'git commit --no-verify --verify -m x',
+    "cat <<'EOF'\nbash -c 'git push origin release/v1'\nEOF",
   ])
     expect(kind(c)).toBe(null)
   expect(commands('a "b c" && d; e | f')).toEqual([['a', 'b c'], ['d'], ['e'], ['f']])

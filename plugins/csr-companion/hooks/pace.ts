@@ -47,6 +47,7 @@ export type Chapter = {
   looks: number
   shown: number
   adopted: number
+  gen?: number // counts the session's chapters: a look that outlived its chapter knows it, whatever the clock says
 }
 
 export const freshChapter = (session: string, started: number): Chapter => ({
