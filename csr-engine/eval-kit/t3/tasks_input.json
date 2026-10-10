@@ -45,66 +45,66 @@
  },
  {
   "task_id": "t3-12",
-  "prompt": "Why did the paywall get redesigned into a bottom sheet with benefit copy and price preview, instead of keeping the settings/collection buttons calling the purchase flow directly?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-13",
-  "prompt": "Why was the paywall-v2 build split into exactly three parallel implementer lanes with disjoint file ownership, instead of one sequential pass?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-14",
-  "prompt": "Why did the settings screen's active-subscription card need \"Restore Purchases\" removed from it specifically?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-15",
-  "prompt": "Did the goal-aware rewrite of the ad-campaign grading logic (installs as the north star, sample-size guards, stripped hardcoded numbers) actually reach the live command-center dashboard?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-16",
-  "prompt": "Did the anonymous-browsing-channel group id backfilled for the 2026-07-24 radio-monetization OTA still appear in the release-train manifest as of the most recent commit touching that file?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-17",
-  "prompt": "Was the \"Manage Subscription\" button in settings \u2014 reported dead the same day as two other subscription-related bugs \u2014 actually fixed with a code change?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-18",
-  "prompt": "Did the OpenAI Ads pixel integration described in its own plan (loader component, tracking wrapper, conversion events on store-badge clicks) ever get committed to version control?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-19",
-  "prompt": "A plan for next-OTA-cycle ANR mitigation on the 1.5.5 binary was logged as a task and then never touched again in the tracker \u2014 did the underlying ANR problem it targeted get fixed anyway?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-20",
-  "prompt": "The \"fb4a Meta install influx\" investigation was logged as a single completed task in the meta-campaigns session history \u2014 did it leave behind any retrievable written finding or code change in these repos?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-21",
-  "prompt": "The Routine feature's epic plan, BRD/TDD doc, and Phase-0 instrumentation task were all recorded in a session under the marketing-analytics project's directory \u2014 does the mobile app repo's own documentation explain why its feature work would be tracked there?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-22",
-  "prompt": "The Counter-engagement analytics module and the active-release resolver were tracked as completed in a session dated 2026-06-27 \u2014 does the commit that actually contains those files carry the same date?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-23",
-  "prompt": "The audio production for the first and second radio tracks, and their release into specific app stations, happened on the same calendar day \u2014 did both halves happen in the same repository?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-24",
-  "prompt": "A set of \"capture\" tasks for practice/feedback-hero, counter, calendar, streak, and radio screenshots was logged in the mobile app repo's task history as never completed \u2014 were those specific captures ever actually produced, and if so, where does the evidence live?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-25",
-  "prompt": "Is the OpenAI Ads pixel work findable anywhere as a committed change in the repository its own plan file names as the deployment target?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-26",
-  "prompt": "The \"production-submit invariant\" hardening idea (rejecting anon-profile builds from production submission) was raised in the same session as a real production release \u2014 did it, or an equivalent guard, ever land in any of the four core repos, under any name?"
+  "prompt": "[private repository task]"
  },
  {
   "task_id": "t3-27",
-  "prompt": "The plan for the release-train dual-OTA-group fix said the writer/helper/test files it built would live in an \"unversioned\" location outside any project repo \u2014 is that still an accurate description of where those files live today?"
+  "prompt": "[private repository task]"
  }
 ]

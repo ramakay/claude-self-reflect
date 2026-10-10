@@ -250,7 +250,7 @@ The new coverage gate quantifies exactly this, live, on every eval run:
 structural_file_coverage (informational, H8 innovation, not gated):
   overall = 400/1737 (23.0%); repo_roots measured=7, skipped(enumeration failed)=0
   claude-self-reflect      66/108  (61.1%)
-  private-app-command-center  92/169  (54.4%)
+  private-app-dashboard       92/169  (54.4%)
   company-website             67/172  (39.0%)
   private-app                 137/610  (22.5%)
   private-app-ota-rls-template 2/537  (0.4%)

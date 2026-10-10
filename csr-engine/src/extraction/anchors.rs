@@ -250,12 +250,12 @@ mod tests {
     #[test]
     fn unsupported_language_yields_file_level_anchor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("RadioSheet.swift");
-        std::fs::write(&path, "class RadioSheet { func show() {} }").unwrap();
+        let path = dir.path().join("AudioSheet.swift");
+        std::fs::write(&path, "class AudioSheet { func show() {} }").unwrap();
         let anchors = capture_file_anchors(&path);
         assert_eq!(anchors.len(), 1);
         assert_eq!(anchors[0].node_kind, "file");
-        assert_eq!(anchors[0].name, "RadioSheet.swift");
+        assert_eq!(anchors[0].name, "AudioSheet.swift");
         assert!(!anchors[0].body_hash.is_empty());
     }
 

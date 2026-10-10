@@ -102,23 +102,23 @@ const QUERIES: &[(&str, &str)] = &[
     ),
     (
         "A3",
-        "why does the command center cache campaign data in a snapshot instead of calling the APIs live on page load",
+        "why does the example dashboard cache report data in a snapshot instead of calling the APIs live on page load",
     ),
     (
         "A5",
-        "why was score save instrumented with observability across multiple app runtime versions",
+        "why was the save action instrumented with observability across multiple client versions",
     ),
     (
         "A6",
-        "why does the whats running section exist on the command center and what does it monitor",
+        "why does the status section exist on the example dashboard and what does it monitor",
     ),
     (
         "A7",
-        "why was the radio reel video built as a remotion composition with a root of multiple scenes",
+        "why was the promo video built as a composition with a root of multiple scenes",
     ),
     (
         "A8",
-        "why does the lessons page pull lesson analytics from posthog instead of supabase",
+        "why does the progress page pull its analytics from one backend instead of another",
     ),
 ];
 

@@ -1564,8 +1564,8 @@ mod tests {
             error_signatures: vec![],
             tools_used: vec![],
             files_modified: vec![
-                "src/radio/RadioSheet.swift".into(),
-                "src/radio/ChannelRing.swift".into(),
+                "src/audio/AudioSheet.swift".into(),
+                "src/audio/ChannelRing.swift".into(),
             ],
             message_count: 10,
             duration_minutes: 5,
@@ -1573,9 +1573,9 @@ mod tests {
             approved_plan: None,
             prev_episode_id: None,
             anchors: vec![crate::extraction::anchors::FunctionAnchor {
-                file: "src/radio/RadioSheet.swift".into(),
+                file: "src/audio/AudioSheet.swift".into(),
                 node_kind: "file".into(),
-                name: "RadioSheet.swift".into(),
+                name: "AudioSheet.swift".into(),
                 body_hash: "h".into(),
             }],
         }
@@ -1585,7 +1585,7 @@ mod tests {
     fn code_map_lists_files_with_anchor_counts_and_lookup() {
         let out = format_code_map(&code_map_episode(), "2d ago").unwrap();
         assert!(out.starts_with("CSR CODE MAP"));
-        assert!(out.contains("src/radio/RadioSheet.swift"));
+        assert!(out.contains("src/audio/AudioSheet.swift"));
         assert!(out.contains("1 anchor"));
         assert!(out.contains("outcome=partial"));
         assert!(out.contains("csr_reflect_on_past(\"conv_abc123\")"));
@@ -1611,22 +1611,22 @@ mod tests {
     fn code_map_anchor_count_respects_path_segment_boundary() {
         // "Ring.swift" must NOT match the anchor for ".../ChannelRing.swift" —
         // that's a basename substring collision, not the same file.
-        // "RadioSheet.swift" (relative, no dir) must still match the anchor's
-        // "src/radio/RadioSheet.swift" (absolute-ish) — that's a genuine
+        // "AudioSheet.swift" (relative, no dir) must still match the anchor's
+        // "src/audio/AudioSheet.swift" (absolute-ish) — that's a genuine
         // path-segment-boundary suffix match across abs/rel styles.
         let mut ep = code_map_episode();
-        ep.files_modified = vec!["Ring.swift".into(), "RadioSheet.swift".into()];
+        ep.files_modified = vec!["Ring.swift".into(), "AudioSheet.swift".into()];
         ep.anchors = vec![
             crate::extraction::anchors::FunctionAnchor {
-                file: "src/radio/ChannelRing.swift".into(),
+                file: "src/audio/ChannelRing.swift".into(),
                 node_kind: "file".into(),
                 name: "ChannelRing.swift".into(),
                 body_hash: "h1".into(),
             },
             crate::extraction::anchors::FunctionAnchor {
-                file: "src/radio/RadioSheet.swift".into(),
+                file: "src/audio/AudioSheet.swift".into(),
                 node_kind: "file".into(),
-                name: "RadioSheet.swift".into(),
+                name: "AudioSheet.swift".into(),
                 body_hash: "h2".into(),
             },
         ];
@@ -1641,8 +1641,8 @@ mod tests {
         );
         let sheet_line = out
             .lines()
-            .find(|l| l.trim_start().starts_with("RadioSheet.swift"))
-            .expect("RadioSheet.swift line present");
+            .find(|l| l.trim_start().starts_with("AudioSheet.swift"))
+            .expect("AudioSheet.swift line present");
         assert!(
             sheet_line.contains("1 anchor"),
             "boundary match across abs/rel paths must still count: {sheet_line}"

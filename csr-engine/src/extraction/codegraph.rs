@@ -361,7 +361,7 @@ fn is_method_callee_kind(kind: &str) -> bool {
 /// by the parser, with `type_arguments` and `arguments` as trailing SIBLINGS
 /// of that `await_expression`, not children of a nested call) — verified by
 /// dumping the tree-sitter-typescript parse of `await metaFetch<any[]>(...)`
-/// (a real, live corpus example, `private-app-command-center/src/lib/data/meta.ts`).
+/// (a real, live corpus example, `private-app/src/lib/data/meta.ts`).
 /// Every downstream callee-text helper (`is_method_callee_kind`,
 /// `call_qualifier`, `bare_callee`) assumes its `func` argument names the
 /// callee directly; fed the outer `await_expression` node as-is, `bare_callee`
@@ -886,8 +886,8 @@ fn collect_local_bindings_from_root<D: ast_grep_core::Doc>(
 /// disagreeing on scope (`""`/module vs the enclosing component's name) even
 /// though both plainly belong to the same component, and the X4 tier's
 /// scope-equality check (`resolver::classify_only`) could never match them.
-/// Confirmed against real-world TSX (`private-app-mvp-expo/src/context/
-/// radio-context.tsx`, `app/radio-player.tsx`): every call from inside a
+/// Confirmed against real-world TSX (`private-app/src/context/
+/// audio-context.tsx`, `app/audio-player.tsx`): every call from inside a
 /// `useCallback`/`useEffect`/`useFocusEffect` closure — i.e. nearly every
 /// call site in idiomatic React hook code — was mis-attributed to module
 /// scope this way, which is why `had_local_binding` was `false` for the
@@ -3359,9 +3359,9 @@ mod tests {
     // agreement (real-world TSX repro session) ───
     //
     // Minimal inline fixtures reproducing the confirmed real-world break:
-    // `private-app-mvp-expo/src/context/radio-context.tsx` (`const playTrack =
+    // `private-app/src/context/audio-context.tsx` (`const playTrack =
     // useCallback(...)`, called from sibling `useCallback` closures) and
-    // `app/radio-player.tsx` (multiline object-destructure of a hook's
+    // `app/audio-player.tsx` (multiline object-destructure of a hook's
     // return value, and `useState` array-destructured setters, both called
     // from inside a `useCallback`/`useFocusEffect` closure). Before the fix,
     // `extract_inner`'s calls-edge source-symbol walk broke at the FIRST
@@ -3420,7 +3420,7 @@ function Component() {\n\
     #[test]
     fn calls_edge_src_matches_local_binding_scope_for_multiline_object_destructure() {
         // Multiline object-destructure of a hook's return value
-        // (`app/radio-player.tsx`'s `const { ..., playTrack } = useRadio();`
+        // (`app/audio-player.tsx`'s `const { ..., playTrack } = useAudio();`
         // shape), called from inside a `useFocusEffect(useCallback(...))`
         // closure.
         let src = "\
@@ -3428,7 +3428,7 @@ function Screen() {\n\
     const {\n\
         currentTrack,\n\
         playTrack,\n\
-    } = useRadio();\n\
+    } = useAudio();\n\
     useFocusEffect(\n\
         useCallback(() => {\n\
             if (currentTrack) playTrack(currentTrack);\n\
