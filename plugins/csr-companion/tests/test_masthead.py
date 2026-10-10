@@ -138,34 +138,35 @@ class MastheadRows(unittest.TestCase):
         self.assertEqual(pane.fit_pieces(facts, 6), '12 pr…')
 
 
-POSTS = [(159_635, 16_807, 70_542), (266_661, 18_603, 78_206), (402_895, 24_947, 102_046)]
+# (tokens before, context of the first request after, ms): three of this session's own compactions
+POSTS = [(159_635, 64_971, 70_542), (266_661, 64_115, 78_206), (402_895, 88_915, 102_046)]
 
 
 class Payback(unittest.TestCase):
     def test_turns_to_break_even_from_this_sessions_own_median_post_size(self):
         turns, floor, seconds = pane.compaction_payback(POSTS, 200_000)
-        self.assertEqual((turns, floor, seconds), (4, 18_603, 78.206))
-        # (2 * 18603 + 5 * 4500 + 0.1 * 200000) / (0.1 * (200000 - 18603)) = 4.39
-        self.assertAlmostEqual((2 * 18_603 + 5 * 4500 + 20_000) / (0.1 * (200_000 - 18_603)), 4.39, places=2)
+        self.assertEqual((turns, floor, seconds), (13, 64_971, 78.206))
+        # (2 * 64971 + 5 * 4500 + 0.1 * 200000) / (0.1 * (200000 - 64971)) = 12.77
+        self.assertAlmostEqual((2 * 64_971 + 5 * 4500 + 20_000) / (0.1 * (200_000 - 64_971)), 12.77, places=2)
 
     def test_a_bigger_context_pays_back_sooner(self):
-        self.assertLess(pane.compaction_payback(POSTS, 300_000)[0], pane.compaction_payback(POSTS, 120_000)[0])
+        self.assertLess(pane.compaction_payback(POSTS, 300_000)[0], pane.compaction_payback(POSTS, 220_000)[0])
 
     def test_nothing_when_there_is_no_history_or_it_would_not_pay_back(self):
         self.assertIsNone(pane.compaction_payback([], 200_000))
         self.assertIsNone(pane.compaction_payback([(None, None, None)], 200_000))
         self.assertIsNone(pane.compaction_payback(POSTS, 0))
-        self.assertIsNone(pane.compaction_payback(POSTS, 18_000))  # below the floor: compacting loses
-        self.assertIsNone(pane.compaction_payback(POSTS, 60_000))  # 16 turns to repay: too slow to say
-        self.assertIsNotNone(pane.compaction_payback(POSTS, 90_000))
+        self.assertIsNone(pane.compaction_payback(POSTS, 60_000))  # below the floor: compacting loses
+        self.assertIsNone(pane.compaction_payback(POSTS, 150_000))  # 20 turns to repay: too slow to say
+        self.assertIsNotNone(pane.compaction_payback(POSTS, 200_000))
 
     def test_an_even_number_of_sizes_takes_the_middle_pair(self):
-        self.assertEqual(pane.compaction_payback(POSTS[:2], 200_000)[1], (16_807 + 18_603) / 2)
+        self.assertEqual(pane.compaction_payback(POSTS[:2], 200_000)[1], (64_971 + 64_115) / 2)
 
     def test_the_phrase_reads_the_context_since_the_last_compaction(self):
         replies = [(100.0, 380_000, 5, 0), (400.0, 150_000, 5, 0), (500.0, 200_000, 5, 0)]
         s = dict(compact_sizes=POSTS, compacts=[300.0], replies=replies)
-        self.assertEqual(pane.payback_phrase(s), 'compact repays in ~4t')  # the 200k reply, not the 380k before the cut
+        self.assertEqual(pane.payback_phrase(s), 'compact repays in ~13t')  # the 200k reply, not the 380k before the cut
         self.assertEqual(pane.payback_phrase(dict(s, replies=replies[:1])), '')  # nothing since the cut
         self.assertEqual(pane.payback_phrase(dict(s, compact_sizes=[])), '')
         self.assertEqual(pane.payback_phrase(dict(id='x')), '')
@@ -177,8 +178,10 @@ class Payback(unittest.TestCase):
                 for pre, post, ms in POSTS[:2]:
                     handle.write(json.dumps(dict(type='system', subtype='compact_boundary',
                                                  timestamp='2026-10-10T10:00:00Z',
-                                                 compactMetadata=dict(trigger='manual', preTokens=pre, postTokens=post,
+                                                 compactMetadata=dict(trigger='manual', preTokens=pre, postTokens=19_000,
                                                                       durationMs=ms))) + '\n')
+                    handle.write(json.dumps(dict(type='assistant', timestamp='2026-10-10T10:01:00Z', message=dict(
+                        id=f'm{pre}', usage=dict(input_tokens=1, cache_read_input_tokens=post - 1)))) + '\n')
                 handle.write(json.dumps(dict(type='system', subtype='compact_boundary',
                                              timestamp='2026-10-10T11:00:00Z')) + '\n')  # no metadata at all
                 handle.write(json.dumps(dict(type='system', subtype='compact_boundary', compactMetadata='odd',
@@ -225,7 +228,7 @@ class OnThePage(unittest.TestCase):
         busy = dict(id='sess-now', prompts=[NOW - 100] * 12, replies=replies, compacts=[NOW - 900],
                     compact_sizes=POSTS, remembered=[], gave=dict(recalls=[], carried=[], dreams=[]), project='p')
         fact = stand_in({}, busy)['head']['facts']
-        self.assertIn('compact repays in ~4t', fact)
+        self.assertIn('compact repays in ~13t', fact)
         self.assertTrue(fact.endswith('1 compacts'))
         calm = dict(busy, compacts=[], compact_sizes=[])
         self.assertNotIn('repays', stand_in({}, calm)['head']['facts'])
@@ -262,15 +265,36 @@ class Wrapper(unittest.TestCase):
                                    seven_day=dict(used_percentage=12, resets_at=1_800_400_000)),
                   context_window=dict(total_input_tokens=57_000, context_window_size=1_000_000, remaining_percentage=94))
 
-    def run_wrapper(self, home, status, pane_open=True):
+    def run_wrapper(self, home, status, pane_open=True, beat_age=0, raw=None):
         keep = os.path.join(home, '.claude-self-reflect', 'csr-companion')
         if pane_open:
             os.makedirs(os.path.join(keep, 'panes'))
-            with open(os.path.join(keep, 'panes', 'sess-w.json'), 'w') as handle:
+            pid_file = os.path.join(keep, 'panes', 'sess-w.json')
+            with open(pid_file, 'w') as handle:
                 json.dump(dict(pid=os.getpid()), handle)
-        done = subprocess.run(['node', self.WRAPPER, '--sh', 'echo drawn'], input=json.dumps(status), text=True,
+            if beat_age:
+                then = __import__('time').time() - beat_age
+                os.utime(pid_file, (then, then))
+        done = subprocess.run(['node', self.WRAPPER, '--sh', 'cat >/dev/null; echo drawn' if raw is None else 'cat'],
+                              input=(raw if raw is not None else json.dumps(status).encode()),
                               capture_output=True, env=dict(os.environ, HOME=home), timeout=30)
+        done.stdout = done.stdout.decode('utf-8', 'replace')
         return done, os.path.join(keep, 'statusline')
+
+    def test_a_pid_file_the_pane_stopped_touching_is_a_pane_that_is_gone(self):
+        with tempfile.TemporaryDirectory() as home:
+            done, folder = self.run_wrapper(home, self.STATUS, beat_age=120)  # a live pid, but no heartbeat for 2 min
+            self.assertEqual(done.stdout.strip(), 'drawn')
+            self.assertFalse(os.path.exists(folder))
+
+    def test_a_character_split_across_input_chunks_reaches_the_command_whole(self):
+        for pad in ('', 'a'):  # one of the two puts a 64 KB chunk edge inside an é (the old code broke 10 of them)
+            where = '/repo/' + pad + 'é' * 40000
+            status = json.dumps(dict(session_id='sess-nopane', workspace=dict(current_dir=where)), ensure_ascii=False).encode()
+            with tempfile.TemporaryDirectory() as home:
+                done, _ = self.run_wrapper(home, None, pane_open=False, raw=status)
+            self.assertNotIn('\ufffd', done.stdout)
+            self.assertEqual(json.loads(done.stdout)['workspace']['current_dir'], where)
 
     def test_the_raw_fields_are_kept_beside_the_line_atomically(self):
         with tempfile.TemporaryDirectory() as home:

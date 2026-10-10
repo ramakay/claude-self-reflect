@@ -18,10 +18,16 @@ const path = require('path')
 const DATA = path.join(process.env.HOME || '', '.claude-self-reflect')
 const KEEPS = ['csr-shifts', 'csr-companion'].map(name => path.join(DATA, name)) // the dev mod, the plugin
 
+// The pane touches its pid file every couple of seconds; one untouched this long names a pane that is gone,
+// whatever process now holds its old pid.
+const HEARTBEAT_S = 30
+
 function paneKeep(session) {
   for (const keep of KEEPS) {
     try {
-      const { pid } = JSON.parse(fs.readFileSync(path.join(keep, 'panes', `${session}.json`), 'utf8'))
+      const file = path.join(keep, 'panes', `${session}.json`)
+      if (Date.now() - fs.statSync(file).mtimeMs > HEARTBEAT_S * 1000) continue
+      const { pid } = JSON.parse(fs.readFileSync(file, 'utf8'))
       process.kill(Number(pid), 0)
       return keep
     } catch {}
@@ -38,8 +44,9 @@ function rawFields(data) {
   return fields
 }
 
-let input = ''
-process.stdin.on('data', chunk => (input += chunk)).on('end', () => {
+const chunks = []
+process.stdin.on('data', chunk => chunks.push(chunk)).on('end', () => {
+  const input = Buffer.concat(chunks).toString('utf8') // decoded whole: a character split across chunks stays one
   let session = ''
   let fields = {}
   try {

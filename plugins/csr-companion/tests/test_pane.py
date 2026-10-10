@@ -981,6 +981,106 @@ class CarryOver(unittest.TestCase):
         self.assertEqual(pane.lost_found([(1000.0, own)], [], other)[0]['came_from'], 'prev-1')
 
 
+class AstraFindings(CarryOver):
+    """Each case one finding of the 10-10 review, reproduced first, then held."""
+
+    def test_a_second_restart_keeps_what_the_first_carried(self):
+        self.before([])
+        os.makedirs(os.path.join(self.folder, pane.CARRY_DIR))
+        task = dict(text='Rename the Dreamt grammar to Shift.', detail=[], first_seen=1.0, last_seen=2.0, times=1,
+                    state='carried', waiting=False, rank=1, key='a-task', came_from='older-0', why='session older-0')
+        with open(os.path.join(self.folder, pane.CARRY_DIR, 'prev-1.json'), 'w') as handle:
+            json.dump([task], handle)
+        self.assertTrue(any(t['key'] == 'a-task' for t in self.carried()))
+        pane.keep_lost('a-task', 'drop', 5.0, os.path.basename(self.folder))
+        self.assertFalse(any(t['key'] == 'a-task' for t in self.carried()))
+
+    def test_a_kept_carry_is_read_back_never_worked_out_again(self):
+        mine = self.transcript('mine-2', [dict(type='user', timestamp=self.at(30), message=dict(role='user', content='hi'))], 2000.0)
+        os.makedirs(os.path.join(self.folder, pane.CARRY_DIR))
+        with open(os.path.join(self.folder, pane.CARRY_DIR, 'mine-2.json'), 'w') as handle:
+            json.dump([dict(text='kept', key='k')], handle)
+        session = pane.Session('mine-2', path=mine)
+        session.read_transcript()
+        pane.carry_into(session)
+        self.assertEqual(session.carried, [dict(text='kept', key='k')])
+
+    def test_lost_found_never_writes_into_the_carried_list(self):
+        carried = [dict(text='Rename the Dreamt grammar to Shift.', detail=[], first_seen=1.0, last_seen=2.0, times=1,
+                        state='carried', waiting=False, rank=1, key='c1', came_from='p')]
+        pane.lost_found([], [], carried)
+        self.assertNotIn('hidden', carried[0])
+
+    def test_headless_transcripts_never_hide_the_session_before(self):
+        self.before([], written=1000.0)
+        for k in range(8):
+            self.transcript(f'headless-{k}', [dict(type='user', timestamp=self.at(1), message=dict(role='user', content='x'))],
+                            1500.0 + k, entry='sdk-cli')
+        mine = self.transcript('mine-3', [dict(type='user', timestamp=self.at(30), message=dict(role='user', content='hi'))], 2000.0)
+        self.assertTrue(pane.previous_session(mine, 2000.0).endswith('prev-1.jsonl'))
+
+    def test_a_drop_before_the_restart_holds_when_a_summary_rewords_the_thread(self):
+        carried = [dict(text='Awaiting approval to deploy production cache migration.', detail=[], first_seen=1.0,
+                        last_seen=2.0, times=1, state='carried', waiting=True, rank=0, key='c-drop', came_from='p')]
+        pane.keep_lost('c-drop', 'drop', 5.0)
+        own = summary("   - Waiting for the user approval to deploy production cache migration.")
+        (thread,) = [t for t in pane.lost_found([(1000.0, own)], [], carried) if 'migration' in t['text']]
+        self.assertEqual(thread['hidden'], 'drop')
+
+    def test_the_tail_is_only_what_came_after_the_last_summary(self):
+        rows = [dict(type='user', timestamp=self.at(0), message=dict(role='user', content='start')),
+                dict(type='assistant', timestamp=self.at(1), message=dict(
+                    content=[dict(type='text', text='Should I push the branch?')], stop_reason='end_turn')),
+                dict(type='user', isCompactSummary=True, timestamp=self.at(5), message=dict(role='user', content=summary('   - Rebuild.')))]
+        self.transcript('prev-1', rows, 1000.0)
+        self.assertFalse(any('asked last' in t['text'] for t in self.carried()))
+
+    def test_a_go_names_a_thread_by_its_subject_not_its_verb(self):
+        wait = summary("   - Awaiting approval to install Redis.")
+        later = summary("   - Rebuild the index.")
+        states = {t['text'][:12]: t['state'] for t in pane.lost_found([(1000.0, wait), (2000.0, later)], [(1500.0, 'ok install PostgreSQL')])}
+        self.assertEqual(states['Awaiting app'], 'lost')
+
+    def test_projects_keep_their_own_answers(self):
+        pane.keep_lost('k1', 'drop', 5.0, 'project-a')
+        pane.keep_lost('k2', 'drop', 5.0)  # kept before answers named a project: counts everywhere
+        self.assertEqual(sorted(pane.lost_log('project-a')), ['k1', 'k2'])
+        self.assertEqual(sorted(pane.lost_log('project-b')), ['k2'])
+
+    def test_the_legend_fits_every_width_so_the_last_row_never_wraps(self):
+        for view in ('main', 'summary', 'threads', 'log'):
+            for width in range(16, 90):
+                self.assertLessEqual(len(plain(pane.legend(view, width))), width + 1, (view, width))
+
+    def test_transcript_text_can_neither_drive_the_terminal_nor_press_keys(self):
+        evil = 'hi\x1b[2J\x1b]52;c;cGF5bG9hZA==\x07\x03 there\x9b31m'
+        line = pane.safe_line(pane.ink('you') + evil + pane.OFF)
+        self.assertNotIn('\x1b]', line)
+        self.assertNotIn('\x1b[2J', line)
+        self.assertNotIn('\x03', line)
+        self.assertNotIn('\x9b', line)
+        self.assertIn(pane.ink('you'), line)  # the pane's own colour stays
+        sent = []
+        saved = pane.herdr
+        pane.herdr = lambda *args: sent.append(args) or ''
+        try:
+            pane.send_text('w2:p1', 'line one\nline two\r\x1b[13~\x03')
+        finally:
+            pane.herdr = saved
+        self.assertEqual(sent[0][3], 'line one line two[13~')
+
+    def test_the_compaction_floor_is_the_first_request_after_not_post_tokens(self):
+        rows = [dict(type='system', subtype='compact_boundary', timestamp=self.at(1),
+                     compactMetadata=dict(preTokens=300000, postTokens=19000, durationMs=90000)),
+                dict(type='assistant', isSidechain=True, timestamp=self.at(2), message=dict(
+                    id='s', usage=dict(input_tokens=5, cache_read_input_tokens=1000))),
+                dict(type='assistant', timestamp=self.at(3), message=dict(
+                    id='m', usage=dict(input_tokens=10, cache_read_input_tokens=60000, cache_creation_input_tokens=4990)))]
+        session = pane.Session('floor', path=self.transcript('floor', rows, 1000.0))
+        session.read_transcript()
+        self.assertEqual(session.compact_sizes, [(300000, 65000, 90000)])
+
+
 class MainScroll(unittest.TestCase):
     def test_the_window_moves_rows_clicks_and_pictures_and_stops_at_the_ends(self):
         lines = pane.Lines([f'row {k}' for k in range(50)])

@@ -445,10 +445,11 @@ def mast_rows(rows, width):
 # One compaction's cost, in input tokens: the post-compaction context written to cache at twice the price of
 # reading, the summary written out at five times, and the context re-read once to be summarised. Each later
 # turn then re-reads (context - floor) fewer tokens at a tenth of the price. The floor is this session's own
-# median post-compaction size (statusline.js assumed 70k; this pane's sessions measure 17k to 25k).
+# median context on the first request after a compaction: 61k to 89k over 67 compactions here (median 65k),
+# where compact_boundary's postTokens, the summary alone, reads 16k to 26k and understates it threefold.
 SUMMARY_OUT = 4500  # tokens of summary text a compaction writes
 PAYBACK_UNDER = 15  # a longer payback than this is not worth saying
-FLOOR_GUESS = 20000  # post-compaction size when a session's own sizes are missing
+FLOOR_GUESS = 65000  # post-compaction context when a session's own are missing
 
 
 def compaction_payback(sizes, context):
@@ -956,7 +957,8 @@ class Session:
         self.offset = 0
         self.replies = {}  # message id -> (time, context tokens, output tokens)
         self.prompts, self.compacts, self.asked, self.questions = [], [], [], []
-        self.compact_sizes = []  # (tokens before, tokens after, ms) of each compaction
+        self.compact_sizes = []  # (tokens before, context of the first request after, ms) of each compaction
+        self.measuring = None  # the compaction whose first request after it is still to come
         self.tools, self.files, self.edited = Counter(), Counter(), set()
         self.shell, self.last = Counter(), {}  # files a command named; when Claude last handled each
         self.talk = []  # (time, words) the person typed or Claude wrote, newest last; no tool output
@@ -996,6 +998,10 @@ class Session:
                 if message.get('id') and when:
                     self.replies[message['id']] = (when, context, usage.get('output_tokens') or 0,
                                                    usage.get('cache_creation_input_tokens') or 0)
+                if self.measuring is not None and context and not entry.get('isSidechain'):
+                    pre, _, ms = self.compact_sizes[self.measuring]
+                    self.compact_sizes[self.measuring] = (pre, context, ms)
+                    self.measuring = None
                 for part in message.get('content') or []:
                     if isinstance(part, dict) and part.get('type') == 'text' and when and not entry.get('isSidechain'):
                         self.talk.append((when, part.get('text') or ''))
@@ -1043,7 +1049,10 @@ class Session:
             elif kind == 'system' and entry.get('subtype') == 'compact_boundary' and when:
                 self.compacts.append(when)
                 meta = entry.get('compactMetadata') if isinstance(entry.get('compactMetadata'), dict) else {}
-                self.compact_sizes.append((meta.get('preTokens'), meta.get('postTokens'), meta.get('durationMs')))
+                # postTokens is only the summary (median 19k here); the next request also carries the system
+                # prompt, tools and what SessionStart re-injects (median 65k), so the floor is that request
+                self.compact_sizes.append((meta.get('preTokens'), None, meta.get('durationMs')))
+                self.measuring = len(self.compact_sizes) - 1
             elif kind == 'ai-title' and entry.get('aiTitle'):
                 self.title = entry['aiTitle']
         del self.talk[:-200]
@@ -1081,7 +1090,7 @@ class Session:
         replies = sorted(self.replies.values())
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
                     compacts=sorted(self.compacts), compact_sizes=self.compact_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
-                    lost=lost_found(self.summaries, self.typed, self.carried or ()),
+                    lost=lost_found(self.summaries, self.typed, self.carried or (), project_of(self.path)),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last))
 
@@ -1514,8 +1523,29 @@ class Lines(list):
         return self
 
 
+CONTROL = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')  # C0 and C1 controls: ESC, Ctrl-C, CSI as one byte...
+SGR = re.compile(r'\x1b\[[0-9;:]*m')  # ...where a colour is the one escape the pane writes inside a line
+
+
 def one_line(text, most=700):
-    return fit(' '.join(str(text).split()), most)
+    """Text from a transcript or the DB on one line, no control left in it: what is drawn or typed into
+    Claude's prompt can never clear the screen, set the clipboard or press a key."""
+    return fit(' '.join(CONTROL.sub('', str(text)).split()), most)
+
+
+def safe_line(line):
+    """A drawn line with every control taken out but the pane's own colours: transcript text inside it
+    cannot move the cursor, clear the screen or reach the clipboard (OSC 52)."""
+    parts, colours = SGR.split(line), SGR.findall(line)
+    out = [CONTROL.sub('', parts[0])]
+    for colour, part in zip(colours, parts[1:]):
+        out += [colour, CONTROL.sub('', part)]
+    return ''.join(out)
+
+
+def send_text(agent, text):
+    """Words into Claude's prompt, unsent: one line, no controls, so nothing in them submits or presses a key."""
+    return bool(agent) and herdr('pane', 'send-text', agent, one_line(text, 4000)) is not None
 
 
 def fit_blocks(out, blocks, room, ui, tail=True):
@@ -2663,6 +2693,13 @@ def legend(view, width, held=None):
     if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width:  # still too wide: 's summary'
         words = [words[0]] + [(key, said.rsplit(' ', 1)[-1]) for key, said in words[1:]]
     sep = '   ' if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) <= width else '  '  # still tight: closer
+    total = lambda: 1 + len(marks) + sum(len(k) + 1 + len(w) for k, w in words) + len(sep) * (len(words) - 1)
+    if total() > width:
+        marks = ''  # the log's marks go before any key does
+    while len(words) > 1 and total() > width:
+        words.pop(-2)  # narrower still: the keys before close go, right to left
+    if total() > width:
+        words = [(words[0][0], fit(words[0][1], max(1, width - len(words[0][0]) - 2)))]
     shown = sep.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
     return ' ' + ink('faint') + marks + OFF + shown
 
@@ -2773,7 +2810,7 @@ class Pane:
         self.acts[rows - 1] = dict(key='view:log' if self.view == 'main' else 'view:main')
         lines = lines[:rows - 1]
         whole = any(h >= rows for _, _, _, h, _ in pictures)  # a paper page draws its own legend
-        screen = ['\x1b_Ga=d,d=A\x1b\\', '\x1b[H\x1b[2J', '\n'.join(lines)]
+        screen = ['\x1b_Ga=d,d=A\x1b\\', '\x1b[H\x1b[2J', '\n'.join(safe_line(line) for line in lines)]
         if not whole:
             screen += [f'\x1b[{rows};1H', legend(self.view, cols - 1, self.held)]
         screen += [kitty(png, r, c, w, h) for r, c, w, h, png in pictures if r + h <= rows]
@@ -2801,7 +2838,7 @@ class Pane:
             keep(dict(kind='answer', id=act['dream'], answer=span, at=time.time(), by='pane'))
             if span == 'ask_claude':
                 agent = agent_pane(self.agent)
-                went = bool(agent) and herdr('pane', 'send-text', agent, act['send']) is not None
+                went = send_text(agent, act['send'])
                 self.sent = (act['key'], went, time.time())
             self.answered = (act['dream'], span, time.time())
         elif not act or act.get('spans'):
@@ -2815,7 +2852,7 @@ class Pane:
             self.anchor = (act['key'], row) if self.view == 'main' else None
         else:
             agent = agent_pane(self.agent)
-            went = bool(agent) and herdr('pane', 'send-text', agent, act['send']) is not None
+            went = send_text(agent, act['send'])
             self.sent = (act['key'], went, time.time())
         focus_back()
 
@@ -2839,7 +2876,11 @@ BOOKKEEPING = re.compile(r"^(?:(?:send|write|give|post|deliver)\b.{0,40}\b(?:fin
                          r"(?:tell|let) the user\b|report\b|confirm the background|responding to\b|(?:the )?messages after this summary)", re.I)
 GENERIC = {'session', 'claude', 'pane', 'csr', 'mod', 'code', 'make', 'need', 'thing', 'work', 'just', 'like', 'what',
            'should', 'also', 'more', 'some', 'here', 'there', 'them', 'they', 'it', 'can', 'did', 'does', 'how', 'out',
-           'see', 'get', 'got', 'let', 'use', 'way', 'go', 'yes', 'ok', 'okay', 'please', 'thank', 'thanks', 'good'}
+           'see', 'get', 'got', 'let', 'use', 'way', 'go', 'yes', 'ok', 'okay', 'please', 'thank', 'thanks', 'good',
+           # the verbs and the asking every go shares: "install PostgreSQL" does not answer "install Redis"
+           'install', 'run', 'push', 'merge', 'build', 'fix', 'check', 'verify', 'update', 'approval', 'approve',
+           'deploy', 'commit', 'test', 'start', 'stop', 'add', 'remove', 'open', 'close', 'send', 'ship', 'proceed',
+           'await', 'wait', 'user', 'next', 'now', 'then', 'done', 'with', 'before', 'after', 'still', 'needs', 'need'}
 APPROVED = re.compile(r"^\W*(?:go|yes|yep|ok|okay|install|proceed|approved?|do it|ship it|push it)\b|\bis a go\b", re.I)
 REMINDERS = re.compile(r'reminders from csr', re.I)  # what prep-compact asks the summary to keep: never a task
 IGNORED = {'the', 'and', 'for', 'with', 'then', 'that', 'this', 'when', 'its', 'are', 'was', 'from', 'into', 'not', 'has',
@@ -2970,36 +3011,50 @@ def lost_threads(summaries, typed=()):
     return sorted(out, key=lambda t: (t['rank'], -t['last_seen']))
 
 
-def lost_log():
-    """What you did with each thread: key -> (drop or later, when). The last line for a key wins."""
+def project_of(path):
+    """A transcript's project: the folder Claude Code keeps it in, one per working directory."""
+    return os.path.basename(os.path.dirname(path)) if path else None
+
+
+def lost_log(project=None):
+    """What you did with each thread in this project: key -> (drop or later, when). The last line for a key
+    wins; a line kept before answers named their project counts in every project."""
     said = {}
     try:
         with open(LOST_LOG, encoding='utf-8') as handle:
             for line in handle:
                 try:
                     r = json.loads(line)
+                    if r.get('project') not in (None, project):
+                        continue
                     said[r['key']] = (r['answer'], float(r['at']))
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError, AttributeError):
                     continue
     except OSError:
         pass
     return said
 
 
-def keep_lost(key, answer, at):
+def keep_lost(key, answer, at, project=None):
     os.makedirs(KEEP, exist_ok=True)
     with open(LOST_LOG, 'a', encoding='utf-8') as handle:
-        handle.write(json.dumps(dict(key=key, answer=answer, at=at)) + '\n')
+        handle.write(json.dumps(dict(key=key, answer=answer, at=at, project=project)) + '\n')
 
 
-def lost_found(summaries, typed=(), carried=()):
+def lost_found(summaries, typed=(), carried=(), project=None):
     """The threads, each marked hidden: "drop" for good, "later" until the next compaction. A thread set
     aside for later is also the one thing prep-compact hands the summary, as a reminder. The session
-    before this one adds its threads, less those this session's own summaries already carry."""
-    threads, said = lost_threads(summaries, typed), lost_log()
-    own = [words_of(t['text']) for t in threads]
-    threads = sorted(threads + [c for c in carried if not any(same_words(words_of(c['text']), w) for w in own)],
-                     key=lambda t: (t['rank'], -t['last_seen']))
+    before this one adds its threads, less those this session's own summaries already carry; such a
+    thread passes its answer on, so a drop made before the restart still holds."""
+    threads, said = lost_threads(summaries, typed), dict(lost_log(project))
+    own = [(t, words_of(t['text'])) for t in threads]
+    for c in carried:
+        match = next((t for t, words in own if same_words(words_of(c['text']), words)), None)
+        if match is None:
+            threads.append(dict(c))  # a copy: the pane's thread may be writing the list it came from
+        elif c['key'] in said and match['key'] not in said:
+            said[match['key']] = said[c['key']]
+    threads.sort(key=lambda t: (t['rank'], -t['last_seen']))
     newest = max((when for when, _ in summaries), default=0)
     for t in threads:
         answer, at = said.get(t['key'], (None, 0))
@@ -3035,7 +3090,7 @@ def previous_session(path, started):
             continue
         if started - CARRY_DAYS * 86400 < written <= started:
             found.append((written, other))
-    for _, other in sorted(found, reverse=True)[:6]:
+    for _, other in sorted(found, reverse=True)[:200]:  # past headless ones too: each costs one 64 KB read
         try:
             with open(other, 'rb') as handle:
                 head = handle.read(1 << 16)
@@ -3061,9 +3116,9 @@ def stopped_at(prev):
     after = [(when, words) for when, words in prev.typed if when > since and (words or '').strip()]
     last = prev.typed[-1] if prev.typed else None
     ask = last_ask(prev.said[1]) if prev.said else None
-    if last and last[0] > prev.turn_end:
+    if last and last[0] > since and last[0] > prev.turn_end:
         text, waiting, rank = f"Cut off before Claude finished answering: “{fit(one_line(last[1]), 200)}”", True, 0
-    elif ask and (not last or prev.said[0] > last[0]):
+    elif ask and prev.said[0] > since and (not last or prev.said[0] > last[0]):
         text, waiting, rank = f"Claude asked last, no answer came: “{fit(ask, 200)}”", True, 0
     elif after:
         text, waiting, rank = f"Last asked before it ended: “{fit(one_line(after[-1][1]), 200)}”", False, 3
@@ -3089,34 +3144,48 @@ def carried_threads(path, started):
         return []
     prev = Session(os.path.basename(before)[:-6], path=before)
     prev.read_transcript()
+    said = lost_log(project_of(before))
     out = []
-    for t in lost_threads(prev.summaries, prev.typed):
+    # what that session itself carried in and nobody dropped: a second restart loses nothing either
+    for t in lost_found(prev.summaries, prev.typed, read_carried(prev.id) or (), project_of(before)):
+        if t['hidden'] == 'drop' or t['key'] in said and said[t['key']][0] == 'drop':
+            continue
         if t['state'] in ('open', 'lost'):
             out.append(dict(t, state='carried', rank=0 if t['waiting'] else 1, came_from=prev.id[:8],
                             why=f"session {prev.id[:8]}, {'open' if t['state'] == 'open' else 'quiet'} when it ended"))
+        elif t['state'] == 'carried':
+            out.append({k: v for k, v in t.items() if k not in ('hidden', 'later')})
     tail = stopped_at(prev)
     return out + ([tail] if tail else [])
 
 
 def carry_into(session):
-    """In the background, once per pane: the session before this one's threads, kept for --lost too."""
+    """In the background, once per session: the session before this one's threads, kept for --lost too. A
+    carry already kept is read back, never worked out again: by now that earlier session may have been
+    resumed and no longer count as the one before. Kept first, then shown, so the two always agree."""
     try:
-        session.carried = carried_threads(session.path, session.started)
-        os.makedirs(os.path.join(KEEP, CARRY_DIR), exist_ok=True)
-        with open(os.path.join(KEEP, CARRY_DIR, f'{session.id}.json.tmp'), 'w', encoding='utf-8') as handle:
-            json.dump(session.carried, handle)
-        os.replace(os.path.join(KEEP, CARRY_DIR, f'{session.id}.json.tmp'), os.path.join(KEEP, CARRY_DIR, f'{session.id}.json'))
+        kept = read_carried(session.id)
+        if kept is None:
+            found = carried_threads(session.path, session.started)
+            os.makedirs(os.path.join(KEEP, CARRY_DIR), exist_ok=True)
+            temp = os.path.join(KEEP, CARRY_DIR, f'{session.id}.json.{os.getpid()}.tmp')
+            with open(temp, 'w', encoding='utf-8') as handle:
+                json.dump(found, handle)
+            os.replace(temp, os.path.join(KEEP, CARRY_DIR, f'{session.id}.json'))
+            kept = found
+        session.carried = kept
     except Exception:  # a carry that fails leaves this session's own threads, as before
         session.carried = session.carried or []
 
 
 def read_carried(session_id):
+    """The carry kept for a session, or None when none was kept."""
     try:
         with open(os.path.join(KEEP, CARRY_DIR, f'{session_id}.json'), encoding='utf-8') as handle:
             got = json.load(handle)
-        return got if isinstance(got, list) else []
+        return got if isinstance(got, list) else None
     except (OSError, ValueError):
-        return []
+        return None
 
 
 def lost_json(session_id):
@@ -3125,9 +3194,9 @@ def lost_json(session_id):
     session = Session(session_id) if session_id else None
     if session:
         session.read_transcript()
-    carried = read_carried(session_id) if session else []
-    return [t for t in lost_found(session.summaries if session else [], session.typed if session else [], carried)
-            if t['hidden'] != 'drop']
+    carried = (read_carried(session_id) or []) if session else []
+    return [t for t in lost_found(session.summaries if session else [], session.typed if session else [], carried,
+                                  project_of(session and session.path)) if t['hidden'] != 'drop']
 
 
 def lost_asks(thread):
@@ -3191,10 +3260,10 @@ def lost_click(pane, act, col):
     Claude's prompt, unsent."""
     pick = next((answer for start, end, answer in act['spans'] if start <= col < end), None)
     if pick in ('drop', 'later'):
-        keep_lost(act['lost'], pick, time.time())
+        keep_lost(act['lost'], pick, time.time(), project_of(getattr(getattr(pane, 'session', None), 'path', None)))
     elif pick:
         agent = agent_pane(pane.agent)
-        went = bool(agent) and herdr('pane', 'send-text', agent, act['asks'][pick]) is not None
+        went = send_text(agent, act['asks'][pick])
         pane.sent = (act['item'], went, time.time())
     focus_back()
 
@@ -3253,6 +3322,11 @@ def watch(root, limit, session_id, agent=None):
             if redraw['now'] or time.time() - last > 2:  # a frame costs ~15 ms; it draws only what changed
                 pane.frame(redraw['now'])
                 redraw['now'], last = False, time.time()
+                if mine:  # the heartbeat: a pid file older than HEARTBEAT_S names a pane that is gone
+                    try:
+                        os.utime(mine)
+                    except OSError:
+                        pass
             try:
                 ready, _, _ = select.select([sys.stdin] if saved else [], [], [], 1.0)
             except InterruptedError:
