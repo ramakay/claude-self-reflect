@@ -1281,6 +1281,32 @@ def session_png(s, cols, cell, now, grounds=None):
     return shrink(image)
 
 
+SYNC_ON, SYNC_OFF = '\x1b[?2026h', '\x1b[?2026l'  # a terminal that knows them shows the frame at once
+
+
+def repaint(drawn, cols, rows, written, placed):
+    """What turns the screen as drawn into the frame written: only the rows that differ, each cleared and
+    written in place (no clearing the whole screen, which flashes), and the pictures sent again only when
+    they changed or a row under one did. The first frame, or a new size, starts from a clear screen."""
+    out = [SYNC_ON]
+    if drawn is None or drawn[:2] != (cols, rows):
+        before, shown = [None] * rows, []
+        out.append('\x1b_Ga=d,d=A\x1b\\\x1b[H\x1b[2J')
+    else:
+        before, shown = drawn[2], drawn[3]
+    changed = [i for i, line in enumerate(written) if before[i] != line]
+    under = {r + k for r, _, _, h, _ in shown + placed for k in range(h)}
+    again = placed != shown or any(i in under for i in changed)
+    if again and shown:
+        out.append('\x1b_Ga=d,d=A\x1b\\')
+    for i in changed:
+        out.append(f'\x1b[{i + 1};1H\x1b[0m\x1b[2K' + written[i])
+    if again:
+        out += [kitty(png, r, c, w, h) for r, c, w, h, png in placed]
+    out += [f'\x1b[{rows};{cols}H', SYNC_OFF]
+    return ''.join(out)
+
+
 def kitty(png, row, col, cols, rows):
     out = [f'\x1b[{row + 1};{col + 1}H']
     data, first = base64.standard_b64encode(png), True
@@ -2681,10 +2707,15 @@ def compact_key(data):
 
 
 def legend(view, width, held=None):
-    """The bottom row: its keys in lamp black, what each does in pencil; a click on it does the first.
-    While an edit to the pane's own file does not compile, the row says so and the old pane runs on."""
+    """The bottom row: its keys in lamp black, what each does in pencil. While an edit to the pane's own file
+    does not compile, the row says so and the old pane runs on."""
+    return legend_parts(view, width, held)[0]
+
+
+def legend_parts(view, width, held=None):
+    """The bottom row, and where each label sits on it: (text, [(first col, past last col, key)])."""
     if held:
-        return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF
+        return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF, []
     keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('f', 'every lost thread'), ('q', 'close')] \
         if view == 'main' else [('d', 'back')] + ([('j/k', 'scroll')] if view in ('summary', 'threads') else []) + [('q', 'close')]
     marks = '' if view in ('main', 'summary', 'threads') else '~ changed  - removed  + back   '
@@ -2702,7 +2733,22 @@ def legend(view, width, held=None):
     if total() > width:
         words = [(words[0][0], fit(words[0][1], max(1, width - len(words[0][0]) - 2)))]
     shown = sep.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
-    return ' ' + ink('faint') + marks + OFF + shown
+    spans, at = [], 1 + len(marks)
+    for key, said in words:
+        spans.append((at, at + len(key) + 1 + len(said), key))
+        at += len(key) + 1 + len(said) + len(sep)
+    return ' ' + ink('faint') + marks + OFF + shown, spans
+
+
+def press(pane, key):
+    """What a page key does, for a click on its label: l, s and f open their pages, d goes back. Scrolling and
+    close stay on the keyboard, so a stray click never closes the pane."""
+    if key == 'l' or key == 'd':
+        pane.view, pane.open = ('log' if key == 'l' else 'main'), None
+    elif key == 's':
+        summary_keys(pane, 's')
+    elif key == 'f':
+        threads_keys(pane, 'f')
 
 
 def herdr(*argv):
@@ -2731,7 +2777,8 @@ def agent_pane(given):
 
 
 def focus_back():
-    """Keys stay Claude's: a click lands here, so hand the focus back to the pane on the left."""
+    """Once a click has put text in Claude's prompt, the focus goes back to Claude's pane on the left. Any
+    other click leaves it here, so the pane's keys work."""
     me = os.environ.get('HERDR_PANE_ID')
     if me:
         herdr('pane', 'focus', '--pane', me, '--direction', 'left')
@@ -2749,6 +2796,8 @@ class Pane:
         self.threads_top = 0  # the f page's first line shown
         self.main_top = 0  # the main page's first line shown, once scrolled or a row is opened
         self.anchor = None  # (row key, screen row) a click just opened: it stays where it was clicked
+        self.tall = False  # the main page keeps its scrolled layout until Esc or another page
+        self.drawn = None  # (cols, rows, rows written, pictures placed): what is on the screen now
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -2773,6 +2822,7 @@ class Pane:
             sys.stdout.write(f"\x1b_Ga=d,d=A\x1b\\\x1b[H\x1b[2J{BOLD}CSR{OFF}\n{DIM}"
                              + '\n'.join(wrap(said, cols - 1, 4)) + f"{OFF}\n")
             sys.stdout.flush()
+            self.drawn = self.shown = None  # the screen is no longer the last frame: the next one starts clear
             return
         if self.sent and now - self.sent[2] > 6:  # the "in Claude's prompt" line has been read
             self.open = None if self.open == self.sent[0] else self.open
@@ -2792,7 +2842,8 @@ class Pane:
         if sig == self.shown and not force:
             return
         self.shown = sig
-        if self.view == 'main' and (self.main_top or self.open):  # laid out whole, the screen a window on it
+        self.tall = self.view == 'main' and bool(self.tall or self.main_top or self.open)
+        if self.tall:  # laid out whole, the screen a window on it
             lines, pictures = draw_main(self.data, s, cols, TALL, now, ui)
             if self.anchor:
                 row = min((r for r, act in lines.acts.items() if act.get('key') == self.anchor[0]), default=None)
@@ -2808,16 +2859,17 @@ class Pane:
         else:
             lines, pictures = draw_log(self.data, cols, rows, ui)
         self.acts = {row: act for row, act in getattr(lines, 'acts', {}).items() if row < rows - 1}
-        self.acts[rows - 1] = dict(key='view:log' if self.view == 'main' else 'view:main')
+        spans = legend_parts(self.view, cols - 1, self.held)[1]
+        self.acts[rows - 1] = dict(key='legend', keys=spans) if spans else \
+            dict(key='view:log' if self.view == 'main' else 'view:main')
         lines = lines[:rows - 1]
         whole = any(h >= rows for _, _, _, h, _ in pictures)  # a paper page draws its own legend
-        screen = ['\x1b_Ga=d,d=A\x1b\\', '\x1b[H\x1b[2J', '\n'.join(safe_line(line) for line in lines)]
-        if not whole:
-            screen += [f'\x1b[{rows};1H', legend(self.view, cols - 1, self.held)]
-        screen += [kitty(png, r, c, w, h) for r, c, w, h, png in pictures if r + h <= rows]
-        screen.append(f'\x1b[{rows};{cols}H')
-        sys.stdout.write(''.join(screen))
+        written = [safe_line(line) for line in lines] + [''] * (rows - 1 - len(lines))
+        written.append('' if whole else legend(self.view, cols - 1, self.held))
+        placed = [(r, c, w, h, png) for r, c, w, h, png in pictures if r + h <= rows]
+        sys.stdout.write(repaint(self.drawn, cols, rows, written, placed))
         sys.stdout.flush()
+        self.drawn = (cols, rows, written, placed)
 
     def scroll(self, step):
         """The wheel, or j and k: the page in view moves, never past its top."""
@@ -2832,6 +2884,11 @@ class Pane:
         """One click opens a row; a second click on it puts it in Claude's prompt, unsent. On a dream's
         answers, the half clicked is the answer: kept in the dream log, and "ask Claude" also typed in."""
         act = self.acts.get(row)
+        if act and act.get('keys') is not None:  # the legend: the label clicked, as if its key were pressed
+            pressed = next((key for start, end, key in act['keys'] if start <= col < end), None)
+            if pressed:
+                press(self, pressed)
+            return
         if act and act.get('lost') and act.get('spans'):
             return lost_click(self, act, col)
         span = act and next((answer for start, end, answer in act.get('spans') or () if start <= col < end), None)
@@ -2841,6 +2898,7 @@ class Pane:
                 agent = agent_pane(self.agent)
                 went = send_text(agent, act['send'])
                 self.sent = (act['key'], went, time.time())
+                focus_back()
             self.answered = (act['dream'], span, time.time())
         elif not act or act.get('spans'):
             self.open = None
@@ -2855,7 +2913,7 @@ class Pane:
             agent = agent_pane(self.agent)
             went = send_text(agent, act['send'])
             self.sent = (act['key'], went, time.time())
-        focus_back()
+            focus_back()  # it is in Claude's prompt now: the next keys belong there
 
 
 # ---------------------------------------------------------------- lost and found
@@ -3266,7 +3324,7 @@ def lost_click(pane, act, col):
         agent = agent_pane(pane.agent)
         went = send_text(agent, act['asks'][pick])
         pane.sent = (act['item'], went, time.time())
-    focus_back()
+        focus_back()  # it is in Claude's prompt now: the next keys belong there
 
 
 def mtime(path):
@@ -3308,7 +3366,7 @@ def watch(root, limit, session_id, agent=None):
         tty.setcbreak(fd)
     sys.stdout.write('\x1b]0;CSR\x07\x1b[?25l' + BLACK + (MOUSE_ON if saved else ''))
     try:
-        last = 0.0
+        last, last_key = 0.0, 0.0
         while True:
             # hot reload: an edit to this file, once it has stood still a tick and compiles, runs in place
             now_seen = mtime(source)
@@ -3343,10 +3401,12 @@ def watch(root, limit, session_id, agent=None):
                     pane.scroll(WHEEL if int(button) == 65 else -WHEEL)
                     redraw['now'] = True
             keys = re.sub(r'\x1b\[<[\d;]*[Mm]', '', data).lower()
-            if 'q' in keys:
+            typing = time.time() - last_key < 1.0  # another key a moment ago: these are words, not commands
+            last_key = time.time() if keys else last_key
+            if keys == 'q' and not typing:
                 break
             if keys == '\x1b':
-                pane.open, redraw['now'] = None, True
+                pane.open, pane.tall, pane.main_top, redraw['now'] = None, False, 0, True
             if summary_keys(pane, keys) or threads_keys(pane, keys):
                 redraw['now'] = True
             elif pane.view == 'main' and any(k in keys for k in ('j', 'k', ' ', '\x1b[a', '\x1b[b')):

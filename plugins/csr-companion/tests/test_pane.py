@@ -1114,6 +1114,60 @@ class MainScroll(unittest.TestCase):
         shell.scroll(pane.WHEEL)
         self.assertEqual(shell.main_top, pane.WHEEL)
 
+    def test_a_frame_rewrites_only_the_rows_that_changed_and_never_clears_the_screen(self):
+        rows = ['a', 'b', 'c', 'legend']
+        first = pane.repaint(None, 10, 4, rows, [])
+        self.assertIn('\x1b[2J', first)  # the first frame starts clear
+        drawn = (10, 4, rows, [])
+        same = pane.repaint(drawn, 10, 4, rows, [])
+        self.assertEqual(same, pane.SYNC_ON + '\x1b[4;10H' + pane.SYNC_OFF)  # nothing to write
+        moved = pane.repaint(drawn, 10, 4, ['a', 'B', 'c', 'legend'], [])
+        self.assertNotIn('\x1b[2J', moved)
+        self.assertIn('\x1b[2;1H\x1b[0m\x1b[2KB', moved)
+        self.assertNotIn('\x1b[1;1H', moved)  # row a is left as it is
+        self.assertTrue(moved.startswith(pane.SYNC_ON) and moved.endswith(pane.SYNC_OFF))
+        self.assertIn('\x1b[2J', pane.repaint(drawn, 12, 4, rows, []))  # a new size starts clear
+
+    def test_each_legend_label_is_its_own_click_and_only_a_send_hands_the_focus_back(self):
+        text, spans = pane.legend_parts('main', 60)
+        plain = pane.re.sub(r'\x1b\[[0-9;]*m', '', text)
+        for start, end, key in spans:
+            self.assertTrue(plain[start:end].startswith(key + ' '), (plain, start, key))
+        shell = pane.Pane.__new__(pane.Pane)
+        shell.view, shell.open, shell.sent, shell.main_top, shell.anchor = 'main', None, None, 0, None
+        shell.threads_top, shell.agent, shell.data, shell.tall = 0, None, {}, False
+        shell.acts = {23: dict(key='legend', keys=spans), 7: dict(key='lost:abc', send='x')}
+        backs, saved = [], (pane.focus_back, pane.send_text)
+        pane.focus_back, pane.send_text = lambda: backs.append(1), lambda agent, text: True
+        try:
+            col = {key: start for start, _, key in spans}
+            shell.click(23, col['s'])
+            self.assertEqual(shell.view, 'summary')
+            shell.view = 'main'
+            shell.click(23, col['f'])
+            self.assertEqual(shell.view, 'threads')
+            shell.view = 'main'
+            shell.click(23, col['q'])  # close stays on the keyboard
+            self.assertEqual(shell.view, 'main')
+            shell.click(7, 3)  # opens the row: the focus stays here, so keys work
+            self.assertEqual((shell.open, backs), ('lost:abc', []))
+            shell.click(7, 3)  # puts it in Claude's prompt: now the focus goes back
+            self.assertEqual(backs, [1])
+        finally:
+            pane.focus_back, pane.send_text = saved
+
+    def test_pictures_are_sent_again_only_when_they_or_the_rows_under_them_change(self):
+        rows, picture = ['a', 'b', 'c', 'legend'], (1, 2, 4, 2, b'png')
+        drawn = (10, 4, rows, [picture])
+        quiet = pane.repaint(drawn, 10, 4, ['A', 'b', 'c', 'legend'], [picture])
+        self.assertNotIn('\x1b_G', quiet)  # row 0 is not under the picture: it stays put
+        under = pane.repaint(drawn, 10, 4, ['a', 'b', 'C', 'legend'], [picture])
+        self.assertIn('\x1b_Ga=d,d=A', under)
+        self.assertIn('a=T', under)  # row 2 is: the picture goes back on top of it
+        gone = pane.repaint(drawn, 10, 4, rows, [])
+        self.assertIn('\x1b_Ga=d,d=A', gone)
+        self.assertNotIn('a=T', gone)
+
 
 if __name__ == '__main__':
     unittest.main()
