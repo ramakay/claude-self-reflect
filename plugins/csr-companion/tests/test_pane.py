@@ -86,5 +86,67 @@ class Feed(unittest.TestCase):
         self.assertEqual([d['at'] for d in fed['folded']], [800, 700, 600, 500, 400])
 
 
+def page(dreams=(), look=None, story=None, remembered=(), chapter=None):
+    """page_main over a stand-in CSR: no rules on record, this session's dreams and story as given."""
+    con = sqlite3.connect(':memory:')
+    con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
+                'byte_start int, project text, kind text)')
+    connect, pane.connect = pane.connect, lambda: con
+    try:
+        s = dict(id=HERE_NOW, prompts=[], replies=[], compacts=[], remembered=list(remembered),
+                 gave=dict(recalls=[], carried=[], dreams=[]), project='csr-engine')
+        data = dict(repo='/tmp/csr-engine', dreams=list(dreams), chapter=chapter or dict(at=1000.0, of=5),
+                    dreams_on=True, look=look, story=story)
+        return pane.page_main(data, s, 2000.0)
+    finally:
+        pane.connect = connect
+
+
+STORY = ('The session built the pane. The threads were the story and the dreams. '
+         'Work stands at: abc1234 committed on fix/x, installed. Nothing is pushed.')
+
+
+class Page(unittest.TestCase):
+    def test_the_story_row_leads_with_where_the_work_stands(self):
+        self.assertEqual(pane.where_it_stands(STORY), 'Work stands at: abc1234 committed on fix/x, installed. Nothing is pushed.')
+        # no sentence says where it stands: its last two
+        self.assertEqual(pane.where_it_stands('One. Two. Three.'), 'Two. Three.')
+        self.assertEqual(pane.where_it_stands('Only one.'), 'Only one.')
+
+    def test_an_idle_dreamer_is_one_folded_row_under_the_story(self):
+        story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=3, by='Haiku', at=1990.0)
+        got = page([dream(1400, 'ask_claude'), dream(1200, 'ignored')], look=dict(at=1995.0, outcome='none'),
+                   story=story)
+        self.assertEqual([s['name'] for s in got['sections']][:2], ['story', 'dreams'])
+        self.assertEqual(got['sections'][0]['right'], 'rev 3 · Haiku · now')
+        self.assertTrue(got['sections'][0]['items'][0]['title'].startswith('Work stands at'))
+        dreams = got['sections'][1]
+        self.assertEqual([i['title'] for i in dreams['items']], ['› 1 adopted · 1 passed'])
+        self.assertEqual(dreams['right'], 'looked just now · 4 left')  # 5 + 1 adopted - 2 shown
+
+    def test_a_dream_waiting_on_you_comes_before_the_story(self):
+        story = dict(text=STORY, now=STORY, rev=1, by='', at=1990.0)
+        got = page([dream(1500)], story=story)
+        self.assertEqual([s['name'] for s in got['sections']][:2], ['dreams', 'story'])
+
+    def test_what_claude_asked_csr_folds_into_the_count(self):
+        asked = [dict(kind='asked', at=1500.0 + k, text=f'query {k}', tool='reflect_on_past', times=1) for k in range(3)]
+        handed = next(s for s in page(remembered=asked)['sections'] if s['name'] == 'remembered')
+        self.assertEqual([i['title'] for i in handed['items']], ['Claude asked 3×'])
+
+
+class HotReload(unittest.TestCase):
+    def test_an_edit_that_does_not_compile_is_held_and_said(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            good, bad = os.path.join(tmp, 'good.py'), os.path.join(tmp, 'bad.py')
+            open(good, 'w').write('x = 1\n')
+            open(bad, 'w').write('x = 1\ndef broken(:\n')
+            self.assertIsNone(pane.compiles(good))
+            self.assertEqual(pane.compiles(bad), 'SyntaxError line 2')
+        self.assertIn('edit not loaded: SyntaxError line 2', pane.legend('main', 60, 'SyntaxError line 2'))
+        self.assertNotIn('edit not loaded', pane.legend('main', 60))
+
+
 if __name__ == '__main__':
     unittest.main()

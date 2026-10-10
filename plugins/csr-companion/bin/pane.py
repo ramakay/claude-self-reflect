@@ -717,6 +717,39 @@ def session_about(con, conversation):
     return _ABOUT[conversation]
 
 
+def session_story(session_id):
+    """This session's story as csr-engine last told it: its words, its revision, who wrote it and when.
+    csr-engine retells it after each compaction and at the session's end."""
+    if not session_id:
+        return None
+    con = connect()
+    try:
+        row = con.execute("select content, tags, timestamp from reflections where tags like ? and "
+                          "tags like '%session_story%' order by timestamp desc limit 1",
+                          (f'%conv_{session_id}%',)).fetchone()
+    finally:
+        con.close()
+    if not row or not (row[0] or '').strip():
+        return None
+    try:
+        tags = json.loads(row[1] or '[]')
+    except ValueError:
+        tags = []
+    rev = next((int(t[10:]) for t in tags if t.startswith('story_rev_') and t[10:].isdigit()), 1)
+    by = 'Haiku' if 'story_by_haiku' in tags else 'extract' if 'story_extracted' in tags else ''
+    text = ' '.join(row[0].split())
+    return dict(text=text, now=where_it_stands(text), rev=rev, by=by, at=epoch(row[2]))
+
+
+def where_it_stands(story):
+    """A story's ending, from the sentence that says where the work stands (its last two sentences
+    when none says it): what the pane shows before a click opens the rest."""
+    told = re.split(r'(?<=[.!?])\s+(?=[A-Z`])', story)
+    at = next((i for i in range(len(told) - 1, -1, -1)
+               if re.search(r'\b(?:stands?|stood|standing)\b', told[i], re.I)), max(0, len(told) - 2))
+    return ' '.join(told[at:])
+
+
 def memory_of(con, kind, memory, conversation, parent):
     """What one recalled memory was: its past session, or the stored reflection itself."""
     if kind == 'reflection':
@@ -976,9 +1009,9 @@ INK = dict(you=PIGMENT['lamp'], ctx=readable(PIGMENT['indigo'], GROUND), learn=r
            sepia=PIGMENT['sepia'], rule=(0, 0, 0, 34), quiet=PIGMENT['graphite'], faint=PIGMENT['pencil'],
            hair=PIGMENT['rule'])
 SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams='dream', memory='recall',
-               changed='quiet', remembered='recall', kept='turn')
+               changed='quiet', remembered='recall', kept='turn', story='ctx')
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
-             kept='◆')  # where no pictures are drawn
+             kept='◆', story='§')  # where no pictures are drawn
 DARK = (PIGMENT['payne'], PIGMENT['night'])  # the masthead's ground, from its first row (Claude's own status
 # line) to its last (the gauges' legend), each row a step darker in CIELAB; payne sits clear of a dark
 # terminal's own ground (herdr's is 40), so the masthead keeps its edge.
@@ -1134,7 +1167,7 @@ def iso_icon(name):
         draw.line([at(*a), at(*b)], fill=fill, width=1)
 
     c, quiet = INK[SECTION[name]], INK['quiet']
-    if name == 'touching':  # the files Claude has open: a sheet of code on its folder, one line just edited
+    if name in ('touching', 'story'):  # Claude's open files, or the session's story: a sheet on its folder
         box(-2, -2, 0, 14, 12, 2, c)
         box(0, 0, 2, 10, 8, 2, c, top=PAPER + (255,), left=PAGES + (255,), right=mix(PAGES, black, 0.12),
             more=lambda d: [line(d, (2, 2, 4), (8, 2, 4), mix(c, white, 0.2)),
@@ -1530,7 +1563,8 @@ def short_path(rel, parts=3):
 
 def page_main(data, s, now, ui=None):
     """What a senior architect wants beside the agent, the star first, each shown only with something in it:
-      What if…          the dreamer's question, its reasoning shown, answered from here
+      Story             where the session stands, as csr-engine last told it (each compaction retells it)
+      What if…          the dreamer's question, its reasoning shown, answered from here; idle, one folded row
       Handed to Claude  what CSR's memory gave Claude this session: past sessions and notes
       Your rules        corrections you typed yourself in this repo
     Above them, the session's gauges: your prompts, Claude's context and CSR's memory at work. Code that
@@ -1574,40 +1608,27 @@ def page_main(data, s, now, ui=None):
         dreams.append(dict(key='dream:' + d['id'], dream=d['id'], title=d['line'], lines=3,
                            body=[d.get('title') or ''] + reasons[:1], answers=True, detail=reasons[1:3],
                            send=dream_send(d, reasons)))
-    if data.get('dreams_on') and look and not starred:
-        when = stamp(look['at'], now)[0]
-        every = look.get('every')
-        dreams.append(dict(key='look', quiet=True, lines=2,
-                           title=f"No open question. Last look {'just now' if when == 'now' else when}: "
-                                 f"{LOOKED.get(look['outcome'], look['outcome'])}.",
-                           meta=f"next after {every} of Claude's steps, if CSR has something new" if every else '',
-                           detail=[f'A chapter (from the start or the last compaction to the next) holds '
-                                   f'{PER_CHAPTER} dreams, spread over it; one you adopt gives its place back. '
-                                   'The dreamer looks only when CSR has something new about the work in hand.'],
-                           send='/shifts dreams'))
-    for d in fed['adopted']:  # what the feed paid: kept in view
-        reasons = reasons_of(d)
-        dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1,
-                           meta=' · '.join(x for x in ('adopted', stamp(d['at'], now)[0], ANSWER_WORD.get(d['answer'], '')) if x),
-                           detail=[d.get('title') or ''] + reasons[:2], send=dream_send(d, reasons)))
-    if fed['folded']:  # everything else, folded: one click opens the list, each still a click from Claude
+    # Every other dream, adopted or passed, folded into one row; when the dreamer last looked sits in the
+    # heading. One click opens the list, each dream still a click from Claude.
+    earlier = sorted(fed['adopted'] + fed['folded'], key=lambda d: d['at'], reverse=True)
+    if earlier:
         is_open = 'passed' in (ui.get('folds') or ())
+        took = len(earlier) - len(fed['passed'])
         dreams.append(dict(key='fold:passed', quiet=True, lines=1,
                            title=f"{'⌄' if is_open else '›'} " + ' · '.join(
-                               x for x in (f"{len(fed['passed'])} passed" if fed['passed'] else '',
-                                           f"{len(fed['folded']) - len(fed['passed'])} adopted earlier"
-                                           if len(fed['folded']) > len(fed['passed']) else '') if x),
+                               x for x in (f"{took} adopted" if took else '',
+                                           f"{len(fed['passed'])} passed" if fed['passed'] else '') if x),
                            detail=[], send=''))
         if is_open:
-            for d in fed['folded']:
+            for d in earlier:
                 reasons = reasons_of(d)
                 dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1,
                                    meta=' · '.join(x for x in (stamp(d['at'], now)[0], ANSWER_WORD.get(d['answer'], 'not answered')) if x),
                                    detail=[d.get('title') or ''] + reasons[:2], send=dream_send(d, reasons)))
 
-    # Only what Claude reached for: a hand-off it then opened, or a question it asked CSR itself; at most
-    # two rows. The rest stays behind one row with the count, which opens to the list.
-    handed, passive = [], []
+    # Only what Claude used: a hand-off it then opened, at most two rows. The rest, and the questions
+    # Claude asked CSR itself, stay behind one row with the counts, which opens to the list.
+    handed, passive, queries = [], [], []
     for item in s.get('remembered') or []:
         if item['kind'] == 'recall':
             where = ' · '.join(x for x in (from_when(item.get('when'), now), item.get('project'),
@@ -1617,33 +1638,49 @@ def page_main(data, s, now, ui=None):
                 handed.append(dict(recall_act(item, now), title=gist, meta='opened · ' + where))
             else:
                 passive.append(f"{gist} · {where}" if where else gist)
-        elif len(handed) < 2:
-            handed.append(dict(key=f"asked:{item['at']}", title=item['text'], meta='Claude asked CSR',
-                               detail=[f"Through {item.get('tool') or 'a CSR tool'}."],
-                               send=one_line(f"Claude asked CSR: “{item['text']}”")))
+        else:
+            queries.append(item['text'])
     given = handoffs(s['gave']['recalls']) + len(s['gave']['carried']) if s.get('gave') else 0
     opened = sum(1 for item in s.get('remembered') or [] if item.get('opened'))
-    if given:
+    if given or queries:
         handed.append(dict(key='handed:all', quiet=True, lines=1,
-                           title=f"{given} handed" + (f" · {opened} opened" if opened else ''),  # a zero would measure the format
-                           detail=passive[:5] or ['Nothing left to list.'],
+                           title=' · '.join(x for x in (f"{given} handed" if given else '',
+                                                        f"{opened} opened" if opened else '',  # a zero would measure the format
+                                                        f"Claude asked {len(queries)}×" if queries else '') if x),
+                           detail=(passive[:4] + [f'Claude asked: {q}' for q in queries[:2]]) or ['Nothing left to list.'],
                            send=one_line('CSR handed you these this session: ' + '; '.join(passive[:5]))))
 
     clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
     if s['compacts']:
         facts.append(f"{len(s['compacts'])} compacts")
+    story, told = data.get('story'), []
+    if story:
+        told.append(dict(key='story', title=story['now'], open_title=story['text'], lines=6, open_lines=30, detail=[],
+                         send=one_line(f"CSR's story of this session, rev {story['rev']}: {story['text']}")))
+    if not data.get('dreams_on'):
+        right = 'off'
+    elif not fed['left']:
+        right = '0 left · next compact'
+    elif look and not starred:
+        when = stamp(look['at'], now)[0]
+        right = f"looked {'just now' if when == 'now' else when} · {fed['left']} left"
+    else:
+        right = f"{fed['left']} of {fed['of']} left"
+    sections = [
+        dict(name='story', title='Story', items=told, empty='',
+             right=' · '.join(x for x in (story and f"rev {story['rev']}", story and story['by'],
+                                          story and story['at'] and stamp(story['at'], now)[0]) if x)),
+        dict(name='dreams', title='What if…', right=right, items=dreams, empty=''),
+        dict(name='remembered', title='Handed to Claude', right='', items=handed, empty=''),
+        dict(name='rules', title='Your rules', right='', items=rules, empty=''),
+    ]
+    if starred:  # a question waiting on you comes before the story
+        sections[:2] = sections[1::-1]
     return dict(head=dict(facts=' · '.join(facts), session=s if s.get('learned') else None,
                           status=data.get('claude_line')),
                 quiet='Nothing to report yet. A section shows here once CSR has something for it.',
-                sections=[
-        dict(name='dreams', title='What if…',
-             right=(f"{fed['left']} of {fed['of']} left" if fed['left'] else '0 left · next compact')
-             if data.get('dreams_on') else 'off',
-             items=dreams, empty=''),
-        dict(name='remembered', title='Handed to Claude', right='', items=handed, empty=''),
-        dict(name='rules', title='Your rules', right='', items=rules, empty=''),
-    ])
+                sections=sections)
 
 
 def page_log(data):
@@ -1680,7 +1717,8 @@ def item_rows(item, name, width, is_open):
     """One item: its title on up to two lines (all of it once opened), its body where it has one (the star
     dream's reasoning, always shown), then what CSR knows about it, quiet, with a flag first in the risk ink."""
     room = width - ITEM
-    title = wrap(item['title'].replace('`', ''), room, 6 if is_open else item.get('lines', 2))
+    title = item.get('open_title', item['title']) if is_open else item['title']
+    title = wrap(title.replace('`', ''), room, item.get('open_lines', 6) if is_open else item.get('lines', 2))
     voice = ink('quiet') if item.get('quiet') else ink('you')  # lamp black: the page's own type
     rows = [' ' * ITEM + voice + line + OFF for line in title]
     for k, text in enumerate(item.get('body') or ()):
@@ -1806,8 +1844,11 @@ def draw_log(data, cols, rows, ui=None):
 
 
 
-def legend(view, width):
-    """The bottom row: its keys in lamp black, what each does in pencil; a click on it does the first."""
+def legend(view, width, held=None):
+    """The bottom row: its keys in lamp black, what each does in pencil; a click on it does the first.
+    While an edit to the pane's own file does not compile, the row says so and the old pane runs on."""
+    if held:
+        return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF
     keys = [('l', 'changes since your sessions'), ('q', 'close')] if view == 'main' else \
         [('d', 'back'), ('q', 'close')]
     marks = '' if view == 'main' else '~ changed  - removed  + back   '
@@ -1858,6 +1899,7 @@ class Pane:
         self.open, self.sent, self.acts = None, None, {}  # the row a click opened; what went to Claude
         self.answered = None  # (dream id, answer, when) the pane kept for a dream, until it is read
         self.folds = set()  # folded rows opened with a click
+        self.held = None  # why an edit to this file was not loaded, until one is
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -1869,6 +1911,7 @@ class Pane:
             self.data['look'] = last_look(self.root)
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
+            self.data['story'] = session_story(self.session and self.session.id)
             s = self.session.load() if self.session and self.view == 'main' else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
             said = SETUP if not os.path.exists(DB) else f'could not read csr-engine: {error}'
@@ -1886,7 +1929,7 @@ class Pane:
                           self.answered,
                           self.data.get('claude_line'),
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds),
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
         if sig == self.shown and not force:
@@ -1902,7 +1945,7 @@ class Pane:
         whole = any(h >= rows for _, _, _, h, _ in pictures)  # a paper page draws its own legend
         screen = ['\x1b_Ga=d,d=A\x1b\\', '\x1b[H\x1b[2J', '\n'.join(lines)]
         if not whole:
-            screen += [f'\x1b[{rows};1H', legend(self.view, cols - 1)]
+            screen += [f'\x1b[{rows};1H', legend(self.view, cols - 1, self.held)]
         screen += [kitty(png, r, c, w, h) for r, c, w, h, png in pictures if r + h <= rows]
         screen.append(f'\x1b[{rows};{cols}H')
         sys.stdout.write(''.join(screen))
@@ -1935,8 +1978,30 @@ class Pane:
         focus_back()
 
 
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+def compiles(path):
+    """None when the file compiles, else why not, short: what a hot reload checks before it runs an edit."""
+    try:
+        with open(path, encoding='utf-8') as handle:
+            compile(handle.read(), path, 'exec')
+    except SyntaxError as error:
+        return f'{type(error).__name__} line {error.lineno}'
+    except (OSError, ValueError) as error:
+        return str(error)
+    return None
+
+
 def watch(root, limit, session_id, agent=None):
     pane = Pane(root, limit, session_id, agent)
+    source = os.path.realpath(__file__)
+    loaded = seen = mtime(source)
+    reload = False
     redraw = {'now': True}
     signal.signal(signal.SIGWINCH, lambda *_: redraw.update(now=True))
     for ending in (signal.SIGTERM, signal.SIGHUP):  # closed or killed: still clear up below
@@ -1954,7 +2019,16 @@ def watch(root, limit, session_id, agent=None):
     try:
         last = 0.0
         while True:
-            if redraw['now'] or time.time() - last > (2 if pane.sent else 10):
+            # hot reload: an edit to this file, once it has stood still a tick and compiles, runs in place
+            now_seen = mtime(source)
+            if now_seen != loaded and now_seen == seen:
+                pane.held, loaded = compiles(source), now_seen
+                if pane.held is None:
+                    reload = True
+                    break
+                redraw['now'] = True
+            seen = now_seen
+            if redraw['now'] or time.time() - last > 2:  # a frame costs ~15 ms; it draws only what changed
                 pane.frame(redraw['now'])
                 redraw['now'], last = False, time.time()
             try:
@@ -1980,7 +2054,7 @@ def watch(root, limit, session_id, agent=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if mine:  # only while it still names this pane: a pane opened in its place has written its own
+        if mine and not reload:  # only while it names this pane; a reload keeps the pid, so keeps the file
             try:
                 with open(mine, encoding='utf-8') as handle:
                     if json.load(handle).get('pid') == os.getpid():
@@ -1990,6 +2064,9 @@ def watch(root, limit, session_id, agent=None):
         if saved:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write('\x1b_Ga=d,d=A\x1b\\' + (MOUSE_OFF if saved else '') + GROUND_BACK + '\x1b[?25h\n')
+        sys.stdout.flush()
+    if reload:  # the same pid in the same pane: herdr and the band above Claude's prompt still find it
+        os.execv(sys.executable, [sys.executable] + (['-I'] if sys.flags.isolated else []) + [source] + sys.argv[1:])
 
 
 def main():
@@ -2047,6 +2124,7 @@ def main():
     elif args.png:
         now, cell = time.time(), (16, 34)
         data = load(root, args.limit, args.sid)
+        data.update(look=last_look(root), chapter=last_chapter(root, args.sid), story=session_story(args.sid))
         os.makedirs(args.png, exist_ok=True)
         if args.sid:
             s = Session(args.sid).load()
