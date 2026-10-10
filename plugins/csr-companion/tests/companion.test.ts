@@ -45,7 +45,7 @@ const DREAM_REPLY = [
 ].join('\n')
 const USAGE = { input_tokens: 900, output_tokens: 100, cache_creation_input_tokens: 0, cache_read_input_tokens: 40_000 }
 
-type World = { herdr: boolean; repo: boolean; notes?: unknown[]; box?: string; replies?: string[]; brief?: string }
+type World = { herdr: boolean; repo: boolean; notes?: unknown[]; box?: string; replies?: string[]; brief?: string; youShouldKnow?: boolean }
 
 function host(on: On, world: World) {
   const runs: string[][] = []
@@ -89,8 +89,12 @@ function host(on: On, world: World) {
     const text = world.replies?.[forks.length - 1] ?? 'dream: none'
     return { value: { isAnswered: true, text, usage: USAGE } }
   })
-  // The engine's own band beneath: nothing to show, as an empty box.
-  on('ui.render', async ($, e) => h($.ui.resolve(e).Box, {}) as never)
+  // The band beneath: empty, or You should know's note with its own 4: Disable.
+  on('ui.render', async ($, e) => {
+    const { Box, Button } = $.ui.resolve(e)
+    if (!world.youShouldKnow) return h(Box, {}) as never
+    return h(Box, {}, h(Button, { key: 'ysk-disable', hotkey: '4', plain: true, label: 'Disable', onPress: () => undefined })) as never
+  })
   on('env.get', async (_$, e) => {
     if (world.herdr && e.name === 'HERDR_PANE_ID') return { value: 'w2:p1' }
     if (world.herdr && e.name === 'HERDR_BIN_PATH') return { value: '/bin/herdr' }
@@ -350,4 +354,27 @@ test('the dim 4 on a dream turns dreams off, after a second press', ON, async ($
   expect(seen.configured).toEqual([{ key: 'csr-companion.dreams', value: false }])
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'answer', answer: 'turn_off' }))
   expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
+})
+
+test('a dream waits while You should know asks, so its 4 can never turn the other band off', ON, async ($, on) => {
+  const world = { herdr: false, repo: true, replies: [DREAM_REPLY], youShouldKnow: true } as World
+  const seen = host(on, world)
+  const band = await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 1)
+  await settle(() => false)
+  expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
+  expect(await band.find({ key: 'ysk-disable' })).toBeDefined()
+
+  // Prompts typed while the dream was hidden are not "typed past".
+  await $.prompt.submit({ text: 'one', origin: { kind: 'human' } } as never)
+  await $.prompt.submit({ text: 'two', origin: { kind: 'human' } } as never)
+  expect(seen.kept.some(entry => entry.answer === 'ignored')).toBe(false)
+  expect(seen.store.get('looksToSkip')).toBeUndefined()
+
+  world.youShouldKnow = false
+  await band.redraw() // as You should know's band redraws when its note clears
+  await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
+  expect(await band.find({ key: 'Disable' })).toBeDefined()
+  expect(await band.find({ key: 'ysk-disable' })).toBeUndefined()
 })

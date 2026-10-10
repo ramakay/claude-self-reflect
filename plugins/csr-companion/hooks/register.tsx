@@ -223,12 +223,22 @@ async function dreamsRow($: EngineInterface): Promise<string> {
   return rows.find(row => /^csr-companion(@[^.]+)?\.dreams$/.test(row.key))?.key ?? OFF_ROW
 }
 
+// Whether a band holds a Button with a hotkey: it is asking the person something.
+function asks(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false
+  const element = node as { type?: string; props?: { hotkey?: unknown }; children?: unknown[] }
+  if (element.type === 'Button' && element.props?.hotkey) return true
+  return (element.children ?? []).some(asks)
+}
+
 // ---------------------------------------------------------------- hooks
 
 export const register: Register = (on, options) => {
   const dreamsOn = options.dreams === true
   let steps = 0
   let dreaming = false
+  // True while another band (You should know's) asks, and the note waits behind it.
+  let waiting = false
 
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
@@ -262,7 +272,7 @@ export const register: Register = (on, options) => {
   on('prompt.submit', async ($, e, next) => {
     let ignored: Note | null = null
     await update($, view, current => {
-      if (!current) return current
+      if (!current || waiting) return current // a note nobody saw was not typed past
       const promptsSurvived = current.promptsSurvived + 1
       if (promptsSurvived < CLEAR_AFTER_PROMPTS) return { ...current, promptsSurvived, message: undefined }
       if (current.kind === 'offer') ignored = current.note
@@ -285,7 +295,11 @@ export const register: Register = (on, options) => {
     const beneath = await next(e)
     if (e.props.hasSurvey) return beneath
     const shown = await read($, view)
-    if (!shown) return beneath
+    // One question at a time. Two bands both on 1, 2, 4 and 0 would answer
+    // the lower one ("two on one hotkey: the later wins"), so 4 under a dream
+    // would turn You should know off. The note waits until that band clears.
+    waiting = Boolean(shown) && asks(beneath)
+    if (!shown || waiting) return beneath
     const { Box, Button, Code, Markdown, Text } = $.ui.resolve(e)
     const { note } = shown
     const isDream = note.kind === 'dream'
