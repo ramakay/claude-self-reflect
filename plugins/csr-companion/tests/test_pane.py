@@ -743,7 +743,7 @@ class LostAndFound(unittest.TestCase):
     def test_the_section_shows_three_rows_with_answers_and_only_with_something_in_it(self):
         self.assertEqual(pane.lost_sections({'lost': []}, 5000.0), [])
         (section,) = pane.lost_sections({'lost': pane.lost_found(SUMMARIES)}, 5000.0)
-        self.assertEqual((section['title'], section['right']), ('Lost and found', '3 quiet'))
+        self.assertEqual((section['title'], section['right']), ('Lost and found', '3 quiet · f all 5'))
         self.assertEqual(len(section['items']), 3)
         rows = pane.lost_rows(section['items'][0], 46, {}, False)
         self.assertEqual([act['spans'][0][2] for _, act in rows] + [act['spans'][1][2] for _, act in rows],
@@ -843,10 +843,36 @@ class LostAndFoundAnswered(unittest.TestCase):
 
     def test_a_thread_you_said_go_to_right_after_is_answered_not_lost(self):
         self.assertEqual(self.states([(1500.0, 'i think story is a go')])['Awaiting the'], 'answered')
-        self.assertEqual(self.states([(1500.0, 'install')])['Awaiting the'], 'answered')
+        self.assertEqual(self.states([(1500.0, 'install the story refresh')])['Awaiting the'], 'answered')
+        # a bare go names nothing, so it answers nothing: the thread stays lost, not silently hidden
+        self.assertEqual(self.states([(1500.0, 'install')])['Awaiting the'], 'lost')
+        self.assertEqual(self.states([(1500.0, 'ok push the branch')])['Awaiting the'], 'lost')
         # a go that came long after, past your next two prompts, answers nothing
         late = [(1100.0, 'show me the pane'), (1200.0, 'and the dreams'), (1300.0, 'go')]
         self.assertEqual(self.states(late)['Awaiting the'], 'lost')
+
+    def test_a_go_never_answers_a_thread_that_asked_you_nothing(self):
+        verify = summary("   - After the next prompt, verify that hand-off lines show the session label.")
+        threads = pane.lost_found([(1000.0, verify), (1200.0, verify), (2000.0, self.DONE)],
+                                  [(1500.0, 'ok, hand-off labels next')])
+        self.assertEqual(next(t for t in threads if 'hand-off' in t['text'])['state'], 'lost')
+
+    def test_every_thread_is_on_the_f_page_with_why_including_the_guesses(self):
+        threads = pane.lost_found([(1000.0, self.WAIT), (2000.0, self.DONE)], [(1500.0, 'story is a go')])
+        lines, _, _ = pane.draw_threads({}, {'lost': threads}, 60, 60, {})
+        page = '\n'.join(plain(line) for line in lines)
+        for words in ('Guessed done', 'Showed once', 'story refresh', 'Tidy the scratch', 'you said “story is a go”'):
+            self.assertIn(words, page)
+
+    def test_the_f_page_scrolls_and_its_rows_open_with_their_answers(self):
+        many = summary('\n'.join(f'   - Awaiting the user on alpha{k} beta{k} gamma{k}.' for k in range(30)))
+        threads = pane.lost_found([(1000.0, many), (2000.0, self.DONE)])
+        lines, _, top = pane.draw_threads({}, {'lost': threads}, 50, 20, {}, top=10)
+        self.assertEqual((len(lines) <= 19, top), (True, 10))
+        key = 'lost:' + threads[0]['key']
+        opened, _, _ = pane.draw_threads({}, {'lost': threads}, 50, 40, {'open': key})
+        spans = [act['spans'] for act in opened.acts.values() if act.get('spans')]
+        self.assertEqual(sorted(a for pair in spans for *_, a in pair), ['drop', 'later', 'side', 'sub'])
 
     def test_a_thread_seen_once_that_never_waited_on_you_faded(self):
         self.assertEqual(self.states([])['Tidy the scr'], 'faded')
@@ -875,6 +901,116 @@ class LostAndFoundAnswered(unittest.TestCase):
         marked = {t['key']: t['later'] for t in pane.lost_found([(1000.0, self.WAIT), (2000.0, self.DONE)])}
         self.assertEqual(sum(marked.values()), 1)
         self.assertTrue(marked[key])
+
+
+
+class CarryOver(unittest.TestCase):
+    """A restart loses nothing: the session before this one gives its summary's threads and what came after."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+        self.keep = pane.KEEP, pane.LOST_LOG
+        pane.KEEP, pane.LOST_LOG = self.folder, os.path.join(self.folder, 'lost-found.jsonl')
+
+    def tearDown(self):
+        pane.KEEP, pane.LOST_LOG = self.keep
+        shutil.rmtree(self.folder)
+
+    def transcript(self, name, rows, written, entry='cli'):
+        path = os.path.join(self.folder, name + '.jsonl')
+        with open(path, 'w') as handle:
+            handle.write('\n'.join(json.dumps(dict(r, entrypoint=entry)) for r in rows) + '\n')
+        os.utime(path, (written, written))
+        return path
+
+    @staticmethod
+    def at(minute):
+        return f'2026-10-10T10:{minute:02d}:00Z'
+
+    def before(self, tail, written=1000.0, entry='cli'):
+        pending = summary("   - Awaiting the user's go on the push guard, then push it.")
+        rows = [dict(type='user', timestamp=self.at(0), message=dict(role='user', content='start')),
+                dict(type='user', isCompactSummary=True, timestamp=self.at(5), message=dict(role='user', content=pending))]
+        return self.transcript('prev-1', rows + tail, written, entry)
+
+    def carried(self, started=2000.0):
+        mine = self.transcript('mine-1', [dict(type='user', timestamp=self.at(30), message=dict(role='user', content='hi'))], started)
+        return pane.carried_threads(mine, started)
+
+    def test_a_prompt_claude_never_finished_answering_is_carried_first(self):
+        self.before([dict(type='user', timestamp=self.at(9), message=dict(role='user', content='rename Dreamt to Shift')),
+                     dict(type='user', timestamp=self.at(9), message=dict(role='user', content=[
+                         dict(type='text', text='[Request interrupted by user for tool use]')])),
+                     dict(type='assistant', timestamp=self.at(10), message=dict(
+                         content=[dict(type='text', text='Looking at the grammar.')], stop_reason='tool_use'))])
+        got = self.carried()
+        self.assertTrue(any('push guard' in t['text'] and t['came_from'] == 'prev-1' for t in got))
+        stop = next(t for t in got if 'Cut off' in t['text'])
+        self.assertEqual((stop['rank'], stop['waiting'], 'rename Dreamt' in stop['text']), (0, True, True))
+        self.assertTrue(any('Looking at the grammar' in line for line in stop['detail']))
+
+    def test_claudes_last_question_is_carried_when_the_turn_ended(self):
+        self.before([dict(type='user', timestamp=self.at(9), message=dict(role='user', content='build it')),
+                     dict(type='assistant', timestamp=self.at(10), message=dict(
+                         content=[dict(type='text', text='Built and tested. Should I push the branch?')], stop_reason='end_turn'))])
+        stop = next(t for t in self.carried() if t['came_from'] and 'asked last' in t['text'])
+        self.assertIn('Should I push the branch?', stop['text'])
+
+    def test_a_finished_session_with_nothing_asked_ranks_its_tail_low_but_keeps_it(self):
+        self.before([dict(type='user', timestamp=self.at(9), message=dict(role='user', content='tidy the docs')),
+                     dict(type='assistant', timestamp=self.at(10), message=dict(
+                         content=[dict(type='text', text='Done.')], stop_reason='end_turn'))])
+        stop = next(t for t in self.carried() if 'Last asked' in t['text'])
+        self.assertEqual(stop['rank'], 3)
+
+    def test_only_a_person_s_session_written_before_this_one_began_counts(self):
+        self.before([], entry='sdk-cli')
+        self.assertEqual(self.carried(), [])
+        self.before([], written=3000.0)  # still running beside this one
+        self.assertEqual(self.carried(started=2000.0), [])
+        self.before([], written=2000.0 - 8 * 86400)  # over a week before
+        self.assertEqual(self.carried(), [])
+
+    def test_a_carried_thread_this_session_already_carries_shows_once(self):
+        own = summary("   - Awaiting the user's go on the push guard, then push it.")
+        carried = [dict(text="Awaiting the user's go on the push guard, then push it.", detail=[], first_seen=1.0,
+                        last_seen=2.0, times=1, state='carried', waiting=True, rank=0, key='c1', came_from='prev-1')]
+        threads = pane.lost_found([(1000.0, own)], [], carried)
+        self.assertEqual(len([t for t in threads if 'push guard' in t['text']]), 1)
+        other = [dict(carried[0], text='Rename the Dreamt grammar to Shift.', key='c2')]
+        self.assertEqual(pane.lost_found([(1000.0, own)], [], other)[0]['came_from'], 'prev-1')
+
+
+class MainScroll(unittest.TestCase):
+    def test_the_window_moves_rows_clicks_and_pictures_and_stops_at_the_ends(self):
+        lines = pane.Lines([f'row {k}' for k in range(50)])
+        lines.acts = {10: dict(key='a'), 30: dict(key='b')}
+        pictures = [(12, 0, 4, 2, b'p'), (27, 0, 4, 2, b'cut'), (2, 0, 4, 2, b'gone')]
+        shown, kept, top = pane.window(lines, pictures, 21, 8)
+        self.assertEqual((shown[0], len(shown), top), ('row 8', 20, 8))
+        self.assertEqual(shown.acts, {2: dict(key='a')})
+        self.assertEqual(kept, [(4, 0, 4, 2, b'p')])
+        self.assertEqual(pane.window(lines, [], 21, 99)[2], 30)  # never past the end
+        self.assertEqual(pane.window(lines, [], 21, -5)[2], 0)
+
+    def test_a_click_that_opens_a_row_keeps_it_where_it_was_clicked_and_the_wheel_scrolls(self):
+        shell = pane.Pane.__new__(pane.Pane)
+        shell.view, shell.open, shell.sent, shell.main_top, shell.anchor = 'main', None, None, 0, None
+        shell.threads_top, shell.agent, shell.data = 0, None, {}
+        shell.acts = {7: dict(key='lost:abc', send='x')}
+        saved = pane.focus_back
+        pane.focus_back = lambda: None
+        try:
+            shell.click(7, 3)
+        finally:
+            pane.focus_back = saved
+        self.assertEqual((shell.open, shell.anchor), ('lost:abc', ('lost:abc', 7)))
+        shell.scroll(pane.WHEEL)
+        shell.scroll(pane.WHEEL)
+        shell.scroll(-10 * pane.WHEEL)
+        self.assertEqual(shell.main_top, 0)
+        shell.scroll(pane.WHEEL)
+        self.assertEqual(shell.main_top, pane.WHEEL)
 
 
 if __name__ == '__main__':

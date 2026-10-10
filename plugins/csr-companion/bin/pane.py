@@ -36,6 +36,7 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 from collections import Counter
@@ -942,12 +943,15 @@ def remembered_items(con, recalls, questions, session_id):
 
 # ---------------------------------------------------------------- this session
 
+INTERRUPTED = re.compile(r'\[Request interrupted by user')  # Claude Code's own marker, not words a person typed
+
+
 class Session:
     """This session, read as it goes: the transcript from where it was left, CSR's rows fresh."""
 
-    def __init__(self, session_id):
+    def __init__(self, session_id, path=None):
         self.id = session_id
-        found = glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
+        found = [path] if path else glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
         self.path = found[0] if found else None
         self.offset = 0
         self.replies = {}  # message id -> (time, context tokens, output tokens)
@@ -959,6 +963,10 @@ class Session:
         self.title = None
         self.summaries = []  # (time, text) of each compaction summary, oldest first
         self.typed = []  # (time, words) of each prompt the person typed, oldest first
+        self.started = 0.0  # the first row's time
+        self.said = None  # (time, text) of Claude's last words to the person
+        self.turn_end = 0.0  # when Claude last finished a turn (stop_reason end_turn)
+        self.carried = None  # the session before this one's threads, once read (see carried_threads)
 
     def read_transcript(self):
         if not self.path:
@@ -977,8 +985,11 @@ class Session:
             except ValueError:
                 continue
             kind, when = entry.get('type'), epoch(entry.get('timestamp'))
+            self.started = self.started or when or 0.0
             if kind == 'assistant':
                 message = entry.get('message') or {}
+                if message.get('stop_reason') == 'end_turn' and when and not entry.get('isSidechain'):
+                    self.turn_end = when
                 usage = message.get('usage') or {}
                 context = sum(usage.get(k) or 0 for k in
                               ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'))
@@ -988,6 +999,7 @@ class Session:
                 for part in message.get('content') or []:
                     if isinstance(part, dict) and part.get('type') == 'text' and when and not entry.get('isSidechain'):
                         self.talk.append((when, part.get('text') or ''))
+                        self.said = self.talk[-1]
                     if isinstance(part, dict) and part.get('type') == 'tool_use':
                         self.tools[part.get('name')] += 1
                         path = (part.get('input') or {}).get('file_path')
@@ -1013,7 +1025,7 @@ class Session:
                     p.get('text', '') for p in content or [] if isinstance(p, dict) and p.get('type') == 'text']
                 if any(t.strip() and not t.lstrip().startswith(('<', '/')) for t in texts):
                     self.prompts.append(when)
-                    if not entry.get('isSidechain'):
+                    if not entry.get('isSidechain') and not INTERRUPTED.match('\n'.join(texts).lstrip()):
                         self.talk.append((when, own_words('\n'.join(texts))))
                         self.typed.append(self.talk[-1])
             elif kind == 'user' and when and entry.get('isCompactSummary'):
@@ -1038,6 +1050,9 @@ class Session:
 
     def load(self):
         self.read_transcript()
+        if self.carried is None and self.path:  # once: the session before this one is done being written
+            self.carried = []
+            threading.Thread(target=carry_into, args=(self,), daemon=True).start()
         con = connect()
         try:
             sid = self.id
@@ -1066,7 +1081,7 @@ class Session:
         replies = sorted(self.replies.values())
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
                     compacts=sorted(self.compacts), compact_sizes=self.compact_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
-                    lost=lost_found(self.summaries, self.typed),
+                    lost=lost_found(self.summaries, self.typed, self.carried or ()),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last))
 
@@ -2545,6 +2560,89 @@ def summary_keys(pane, keys):
     return False
 
 
+THREAD_GROUPS = (('waiting', 'Waiting on you', 'waiting'), ('lost', 'Went quiet', 'quiet'),
+                 ('carried', 'From the session before', 'before'), ('open', 'Still open', 'open'),
+                 ('faded', 'Showed once', 'once'), ('answered', 'Guessed done', 'guessed'),
+                 ('later', 'Set aside for later', 'later'), ('drop', 'Dropped', 'dropped'))
+
+
+def thread_group(t):
+    if t['hidden']:
+        return t['hidden']
+    if t['state'] in ('lost', 'open') and t['waiting']:
+        return 'waiting'
+    return t['state']
+
+
+def draw_threads(data, s, cols, rows, ui, top=0):
+    """The f page: every thread Lost and found knows, grouped, nothing hidden; each says why it sits where
+    it does. A click opens one and shows its answers, as on the main page."""
+    width = max(24, cols - 1)
+    every = (s or {}).get('lost') or []
+    groups = {name: [t for t in every if thread_group(t) == name] for name, *_ in THREAD_GROUPS}
+    facts = f"{len(every)} threads: " + ' · '.join(f"{len(groups[name])} {short}" for name, _, short in THREAD_GROUPS
+                                                   if groups[name]) if every else 'No compaction summary yet.'
+    head = [' ' + BOLD + 'Lost and found · every thread' + OFF] + [' ' + line for line in wrap(facts, width - 1, 3)]
+    out = Lines([on_dark(line, ground) for line, ground in zip(head, dark_steps(len(head)))])
+    body = []  # (line, act)
+    for name, title, _ in THREAD_GROUPS:
+        if not groups[name]:
+            continue
+        body.append(('', None))
+        body.append((' ' + ink('turn') + BOLD + title + OFF + ink('faint') + f'  {len(groups[name])}' + OFF, None))
+        for t in groups[name]:
+            asks = lost_asks(t)
+            item = dict(key='lost:' + t['key'], lost=t['key'], top=False, asks=asks, send=asks['side'])
+            act = dict(key=item['key'], send=asks['side'])
+            for line in wrap(t['text'], width - ITEM, 3):
+                body.append((' ' * ITEM + ink('you') + line + OFF, act))
+            body.append((' ' * ITEM + ink('faint') + fit(t.get('why') or '', width - ITEM) + OFF, act))
+            if ui.get('open') == item['key']:
+                for line in t['detail'][:3]:
+                    body.append((' ' * ITEM + ink('quiet') + fit(line, width - ITEM) + OFF, act))
+                for rows_, answer in lost_rows(item, width, ui, True):
+                    body += [(line, answer) for line in rows_]
+    room = max(1, rows - 1 - len(out))
+    top = max(0, min(top, len(body) - room))
+    for line, act in body[top:top + room]:
+        out.put([line], act)
+    return out, [], top
+
+
+def threads_keys(pane, keys):
+    """The f page's keys: f opens it, f or Esc goes back, j and k scroll; True when the screen must redraw."""
+    if 'f' in keys and pane.view != 'threads':
+        pane.view, pane.open, pane.threads_top = 'threads', None, 0
+        return True
+    if pane.view != 'threads':
+        return False
+    if keys == '\x1b' or 'f' in keys:
+        pane.view, pane.open = 'main', None
+        return True
+    step = 3 if any(k in keys for k in ('j', '\x1b[b')) else -3 if any(k in keys for k in ('k', '\x1b[a')) else 0
+    if ' ' in keys:
+        step = 12
+    if step:
+        pane.threads_top = max(0, pane.threads_top + step)
+        return True
+    return False
+
+
+TALL = 600  # the rows a scrolled main page is laid out in: every section at its whole length
+WHEEL = 3  # rows one wheel notch or one j/k moves
+
+
+def window(lines, pictures, rows, top):
+    """The rows of a page laid out tall that the screen shows from top, their clicks and pictures moved
+    with them; a picture the edge would cut is left out."""
+    room = rows - 1
+    top = max(0, min(top, len(lines) - room))
+    shown = Lines(lines[top:top + room])
+    shown.acts = {row - top: act for row, act in lines.acts.items() if top <= row < top + room}
+    kept = [(row - top, col, w, h, png) for row, col, w, h, png in pictures if 0 <= row - top and row - top + h <= room]
+    return shown, kept, top
+
+
 def compact_key(data):
     """What redraws the pane for a compaction: the timer's second and facts, the summary page's place."""
     summary = data.get('summary')
@@ -2556,15 +2654,16 @@ def legend(view, width, held=None):
     While an edit to the pane's own file does not compile, the row says so and the old pane runs on."""
     if held:
         return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF
-    keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('q', 'close')] if view == 'main' else \
-        [('d', 'back')] + ([('j/k', 'scroll')] if view == 'summary' else []) + [('q', 'close')]
-    marks = '' if view in ('main', 'summary') else '~ changed  - removed  + back   '
+    keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('f', 'every lost thread'), ('q', 'close')] \
+        if view == 'main' else [('d', 'back')] + ([('j/k', 'scroll')] if view in ('summary', 'threads') else []) + [('q', 'close')]
+    marks = '' if view in ('main', 'summary', 'threads') else '~ changed  - removed  + back   '
     words = [(key, said) for key, said in keys]
     while len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width and len(words[0][1]) > 7:
         words[0] = (words[0][0], words[0][1].rsplit(' ', 1)[0])
     if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width:  # still too wide: 's summary'
         words = [words[0]] + [(key, said.rsplit(' ', 1)[-1]) for key, said in words[1:]]
-    shown = '   '.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
+    sep = '   ' if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) <= width else '  '  # still tight: closer
+    shown = sep.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
     return ' ' + ink('faint') + marks + OFF + shown
 
 
@@ -2609,6 +2708,9 @@ class Pane:
         self.answered = None  # (dream id, answer, when) the pane kept for a dream, until it is read
         self.folds = set()  # folded rows opened with a click
         self.held = None  # why an edit to this file was not loaded, until one is
+        self.threads_top = 0  # the f page's first line shown
+        self.main_top = 0  # the main page's first line shown, once scrolled or a row is opened
+        self.anchor = None  # (row key, screen row) a click just opened: it stays where it was clicked
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -2627,7 +2729,7 @@ class Pane:
                 self.data['summary'] = newest_summary(self.session and self.session.path)
             force = compaction_ended(self, self.data['compacting']) or force  # the marker went: redraw at once
             self.data['readings'] = how_claude_read(self.session and self.session.id)
-            s = self.session.load() if self.session and self.view == 'main' else None
+            s = self.session.load() if self.session and self.view in ('main', 'threads') else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
             said = SETUP if not os.path.exists(DB) else f'could not read csr-engine: {error}'
             sys.stdout.write(f"\x1b_Ga=d,d=A\x1b\\\x1b[H\x1b[2J{BOLD}CSR{OFF}\n{DIM}"
@@ -2645,16 +2747,26 @@ class Pane:
                           self.data.get('claude_line'), masthead(self.data.get('claude_fields'), now),
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
                           self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
-                          compact_key(self.data), self.data.get('readings'),
+                          compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
+                          s and [(t['key'], t['hidden'], t['state']) for t in s['lost']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
         if sig == self.shown and not force:
             return
         self.shown = sig
-        if self.view == 'main':
+        if self.view == 'main' and (self.main_top or self.open):  # laid out whole, the screen a window on it
+            lines, pictures = draw_main(self.data, s, cols, TALL, now, ui)
+            if self.anchor:
+                row = min((r for r, act in lines.acts.items() if act.get('key') == self.anchor[0]), default=None)
+                self.main_top = max(0, row - self.anchor[1]) if row is not None else self.main_top
+                self.anchor = None
+            lines, pictures, self.main_top = window(lines, pictures, rows, self.main_top)
+        elif self.view == 'main':
             lines, pictures = draw_main(self.data, s, cols, rows, now, ui)
         elif self.view == 'summary':
             lines, pictures = draw_summary(self.data, cols, rows, ui)
+        elif self.view == 'threads':
+            lines, pictures, self.threads_top = draw_threads(self.data, s, cols, rows, ui, self.threads_top)
         else:
             lines, pictures = draw_log(self.data, cols, rows, ui)
         self.acts = {row: act for row, act in getattr(lines, 'acts', {}).items() if row < rows - 1}
@@ -2668,6 +2780,15 @@ class Pane:
         screen.append(f'\x1b[{rows};{cols}H')
         sys.stdout.write(''.join(screen))
         sys.stdout.flush()
+
+    def scroll(self, step):
+        """The wheel, or j and k: the page in view moves, never past its top."""
+        if self.view == 'summary' and (self.data or {}).get('summary'):
+            self.data['summary']['top'] = max(0, self.data['summary']['top'] + step)
+        elif self.view == 'threads':
+            self.threads_top = max(0, self.threads_top + step)
+        elif self.view == 'main':
+            self.main_top = max(0, self.main_top + step)
 
     def click(self, row, col=0):
         """One click opens a row; a second click on it puts it in Claude's prompt, unsent. On a dream's
@@ -2691,6 +2812,7 @@ class Pane:
             self.folds ^= {act['key'][5:]}
         elif act['key'] != self.open:
             self.open, self.sent = act['key'], None
+            self.anchor = (act['key'], row) if self.view == 'main' else None
         else:
             agent = agent_pane(self.agent)
             went = bool(agent) and herdr('pane', 'send-text', agent, act['send']) is not None
@@ -2715,6 +2837,9 @@ OWED = re.compile(r"\b(wait|waiting|await|awaiting|confirm|verify|check|update|r
 BOOKKEEPING = re.compile(r"^(?:(?:send|write|give|post|deliver)\b.{0,40}\b(?:final|brief|short|settle)\b.{0,30}\b(?:reply|report|summary|message)|"
                          r"(?:brief|short|final)\b.{0,20}\b(?:reply|report|summary)|report\b.*\bto the user|"
                          r"(?:tell|let) the user\b|report\b|confirm the background|responding to\b|(?:the )?messages after this summary)", re.I)
+GENERIC = {'session', 'claude', 'pane', 'csr', 'mod', 'code', 'make', 'need', 'thing', 'work', 'just', 'like', 'what',
+           'should', 'also', 'more', 'some', 'here', 'there', 'them', 'they', 'it', 'can', 'did', 'does', 'how', 'out',
+           'see', 'get', 'got', 'let', 'use', 'way', 'go', 'yes', 'ok', 'okay', 'please', 'thank', 'thanks', 'good'}
 APPROVED = re.compile(r"^\W*(?:go|yes|yep|ok|okay|install|proceed|approved?|do it|ship it|push it)\b|\bis a go\b", re.I)
 REMINDERS = re.compile(r'reminders from csr', re.I)  # what prep-compact asks the summary to keep: never a task
 IGNORED = {'the', 'and', 'for', 'with', 'then', 'that', 'this', 'when', 'its', 'are', 'was', 'from', 'into', 'not', 'has',
@@ -2796,12 +2921,23 @@ def summary_items(text):
     return items
 
 
+def replies_to(words, thread_words):
+    """A prompt is about a thread when it names something the thread names, past the words every prompt
+    here uses."""
+    return any(len(w) > 3 and w not in GENERIC for w in words_of(words or '') & thread_words)
+
+
+def hhmm(t):
+    return datetime.fromtimestamp(t).strftime('%m-%d %H:%M') if t else ''
+
+
 def lost_threads(summaries, typed=()):
     """The threads across a session's compaction summaries [(time, text)], ranked: lost and waiting on you,
-    lost, open and waiting, open. A thread is open while the newest summary still carries it and lost once
-    it dropped out; the same thread in two summaries is two items sharing most of their words. A thread that
-    dropped out right after you said go is answered, not lost; one that showed once and never waited on you
-    faded (most of those were done in passing)."""
+    lost, open and waiting, open, then the guesses. A thread is open while the newest summary still carries
+    it and lost once it dropped out; the same thread in two summaries is two items sharing most of their
+    words. Two guesses rank a lost thread low, never hide it (f lists every thread with why): answered, when
+    it waited on you and one of your next two prompts said go and named it; faded, when it showed in one
+    summary only and never waited on you."""
     summaries = sorted(summaries)
     threads = []
     for index, (when, text) in enumerate(summaries):
@@ -2819,14 +2955,17 @@ def lost_threads(summaries, typed=()):
     for t in threads:
         state = 'open' if max(t['carried']) == len(summaries) - 1 else 'lost'
         waiting = bool(WAITING.search(' '.join([t['text']] + t['nested'])))
-        after = [words for when, words in sorted(typed) if when > t['last']][:2]
-        if state == 'lost' and any(APPROVED.search(words or '') for words in after):
-            state = 'answered'
+        after = [(when, words) for when, words in sorted(typed) if when > t['last']][:2]
+        said = next(((when, words) for when, words in after
+                     if APPROVED.search(words or '') and replies_to(words, t['words'])), None)
+        why = 'in the newest summary' if state == 'open' else f"quiet since {hhmm(t['last'])}"
+        if state == 'lost' and waiting and said:
+            state, why = 'answered', f"guessed done {hhmm(said[0])}: you said “{fit(one_line(said[1]), 60)}”"
         elif state == 'lost' and not waiting and len(t['carried']) < 2:
-            state = 'faded'
-        rank = {'lost': 0 if waiting else 1, 'open': 2 if waiting else 3}.get(state, 4)
+            state, why = 'faded', 'in one summary, asked you nothing'
+        rank = {'lost': 0 if waiting else 1, 'open': 2 if waiting else 3, 'faded': 3}.get(state, 4)
         out.append(dict(text=t['text'], detail=t['nested'], first_seen=t['first'], last_seen=t['last'],
-                        times=len(t['carried']), state=state, waiting=waiting, rank=rank,
+                        times=len(t['carried']), state=state, waiting=waiting, rank=rank, why=why,
                         key=hashlib.sha1(t['first_words'].encode()).hexdigest()[:12]))
     return sorted(out, key=lambda t: (t['rank'], -t['last_seen']))
 
@@ -2853,10 +2992,14 @@ def keep_lost(key, answer, at):
         handle.write(json.dumps(dict(key=key, answer=answer, at=at)) + '\n')
 
 
-def lost_found(summaries, typed=()):
+def lost_found(summaries, typed=(), carried=()):
     """The threads, each marked hidden: "drop" for good, "later" until the next compaction. A thread set
-    aside for later is also the one thing prep-compact hands the summary, as a reminder."""
+    aside for later is also the one thing prep-compact hands the summary, as a reminder. The session
+    before this one adds its threads, less those this session's own summaries already carry."""
     threads, said = lost_threads(summaries, typed), lost_log()
+    own = [words_of(t['text']) for t in threads]
+    threads = sorted(threads + [c for c in carried if not any(same_words(words_of(c['text']), w) for w in own)],
+                     key=lambda t: (t['rank'], -t['last_seen']))
     newest = max((when for when, _ in summaries), default=0)
     for t in threads:
         answer, at = said.get(t['key'], (None, 0))
@@ -2865,13 +3008,125 @@ def lost_found(summaries, typed=()):
     return threads
 
 
+CARRY_DAYS = 7  # a session last written longer ago than this before one began is not its restart
+ASKS_YOU = re.compile(r"\?\s*$|\b(?:say go|when you say|your go|needs? your|want me to|should i|shall i|do you want|"
+                      r"which (?:one|do you)|approve|your call|your pick)\b", re.I)
+CARRY_DIR = 'carried'  # KEEP/carried/<session>.json: what the pane read, for --lost
+
+
+def previous_session(path, started):
+    """The session before this one in the same project: the newest transcript last written before this one
+    began (a session still running beside this one is not it), within a week, started by a person at the
+    terminal, not by `claude -p`."""
+    if not path or not started:
+        return None
+    folder, mine, found = os.path.dirname(path), os.path.basename(path), []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    for name in names:
+        other = os.path.join(folder, name)
+        if not name.endswith('.jsonl') or name == mine:
+            continue
+        try:
+            written = os.stat(other).st_mtime
+        except OSError:
+            continue
+        if started - CARRY_DAYS * 86400 < written <= started:
+            found.append((written, other))
+    for _, other in sorted(found, reverse=True)[:6]:
+        try:
+            with open(other, 'rb') as handle:
+                head = handle.read(1 << 16)
+        except OSError:
+            continue
+        if re.search(rb'"entrypoint"\s*:\s*"cli"', head):
+            return other
+    return None
+
+
+def last_ask(text):
+    """The last thing Claude's words asked of the person, or None: a question, or an offer waiting on a go."""
+    tail = ' '.join(str(text or '').split())[-900:]
+    asks = [s.strip() for s in re.split(r'(?<=[.?!])\s+', tail) if ASKS_YOU.search(s.strip())]
+    return asks[-1] if asks else None
+
+
+def stopped_at(prev):
+    """What the session before this one left after its last summary, which no summary holds: a prompt
+    Claude was still answering when it stopped, else Claude's last question, else the last prompt typed
+    after that summary. One thread, its detail the last prompts and Claude's last words."""
+    since = prev.summaries[-1][0] if prev.summaries else 0
+    after = [(when, words) for when, words in prev.typed if when > since and (words or '').strip()]
+    last = prev.typed[-1] if prev.typed else None
+    ask = last_ask(prev.said[1]) if prev.said else None
+    if last and last[0] > prev.turn_end:
+        text, waiting, rank = f"Cut off before Claude finished answering: “{fit(one_line(last[1]), 200)}”", True, 0
+    elif ask and (not last or prev.said[0] > last[0]):
+        text, waiting, rank = f"Claude asked last, no answer came: “{fit(ask, 200)}”", True, 0
+    elif after:
+        text, waiting, rank = f"Last asked before it ended: “{fit(one_line(after[-1][1]), 200)}”", False, 3
+    else:
+        return None
+    detail = [f"{hhmm(when)} you: {fit(one_line(words), 160)}" for when, words in after[-3:]]
+    if prev.said:
+        detail.append(f"{hhmm(prev.said[0])} Claude: {fit(one_line(prev.said[1]), 200)}")
+    import hashlib
+    ended = max([prev.said[0] if prev.said else 0, last[0] if last else 0])
+    return dict(text=text, detail=detail, first_seen=after[0][0] if after else ended, last_seen=ended, times=0,
+                state='carried', waiting=waiting, rank=rank, came_from=(prev.id or '')[:8],
+                why=f"session {(prev.id or '')[:8]}, after its last summary; ended {hhmm(ended)}",
+                key=hashlib.sha1(f'stopped {prev.id}'.encode()).hexdigest()[:12])
+
+
+def carried_threads(path, started):
+    """What a restart would lose, read from the session before this one, no model: the threads its newest
+    summary carried or dropped with no answer, plus what came after that summary (stopped_at), which is
+    the newest work and the likeliest to be unanswered. A session that never compacted still gives that."""
+    before = previous_session(path, started)
+    if not before:
+        return []
+    prev = Session(os.path.basename(before)[:-6], path=before)
+    prev.read_transcript()
+    out = []
+    for t in lost_threads(prev.summaries, prev.typed):
+        if t['state'] in ('open', 'lost'):
+            out.append(dict(t, state='carried', rank=0 if t['waiting'] else 1, came_from=prev.id[:8],
+                            why=f"session {prev.id[:8]}, {'open' if t['state'] == 'open' else 'quiet'} when it ended"))
+    tail = stopped_at(prev)
+    return out + ([tail] if tail else [])
+
+
+def carry_into(session):
+    """In the background, once per pane: the session before this one's threads, kept for --lost too."""
+    try:
+        session.carried = carried_threads(session.path, session.started)
+        os.makedirs(os.path.join(KEEP, CARRY_DIR), exist_ok=True)
+        with open(os.path.join(KEEP, CARRY_DIR, f'{session.id}.json.tmp'), 'w', encoding='utf-8') as handle:
+            json.dump(session.carried, handle)
+        os.replace(os.path.join(KEEP, CARRY_DIR, f'{session.id}.json.tmp'), os.path.join(KEEP, CARRY_DIR, f'{session.id}.json'))
+    except Exception:  # a carry that fails leaves this session's own threads, as before
+        session.carried = session.carried or []
+
+
+def read_carried(session_id):
+    try:
+        with open(os.path.join(KEEP, CARRY_DIR, f'{session_id}.json'), encoding='utf-8') as handle:
+            got = json.load(handle)
+        return got if isinstance(got, list) else []
+    except (OSError, ValueError):
+        return []
+
+
 def lost_json(session_id):
     """--lost: the threads of this session a person has not dropped, for the pane's own tools and the
     compaction hook."""
     session = Session(session_id) if session_id else None
     if session:
         session.read_transcript()
-    return [t for t in lost_found(session.summaries if session else [], session.typed if session else [])
+    carried = read_carried(session_id) if session else []
+    return [t for t in lost_found(session.summaries if session else [], session.typed if session else [], carried)
             if t['hidden'] != 'drop']
 
 
@@ -2887,20 +3142,24 @@ def lost_asks(thread):
 
 def lost_sections(s, now):
     """The Lost and found section: the top three threads that went quiet or wait on you, once there is any."""
-    shown = [t for t in (s or {}).get('lost') or [] if not t['hidden'] and t['rank'] < 3]
+    every = (s or {}).get('lost') or []
+    shown = [t for t in every if not t['hidden'] and t['rank'] < 3]
     when = lambda t: datetime.fromtimestamp(t).strftime('%m-%d %H:%M')
     items = []
     for k, t in enumerate(shown[:3]):
         asks = lost_asks(t)
-        meta = ' · '.join(x for x in ('quiet ' + stamp(t['last_seen'], now)[0] if t['state'] == 'lost' else 'open', f"{t['times']}×") if x)
+        meta = ' · '.join(x for x in (
+            f"from {t['came_from']}" if t['state'] == 'carried' else
+            'quiet ' + stamp(t['last_seen'], now)[0] if t['state'] == 'lost' else 'open',
+            f"{t['times']}×" if t['times'] else '') if x)
         items.append(dict(key='lost:' + t['key'], title=t['text'], lines=2, meta=meta, lost=t['key'], top=k == 0,
                           flag='waiting on you' if t['waiting'] else '', asks=asks, send=asks['side'],
-                          detail=[f"First appeared {when(t['first_seen'])}, last {when(t['last_seen'])}, "
+                          detail=[t.get('why') or f"First appeared {when(t['first_seen'])}, last {when(t['last_seen'])}, "
                                   f"carried through {t['times']} {'compaction' if t['times'] == 1 else 'compactions'}."]
-                          + t['detail'][:2]))
+                          + t['detail'][:3]))
     if not items:
         return []
-    return [dict(name='lost', title='Lost and found', right=f'{len(shown)} quiet', items=items, empty='')]
+    return [dict(name='lost', title='Lost and found', right=f'{len(shown)} quiet · f all {len(every)}', items=items, empty='')]
 
 
 LOST_ASKS = (('side', '→ side task'), ('sub', '→ subagent'), ('drop', '✗ drop'), ('later', 'later'))
@@ -3002,15 +3261,21 @@ def watch(root, limit, session_id, agent=None):
                 continue
             data = os.read(fd, 1024).decode('utf-8', 'replace')
             for button, x, y, kind in re.findall(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', data):
-                if kind == 'M' and int(button) == 0:  # a left press; releases and the wheel pass
+                if kind == 'M' and int(button) == 0:  # a left press; releases pass
                     pane.click(int(y) - 1, int(x) - 1)
+                    redraw['now'] = True
+                elif kind == 'M' and int(button) in (64, 65):  # the wheel, up or down
+                    pane.scroll(WHEEL if int(button) == 65 else -WHEEL)
                     redraw['now'] = True
             keys = re.sub(r'\x1b\[<[\d;]*[Mm]', '', data).lower()
             if 'q' in keys:
                 break
             if keys == '\x1b':
                 pane.open, redraw['now'] = None, True
-            if summary_keys(pane, keys):
+            if summary_keys(pane, keys) or threads_keys(pane, keys):
+                redraw['now'] = True
+            elif pane.view == 'main' and any(k in keys for k in ('j', 'k', ' ', '\x1b[a', '\x1b[b')):
+                pane.scroll(-WHEEL if any(k in keys for k in ('k', '\x1b[a')) else 4 * WHEEL if ' ' in keys else WHEEL)
                 redraw['now'] = True
             for key in keys:
                 if key in ('d', 'l'):
