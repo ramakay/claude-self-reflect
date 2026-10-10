@@ -445,10 +445,12 @@ def feed(dreams, chapter, session_id):
     current = [d for d in mine if d['at'] >= start]
     adopted_here = sum(1 for d in current if d['answer'] in ADOPTED)
     star = mine[0] if mine and mine[0]['answer'] is None and mine[0]['at'] >= start else None
-    adopted = [d for d in mine if d['answer'] in ADOPTED][:2]
-    passed = [d for d in mine if d is not star and d not in adopted]
+    kept = [d for d in mine if d['answer'] in ADOPTED]
+    adopted = kept[:2]
+    folded = [d for d in mine if d is not star and d not in adopted]  # newest first
+    passed = [d for d in folded if d['answer'] not in ADOPTED]
     return dict(left=max(0, of + adopted_here - len(current)), of=of + adopted_here, star=star, adopted=adopted,
-                passed=passed)
+                passed=passed, folded=folded)
 
 
 def last_look(root=None):
@@ -1588,12 +1590,16 @@ def page_main(data, s, now, ui=None):
         dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1,
                            meta=' · '.join(x for x in ('adopted', stamp(d['at'], now)[0], ANSWER_WORD.get(d['answer'], '')) if x),
                            detail=[d.get('title') or ''] + reasons[:2], send=dream_send(d, reasons)))
-    if fed['passed']:  # everything else, folded: one click opens the list, each still a click from Claude
+    if fed['folded']:  # everything else, folded: one click opens the list, each still a click from Claude
         is_open = 'passed' in (ui.get('folds') or ())
         dreams.append(dict(key='fold:passed', quiet=True, lines=1,
-                           title=f"{'⌄' if is_open else '›'} {len(fed['passed'])} passed", detail=[], send=''))
+                           title=f"{'⌄' if is_open else '›'} " + ' · '.join(
+                               x for x in (f"{len(fed['passed'])} passed" if fed['passed'] else '',
+                                           f"{len(fed['folded']) - len(fed['passed'])} adopted earlier"
+                                           if len(fed['folded']) > len(fed['passed']) else '') if x),
+                           detail=[], send=''))
         if is_open:
-            for d in fed['passed']:
+            for d in fed['folded']:
                 reasons = reasons_of(d)
                 dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1,
                                    meta=' · '.join(x for x in (stamp(d['at'], now)[0], ANSWER_WORD.get(d['answer'], 'not answered')) if x),

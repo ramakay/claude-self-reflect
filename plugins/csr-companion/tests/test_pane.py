@@ -76,6 +76,15 @@ class Feed(unittest.TestCase):
     def test_no_chapter_yet_means_five_left(self):
         self.assertEqual(pane.feed([], None, HERE_NOW)['left'], 5)
 
+    def test_an_adopted_dream_is_never_counted_as_passed(self):
+        # the 10-10 pane: three adopted, four passed; the third adopted folded, but not as passed
+        dreams = [dream(1400, 'ask_claude'), dream(900, 'helpful'), dream(800, 'ask_claude'), dream(700, 'ignored'),
+                  dream(600, 'ignored'), dream(500, 'ignored'), dream(400, 'ignored')]
+        fed = pane.feed(dreams, self.CHAPTER, HERE_NOW)
+        self.assertEqual([d['at'] for d in fed['adopted']], [1400, 900])
+        self.assertEqual([d['at'] for d in fed['passed']], [700, 600, 500, 400])
+        self.assertEqual([d['at'] for d in fed['folded']], [800, 700, 600, 500, 400])
+
 
 if __name__ == '__main__':
     unittest.main()
