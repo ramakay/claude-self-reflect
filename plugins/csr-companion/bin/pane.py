@@ -310,11 +310,11 @@ def load(root, limit, session_id=None):
                                (session_id or '',)).fetchone()[0]
     finally:
         con.close()
-    dreams, look = load_dream_log(root), last_look(root)
+    dreams, look, chapter = load_dream_log(root), last_look(root), last_chapter(root, session_id)
     week = [d for d in dreams if d['at'] >= time.time() - 7 * 86400]
     return dict(repo=root, total=len(shifts), shifts=shifts[:limit], changes=changes, dreams_on=dreams_on(),
                 recalled=recalled, 
-                changes_total=len(changes), dreams=dreams, look=look, dreams_7d=len(week),
+                changes_total=len(changes), dreams=dreams, look=look, chapter=chapter, dreams_7d=len(week),
                 dream_tokens_7d=sum(d.get('tokens') or 0 for d in week),
                 corrections_carried_7d=carried, shifts_told_7d=told, reminded_7d=carried + told)
 
@@ -362,7 +362,7 @@ def public(data):
                     commits=c['commits'], shifts=[shift(s) for s in c['shifts']][:12])
                for c in data['changes'][:20]]
     dreams = [{k: d.get(k) for k in ('id', 'at', 'line', 'title', 'answer')} for d in data['dreams'][:20]]
-    return dict({k: v for k, v in data.items() if k not in ('shifts', 'changes', 'dreams', 'look')},
+    return dict({k: v for k, v in data.items() if k not in ('shifts', 'changes', 'dreams', 'look', 'chapter')},
                 shifts=[shift(s) for s in data['shifts']], changes=changes, dreams=dreams)
 
 
@@ -375,7 +375,10 @@ def keep(record):
         handle.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
-SETTLED = ('helpful', 'not_relevant', 'ask_claude', 'thought_of_it', 'got_it', 'dismiss', 'ignored', 'turn_off')
+SETTLED = ('helpful', 'not_relevant', 'ask_claude', 'thought_of_it', 'got_it', 'dismiss', 'ignored', 'turn_off',
+           'expired')
+ADOPTED = ('helpful', 'ask_claude')  # a dream you took up: it gives its place in the chapter back
+PER_CHAPTER = 5
 
 
 def load_dream_log(root=None):
@@ -410,7 +413,42 @@ LOOKED = dict(  # what came of a look, as the pane says it
     repeat='its question had been asked before, so it was dropped',
     budget="it waits: a look now would pass its share of Claude's tokens",
     skip='it waits: backing off after a question you passed',
+    spent="this chapter's dreams are used up; the next compaction starts a new one",
 )
+
+
+def last_chapter(root=None, session_id=None):
+    """Where this session's chapter of dreams began, and how many it holds: the mod writes a line at the
+    session's start, at each compaction, and after two hours without one. None before the first."""
+    try:
+        with open(DREAM_LOG, encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get('kind') == 'chapter' and record.get('session') == session_id \
+                and (not root or record.get('repo') in (None, root)):
+            return dict(at=float(record.get('at') or 0), of=int(record.get('of') or PER_CHAPTER))
+    return None
+
+
+def feed(dreams, chapter, session_id):
+    """This session's dreams as the pane shows them: how many are left in the chapter, the star (the
+    newest, if it is still open and came in this chapter), the adopted ones, and the passed rest."""
+    mine = [d for d in dreams if d.get('session') == session_id]  # newest first
+    start = chapter['at'] if chapter else 0
+    of = chapter['of'] if chapter else PER_CHAPTER
+    current = [d for d in mine if d['at'] >= start]
+    adopted_here = sum(1 for d in current if d['answer'] in ADOPTED)
+    star = mine[0] if mine and mine[0]['answer'] is None and mine[0]['at'] >= start else None
+    adopted = [d for d in mine if d['answer'] in ADOPTED][:2]
+    passed = [d for d in mine if d is not star and d not in adopted]
+    return dict(left=max(0, of + adopted_here - len(current)), of=of + adopted_here, star=star, adopted=adopted,
+                passed=passed)
 
 
 def last_look(root=None):
@@ -1291,10 +1329,11 @@ def opened(rows, name, detail, width, ui, key, indent=None):
 STAR = ink('asked') + '☾' + OFF  # CSR's mark, as in the band above Claude's prompt
 MARK = {'changed': '\x1b[33m~', 'removed': '\x1b[31m-', 'came back': '\x1b[32m+'}
 ANSWER_MARK = dict(helpful='\x1b[32m✓', ask_claude='\x1b[36m→', thought_of_it='\x1b[2m=', not_relevant='\x1b[31m✗',
-                   got_it='\x1b[35m·', dismiss='\x1b[2m·', ignored='\x1b[2m·', turn_off='\x1b[2m○')
+                   got_it='\x1b[35m·', dismiss='\x1b[2m·', ignored='\x1b[2m·', turn_off='\x1b[2m○',
+                   expired='\x1b[2m·')
 ANSWER_WORD = dict(helpful='helpful', ask_claude='asked Claude', thought_of_it="you'd thought of it",
                    not_relevant='not relevant', got_it='read', dismiss='dismissed', ignored='passed',
-                   turn_off='turned dreams off')
+                   turn_off='turned dreams off', expired='folded at a compaction')
 
 
 def fit(text, width):
@@ -1487,7 +1526,7 @@ def short_path(rel, parts=3):
     return '/'.join(rel.split('/')[-parts:])
 
 
-def page_main(data, s, now):
+def page_main(data, s, now, ui=None):
     """What a senior architect wants beside the agent, the star first, each shown only with something in it:
       What if…          the dreamer's question, its reasoning shown, answered from here
       Handed to Claude  what CSR's memory gave Claude this session: past sessions and notes
@@ -1515,11 +1554,24 @@ def page_main(data, s, now):
     finally:
         con.close()
 
-    week = sum(1 for d in data['dreams'] if d['at'] >= now - 7 * 86400)
+    ui = ui or {}
+    fed = feed(data['dreams'], data.get('chapter'), s.get('id'))
     dreams = []
-    newest = data['dreams'][0] if data['dreams'] else None
-    starred = bool(newest) and newest['answer'] in (None, 'ignored', 'dismiss', 'got_it')  # still yours to answer
+    starred = fed['star'] is not None
     look = data.get('look')
+
+    def dream_send(d, reasons):
+        return one_line(f"{DREAMER_SAID}: “{d['line']}” Its reasoning: {d.get('title') or ''}. {' '.join(reasons[:3])}")
+
+    def reasons_of(d):
+        return [re.sub(r'^[*-]\s*', '', line) for line in (d.get('text') or '').splitlines() if line.strip()]
+
+    if starred:  # the star: its question whole, its reasoning shown, its answers a click away
+        d = fed['star']
+        reasons = reasons_of(d)
+        dreams.append(dict(key='dream:' + d['id'], dream=d['id'], title=d['line'], lines=3,
+                           body=[d.get('title') or ''] + reasons[:1], answers=True, detail=reasons[1:3],
+                           send=dream_send(d, reasons)))
     if data.get('dreams_on') and look and not starred:
         when = stamp(look['at'], now)[0]
         every = look.get('every')
@@ -1527,21 +1579,25 @@ def page_main(data, s, now):
                            title=f"No open question. Last look {'just now' if when == 'now' else when}: "
                                  f"{LOOKED.get(look['outcome'], look['outcome'])}.",
                            meta=f"next after {every} of Claude's steps, if CSR has something new" if every else '',
-                           detail=['The dreamer looks only when CSR remembers something new near this work, '
-                                   'waits longer each time it finds nothing, and asks only what stands on '
-                                   'another session.'],
+                           detail=[f'A chapter (from the start or the last compaction to the next) holds '
+                                   f'{PER_CHAPTER} dreams, spread over it; one you adopt gives its place back. '
+                                   'The dreamer looks only when CSR has something new about the work in hand.'],
                            send='/shifts dreams'))
-    for k, d in enumerate(data['dreams'][:3 - len(dreams)]):
-        reasons = [re.sub(r'^[*-]\s*', '', line) for line in (d.get('text') or '').splitlines() if line.strip()]
-        send = one_line(f"{DREAMER_SAID}: “{d['line']}” Its reasoning: {d.get('title') or ''}. {' '.join(reasons[:3])}")
-        meta = ' · '.join(x for x in (short_date(d['at']), ANSWER_WORD.get(d['answer'], '')) if x)
-        if k == 0 and starred:  # the star: its question whole, its reasoning shown, its answers a click away
-            dreams.append(dict(key='dream:' + d['id'], dream=d['id'], title=d['line'], lines=3,
-                               body=[d.get('title') or ''] + reasons[:1], answers=True, detail=reasons[1:3],
-                               send=send))
-        else:
-            dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1, meta=meta,
-                               detail=[d.get('title') or ''] + reasons[:2], send=send))
+    for d in fed['adopted']:  # what the feed paid: kept in view
+        reasons = reasons_of(d)
+        dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1,
+                           meta=' · '.join(x for x in ('adopted', stamp(d['at'], now)[0], ANSWER_WORD.get(d['answer'], '')) if x),
+                           detail=[d.get('title') or ''] + reasons[:2], send=dream_send(d, reasons)))
+    if fed['passed']:  # everything else, folded: one click opens the list, each still a click from Claude
+        is_open = 'passed' in (ui.get('folds') or ())
+        dreams.append(dict(key='fold:passed', quiet=True, lines=1,
+                           title=f"{'⌄' if is_open else '›'} {len(fed['passed'])} passed", detail=[], send=''))
+        if is_open:
+            for d in fed['passed']:
+                reasons = reasons_of(d)
+                dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1,
+                                   meta=' · '.join(x for x in (stamp(d['at'], now)[0], ANSWER_WORD.get(d['answer'], 'not answered')) if x),
+                                   detail=[d.get('title') or ''] + reasons[:2], send=dream_send(d, reasons)))
 
     # Only what Claude reached for: a hand-off it then opened, or a question it asked CSR itself; at most
     # two rows. The rest stays behind one row with the count, which opens to the list.
@@ -1575,7 +1631,9 @@ def page_main(data, s, now):
                           status=data.get('claude_line')),
                 quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=[
-        dict(name='dreams', title='What if…', right=('on' + (f' · {week} this week' if week else '')) if data.get('dreams_on') else 'off',
+        dict(name='dreams', title='What if…',
+             right=(f"{fed['left']} of {fed['of']} left" if fed['left'] else '0 left · next compact')
+             if data.get('dreams_on') else 'off',
              items=dreams, empty=''),
         dict(name='remembered', title='Handed to Claude', right='', items=handed, empty=''),
         dict(name='rules', title='Your rules', right='', items=rules, empty=''),
@@ -1731,7 +1789,7 @@ def draw_main(data, s, cols, rows, now, ui=None):
     if s is None:
         s = dict(id=None, title=None, prompts=[], replies=[], compacts=[], gave=dict(recalls=[], carried=[], dreams=[]),
                  remembered=[], sessions=0, project=None, files={}, edited=[], shell={}, last={})
-    return draw_page(page_main(data, s, now), cols, rows, ui or {})
+    return draw_page(page_main(data, s, now, ui), cols, rows, ui or {})
 
 
 def draw_log(data, cols, rows, ui=None):
@@ -1793,6 +1851,7 @@ class Pane:
         self.view, self.data, self.loaded, self.shown = 'main', None, 0.0, None
         self.open, self.sent, self.acts = None, None, {}  # the row a click opened; what went to Claude
         self.answered = None  # (dream id, answer, when) the pane kept for a dream, until it is read
+        self.folds = set()  # folded rows opened with a click
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -1802,6 +1861,7 @@ class Pane:
                 self.data, self.loaded = load(self.root, self.limit, self.session and self.session.id), now
             self.data['dreams'] = load_dream_log(self.root)  # the mod appends while we watch
             self.data['look'] = last_look(self.root)
+            self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             s = self.session.load() if self.session and self.view == 'main' else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
@@ -1815,11 +1875,12 @@ class Pane:
             self.sent = None
         if self.answered and now - self.answered[2] > 6:
             self.answered = None
-        ui = dict(open=self.open, sent=self.sent, answered=self.answered)
+        ui = dict(open=self.open, sent=self.sent, answered=self.answered, folds=self.folds)
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
                           self.answered,
                           self.data.get('claude_line'),
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
+                          self.data.get('chapter'), sorted(self.folds),
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
         if sig == self.shown and not force:
@@ -1857,6 +1918,8 @@ class Pane:
             self.open = None
         elif act['key'].startswith('view:'):
             self.view, self.open = act['key'][5:], None
+        elif act['key'].startswith('fold:'):
+            self.folds ^= {act['key'][5:]}
         elif act['key'] != self.open:
             self.open, self.sent = act['key'], None
         else:
@@ -1939,7 +2002,7 @@ def main():
     args = parser.parse_args()
     if args.keep:
         record = json.loads(args.keep)
-        if record.get('kind') in ('dream', 'look'):
+        if record.get('kind') in ('dream', 'look', 'chapter'):
             record['repo'] = repo_root(args.repo)
         keep(record)
         print('{}')

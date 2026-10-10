@@ -3,8 +3,8 @@ import type { EngineInterface, ModelUsage, Register, Settings, SettingsSource } 
 
 import type { Note, NoteView, Shift, ShiftsData } from '../types'
 import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
-import { canAfford, facts, freshPace, hasNews, paceAfter, paceText } from './pace'
-import type { Pace } from './pace'
+import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, hasNews, mayLook, median, paceText, spacing } from './pace'
+import type { Chapter, Pace } from './pace'
 
 // CSR beside Claude, patterned on Claude Code's own "You should know".
 //
@@ -36,6 +36,8 @@ const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'
 const SEEN_KEPT = 50
 const SKIP_MAX = 16
 const FACTS_KEPT = 400
+const CHAPTERS_KEPT = 20
+const ADOPTED = new Set(['helpful', 'ask_claude']) // a dream you took up
 const OFF_ROW = 'csr-companion.dreams'
 
 const data = atom({ plugin: 'csr-companion', key: 'data' } as const, null as ShiftsData | null)
@@ -86,8 +88,10 @@ async function answered($: EngineInterface, note: Note, answer: string, logged =
     await $.store.set('typedPastInARow', 0)
     await $.store.set('looksToSkip', 0)
   }
-  const pace = await paceOf($)
-  await $.store.set('pace', paceAfter(pace, answer))
+  if (ADOPTED.has(answer)) {
+    // You adopted it: it gives its place in the chapter back, if it came in this chapter.
+    await changeChapter($, chapter => (note.at >= chapter.started ? { ...chapter, adopted: chapter.adopted + 1 } : chapter))
+  }
   if (logged) return // the pane wrote it to the dream log already
   await run($, ['--repo', await $.session.cwd(), '--keep', JSON.stringify({ kind: 'answer', id: note.id, answer, at: at / 1000 })])
 }
@@ -191,29 +195,97 @@ async function paceOf($: EngineInterface): Promise<Pace> {
 const tokensOf = (usage: ModelUsage) =>
   usage.input_tokens + usage.output_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
 
-// What came of a look, kept in the dream log: once you have answered the last dream, the pane shows it
-// in the dream's place, so a quiet dreamer reads as quiet, not as stuck.
-async function lookCameTo($: EngineInterface, cwd: string, session: string, outcome: string, every: number, tokens = 0) {
-  const at = await $.clock.now()
-  await run($, ['--repo', cwd, '--keep', JSON.stringify({ kind: 'look', at: at / 1000, session, outcome, every, tokens })])
+// This chapter of the session: a fresh one for a new session, and after two hours without a compaction.
+async function chapterOf($: EngineInterface): Promise<Chapter> {
+  const session = await $.session.id()
+  const value = (await $.store.get('chapter').catch(() => undefined)) as Chapter | undefined
+  const now = await $.clock.now()
+  if (value?.session === session && now - value.started < CHAPTER_MS) return { ...freshChapter(session, now), ...value }
+  return newChapter($, value?.session === session ? 'two hours' : 'start')
 }
 
-// One look, when the pace allows it: a fork of this session asking for one "what if...?".
-async function dream($: EngineInterface, lastStep: number): Promise<void> {
+// A chapter starts over: five dreams again, the first look soon. A chapter a compaction ended teaches
+// how long your chapters run; the dream log gets a line, so the pane counts from here.
+async function newChapter($: EngineInterface, why: 'start' | 'compact' | 'two hours'): Promise<Chapter> {
+  const session = await $.session.id()
+  const old = (await $.store.get('chapter').catch(() => undefined)) as Chapter | undefined
+  if (why === 'compact' && old?.session === session && old.steps > 0) {
+    const lengths = (await $.store.get('chapterSteps').catch(() => undefined)) as number[] | undefined
+    await $.store.set('chapterSteps', [...(Array.isArray(lengths) ? lengths : []), old.steps].slice(-CHAPTERS_KEPT))
+  }
+  const at = await $.clock.now()
+  const chapter = freshChapter(session, at)
+  await $.store.set('chapter', chapter)
+  await run($, ['--repo', await $.session.cwd(), '--keep', JSON.stringify({
+    kind: 'chapter', at: at / 1000, session, why, left: dreamsLeft(chapter), of: allowance(chapter),
+  })])
+  return chapter
+}
+
+// Every change to the chapter goes through one queue: Claude's steps count while a look runs and an
+// answer lands, and two read-then-write changes at once would lose one.
+let chapterQueue: Promise<unknown> = Promise.resolve()
+function serially<T>(work: () => Promise<T>): Promise<T> {
+  const done = chapterQueue.then(work)
+  chapterQueue = done.catch(() => undefined)
+  return done
+}
+
+// The chapter as it is now, changed: read fresh inside the queue.
+function changeChapter($: EngineInterface, change: (chapter: Chapter) => Chapter): Promise<Chapter> {
+  return serially(async () => {
+    const chapter = change(await chapterOf($))
+    await $.store.set('chapter', chapter)
+    return chapter
+  })
+}
+
+async function usualSteps($: EngineInterface): Promise<number> {
+  const lengths = (await $.store.get('chapterSteps').catch(() => undefined)) as number[] | undefined
+  return median(Array.isArray(lengths) ? lengths : [])
+}
+
+// What came of a look, kept in the dream log: once you have answered the last dream, the pane shows it
+// in the dream's place, so a quiet dreamer reads as quiet, not as stuck. "every" is the steps from the
+// look to the next.
+async function lookCameTo($: EngineInterface, cwd: string, session: string, outcome: string, chapter: Chapter, base: number, tokens = 0) {
+  const at = await $.clock.now()
+  await run($, ['--repo', cwd, '--keep', JSON.stringify({
+    kind: 'look', at: at / 1000, session, outcome, every: Math.max(0, chapter.due - base), tokens,
+    left: dreamsLeft(chapter), of: allowance(chapter),
+  })])
+}
+
+// The next look, counted from the step that started this one (Claude's steps go on while a look runs):
+// soon after a look that cost nothing, else the chapter's dreams left spread over the rest of it.
+const soon = (base: number) => (chapter: Chapter): Chapter => ({ ...chapter, due: base + FIRST_EVERY })
+const spread = (base: number, usual: number) => (chapter: Chapter): Chapter => ({
+  ...chapter,
+  due: mayLook(chapter) ? base + spacing({ ...chapter, steps: base }, usual) : Number.MAX_SAFE_INTEGER,
+})
+
+// One look, when the chapter allows it: a fork of this session asking for one "what if...?". `base` is
+// the chapter step that started it.
+async function dream($: EngineInterface, lastStep: number, base: number): Promise<void> {
   const cwd = await $.session.cwd()
   const session = await $.session.id()
+  const usual = await usualSteps($)
   let pace = await paceOf($)
+  if (!mayLook(await chapterOf($))) {
+    // The chapter's dreams are spent: no look until the next compaction starts a new one.
+    return lookCameTo($, cwd, session, 'spent', await changeChapter($, spread(base, usual)), base)
+  }
   const skip = await count($, 'looksToSkip')
   if (skip > 0) {
     await $.store.set('looksToSkip', skip - 1)
-    return lookCameTo($, cwd, session, 'skip', pace.every)
+    return lookCameTo($, cwd, session, 'skip', await changeChapter($, spread(base, usual)), base)
   }
-  if (await isBusy($)) return // a note is up: no question would be seen
-  if (!canAfford(pace, lastStep)) return lookCameTo($, cwd, session, 'budget', pace.every)
+  if (await isBusy($)) return void (await changeChapter($, soon(base))) // a note is up: no question would be seen
+  if (!canAfford(pace, lastStep)) return lookCameTo($, cwd, session, 'budget', await changeChapter($, soon(base)), base)
   const brief = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
   const now = facts(brief)
   const before = await strings($, 'briefFacts')
-  if (!hasNews(now, before)) return lookCameTo($, cwd, session, 'quiet', pace.every) // nothing new near this work: 0 tokens
+  if (!hasNews(now, before)) return lookCameTo($, cwd, session, 'quiet', await changeChapter($, soon(base)), base) // 0 tokens
   const seen = await strings($, 'seenDreams')
   const known = await strings($, 'knownDreams')
   const reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known) })
@@ -224,9 +296,9 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
   const found = reply.isAnswered ? parseDream(reply.text) : null
   const repeat = !!found && [...seen, ...known].some(line => sameDream(line, found.line))
   if (!found || repeat) {
-    const slower = paceAfter(pace, 'none')
-    await $.store.set('pace', slower)
-    return lookCameTo($, cwd, session, repeat ? 'repeat' : 'none', slower.every, used)
+    await $.store.set('pace', pace)
+    const chapter = await changeChapter($, current => spread(base, usual)({ ...current, looks: current.looks + 1 }))
+    return lookCameTo($, cwd, session, repeat ? 'repeat' : 'none', chapter, base, used)
   }
   await $.store.set('pace', { ...pace, dreams: pace.dreams + 1 })
   const at = await $.clock.now()
@@ -244,18 +316,21 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
     at,
     tokens: used,
   }
-  if (!(await show($, note, 'Dream'))) return
+  const isShown = await show($, note, 'Dream')
+  const chapter = await changeChapter($, current =>
+    spread(base, usual)({ ...current, looks: current.looks + 1, shown: current.shown + (isShown ? 1 : 0) }))
+  if (!isShown) return
   await remember($, 'seenDreams', found.line, SEEN_KEPT)
   await run($, ['--repo', cwd, '--keep', JSON.stringify({
     kind: 'dream', id: note.id, at: at / 1000, session, line: note.line, title: note.title, text: note.text, tokens: used,
-    outcome: 'dream', every: pace.every, // the look that found it
+    outcome: 'dream', every: Math.max(0, chapter.due - base), left: dreamsLeft(chapter), of: allowance(chapter),
     brief, // what the dreamer read: with the answer that settles this dream, one labelled example
   })])
   void refresh($, cwd)
 }
 
 async function dreamsText($: EngineInterface, on: boolean): Promise<string> {
-  return paceText(on ? await paceOf($) : null, on)
+  return paceText(on ? await paceOf($) : null, on ? await chapterOf($) : null, on)
 }
 
 // The /config row, found by its plugin's prefix: a folder-loaded plugin may carry "@inline".
@@ -276,7 +351,6 @@ function asks(node: unknown): boolean {
 
 export const register: Register = (on, options) => {
   const dreamsOn = options.dreams === true
-  let steps = 0
   let dreaming = false
   // True while another band (You should know's) asks, and the note waits behind it.
   let waiting = false
@@ -288,10 +362,11 @@ export const register: Register = (on, options) => {
     const spent = result?.usage ? tokensOf(result.usage) : 0
     const pace = await paceOf($)
     if (spent) await $.store.set('pace', { ...pace, claude: pace.claude + spent })
-    if (++steps >= pace.every && !dreaming) {
-      steps = 0
+    // Steps counted in the store, so a reload of this module does not start the count over.
+    const chapter = await changeChapter($, current => ({ ...current, steps: current.steps + 1 }))
+    if (chapter.steps >= chapter.due && !dreaming) {
       dreaming = true
-      void dream($, spent)
+      void dream($, spent, chapter.steps)
         .catch(() => undefined)
         .finally(() => {
           dreaming = false
@@ -299,6 +374,25 @@ export const register: Register = (on, options) => {
     }
     return result
   })
+
+  // A compaction ends the chapter: the context a dream was about is gone. The open dream folds into
+  // the pane's passed ones, and the next chapter starts with five.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (!dreamsOn || e.agentId !== undefined || e.trigger === 'precompute' || result.skip !== undefined) return result
+    let expired: Note | null = null
+    await update($, view, current => {
+      if (current && current.kind !== 'asked' && current.note.kind === 'dream') {
+        expired = current.note
+        return null
+      }
+      return current
+    })
+    const note = expired as Note | null
+    if (note) await answered($, note, 'expired')
+    await serially(() => newChapter($, 'compact'))
+    return result
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
 
   on('tool.call', async ($, e, next) => {
     if (e.agentId === undefined && FILE_TOOLS.has(e.tool)) {

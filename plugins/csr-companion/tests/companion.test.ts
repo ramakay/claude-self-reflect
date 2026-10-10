@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
-import { facts } from '../hooks/pace'
+import { facts, freshChapter, median, spacing } from '../hooks/pace'
 
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -35,6 +35,8 @@ const NOTE = {
   conversation: 'd8fe3a96-e6f8',
   at: 1,
 }
+const NOW = Date.UTC(2026, 9, 9, 12)
+const MESSAGES = [{ role: 'user', text: 'one', toolUses: [] }, { role: 'assistant', text: 'done', toolUses: [] }]
 const BRIEF = 'Things the person built in other sessions that came up in this work:\n* skill notes-sync: built over 2 sessions, latest 08-26 [session dc24d328]'
 const DREAM_LINE = 'What if the notes also read your side branches, so this week’s work gets notes before it reaches main?'
 const DREAM_REPLY = [
@@ -77,7 +79,8 @@ function host(on: On, world: World) {
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
   on('clock.every', async () => ({ value: undefined }))
-  on('clock.now', async () => ({ value: Date.UTC(2026, 9, 9, 12) }))
+  on('clock.now', async () => ({ value: NOW }))
+  on('session.compact', async (_$, e) => ({ messages: e.messages }) as never)
   on('session.id', async () => ({ value: 'sess-1' }))
   on('session.cwd', async () => ({ value: '/repo' }))
   on('store.get', async (_$, e) => ({ value: store.get(e.key) }))
@@ -304,7 +307,8 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   await steps($, 12, 'sub-1')
   await settle(() => false)
   expect(seen.forks).toEqual([])
-  expect(seen.kept).toEqual([expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, session: 'sess-1' })])
+  expect(seen.kept[0]).toEqual(expect.objectContaining({ kind: 'chapter', why: 'start', left: 5, of: 5, session: 'sess-1' }))
+  expect(seen.kept.slice(1)).toEqual([expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, session: 'sess-1' })])
 
   await steps($, 6) // 12 steps: 1 in 12, within it
   await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
@@ -314,8 +318,11 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   expect(seen.forks[0]).toContain('You should know')
   expect(await band.find({ text: /Dream · / })).toBeDefined()
   expect(await band.find({ type: 'Button', text: 'Already thought of it' })).toBeDefined()
-  expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 12 * LOOK, every: 6 }))
-  expect(seen.kept[1]).toEqual(expect.objectContaining({ kind: 'dream', line: DREAM_LINE, tokens: LOOK, session: 'sess-1', outcome: 'dream' }))
+  expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 12 * LOOK }))
+  // 4 left in the chapter, spread over the rest of a usual one: (120 - 12) / 4 = 27 steps
+  expect(seen.kept.find(record => record.kind === 'dream')).toEqual(expect.objectContaining({
+    line: DREAM_LINE, tokens: LOOK, session: 'sess-1', outcome: 'dream', left: 4, of: 5, every: 27,
+  }))
 
   await band.press({ key: 'Learn more' })
   expect(await band.find({ text: 'Notes could follow side branches' })).toBeDefined()
@@ -327,10 +334,13 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   expect(seen.filled[0]).toContain('> **Notes could follow side branches**')
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'answer', answer: 'ask_claude' }))
   expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
-  expect(JSON.stringify(await $.command.run(DREAMS))).toContain('1 look, 1 dream')
+  expect(seen.store.get('chapter')).toEqual(expect.objectContaining({ shown: 1, adopted: 1 })) // adopted: its place back
+  const said = JSON.stringify(await $.command.run(DREAMS))
+  expect(said).toContain('1 look, 1 dream')
+  expect(said).toContain('5 of 6 dreams left in this chapter')
 })
 
-test('a look that finds nothing doubles the wait, and with nothing new near the work there is no look at all', ON, async ($, on) => {
+test('a look that finds nothing does not slow the next, and with nothing new about the work there is no look at all', ON, async ($, on) => {
   const world = { herdr: false, repo: true, replies: ['dream: none', 'dream: none'] } as World
   const seen = host(on, world)
   const band = await $.ui.mount(BAND)
@@ -338,30 +348,30 @@ test('a look that finds nothing doubles the wait, and with nothing new near the 
   await settle(() => seen.forks.length >= 1)
   await settle(() => false)
   expect(seen.forks.length).toBe(1)
-  expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 1, dreams: 0, every: 12 }))
+  expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 1, dreams: 0 }))
   expect(await band.find({ text: /Dream · / })).toBeUndefined()
-  expect(seen.kept).toEqual([ // step 6 waits for its share; step 12 looks and finds nothing
-    expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, tokens: 0 }),
-    expect.objectContaining({ kind: 'look', outcome: 'none', every: 12, tokens: LOOK }),
+  expect(seen.kept.filter(record => record.kind === 'look')).toEqual([ // step 6 waits for its share; step 12 finds nothing
+    expect.objectContaining({ outcome: 'budget', every: 6, tokens: 0 }),
+    expect.objectContaining({ outcome: 'none', every: 22, tokens: LOOK, left: 5 }), // (120 - 12) / 5, not doubled
   ])
 
-  await steps($, 48) // affordable, but CSR's brief holds nothing the last look lacked
-  await settle(() => false)
+  const quiet = () => seen.kept.filter(record => record.outcome === 'quiet').length
+  await steps($, 30) // step 42, past the next look (34): affordable, but CSR's brief holds nothing new
+  await settle(() => quiet() >= 2) // 34 and 40
   expect(seen.forks.length).toBe(1)
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'look', outcome: 'quiet', tokens: 0 }))
 
   world.brief = `${BRIEF}\n- 10-08 (csr-engine): “the import should retry” [session 3f2a91c0]` // a past line: not news
-  await steps($, 48)
-  await settle(() => false)
+  await steps($, 12)
+  await settle(() => quiet() >= 4) // 46 and 52
   expect(seen.forks.length).toBe(1)
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'look', outcome: 'quiet' }))
 
   world.brief = `${world.brief}\n* plugin retry-queue: built over 1 session, latest 10-08 [session 3f2a91c0]`
   await steps($, 12)
-  await settle(() => seen.forks.length >= 2)
-  await settle(() => false)
+  await settle(() => seen.store.get('pace') !== undefined && (seen.store.get('pace') as { looks: number }).looks >= 2)
   expect(seen.forks.length).toBe(2)
-  expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 2, every: 24 }))
+  expect(seen.store.get('pace')).toEqual(expect.objectContaining({ looks: 2 }))
 })
 
 test('only the brief\'s "* " lines, about the work in hand, count as news', async () => {
@@ -375,6 +385,46 @@ test('only the brief\'s "* " lines, about the work in hand, count as news', asyn
     '- 10-09: “What if…?” [ask_claude]',
   ].join('\n')
   expect(facts(brief)).toEqual(['* skill pigment: built over 2 sessions, latest 10-09 [session cd677a49]'])
+})
+
+test('the dreams left are spread over the rest of a usual chapter', async () => {
+  const chapter = { ...freshChapter('s', 0), steps: 12, shown: 1 }
+  expect(spacing(chapter, 120)).toBe(27)
+  expect(spacing({ ...chapter, steps: 200 }, 120)).toBe(6) // a long chapter: no less than 6
+  expect(spacing({ ...chapter, shown: 5 }, 120)).toBe(0) // none left
+  expect(spacing({ ...chapter, shown: 5, adopted: 1 }, 120)).toBe(108) // one adopted: its place back
+  expect(median([90, 150, 120])).toBe(120)
+  expect(median([])).toBe(120)
+})
+
+test('a chapter holds five dreams: with none left there is no look until a compaction starts the next', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
+  await $.ui.mount(BAND)
+  seen.store.set('chapter', { session: 'sess-1', started: NOW, steps: 0, due: 6, looks: 5, shown: 5, adopted: 0 })
+  await steps($, 60)
+  await settle(() => false)
+  expect(seen.forks).toEqual([])
+  expect(seen.kept.filter(record => record.kind === 'look').map(record => record.outcome)).toEqual(['spent'])
+
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never)
+  await settle(() => seen.kept.some(record => record.kind === 'chapter'))
+  expect(seen.kept.find(record => record.kind === 'chapter')).toEqual(expect.objectContaining({ why: 'compact', left: 5, of: 5 }))
+  expect(seen.store.get('chapterSteps')).toEqual([60]) // how long your chapters run, learned
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 1)
+  expect(seen.forks.length).toBe(1)
+})
+
+test('a compaction folds the dream that is up: its context is gone', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
+  const band = await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
+  await $.session.compact({ trigger: 'manual', messages: MESSAGES } as never)
+  await settle(async () => (await band.find({ text: /What if the notes also read/ })) === undefined)
+  expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
+  expect(seen.kept.filter(record => record.kind === 'answer')).toEqual([expect.objectContaining({ answer: 'expired' })])
+  expect(seen.store.get('chapter')).toEqual(expect.objectContaining({ shown: 0, steps: 0 }))
 })
 
 test('a dream typed past is never asked again, and the dreamer backs off', ON, async ($, on) => {
@@ -391,11 +441,12 @@ test('a dream typed past is never asked again, and the dreamer backs off', ON, a
   expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'answer', answer: 'ignored' }))
 
   world.brief = `${BRIEF}\n* plugin retry-queue: built over 1 session, latest 10-08 [session 3f2a91c0]`
-  await steps($, 6) // skipped: backing off
+  await steps($, 27) // step 39, when the next look is due: skipped, backing off
   await settle(() => false)
   expect(seen.forks.length).toBe(1)
+  expect(seen.kept.at(-1)).toEqual(expect.objectContaining({ kind: 'look', outcome: 'skip' }))
 
-  await steps($, 6) // looks again, but the same dream is not shown twice
+  await steps($, 20) // step 59: looks again, but the same dream is not shown twice
   await settle(() => seen.forks.length >= 2)
   await settle(() => false)
   expect(seen.forks.length).toBe(2)
