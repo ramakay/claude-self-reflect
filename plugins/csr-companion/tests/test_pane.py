@@ -15,7 +15,7 @@ spec = importlib.util.spec_from_file_location('pane', os.path.join(HERE, '..', '
 pane = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pane)
 
-PAST = 'a3e857eb-1111-4222-8333-444455556666'
+PAST = '00000000-1111-4222-8333-444455556666'
 HERE_NOW = 'sess-now'
 AT = '2026-10-08T22:33:57.100000+00:00'
 
@@ -615,16 +615,16 @@ class SaidItInSessions(unittest.TestCase):
 
     def test_a_word_of_your_prompt_looked_up_in_memory_within_six_calls_counts(self):
         home, path = transcript([
-            said('call astra for the review'), looked('grep -ril "astra" /home/u/.claude/memory'),
+            said('call osprey for the review'), looked('grep -ril "osprey" /home/u/.claude/memory'),
             said('now zebra and thing'), looked('ls /tmp'), looked('grep -r "zebra" /repo/src'),
             said('quokka please'), looked('cat /home/u/.claude/CLAUDE.md | grep quokka'),
         ])
         got = pane.terms_looked_up(path)
-        self.assertEqual(list(got), ['astra'])  # not zebra (not memory), not quokka (not quoted)
-        self.assertIn('call astra for the review', got['astra'])
+        self.assertEqual(list(got), ['osprey'])  # not zebra (not memory), not quokka (not quoted)
+        self.assertIn('call osprey for the review', got['osprey'])
 
     def test_a_lookup_after_six_other_calls_is_not_about_the_prompt(self):
-        home, path = transcript([said('call astra'), looked(*['ls'] * 6), looked('grep -ril "astra" /home/u/.claude/memory')])
+        home, path = transcript([said('call osprey'), looked(*['ls'] * 6), looked('grep -ril "osprey" /home/u/.claude/memory')])
         self.assertEqual(pane.terms_looked_up(path), {})
 
     def test_two_sessions_not_in_claude_md_give_one_note_and_it_is_cached_by_mtime(self):
@@ -636,11 +636,11 @@ class SaidItInSessions(unittest.TestCase):
         for n in (1, 2):
             with open(os.path.join(folder, f's{n}.jsonl'), 'w') as handle:
                 for row in (said('call quokka now'), looked('grep -ril "quokka" /home/u/.claude/memory'),
-                            said('call astra now'), looked('grep -ril "astra" /home/u/.claude/memory')):
+                            said('call osprey now'), looked('grep -ril "osprey" /home/u/.claude/memory')):
                     handle.write(json.dumps(row, separators=(',', ':')) + '\n')
         os.makedirs(os.path.join(home, '.claude-self-reflect'))
         with open(os.path.join(home, '.claude', 'CLAUDE.md'), 'w') as handle:
-            handle.write('# Prefs\nastra = Codex\n')
+            handle.write('# Prefs\nosprey = a seabird\n')
         saved = (pane.HOME, pane.KEEP, pane.COACH_KEPT, pane.CLAUDE_MD, pane.terms_looked_up)
         pane.HOME, pane.KEEP = home, os.path.join(home, 'kept')
         pane.COACH_KEPT = os.path.join(pane.KEEP, 'coach.json')
@@ -981,8 +981,8 @@ class CarryOver(unittest.TestCase):
         self.assertEqual(pane.lost_found([(1000.0, own)], [], other)[0]['came_from'], 'prev-1')
 
 
-class AstraFindings(CarryOver):
-    """Each case one finding of the 10-10 review, reproduced first, then held."""
+class CarryOverRegressions(CarryOver):
+    """Each case one defect found in review, reproduced first, then held."""
 
     def test_a_second_restart_keeps_what_the_first_carried(self):
         self.before([])

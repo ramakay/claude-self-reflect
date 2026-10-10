@@ -1919,7 +1919,7 @@ def mentions(text, term):
 
 
 def quoted_in(asked, term, pattern=None):
-    """Whether a lookup names the word on its own, in quotes (grep -ril "astra") or as the whole search
+    """Whether a lookup names the word on its own, in quotes (grep -ril "osprey") or as the whole search
     pattern, not as a piece of some longer word or path."""
     if isinstance(pattern, str) and pattern.strip().lower() in (term, f'\\b{term}\\b'):
         return True

@@ -417,14 +417,14 @@ test('a look that finds nothing does not slow the next, and with nothing new abo
 test('only the brief\'s "* " lines, about the work in hand, count as news', async () => {
   const brief = [
     'Things the person built in other sessions that came up in this work:',
-    '* skill pigment: built over 2 sessions, latest 10-09 [session cd677a49]',
-    '  “Archetype-based visual system”',
+    '* skill chartkit: built over 2 sessions, latest 10-09 [session 5c1d0e77]',
+    '  “Chart styles for reports”',
     'Lines the person wrote in past sessions that sit close to this work:',
-    '- 06-10 (claude-self-reflect): “my vision” [session 0bab445f]',
+    '- 06-10 (csr-engine): “the long-term plan” [session 9b2e4a10]',
     'Dreams already offered here, and what the person answered:',
     '- 10-09: “What if…?” [ask_claude]',
   ].join('\n')
-  expect(facts(brief)).toEqual(['* skill pigment: built over 2 sessions, latest 10-09 [session cd677a49]'])
+  expect(facts(brief)).toEqual(['* skill chartkit: built over 2 sessions, latest 10-09 [session 5c1d0e77]'])
 })
 
 test('the dreams left are spread over the rest of a usual chapter', async () => {
