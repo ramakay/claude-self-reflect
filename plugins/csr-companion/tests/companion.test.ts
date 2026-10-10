@@ -146,7 +146,9 @@ function host(on: On, world: World) {
     if (e.argv[0] === 'python3') {
       return ok(JSON.stringify(world.repo ? SHIFTS : { repo: null, total: 0, shifts: [], changes: [], changes_total: 0, dreams: [], status: null }))
     }
+    if (e.argv[2] === 'get') return ok(JSON.stringify({ result: { pane: { pane_id: e.argv[3], tab_id: 'w2:t1', workspace_id: 'w2' } } }))
     if (e.argv[2] === 'list') {
+      if (e.argv[3] !== '--workspace' || e.argv[4] !== 'w2') return ok(JSON.stringify({ result: { panes: [] } })) // only Claude's own space
       return ok(JSON.stringify({ result: { panes: [
         { pane_id: 'w2:p1', tab_id: 'w2:t1' },
         { pane_id: 'w2:p2', tab_id: 'w2:t1', label: 'Shifts' },

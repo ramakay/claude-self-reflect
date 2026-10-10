@@ -41,7 +41,7 @@ const OFF_ROW = 'csr-companion.dreams'
 const data = atom({ plugin: 'csr-companion', key: 'data' } as const, null as ShiftsData | null)
 const view = atom({ plugin: 'csr-companion', key: 'view' } as const, null as NoteView | null)
 
-type HerdrPane = { pane_id: string; tab_id?: string; label?: string | null }
+type HerdrPane = { pane_id: string; tab_id?: string; workspace_id?: string; label?: string | null }
 
 async function run($: EngineInterface, argv: string[]): Promise<string | null> {
   const ran = await $.process.run(['python3', '-I', script($), ...argv], { timeoutMs: 20_000 })
@@ -556,7 +556,17 @@ async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> 
   const self = await $.env.get('HERDR_PANE_ID')
   const herdr = (await $.env.get('HERDR_BIN_PATH')) ?? 'herdr'
   if (!self) return false
-  const listed = await $.process.run([herdr, 'pane', 'list'])
+  // Claude's own space and tab, asked of herdr by its pane id: the old CSR pane is looked for there,
+  // whichever space you are looking at when the session starts.
+  const got = await $.process.run([herdr, 'pane', 'get', self])
+  let mine: HerdrPane | undefined
+  try {
+    mine = got.exitCode === 0 ? JSON.parse(got.stdout).result?.pane : undefined
+  } catch {}
+  const tab = mine?.tab_id
+  if (!tab) return false
+  const space = mine?.workspace_id ?? tab.split(':')[0] ?? ''
+  const listed = await $.process.run([herdr, 'pane', 'list', '--workspace', space])
   if (listed.exitCode !== 0) return false
   let panes: HerdrPane[] = []
   try {
@@ -564,7 +574,6 @@ async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> 
   } catch {
     return false
   }
-  const tab = panes.find(pane => pane.pane_id === self)?.tab_id
   for (const pane of panes) {
     if (pane.tab_id === tab && (pane.label === LABEL || pane.label === 'Shifts')) await $.process.run([herdr, 'pane', 'close', pane.pane_id])
   }
