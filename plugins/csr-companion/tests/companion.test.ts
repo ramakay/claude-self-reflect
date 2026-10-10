@@ -376,6 +376,18 @@ test('a dream typed past is never asked again, and the dreamer backs off', ON, a
   expect(await band.find({ text: /What if the notes also read/ })).toBeUndefined()
 })
 
+test('a dream that only echoes this session, or asks about the pane, never reaches you', ON, async ($, on) => {
+  const echo = DREAM_REPLY.replace('[session dc24d328]', '[session sess-1]').replace('On 08-26 you asked', 'Today you asked')
+  const tool = DREAM_REPLY.replace('What if the notes also read', 'What if the pane also read')
+  const seen = host(on, { herdr: false, repo: true, replies: [echo, tool] })
+  const band = await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 1)
+  await settle(() => false)
+  expect(await band.find({ text: /What if the (notes|pane) also read/ })).toBeUndefined()
+  expect(seen.kept.filter(record => record.kind === 'dream')).toEqual([])
+})
+
 test('the dim 4 on a dream turns dreams off, after a second press', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   const band = await $.ui.mount(BAND)

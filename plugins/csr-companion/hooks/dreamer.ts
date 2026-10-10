@@ -45,7 +45,8 @@ dream: <question>
 Length: one sentence, about 20 words, at most 2 clauses. Start with "What if" or "Have you thought about". End with a question mark.
 
 * **Ask what this person would ask.** Read how they talk to the agent and the lines they wrote before (above). Ask in that spirit: practical, ambitious, about what they are building, never trivia.
-* **Grounded.** The question must follow from this session's work AND at least one concrete thing: a receipt from CSR's memory above, or a fact stated in this session. The explainer names it. A question you could ask of any project does not clear the bar.
+* **Grounded in another session.** The question must follow from this session's work AND a receipt from CSR's memory above that is not this session: a past session or a commit. The explainer names it with its receipt in brackets, as [session 3f2a91c0] or [commit ab12cd3]. A fact from this session alone does not clear the bar: without such a receipt, answer dream: none.
+* **About the work, not about CSR.** Never ask about CSR's own pane, dreamer or side agents, their layout or their colours. They are the tool; the person's work is the point.
 * **Worth a detour.** It should open a clearly better path: save real time or money, remove a whole class of work, reuse something already built, or carry this session's goal further. Interesting is not the same as important.
 * **Not already on the table.** Skip it if the person or the main agent raised it in this session, or the main agent is about to do it. Repeating the conversation back is noise.
 * **Not a correction.** If your question is really "you got X wrong" or "watch out for Y", answer dream: none. That belongs to You should know.
@@ -106,6 +107,22 @@ The session is a small, routine change with no open question worth a detour.
 
 Keep the labels dream: and explain:, and the word none, exactly as written. Write the question, title and text in the language the person writes in.`,
   ].join('')
+}
+
+// A dream reaches the person only when it stands on another session: a session or commit receipt the
+// brief carries, other than this session's own. An echo of today's work, or a question about CSR's
+// own pane or dreamer, never does.
+const RECEIPT = /\b(?:session|commit)\s+([0-9a-f]{7,8})\b/gi
+const ABOUT_THE_TOOL = /\b(?:pane|dreamer|dreams?|side agents?)\b/i
+
+export function standsOnThePast(dream: Dream, brief: string, session: string): boolean {
+  if (ABOUT_THE_TOOL.test(`${dream.line} ${dream.title}`)) return false
+  const own = session.slice(0, 8).toLowerCase()
+  const known = brief.toLowerCase()
+  return [...`${dream.line}\n${dream.text}`.matchAll(RECEIPT)].some(([, id]) => {
+    const receipt = (id ?? '').toLowerCase()
+    return receipt !== own && known.includes(receipt)
+  })
 }
 
 const DREAM = /^\s*dream:\s*(.+?)\s*$/im

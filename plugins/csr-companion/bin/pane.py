@@ -514,7 +514,6 @@ def brief(con, root, session_id):
 # ---------------------------------------------------------------- what CSR remembered for you
 
 EDITS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
-NOW = 3600  # "touching now": what Claude handled in the last hour
 NAMED = re.compile(r"(/(?:Users|home)/[\w./@+-]+)")  # an absolute path in a command Claude ran
 ASK_KEYS = ('query', 'concept', 'topic', 'file_path', 'symbol', 'target', 'pattern', 'conversation_id')
 _ABOUT = {}  # a past session or a stored reflection -> (what it was about, when, project), or None
@@ -755,24 +754,82 @@ class Clock:
 
 # ---------------------------------------------------------------- pictures
 
-# pigment's light-ground inks (its nyt archetype): the pane is a page of paper, black ink on it, and
-# each section keeps one pigment for its icon, its label and its marks, dark enough to read as text.
-GROUND = (251, 251, 249)
-INK = dict(you=(23, 25, 28), ctx=(44, 90, 160), learn=(35, 122, 92), turn=(200, 68, 42), dream=(138, 100, 20),
-           recall=(35, 122, 92), asked=(94, 86, 160), sepia=(111, 86, 66), rule=(0, 0, 0, 34),
-           quiet=(94, 94, 89), faint=(141, 140, 134), hair=(226, 225, 219))
+def _linear(c):
+    c /= 255
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _encoded(c):
+    c = c * 12.92 if c <= 0.0031308 else 1.055 * max(c, 0) ** (1 / 2.4) - 0.055
+    return max(0, min(255, round(c * 255)))
+
+
+def to_lab(rgb):
+    r, g, b = (_linear(c) for c in rgb[:3])
+    x, y, z = ((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047, 0.2126 * r + 0.7152 * g + 0.0722 * b,
+               (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883)
+    f = lambda t: t ** (1 / 3) if t > 216 / 24389 else (24389 / 27 * t + 16) / 116
+    return 116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))
+
+
+def from_lab(lab):
+    light, a, b = lab
+    fy = (light + 16) / 116
+    g = lambda t: t ** 3 if t ** 3 > 216 / 24389 else (116 * t - 16) / (24389 / 27)
+    x, y, z = g(fy + a / 500) * 0.95047, g(fy), g(fy - b / 200) * 1.08883
+    return (_encoded(3.2406 * x - 1.5372 * y - 0.4986 * z), _encoded(-0.9689 * x + 1.8758 * y + 0.0415 * z),
+            _encoded(0.0557 * x - 0.2040 * y + 1.0570 * z))
+
+
+def blend(a, b, t):
+    """a toward b by t, in CIELAB: even steps to the eye, no muddy middle."""
+    return from_lab(tuple(p + (q - p) * t for p, q in zip(to_lab(a), to_lab(b))))
+
+
+def contrast(a, b):
+    lum = lambda rgb: sum(w * _linear(c) for w, c in zip((0.2126, 0.7152, 0.0722), rgb[:3]))
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def readable(ink, ground, ratio=4.5):
+    """The ink, its hue kept, darkened (or lightened on a dark ground) until it reads as text there."""
+    light, a, b = to_lab(ink)
+    step = -1 if to_lab(ground)[0] > 50 else 1
+    while contrast(from_lab((light, a, b)), ground) < ratio and 0 < light < 100:
+        light += step
+    return from_lab((light, a, b))
+
+
+# pigment's inks (its nyt archetype; `pigment.py tokens`), the pane's only colours: a page of sheet paper
+# in lamp black, each section one pigment for its icon and its marks, made readable on the sheet; the
+# masthead in the inks pigment lights for its night ground.
+PIGMENT = dict(lamp=(23, 25, 28), graphite=(94, 94, 89), pencil=(141, 140, 134), rule=(226, 225, 219),
+               sheet=(251, 251, 249), night=(14, 15, 17), payne=(47, 58, 72), chalk=(238, 245, 250),
+               indigo=(44, 90, 160), vermilion=(200, 68, 42), viridian=(46, 139, 106), ochre=(196, 146, 47),
+               sepia=(111, 86, 66), indigo_lit=(58, 127, 224), viridian_lit=(36, 163, 114),
+               vermilion_lit=(232, 88, 44), ochre_lit=(242, 182, 50), violet_lit=(154, 123, 232))
+GROUND = PIGMENT['sheet']
+INK = dict(you=PIGMENT['lamp'], ctx=readable(PIGMENT['indigo'], GROUND), learn=readable(PIGMENT['viridian'], GROUND),
+           turn=readable(PIGMENT['vermilion'], GROUND), dream=readable(PIGMENT['ochre'], GROUND),
+           recall=readable(PIGMENT['viridian'], GROUND), asked=readable(PIGMENT['violet_lit'], GROUND),
+           sepia=PIGMENT['sepia'], rule=(0, 0, 0, 34), quiet=PIGMENT['graphite'], faint=PIGMENT['pencil'],
+           hair=PIGMENT['rule'])
 SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams='dream', memory='recall',
                changed='quiet', remembered='recall', kept='turn')
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆')  # where no pictures are drawn
-DARK = ((50, 50, 48), (12, 12, 12))  # the masthead's ground, from its first row (Claude's own status line)
-# to its last (the gauges' legend), each row a step darker than the one above; the first lighter than a dark
-# terminal's own ground (herdr's is 40), so the masthead keeps its edge. Its lines read best dark.
-ON_DARK = dict(text=(236, 236, 231), label=(150, 150, 144), you=(236, 236, 231), ctx=(112, 164, 232),
-               learn=(96, 196, 146), recall=(96, 196, 146), turn=(240, 112, 82), dream=(226, 176, 64),
-               asked=(168, 156, 240), rule=(255, 255, 255, 40))
+DARK = (PIGMENT['payne'], PIGMENT['night'])  # the masthead's ground, from its first row (Claude's own status
+# line) to its last (the gauges' legend), each row a step darker in CIELAB; payne sits clear of a dark
+# terminal's own ground (herdr's is 40), so the masthead keeps its edge.
+ON_DARK = dict(text=PIGMENT['chalk'], label=blend(PIGMENT['chalk'], PIGMENT['payne'], 0.45), you=PIGMENT['chalk'],
+               ctx=PIGMENT['indigo_lit'], learn=PIGMENT['viridian_lit'], recall=PIGMENT['viridian_lit'],
+               turn=PIGMENT['vermilion_lit'], dream=PIGMENT['ochre_lit'], asked=PIGMENT['violet_lit'],
+               rule=(255, 255, 255, 40))
 TINT = 0.15  # an opened row: its section's ink at this strength on the paper
-ROW = 0.065  # every other row of a section
+HEAD = 0.10  # a section's heading row
+ROW = 0.04  # its items, one tint for all of them
+STAR_DEPTH = 1.5  # What if…, the star: its tints this much deeper
 SS = 2  # draw at twice the size, then shrink: PIL draws no anti-aliased edges
 
 
@@ -992,6 +1049,7 @@ def ink(name):
 
 
 def tint(name, strength=TINT):
+    strength *= STAR_DEPTH if name == 'dreams' else 1
     return tuple(round(p + (i - p) * strength) for i, p in zip(INK[SECTION[name]][:3], GROUND))
 
 
@@ -1036,9 +1094,9 @@ def ansi_wrap(text, width, rows):
 
 
 def dark_steps(n):
-    """n grounds stepping evenly from the masthead's first shade to its last."""
-    (top, bottom), last = DARK, max(1, n - 1)
-    return [tuple(round(a + (b - a) * i / last) for a, b in zip(top, bottom)) for i in range(n)]
+    """n grounds stepping evenly, in CIELAB, from the masthead's first shade to its last."""
+    top, bottom = DARK
+    return [blend(top, bottom, i / max(1, n - 1)) for i in range(n)]
 
 
 def on_dark(line, ground):
@@ -1213,7 +1271,8 @@ def heading(name, title, right, width):
     gap = room - len(title) - len(right) - 1
     if gap < 1:
         right, gap = '', room - len(title) - 1
-    return lead + ink(SECTION[name]) + BOLD + fit(title, room - 1) + OFF + ' ' * max(1, gap) + ink('quiet') + right + OFF
+    voice = ink(SECTION[name]) if name == 'dreams' else ink('quiet')  # one accent on the page: What if…
+    return lead + voice + BOLD + fit(title, room - 1) + OFF + ' ' * max(1, gap) + ink('quiet') + right + OFF
 
 
 LANE = 9  # the lanes' labels, then their picture
@@ -1250,27 +1309,8 @@ def recall_act(item, now):
 
 
 
-def main_path(path):
-    """A worktree's file as the main checkout names it: the code graph and the ledger know that path."""
-    for mark in NESTED:
-        if mark in path:
-            head, tail = path.split(mark, 1)
-            return head + '/' + tail.split('/', 1)[1] if '/' in tail else path
-    return path
 
 
-def file_facts(con, path, session_id):
-    """How much of the code depends on a file, and how many of your past sessions worked on it."""
-    callers, symbols = con.execute('select coalesce(sum(r.in_degree), 0), count(n.id) from code_nodes n '
-                                   'left join code_node_rank r on r.node_id = n.id where n.file=?', (path,)).fetchone()
-    top = con.execute('select n.name, r.in_degree from code_nodes n join code_node_rank r on r.node_id = n.id '
-                      'where n.file=? and r.in_degree > 0 and n.kind != \'import\' order by r.in_degree desc limit 3',
-                      (path,)).fetchall()
-    shaped = con.execute('select count(distinct s) from (select first_conv_id s from code_nodes where file=?1 '
-                         'union select last_conv_id from code_nodes where file=?1 '
-                         'union select session_id from episode_anchors where file=?1) where s != \'\' and s != ?2',
-                         (path, session_id or '')).fetchone()[0]
-    return dict(callers=callers, symbols=symbols, top=top, shaped=shaped)
 
 
 _WHO = {}  # (transcript, byte) -> whether the words there are yours
@@ -1313,84 +1353,22 @@ def short_path(rel, parts=3):
 
 
 def page_main(data, s, now):
-    """What a senior architect wants beside the agent, most first, each shown only with something in it:
-      Touching now      code Claude edited in the last hour, and code it read there that the rest
-                        depends on or your past sessions worked on
-      Decisions at risk past sessions' work on code that a later commit changed: what they concluded may not hold
+    """What a senior architect wants beside the agent, the star first, each shown only with something in it:
+      What if…          the dreamer's question, its reasoning shown, answered from here
+      Handed to Claude  what CSR's memory gave Claude this session: past sessions and notes
       Your rules        corrections you typed yourself in this repo
-      What if…          the dreamer's challenges
-    Above them, the session's gauges: your prompts, Claude's context and CSR's memory at work."""
+    Above them, the session's gauges: your prompts, Claude's context and CSR's memory at work. Code that
+    changed since your past sessions stays one key away (l)."""
     root = data['repo']
     con = connect()
     try:
-        files, since, last = {}, now - NOW, s.get('last') or {}
-        handled = Counter(s.get('files') or {})
-        handled.update(s.get('shell') or {})
-        for path, n in handled.items():
-            main = main_path(path)
-            if last.get(path, 0) < since or not main.startswith(root + '/') or any(mark in main for mark in NESTED):
-                continue
-            seen = files.setdefault(main, dict(path=main, uses=0, edited=False, read=False))
-            seen['uses'] += n
-            seen['edited'] = seen['edited'] or path in (s.get('edited') or ())
-            seen['read'] = seen['read'] or path in (s.get('files') or {})
-        touching, risks = [], {}
-        for seen in files.values():
-            rel = seen['path'][len(root) + 1:]
-            facts = file_facts(con, seen['path'], s['id'])
-            notes = notes_for(con, root, seen['path'], s['id'])
-            moved = [n for n in notes if n['kind'] == 'shift']
-            for note in moved:
-                risks.setdefault(note['id'], note)
-            if not (facts['callers'] or facts['shaped'] or moved or seen['edited']):
-                continue  # only read or named, and nothing to say about it
-            meta = []
-            if facts['callers']:
-                meta.append(f"{facts['callers']} call site{'s' if facts['callers'] != 1 else ''}")
-            if facts['shaped']:
-                meta.append(f"{facts['shaped']} past session{'s' if facts['shaped'] != 1 else ''}")
-            meta.append('edited' if seen['edited'] else 'read' if seen['read'] else 'in a command')
-            if not facts['symbols'] and not facts['shaped']:
-                meta.append('new to CSR')
-            top = ', '.join(f'{name} ({n})' for name, n in facts['top'])
-            detail = ([f'Most depended on: {top}.'] if top else []) + [n['line'] for n in notes[:2]]
-            send = (f"Before we change {rel}: {facts['callers']} call sites depend on it" +
-                    (f", most on {', '.join(name for name, _ in facts['top'])}" if facts['top'] else '') + '. ' +
-                    ' '.join(n['line'] for n in notes[:2]))
-            touching.append(dict(key='file:' + rel, title=short_path(rel), mono=True, meta=' · '.join(meta),
-                                 flag=f'{len(moved)} changed since' if moved else '', detail=detail,
-                                 send=one_line(send), rank=(not seen['edited'], -facts['callers'], -seen['uses'])))
-        touching.sort(key=lambda item: item['rank'])
-
-        at_risk = [dict(key='note:' + n['id'], title=n['line'], meta=f"{n['oid'][:7]} · {short_date(n['at'])}",
-                        detail=[n['text']], send=one_line(n['text'])) for n in risks.values()]
-        for change in data['changes']:
-            if len(at_risk) >= 4:
-                break
-            latest = max(change['shifts'], key=lambda x: x['at'])
-            symbols = list(dict.fromkeys(x['symbol'] or os.path.basename(x['file']) for x in change['shifts']))
-            files_moved = list(dict.fromkeys(short_path(x['file'], 2) for x in change['shifts']))
-            key = f"change:{change['conversation']}"
-            if any(item['key'] == key for item in at_risk):
-                continue
-            title = (f"{', '.join(symbols[:2])}{' +' + str(len(symbols) - 2) if len(symbols) > 2 else ''} "
-                     f"in {files_moved[0]}" + (f' and {len(files_moved) - 1} more files' if len(files_moved) > 1 else ''))
-            at_risk.append(dict(
-                key=key, title=title,
-                meta=f"your {short_date(change['talked'])} session · changed in {latest['oid'][:7]} on {latest['date'][5:]}",
-                detail=[f"That session: {quoted(change['title'], 120)}",
-                        f"Commit {latest['oid'][:7]} {quoted(latest['subject'], 80)}"],
-                send=one_line(f"Our {short_date(change['talked'])} session ({quoted(change['title'], 80)}) worked on "
-                              f"{', '.join(symbols[:4])}; commit {latest['oid'][:7]} {quoted(latest['subject'], 70)} changed "
-                              f"them on {latest['date']}. What that session concluded may no longer hold.")))
-
         projects = {p for p in (s.get('project'), os.path.basename(root)) if p}
         marks = ','.join('?' * len(projects))
         rules = []  # only your own words: the detector also hears Claude, to itself and to its subagents
         for when, quote, session, transcript, at in con.execute(
                 f"select ts, quote, session_id, transcript_path, byte_start from intent_events where project in "
                 f"({marks}) and kind = 'correction' order by ts desc limit 200", tuple(projects)).fetchall():
-            if len(rules) >= 4:
+            if len(rules) >= 3:
                 break
             if not typed_by_you(transcript, at):
                 continue
@@ -1403,11 +1381,35 @@ def page_main(data, s, now):
         con.close()
 
     week = sum(1 for d in data['dreams'] if d['at'] >= now - 7 * 86400)
-    dreams = [dict(key='dream:' + d['id'], title=d['line'],
-                   meta=' · '.join(x for x in (short_date(d['at']), ANSWER_WORD.get(d['answer'], '')) if x),
-                   detail=[d.get('title') or ''] + [re.sub(r'^[*-]\s*', '', line) for line in
-                                                    (d.get('text') or '').splitlines() if line.strip()][:2],
-                   send=one_line(f"CSR's dreamer asked: “{d['line']}”")) for d in data['dreams'][:3]]
+    dreams = []
+    for k, d in enumerate(data['dreams'][:3]):
+        reasons = [re.sub(r'^[*-]\s*', '', line) for line in (d.get('text') or '').splitlines() if line.strip()]
+        send = one_line(f"{DREAMER_SAID}: “{d['line']}” Its reasoning: {d.get('title') or ''}. {' '.join(reasons[:3])}")
+        meta = ' · '.join(x for x in (short_date(d['at']), ANSWER_WORD.get(d['answer'], '')) if x)
+        if k == 0:  # the star: its question whole, its reasoning shown, its answers a click away while it is open
+            is_open = d['answer'] in (None, 'ignored', 'dismiss', 'got_it')
+            dreams.append(dict(key='dream:' + d['id'], dream=d['id'], title=d['line'], lines=3,
+                               body=[d.get('title') or ''] + reasons[:1], meta='' if is_open else meta,
+                               answers=is_open, detail=reasons[1:3], send=send))
+        else:
+            dreams.append(dict(key='dream:' + d['id'], title=d['line'], lines=1, meta=meta,
+                               detail=[d.get('title') or ''] + reasons[:2], send=send))
+
+    handed = []
+    for item in s.get('remembered') or []:
+        if len(handed) >= 4:
+            break
+        if item['kind'] == 'recall':
+            where = ' · '.join(x for x in (from_when(item.get('when'), now), item.get('project'),
+                                           f"{item['times']}×" if item['times'] > 1 else '') if x)
+            gist = re.sub(r'\*\*|(?:^|\s)#+\s*', ' ', item['text']).strip()  # a note's markdown, as words
+            handed.append(dict(recall_act(item, now), title=gist, meta=where))
+        else:
+            handed.append(dict(key=f"asked:{item['at']}", title=item['text'], meta='Claude asked CSR',
+                               detail=[f"Through {item.get('tool') or 'a CSR tool'}."],
+                               send=one_line(f"Claude asked CSR: “{item['text']}”")))
+    given = len(s['gave']['recalls']) + len(s['gave']['carried']) if s.get('gave') else 0
+
     clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
     if s['compacts']:
@@ -1416,16 +1418,10 @@ def page_main(data, s, now):
                           status=data.get('claude_line')),
                 quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=[
-        dict(name='touching', title='Touching now', right=f"{len(touching)} file{'s' if len(touching) != 1 else ''}" if touching else '', items=touching[:5],
-             empty='Nothing yet. As Claude reads and edits code here, each file shows how much depends on it '
-                   'and what your past sessions did there.'),
-        dict(name='risk', title='Decisions at risk', right=f"{data['changes_total']}" if data['changes_total'] else '',
-             items=at_risk[:4], empty='No commit has changed code your past sessions worked on.'),
-        dict(name='rules', title='Your rules', right='', items=rules[:4],
-             empty='No corrections yet. When you tell Claude "no, not that", CSR keeps it here.'),
         dict(name='dreams', title='What if…', right=('on' + (f' · {week} this week' if week else '')) if data.get('dreams_on') else 'off',
-             items=dreams, empty=('The dreamer asks when CSR has something new near this work.' if data.get('dreams_on') else
-                                  'A side agent that asks "what if…?" while Claude works. Turn it on in /config.')),
+             items=dreams, empty=''),
+        dict(name='remembered', title='Handed to Claude', right=f'{given}×' if given else '', items=handed, empty=''),
+        dict(name='rules', title='Your rules', right='', items=rules, empty=''),
     ])
 
 
@@ -1460,17 +1456,45 @@ ITEM = GUTTER  # an item's text starts under its section's title
 
 
 def item_rows(item, name, width, is_open):
-    """One item: its title on one line (all of it once opened), then what CSR knows about it, quiet,
-    with a flag first in the risk ink."""
+    """One item: its title on up to two lines (all of it once opened), its body where it has one (the star
+    dream's reasoning, always shown), then what CSR knows about it, quiet, with a flag first in the risk ink."""
     room = width - ITEM
-    title = wrap(item['title'].replace('`', ''), room, 6 if is_open else 1)
-    rows = [' ' * ITEM + line for line in title]
+    title = wrap(item['title'].replace('`', ''), room, 6 if is_open else item.get('lines', 2))
+    rows = [' ' * ITEM + ink('you') + line + OFF for line in title]  # lamp black: the page's own type
+    for k, text in enumerate(item.get('body') or ()):
+        voice = ink('quiet') + (BOLD if k == 0 else '')
+        rows += [' ' * ITEM + voice + line + OFF for line in wrap(text, room, 1 if k == 0 else 2)]
     flag, meta = item.get('flag') or '', item.get('meta') or ''
     text = fit(' · '.join(x for x in (flag, meta) if x), room)
-    line = ink('quiet') + text
+    line = ink('faint') + text
     if flag and text.startswith(flag):
-        line = ink('turn') + flag + ink('quiet') + text[len(flag):]
+        line = ink('turn') + flag + ink('faint') + text[len(flag):]
     return rows + [' ' * ITEM + line + OFF] if text else rows
+
+
+ANSWERS = (('helpful', '✓ helpful'), ('thought_of_it', '= thought of it'),
+           ('not_relevant', '✗ not relevant'), ('ask_claude', '→ ask Claude'))
+
+
+def answer_rows(item, width, ui):
+    """The star dream's answers, two to a row; a click on either half answers it. Each row is its own
+    block, so a click knows the dream and, by its column, the answer."""
+    if not item.get('answers'):
+        return []
+    half = (width - ITEM) // 2
+    rows = []
+    for pair in (ANSWERS[:2], ANSWERS[2:]):
+        text, spans = ' ' * ITEM, []
+        for k, (answer, label) in enumerate(pair):
+            start = ITEM + k * half
+            spans.append((start, start + half, answer))
+            text += ink(SECTION['dreams']) + BOLD + label[0] + OFF + ink('quiet') + fit(label[1:], half - 2).ljust(half - 1) + OFF
+        rows.append(([text], dict(key=item['key'] + ':answers', dream=item['dream'], send=item['send'], spans=spans)))
+    answered = ui.get('answered')
+    if answered and answered[0] == item['dream']:
+        said = ANSWER_WORD.get(answered[1], answered[1])
+        rows = [([' ' * ITEM + ink('faint') + fit(f'✓ kept: {said}', width - ITEM) + OFF], None)]
+    return rows
 
 
 def page_lines(page, width, rows, ui):
@@ -1502,6 +1526,7 @@ def page_lines(page, width, rows, ui):
             if is_open:
                 rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'], indent=ITEM)
             blocks.append((rows_, item))
+            blocks += answer_rows(item, width, ui)
         if blocks:
             built.append((section, blocks, 2 + len(blocks[0][0]), 2 + sum(len(rows_) for rows_, _ in blocks)))
     if not built:
@@ -1513,12 +1538,9 @@ def page_lines(page, width, rows, ui):
         name = section['name']
         part = Lines([heading(name, section['title'], section['right'], width)])
         fit_blocks(part, blocks, room - 1, ui, tail=False)
-        shade, k, lit = [], 1, tint(name, ROW)
-        for i, line in enumerate(part):  # each item's rows share a tint, the next item's the other
-            act = part.acts.get(i)
-            if i and act is not part.acts.get(i - 1):
-                k += 1
-            back = lit if k % 2 == 0 else tint(name, ROW * 1.9)
+        shade = []
+        for i, line in enumerate(part):  # the heading a shade deeper than its items, which share one tint
+            back = tint(name, HEAD if i == 0 else ROW)
             opened_row = line.startswith(band(name))
             shade.append(tint(name) if opened_row else back)
             part[i] = line if opened_row else tinted(line, '\x1b[48;2;%d;%d;%dm' % back)
@@ -1563,8 +1585,15 @@ def draw_log(data, cols, rows, ui=None):
 
 
 def legend(view, width):
-    text = 'l changed since your sessions · q' if view == 'main' else '~ changed  - removed  + back · d back · q'
-    return DIM + fit(text, width) + OFF
+    """The bottom row: its keys in lamp black, what each does in pencil; a click on it does the first."""
+    keys = [('l', 'changes since your sessions'), ('q', 'close')] if view == 'main' else \
+        [('d', 'back'), ('q', 'close')]
+    marks = '' if view == 'main' else '~ changed  - removed  + back   '
+    words = [(key, said) for key, said in keys]
+    while len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width and len(words[0][1]) > 7:
+        words[0] = (words[0][0], words[0][1].rsplit(' ', 1)[0])
+    shown = '   '.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
+    return ' ' + ink('faint') + marks + OFF + shown
 
 
 def herdr(*argv):
@@ -1605,6 +1634,7 @@ class Pane:
         self.session = Session(session_id) if session_id else None
         self.view, self.data, self.loaded, self.shown = 'main', None, 0.0, None
         self.open, self.sent, self.acts = None, None, {}  # the row a click opened; what went to Claude
+        self.answered = None  # (dream id, answer, when) the pane kept for a dream, until it is read
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -1624,8 +1654,11 @@ class Pane:
         if self.sent and now - self.sent[2] > 6:  # the "in Claude's prompt" line has been read
             self.open = None if self.open == self.sent[0] else self.open
             self.sent = None
-        ui = dict(open=self.open, sent=self.sent)
+        if self.answered and now - self.answered[2] > 6:
+            self.answered = None
+        ui = dict(open=self.open, sent=self.sent, answered=self.answered)
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
+                          self.answered,
                           self.data.get('claude_line'),
                           [(d['id'], d['answer']) for d in self.data['dreams']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
@@ -1649,10 +1682,19 @@ class Pane:
         sys.stdout.write(''.join(screen))
         sys.stdout.flush()
 
-    def click(self, row):
-        """One click opens a row; a second click on it puts it in Claude's prompt, unsent."""
+    def click(self, row, col=0):
+        """One click opens a row; a second click on it puts it in Claude's prompt, unsent. On a dream's
+        answers, the half clicked is the answer: kept in the dream log, and "ask Claude" also typed in."""
         act = self.acts.get(row)
-        if not act:
+        span = act and next((answer for start, end, answer in act.get('spans') or () if start <= col < end), None)
+        if span:
+            keep(dict(kind='answer', id=act['dream'], answer=span, at=time.time(), by='pane'))
+            if span == 'ask_claude':
+                agent = agent_pane(self.agent)
+                went = bool(agent) and herdr('pane', 'send-text', agent, act['send']) is not None
+                self.sent = (act['key'], went, time.time())
+            self.answered = (act['dream'], span, time.time())
+        elif not act or act.get('spans'):
             self.open = None
         elif act['key'].startswith('view:'):
             self.view, self.open = act['key'][5:], None
@@ -1694,9 +1736,9 @@ def watch(root, limit, session_id, agent=None):
             if not ready:
                 continue
             data = os.read(fd, 1024).decode('utf-8', 'replace')
-            for button, _, y, kind in re.findall(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', data):
+            for button, x, y, kind in re.findall(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', data):
                 if kind == 'M' and int(button) == 0:  # a left press; releases and the wheel pass
-                    pane.click(int(y) - 1)
+                    pane.click(int(y) - 1, int(x) - 1)
                     redraw['now'] = True
             keys = re.sub(r'\x1b\[<[\d;]*[Mm]', '', data).lower()
             if 'q' in keys:

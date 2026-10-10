@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, Settings, SettingsSource } from 'claude-code'
 
 import type { Note, NoteView, Shift, ShiftsData } from '../types'
-import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
+import { askClaude, dreamId, dreamPrompt, parseDream, sameDream, standsOnThePast } from './dreamer'
 import { canAfford, facts, freshPace, hasNews, paceAfter, paceText } from './pace'
 import type { Pace } from './pace'
 
@@ -75,7 +75,7 @@ async function remember($: EngineInterface, key: string, value: string, kept = K
 
 // What each note came to, kept across sessions: the "at least 1 in 3 acted on" gate
 // reads this. A dream's answer also goes to the dream log, where the pane draws it.
-async function answered($: EngineInterface, note: Note, answer: string): Promise<void> {
+async function answered($: EngineInterface, note: Note, answer: string, logged = false): Promise<void> {
   const at = await $.clock.now()
   const value = await $.store.get('answers').catch(() => undefined)
   const list = Array.isArray(value) ? value : []
@@ -88,7 +88,37 @@ async function answered($: EngineInterface, note: Note, answer: string): Promise
   }
   const pace = await paceOf($)
   await $.store.set('pace', paceAfter(pace, answer))
+  if (logged) return // the pane wrote it to the dream log already
   await run($, ['--repo', await $.session.cwd(), '--keep', JSON.stringify({ kind: 'answer', id: note.id, answer, at: at / 1000 })])
+}
+
+const DREAM_LOG = '.claude-self-reflect/csr-companion/dreams.jsonl' // under HOME: the pane's answers land here
+const SETTLED_IN_PANE_MS = 15_000
+
+// A dream answered in the pane (its answer buttons write the dream log) leaves the band here too, and
+// paces the dreamer as an answer in the band would. The log is read only while a dream is up.
+async function settledInThePane($: EngineInterface): Promise<void> {
+  const up: { note?: Note } = {}
+  await update($, view, current => {
+    if (current && current.kind !== 'asked' && current.note.kind === 'dream') up.note = current.note
+    return current
+  })
+  const note = up.note
+  const home = note && (await $.env.get('HOME'))
+  if (!note || !home) return
+  const log = await $.fs.read(`${home}/${DREAM_LOG}`).catch(() => '')
+  let answer: string | undefined
+  for (const line of log.split('\n')) {
+    try {
+      const record = JSON.parse(line) as { kind?: string; id?: string; answer?: unknown; by?: string }
+      if (record.kind === 'answer' && record.id === note.id && record.by === 'pane' && typeof record.answer === 'string') {
+        answer = record.answer
+      }
+    } catch {}
+  }
+  if (!answer) return
+  await update($, view, current => (current?.note.id === note.id ? null : current))
+  await answered($, note, answer, true)
 }
 
 async function refresh($: EngineInterface, cwd: string): Promise<ShiftsData | null> {
@@ -183,7 +213,8 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
   const used = 'usage' in reply ? tokensOf(reply.usage) : 0
   await $.store.set('briefFacts', [...before.filter(line => !now.includes(line)), ...now].slice(-FACTS_KEPT))
   pace = { ...(await paceOf($)), looks: pace.looks + 1, dreamer: pace.dreamer + used, lastLook: used || pace.lastLook }
-  const found = reply.isAnswered ? parseDream(reply.text) : null
+  const parsed = reply.isAnswered ? parseDream(reply.text) : null
+  const found = parsed && standsOnThePast(parsed, brief, session) ? parsed : null // another session under it
   if (!found || [...seen, ...known].some(line => sameDream(line, found.line))) {
     await $.store.set('pace', paceAfter(pace, 'none'))
     return
@@ -270,6 +301,7 @@ export const register: Register = (on, options) => {
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
 
   on('prompt.submit', async ($, e, next) => {
+    await settledInThePane($).catch(() => undefined) // answered there: never counted as typed past
     let ignored: Note | null = null
     await update($, view, current => {
       if (!current || waiting) return current // a note nobody saw was not typed past
@@ -453,6 +485,7 @@ export const register: Register = (on, options) => {
       const fresh = await refresh($, e.cwd)
       if (fresh?.repo) await openPane($, e.cwd)
       $.clock.every(REFRESH_MS, () => void refresh($, e.cwd))
+      $.clock.every(SETTLED_IN_PANE_MS, () => void settledInThePane($).catch(() => undefined))
     })()
     return started
   })
