@@ -211,10 +211,13 @@ fn dream_end_to_end_supersession_rerun_idempotency_and_reinstatement() {
         .unwrap()
         .unwrap();
     assert_eq!(v1.verdict, VerdictKind::SupersededBy);
+    // A receipt is the commit that MADE the change, not the HEAD that
+    // observed it: commit1's body (`1`) was first replaced by commit2, even
+    // though the join only ran at c3.
     assert_eq!(
         v1.receipt_oid.as_deref(),
-        Some(c3.as_str()),
-        "commit1's successor must be the live HEAD (c3) that ran the join"
+        Some(c2.as_str()),
+        "commit1's receipt is the first commit that changed it (c2), not the observing HEAD (c3)"
     );
     let v2_run1 = engine
         .storage()
@@ -222,6 +225,11 @@ fn dream_end_to_end_supersession_rerun_idempotency_and_reinstatement() {
         .unwrap()
         .unwrap();
     assert_eq!(v2_run1.verdict, VerdictKind::SupersededBy);
+    assert_eq!(
+        v2_run1.receipt_oid.as_deref(),
+        Some(c3.as_str()),
+        "commit2's body (`2`) was first replaced by commit3"
+    );
 
     // ── Run 2: rerun at the SAME HEAD (c3) — must write nothing new ──
     let run2 = csr_engine::dream::run_dream(&engine, None, false).unwrap();
