@@ -1293,6 +1293,22 @@ fn is_self_echo(chunk: &crate::import::ConversationChunk, current_session: Optio
         .any(|block| opening.starts_with(block))
 }
 
+/// A chunk one of this session's own subagents wrote: filed under the subagent's `agent-` id, with the
+/// session that ran it as its parent in provenance. `is_self_echo` catches the session's own chunks by
+/// id; these slip past it, and handing a session its own subagents' words back is the same echo.
+fn is_own_subagent(
+    chunk: &crate::import::ConversationChunk,
+    current_session: Option<&str>,
+    parent: impl FnOnce() -> Option<String>,
+) -> bool {
+    match current_session {
+        Some(session) if chunk.conversation_id.starts_with("agent-") => {
+            parent().as_deref() == Some(session)
+        }
+        _ => false,
+    }
+}
+
 /// Search chunks using a pre-computed embedding vector (P-1 optimization).
 /// Scoped to `project` — chunks from other projects are filtered out, and so
 /// is anything `is_self_echo` names.
@@ -1408,6 +1424,15 @@ async fn search_chunks_with_vec_core(
                 }
 
                 if is_self_echo(&chunk, current_session) {
+                    continue;
+                }
+                if is_own_subagent(&chunk, current_session, || {
+                    storage
+                        .get_chunk_provenance(&result.id)
+                        .ok()
+                        .flatten()
+                        .map(|provenance| provenance.source_conv_id)
+                }) {
                     continue;
                 }
 
@@ -1955,6 +1980,41 @@ mod tests {
             author: None,
             min_trust: crate::provenance::TrustTier::Unknown,
         }
+    }
+
+    #[test]
+    fn this_sessions_own_subagents_are_never_handed_back_to_it() {
+        let chunk = |conversation_id: &str| crate::import::ConversationChunk {
+            id: "c".into(),
+            conversation_id: conversation_id.into(),
+            project_name: "csr-engine".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: "the pane reads the dream log".into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::Assistant,
+            seq: 0,
+            is_sidechain: true,
+        };
+        let parent = |id: &str| {
+            let id = id.to_owned();
+            move || Some(id)
+        };
+        let ours = chunk("agent-a3dd7b830b8b7fa52");
+        assert!(is_own_subagent(&ours, Some("6ca2a4d5"), parent("6ca2a4d5")));
+        // another session's subagent is memory, and so is a chunk with no parent on record
+        assert!(!is_own_subagent(
+            &ours,
+            Some("6ca2a4d5"),
+            parent("f98b6500")
+        ));
+        assert!(!is_own_subagent(&ours, Some("6ca2a4d5"), || None));
+        // not a subagent: its parent is never looked up
+        let plain = chunk("f98b6500-1111-4222-8333-444455556666");
+        assert!(!is_own_subagent(&plain, Some("6ca2a4d5"), || panic!(
+            "looked up"
+        )));
+        assert!(!is_own_subagent(&ours, None, || panic!("looked up")));
     }
 
     #[test]
