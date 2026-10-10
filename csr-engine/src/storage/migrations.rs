@@ -2035,6 +2035,7 @@ pub fn run(conn: &Connection) -> Result<()> {
     migrate_intent_events_detector_v3(conn)?;
     migrate_artifact_provenance(conn)?;
     migrate_strip_memory_tag_from_derived_reflections(conn)?;
+    crate::import::scratch::migrate(conn)?;
 
     // Reaction-judge shadow mode (src/reaction_shadow.rs): per-transcript scan
     // state and one row per (human turn, model build). Written by the daemon

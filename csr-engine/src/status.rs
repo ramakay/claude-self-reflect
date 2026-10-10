@@ -74,6 +74,9 @@ pub struct StatusReport {
     /// Watcher busy-retry backoff + daemon catch-up sweep receipts (gap-G1).
     /// See [`ImportWatcherStatus`].
     pub import_watcher: ImportWatcherStatus,
+    /// Scratch scripts indexed from Bash tool calls: language and import
+    /// frequency table, no model. See `import::scratch`.
+    pub scratch: crate::import::scratch::ScratchStatus,
 }
 
 /// Receipts for the watcher's `database is locked` retry backoff
@@ -821,6 +824,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             dreaming,
             codex_backfill: CodexBackfillStatus::default(),
             import_watcher: ImportWatcherStatus::default(),
+            scratch: Default::default(),
         });
     }
 
@@ -953,6 +957,9 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         dreaming,
         codex_backfill,
         import_watcher,
+        scratch: storage
+            .with_connection(crate::import::scratch::status)
+            .unwrap_or_default(),
     })
 }
 
@@ -2058,6 +2065,7 @@ mod tests {
             dreaming: None,
             codex_backfill: CodexBackfillStatus::default(),
             import_watcher: ImportWatcherStatus::default(),
+            scratch: Default::default(),
         }
     }
 
@@ -2155,6 +2163,9 @@ mod tests {
                 trained_ndcg5: 0.5,
                 outcome: "win".into(),
             }];
+        let scratch = serde_json::to_value(&report.scratch).unwrap();
+        assert_eq!(scratch["scripts"], 0);
+        assert!(scratch["by_language"].is_object());
         let value = serde_json::to_value(report).unwrap();
         assert_eq!(value["trained_rerank"]["gate_status"], "failed");
         assert_eq!(value["trained_rerank"]["cluster_wins"], 4);

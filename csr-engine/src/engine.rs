@@ -467,6 +467,15 @@ impl Engine {
             self.storage
                 .set_conversation_entrypoint(&conversation_id, ep)?;
         }
+        // Scratch scripts from Bash tool calls (never fatal to the import).
+        if let Err(e) = import::scratch::index_transcript(
+            &self.storage,
+            file_path,
+            &conversation_id,
+            &attribution.project_name,
+        ) {
+            tracing::warn!(error = %e, "scratch script indexing failed");
+        }
         if chunks.is_empty() {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent

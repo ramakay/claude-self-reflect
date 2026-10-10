@@ -9,6 +9,7 @@ pub mod plans;
 pub mod provenance_backfill;
 mod provenance_matcher;
 pub mod registry;
+pub mod scratch;
 pub mod scrub;
 pub mod watcher;
 

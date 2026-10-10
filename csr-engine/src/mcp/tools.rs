@@ -2506,8 +2506,46 @@ pub async fn why(
     );
 
     append_memory_provenance_hop(storage, &ranking.items, &mut rendered)?;
+    append_scratch_hop(storage, query, &ranking.items, &mut rendered);
 
     Ok(rendered)
+}
+
+/// "Became final" hop: repo functions named in the query, or linked to the
+/// evidence chunks, whose name and body match a scratch function Claude drafted
+/// earlier. Adds nothing (and never fails the call) when there is no match.
+fn append_scratch_hop(
+    storage: &Arc<Storage>,
+    query: &str,
+    items: &[crate::search::reinstatement::EvidenceItem],
+    out: &mut String,
+) {
+    let mut names: Vec<String> = query
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.len() >= 4)
+        .map(str::to_string)
+        .collect();
+    let _ = storage.with_connection(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT name FROM code_nodes
+             WHERE last_chunk_id = ?1 AND kind IN ('function', 'method')
+               AND file NOT LIKE 'scratch/%' LIMIT 5",
+        )?;
+        for item in items.iter().take(10) {
+            let rows = stmt.query_map([&item.chunk_id], |r| r.get::<_, String>(0))?;
+            names.extend(rows.flatten());
+        }
+        Ok(())
+    });
+    names.sort();
+    names.dedup();
+    names.truncate(40);
+    let promotions = storage
+        .with_connection(|conn| crate::import::scratch::promotions_for_names(conn, &names))
+        .unwrap_or_default();
+    for promotion in promotions.iter().take(3) {
+        out.push_str(&format!("\n{}", promotion.line()));
+    }
 }
 
 /// Read-only additive join: for each conversation the evidence resolved to,
@@ -3964,6 +4002,50 @@ fn apply_resolutions_before_limit(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn why_appends_became_final_receipt_only_on_match() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let body = "def build_index(rows):\n    return {r: i for i, r in enumerate(rows)}\n";
+        let scratch = crate::extraction::codegraph::extract_graph_fragment_for_file(
+            body,
+            "scratch/abcd1234/inline-aaaa.py",
+            "p",
+            "p",
+            "c1",
+            "s1",
+        );
+        let repo = crate::extraction::codegraph::extract_graph_fragment_for_file(
+            body,
+            "src/index.py",
+            "p",
+            "p",
+            "c2",
+            "s2",
+        );
+        for n in scratch.nodes.iter().chain(repo.nodes.iter()) {
+            storage.upsert_code_node(n).unwrap();
+        }
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO scratch_scripts (id, session_id, conv_id, project, lang, file, body, created_at)
+                     VALUES ('i','abcd1234-0000','c1','p','py','scratch/abcd1234/inline-aaaa.py','x','2026-09-30T10:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut out = String::from("why");
+        append_scratch_hop(&storage, "why does build_index exist", &[], &mut out);
+        assert!(
+            out.contains("drafted as scratch in session abcd1234 on 2026-09-30"),
+            "{out}"
+        );
+        let mut quiet = String::from("why");
+        append_scratch_hop(&storage, "unrelated question here", &[], &mut quiet);
+        assert_eq!(quiet, "why");
+    }
+
     use super::*;
     // Pure parsing seam — tests drive it by parameter instead of mutating
     // the process env, so the non-test build has no use for it.

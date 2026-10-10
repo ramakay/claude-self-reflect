@@ -491,6 +491,12 @@ pub(crate) async fn import_file_content_diff(
     if let Some(ep) = entrypoint.as_deref() {
         storage.set_conversation_entrypoint(&conv_id, ep)?;
     }
+    // Scratch scripts from Bash tool calls (never fatal to the import).
+    if let Err(e) =
+        import::scratch::index_transcript(storage, file_path, &conv_id, &attribution.project_name)
+    {
+        tracing::warn!(error = %e, "scratch script indexing failed");
+    }
     if chunks.is_empty() {
         // Record the skip so this file isn't re-parsed every watcher pass
         // and import_percent counts it as processed.
