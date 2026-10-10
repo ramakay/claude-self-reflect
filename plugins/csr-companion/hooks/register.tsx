@@ -208,6 +208,7 @@ async function dream($: EngineInterface, lastStep: number): Promise<void> {
   await remember($, 'seenDreams', found.line, SEEN_KEPT)
   await run($, ['--repo', cwd, '--keep', JSON.stringify({
     kind: 'dream', id: note.id, at: at / 1000, session, line: note.line, title: note.title, text: note.text, tokens: used,
+    brief, // what the dreamer read: with the answer that settles this dream, one labelled example
   })])
   void refresh($, cwd)
 }

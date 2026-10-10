@@ -141,7 +141,9 @@ export function dreamId(line: string, at: number): string {
   return `dream:${hash.toString(36)}:${Math.floor(at / 1000).toString(36)}`
 }
 
-// What you'd send Claude yourself: the question first, the dreamer's reasoning after it.
+// What you'd send Claude yourself: the question first, the dreamer's reasoning after it. Keep its
+// "CSR's dreamer asked this while you worked" word for word: csr-engine's provenance guard and the
+// pane's voice_and_lines match it, so the dreamer's words are never read back as yours.
 export function askClaude(dream: { line: string; title: string; text: string }): string {
   const quoted = dream.text.split('\n').map(line => (line.trim() ? `> ${line}` : '>'))
   return [dream.line, '', "CSR's dreamer asked this while you worked. Its reasoning:", '', `> **${dream.title}**`, ...quoted].join('\n')

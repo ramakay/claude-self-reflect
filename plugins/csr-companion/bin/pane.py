@@ -55,6 +55,9 @@ SETUP = 'CSR is not set up yet: npx claude-self-reflect setup'
 IDLE = 15 * 60  # a gap longer than this is drawn as a break, not as time
 KEEP = os.path.join(HOME, '.claude-self-reflect', 'csr-companion')
 DREAM_LOG = os.path.join(KEEP, 'dreams.jsonl')  # the mod's own: csr-engine's DB stays read-only
+# Every prompt the dreamer writes for you carries this sentence (dreamer.ts askClaude); csr-engine's
+# provenance guard matches it too. Such a prompt is the dreamer's words, never your voice.
+DREAMER_SAID = "CSR's dreamer asked this while you worked"
 PANES = os.path.join(KEEP, 'panes')  # <session>.json: the pid of the pane open beside that session
 STATUS_LINES = os.path.join(KEEP, 'statusline')  # <session>.json: Claude's status line, moved into the pane
 
@@ -428,7 +431,7 @@ def voice_and_lines(con, session_id, limit=4, floor=0.40):
             except ValueError:
                 continue
             text = (entry.get('display') or '').strip()
-            if not text or text.startswith('/'):
+            if not text or text.startswith('/') or DREAMER_SAID in text:
                 continue
             low = text.lower()
             for name, pattern in VOICE:
@@ -485,9 +488,10 @@ def brief(con, root, session_id):
         out += ['', 'Rules the person set for these files:']
         out += [f"- {n['line']} [session {n['conversation'][:8]}]" for n in rules]
     project = os.path.basename(root)
-    corrections = con.execute(
-        "select ts, quote, session_id from intent_events where kind = 'correction' and session_id != ?1 "
-        "and (project = ?2 or project like ?2 || '-%') order by ts desc limit 3", (session_id, project)).fetchall()
+    corrections = [(ts, quote, sid) for ts, quote, sid, transcript, at in con.execute(
+        "select ts, quote, session_id, transcript_path, byte_start from intent_events where kind = 'correction' "
+        "and session_id != ?1 and (project = ?2 or project like ?2 || '-%') order by ts desc limit 200",
+        (session_id, project)).fetchall() if typed_by_you(transcript, at)][:3]  # yours, not Claude's to a subagent
     if corrections:
         out += ['', 'Corrections CSR recorded in this repo lately:']
         out += [f"- {short_date(epoch(ts)) if epoch(ts) else (ts or '')[:10]}: {quoted(quote, 200)} [session {sid[:8]}]"
