@@ -10,7 +10,7 @@
 //!
 //!   cargo run --release --example probe_codex_recall -- \
 //!       --db /tmp/csr-wpa/csr-engine.db \
-//!       --projects-dir /Users/ramakrishnanannaswamy/.claude/projects \
+//!       --projects-dir /Users/you/.claude/projects \
 //!       --sample 20
 //!
 //! Optional `--paraphrases <path>`: a `{"<conversation_id>": "<paraphrase>"}`
@@ -95,12 +95,12 @@ use csr_engine::mcp::stage_probe::{self, StageSample};
 use csr_engine::search::rerank::ScoreBreakdown;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The conversation and query WP-A's diagnosis centers on.
-const TARGET_CONVERSATION_ID: &str = "codex:01a0c0d5-9783-7fa1-8032-d12e19f919ea";
+const TARGET_CONVERSATION_ID: &str = "codex:019aaaaa-0000-7000-8000-000000000001";
 const TARGET_QUERY: &str = "codex blocked revival 2026 iOS deploy blocker where stuck";
-const TARGET_PROJECT: &str = "EnhanceMe";
+const TARGET_PROJECT: &str = "SampleApp";
 /// Short form of the target's uuid — what a transcript discussing this exact
 /// investigation would quote, and what identifies a contaminating session.
 const TARGET_UUID_SUBSTRING: &str = "01a0c0d5";
@@ -896,7 +896,7 @@ fn losing_stage(samples: &[StageSample], limit: usize) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut db = PathBuf::from("/tmp/csr-wpa/csr-engine.db");
-    let mut projects_dir = PathBuf::from("/Users/ramakrishnanannaswamy/.claude/projects");
+    let mut projects_dir = dirs::home_dir().expect("home dir").join(".claude/projects");
     let mut sample_n = 20usize;
     let mut paraphrases_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
@@ -923,7 +923,9 @@ async fn main() -> Result<()> {
     }
 
     anyhow::ensure!(
-        db != Path::new("/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db"),
+        db != dirs::home_dir()
+            .expect("home dir")
+            .join(".claude-self-reflect/csr-engine.db"),
         "refusing to run against the live database — pass a /tmp clone via --db"
     );
 
@@ -1018,7 +1020,7 @@ async fn main() -> Result<()> {
     }
 
     for (label, project) in [
-        ("project=EnhanceMe", Some(TARGET_PROJECT)),
+        ("project=SampleApp", Some(TARGET_PROJECT)),
         ("project=all", Some("all")),
     ] {
         let (result, samples) = stage_probe::scope(TARGET_CONVERSATION_ID, || {

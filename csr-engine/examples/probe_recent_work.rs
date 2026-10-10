@@ -8,7 +8,11 @@ use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let db_path = std::env::var("CSR_DB_PATH").unwrap_or_else(|_| {
-        "/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db".into()
+        dirs::home_dir()
+            .expect("home dir")
+            .join(".claude-self-reflect/csr-engine.db")
+            .to_string_lossy()
+            .into_owned()
     });
     let storage = Storage::open_read_only(Path::new(&db_path))?;
 

@@ -2049,11 +2049,11 @@ mod tests {
         assert!(!is_own_subagent(
             &ours,
             Some("6ca2a4d5"),
-            parent("f98b6500")
+            parent("11110005")
         ));
         assert!(!is_own_subagent(&ours, Some("6ca2a4d5"), || None));
         // not a subagent: its parent is never looked up
-        let plain = chunk("f98b6500-1111-4222-8333-444455556666");
+        let plain = chunk("11110005-1111-4222-8333-444455556666");
         assert!(!is_own_subagent(&plain, Some("6ca2a4d5"), || panic!(
             "looked up"
         )));
@@ -2155,9 +2155,9 @@ mod tests {
 
     #[test]
     fn a_handed_line_names_the_session_claude_can_open() {
-        let label = handoff_label(&handed(Some("a3e857eb-1111-4222-8333-444455556666")));
+        let label = handoff_label(&handed(Some("11110004-1111-4222-8333-444455556666")));
         assert!(label.starts_with("conversation|"), "{label}");
-        assert!(label.ends_with("|session a3e857eb"), "{label}");
+        assert!(label.ends_with("|session 11110004"), "{label}");
         // a subagent's chunk, or none at all: no id to open
         assert!(!handoff_label(&handed(Some("agent-a1b2c3d4e5"))).contains("session"));
         assert!(!handoff_label(&handed(None)).contains("session"));

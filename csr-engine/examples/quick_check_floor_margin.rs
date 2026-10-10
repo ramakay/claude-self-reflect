@@ -35,7 +35,7 @@ const PROBES: &[Probe] = &[
         fabricated: true,
     },
     Probe {
-        text: "the team decision to rewrite anukriti in Elixir Phoenix LiveView",
+        text: "the team decision to rewrite acmecorp in Elixir Phoenix LiveView",
         fabricated: true,
     },
     Probe {
@@ -47,7 +47,7 @@ const PROBES: &[Probe] = &[
         fabricated: true,
     },
     Probe {
-        text: "the GraphQL API gateway we built for anukriti last quarter",
+        text: "the GraphQL API gateway we built for acmecorp last quarter",
         fabricated: true,
     },
     Probe {

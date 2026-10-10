@@ -3168,8 +3168,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let projects_dir = root.path().join("claude_projects");
         let sidechain_dir = projects_dir
-            .join("-Users-test-projects-anukriti-meta-campaigns")
-            .join("6897846e-0000-4000-8000-000000000000")
+            .join("-Users-test-projects-acmecorp-meta-campaigns")
+            .join("11110003-0000-4000-8000-000000000000")
             .join("subagents");
         std::fs::create_dir_all(&sidechain_dir).unwrap();
         let conv_id = "agent-aec0a3cf2fe94c998";
@@ -3213,7 +3213,7 @@ mod tests {
             .unwrap()
             .expect("v3 reflection stored");
         assert!(
-            tags.iter().any(|t| t == "project_anukriti-meta-campaigns"),
+            tags.iter().any(|t| t == "project_acmecorp-meta-campaigns"),
             "must derive the real project from the path, got {tags:?}"
         );
         assert!(

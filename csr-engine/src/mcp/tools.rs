@@ -254,7 +254,7 @@ pub(crate) fn is_explicit_memory(id: &str, tags: &[String]) -> bool {
 /// relevance signal, let alone lift with a flat +0.50. Without this gate a
 /// legacy uuid-shaped reflection at cosine 0.12 outranked the actually
 /// relevant chunk for the query — measured live 2026-09-22, project
-/// EnhanceMe: `ca488584` (raw 0.116, adj 0.616) and `54dbda97` (raw 0.114,
+/// SampleApp: `11110007` (raw 0.116, adj 0.616) and `11110008` (raw 0.114,
 /// adj 0.614) both outranked the target codex chunk at cosine 0.549.
 const EXPLICIT_MEMORY_STANDING_FLOOR: f32 = crate::format::QUICK_CHECK_FLOOR;
 
@@ -345,9 +345,9 @@ fn resolve_reflection_project(tags: &[String], scope: &SearchProjectScope) -> St
 /// reflection can carry several `project_*` slugs (one per source memory
 /// file) plus a bare family tag, and deciding from only the first `project_*`
 /// tag misclassified in-family rows whose first tag happened not to match
-/// (live 2026-09-22: `e97fa3b4`/`5eb5aebb`/`22ffc13b`, each carrying a
+/// (live 2026-09-22: `11110006`/`5eb5aebb`/`11110001`, each carrying a
 /// non-matching `project_*` slug alongside the matching bare tag
-/// `anukriti-meta-campaigns`).
+/// `acmecorp-meta-campaigns`).
 fn reflection_in_family(tags: &[String], scope: &SearchProjectScope) -> bool {
     scope.effective_project.is_none()
         || tags.iter().any(|tag| {
@@ -629,9 +629,9 @@ pub fn search_mode_from(value: Option<&str>) -> SearchMode {
 /// filter when it is among the first K rows of the reflection keyword ranking.
 /// The keyword channel OR-joins single query words, so merely matching is weak
 /// evidence; leading the ranking is not. Measured live 2026-09-23: a real
-/// burst answer (a May story from the sibling Anukriti-Campaigns project, only
+/// burst answer (a May story from the sibling Acmecorp-Campaigns project, only
 /// reachable as `[keyword] [story]`) and its narrative ranked 1 and 2, while
-/// the rows that leaked into project=EnhanceMe ranked 15, 21 and 24 (and 38 on
+/// the rows that leaked into project=SampleApp ranked 15, 21 and 24 (and 38 on
 /// the other query).
 const OUT_OF_FAMILY_KEYWORD_TOP_K: usize = 3;
 
@@ -645,7 +645,7 @@ const OUT_OF_FAMILY_KEYWORD_TOP_K: usize = 3;
 /// keeps its place when its raw cosine clears `QUICK_CHECK_FLOOR` (a strong
 /// sibling-project answer, e.g. a May story tagged with a sibling project that
 /// a real burst query needed) and sinks when it does not (live 2026-09-23,
-/// project=EnhanceMe: an anukriti story at 0.121 and an unknown-project
+/// project=SampleApp: an acmecorp story at 0.121 and an unknown-project
 /// reflection at 0.116 sat at ranks 5-6). A row at the very top of the
 /// reflection keyword ranking also keeps its place (see
 /// [`OUT_OF_FAMILY_KEYWORD_TOP_K`]). No-op without an explicit project.
@@ -1394,7 +1394,7 @@ async fn reflect_gather_pass(
         // OR-of-terms bm25 ranking can express (bm25 compares corpus stats
         // across `reflections`, so a recurring project-name slug can bury
         // the literal opener under rows that merely mention one of its
-        // words — live: `MEMORY-ARCHIVE anukriti-meta-campaigns` never
+        // words — live: `MEMORY-ARCHIVE acmecorp-meta-campaigns` never
         // surfaced its 3 memories because 267 rows matched the OR terms).
         // Prepended ahead of the bm25 merge so it always wins the keyword
         // channel rather than just competing on bm25 scale.
@@ -1805,8 +1805,8 @@ async fn reflect_gather_pass(
     // Under an explicit project filter, chunk search is already restricted to
     // the project family, but reflections and stories are not: RRF places them
     // by rank, so a cosine-0.12 story from another project could sit above
-    // in-family hits (measured live 2026-09-23, project=EnhanceMe: ranks 5-7
-    // were an anukriti story, an unknown-project reflection and a subagent
+    // in-family hits (measured live 2026-09-23, project=SampleApp: ranks 5-7
+    // were an acmecorp story, an unknown-project reflection and a subagent
     // extraction). Sink out-of-family rows below every in-family row instead
     // of dropping them: a hard drop lost the answer to a real burst query
     // (a May story tagged with a sibling project name).
@@ -4327,14 +4327,14 @@ mod tests {
 
     #[test]
     fn explicit_memory_is_told_apart_from_derived_reflections() {
-        let uuid = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        let uuid = "22220000-0000-4000-8000-000000000001";
         assert!(is_explicit_memory(
             "story_x",
             &[EXPLICIT_MEMORY_TAG.to_string()]
         ));
         assert!(is_explicit_memory(
             uuid,
-            &["anukriti".into(), "memory-archive".into()]
+            &["acmecorp".into(), "memory-archive".into()]
         ));
         assert!(is_explicit_memory(uuid, &[]));
         assert!(!is_explicit_memory(
@@ -4361,7 +4361,7 @@ mod tests {
     /// memory write, whatever it happens to be stamped with.
     #[test]
     fn derived_tag_overrides_explicit_memory_stamp() {
-        let uuid = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        let uuid = "22220000-0000-4000-8000-000000000001";
         assert!(
             !is_explicit_memory(
                 uuid,
@@ -4511,7 +4511,7 @@ mod tests {
 
     #[tokio::test]
     async fn bare_family_tag_keeps_a_memory_with_a_topical_project_tag_in_family() {
-        // Live shape of e97fa3b4: a bare project tag plus a topical project_
+        // Live shape of 11110006: a bare project tag plus a topical project_
         // tag that resolves the row's project elsewhere. It must not sink.
         assert_ne!(
             first_cid_for_scope_tagged(
@@ -4627,7 +4627,7 @@ mod tests {
                 .unwrap();
             engine.insert_chunk(chunk.id, vector);
         }
-        let memory_id = "5eb5aebb-65ab-4fba-9917-86cb83845154";
+        let memory_id = "22220000-0000-4000-8000-000000000001";
         let tags: Vec<String> = memory_tags.iter().map(|t| t.to_string()).collect();
         storage
             .insert_reflection(
@@ -4666,12 +4666,12 @@ mod tests {
     #[tokio::test]
     async fn exact_explicit_memory_outranks_boosted_user_chunks() {
         assert_eq!(
-            memory_vs_user_chunks_first_hit(&["anukriti", "memory-archive"]).await,
-            "5eb5aebb-65ab-4fba-9917-86cb83845154"
+            memory_vs_user_chunks_first_hit(&["acmecorp", "memory-archive"]).await,
+            "22220000-0000-4000-8000-000000000001"
         );
         assert_eq!(
             memory_vs_user_chunks_first_hit(&["free-form", EXPLICIT_MEMORY_TAG]).await,
-            "5eb5aebb-65ab-4fba-9917-86cb83845154"
+            "22220000-0000-4000-8000-000000000001"
         );
     }
 
@@ -4685,7 +4685,7 @@ mod tests {
         assert!(first.starts_with("conv-"), "{first}");
     }
 
-    /// Live 2026-09-22 defect (project EnhanceMe, query "codex blocked
+    /// Live 2026-09-22 defect (project SampleApp, query "codex blocked
     /// revival..."): a legacy uuid-shaped reflection at raw cosine ~0.12 to
     /// the query was still granted UserHistory standing, so `+0.50` lifted it
     /// (adj 0.616) above the actually relevant chunk (cosine 0.549, no
@@ -4728,12 +4728,12 @@ mod tests {
             0.0,
             0.0,
         ];
-        let memory_id = "ca488584-0000-4000-8000-000000000001";
+        let memory_id = "11110007-0000-4000-8000-000000000001";
         storage
             .insert_reflection(
                 memory_id,
-                "an unrelated anukriti campaign note",
-                &["anukriti".to_string()],
+                "an unrelated acmecorp campaign note",
+                &["acmecorp".to_string()],
                 &weak_vector,
             )
             .unwrap();
@@ -4775,7 +4775,7 @@ mod tests {
     /// already `UserHistory` skipped that gate entirely and still got the
     /// flat `W_USER` boost at any cosine — live receipt: `extracted_v3_*`
     /// rows scored `cos=0.535 user=+0.50 total=1.035`, the same shape as the
-    /// `ca488584` bug this item was opened for. Same fixture as
+    /// `11110007` bug this item was opened for. Same fixture as
     /// `weak_similarity_memory_does_not_outrank_relevant_chunk`, but the
     /// weak memory is a derived row with a pre-cached `UserHistory` floor
     /// instead of an explicit `store_reflection` write.
@@ -4947,8 +4947,8 @@ mod tests {
     /// no tag names a project — are NOT dropped (6cf8a2b: a hard drop lost a
     /// real sibling-project answer); they must rank after every in-family row
     /// (`sink_out_of_family_under_explicit_scope` + the 0.3x cross-project
-    /// multiplier). Live 2026-09-22 defect (project EnhanceMe): an
-    /// unknown-project memory and an anukriti story both out-ranked in-family
+    /// multiplier). Live 2026-09-22 defect (project SampleApp): an
+    /// unknown-project memory and an acmecorp story both out-ranked in-family
     /// results. A bare project tag that matches the scope still keeps the row
     /// in the family.
     #[tokio::test]
@@ -4961,8 +4961,8 @@ mod tests {
         storage
             .insert_reflection(
                 "story-out-of-family",
-                "MEMORY-ARCHIVE anukriti campaign story",
-                &["session_story".into(), "project_anukriti".into()],
+                "MEMORY-ARCHIVE acmecorp campaign story",
+                &["session_story".into(), "project_acmecorp".into()],
                 &query,
             )
             .unwrap();
@@ -4983,8 +4983,8 @@ mod tests {
         storage
             .insert_reflection(
                 "memory-in-family",
-                "MEMORY-ARCHIVE EnhanceMe roster note",
-                &["EnhanceMe".into(), EXPLICIT_MEMORY_TAG.into()],
+                "MEMORY-ARCHIVE SampleApp roster note",
+                &["SampleApp".into(), EXPLICIT_MEMORY_TAG.into()],
                 &query,
             )
             .unwrap();
@@ -4998,7 +4998,7 @@ mod tests {
             "roster memory",
             10,
             0.0,
-            Some("EnhanceMe"),
+            Some("SampleApp"),
             0,
             false,
             ConsumptionMode::Off,
@@ -5032,31 +5032,31 @@ mod tests {
 
     /// Opus review finding 1 (W3-K, high): a memory-file reflection carries a
     /// `project_*` tag that does NOT itself resolve to the scope's family
-    /// (`project_meta_campaigns_setup` vs scope `anukriti-meta-campaigns`)
+    /// (`project_meta_campaigns_setup` vs scope `acmecorp-meta-campaigns`)
     /// alongside the bare family tag every `MEMORY-ARCHIVE` writer also
-    /// stamps (`anukriti-meta-campaigns`). `reflection_in_family` must
+    /// stamps (`acmecorp-meta-campaigns`). `reflection_in_family` must
     /// accept the row on ANY tag clearing `scope.is_family`, not just the
     /// first `project_*` tag found — before this fix it read only that first
     /// tag, resolved to `meta_campaigns_setup`, failed `is_family`, and
     /// dropped the row outright even though it plainly belongs to the
-    /// family. Live receipt: `e97fa3b4`/`5eb5aebb`/`22ffc13b` all carry this
-    /// exact tag shape and vanished from `project=anukriti-meta-campaigns`
+    /// family. Live receipt: `11110006`/`5eb5aebb`/`11110001` all carry this
+    /// exact tag shape and vanished from `project=acmecorp-meta-campaigns`
     /// scoped search.
     #[tokio::test]
     async fn family_bare_tag_keeps_memory_file_reflection_in_scope() {
         let storage = Arc::new(Storage::open_memory().unwrap());
         let mut engine = SearchEngine::new(4);
         let query = [1.0_f32, 0.0, 0.0, 0.0];
-        let id = "e97fa3b4-0000-4000-8000-000000000000";
+        let id = "11110006-0000-4000-8000-000000000000";
         let tags = vec![
             "project_meta_campaigns_setup".to_string(),
-            "anukriti-meta-campaigns".to_string(),
+            "acmecorp-meta-campaigns".to_string(),
             EXPLICIT_MEMORY_TAG.to_string(),
         ];
         storage
             .insert_reflection(
                 id,
-                "MEMORY-ARCHIVE anukriti-meta-campaigns paying customers may22",
+                "MEMORY-ARCHIVE acmecorp-meta-campaigns paying customers may22",
                 &tags,
                 &query,
             )
@@ -5070,7 +5070,7 @@ mod tests {
             "paying customers memory",
             5,
             0.0,
-            Some("anukriti-meta-campaigns"),
+            Some("acmecorp-meta-campaigns"),
             0,
             false,
             ConsumptionMode::Off,
@@ -5166,9 +5166,9 @@ mod tests {
     /// Spec (e): an exact-prefix reflection must reach page 1 of the keyword
     /// channel even when a common term in the query also appears in many
     /// chunks. Live 2026-09-22: `reflections_fts` itself ranked 3
-    /// `MEMORY-ARCHIVE anukriti-meta-campaigns` memories at bm25 8/9/10 of
+    /// `MEMORY-ARCHIVE acmecorp-meta-campaigns` memories at bm25 8/9/10 of
     /// 267 matches (the OR-of-terms query rewards any row mentioning
-    /// "anukriti"), and the combined chunk+reflection bm25 merge buried them
+    /// "acmecorp"), and the combined chunk+reflection bm25 merge buried them
     /// under chunk hits entirely — none of the 3 made the final page.
     #[tokio::test]
     async fn exact_prefix_reflection_reaches_page_one_over_many_keyword_matching_chunks() {
@@ -5546,18 +5546,18 @@ mod tests {
     #[test]
     fn default_scope_project_resolves_to_the_client_dirs_family_when_project_omitted() {
         let storage = Arc::new(Storage::open_memory().unwrap());
-        let scope = SearchProjectScope::resolve_with(&storage, None, None, Some("EnhanceMe"), None)
+        let scope = SearchProjectScope::resolve_with(&storage, None, None, Some("SampleApp"), None)
             .unwrap();
-        assert_eq!(scope.effective_project.as_deref(), Some("EnhanceMe"));
-        assert_eq!(scope.scope_label, "EnhanceMe");
-        assert!(scope.family_projects.contains("EnhanceMe"));
+        assert_eq!(scope.effective_project.as_deref(), Some("SampleApp"));
+        assert_eq!(scope.scope_label, "SampleApp");
+        assert!(scope.family_projects.contains("SampleApp"));
     }
 
     #[test]
     fn explicit_all_scope_ignores_default_scope_project() {
         let storage = Arc::new(Storage::open_memory().unwrap());
         let scope =
-            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some("EnhanceMe"), None)
+            SearchProjectScope::resolve_with(&storage, Some("all"), None, Some("SampleApp"), None)
                 .unwrap();
         assert_eq!(scope.effective_project, None);
         assert_eq!(scope.scope_label, "all");
@@ -5570,7 +5570,7 @@ mod tests {
     /// same candidate set with or without a client directory present.
     /// Threading the fallback through `current_project` instead would make
     /// this diverge: `with_client_dir.family_projects` would gain the
-    /// `EnhanceMe` family and its ranking boost would newly apply, changing
+    /// `SampleApp` family and its ranking boost would newly apply, changing
     /// output for every Claude Code session that ever calls `project="all"`.
     #[test]
     fn explicit_all_scope_is_identical_with_and_without_a_client_dir() {
@@ -5588,7 +5588,7 @@ mod tests {
             &storage,
             Some("all"),
             None,
-            Some("EnhanceMe"),
+            Some("SampleApp"),
             Some(projects_root.path()),
         )
         .unwrap();
@@ -5606,7 +5606,7 @@ mod tests {
             with_client_dir.family_projects
         );
         assert!(
-            !with_client_dir.family_projects.contains("EnhanceMe"),
+            !with_client_dir.family_projects.contains("SampleApp"),
             "the default-scope-only fallback must not leak into project=\"all\": {:?}",
             with_client_dir.family_projects
         );
@@ -5722,7 +5722,7 @@ mod tests {
     #[tokio::test]
     async fn defaulted_scope_excludes_a_higher_ranked_out_of_family_chunk() {
         // The spec's receipt: with `project` omitted and `CLAUDE_PROJECT_DIR`
-        // resolving to `EnhanceMe`, an EnhanceMe-family chunk is returned and
+        // resolving to `SampleApp`, an SampleApp-family chunk is returned and
         // a higher-scoring out-of-family chunk is not — even though an
         // unscoped ("all") search would put the out-of-family chunk first.
         let storage = Arc::new(Storage::open_memory().unwrap());
@@ -5742,7 +5742,7 @@ mod tests {
             (
                 mk(
                     "chunk-in-family",
-                    "EnhanceMe",
+                    "SampleApp",
                     "codex blocked revival deploy blocker",
                 ),
                 vec![0.80f32, 0.6, 0.0, 0.0],
@@ -5769,7 +5769,7 @@ mod tests {
             &storage,
             None,
             None,
-            Some("EnhanceMe"),
+            Some("SampleApp"),
             Some(projects_root.path()),
         )
         .unwrap();
@@ -5792,7 +5792,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            output.contains("chunk-in-family") || output.contains("EnhanceMe"),
+            output.contains("chunk-in-family") || output.contains("SampleApp"),
             "expected the in-family chunk in defaulted-scope output:\n{output}"
         );
         assert!(

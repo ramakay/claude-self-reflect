@@ -2831,8 +2831,8 @@ mod tests {
         // The file itself never has to exist — only the recorded path,
         // matching the shape a real deleted sidechain transcript left behind.
         let missing_path =
-            "/tmp/does-not-exist/claude_projects/-Users-test-projects-anukriti-meta-campaigns/\
-             6897846e-0000-4000-8000-000000000000/subagents/agent-aec0a3cf2fe94c998.jsonl";
+            "/tmp/does-not-exist/claude_projects/-Users-test-projects-acmecorp-meta-campaigns/\
+             11110003-0000-4000-8000-000000000000/subagents/agent-aec0a3cf2fe94c998.jsonl";
         storage
             .upsert_import_state_explicit(missing_path, conv_id, 1, "2026-09-01T00:00:00Z")
             .unwrap();
@@ -2856,7 +2856,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(project_name, "anukriti-meta-campaigns");
+        assert_eq!(project_name, "acmecorp-meta-campaigns");
         assert_eq!(source, "sidechain");
 
         let (_, tags, _) = storage
@@ -2864,7 +2864,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            tags.iter().any(|t| t == "project_anukriti-meta-campaigns"),
+            tags.iter().any(|t| t == "project_acmecorp-meta-campaigns"),
             "reflection tag must be rewritten too: {tags:?}"
         );
         assert!(!tags.iter().any(|t| t == "project_subagents"));

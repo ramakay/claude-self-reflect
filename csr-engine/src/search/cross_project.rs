@@ -528,15 +528,15 @@ mod tests {
 
     #[test]
     fn omitted_project_defaults_to_the_client_dirs_project() {
-        let known = vec!["EnhanceMe".to_string()];
+        let known = vec!["SampleApp".to_string()];
         let (project, label) = normalize_project_scope_with(
             None,
-            Some("/Users/name/projects/EnhanceMe"),
+            Some("/Users/name/projects/SampleApp"),
             &known,
             None,
         );
-        assert_eq!(project, Some("EnhanceMe".to_string()));
-        assert_eq!(label, "EnhanceMe");
+        assert_eq!(project, Some("SampleApp".to_string()));
+        assert_eq!(label, "SampleApp");
     }
 
     /// W3-S finding 1: a candidate that matches nothing in storage must fall
@@ -546,7 +546,7 @@ mod tests {
         let known = vec!["totally-unrelated-project".to_string()];
         let (project, label) = normalize_project_scope_with(
             None,
-            Some("/Users/name/projects/EnhanceMe"),
+            Some("/Users/name/projects/SampleApp"),
             &known,
             None,
         );
@@ -593,10 +593,10 @@ mod tests {
 
     #[test]
     fn explicit_all_stays_global_even_with_a_client_dir() {
-        let known = vec!["EnhanceMe".to_string()];
+        let known = vec!["SampleApp".to_string()];
         let (project, label) = normalize_project_scope_with(
             Some("all"),
-            Some("/Users/name/projects/EnhanceMe"),
+            Some("/Users/name/projects/SampleApp"),
             &known,
             None,
         );
@@ -620,10 +620,10 @@ mod tests {
 
     #[test]
     fn explicit_project_wins_over_client_dir() {
-        let known = vec!["EnhanceMe".to_string()];
+        let known = vec!["SampleApp".to_string()];
         let (project, label) = normalize_project_scope_with(
             Some("other-project"),
-            Some("/Users/name/projects/EnhanceMe"),
+            Some("/Users/name/projects/SampleApp"),
             &known,
             None,
         );
@@ -652,14 +652,14 @@ mod tests {
     #[test]
     fn verified_default_scope_at_root_matches_a_family_alias() {
         let projects_root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(projects_root.path().join("EnhanceMe")).unwrap();
-        let known = vec!["EnhanceMe-csr-engine".to_string()];
+        std::fs::create_dir(projects_root.path().join("SampleApp")).unwrap();
+        let known = vec!["SampleApp-csr-engine".to_string()];
         let resolved = resolve_verified_default_scope_project_at_root(
-            "/Users/name/projects/EnhanceMe",
+            "/Users/name/projects/SampleApp",
             &known,
             projects_root.path(),
         );
-        assert_eq!(resolved, Some("EnhanceMe".to_string()));
+        assert_eq!(resolved, Some("SampleApp".to_string()));
     }
 
     // Pure function tests — no env var manipulation needed

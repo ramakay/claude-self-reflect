@@ -926,7 +926,7 @@ fn marker_scan_text(text: &str) -> String {
 }
 
 // `pasted_content` is a block the person pasted, often another agent's words
-// ("Do not send this to grok-advisor…" was Grok's): never their correction.
+// ("Do not send this to the reviewer…" was another agent's): never their correction.
 const WRAPPER_TAGS: &[&str] = &[
     "pasted_content",
     "system-reminder",
@@ -1795,7 +1795,7 @@ mod tests {
         // After the opening prompt, a reaction in a pasted block (another agent's words), then the person's own.
         let raw = concat!(
             "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Build the first approach\"}]}}\n",
-            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"check this <pasted_content id=\\\"3b47\\\">\\nNo, do not send this to grok-advisor.\\n</pasted_content>\"}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"check this <pasted_content id=\\\"3b47\\\">\\nNo, do not send this to the reviewer.\\n</pasted_content>\"}]}}\n",
             "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No, use OtherThing\"}]}}\n",
         );
         std::fs::write(&transcript, raw).unwrap();

@@ -830,7 +830,7 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
     // this test exercises the real margin, not a synthesized absence of one.
     //
     // Re-measuring surfaced a finding beyond what the review asked for: one
-    // of the 8 probes ("the team decision to rewrite anukriti in Elixir
+    // of the 8 probes ("the team decision to rewrite acmecorp in Elixir
     // Phoenix LiveView") now scores 0.629 — that is corpus growth pushing a
     // fabricated topic's nearest neighbour PAST WEAK_BAND_TOP (0.62)
     // entirely, into the "partial" band, which carries no caveat at all by
@@ -949,7 +949,7 @@ fn weak_band_fabricated_probes_still_carry_a_caveat() {
 #[test]
 fn weak_band_margin_skips_synthetic_keyword_runner_up() {
     // Review finding [high] #2, live receipt: the fabricated probe "the team
-    // decision to rewrite anukriti in Elixir Phoenix LiveView" scored 0.601
+    // decision to rewrite acmecorp in Elixir Phoenix LiveView" scored 0.601
     // against `reflect_on_past` with a `[keyword] `-prefixed rank-2 at 0.405
     // (that prefix marks `score_fts_candidate`'s synthetic FTS/keyword-
     // fallback floor, not a cosine measurement — see `mcp::tools`). The raw

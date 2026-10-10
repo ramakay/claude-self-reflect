@@ -5117,7 +5117,7 @@ mod tests {
         insert_reflection(
             &conn,
             "exact",
-            "MEMORY-ARCHIVE anukriti-meta-campaign notes here",
+            "MEMORY-ARCHIVE acmecorp-meta-campaign notes here",
             &[],
             &[0.1; 4],
         )
@@ -5125,13 +5125,13 @@ mod tests {
         insert_reflection(
             &conn,
             "mid-token",
-            "MEMORY-ARCHIVE anukriti-meta-campaigns notes here",
+            "MEMORY-ARCHIVE acmecorp-meta-campaigns notes here",
             &[],
             &[0.1; 4],
         )
         .unwrap();
         let matches =
-            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE anukriti-meta-campaign", 10)
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE acmecorp-meta-campaign", 10)
                 .unwrap();
         assert_eq!(matches, vec!["exact".to_string()]);
     }
@@ -5854,7 +5854,7 @@ mod tests {
         // of the real `$HOME/projects`, so this passes regardless of what
         // exists on the machine running it (was previously gated on
         // `$HOME/projects/claude-self-reflect` genuinely existing, which
-        // fails on CI runners — see codex review finding on queries.rs:4648).
+        // fails on CI runners — see a review finding on the original check).
         let projects_root = tempfile::tempdir().unwrap();
         std::fs::create_dir(projects_root.path().join("claude-self-reflect")).unwrap();
         // A genuine sibling repo whose directory exists stays out of family —

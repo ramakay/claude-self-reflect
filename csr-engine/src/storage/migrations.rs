@@ -4273,7 +4273,7 @@ mod tests {
             [&story_tags],
         )
         .unwrap();
-        let memory_tags = serde_json::to_string(&["anukriti", "csr:memory"]).unwrap();
+        let memory_tags = serde_json::to_string(&["acmecorp", "csr:memory"]).unwrap();
         conn.execute(
             "INSERT INTO reflections (id, content, tags, timestamp)
              VALUES ('mem_1', 'a memory', ?1, '2026-01-01T00:00:00Z')",

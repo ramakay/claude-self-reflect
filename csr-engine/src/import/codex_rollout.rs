@@ -2867,7 +2867,7 @@ mod tests {
     #[ignore = "acceptance receipt only: reads the operator's real ~/.codex/sessions corpus, never committed as a running gate"]
     fn acceptance_receipt_01a0c5df_real_file_strips_cleanly() {
         let real = std::path::Path::new(
-            "/Users/ramakrishnanannaswamy/.codex/sessions/2026/09/21/rollout-2026-09-21T14-29-18-01a0c5df-904a-7031-b2b8-dc71f64900bf.jsonl",
+            "/Users/you/.codex/sessions/2026/09/21/rollout-2026-09-21T14-29-18-019aaaaa-0000-7000-8000-000000000002.jsonl",
         );
         if !real.exists() {
             eprintln!("acceptance receipt skipped: fixture file not present on this machine");
@@ -2899,7 +2899,7 @@ mod tests {
         assert_eq!(stats.files_imported, 1);
 
         let ids = storage
-            .get_chunk_ids_for_conversation("codex:01a0c5df-904a-7031-b2b8-dc71f64900bf")
+            .get_chunk_ids_for_conversation("codex:019aaaaa-0000-7000-8000-000000000002")
             .unwrap();
         let chunks = storage.get_chunks_by_ids(&ids).unwrap();
         let boilerplate: Vec<_> = chunks
@@ -3034,12 +3034,12 @@ mod tests {
         let session_meta = serde_json::json!({
             "type": "session_meta",
             "payload": {
-                "id": "01a0c5e1-904a-7031-b2b8-dc71f64900bf",
+                "id": "019aaaaa-0000-7000-8000-000000000003",
                 "cwd": "/tmp/subagent-project",
                 "source": {
                     "subagent": {
                         "thread_spawn": {
-                            "parent_thread_id": "01a0c5df-904a-7031-b2b8-dc71f64900bf"
+                            "parent_thread_id": "019aaaaa-0000-7000-8000-000000000002"
                         }
                     }
                 }
@@ -3061,7 +3061,7 @@ mod tests {
         let session_meta = serde_json::json!({
             "type": "session_meta",
             "payload": {
-                "id": "01a0c5df-904a-7031-b2b8-dc71f64900bf",
+                "id": "019aaaaa-0000-7000-8000-000000000002",
                 "cwd": "/tmp/subagent-project"
             }
         });
@@ -3087,7 +3087,7 @@ mod tests {
         let session_meta = serde_json::json!({
             "type": "session_meta",
             "payload": {
-                "id": "01a0c5e1-904a-7031-b2b8-dc71f64900bf",
+                "id": "019aaaaa-0000-7000-8000-000000000003",
                 "cwd": "/tmp/subagent-project",
                 "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent-id"}}}
             }

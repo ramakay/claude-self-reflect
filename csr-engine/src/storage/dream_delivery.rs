@@ -859,7 +859,7 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         seed_dated(
             &storage,
-            "VidhiVow",
+            "SampleVow",
             "0145628",
             "2026-10-08 01:00:00",
             Some("2026-09-12 14:30:00"),
@@ -876,7 +876,7 @@ mod tests {
             conclusion_id(
                 "proj",
                 "/repo/a.rs",
-                Some("VidhiVow"),
+                Some("SampleVow"),
                 "anchor_obsolete",
                 "0145628"
             )

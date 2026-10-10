@@ -66,8 +66,10 @@ fn rank_of_id_in_rendered_output(out: &str, id: &str) -> Option<usize> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut db = PathBuf::from("/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db");
-    let mut projects = PathBuf::from("/Users/ramakrishnanannaswamy/.claude/projects");
+    let mut db = dirs::home_dir()
+        .expect("home dir")
+        .join(".claude-self-reflect/csr-engine.db");
+    let mut projects = dirs::home_dir().expect("home dir").join(".claude/projects");
     let mut ids: Vec<String> = Vec::new();
     let mut query_override: Option<String> = None;
     // Opus review finding (high, W3-K spec (b) gate): the eval gate must
@@ -316,12 +318,12 @@ mod tests {
         let out = r#"
 <r rank="1">
   <s>0.900</s>
-  <excerpt><![CDATA[quotes conv_22ffc13b-0000-4000-8000-000000000000 as a reference]]></excerpt>
-  <cid>b5a982df-0000-4000-8000-000000000000</cid>
-  <id>b5a982df-0000-4000-8000-000000000000</id>
+  <excerpt><![CDATA[quotes conv_11110001-0000-4000-8000-000000000000 as a reference]]></excerpt>
+  <cid>11110002-0000-4000-8000-000000000000</cid>
+  <id>11110002-0000-4000-8000-000000000000</id>
 </r>
 "#;
-        let target = "22ffc13b-0000-4000-8000-000000000000";
+        let target = "11110001-0000-4000-8000-000000000000";
         assert!(out.contains(target), "sanity: substring IS present");
         assert_eq!(
             rank_of_id_in_rendered_output(out, target),

@@ -16,7 +16,7 @@
 //!
 //!   cargo run --release --example probe_codex_harness_strip -- \
 //!       --db /tmp/csr-w3r-clone/csr-engine.db \
-//!       --projects-dir /Users/ramakrishnanannaswamy/.claude/projects \
+//!       --projects-dir /Users/you/.claude/projects \
 //!       --batch-size 25 --max-batches 400
 
 use anyhow::Result;
@@ -25,7 +25,7 @@ use csr_engine::import::codex_rollout::{
     harness_strip_batch, restamp_codex_chunk_timestamps, HARNESS_STRIP_V2_BATCH_SIZE,
 };
 use rusqlite::{Connection, OpenFlags};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
@@ -73,7 +73,7 @@ fn harness_preview_conversations(conn: &Connection) -> Result<i64> {
 
 fn main() -> Result<()> {
     let mut db = PathBuf::from("/tmp/csr-w3r-clone/csr-engine.db");
-    let mut projects_dir = PathBuf::from("/Users/ramakrishnanannaswamy/.claude/projects");
+    let mut projects_dir = dirs::home_dir().expect("home dir").join(".claude/projects");
     let mut batch_size = HARNESS_STRIP_V2_BATCH_SIZE;
     let mut max_batches = 10_000usize;
     let mut args = std::env::args().skip(1);
@@ -102,7 +102,9 @@ fn main() -> Result<()> {
     }
 
     anyhow::ensure!(
-        db != Path::new("/Users/ramakrishnanannaswamy/.claude-self-reflect/csr-engine.db"),
+        db != dirs::home_dir()
+            .expect("home dir")
+            .join(".claude-self-reflect/csr-engine.db"),
         "refusing to run against the live database — pass a /tmp clone via --db"
     );
 
