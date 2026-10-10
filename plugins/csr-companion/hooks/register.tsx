@@ -2,9 +2,12 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, Settings, SettingsSource } from 'claude-code'
 
 import type { Note, NoteView, Shift, ShiftsData } from '../types'
+import { carryBlock } from './carry'
+import type { Thread } from './carry'
 import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
 import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, hasNews, mayLook, median, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
+import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, PUSH_OK_MS, SAY_PUSH, saysPush } from './coach'
 
 // CSR beside Claude, patterned on Claude Code's own "You should know".
 //
@@ -333,6 +336,26 @@ async function dream($: EngineInterface, lastStep: number, base: number): Promis
   void refresh($, cwd)
 }
 
+// Coaching: a word you have said in 2 sessions that Claude looked up each time, offered once as a band note
+// (bin/pane.py --coach works it out off the hot path). Nothing is written until you press 1.
+async function coachNote($: EngineInterface, cwd: string): Promise<void> {
+  const notes = await json<Note[]>($, ['--repo', cwd, '--coach'])
+  const skip = new Set(await strings($, 'coached'))
+  const note = notes?.find(candidate => candidate.kind === 'term' && !skip.has(candidate.id))
+  if (note && (await show($, note, 'Coaching'))) await remember($, 'coached', note.id)
+}
+
+// One line under "## Terms" of the global CLAUDE.md, written only when the person pressed the key.
+async function addToClaudeMd($: EngineInterface, line: string): Promise<boolean> {
+  const home = await $.env.get('HOME')
+  if (!home) return false
+  const file = `${home}/.claude/CLAUDE.md`
+  // Read it first: a file that is there but could not be read is left alone, never written over.
+  const text = (await $.fs.exists(file).catch(() => null)) === false ? '' : await $.fs.read(file).catch(() => null)
+  if (text === null) return false
+  return $.fs.write(file, addTerm(text, line)).then(() => true, () => false)
+}
+
 async function dreamsText($: EngineInterface, on: boolean): Promise<string> {
   return paceText(on ? await paceOf($) : null, on ? await chapterOf($) : null, on)
 }
@@ -398,6 +421,28 @@ export const register: Register = (on, options) => {
     return result
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
 
+  let held: { text: string; at: number } | null = null // a bare digit kept back, for 10 s
+  let bandAt = 0 // when another band (You should know's) last drew a question
+  let pushPromptAt = -Infinity // when a prompt last said push
+  let pushDenied = '' // the git push that asked for it
+
+  // The push guard: --no-verify and release/v* never; any other git push waits for the person's word.
+  // The tool.call result has no ask form, so a push is denied with what to say, and the identical
+  // command goes through for 60 s after a prompt that says push.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const verdict = gitVerdict(e.command)
+    if (!verdict) return next(e)
+    if (verdict.kind === 'deny') return { deny: verdict.reason }
+    const said = (await $.clock.now()) - pushPromptAt <= PUSH_OK_MS // the person said push, lately
+    if (said && (!pushDenied || pushDenied === e.command)) {
+      pushDenied = ''
+      pushPromptAt = -Infinity // one word, one push: the next push asks again
+      return next(e)
+    }
+    if (!said) pushDenied = e.command // the one the person is being asked about
+    return { deny: SAY_PUSH }
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
+
   on('tool.call', async ($, e, next) => {
     if (e.agentId === undefined && FILE_TOOLS.has(e.tool)) {
       const file = 'file_path' in e && typeof e.file_path === 'string'
@@ -409,6 +454,22 @@ export const register: Register = (on, options) => {
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
 
   on('prompt.submit', async ($, e, next) => {
+    // A prompt that is only a digit, just after a band note, is a hotkey that missed: held with a toast,
+    // sent on if the same digit comes again within 10 s. A held digit is not counted as typed past a note.
+    const at = await $.clock.now()
+    const yours = e.origin.kind === 'composer' || e.origin.kind === 'bridge' // you typed it, not a peer or a plugin
+    if (yours && saysPush(e.text)) pushPromptAt = at
+    if (yours && isBareDigit(e.text)) {
+      const digit = e.text.trim()
+      const up = await read($, view)
+      if (held?.text === digit && at - held.at <= AGAIN_MS) held = null
+      else if ((!!up && up.kind !== 'asked' && at - up.shownAt <= BAND_WINDOW_MS) || (bandAt > 0 && at - bandAt <= BAND_WINDOW_MS)) {
+        held = { text: digit, at }
+        const said = `“${digit}” looks like a band hotkey. Press it on the band, or send it again within 10 s to give it to Claude.`
+        $.ui.toast(said)
+        return { drop: said }
+      }
+    }
     await settledInThePane($).catch(() => undefined) // answered there: never counted as typed past
     let ignored: Note | null = null
     await update($, view, current => {
@@ -431,8 +492,21 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the prompt go on
 
+  // While a compaction runs, a marker file says so and when it began; the pane draws the timer from it. It
+  // is removed when the compaction ends, however it ends. Nothing here can fail the compaction.
+  // A matcher of its own: a compaction hook with none is registered once (the chapter's, above).
+  on('session.compact', { trigger: ['manual', 'auto', 'plugin'] }, async ($, e, next) => {
+    const marker = e.agentId === undefined ? await markCompacting($, e.trigger) : null
+    try {
+      return await next(e)
+    } finally {
+      if (marker) await unmarkCompacting($, marker)
+    }
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const beneath = await next(e)
+    if (asks(beneath)) bandAt = await $.clock.now()
     if (e.props.hasSurvey) return beneath
     const shown = await read($, view)
     // One question at a time. Two bands both on 1, 2, 4 and 0 would answer
@@ -494,7 +568,25 @@ export const register: Register = (on, options) => {
     )
 
     let ours
-    if (shown.kind === 'offer') {
+    if (note.kind === 'term') {
+      // Coaching: one word, defined once in your CLAUDE.md, only if you press 1.
+      const add = async () => {
+        if (await addToClaudeMd($, note.text)) {
+          $.ui.toast('Added to your CLAUDE.md under Terms. Edit the line to say what you mean.')
+          await close('added', null)
+        } else await update($, view, () => ({ ...shown, message: "Couldn't write your CLAUDE.md. Nothing was changed." }))
+      }
+      ours = (
+        <Box flexDirection="column" marginTop={1}>
+          {lead(note.line)}
+          {buttons([
+            { hotkey: '1', label: 'Add to CLAUDE.md', onPress: add },
+            { hotkey: '0', label: 'Dismiss', onPress: () => close('dismiss', null), dismiss: true },
+          ])}
+          {shown.message ? <Box marginLeft={2}><Text color="warning" wrap="wrap">{shown.message}</Text></Box> : null}
+        </Box>
+      )
+    } else if (shown.kind === 'offer') {
       ours = (
         <Box flexDirection="column" marginTop={1}>
           {lead(note.line)}
@@ -591,6 +683,7 @@ export const register: Register = (on, options) => {
     void refreshWrapper($).catch(() => undefined) // never blocks or fails the start
     void (async () => {
       const fresh = await refresh($, e.cwd)
+      void coachNote($, e.cwd).catch(() => undefined) // a word you keep saying, offered once
       if (fresh?.repo) await openPane($, e.cwd)
       $.clock.every(REFRESH_MS, () => void refresh($, e.cwd))
       $.clock.every(SETTLED_IN_PANE_MS, () => void settledInThePane($).catch(() => undefined))
@@ -612,6 +705,24 @@ export const register: Register = (on, options) => {
       : 'csr-engine could not be read'
     return { text: `${where === 'herdr' ? 'CSR pane opened beside this one' : 'CSR pane opened'} (${counts}). ${await dreamsText($, dreamsOn)}` }
   })
+
+  // Prep-compact: the threads still open or gone quiet go into the summarizer's instructions. A failure, or
+  // a pane.py that takes over two seconds, lets the compaction run as it was. It names its triggers: the
+  // engine refuses two session.compact hooks that both match every one, and the chapter hook above is one.
+  on('session.compact', { trigger: /^(manual|auto|plugin|precompute)$/ }, async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
+    let block: string | null = null
+    try {
+      const ran = await $.process.run(
+        ['python3', '-I', script($), '--repo', await $.session.cwd(), '--lost', '--sid', await $.session.id()],
+        { timeoutMs: 2000 }, // past it the call rejects: the compaction goes on as it was
+      )
+      block = ran.exitCode === 0 ? carryBlock(JSON.parse(ran.stdout) as Thread[]) : null
+    } catch {
+      block = null
+    }
+    return next(block ? { ...e, instructions: e.instructions ? `${e.instructions}\n\n${block}` : block } : e)
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
@@ -875,6 +986,29 @@ async function refreshWrapper($: EngineInterface): Promise<void> {
   if (!where || !(await $.fs.exists(where.wrapper))) return
   const shipped = await $.fs.read(shippedWrapper($))
   if (shipped !== (await $.fs.read(where.wrapper))) await $.fs.write(where.wrapper, shipped)
+}
+
+// ---------------------------------------------------------------- compaction marker
+
+// <HOME>/.claude-self-reflect/csr-companion/compacting/<session>.json, {at, trigger}: bin/pane.py reads it.
+async function markCompacting($: EngineInterface, trigger: string): Promise<string | null> {
+  try {
+    const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+    if (!home) return null
+    const path = `${home}/.claude-self-reflect/csr-companion/compacting/${await $.session.id()}.json`
+    await $.fs.write(path, JSON.stringify({ at: (await $.clock.now()) / 1000, trigger }))
+    return path
+  } catch {
+    return null
+  }
+}
+
+// Removed with rm; where that cannot run, the marker is overwritten as ended, which the pane reads as none.
+async function unmarkCompacting($: EngineInterface, path: string): Promise<void> {
+  try {
+    await $.process.run(['rm', '-f', path], { timeoutMs: 5_000 })
+    if (await $.fs.exists(path)) await $.fs.write(path, JSON.stringify({ ended: true }))
+  } catch {}
 }
 
 function byCommit(shifts: Shift[]): Array<[string, Shift[]]> {

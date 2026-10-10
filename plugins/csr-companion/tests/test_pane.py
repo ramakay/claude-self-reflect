@@ -1,7 +1,13 @@
 """The pane script's counting, without a live CSR: python3 -m unittest discover -s tests -p 'test_*.py'"""
+import glob
 import importlib.util
+import json
 import os
+import re
+import shutil
 import sqlite3
+import tempfile
+import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -129,10 +135,104 @@ class Page(unittest.TestCase):
         got = page([dream(1500)], story=story)
         self.assertEqual([s['name'] for s in got['sections']][:2], ['dreams', 'story'])
 
+    def test_the_sections_run_story_dreams_lost_handed_coach_rules(self):
+        story = dict(text=STORY, now=STORY, rev=1, by='', at=1990.0)
+        lost = pane.lost_sections
+        pane.lost_sections = lambda s, now: [dict(name='lost', title='Lost and found', right='1 quiet', items=[], empty='')]
+        try:
+            names = [s['name'] for s in page([dream(1400, 'ask_claude')], story=story)['sections']]
+            self.assertEqual(names, ['story', 'dreams', 'lost', 'remembered', 'coach', 'rules'])
+            names = [s['name'] for s in page([dream(1500)], story=story)['sections']]  # a dream waiting on you
+            self.assertEqual(names, ['dreams', 'story', 'lost', 'remembered', 'coach', 'rules'])
+        finally:
+            pane.lost_sections = lost
+
     def test_what_claude_asked_csr_folds_into_the_count(self):
         asked = [dict(kind='asked', at=1500.0 + k, text=f'query {k}', tool='reflect_on_past', times=1) for k in range(3)]
         handed = next(s for s in page(remembered=asked)['sections'] if s['name'] == 'remembered')
         self.assertEqual([i['title'] for i in handed['items']], ['Claude asked 3×'])
+
+
+class Depth(unittest.TestCase):
+    """Shadows and depth: the cards' tint, the icon's cast shadow, the masthead's lip, the opened card's edge."""
+    ESC = __import__('re').compile(r'\x1b\[[0-9;]*[mK]')
+
+    def lines(self, rows=40, opened=False):
+        story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=3, by='Haiku', at=1990.0)
+        got = page([dream(1400, 'ask_claude')], look=dict(at=1995.0, outcome='none'), story=story)
+        ui = dict(open=got['sections'][0]['items'][0]['key']) if opened else {}
+        return pane.page_lines(got, 60, rows, ui), got
+
+    def test_a_card_row_is_tinted_deeper_but_stays_under_the_heading_and_readable(self):
+        self.assertEqual(pane.ROW, 0.07)
+        self.assertLess(pane.ROW, pane.HEAD)
+        for name in pane.SECTION:
+            ground = pane.tint(name, pane.ROW)
+            for voice in ('you', 'quiet'):  # the page's body type and its quiet type
+                self.assertGreaterEqual(pane.contrast(pane.INK[voice], ground), 4.5, (name, voice))
+            self.assertGreaterEqual(pane.contrast(pane.INK['faint'], ground), pane.FAINT, name)  # the meta type
+
+    def test_the_masthead_has_one_lip_row_where_the_pane_is_tall_enough(self):
+        lip = '\x1b[48;2;%d;%d;%dm' % pane.blend(pane.DARK[1], pane.PAPER, 0.6)
+        lines, _ = self.lines(rows=40)
+        lips = [line for line in lines if line.startswith(lip)]
+        self.assertEqual(len(lips), 1)
+        self.assertEqual(self.ESC.sub('', lips[0]), '')
+        self.assertEqual(lines.index(lips[0]), len(lines.heads) and lines.heads[0][0] - 2)  # just above the paper strip
+        short, _ = self.lines(rows=pane.LIP_ROWS - 1)
+        self.assertFalse([line for line in short if line.startswith(lip)])
+
+    def test_the_lip_costs_one_row_and_moves_the_icons_with_it(self):
+        tall, _ = self.lines(rows=pane.LIP_ROWS)
+        short, _ = self.lines(rows=pane.LIP_ROWS - 1)
+        self.assertEqual(tall.heads[0][0], short.heads[0][0] + 1)
+
+    def test_an_opened_block_carries_the_section_edge_and_steps_back_to_the_row_tint_below(self):
+        lines, got = self.lines(opened=True)
+        name = got['sections'][0]['name']
+        edge = pane.ink(pane.SECTION[name]) + '\u258c'
+        first, count = lines.heads[0][0], len(lines)
+        block = [line for line in lines[first:] if edge in line]
+        plain, _ = self.lines()
+        self.assertEqual(len([line for line in plain if '\u258c' in line]), 0)
+        self.assertGreaterEqual(len(block), 2)
+        # the edge sits in the cell just left of the text, on every row of the block, and only there
+        for line in block:
+            self.assertEqual(self.ESC.sub('', line)[:pane.ITEM], ' ' * (pane.ITEM - 1) + '\u258c')
+        self.assertEqual(len(block), sum(1 for line in lines if '\u258c' in line))
+        deep = pane.band(name)
+        self.assertTrue(all(line.startswith(deep) for line in block[:-1]))
+        row = '\x1b[48;2;%d;%d;%dm' % pane.tint(name, pane.ROW)
+        self.assertTrue(block[-1].startswith(row))
+        self.assertFalse(block[-1].startswith(deep))
+
+    def test_an_icon_carries_a_cast_shadow_two_cells_right_and_one_down(self):
+        import io
+        from PIL import Image
+        cell, backs = (10, 20), ((200, 200, 200), (240, 240, 240))
+        name = 'touching'
+        icon = pane.iso_icon(name)
+        k = max(1, min((5 * 10 - 4) // icon.width, (2 * 20 - 4) // icon.height))
+        w, h = 5 * 10, 2 * 20
+        x, y = (w - icon.width * k) // 2, (h - icon.height * k) // 2
+        got = Image.open(io.BytesIO(pane.iso_png(name, cell, backs))).convert('RGBA')
+        big = icon.resize((icon.width * k, icon.height * k), Image.NEAREST)
+        alpha = big.getchannel('A')
+        seen = 0
+        for py in range(big.height):
+            for px in range(big.width):
+                sx, sy = px + pane.SHADOW[0] * k, py + pane.SHADOW[1] * k
+                if alpha.getpixel((px, py)) and sx < big.width and sy < big.height and not alpha.getpixel((sx, sy)) \
+                        and 0 <= x + sx < w and 0 <= y + sy < h:
+                    ground = backs[0] if y + sy < 20 else backs[1]
+                    pixel = got.getpixel((x + sx, y + sy))[:3]
+                    want = tuple(round(c * (1 - 56 / 255)) for c in ground)  # 22% black on the tint
+                    self.assertEqual(pixel, want)
+                    seen += 1
+        self.assertGreater(seen, 0)
+        self.assertEqual(pane.SHADOW, (2, 1))
+        # nothing was drawn outside the icon's cell box
+        self.assertEqual(got.size, (w, h))
 
 
 class HotReload(unittest.TestCase):
@@ -147,6 +247,582 @@ class HotReload(unittest.TestCase):
         self.assertIn('edit not loaded: SyntaxError line 2', pane.legend('main', 60, 'SyntaxError line 2'))
         self.assertNotIn('edit not loaded', pane.legend('main', 60))
 
+
+def plain(text):
+    return pane.COLOUR.sub('', text)
+
+
+def put(path, record):
+    with open(path, 'w') as handle:
+        json.dump(record, handle)
+
+
+def boundary(seconds):
+    return json.dumps(dict(type='system', subtype='compact_boundary', compactMetadata=dict(trigger='manual', durationMs=int(seconds * 1000))))
+
+
+def transcripts(folder, durations, name='s1'):
+    """A projects folder with one transcript holding a compaction of each duration, and talk around them."""
+    os.makedirs(os.path.join(folder, 'proj'), exist_ok=True)
+    path = os.path.join(folder, 'proj', f'{name}.jsonl')
+    with open(path, 'w') as handle:
+        handle.write(json.dumps(dict(type='user', message=dict(content='mentions compact_boundary in passing'))) + '\n')
+        for seconds in durations:
+            handle.write(boundary(seconds) + '\n')
+    return path
+
+
+class CompactionTimer(unittest.TestCase):
+    def test_marker_lifecycle_young_old_and_ended(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file = os.path.join(tmp, 'sess-1.json')
+            self.assertIsNone(pane.compacting_since('sess-1', 1000.0, tmp))  # no marker
+            put(file, dict(at=990.0, trigger='manual'))
+            self.assertEqual(pane.compacting_since('sess-1', 1000.0, tmp), dict(at=990.0, trigger='manual'))
+            self.assertIsNone(pane.compacting_since('sess-1', 990.0 + 601, tmp))  # left over: ten minutes old
+            put(file, dict(ended=True))
+            self.assertIsNone(pane.compacting_since('sess-1', 1000.0, tmp))
+            self.assertIsNone(pane.compacting_since('../x', 1000.0, tmp))
+
+    def test_durations_come_from_compact_boundary_rows_of_the_newest_transcripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcripts(tmp, [60, 80, 100])
+            transcripts(tmp, [120, 140], name='s2')
+            cache = os.path.join(tmp, 'times.json')
+            self.assertEqual(pane.compaction_seconds(tmp, cache), [60, 80, 100, 120, 140])
+            newest = max(glob.glob(os.path.join(tmp, 'proj', '*.jsonl')), key=os.path.getmtime)
+            self.assertEqual(pane.compaction_seconds(tmp, cache, newest=1), [60, 80, 100] if newest.endswith('s1.jsonl') else [120, 140])
+
+    def test_a_transcript_is_read_again_only_when_its_mtime_moves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = transcripts(tmp, [60, 80, 100])
+            cache = os.path.join(tmp, 'times.json')
+            pane.compaction_seconds(tmp, cache)
+            stat = os.stat(path)
+            transcripts(tmp, [10])  # rewritten, then its mtime put back: the cache answers
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            self.assertEqual(pane.compaction_seconds(tmp, cache), [60, 80, 100])
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+            self.assertEqual(pane.compaction_seconds(tmp, cache), [10])
+
+    def test_usual_is_the_tenth_to_ninetieth_percentile_and_needs_three(self):
+        self.assertIsNone(pane.compaction_usual([60, 80]))
+        usual = pane.compaction_usual([float(x) for x in range(60, 160, 10)])  # 60..150
+        self.assertEqual((usual['n'], usual['low'], usual['median'], usual['high']), (10, 69.0, 105.0, 141.0))
+
+    def test_the_strip_says_the_time_against_the_usual_range_with_a_bar(self):
+        usual = dict(low=69.0, median=105.0, high=141.0, n=10)
+        rows = [plain(r) for r in pane.compact_rows(dict(elapsed=42, trigger='manual', usual=usual, facts=['a fact']), 60)]
+        self.assertEqual(rows[0], ' Compacting · 0:42 · usually 1:09 to 2:21')
+        self.assertEqual(rows[1], ' ' + '█' * 11 + '▉' + '░' * 28)  # 42/141 of 40 cells: 11 and 7/8
+        self.assertEqual(rows[2], ' a fact')
+        late = [plain(r) for r in pane.compact_rows(dict(elapsed=200, trigger='auto', usual=usual, facts=[]), 60)]
+        self.assertEqual(late, [' Compacting (auto) · 3:20 · taking longer than usual', ' ' + '█' * 40])
+        bare = [plain(r) for r in pane.compact_rows(dict(elapsed=5, trigger='manual', usual=None, facts=[]), 60)]
+        self.assertEqual(bare, [' Compacting · 0:05'])
+        self.assertEqual(pane.compact_rows(None, 60), [])
+
+    def test_the_bar_is_empty_at_the_start_and_full_at_the_end(self):
+        self.assertEqual(pane.compaction_bar(0, 100, 8), '░' * 8)
+        self.assertEqual(pane.compaction_bar(50, 100, 8), '████░░░░')
+        self.assertEqual(pane.compaction_bar(100, 100, 8), '█' * 8)
+        self.assertEqual(pane.compaction_bar(9, 0, 8), '░' * 8)
+
+    def test_the_facts_are_only_those_with_a_number_behind_them(self):
+        con = sqlite3.connect(':memory:')
+        con.execute('create table chunks (id text, conversation_id text)')
+        con.executemany('insert into chunks values (?, ?)', [(f'c{k}', HERE_NOW) for k in range(1200)] + [('x', 'other')])
+        story = dict(rev=3)
+        self.assertEqual(pane.compaction_facts(con, HERE_NOW, story, True),
+                         ['CSR keeps 1,200 chunks of this session', 'story rev 3 → 4 after this',
+                          'a new chapter of dreams after this (5 looks)'])
+        self.assertEqual(pane.compaction_facts(con, 'nobody', None, False), [])
+
+    def test_info_is_none_without_a_marker_and_whole_with_one(self):
+        con = sqlite3.connect(':memory:')
+        con.execute('create table chunks (id text, conversation_id text)')
+        con.execute("insert into chunks values ('c', 'sess-1')")
+        connect, pane.connect = pane.connect, lambda: con
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                transcripts(tmp, [60, 80, 100])
+                marks = os.path.join(tmp, 'marks')
+                os.makedirs(marks)
+                args = dict(folder=marks, projects=tmp, cache=os.path.join(tmp, 'times.json'))
+                self.assertIsNone(pane.compacting_info('sess-1', 1000.0, {}, **args))
+                put(os.path.join(marks, 'sess-1.json'), dict(at=958.0, trigger='manual'))
+                info = pane.compacting_info('sess-1', 1000.0, dict(story=dict(rev=1), dreams_on=False), **args)
+        finally:
+            pane.connect = connect
+        self.assertEqual((info['elapsed'], info['trigger']), (42, 'manual'))
+        self.assertEqual(info['usual']['median'], 80.0)
+        self.assertEqual(info['facts'], ['CSR keeps 1 chunk of this session', 'story rev 1 → 2 after this'])
+
+    def test_a_narrow_pane_puts_the_range_on_its_own_row(self):
+        usual = dict(low=64.0, median=80.0, high=104.0, n=9)
+        rows = [plain(r) for r in pane.compact_rows(dict(elapsed=400, trigger='auto', usual=usual, facts=[]), 40)]
+        self.assertEqual(rows[:2], [' Compacting (auto) · 6:40', ' taking longer than usual'])
+        self.assertTrue(all(len(r) <= 40 for r in rows))
+
+    def test_the_usual_range_is_read_once_in_five_minutes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcripts(tmp, [60, 80, 100])
+            marks = os.path.join(tmp, 'marks')
+            os.makedirs(marks)
+            put(os.path.join(marks, 'sess-1.json'), dict(at=990.0, trigger='manual'))
+            args = dict(folder=marks, projects=tmp, cache=os.path.join(tmp, 'times.json'))
+            first = pane.compacting_info('sess-1', 1000.0, {}, **args)['usual']
+            transcripts(tmp, [600, 800, 1000], name='s9')
+            self.assertEqual(pane.compacting_info('sess-1', 1100.0, {}, **args)['usual'], first)
+            self.assertNotEqual(pane.compacting_info('sess-1', 1000.0 + 301, {}, **args)['usual'], first)
+
+    def test_the_watch_loop_draws_at_once_when_the_marker_goes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shell = types.SimpleNamespace(session=types.SimpleNamespace(id='sess-1'), compacting=True)
+            put(os.path.join(tmp, 'sess-1.json'), dict(at=1.0, trigger='manual'))
+            self.assertFalse(pane.compaction_gone(shell, tmp))
+            os.remove(os.path.join(tmp, 'sess-1.json'))
+            self.assertTrue(pane.compaction_gone(shell, tmp))
+            shell.compacting = False
+            self.assertFalse(pane.compaction_gone(shell, tmp))
+
+    def test_the_strip_leads_the_page_and_the_pane_redraws_when_it_goes(self):
+        got = page()
+        info = dict(elapsed=42, trigger='manual', usual=dict(low=69.0, median=105.0, high=141.0, n=10), facts=[])
+        lines = pane.page_lines(pane.with_compacting(got, dict(compacting=info)), 60, 30, {})
+        self.assertTrue(plain(lines[0]).startswith(' Compacting · 0:42'))
+        self.assertFalse(any('Compacting' in plain(l) for l in pane.page_lines(pane.with_compacting(page(), {}), 60, 30, {})))
+        shell = types.SimpleNamespace()
+        self.assertFalse(pane.compaction_ended(shell, info))  # it began
+        self.assertFalse(pane.compaction_ended(shell, info))  # it runs
+        self.assertTrue(pane.compaction_ended(shell, None))  # the marker went: draw at once
+        self.assertFalse(pane.compaction_ended(shell, None))  # once
+
+
+def summary_row(text, at='2026-10-10T18:17:14.109Z'):
+    return json.dumps(dict(type='user', isCompactSummary=True, timestamp=at, message=dict(role='user', content=text)))
+
+
+class SummaryPage(unittest.TestCase):
+    TEXT = ('Summary:\n1. Primary Request and Intent:\n   - Build the timer.\n'
+            '   - Interpreted as: a bar, not a spinner.\n\n\n2. Key Concepts:\n   - typo for "pane" in the second prompt (unclear)\n')
+
+    def test_the_newest_summary_is_read_from_where_it_was_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'sess.jsonl')
+            with open(path, 'w') as handle:
+                handle.write(summary_row('first') + '\n' + json.dumps(dict(type='user', message=dict(content='hi'))) + '\n')
+            self.assertEqual(pane.newest_summary(path)['text'], 'first')
+            same = pane.newest_summary(path)
+            self.assertIs(pane.newest_summary(path), same)  # nothing newer: the same page, its scroll kept
+            with open(path, 'a') as handle:
+                handle.write(summary_row([dict(type='text', text='second')]) + '\n')
+                handle.write(summary_row('half a line'))  # still being written: not read yet
+            got = pane.newest_summary(path)
+            self.assertEqual((got['text'], got['count']), ('second', 2))
+        self.assertIsNone(pane.newest_summary(None))
+        self.assertIsNone(pane.newest_summary('/nonexistent/x.jsonl'))
+
+    def test_read_as_lines_are_marked_and_the_text_keeps_its_shape(self):
+        rows = pane.summary_lines(self.TEXT, 40)
+        marked = ' '.join(line.strip() for line, is_marked in rows if is_marked)
+        self.assertEqual(marked, '- Interpreted as: a bar, not a spinner. - typo for "pane" in the second prompt (unclear)')
+        self.assertFalse(any(is_marked for line, is_marked in rows if 'Build the timer' in line or 'Key Concepts' in line))
+        self.assertIn(('', False), rows)
+        self.assertEqual(sum(1 for line, _ in rows if not line), 1)  # a run of blank lines is one
+        self.assertTrue(all(len(line) <= 40 for line, _ in rows))
+
+    def test_the_page_draws_the_marked_lines_in_the_accent_ink_and_scrolls(self):
+        summary = dict(text=self.TEXT, at=pane.epoch('2026-10-10T18:17:14Z'), count=2, top=0)
+        lines, pictures = pane.draw_summary(dict(summary=summary), 50, 30)
+        self.assertEqual(pictures, [])
+        self.assertIn('Compaction summary', plain(lines[0]))
+        marked = [l for l in lines if 'Interpreted as' in l][0]
+        self.assertTrue(marked.startswith(' ' + pane.ink('turn')))
+        plain_line = [l for l in lines if 'Build the timer' in l][0]
+        self.assertTrue(plain_line.startswith(' ' + pane.ink('you')))
+        long = dict(text='\n'.join(f'line {k}' for k in range(100)), at=None, count=1, top=500)
+        lines, _ = pane.draw_summary(dict(summary=long), 50, 12)
+        self.assertEqual(long['top'], 100 - 9)  # clamped to the last page: 12 rows less legend and masthead
+        self.assertIn('line 99', plain(lines[-1]))
+        lines, _ = pane.draw_summary({}, 50, 12)
+        self.assertIn('No compaction summary', plain(lines[1]))
+
+    def test_s_opens_the_page_and_esc_or_d_return_j_and_k_scroll(self):
+        shell = types.SimpleNamespace(view='main', open='x', data=dict(summary=dict(top=0)))
+        self.assertTrue(pane.summary_keys(shell, 's'))
+        self.assertEqual((shell.view, shell.open), ('summary', None))
+        self.assertTrue(pane.summary_keys(shell, 'j'))
+        self.assertEqual(shell.data['summary']['top'], 3)
+        self.assertTrue(pane.summary_keys(shell, 'k'))
+        self.assertTrue(pane.summary_keys(shell, 'k'))
+        self.assertEqual(shell.data['summary']['top'], 0)
+        self.assertTrue(pane.summary_keys(shell, '\x1b'))
+        self.assertEqual(shell.view, 'main')
+        self.assertFalse(pane.summary_keys(shell, 'j'))
+        self.assertTrue(pane.summary_keys(shell, 's'))
+        self.assertTrue(pane.summary_keys(shell, 's'))  # s again goes back
+        self.assertEqual(shell.view, 'main')
+
+    def test_the_legend_lists_s_on_the_main_page_and_the_way_back_on_the_summary(self):
+        self.assertIn('s compaction summary', plain(pane.legend('main', 80)))
+        self.assertIn('d back', plain(pane.legend('summary', 80)))
+        self.assertNotIn('changed', plain(pane.legend('summary', 80)))
+
+    def test_the_main_legend_fits_a_forty_column_pane(self):
+        row = plain(pane.legend('main', 39))
+        self.assertLessEqual(len(row), 40)
+        self.assertIn('s summary', row)
+
+
+def transcript(rows):
+    """A session's transcript in a temp HOME, one JSON line per row; returns (home, path)."""
+    import json
+    import tempfile
+    home = tempfile.mkdtemp()
+    folder = os.path.join(home, '.claude', 'projects', '-proj')
+    os.makedirs(folder)
+    path = os.path.join(folder, 'sess-coach.jsonl')
+    with open(path, 'w') as handle:
+        for row in rows:
+            handle.write(json.dumps(row, separators=(',', ':')) + '\n')
+    return home, path
+
+
+def said(text, **more):
+    return dict(type='user', timestamp='2026-10-10T10:00:00.000Z', message=dict(role='user', content=text), **more)
+
+
+def replied(text):
+    return dict(type='assistant', timestamp='2026-10-10T10:00:05.000Z',
+                message=dict(role='assistant', content=[dict(type='text', text=text)]))
+
+
+def looked(*commands):
+    return dict(type='assistant', timestamp='2026-10-10T10:00:06.000Z', message=dict(role='assistant', content=[
+        dict(type='tool_use', name='Bash', input=dict(command=c)) for c in commands]))
+
+
+class HowClaudeReadYou(unittest.TestCase):
+    def test_a_typo_a_bare_unclear_and_an_interpretation_are_parsed(self):
+        typo = pane.reading_in('Read as: fix the bugs. "dknr" is most likely a typo for "done".', pane.MARKED)
+        self.assertEqual((typo['words'], typo['read']), ('dknr', 'done'))
+        unclear = pane.reading_in('   - (j) "2" (unclear).', pane.MARKED)
+        self.assertEqual((unclear['words'], unclear['read']), ('2', ''))
+        said_as = pane.reading_in('"done here means a wow gallery like feel" — interpreted as: build the WebGPU upgrade',
+                                  pane.MARKED)
+        self.assertEqual((said_as['words'], said_as['read']), ('done here means a wow gallery like feel',
+                                                               'build the WebGPU upgrade'))
+        bare = pane.reading_in('Read as: ship it today', pane.MARKED)
+        self.assertEqual((bare['words'], bare['line']), ('', 'Read as: ship it today'))
+
+    def test_lines_that_only_sound_unsure_are_not_readings(self):
+        for line in ('The verse reading is ambiguous.', 'It is unclear whether the audio loops.', ''):
+            self.assertIsNone(pane.reading_in(line, pane.MARKED))
+        self.assertIsNone(pane.reading_in('That is ambiguous, so I will ask.', pane.FIRST_WORDS))
+
+    def test_the_replies_first_sentence_is_read_for_an_interpretation(self):
+        got = pane.reading_in('I\'ll interpret “gm” as good morning. Then I start.'.split('. ')[0] + '.', pane.FIRST_WORDS)
+        self.assertEqual((got['words'], got['read']), ('gm', 'good morning'))
+
+    def test_rows_say_what_was_read_and_a_second_click_sends_the_check(self):
+        rows = pane.reading_items([dict(words='dknr', read='done', line='x', when=0, source='compaction'),
+                                   dict(words='2', read='', line='y', when=0, source='compaction'),
+                                   dict(words='', read='', line='Read as: ship it', when=0, source='reply')], 2000.0)
+        self.assertEqual([r['title'] for r in rows], ['“dknr” → read as “done”', '“2” → read as unclear', 'Read as: ship it'])
+        self.assertEqual(rows[0]['send'], 'Earlier you read my “dknr” as “done”. Check that reading before relying on it.')
+        self.assertNotIn('—', ''.join(r['title'] + r['send'] for r in rows))
+
+    def test_this_sessions_summaries_and_first_replies_give_at_most_two_newest_rows(self):
+        home, path = transcript([
+            said('hello'), replied('Fine, on it.'),
+            said('x', isCompactSummary=True) | dict(message=dict(role='user', content=
+                'Summary:\n- Read as: ship. "dknr" is most likely a typo for "done".\n- (j) "2" (unclear).\n')),
+            said('gm'), replied('I\'ll interpret “gm” as good morning. Starting now.'),
+        ])
+        gone, pane.HOME = pane.HOME, home
+        pane._READINGS.clear()
+        try:
+            got = pane.how_claude_read('sess-coach')
+            self.assertEqual([(r['words'], r['source']) for r in got], [('gm', 'reply'), ('2', 'compaction')])
+            self.assertEqual(len(pane.how_claude_read('sess-coach', most=9)), 3)
+            self.assertEqual(pane.how_claude_read('no-such-session'), [])
+        finally:
+            pane.HOME = gone
+            pane._READINGS.clear()
+
+    def test_the_section_shows_only_with_something_in_it(self):
+        def coach(readings):
+            con = sqlite3.connect(':memory:')
+            con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
+                        'byte_start int, project text, kind text)')
+            connect, pane.connect = pane.connect, lambda: con
+            try:
+                s = dict(id=HERE_NOW, prompts=[], replies=[], compacts=[], remembered=[],
+                         gave=dict(recalls=[], carried=[], dreams=[]), project='csr-engine')
+                data = dict(repo='/tmp/csr-engine', dreams=[], chapter=dict(at=1000.0, of=5), dreams_on=True,
+                            look=None, story=None, readings=readings)
+                page_ = pane.page_main(data, s, 2000.0)
+                text = '\n'.join(pane.COLOUR.sub('', l) for l in pane.page_lines(page_, 50, 30, {}))
+                return next(x for x in page_['sections'] if x['name'] == 'coach'), text
+            finally:
+                pane.connect = connect
+        section, text = coach([])
+        self.assertEqual(section['items'], [])
+        self.assertNotIn('How Claude read you', text)
+        section, text = coach([dict(words='dknr', read='done', line='x', when=1000.0, source='compaction')])
+        self.assertIn('How Claude read you', text)
+        self.assertIn('“dknr” → read as “done”', text)
+
+    def test_malformed_lines_and_a_transcript_written_anew_do_not_break_it(self):
+        home, path = transcript([
+            said('x', isCompactSummary=True) | dict(message=dict(role='user', content='- "2" (unclear).')),
+            [], 'text', dict(type='user', message='flat'), dict(type='assistant', message=dict(content=[dict(type='text', text=3)])),
+            said(['not', 'parts']),
+        ])
+        with open(path, 'a') as handle:
+            handle.write('{not json\n')
+        gone, pane.HOME = pane.HOME, home
+        pane._READINGS.clear()
+        try:
+            self.assertEqual([r['words'] for r in pane.how_claude_read('sess-coach')], ['2'])
+            with open(path, 'w') as handle:  # compacted to a new, shorter file
+                handle.write(json.dumps(said('x', isCompactSummary=True) | dict(
+                    message=dict(role='user', content='- "dknr" is most likely a typo for "done".')), separators=(',', ':')) + '\n')
+            self.assertEqual([r['words'] for r in pane.how_claude_read('sess-coach')], ['dknr'])
+            self.assertEqual(pane.terms_looked_up(path), {})
+        finally:
+            pane.HOME = gone
+            pane._READINGS.clear()
+
+
+class SaidItInSessions(unittest.TestCase):
+    def test_a_kept_file_of_another_shape_is_read_again(self):
+        import tempfile
+        home = tempfile.mkdtemp()
+        os.makedirs(os.path.join(home, '.claude', 'projects', '-proj'))
+        saved = (pane.HOME, pane.KEEP, pane.COACH_KEPT, pane.CLAUDE_MD)
+        pane.HOME, pane.KEEP = home, os.path.join(home, 'kept')
+        pane.COACH_KEPT, pane.CLAUDE_MD = os.path.join(pane.KEEP, 'coach.json'), os.path.join(home, 'none.md')
+        try:
+            for bad in ('[1, 2]', '{"/x.jsonl": 5}', '{"/x.jsonl": [1, []]}'):
+                os.makedirs(pane.KEEP, exist_ok=True)
+                with open(pane.COACH_KEPT, 'w') as handle:
+                    handle.write(bad)
+                self.assertEqual(pane.coach_terms(now=1.0), [])
+        finally:
+            pane.HOME, pane.KEEP, pane.COACH_KEPT, pane.CLAUDE_MD = saved
+
+    def test_a_word_of_your_prompt_looked_up_in_memory_within_six_calls_counts(self):
+        home, path = transcript([
+            said('call astra for the review'), looked('grep -ril "astra" /home/u/.claude/memory'),
+            said('now zebra and thing'), looked('ls /tmp'), looked('grep -r "zebra" /repo/src'),
+            said('quokka please'), looked('cat /home/u/.claude/CLAUDE.md | grep quokka'),
+        ])
+        got = pane.terms_looked_up(path)
+        self.assertEqual(list(got), ['astra'])  # not zebra (not memory), not quokka (not quoted)
+        self.assertIn('call astra for the review', got['astra'])
+
+    def test_a_lookup_after_six_other_calls_is_not_about_the_prompt(self):
+        home, path = transcript([said('call astra'), looked(*['ls'] * 6), looked('grep -ril "astra" /home/u/.claude/memory')])
+        self.assertEqual(pane.terms_looked_up(path), {})
+
+    def test_two_sessions_not_in_claude_md_give_one_note_and_it_is_cached_by_mtime(self):
+        import json
+        import tempfile
+        home = tempfile.mkdtemp()
+        folder = os.path.join(home, '.claude', 'projects', '-proj')
+        os.makedirs(folder)
+        for n in (1, 2):
+            with open(os.path.join(folder, f's{n}.jsonl'), 'w') as handle:
+                for row in (said('call quokka now'), looked('grep -ril "quokka" /home/u/.claude/memory'),
+                            said('call astra now'), looked('grep -ril "astra" /home/u/.claude/memory')):
+                    handle.write(json.dumps(row, separators=(',', ':')) + '\n')
+        os.makedirs(os.path.join(home, '.claude-self-reflect'))
+        with open(os.path.join(home, '.claude', 'CLAUDE.md'), 'w') as handle:
+            handle.write('# Prefs\nastra = Codex\n')
+        saved = (pane.HOME, pane.KEEP, pane.COACH_KEPT, pane.CLAUDE_MD, pane.terms_looked_up)
+        pane.HOME, pane.KEEP = home, os.path.join(home, 'kept')
+        pane.COACH_KEPT = os.path.join(pane.KEEP, 'coach.json')
+        pane.CLAUDE_MD = os.path.join(home, '.claude', 'CLAUDE.md')
+        reads = []
+        real = pane.terms_looked_up
+        pane.terms_looked_up = lambda path: reads.append(path) or real(path)
+        try:
+            notes = pane.coach_terms(now=5.0)
+            self.assertEqual([(n['id'], n['kind']) for n in notes], [('term:quokka', 'term')])
+            self.assertIn('2 sessions', notes[0]['line'])
+            self.assertTrue(notes[0]['text'].startswith('- quokka: '))
+            self.assertEqual(len(reads), 2)
+            pane.coach_terms(now=6.0)
+            self.assertEqual(len(reads), 2)  # unchanged transcripts are not read again
+        finally:
+            pane.HOME, pane.KEEP, pane.COACH_KEPT, pane.CLAUDE_MD, pane.terms_looked_up = saved
+
+
+
+def summary(pending, step='', other='8. Current Work:\n   - Something else.\n'):
+    return ('1. Primary Request and Intent:\n   - The ask.\n\n7. Pending Tasks:\n' + pending + '\n' + other
+            + ('\n9. Optional Next Step:\n' + step if step else ''))
+
+
+S1 = summary("   - Fix the importer: remove the old cache.\n     - Start with the loader.\n"
+             "   - Awaiting the user's go on the push guard.\n"
+             "   - Send the final reply to the user.\n"
+             "   - Report the results to the user.\n"
+             "   - Confirm the background commit landed.\n"
+             "   - Tidy the scratch directory, not started.")
+S2 = summary("   - Fix the importer: remove the old cache, then rebuild.\n"
+             "   - Awaiting the user's go on the push guard, then push it.\n"
+             "   - Tidy the scratch directory, not started.")
+S3 = summary("   - Fix the importer: remove the old cache, then rebuild it.\n"
+             "   - Wait for the user's pasted deck picks before acting on the mods.",
+             step="   - Run the importer fix and check it.")
+SUMMARIES = [(1000.0, S1), (2000.0, S2), (3000.0, S3)]
+
+
+class LostAndFound(unittest.TestCase):
+    def setUp(self):
+        self.keep = pane.KEEP, pane.LOST_LOG
+        self.folder = tempfile.mkdtemp()
+        pane.KEEP, pane.LOST_LOG = self.folder, os.path.join(self.folder, 'lost-found.jsonl')
+
+    def tearDown(self):
+        pane.KEEP, pane.LOST_LOG = self.keep
+        shutil.rmtree(self.folder)
+
+    def by_text(self, threads=None):
+        return {t['text'].split(':')[0].split(',')[0][:24]: t for t in threads or pane.lost_found(SUMMARIES)}
+
+    def test_a_dropped_item_is_lost_one_that_persists_is_open_and_bookkeeping_is_skipped(self):
+        threads = pane.lost_found(SUMMARIES)
+        texts = ' | '.join(t['text'] for t in threads)
+        self.assertNotIn('final reply', texts)
+        self.assertNotIn('Report the results', texts)
+        self.assertNotIn('background commit', texts)
+        guard = next(t for t in threads if 'push guard' in t['text'])
+        self.assertEqual((guard['state'], guard['times'], guard['first_seen'], guard['last_seen']), ('lost', 2, 1000.0, 2000.0))
+        importer = next(t for t in threads if 'importer' in t['text'] and 'Run' not in t['text'])
+        self.assertEqual((importer['state'], importer['times'], importer['first_seen'], importer['last_seen']), ('open', 3, 1000.0, 3000.0))
+        self.assertEqual(len([t for t in threads if 'importer' in t['text']]), 2)  # the fix, and the next step's run of it
+
+    def test_waiting_on_you_is_flagged_and_ranks_first(self):
+        threads = pane.lost_found(SUMMARIES)
+        self.assertEqual([t['rank'] for t in threads], sorted(t['rank'] for t in threads))
+        self.assertIn('push guard', threads[0]['text'])
+        self.assertEqual((threads[0]['state'], threads[0]['waiting'], threads[0]['rank']), ('lost', True, 0))
+        deck = next(t for t in threads if 'deck picks' in t['text'])
+        self.assertEqual((deck['state'], deck['waiting'], deck['rank']), ('open', True, 2))
+        tidy = next(t for t in threads if 'scratch' in t['text'])
+        self.assertEqual((tidy['state'], tidy['waiting'], tidy['rank']), ('lost', False, 1))
+
+    def test_nested_bullets_stay_with_their_parent(self):
+        self.assertEqual(pane.section_items(['   - A thing', '     - its part', '     - another part', '   - Second']),
+                         [('A thing', ['its part', 'another part']), ('Second', [])])
+
+    def test_drop_is_for_good_and_later_lasts_until_the_next_compaction(self):
+        key = next(t['key'] for t in pane.lost_found(SUMMARIES) if 'scratch' in t['text'])
+        other = next(t['key'] for t in pane.lost_found(SUMMARIES) if 'push guard' in t['text'])
+        pane.keep_lost(key, 'later', 3500.0)
+        pane.keep_lost(other, 'drop', 3500.0)
+        marked = {t['key']: t['hidden'] for t in pane.lost_found(SUMMARIES)}
+        self.assertEqual((marked[key], marked[other]), ('later', 'drop'))
+        again = {t['key']: t['hidden'] for t in pane.lost_found(SUMMARIES + [(4000.0, S3)])}  # a compaction since
+        self.assertEqual((again[key], again[other]), (None, 'drop'))
+
+    def test_the_two_asks_are_the_words_typed_into_claudes_prompt(self):
+        thread = dict(text='Fix the importer', last_seen=pane.epoch('2026-10-10T18:17:14Z'))
+        hhmm = pane.datetime.fromtimestamp(thread['last_seen']).strftime('%H:%M')
+        asks = pane.lost_asks(thread)
+        self.assertEqual(asks['side'], f"Lost and found: “Fix the importer” went quiet after {hhmm}. Revisit it as a side task: "
+                         "finish or close it in a few steps without derailing the current work, then tell me in one line.")
+        self.assertEqual(asks['sub'], f"Lost and found: “Fix the importer” went quiet after {hhmm}. Hand it to a background subagent "
+                         "with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the "
+                         "current task, and report its result when it lands.")
+
+    def test_the_section_shows_three_rows_with_answers_and_only_with_something_in_it(self):
+        self.assertEqual(pane.lost_sections({'lost': []}, 5000.0), [])
+        (section,) = pane.lost_sections({'lost': pane.lost_found(SUMMARIES)}, 5000.0)
+        self.assertEqual((section['title'], section['right']), ('Lost and found', '3 quiet'))
+        self.assertEqual(len(section['items']), 3)
+        rows = pane.lost_rows(section['items'][0], 46, {}, False)
+        self.assertEqual([act['spans'][0][2] for _, act in rows] + [act['spans'][1][2] for _, act in rows],
+                         ['side', 'drop', 'sub', 'later'])
+        self.assertEqual(pane.lost_rows(section['items'][1], 46, {}, False), [])  # not the top row, not opened
+        self.assertEqual(len(pane.lost_rows(section['items'][1], 46, {}, True)), 2)
+
+    def test_a_click_on_an_answer_keeps_it_or_types_it_into_claude(self):
+        (section,) = pane.lost_sections({'lost': pane.lost_found(SUMMARIES)}, 5000.0)
+        item = section['items'][0]
+        rows = pane.lost_rows(item, 46, {}, False)
+        sent = []
+        saved = pane.herdr, pane.agent_pane, pane.focus_back
+        pane.herdr = lambda *argv: sent.append(argv) or ''
+        pane.agent_pane, pane.focus_back = lambda given: 'w1:p1', lambda: None
+        try:
+            box = pane.Pane('/repo', 10, None)
+            box.acts = {4: rows[0][1], 5: rows[1][1]}
+            box.click(4, 7)  # the left half of the first row: side task
+            self.assertEqual(sent[-1], ('pane', 'send-text', 'w1:p1', item['asks']['side']))
+            self.assertEqual(box.sent[:2], (item['key'], True))
+            box.click(4, 30)  # the right half: subagent
+            self.assertEqual(sent[-1][3], item['asks']['sub'])
+            box.click(5, 30)  # later
+            box.click(5, 7)  # drop
+        finally:
+            pane.herdr, pane.agent_pane, pane.focus_back = saved
+        self.assertEqual(len(sent), 2)
+        with open(pane.LOST_LOG, encoding='utf-8') as handle:
+            self.assertEqual([json.loads(line)['answer'] for line in handle], ['later', 'drop'])
+
+    def test_a_transcript_gives_its_summaries_and_the_cli_prints_the_threads(self):
+        home = tempfile.mkdtemp()
+        folder = os.path.join(home, '.claude', 'projects', 'p')
+        os.makedirs(folder)
+        rows = [dict(type='user', isCompactSummary=True, timestamp=f'2026-10-10T1{k}:00:00Z', message=dict(role='user', content=text))
+                for k, (_, text) in enumerate(SUMMARIES)]
+        rows.insert(1, dict(type='user', timestamp='2026-10-10T10:30:00Z', message=dict(role='user', content='hello')))
+        with open(os.path.join(folder, 'sid-1.jsonl'), 'w') as handle:
+            handle.write('\n'.join(json.dumps(r) for r in rows) + '\n')
+        saved = pane.HOME
+        pane.HOME = home
+        try:
+            found = pane.lost_json('sid-1')
+        finally:
+            pane.HOME = saved
+            shutil.rmtree(home)
+        self.assertEqual([t['state'] for t in found].count('open'), 3)
+        self.assertEqual(found[0]['key'], pane.lost_found(SUMMARIES)[0]['key'])
+        self.assertEqual(sorted(found[0]), sorted(pane.lost_found(SUMMARIES)[0]))
+
+
+    def test_an_empty_or_broken_summary_line_is_not_the_newest_summary(self):
+        home = tempfile.mkdtemp()
+        folder = os.path.join(home, '.claude', 'projects', 'p')
+        os.makedirs(folder)
+        rows = [json.dumps(dict(type='user', isCompactSummary=True, timestamp=f'2026-10-10T1{k}:00:00Z',
+                                message=dict(role='user', content=[dict(type='text', text=text)])))
+                for k, (_, text) in enumerate(SUMMARIES)]
+        rows += ['{not json', json.dumps(dict(type='user', isCompactSummary=True, timestamp='2026-10-10T15:00:00Z',
+                                              message=dict(role='user', content=None))),
+                 json.dumps(dict(type='user', isCompactSummary=True, message=dict(content='no time')))]
+        with open(os.path.join(folder, 'sid-2.jsonl'), 'w') as handle:
+            handle.write('\n'.join(rows) + '\n')
+        saved = pane.HOME
+        pane.HOME = home
+        try:
+            found = pane.lost_json('sid-2')
+            none = pane.lost_json('no-such-session')
+        finally:
+            pane.HOME = saved
+            shutil.rmtree(home)
+        self.assertEqual([t['state'] for t in found].count('open'), 3)  # the newest real summary still decides
+        self.assertEqual(none, [])
+
+    def test_the_answers_fit_a_forty_column_pane(self):
+        (section,) = pane.lost_sections({'lost': pane.lost_found(SUMMARIES)}, 5000.0)
+        for text, _ in pane.lost_rows(section['items'][0], 40, {}, False):
+            self.assertLessEqual(len(re.sub(r'\x1b\[[0-9;]*m', '', text[0])), 40)
 
 if __name__ == '__main__':
     unittest.main()

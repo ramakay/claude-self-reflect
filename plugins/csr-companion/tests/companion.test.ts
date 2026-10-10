@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
 import { facts, freshChapter, median, spacing } from '../hooks/pace'
+import { addTerm, commands, gitVerdict, isBareDigit, NO_VERIFY, RELEASE, SAY_PUSH, saysPush } from '../hooks/coach'
 
 // The test runner has timers; the hooks environment's typings do not declare them.
 declare const setTimeout: (fn: () => void, ms: number) => unknown
@@ -52,6 +53,9 @@ type World = {
   herdr: boolean
   repo: boolean
   notes?: unknown[]
+  coach?: unknown[]
+  clock?: { now: number } // moved by a test; NOW where left out
+  unreadable?: string[] // files that are there but fail to read
   box?: string
   replies?: string[]
   brief?: string
@@ -61,8 +65,11 @@ type World = {
   sources?: Partial<Record<SettingsSource, Record<string, unknown>>>
   configDir?: string
   noNode?: boolean
+  compactFails?: boolean
+  lost?: unknown[] | string // what pane.py --lost prints (a string as is, 'hangs' a timeout); undefined makes it fail
 }
 const HOME = '/home/u'
+const MARKER = `${HOME}/.claude-self-reflect/csr-companion/compacting/sess-1.json`
 
 function host(on: On, world: World) {
   const runs: string[][] = []
@@ -71,6 +78,7 @@ function host(on: On, world: World) {
   const filled: string[] = []
   const forks: string[] = []
   const kept: Array<Record<string, unknown>> = []
+  const compacted: Array<string | undefined> = [] // the instructions each compaction reached core with
   const configured: Array<{ key: string; value: unknown }> = []
   const store = new Map<string, unknown>()
   const files = new Map<string, string>(Object.entries(world.files ?? {}))
@@ -79,8 +87,19 @@ function host(on: On, world: World) {
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
   on('clock.every', async () => ({ value: undefined }))
-  on('clock.now', async () => ({ value: NOW }))
-  on('session.compact', async (_$, e) => ({ messages: e.messages }) as never)
+  on('clock.now', async () => ({ value: world.clock?.now ?? NOW }))
+  const toasts: string[] = []
+  on('ui.toast', async (_$, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  const compacting: Array<string | undefined> = [] // the compaction marker as each compaction ran
+  on('session.compact', async (_$, e) => {
+    compacting.push(files.get(MARKER))
+    compacted.push(e.instructions)
+    if (world.compactFails) throw new Error('summary failed')
+    return { messages: e.messages } as never
+  })
   on('session.id', async () => ({ value: 'sess-1' }))
   on('session.cwd', async () => ({ value: '/repo' }))
   on('store.get', async (_$, e) => ({ value: store.get(e.key) }))
@@ -94,6 +113,7 @@ function host(on: On, world: World) {
   })
   on('fs.read', async (_$, e) => {
     if (e.path.endsWith('/csr-companion/bin/statusline.cjs')) return { value: SHIPPED } // the plugin's own copy
+    if (world.unreadable?.includes(e.path)) return { deny: `EACCES: ${e.path}` }
     const text = files.get(e.path)
     return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
   })
@@ -140,8 +160,21 @@ function host(on: On, world: World) {
   })
   on('process.run', async (_$, e) => {
     runs.push([...e.argv])
+    if (e.argv[0] === 'rm') {
+      for (const path of e.argv.slice(2)) files.delete(path)
+      return ok('')
+    }
     if (e.argv[0] === 'node' && world.noNode) return { value: { exitCode: 127, stdout: '', stderr: 'node: not found', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'python3' && e.argv.includes('--note')) return ok(JSON.stringify(world.notes ?? []))
+    if (e.argv[0] === 'python3' && e.argv.includes('--coach')) return ok(JSON.stringify(world.coach ?? []))
+    if (e.argv[0] === 'python3' && e.argv.includes('--lost')) {
+      if (world.lost === 'hangs') { // process.run rejects past timeoutMs; without the 2 s limit it 'answers' instead
+        if (e.init?.timeoutMs !== 2000) return ok(JSON.stringify([{ text: 'no time limit passed', state: 'lost' }]))
+        return { deny: 'timed out after 2000 ms' }
+      }
+      if (typeof world.lost === 'string') return ok(world.lost)
+      return world.lost ? ok(JSON.stringify(world.lost)) : { value: { exitCode: 1, stdout: '', stderr: 'boom', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (e.argv[0] === 'python3' && e.argv.includes('--brief')) return ok(world.brief ?? BRIEF)
     if (e.argv[0] === 'python3' && e.argv.includes('--keep')) {
       kept.push(JSON.parse(e.argv[e.argv.indexOf('--keep') + 1] ?? '{}'))
@@ -169,7 +202,7 @@ function host(on: On, world: World) {
     opened.push(e.id)
     return { value: { isPlaced: true } }
   })
-  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes }
+  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted }
 }
 
 async function settle(done: () => boolean | Promise<boolean>) {
@@ -711,4 +744,281 @@ test('session start brings a stale stable wrapper up to date, and never makes on
   await settle(() => seen.files.get(STABLE) === SHIPPED)
   expect(seen.files.get(STABLE)).toBe(SHIPPED)
   expect(seen.writes).toEqual([STABLE])
+})
+
+test('a compaction leaves a marker while it runs and removes it when it ends', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  await $.session.compact({ trigger: 'manual', messages: MESSAGES } as never)
+
+  expect(JSON.parse(seen.compacting[0] ?? '{}')).toEqual({ at: NOW / 1000, trigger: 'manual' })
+  expect(seen.files.has(MARKER)).toBe(false)
+})
+
+test('the marker goes also when the compaction fails', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, compactFails: true })
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never).catch(() => undefined)
+
+  expect(seen.compacting.length).toBeGreaterThan(0)
+  expect(seen.compacting.every(marker => JSON.parse(marker ?? '{}').trigger === 'auto')).toBe(true)
+  expect(seen.files.has(MARKER)).toBe(false)
+})
+
+test('a precompute or a subagent leaves no marker', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  await $.session.compact({ trigger: 'precompute', messages: MESSAGES } as never)
+  await $.session.compact({ trigger: 'manual', agentId: 'sub-1', messages: MESSAGES } as never)
+
+  expect(seen.compacting).toEqual([undefined, undefined])
+  expect(seen.writes.some(path => path.includes('/compacting/'))).toBe(false)
+})
+
+// ---------------------------------------------------------------- coaching and the push guard
+
+const TERM_NOTE = {
+  id: 'term:quokka',
+  kind: 'term',
+  file: '',
+  line: 'You said “quokka” in 2 sessions and Claude looked it up each time. Define it once?',
+  title: 'Define “quokka” once',
+  text: '- quokka: said in 2 sessions, each time Claude looked it up (e.g. “call quokka now”). Edit this line to say what you mean.',
+  sketch: [],
+  symbol: null,
+  oid: null,
+  conversation: '',
+  at: 1,
+}
+const CLAUDE_MD = `${HOME}/.claude/CLAUDE.md`
+const HUMAN = { kind: 'composer' }
+
+test('a coaching note names a word you said in 2 sessions, writes nothing, and adds the line only on 1', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, coach: [TERM_NOTE], files: { [CLAUDE_MD]: '# Prefs\n\n## Core\n- be brief\n' } })
+  const band = await $.ui.mount(BAND)
+  await $.session.start(START as never)
+  await settle(async () => (await band.find({ text: /You said “quokka”/ })) !== undefined)
+
+  expect(await band.find({ text: /Coaching/ })).toBeDefined()
+  expect(await band.find({ type: 'Button', text: 'Add to CLAUDE.md' })).toBeDefined()
+  expect(seen.runs.find(argv => argv.includes('--coach'))).toEqual(expect.arrayContaining(['--coach']))
+  expect(seen.writes.includes(CLAUDE_MD)).toBe(false) // shown is not written
+
+  await band.press({ key: 'Add to CLAUDE.md' })
+  expect(seen.files.get(CLAUDE_MD)).toBe(`# Prefs\n\n## Core\n- be brief\n\n## Terms\n${TERM_NOTE.text}\n`)
+  expect(seen.toasts.some(text => text.includes('CLAUDE.md'))).toBe(true)
+  expect(await band.find({ text: /You said “quokka”/ })).toBeUndefined()
+  expect(seen.store.get('coached')).toEqual(['term:quokka'])
+
+  await $.session.start(START as never) // once: the same word is not offered again
+  await settle(() => false)
+  expect(await band.find({ text: /You said “quokka”/ })).toBeUndefined()
+})
+
+test('dismissing a coaching note leaves CLAUDE.md alone', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, coach: [TERM_NOTE], files: { [CLAUDE_MD]: '# Prefs\n' } })
+  const band = await $.ui.mount(BAND)
+  await $.session.start(START as never)
+  await settle(async () => (await band.find({ text: /You said “quokka”/ })) !== undefined)
+  await band.press({ key: 'Dismiss' })
+  expect(await band.find({ text: /You said “quokka”/ })).toBeUndefined()
+  expect(seen.files.get(CLAUDE_MD)).toBe('# Prefs\n')
+})
+
+test('addTerm puts a line under an existing Terms heading, makes one if missing, and never repeats', () => {
+  expect(addTerm('# A\n', '- x: y')).toBe('# A\n\n## Terms\n- x: y\n')
+  expect(addTerm('', '- x: y')).toBe('## Terms\n- x: y\n')
+  expect(addTerm('# A\n## Terms\n- a: b\n\n## Next\ntext\n', '- x: y')).toBe('# A\n## Terms\n- a: b\n- x: y\n\n## Next\ntext\n')
+  expect(addTerm('# A\n## Terms\n- a: b\n', '- x: y')).toBe('# A\n## Terms\n- a: b\n- x: y\n')
+  expect(addTerm('## Terms\n- x: y\n', '- x: y')).toBe('## Terms\n- x: y\n')
+})
+
+test('a bare digit just after a band note is held with a toast; the same digit again within 10 s goes through', async ($, on) => {
+  const clock = { now: NOW }
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], clock })
+  const band = await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/src/hooks/mod.rs' } as never)
+  await settle(async () => (await band.find({ text: /changed in ca5655a/ })) !== undefined)
+  expect(isBareDigit(' 2 ')).toBe(true)
+
+  clock.now = NOW + 2_000
+  const first = await $.prompt.submit({ text: '2', origin: HUMAN } as never)
+  expect(first.drop).toContain('looks like a band hotkey')
+  expect(seen.toasts).toEqual([first.drop])
+  expect(first.drop).toContain('send it again within 10 s')
+
+  clock.now = NOW + 8_000 // 6 s later: the same digit goes through
+  const again = await $.prompt.submit({ text: '2', origin: HUMAN } as never)
+  expect(again.drop).toBeUndefined()
+  expect(again.text).toBe('2')
+
+  clock.now = NOW + 9_000 // held is spent: a third one is held again
+  expect((await $.prompt.submit({ text: '2', origin: HUMAN } as never)).drop).toBeDefined()
+  expect(seen.store.get('answers')).toEqual([expect.objectContaining({ answer: 'shown' })]) // nothing counted as typed past
+})
+
+test('a digit sent again after 10 s is held again; more than a digit, or no band, or 30 s later, is never held', async ($, on) => {
+  const clock = { now: NOW }
+  host(on, { herdr: false, repo: true, notes: [NOTE], clock })
+  const band = await $.ui.mount(BAND)
+  const plain = await $.prompt.submit({ text: '2', origin: HUMAN } as never) // no band yet
+  expect(plain.drop).toBeUndefined()
+
+  await $.tool.call({ tool: 'Read', file_path: '/repo/src/hooks/mod.rs' } as never)
+  await settle(async () => (await band.find({ text: /changed in ca5655a/ })) !== undefined)
+  clock.now = NOW + 1_000
+  expect((await $.prompt.submit({ text: '2', origin: HUMAN } as never)).drop).toBeDefined()
+  clock.now = NOW + 12_000 // past the 10 s window
+  expect((await $.prompt.submit({ text: '2', origin: HUMAN } as never)).drop).toBeDefined()
+  for (const text of ['22', '2 please', 'yes', '']) expect((await $.prompt.submit({ text, origin: HUMAN } as never)).drop).toBeUndefined()
+  clock.now = NOW + 31_000 // the band showed over 30 s ago
+  expect((await $.prompt.submit({ text: '3', origin: HUMAN } as never)).drop).toBeUndefined()
+})
+
+test('the push guard: --no-verify and release/v* are denied; other pushes wait for the word push', async ($, on) => {
+  const clock = { now: NOW }
+  host(on, { herdr: false, repo: true, clock })
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as never) as Promise<{ deny?: string; result?: unknown }>
+
+  expect((await bash('git commit --no-verify -m wip')).deny).toBe(NO_VERIFY)
+  expect((await bash('git push origin HEAD:release/v9.5.9')).deny).toBe(RELEASE)
+  expect((await bash('git status')).deny).toBeUndefined()
+  expect((await bash('echo "git push origin main"')).deny).toBeUndefined()
+
+  const push = 'git push origin main'
+  expect((await bash(push)).deny).toBe(SAY_PUSH)
+  expect((await bash(push)).deny).toBe(SAY_PUSH) // saying nothing does not change it
+  await $.prompt.submit({ text: 'push', origin: { kind: 'peer' } } as never) // a peer's word is not yours
+  expect((await bash(push)).deny).toBe(SAY_PUSH)
+  await $.prompt.submit({ text: 'ok push it', origin: HUMAN } as never)
+  clock.now = NOW + 30_000
+  expect((await bash('git push --force origin other')).deny).toBe(SAY_PUSH) // not the command that was asked about
+  expect((await bash(push)).deny).toBeUndefined() // the identical command, within 60 s of the word
+  expect((await bash('git push origin HEAD:release/v9')).deny).toBe(RELEASE) // release/v* is never let through
+
+  clock.now = NOW + 120_000 // a minute after the word
+  expect((await bash(push)).deny).toBe(SAY_PUSH)
+})
+
+test('gitVerdict reads git as a command word, not git in words', () => {
+  const kind = (c: string) => gitVerdict(c)?.kind ?? null
+  const reason = (c: string) => {
+    const v = gitVerdict(c)
+    return v?.kind === 'deny' ? v.reason : null
+  }
+  for (const c of ['git commit --no-verify -m x', 'git push --no-verify', 'git -C /r merge --no-verify topic', 'cd r && git commit -n -m x'])
+    expect(reason(c)).toBe(NO_VERIFY)
+  for (const c of [
+    'git push origin release/v9.5.9', 'git push origin HEAD:release/v9', 'git push origin refs/heads/release/v9',
+    'git push origin +HEAD:refs/heads/release/v9', 'git push --all', 'git push --mirror origin', 'git push -u origin release/v10',
+    'git -C /repo push origin HEAD:release/v1', 'FOO=1 git push origin release/v2', 'bash -c "git push origin release/v3"',
+  ])
+    expect(reason(c)).toBe(RELEASE)
+  for (const c of ['git push', 'git push origin main', 'git push -u origin feature/x', 'echo hi && git push origin backport/x', 'sudo git push origin main', '(git push origin main)', 'sh -c \'git push origin main\'', 'git push origin main 2>&1 | tail -3'])
+    expect(kind(c)).toBe('ask')
+  for (const c of [
+    'ls', 'git status', 'git log --oneline', 'git commit -m "git push --no-verify"', 'git commit -m "mention release/v9 push"',
+    'echo git push origin main', 'echo "git push origin main"', 'grep "git push" notes.md', 'git push --dry-run origin main',
+    "cat <<'EOF'\ngit push origin release/v9\ngit commit --no-verify\nEOF", 'echo hi # git push origin main',
+    'git pull origin release/v9', 'git checkout release/v9', 'git commit -m "x" --amend', 'git stash push',
+  ])
+    expect(kind(c)).toBe(null)
+  expect(commands('a "b c" && d; e | f')).toEqual([['a', 'b c'], ['d'], ['e'], ['f']])
+})
+
+test('commit -n is read as git reads it: in a cluster, never inside an option value or after --', () => {
+  const kind = (c: string) => gitVerdict(c)?.kind ?? null
+  for (const c of ['git commit -an -m x', 'git commit -nm x', 'git commit -m x -n']) expect(kind(c)).toBe('deny')
+  for (const c of ['git commit -uno -m x', 'git commit -m n', 'git commit -mn', 'git commit -m x -- -n', 'git commit -F notes -S'])
+    expect(kind(c)).toBe(null)
+})
+
+test('the word push: "don\'t push" and the like are not the word, and one word lets one push through', async ($, on) => {
+  for (const text of ['push', 'ok push it', 'you have my approval to push', 'Push.']) expect(saysPush(text)).toBe(true)
+  for (const text of ["don't push yet", 'do not push', 'never push to main', 'commit but no push', 'without pushing', 'pushed already', 'pushy'])
+    expect(saysPush(text)).toBe(false)
+
+  const clock = { now: NOW }
+  host(on, { herdr: false, repo: true, clock })
+  const bash = (command: string) => $.tool.call({ tool: 'Bash', command } as never) as Promise<{ deny?: string }>
+  const push = 'git push origin main'
+  await $.prompt.submit({ text: "don't push yet", origin: HUMAN } as never)
+  expect((await bash(push)).deny).toBe(SAY_PUSH)
+  await $.prompt.submit({ text: 'push', origin: HUMAN } as never)
+  expect((await bash(push)).deny).toBeUndefined()
+  expect((await bash(push)).deny).toBe(SAY_PUSH) // spent: the next push asks again
+})
+
+test('a CLAUDE.md that is there but cannot be read is never written over', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, coach: [TERM_NOTE], files: { [CLAUDE_MD]: '# Prefs\n' }, unreadable: [CLAUDE_MD] })
+  const band = await $.ui.mount(BAND)
+  await $.session.start(START as never)
+  await settle(async () => (await band.find({ text: /You said “quokka”/ })) !== undefined)
+  await band.press({ key: 'Add to CLAUDE.md' })
+  expect(seen.files.get(CLAUDE_MD)).toBe('# Prefs\n')
+  expect(seen.writes.includes(CLAUDE_MD)).toBe(false)
+  expect(await band.find({ text: /Couldn't write your CLAUDE.md/ })).toBeDefined()
+})
+
+const THREADS = [
+  { text: 'Awaiting the user’s go on the push guard.', state: 'lost', waiting: true },
+  { text: 'Fix the importer: remove the old cache.', state: 'open', waiting: false },
+]
+
+test('prep-compact adds the open and lost threads to the compaction instructions', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: THREADS })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: MESSAGES } as never)
+  const told = seen.compacted.at(-1) ?? ''
+  expect(told.startsWith('keep the plan\n\nCarry these open threads into Pending Tasks, one line each, unless the conversation closed them:')).toBe(true)
+  expect(told).toContain('- Awaiting the user’s go on the push guard. (waiting on the user)')
+  expect(told).toContain('- Fix the importer: remove the old cache.')
+  const asked = seen.runs.find(run => run.includes('--lost'))
+  expect(asked).toEqual(expect.arrayContaining(['python3', '-I', '--repo', '/repo', '--lost', '--sid', 'sess-1']))
+})
+
+test('prep-compact holds the block to eight threads and 1200 characters', async ($, on) => {
+  const many = Array.from({ length: 20 }, (_, k) => ({ text: `Thread ${k} ${'x'.repeat(200)}`, state: 'lost', waiting: false }))
+  const seen = host(on, { herdr: false, repo: true, lost: many })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never)
+  const told = seen.compacted.at(-1) ?? ''
+  expect(told.length).toBeLessThanOrEqual(1200)
+  expect(told.split('\n').length - 1).toBeLessThanOrEqual(8)
+  expect(told).toContain('Thread 0 ')
+})
+
+test('prep-compact fails open: a pane.py that fails, or has no threads, leaves the compaction as it was', async ($, on) => {
+  const failing = host(on, { herdr: false, repo: true })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: MESSAGES } as never)
+  expect(failing.compacted.at(-1)).toBe('keep the plan')
+  await $.session.compact({ trigger: 'manual', messages: MESSAGES } as never)
+  expect(failing.compacted.at(-1)).toBeUndefined()
+})
+
+test('prep-compact leaves a compaction with no threads to carry unchanged', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: [] })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: MESSAGES } as never)
+  expect(seen.compacted.at(-1)).toBe('keep the plan')
+})
+
+test('prep-compact fails open on a pane.py that times out or prints no JSON, and passes its two-second limit', async ($, on) => {
+  const hung = host(on, { herdr: false, repo: true, lost: 'hangs' })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: MESSAGES } as never)
+  expect(hung.compacted.at(-1)).toBe('keep the plan')
+})
+
+test('prep-compact leaves a compaction unchanged when pane.py prints something that is not JSON', async ($, on) => {
+  const garbled = host(on, { herdr: false, repo: true, lost: 'Traceback (most recent call last)' })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'auto', messages: MESSAGES } as never)
+  expect(garbled.compacted.at(-1)).toBeUndefined()
+  expect(garbled.compacted.length).toBe(1)
+})
+
+test('prep-compact also carries the threads into a compaction made ahead of time', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: THREADS })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'precompute', messages: MESSAGES } as never)
+  expect(seen.compacted.at(-1) ?? '').toContain('Carry these open threads into Pending Tasks')
 })

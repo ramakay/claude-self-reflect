@@ -11,7 +11,7 @@ report, in its own tint beside a pixel isometric icon:
   l: Changed since     every commit under your past sessions (Claude gets a Heads up there).
 
   pane.py --repo PATH --json                    status counts + rows, for the mod
-  pane.py --repo PATH --watch [--sid ID] [--agent PANE]  full-screen pane: d main, l log, q quits;
+  pane.py --repo PATH --watch [--sid ID] [--agent PANE]  full-screen pane: d main, l log, s summary, q quits;
       a click opens a row, a second click puts it in Claude's prompt (herdr pane PANE)
   pane.py --repo PATH --png DIR [--sid ID]    write the pane's pictures, for a look
   pane.py --repo PATH --note FILE [--sid ID]  what CSR remembers about FILE, as notes for the band
@@ -25,6 +25,7 @@ import fcntl
 import glob
 import io
 import json
+import math
 import os
 import re
 import select
@@ -334,6 +335,146 @@ def claude_status(session_id, now):
         return line if line and now - float(kept.get('at') or 0) < 86400 else None
     except (OSError, ValueError, TypeError, AttributeError):
         return None
+
+
+# ---------------------------------------------------------------- the masthead's clocks
+
+def claude_fields(session_id, now):
+    """The raw fields the status line wrapper kept beside the line (prompt_cache, rate_limits,
+    context_window); {} when there are none or they are a day old. Like the line, an idle session's
+    fields are old and still right: the clocks inside them are absolute times."""
+    try:
+        with open(kept_file(STATUS_LINES, session_id) or '', encoding='utf-8') as handle:
+            kept = json.load(handle)
+        fields = kept.get('fields')
+        return fields if isinstance(fields, dict) and now - float(kept.get('at') or 0) < 86400 else {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def seconds_of(value):
+    """A time Claude Code gave as epoch seconds, or as a date and time; None when it is neither, or is not
+    a time a clock could show (past the year 9999, before 1970)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        value = float(value) / 1000 if value > 1e11 else float(value)  # milliseconds, in case
+    elif isinstance(value, str):
+        value = epoch(value)
+    else:
+        return None
+    return value if value is not None and math.isfinite(value) and 0 <= value < 253402300000 else None
+
+
+def percent_of(value):
+    """A number as the status line gave it; None for anything else, a NaN or an infinity."""
+    ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    return value if ok else None
+
+
+def cache_clock(cache, now):
+    """The prompt cache as a clock: how long it stays warm, or how much the next turn re-reads once cold.
+    (text, ink name) or None when the status line told nothing about it."""
+    if not isinstance(cache, dict):
+        return None
+    expires, warm, cold_cost = seconds_of(cache.get('expires_at')), cache.get('warm'), percent_of(cache.get('recache_tokens_if_cold'))
+    if warm is False or (expires is not None and expires <= now):
+        return ('cache cold' + (f' · re-reads ~{short(cold_cost)}' if cold_cost and cold_cost > 0 else ''), 'turn')
+    if expires is not None and expires - now > 86400:
+        expires = None  # no prompt cache lives a day: that clock is wrong, so say only that it is warm
+    if expires is None:
+        return ('cache warm' + (f' · {cache["ttl"]}' if isinstance(cache.get('ttl'), str) else ''), None) if warm else None
+    left = expires - now
+    return (f'cache warm · {span(left)} left' if left >= 60 else 'cache warm · under 1m left', None if left >= 300 else 'dream')
+
+
+def quota_pieces(limits, now):
+    """The plan's two windows as "5h 34%"; above 70% with the time the window resets, in ink that warns."""
+    pieces = []
+    for key, label in (('five_hour', '5h'), ('seven_day', '7d')):
+        window = (limits or {}).get(key) if isinstance(limits, dict) else None
+        used = percent_of(window.get('used_percentage')) if isinstance(window, dict) else None
+        if used is None:
+            continue
+        resets = seconds_of(window.get('resets_at'))
+        if resets is not None and resets <= now:
+            continue  # that window has rolled over since the status line last ran: the number is old
+        text = f'{label} {round(used)}%'
+        if used > 70 and resets is not None:
+            try:
+                when = datetime.fromtimestamp(resets)
+                text += ' resets ' + when.strftime('%H:%M' if resets - now < 86400 else '%a %H:%M')
+            except (OverflowError, OSError, ValueError):
+                pass  # a reset time this machine cannot show: the percentage alone
+        pieces.append((text, 'turn' if used >= 90 else 'dream' if used > 70 else None))
+    return pieces
+
+
+def masthead(fields, now):
+    """The masthead's clock rows, each a list of (text, ink name) pieces: the cache clock, then the quotas.
+    A row with nothing in it is left out; missing fields draw nothing."""
+    fields = fields if isinstance(fields, dict) else {}
+    clock = cache_clock(fields.get('prompt_cache'), now)
+    return [row for row in ([clock] if clock else [], quota_pieces(fields.get('rate_limits'), now)) if row]
+
+
+def fit_pieces(text, width):
+    """The ' · '-joined pieces of text that fit width, the rightmost dropped first."""
+    pieces = text.split(' · ')
+    while len(pieces) > 1 and len(' · '.join(pieces)) > width:
+        pieces.pop()
+    return fit(' · '.join(pieces), width)
+
+
+def mast_rows(rows, width):
+    """The clock rows as lines for the dark masthead: pieces dropped right to left to fit, a piece's ink
+    where it has one, a dim middle dot between."""
+    hue = lambda name: '\x1b[38;2;%d;%d;%dm' % ON_DARK[name][:3]
+    lines = []
+    for pieces in rows or ():
+        pieces = list(pieces)
+        while len(pieces) > 1 and len(' · '.join(text for text, _ in pieces)) > width:
+            pieces.pop()
+        pieces[0] = (fit(pieces[0][0], width), pieces[0][1])
+        dot = f' {hue("label")}·{OFF} '
+        lines.append(' ' + dot.join((hue(name) if name else '') + text + OFF for text, name in pieces))
+    return lines
+
+
+# One compaction's cost, in input tokens: the post-compaction context written to cache at twice the price of
+# reading, the summary written out at five times, and the context re-read once to be summarised. Each later
+# turn then re-reads (context - floor) fewer tokens at a tenth of the price. The floor is this session's own
+# median post-compaction size (statusline.js assumed 70k; this pane's sessions measure 17k to 25k).
+SUMMARY_OUT = 4500  # tokens of summary text a compaction writes
+PAYBACK_UNDER = 15  # a longer payback than this is not worth saying
+FLOOR_GUESS = 20000  # post-compaction size when a session's own sizes are missing
+
+
+def compaction_payback(sizes, context):
+    """(turns to break even, this session's median post size, its median compaction seconds) for compacting
+    now, from the session's (pre, post, ms) rows; None with no history, or when it would not pay back."""
+    posts = sorted(p for _, p, _ in sizes if isinstance(p, (int, float)) and p > 0)
+    if not posts or not context:
+        return None
+    floor = posts[len(posts) // 2] if len(posts) % 2 else (posts[len(posts) // 2 - 1] + posts[len(posts) // 2]) / 2
+    saved = (context - floor) * 0.1
+    if saved <= 0:
+        return None
+    turns = (floor * 2 + SUMMARY_OUT * 5 + context * 0.1) / saved
+    if turns > PAYBACK_UNDER:
+        return None
+    spent = sorted(m for _, _, m in sizes if isinstance(m, (int, float)) and m > 0)
+    return max(1, round(turns)), floor, spent[len(spent) // 2] / 1000 if spent else None
+
+
+def payback_phrase(s):
+    """"compact repays in ~6t" for the facts row, from this session's compaction rows and its context since
+    the last one; '' when there is no compaction history or no payback."""
+    sizes = s.get('compact_sizes') or []
+    since = max(s.get('compacts') or [0])
+    later = [r for r in s.get('replies') or [] if r[0] > since]
+    found = compaction_payback(sizes, max(later)[1] if later else 0)  # the newest reply's context
+    return f'compact repays in ~{found[0]}t' if found else ''
 
 
 def dreams_on():
@@ -811,10 +952,12 @@ class Session:
         self.offset = 0
         self.replies = {}  # message id -> (time, context tokens, output tokens)
         self.prompts, self.compacts, self.asked, self.questions = [], [], [], []
+        self.compact_sizes = []  # (tokens before, tokens after, ms) of each compaction
         self.tools, self.files, self.edited = Counter(), Counter(), set()
         self.shell, self.last = Counter(), {}  # files a command named; when Claude last handled each
         self.talk = []  # (time, words) the person typed or Claude wrote, newest last; no tool output
         self.title = None
+        self.summaries = []  # (time, text) of each compaction summary, oldest first
 
     def read_transcript(self):
         if not self.path:
@@ -871,6 +1014,12 @@ class Session:
                     self.prompts.append(when)
                     if not entry.get('isSidechain'):
                         self.talk.append((when, own_words('\n'.join(texts))))
+            elif kind == 'user' and when and entry.get('isCompactSummary'):
+                content = (entry.get('message') or {}).get('content')
+                text = content if isinstance(content, str) else '\n'.join(
+                    str(p.get('text') or '') for p in content or [] if isinstance(p, dict) and p.get('type') == 'text')
+                if text.strip():  # an empty one says nothing about what dropped out
+                    self.summaries.append((when, text))
             elif kind == 'attachment' and when:
                 queued = entry.get('attachment') or {}
                 text = str(queued.get('prompt') or '').strip()
@@ -879,6 +1028,8 @@ class Session:
                     self.prompts.append(when)
             elif kind == 'system' and entry.get('subtype') == 'compact_boundary' and when:
                 self.compacts.append(when)
+                meta = entry.get('compactMetadata') if isinstance(entry.get('compactMetadata'), dict) else {}
+                self.compact_sizes.append((meta.get('preTokens'), meta.get('postTokens'), meta.get('durationMs')))
             elif kind == 'ai-title' and entry.get('aiTitle'):
                 self.title = entry['aiTitle']
         del self.talk[:-200]
@@ -912,7 +1063,8 @@ class Session:
             con.close()
         replies = sorted(self.replies.values())
         return dict(id=self.id, title=self.title, replies=replies, prompts=sorted(self.prompts),
-                    compacts=sorted(self.compacts), asked=sorted(self.asked), tools=self.tools, learned=learned,
+                    compacts=sorted(self.compacts), compact_sizes=self.compact_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
+                    lost=lost_found(self.summaries),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last))
 
@@ -1012,6 +1164,7 @@ SECTION = dict(session='you', touching='ctx', risk='turn', rules='sepia', dreams
                changed='quiet', remembered='recall', kept='turn', story='ctx')
 GLYPH = dict(session='◉', touching='‹›', risk='~', rules='◆', dreams='☾', memory='↑', changed='~', remembered='↑',
              kept='◆', story='§')  # where no pictures are drawn
+SECTION['coach'], GLYPH['coach'] = 'ctx', '→'  # How Claude read you
 DARK = (PIGMENT['payne'], PIGMENT['night'])  # the masthead's ground, from its first row (Claude's own status
 # line) to its last (the gauges' legend), each row a step darker in CIELAB; payne sits clear of a dark
 # terminal's own ground (herdr's is 40), so the masthead keeps its edge.
@@ -1021,7 +1174,7 @@ ON_DARK = dict(text=PIGMENT['chalk'], label=blend(PIGMENT['chalk'], PIGMENT['pay
                rule=(255, 255, 255, 40))
 TINT = 0.15  # an opened row: its section's ink at this strength on the paper
 HEAD = 0.10  # a section's heading row
-ROW = 0.04  # its items, one tint for all of them
+ROW = 0.07  # its items, one tint for all of them; deep enough to read as a card, still under HEAD
 STAR_DEPTH = 1.5  # What if…, the star: its tints this much deeper
 SS = 2  # draw at twice the size, then shrink: PIL draws no anti-aliased edges
 
@@ -1208,6 +1361,16 @@ def iso_icon(name):
 
 
 _ICONS = {}
+SHADOW = (2, 1)  # an icon's cast shadow: its outline this many pixel-art cells right and down
+SHADOW_ALPHA = 56  # 22% black
+
+
+def cast_shadow(icon):
+    """The icon's outline in 22% black, hard-edged like the icon: the shadow a pixel-art drawing casts."""
+    from PIL import Image
+    shadow = Image.new('RGBA', icon.size, (0, 0, 0, 0))
+    shadow.paste((0, 0, 0, SHADOW_ALPHA), mask=icon.getchannel('A').point(lambda a: 255 if a else 0))
+    return shadow
 
 
 def iso_png(name, cell, backs):
@@ -1222,7 +1385,9 @@ def iso_png(name, cell, backs):
     icon = iso_icon(name)
     k = max(1, min((w - 4) // icon.width, (h - 4) // icon.height))
     icon = icon.resize((icon.width * k, icon.height * k), Image.NEAREST)
-    image.alpha_composite(icon, ((w - icon.width) // 2, (h - icon.height) // 2))
+    x, y = (w - icon.width) // 2, (h - icon.height) // 2
+    image.alpha_composite(cast_shadow(icon), (x + SHADOW[0] * k, y + SHADOW[1] * k))
+    image.alpha_composite(icon, (x, y))
     out = io.BytesIO()
     image.save(out, 'PNG')
     _ICONS[key] = out.getvalue()
@@ -1249,6 +1414,10 @@ def tint(name, strength=TINT):
 def band(name, strength=TINT):
     r, g, b = tint(name, strength)
     return f'\x1b[48;2;{r};{g};{b}m'
+
+
+FAINT = 3.0  # the meta type's floor: pencil read at 3:1 on paper, and stays there on the items' deeper tint
+INK['faint'] = readable(INK['faint'], min((tint(name, ROW) for name in SECTION), key=lambda c: to_lab(c)[0]), FAINT)
 
 
 COLOUR = re.compile(r'\x1b\[[0-9;]*m')
@@ -1290,6 +1459,17 @@ def dark_steps(n):
     """n grounds stepping evenly, in CIELAB, from the masthead's first shade to its last."""
     top, bottom = DARK
     return [blend(top, bottom, i / max(1, n - 1)) for i in range(n)]
+
+
+LIP_ROWS = 30  # the lip under the masthead shows when the pane is at least this tall
+
+
+def masthead_lip(rows):
+    """One bare row between the masthead and the first section, between their two grounds: the soft edge a
+    shadow would give. None where the pane is too short to spare the row."""
+    if rows < LIP_ROWS:
+        return []
+    return [tinted('', '\x1b[48;2;%d;%d;%dm' % blend(DARK[1], PAPER, 0.6))]
 
 
 def on_dark(line, ground):
@@ -1347,6 +1527,14 @@ def fit_blocks(out, blocks, room, ui, tail=True):
     return out
 
 
+def card_edge(rows, name, indent):
+    """An opened block as a card: each row on the deep tint with a left border cell in the section's ink,
+    just left of the text; the bottom row steps back to the items' tint (page_lines tints it as a plain row)."""
+    edge = ink(SECTION[name]) + '▌' + OFF
+    lines = [row[:indent - 1] + edge + row[indent:] for row in rows]
+    return [tinted(line, band(name)) for line in lines[:-1]] + lines[-1:]
+
+
 def opened(rows, name, detail, width, ui, key, indent=None):
     """A row a click opened: its whole text, what more CSR knows, and what a second click does."""
     sent = ui.get('sent')
@@ -1358,7 +1546,7 @@ def opened(rows, name, detail, width, ui, key, indent=None):
     room = width - indent
     more = [' ' * indent + DIM + line + OFF for text in detail for line in wrap(text, room, 2)][:4]
     last = ' ' * indent + ink(SECTION[name]) + fit(hint, room) + OFF
-    return [tinted(row, band(name)) for row in rows + more + [last]]
+    return card_edge(rows + more + [last], name, indent)
 
 
 STAR = ink('asked') + '☾' + OFF  # CSR's mark, as in the band above Claude's prompt
@@ -1561,13 +1749,242 @@ def short_path(rel, parts=3):
     return '/'.join(rel.split('/')[-parts:])
 
 
+# ---------------------------------------------------------------- coaching: how Claude read you
+
+QUOTE = r'[“"]([^”"]{1,120})[”"]'
+TYPO = re.compile(QUOTE + r'\s+(?:is|was)\s+most\s+likely\s+a\s+typo\s+for\s+' + QUOTE, re.I)
+UNCLEAR = re.compile(QUOTE + r'\s*\(unclear\)', re.I)
+SAID_AS = re.compile(QUOTE + r'\s*[—–-]*\s*(?:interpreted|read)\s+as:?\s*(.+)', re.I)
+MARKED = re.compile(r'Interpreted as:|Read as:|\(unclear\)|most likely a typo for', re.I)  # a compaction summary's
+FIRST_WORDS = re.compile(r'checking what [“"][^”"]+[”"] maps to|I[\'’]ll interpret [“"][^”"]+[”"] as|'
+                         r'reading (?:this|it) as|most plausibly refers to|typo for', re.I)  # Claude's first sentence
+INTERPRET = re.compile(r'I[\'’]ll interpret ' + QUOTE + r' as\s+(.+)', re.I)
+_READINGS = {}  # transcript -> where the last read stopped, what it found, whether a prompt awaits Claude's words
+
+
+def reading_in(line, marks):
+    """How Claude read you in one line, or None: the words, what it read them as, the line trimmed.
+    Parsed when the line says it in a shape the pane knows; otherwise the whole line, for a click to open."""
+    line = ' '.join(line.split()).lstrip('-*• ').strip()
+    if not marks.search(line):
+        return None
+    for pattern, shape in ((TYPO, lambda m: (m[1], m[2])), (INTERPRET, lambda m: (m[1], m[2].split('. ')[0].rstrip('.'))),
+                           (SAID_AS, lambda m: (m[1], m[2].split('. ')[0].rstrip('.'))),
+                           (UNCLEAR, lambda m: (m[1], ''))):
+        found = pattern.search(line)
+        if found:
+            words, read = shape(found)
+            return dict(words=words.strip(), read=read.strip(), line=line)
+    return dict(words='', read='', line=line)
+
+
+def how_claude_read(session_id, most=2):
+    """This session's newest readings, newest first: lines of its compaction summaries that say how Claude
+    read your words (Interpreted as: · Read as: · "(unclear)" · most likely a typo for), and the first
+    sentence of a reply that says so. Read on from where the last look stopped; no model calls."""
+    found = glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl')) \
+        if session_id and re.fullmatch(r'[\w-]+', session_id) else []
+    if not found:
+        return []
+    state = _READINGS.setdefault(found[0], dict(offset=0, found=[], waiting=False))
+    try:
+        if os.path.getsize(found[0]) < state['offset']:  # written anew: read it again from the top
+            state.update(offset=0, found=[], waiting=False)
+        with open(found[0], 'rb') as handle:
+            handle.seek(state['offset'])
+            block = handle.read()
+    except OSError:
+        return []
+    end = block.rfind(b'\n') + 1
+    state['offset'] += end
+    for raw in block[:end].splitlines():
+        summary = b'"isCompactSummary":true' in raw
+        typed = b'"type":"user"' in raw and b'"tool_use_id"' not in raw
+        if not (summary or typed or (state['waiting'] and b'"type":"assistant"' in raw)):
+            continue
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        message = entry.get('message') if isinstance(entry, dict) else None
+        if not isinstance(message, dict):  # a line of some other shape: not a turn
+            continue
+        when = epoch(entry.get('timestamp')) or 0
+        content = message.get('content')
+        texts = [content] if isinstance(content, str) else [
+            p['text'] for p in content if isinstance(p, dict) and p.get('type') == 'text' and isinstance(p.get('text'), str)
+        ] if isinstance(content, list) else []
+        if entry.get('type') == 'user' and entry.get('isCompactSummary'):
+            for line in '\n'.join(texts).splitlines():
+                read = reading_in(line, MARKED)
+                if read and not any(x['line'] == read['line'] for x in state['found']):
+                    state['found'].append(dict(read, when=when, source='compaction'))
+        elif entry.get('type') == 'user' and not entry.get('isMeta') and not entry.get('isSidechain'):
+            state['waiting'] = any(t.strip() and not t.lstrip().startswith(('<', '/')) for t in texts)
+        elif entry.get('type') == 'assistant' and not entry.get('isSidechain') and any(t.strip() for t in texts):
+            state['waiting'] = False
+            first = re.split(r'(?<=[.!?])\s|\n', next(t for t in texts if t.strip()).strip(), maxsplit=1)[0]
+            read = reading_in(first, FIRST_WORDS)
+            if read:
+                state['found'].append(dict(read, when=when, source='reply'))
+    del state['found'][:-20]
+    return state['found'][::-1][:most]
+
+
+def reading_items(readings, now):
+    """The "How Claude read you" rows: “dknr” → read as “done” where it parsed, else the marked line
+    trimmed. A click opens the whole line; a second puts the check in Claude's prompt."""
+    items = []
+    for r in readings:
+        words, read = r['words'], r['read']
+        if words and read:
+            title, send = f'“{words}” → read as “{read}”', f'Earlier you read my “{words}” as “{read}”.'
+        elif words:
+            title, send = f'“{words}” → read as unclear', f'Earlier you read my “{words}” as unclear.'
+        else:
+            title, send = r["line"], f'Earlier you read me this way: “{r["line"].rstrip(".")}”.'
+        where = 'in a compaction summary' if r.get('source') == 'compaction' else 'in a reply'
+        items.append(dict(key=f"read:{r['when']}:{(words or r['line'])[:24]}", title=title, lines=2,
+                          meta=' · '.join(x for x in (short_date(r['when']) if r['when'] else '', where) if x),
+                          detail=[r['line']], send=one_line(f'{send} Check that reading before relying on it.')))
+    return items
+
+
+# ---------------------------------------------------------------- coaching: terms you say again
+
+CLAUDE_MD = os.path.join(HOME, '.claude', 'CLAUDE.md')
+COACH_KEPT = os.path.join(KEEP, 'coach.json')  # transcript -> (mtime, terms Claude looked up there)
+LOOKED_IN = ('/.claude/', 'claude.md', 'agent_docs', '/agents', '/skills', 'memory')  # where Claude looks a word up
+LOOKUP_WINDOW = 6  # tool calls after a prompt in which a lookup counts as about it
+COACH_SESSIONS = 60
+COACH_BUDGET = 12  # seconds a run may spend reading transcripts; the next run goes on from the kept ones
+PLAIN = set('''the and for that this with from have what when your you are was but not can will all any how why who
+    its it's our out has had does did get got let just into over then than them they there their here more most
+    some such only also very been being would could should about after before again once make made want need like
+    use used using see look now new one two add fix run file files code claude memory agent agents skill skills
+    session sessions build test tests work works thing things please yes yeah okay done message messages name text'''.split())
+TERM = re.compile(r"[a-z][a-z0-9_-]{2,}")
+
+
+def mentions(text, term):
+    return re.search(r'(?<![\w-])' + re.escape(term) + r'(?![\w-])', text, re.I) is not None
+
+
+def quoted_in(asked, term, pattern=None):
+    """Whether a lookup names the word on its own, in quotes (grep -ril "astra") or as the whole search
+    pattern, not as a piece of some longer word or path."""
+    if isinstance(pattern, str) and pattern.strip().lower() in (term, f'\\b{term}\\b'):
+        return True
+    return re.search(r'["\'`](?:-\w+\s+)?' + re.escape(term) + r'["\'`]', asked, re.I) is not None
+
+
+def terms_looked_up(path):
+    """The words of your prompts that Claude then looked up in your memory files, CLAUDE.md, agent docs,
+    agents or skills within its next few tool calls, in one transcript: {word: the sentence you said it in}."""
+    out, prompt, calls = {}, {}, LOOKUP_WINDOW
+    with open(path, 'rb') as handle:
+        for raw in handle:
+            if b'"type":"user"' in raw and b'"tool_use_id"' not in raw and b'"isMeta":true' not in raw \
+                    and b'"isSidechain":true' not in raw:
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                message = entry.get('message') if isinstance(entry, dict) else None
+                if not isinstance(message, dict):  # a line of some other shape: not a prompt
+                    continue
+                content = message.get('content')
+                text = own_words(content if isinstance(content, str) else ' '.join(
+                    p['text'] for p in content if isinstance(p, dict) and p.get('type') == 'text'
+                    and isinstance(p.get('text'), str)) if isinstance(content, list) else '')
+                if entry.get('isCompactSummary') or not text.strip() or text.lstrip().startswith(('<', '/')):
+                    continue
+                prompt = {t: text for t in TERM.findall(text.lower()) if t not in PLAIN}
+                calls = 0
+            elif calls < LOOKUP_WINDOW and prompt and b'"type":"tool_use"' in raw and b'"isSidechain":true' not in raw:
+                seen = raw.count(b'"type":"tool_use"')
+                calls += seen
+                if not any(mark.encode() in raw.lower() for mark in LOOKED_IN):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                message = entry.get('message') if isinstance(entry, dict) else None
+                parts = message.get('content') if isinstance(message, dict) else None
+                for part in parts if isinstance(parts, list) else []:
+                    if not isinstance(part, dict) or part.get('type') != 'tool_use':
+                        continue
+                    args = part.get('input') if isinstance(part.get('input'), dict) else {}
+                    asked = ' '.join(str(args.get(k) or '') for k in ('pattern', 'command', 'query', 'file_path', 'path'))
+                    if not any(mark in asked.lower() for mark in LOOKED_IN):
+                        continue
+                    for term, said in prompt.items():
+                        if term not in out and quoted_in(asked, term, args.get('pattern')):
+                            sentence = next((s for s in re.split(r'(?<=[.!?])\s+|\n', said) if mentions(s, term)), said)
+                            out[term] = ' '.join(sentence.split())[:90]
+    return out
+
+
+def coach_terms(now=None, newest=COACH_SESSIONS):
+    """Words you have said in 2 or more of your newest sessions that Claude looked up in your memory each
+    time, and that your global CLAUDE.md does not define yet, as notes for the band. Worked out off the hot
+    path: a transcript is read once, kept by its modified time."""
+    now = now or time.time()
+    try:
+        with open(COACH_KEPT) as handle:
+            kept = json.load(handle)
+    except (OSError, ValueError):
+        kept = {}
+    kept = {p: v for p, v in kept.items() if isinstance(v, list) and len(v) == 2 and isinstance(v[1], dict)} \
+        if isinstance(kept, dict) else {}  # a kept file of another shape is read again, not trusted
+    paths = sorted(glob.glob(os.path.join(HOME, '.claude', 'projects', '*', '*.jsonl')),
+                   key=lambda p: -(mtime(p) or 0))[:newest]
+    started, sessions = time.time(), {}
+    for path in paths:
+        stamp_ = mtime(path)
+        if path not in kept or kept[path][0] != stamp_:
+            if time.time() - started > COACH_BUDGET:
+                continue
+            try:
+                kept[path] = [stamp_, terms_looked_up(path)]
+            except OSError:
+                continue
+        for term, said in kept[path][1].items():
+            sessions.setdefault(term, []).append(said)
+    try:
+        os.makedirs(KEEP, exist_ok=True)
+        with open(COACH_KEPT, 'w') as handle:
+            json.dump({p: v for p, v in kept.items() if p in paths}, handle)
+    except OSError:
+        pass
+    try:
+        with open(CLAUDE_MD, encoding='utf-8') as handle:
+            defined = handle.read()
+    except OSError:
+        defined = ''
+    notes = []
+    for term, said in sorted(sessions.items(), key=lambda kv: -len(kv[1])):
+        if len(said) < 2 or mentions(defined, term):
+            continue
+        notes.append(dict(
+            id=f'term:{term}', kind='term', file='', symbol=None, oid=None, conversation='', sketch=[], at=now * 1000,
+            line=f'You said “{term}” in {len(said)} sessions and Claude looked it up each time. Define it once?',
+            title=f'Define “{term}” once',
+            text=f'- {term}: said in {len(said)} sessions, each time Claude looked it up (e.g. “{said[0]}”). '
+                 f'Edit this line to say what you mean.'))
+    return notes[:3]
+
+
 def page_main(data, s, now, ui=None):
     """What a senior architect wants beside the agent, the star first, each shown only with something in it:
       Story             where the session stands, as csr-engine last told it (each compaction retells it)
       What if…          the dreamer's question, its reasoning shown, answered from here; idle, one folded row
+      Lost and found    threads a compaction summary carried once and then dropped, each a click from Claude
       Handed to Claude  what CSR's memory gave Claude this session: past sessions and notes
+      How Claude read you  where Claude read a short word of yours one way, so you can check it
       Your rules        corrections you typed yourself in this repo
-    Above them, the session's gauges: your prompts, Claude's context and CSR's memory at work. Code that
+    Above them, the session's gauges (and the compaction strip while one runs): your prompts, Claude's context and CSR's memory at work. Code that
     changed since your past sessions stays one key away (l)."""
     root = data['repo']
     con = connect()
@@ -1652,6 +2069,7 @@ def page_main(data, s, now, ui=None):
 
     clock = Clock(s['prompts'] + [r[0] for r in s['replies']], now)
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
+    facts += [phrase for phrase in [payback_phrase(s)] if phrase]
     if s['compacts']:
         facts.append(f"{len(s['compacts'])} compacts")
     story, told = data.get('story'), []
@@ -1673,12 +2091,15 @@ def page_main(data, s, now, ui=None):
                                           story and story['at'] and stamp(story['at'], now)[0]) if x)),
         dict(name='dreams', title='What if…', right=right, items=dreams, empty=''),
         dict(name='remembered', title='Handed to Claude', right='', items=handed, empty=''),
+        dict(name='coach', title='How Claude read you', right='', items=reading_items(data.get('readings') or [], now),
+             empty=''),
         dict(name='rules', title='Your rules', right='', items=rules, empty=''),
     ]
+    sections[2:2] = lost_sections(s, now)
     if starred:  # a question waiting on you comes before the story
         sections[:2] = sections[1::-1]
     return dict(head=dict(facts=' · '.join(facts), session=s if s.get('learned') else None,
-                          status=data.get('claude_line')),
+                          status=data.get('claude_line'), mast=masthead(data.get('claude_fields'), now)),
                 quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=sections)
 
@@ -1764,9 +2185,11 @@ def page_lines(page, width, rows, ui):
     head, s = page['head'], page['head'].get('session')
     label = '\x1b[38;2;%d;%d;%dm' % ON_DARK['label']
     top = [' ' + line for line in ansi_wrap(head.get('status') or '', width - 1, 2)]  # Claude's status line
+    top[:0] = compact_rows(head.get('compacting'), width)  # while a compaction runs
     if head.get('title'):
         top.append(' ' + BOLD + fit(head['title'], width - 1) + OFF)
-    top.append(' ' + fit(head['facts'], width - 1))
+    top.append(' ' + fit_pieces(head['facts'], width - 1))
+    top += mast_rows(head.get('mast'), width - 1)  # the cache clock and the plan's quotas
     lanes = None
     if s:
         if PIXELS and width - LANE > 8:
@@ -1777,6 +2200,7 @@ def page_lines(page, width, rows, ui):
     out = Lines([on_dark(line, ground) for line, ground in zip(top, grounds)])
     out.heads = []
     out.lanes = None if lanes is None else (lanes, grounds[lanes:lanes + 3])  # the gauges' row, their grounds
+    out.put(masthead_lip(rows))
     built = []
     for section in page['sections']:
         blocks = []
@@ -1786,7 +2210,7 @@ def page_lines(page, width, rows, ui):
             if is_open:
                 rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'], indent=ITEM)
             blocks.append((rows_, item))
-            blocks += answer_rows(item, width, ui)
+            blocks += answer_rows(item, width, ui) + lost_rows(item, width, ui, is_open)
         if blocks:
             built.append((section, blocks, 2 + len(blocks[0][0]), 2 + sum(len(rows_) for rows_, _ in blocks)))
     if not built:
@@ -1833,15 +2257,296 @@ def draw_main(data, s, cols, rows, now, ui=None):
     if s is None:
         s = dict(id=None, title=None, prompts=[], replies=[], compacts=[], gave=dict(recalls=[], carried=[], dreams=[]),
                  remembered=[], sessions=0, project=None, files={}, edited=[], shell={}, last={})
-    return draw_page(page_main(data, s, now, ui), cols, rows, ui or {})
+    return draw_page(with_compacting(page_main(data, s, now, ui), data), cols, rows, ui or {})
 
 
 def draw_log(data, cols, rows, ui=None):
     return draw_page(page_log(data), cols, rows, ui or {})
 
 
+# ---------------------------------------------------------------- compaction: the timer, what CSR keeps, the summary
+
+COMPACTING = os.path.join(KEEP, 'compacting')  # <session>.json: {at, trigger}, written by the mod while a compaction runs
+COMPACT_TIMES = os.path.join(KEEP, 'compaction-times.json')  # transcript -> [mtime, [seconds each compaction took]]
+PROJECTS = os.path.join(HOME, '.claude', 'projects')
+MARKER_LIFE = 10 * 60  # a marker older than this is from a compaction that never reported its end
+NEWEST = 60  # transcripts read for how long a compaction usually takes
+FRACTIONS = ('', '▏', '▎', '▍', '▌', '▋', '▊', '▉')  # eighths of a cell, so the bar moves smoothly
+READ_AS = re.compile(r'interpreted as:|read as:|\(unclear\)|typo for', re.I)  # where a summary says how it read you
+_SUMMARIES = {}  # transcript -> dict(offset, found, count): read from where it was left
+_USUAL = {}  # (projects, cache) -> (when read, the usual range): the transcripts are listed once in five minutes
 
 
+def compacting_since(session_id, now, folder=None):
+    """The compaction running now: dict(at, trigger) from the mod's marker, or None when none runs. A marker
+    older than ten minutes is left over from one that never reported its end."""
+    try:
+        with open(kept_file(folder or COMPACTING, session_id) or '', encoding='utf-8') as handle:
+            kept = json.load(handle)
+        at = float(kept.get('at') or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    at = at / 1000 if at > 1e11 else at  # seconds; a clock in milliseconds is read as such
+    if not at or now - at > MARKER_LIFE:
+        return None
+    return dict(at=at, trigger=str(kept.get('trigger') or ''))
+
+
+def percentile(values, share):
+    """The share (0 to 1) of sorted values, between the two nearest ones."""
+    at = (len(values) - 1) * share
+    low = int(at)
+    return values[low] + (values[min(low + 1, len(values) - 1)] - values[low]) * (at - low)
+
+
+def compaction_seconds(projects=None, cache=None, newest=NEWEST):
+    """Seconds each compaction took, from the compact_boundary rows (compactMetadata.durationMs) of the
+    newest transcripts, sorted. A transcript is read again only when its mtime moved; the rest come from the cache."""
+    projects, cache = projects or PROJECTS, cache or COMPACT_TIMES
+    try:
+        with open(cache, encoding='utf-8') as handle:
+            kept = json.load(handle)
+    except (OSError, ValueError):
+        kept = {}
+    found = []
+    for path in glob.glob(os.path.join(projects, '*', '*.jsonl')):
+        modified = mtime(path)
+        if modified is not None:
+            found.append((modified, path))
+    current, seconds = {}, []
+    for modified, path in sorted(found, reverse=True)[:newest]:
+        entry = kept.get(path)
+        if not (isinstance(entry, list) and len(entry) == 2 and entry[0] == modified):
+            took = []
+            try:
+                with open(path, 'rb') as handle:
+                    for line in handle:
+                        if b'"compact_boundary"' not in line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        ms = ((row.get('compactMetadata') or {}).get('durationMs')) if row.get('subtype') == 'compact_boundary' else None
+                        if isinstance(ms, (int, float)) and ms > 0:
+                            took.append(ms / 1000)
+            except OSError:
+                continue
+            entry = [modified, took]
+        current[path] = entry
+        seconds += entry[1]
+    if current != kept:
+        try:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            with open(cache + '.tmp', 'w', encoding='utf-8') as handle:
+                json.dump(current, handle)
+            os.replace(cache + '.tmp', cache)
+        except OSError:
+            pass
+    return sorted(seconds)
+
+
+def compaction_usual(seconds):
+    """How long a compaction usually takes: dict(low, median, high, n) with the 10th and 90th percentile
+    around the median; None with fewer than three to go on."""
+    if len(seconds) < 3:
+        return None
+    return dict(low=percentile(seconds, 0.1), median=percentile(seconds, 0.5), high=percentile(seconds, 0.9), n=len(seconds))
+
+
+def compaction_facts(con, session_id, story, dreams_on):
+    """What CSR keeps from the part being folded, one to three lines, each with a number behind it: no model."""
+    lines = []
+    chunks = con.execute('select count(*) from chunks where conversation_id=?', (session_id,)).fetchone()[0]
+    if chunks:
+        lines.append(f"CSR keeps {chunks:,} chunk{'s' if chunks != 1 else ''} of this session")
+    if story and story.get('rev'):
+        lines.append(f"story rev {story['rev']} → {story['rev'] + 1} after this")
+    if dreams_on:
+        lines.append(f"a new chapter of dreams after this ({PER_CHAPTER} looks)")
+    return lines
+
+
+def compacting_info(session_id, now, data, folder=None, projects=None, cache=None):
+    """What the pane shows while a compaction runs: dict(elapsed, trigger, usual, facts), or None when none runs."""
+    marker = compacting_since(session_id, now, folder)
+    if not marker:
+        return None
+    info = dict(elapsed=int(max(0, now - marker['at'])), trigger=marker['trigger'], usual=None, facts=[])
+    hit = _USUAL.get((projects, cache))
+    if hit and now - hit[0] < 300:
+        info['usual'] = hit[1]
+    else:
+        try:
+            info['usual'] = compaction_usual(compaction_seconds(projects, cache))
+            _USUAL[(projects, cache)] = (now, info['usual'])
+        except Exception:  # a transcript that cannot be read costs the range, never the pane
+            pass
+    try:
+        con = connect()
+        try:
+            info['facts'] = compaction_facts(con, session_id, data.get('story'), bool(data.get('dreams_on')))
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return info
+
+
+def clock_text(seconds):
+    seconds = int(seconds)
+    return f'{seconds // 60}:{seconds % 60:02d}'
+
+
+def compaction_bar(elapsed, high, width):
+    """A bar of block characters filled by how far elapsed has come toward the usual longest time."""
+    cells = max(0.0, min(1.0, elapsed / high)) * width if high else 0.0
+    full = int(cells)
+    if full >= width:
+        return '█' * width
+    return ('█' * full + FRACTIONS[int((cells - full) * 8)]).ljust(width, '░')
+
+
+def compact_rows(info, width):
+    """The strip at the top of the page while a compaction runs: the timer against the usual time, a bar, and
+    the facts under it. Rows for the dark masthead."""
+    if not info:
+        return []
+    usual, elapsed = info.get('usual'), info['elapsed']
+    over = bool(usual) and elapsed > usual['high']
+    note = ('taking longer than usual' if over else f"usually {clock_text(usual['low'])} to {clock_text(usual['high'])}") if usual else ''
+    kind = ' (auto)' if info.get('trigger') == 'auto' else ''
+    words = ' · '.join(x for x in (f'Compacting{kind}', clock_text(elapsed), note) if x)
+    if len(words) > width - 1 and note:  # a narrow pane: the range goes on a row of its own
+        words = f'Compacting{kind} · {clock_text(elapsed)}'
+        rows = [' ' + BOLD + fit(words, width - 1) + OFF, ' ' + fit(note, width - 1)]
+    else:
+        rows = [' ' + BOLD + fit(words, width - 1) + OFF]
+    if usual:
+        hue = '\x1b[38;2;%d;%d;%dm' % ON_DARK['turn' if over else 'ctx'][:3]
+        rows.append(' ' + hue + compaction_bar(elapsed, usual['high'], max(8, min(40, width - 2))) + OFF)
+    return rows + [' ' + DIM + fit(line, width - 1) + OFF for line in (info.get('facts') or [])[:3]]
+
+
+def with_compacting(page, data):
+    """The page with the compaction strip in its head, for the masthead to draw."""
+    page['head']['compacting'] = data.get('compacting')
+    return page
+
+
+def compaction_ended(pane, running):
+    """True on the frame after a compaction's marker is gone, so the pane redraws at once."""
+    was, pane.compacting = getattr(pane, 'compacting', False), bool(running)
+    return was and not running
+
+
+def compaction_gone(pane, folder=None):
+    """True between frames once the marker of the compaction the pane is showing is gone: the watch loop
+    then draws at once, not on the next two-second tick."""
+    if not getattr(pane, 'compacting', False) or not pane.session:
+        return False
+    return not os.path.exists(kept_file(folder or COMPACTING, pane.session.id) or '')
+
+
+def row_text(entry):
+    content = (entry.get('message') or {}).get('content')
+    if isinstance(content, str):
+        return content
+    return '\n'.join(p.get('text', '') for p in content or [] if isinstance(p, dict) and p.get('type') == 'text')
+
+
+def newest_summary(path):
+    """The newest compaction summary in a session's transcript (the isCompactSummary row): dict(text, at,
+    count, top). Read from where it was left; the same dict comes back until a newer one lands, so the
+    page keeps its scroll."""
+    if not path:
+        return None
+    state = _SUMMARIES.setdefault(path, dict(offset=0, found=None, count=0))
+    try:
+        if os.path.getsize(path) < state['offset']:  # rewritten: start again
+            state.update(offset=0, found=None, count=0)
+        with open(path, 'rb') as handle:
+            handle.seek(state['offset'])
+            for line in handle:
+                if not line.endswith(b'\n'):
+                    break
+                state['offset'] += len(line)
+                if b'isCompactSummary' not in line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('isCompactSummary') and row_text(entry).strip():
+                    state['count'] += 1
+                    state['found'] = dict(text=row_text(entry), at=epoch(entry.get('timestamp')), count=state['count'], top=0)
+    except OSError:
+        pass
+    return state['found']
+
+
+def summary_lines(text, width):
+    """The summary wrapped to the width, its blank lines and indents kept: (line, marked) pairs, marked where
+    the summary says how it read you (Interpreted as: / Read as: / (unclear) / typo for)."""
+    rows = []
+    for raw in text.replace('**', '').splitlines():
+        if not raw.strip():
+            if rows and rows[-1][0]:
+                rows.append(('', False))
+            continue
+        indent = ' ' * min(len(raw) - len(raw.lstrip()), 8)
+        marked = bool(READ_AS.search(raw))
+        rows += [(indent + piece, marked) for piece in wrap(raw.strip(), max(8, width - len(indent)), 10 ** 6)]
+    return rows
+
+
+def draw_summary(data, cols, rows, ui=None):
+    """The s page: this session's newest compaction summary, wrapped, the read-as lines in the accent ink."""
+    width = max(24, cols - 1)
+    summary = data.get('summary')
+    body, facts = [], 'No compaction summary yet.'
+    room = max(1, rows - 1 - 2)
+    if summary:
+        body = summary_lines(summary['text'], width - 1)
+        summary['top'] = max(0, min(summary['top'], len(body) - room))
+        when = datetime.fromtimestamp(summary['at']).strftime('%m-%d %H:%M') if summary['at'] else ''
+        shown = f"lines {summary['top'] + 1}-{min(len(body), summary['top'] + room)} of {len(body)}"
+        marks = sum(1 for _, marked in body if marked)
+        facts = ' · '.join(x for x in (when, f"summary {summary['count']}" if summary['count'] > 1 else '', shown,
+                                       f"{marks} read-as" if marks else '', f"{len(summary['text']):,} chars") if x)
+    top = [' ' + BOLD + 'Compaction summary' + OFF, ' ' + fit(facts, width - 1)]
+    out = Lines([on_dark(line, ground) for line, ground in zip(top, dark_steps(len(top)))])
+    start = summary['top'] if summary else 0
+    for line, marked in body[start:start + room]:
+        out.append(' ' + (ink('turn') if marked else ink('you')) + line + OFF)
+    return out, []
+
+
+def summary_keys(pane, keys):
+    """The summary page's keys: s opens it, s or Esc goes back (d does, in the loop), j and k scroll; True when the
+    screen must redraw."""
+    if 's' in keys and pane.view != 'summary':
+        pane.view, pane.open = 'summary', None
+        return True
+    if pane.view != 'summary':
+        return False
+    if keys == '\x1b' or 's' in keys:
+        pane.view = 'main'
+        return True
+    summary = (pane.data or {}).get('summary')
+    step = 3 if any(k in keys for k in ('j', '\x1b[b')) else -3 if any(k in keys for k in ('k', '\x1b[a')) else 0
+    if ' ' in keys:
+        step = 12
+    if summary and step:
+        summary['top'] = max(0, summary['top'] + step)
+        return True
+    return False
+
+
+def compact_key(data):
+    """What redraws the pane for a compaction: the timer's second and facts, the summary page's place."""
+    summary = data.get('summary')
+    return [data.get('compacting'), summary and [summary['count'], summary['top']]]
 
 
 def legend(view, width, held=None):
@@ -1849,12 +2554,14 @@ def legend(view, width, held=None):
     While an edit to the pane's own file does not compile, the row says so and the old pane runs on."""
     if held:
         return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF
-    keys = [('l', 'changes since your sessions'), ('q', 'close')] if view == 'main' else \
-        [('d', 'back'), ('q', 'close')]
-    marks = '' if view == 'main' else '~ changed  - removed  + back   '
+    keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('q', 'close')] if view == 'main' else \
+        [('d', 'back')] + ([('j/k', 'scroll')] if view == 'summary' else []) + [('q', 'close')]
+    marks = '' if view in ('main', 'summary') else '~ changed  - removed  + back   '
     words = [(key, said) for key, said in keys]
     while len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width and len(words[0][1]) > 7:
         words[0] = (words[0][0], words[0][1].rsplit(' ', 1)[0])
+    if len(marks) + sum(len(k) + len(w) + 4 for k, w in words) > width:  # still too wide: 's summary'
+        words = [words[0]] + [(key, said.rsplit(' ', 1)[-1]) for key, said in words[1:]]
     shown = '   '.join(f'{BOLD}{ink("you")}{key}{OFF}{ink("faint")} {said}{OFF}' for key, said in words)
     return ' ' + ink('faint') + marks + OFF + shown
 
@@ -1912,6 +2619,12 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
+            self.data['claude_fields'] = claude_fields(self.session and self.session.id, now)
+            self.data['compacting'] = compacting_info(self.session and self.session.id, now, self.data)
+            if self.view == 'summary':
+                self.data['summary'] = newest_summary(self.session and self.session.path)
+            force = compaction_ended(self, self.data['compacting']) or force  # the marker went: redraw at once
+            self.data['readings'] = how_claude_read(self.session and self.session.id)
             s = self.session.load() if self.session and self.view == 'main' else None
         except Exception as error:  # the DB is busy or missing: say so, keep the pane alive
             said = SETUP if not os.path.exists(DB) else f'could not read csr-engine: {error}'
@@ -1927,9 +2640,10 @@ class Pane:
         ui = dict(open=self.open, sent=self.sent, answered=self.answered, folds=self.folds)
         sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
                           self.answered,
-                          self.data.get('claude_line'),
+                          self.data.get('claude_line'), masthead(self.data.get('claude_fields'), now),
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
                           self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
+                          compact_key(self.data), self.data.get('readings'),
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
         if sig == self.shown and not force:
@@ -1937,6 +2651,8 @@ class Pane:
         self.shown = sig
         if self.view == 'main':
             lines, pictures = draw_main(self.data, s, cols, rows, now, ui)
+        elif self.view == 'summary':
+            lines, pictures = draw_summary(self.data, cols, rows, ui)
         else:
             lines, pictures = draw_log(self.data, cols, rows, ui)
         self.acts = {row: act for row, act in getattr(lines, 'acts', {}).items() if row < rows - 1}
@@ -1955,6 +2671,8 @@ class Pane:
         """One click opens a row; a second click on it puts it in Claude's prompt, unsent. On a dream's
         answers, the half clicked is the answer: kept in the dream log, and "ask Claude" also typed in."""
         act = self.acts.get(row)
+        if act and act.get('lost') and act.get('spans'):
+            return lost_click(self, act, col)
         span = act and next((answer for start, end, answer in act.get('spans') or () if start <= col < end), None)
         if span:
             keep(dict(kind='answer', id=act['dream'], answer=span, at=time.time(), by='pane'))
@@ -1976,6 +2694,222 @@ class Pane:
             went = bool(agent) and herdr('pane', 'send-text', agent, act['send']) is not None
             self.sent = (act['key'], went, time.time())
         focus_back()
+
+
+# ---------------------------------------------------------------- lost and found
+
+LOST_LOG = os.path.join(KEEP, 'lost-found.jsonl')  # drop / later, one line each, keyed by the thread's text
+SECTION['lost'], GLYPH['lost'] = 'turn', '?'  # its ink (vermilion) and its mark where no pictures are drawn
+SAME_THREAD = 0.5  # two items are one thread when this share of their words match
+CARRIED = ('Pending Tasks', 'Optional Next Step')  # the summary sections that name what is still owed
+NUMBERED = re.compile(r"^(?:#+\s*)?\**\d+\.\s+[A-Z][A-Za-z /&,'-]{2,50}:?\**\s*$")
+BULLET = re.compile(r'^(\s*)(?:[-*•]|\d+[.)])\s+(.*)$')
+WAITING = re.compile(r"\b(awaiting|waiting (?:on|for) (?:you|the user)|wait for the user|needs? (?:your|their|the user'?s) "
+                     r"(?:go|ok|approval|call|decision)|approval|the user'?s (?:answer|go|pick|picks|decision|decisions|call|pasted)|"
+                     r"the user needs? to|asks? the user)\b", re.I)
+OWED = re.compile(r"\b(wait|waiting|await|awaiting|confirm|verify|check|update|run|fix|build|built|install|merge|push|pushed|publish|ask|"
+                  r"decide|need|needs|needing|not (?:yet )?(?:started|built|applied|pushed|done)|pending|todo|next|after|then|"
+                  r"before|still|should|must|owed|deferred|proposal|proposals|proposed|open question|without|never)\b", re.I)
+BOOKKEEPING = re.compile(r"^(?:(?:send|write|give|post|deliver)\b.{0,40}\b(?:final|brief|short|settle)\b.{0,30}\b(?:reply|report|summary|message)|"
+                         r"(?:brief|short|final)\b.{0,20}\b(?:reply|report|summary)|report\b.*\bto the user|"
+                         r"(?:tell|let) the user\b|report\b|confirm the background|responding to\b|(?:the )?messages after this summary)", re.I)
+IGNORED = {'the', 'and', 'for', 'with', 'then', 'that', 'this', 'when', 'its', 'are', 'was', 'from', 'into', 'not', 'has',
+           'have', 'will', 'any', 'all', 'one', 'new', 'now', 'yet', 'but', 'you', 'your', 'user'}
+
+
+def plain(text):
+    """A summary line without its markdown."""
+    return ' '.join(re.sub(r'\*\*|__|`', '', text).split())
+
+
+def words_of(text):
+    return {w for w in re.findall(r'[a-z0-9_]+', text.lower()) if len(w) > 2 and w not in IGNORED}
+
+
+def same_words(a, b):
+    return bool(a and b) and len(a & b) / len(a | b) >= SAME_THREAD
+
+
+def summary_section(text, name):
+    """The lines of one numbered section ("7. Pending Tasks:") of a compaction summary, up to the next."""
+    lines, found = [], False
+    for line in text.splitlines():
+        if NUMBERED.match(line.strip()) and not line.startswith(' '):
+            if found:
+                break
+            found = name.lower() in line.lower()
+        elif found:
+            lines.append(line)
+    return lines
+
+
+def section_items(lines):
+    """A section's top-level bullets, each with the bullets nested under it: [(head, [nested])]. Without
+    bullets, each paragraph is one item."""
+    marks = [(len(m.group(1)), m.group(2)) for m in (BULLET.match(line) for line in lines) if m]
+    if not marks:
+        paragraphs = [plain(p) for p in re.split(r'\n\s*\n', '\n'.join(lines))]
+        return [(p, []) for p in paragraphs if p]
+    top, items = min(indent for indent, _ in marks), []
+    for line in lines:
+        m = BULLET.match(line)
+        if m and len(m.group(1)) <= top:
+            items.append([m.group(2), []])
+        elif m and items:
+            items[-1][1].append(m.group(2))
+        elif line.strip() and items:  # a wrapped line belongs to the bullet above
+            if items[-1][1]:
+                items[-1][1][-1] += ' ' + line.strip()
+            else:
+                items[-1][0] += ' ' + line.strip()
+    return [(plain(head), [plain(n) for n in nested]) for head, nested in items]
+
+
+def summary_items(text):
+    """What a compaction summary says is still owed: Pending Tasks, then the Optional Next Step, the pure
+    bookkeeping (a reply to send, a report to give) left out."""
+    items = []
+    for name in CARRIED:
+        for head, nested in section_items(summary_section(text, name)):
+            if head.endswith(':') and nested:  # a label: what it names is under it
+                head, nested = f"{head} {'; '.join(n.rstrip(';.') for n in nested[:2])}", nested[2:]
+            if head and not BOOKKEEPING.match(head) and OWED.search(head):
+                items.append((head, nested))
+    return items
+
+
+def lost_threads(summaries):
+    """The threads across a session's compaction summaries [(time, text)], ranked: lost and waiting on you,
+    lost, open and waiting, open. A thread is open while the newest summary still carries it and lost once
+    it dropped out; the same thread in two summaries is two items sharing most of their words."""
+    summaries = sorted(summaries)
+    threads = []
+    for index, (when, text) in enumerate(summaries):
+        for head, nested in summary_items(text):
+            words = words_of(head)
+            best = max(threads, key=lambda t: len(words & t['words']) / len(words | t['words']) if words | t['words'] else 0,
+                       default=None)
+            if best is None or not same_words(words, best['words']):
+                best = dict(text=head, first=when, words=words, first_words=' '.join(sorted(words)), carried=set())
+                threads.append(best)
+            best.update(text=head, nested=nested, words=words, last=when)
+            best['carried'].add(index)
+    import hashlib
+    out = []
+    for t in threads:
+        state = 'open' if max(t['carried']) == len(summaries) - 1 else 'lost'
+        waiting = bool(WAITING.search(' '.join([t['text']] + t['nested'])))
+        rank = (0 if waiting else 1) if state == 'lost' else (2 if waiting else 3)
+        out.append(dict(text=t['text'], detail=t['nested'], first_seen=t['first'], last_seen=t['last'],
+                        times=len(t['carried']), state=state, waiting=waiting, rank=rank,
+                        key=hashlib.sha1(t['first_words'].encode()).hexdigest()[:12]))
+    return sorted(out, key=lambda t: (t['rank'], -t['last_seen']))
+
+
+def lost_log():
+    """What you did with each thread: key -> (drop or later, when). The last line for a key wins."""
+    said = {}
+    try:
+        with open(LOST_LOG, encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    r = json.loads(line)
+                    said[r['key']] = (r['answer'], float(r['at']))
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError:
+        pass
+    return said
+
+
+def keep_lost(key, answer, at):
+    os.makedirs(KEEP, exist_ok=True)
+    with open(LOST_LOG, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(dict(key=key, answer=answer, at=at)) + '\n')
+
+
+def lost_found(summaries):
+    """The threads, each marked hidden: "drop" for good, "later" until the next compaction."""
+    threads, said = lost_threads(summaries), lost_log()
+    newest = max((when for when, _ in summaries), default=0)
+    for t in threads:
+        answer, at = said.get(t['key'], (None, 0))
+        t['hidden'] = answer if answer == 'drop' or (answer == 'later' and at > newest) else None
+    return threads
+
+
+def lost_json(session_id):
+    """--lost: the threads of this session a person has not dropped, for the pane's own tools and the
+    compaction hook."""
+    session = Session(session_id) if session_id else None
+    if session:
+        session.read_transcript()
+    return [t for t in lost_found(session.summaries if session else []) if t['hidden'] != 'drop']
+
+
+def lost_asks(thread):
+    """The two things a thread can be asked to become, as the words typed into Claude's prompt (unsent)."""
+    quiet = f"Lost and found: “{fit(thread['text'], 240)}” went quiet after {datetime.fromtimestamp(thread['last_seen']).strftime('%H:%M')}."
+    return dict(
+        side=one_line(f"{quiet} Revisit it as a side task: finish or close it in a few steps without derailing the "
+                      f"current work, then tell me in one line."),
+        sub=one_line(f"{quiet} Hand it to a background subagent with a five-part spec (objective, files, interfaces, "
+                     f"constraints, verification), keep working on the current task, and report its result when it lands."))
+
+
+def lost_sections(s, now):
+    """The Lost and found section: the top three threads that went quiet or wait on you, once there is any."""
+    shown = [t for t in (s or {}).get('lost') or [] if not t['hidden'] and t['rank'] < 3]
+    when = lambda t: datetime.fromtimestamp(t).strftime('%m-%d %H:%M')
+    items = []
+    for k, t in enumerate(shown[:3]):
+        asks = lost_asks(t)
+        meta = ' · '.join(x for x in ('quiet ' + stamp(t['last_seen'], now)[0] if t['state'] == 'lost' else 'open', f"{t['times']}×") if x)
+        items.append(dict(key='lost:' + t['key'], title=t['text'], lines=2, meta=meta, lost=t['key'], top=k == 0,
+                          flag='waiting on you' if t['waiting'] else '', asks=asks, send=asks['side'],
+                          detail=[f"First appeared {when(t['first_seen'])}, last {when(t['last_seen'])}, "
+                                  f"carried through {t['times']} {'compaction' if t['times'] == 1 else 'compactions'}."]
+                          + t['detail'][:2]))
+    if not items:
+        return []
+    return [dict(name='lost', title='Lost and found', right=f'{len(shown)} quiet', items=items, empty='')]
+
+
+LOST_ASKS = (('side', '→ side task'), ('sub', '→ subagent'), ('drop', '✗ drop'), ('later', 'later'))
+
+
+def lost_rows(item, width, ui, is_open):
+    """A thread's answers under its row (the top thread's always, any other's once opened), two to a row;
+    each row is its own block, so a click knows the thread and, by its column, the answer."""
+    if not item.get('lost') or not (item.get('top') or is_open):
+        return []
+    sent = ui.get('sent')
+    if sent and sent[0] == item['key']:
+        said = "✓ now in Claude's prompt" if sent[1] else "✗ couldn't reach Claude's pane"
+        return [([' ' * ITEM + ink('faint') + fit(said, width - ITEM) + OFF], None)]
+    half = (width - ITEM) // 2
+    rows = []
+    for pair in (LOST_ASKS[:2], LOST_ASKS[2:]):
+        text, spans = ' ' * ITEM, []
+        for k, (answer, label) in enumerate(pair):
+            spans.append((ITEM + k * half, ITEM + (k + 1) * half, answer))
+            text += ink('turn') + BOLD + label[0] + OFF + ink('quiet') + fit(label[1:], half - 2).ljust(half - 1) + OFF
+        rows.append(([text], dict(key=f"{item['key']}:{pair[0][0]}", lost=item['lost'], item=item['key'],
+                                  asks=item['asks'], spans=spans)))
+    return rows
+
+
+def lost_click(pane, act, col):
+    """A click on a thread's answers: drop and later are kept in the log; the two asks are typed into
+    Claude's prompt, unsent."""
+    pick = next((answer for start, end, answer in act['spans'] if start <= col < end), None)
+    if pick in ('drop', 'later'):
+        keep_lost(act['lost'], pick, time.time())
+    elif pick:
+        agent = agent_pane(pane.agent)
+        went = bool(agent) and herdr('pane', 'send-text', agent, act['asks'][pick]) is not None
+        pane.sent = (act['item'], went, time.time())
+    focus_back()
 
 
 def mtime(path):
@@ -2028,6 +2962,7 @@ def watch(root, limit, session_id, agent=None):
                     break
                 redraw['now'] = True
             seen = now_seen
+            redraw['now'] = redraw['now'] or compaction_gone(pane)  # a compaction ended: draw it now
             if redraw['now'] or time.time() - last > 2:  # a frame costs ~15 ms; it draws only what changed
                 pane.frame(redraw['now'])
                 redraw['now'], last = False, time.time()
@@ -2047,6 +2982,8 @@ def watch(root, limit, session_id, agent=None):
                 break
             if keys == '\x1b':
                 pane.open, redraw['now'] = None, True
+            if summary_keys(pane, keys):
+                redraw['now'] = True
             for key in keys:
                 if key in ('d', 'l'):
                     pane.view, pane.open = ('main' if key == 'd' else 'log'), None
@@ -2081,8 +3018,13 @@ def main():
     mode.add_argument('--png')
     mode.add_argument('--note', help='a file Claude is reading or editing')
     mode.add_argument('--brief', action='store_true', help="CSR's memory near this session, for the dreamer")
+    mode.add_argument('--lost', action='store_true', help="threads that went quiet or wait on you, from this session's compaction summaries")
     mode.add_argument('--keep', help='a dream or an answer, as JSON, for the dream log')
+    mode.add_argument('--coach', action='store_true', help='words you said in 2+ sessions that Claude looked up, as band notes')
     args = parser.parse_args()
+    if args.coach:
+        print(json.dumps(coach_terms()))
+        return
     if args.keep:
         record = json.loads(args.keep)
         if record.get('kind') in ('dream', 'look', 'chapter'):
@@ -2101,6 +3043,9 @@ def main():
             print(json.dumps(notes_for(con, os.path.realpath(root), path, args.sid)))
         finally:
             con.close()
+        return
+    if args.lost:
+        print(json.dumps(lost_json(args.sid)))
         return
     root = repo_root(args.repo)
     if args.brief:
@@ -2124,7 +3069,8 @@ def main():
     elif args.png:
         now, cell = time.time(), (16, 34)
         data = load(root, args.limit, args.sid)
-        data.update(look=last_look(root), chapter=last_chapter(root, args.sid), story=session_story(args.sid))
+        data.update(look=last_look(root), chapter=last_chapter(root, args.sid), story=session_story(args.sid),
+                    claude_fields=claude_fields(args.sid, now), readings=how_claude_read(args.sid))
         os.makedirs(args.png, exist_ok=True)
         if args.sid:
             s = Session(args.sid).load()

@@ -43,7 +43,7 @@ export type ShiftsData = {
 // or a dream the dreamer asked.
 export type Note = {
   id: string
-  kind: 'shift' | 'rule' | 'dream'
+  kind: 'shift' | 'rule' | 'dream' | 'term'
   file: string
   line: string
   title: string
@@ -61,7 +61,7 @@ export type Note = {
 export type NoteView = {
   kind: 'offer' | 'explained' | 'asked'
   note: Note
-  tag: 'Heads up' | 'You should know' | 'Dream'
+  tag: 'Heads up' | 'You should know' | 'Dream' | 'Coaching'
   shownAt: number
   promptsSurvived: number
   message?: string
