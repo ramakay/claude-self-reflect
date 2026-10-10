@@ -257,6 +257,9 @@ pub fn is_csr_emission(text: &str) -> bool {
     if contains_machine_sentinel(text) {
         return true;
     }
+    if is_dreamer_prompt(text) {
+        return true;
+    }
 
     let head_end = text.floor_char_boundary(HEADER_WINDOW.min(text.len()));
     let head = &text[..head_end];
@@ -277,6 +280,39 @@ pub fn is_csr_emission(text: &str) -> bool {
         .filter(|t| text.contains(**t))
         .count()
         >= 2
+}
+
+/// The attribution sentence the companion dreamer's "ask Claude" message carries.
+const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you worked";
+
+/// True when the WHOLE of `text` is the companion dreamer's "ask Claude"
+/// message, in the exact grammar `askClaude` (plugins/csr-companion/hooks/
+/// dreamer.ts) writes: an optional one-line question, a blank line, a one-line
+/// attribution sentence, a blank line, then the dreamer's reasoning as a
+/// blockquote. Every word of it is the dreamer's, not the person's, so a caller
+/// must drop the message as a whole: paragraph scrubbing alone would remove
+/// only the attribution and keep the question and the reasoning as the
+/// person's own words. Prose that merely mentions the marker does not match.
+pub fn is_dreamer_prompt(text: &str) -> bool {
+    let normalized = text.replace("\r\n", "\n");
+    let paragraphs: Vec<&str> = normalized.trim().split("\n\n").collect();
+    let Some(at) = paragraphs
+        .iter()
+        .position(|p| p.trim_start().starts_with(DREAMER_ATTRIBUTION))
+    else {
+        return false;
+    };
+    let one_line = |p: &str| !p.trim().is_empty() && !p.trim().contains('\n');
+    let quoted = |p: &str| {
+        !p.trim().is_empty()
+            && p.lines()
+                .all(|line| line.trim_start().starts_with('>') || line.trim().is_empty())
+    };
+    at <= 1
+        && paragraphs[..at].iter().all(|p| one_line(p))
+        && one_line(paragraphs[at])
+        && paragraphs.len() > at + 1
+        && paragraphs[at + 1..].iter().all(|p| quoted(p))
 }
 
 /// True if `text` is a substantive description of real work — it survives
@@ -385,6 +421,32 @@ mod tests {
         assert!(is_csr_emission(sent));
         assert!(!is_csr_emission(
             "what if the dreamer asked fewer questions while I work?"
+        ));
+    }
+
+    #[test]
+    fn dreamer_prompt_is_recognised_only_in_its_exact_whole_message_grammar() {
+        let sent = "What if the pane took its colours from pigment's nyt inks?\n\n\
+                    CSR's dreamer asked this while you worked. Its reasoning:\n\n\
+                    > **Share the palette**\n>\n> Two surfaces already read the same inks.";
+        assert!(is_dreamer_prompt(sent));
+        assert!(is_dreamer_prompt(&sent.replace('\n', "\r\n")));
+        // the question may be absent
+        assert!(is_dreamer_prompt(
+            "CSR's dreamer asked this while you worked. Its reasoning:\n\n> **t**\n> body"
+        ));
+        // prose that mentions it, extra person-typed prose, or an unquoted tail is not the grammar
+        assert!(!is_dreamer_prompt(
+            "what if the dreamer asked fewer questions while I work?"
+        ));
+        assert!(!is_dreamer_prompt(
+            "I wrote this myself.\n\nSecond thought of mine.\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> q"
+        ));
+        assert!(!is_dreamer_prompt(
+            "Q?\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\nand then I typed more"
+        ));
+        assert!(!is_dreamer_prompt(
+            "Q?\n\nCSR's dreamer asked this while you worked. Its reasoning:"
         ));
     }
 
