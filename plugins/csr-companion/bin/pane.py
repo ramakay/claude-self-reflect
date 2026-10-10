@@ -492,7 +492,7 @@ def brief(con, root, session_id):
     corrections = [(ts, quote, sid) for ts, quote, sid, transcript, at in con.execute(
         "select ts, quote, session_id, transcript_path, byte_start from intent_events where kind = 'correction' "
         "and session_id != ?1 and (project = ?2 or project like ?2 || '-%') order by ts desc limit 200",
-        (session_id, project)).fetchall() if typed_by_you(transcript, at)][:3]  # yours, not Claude's to a subagent
+        (session_id, project)).fetchall() if typed_by_you(transcript, at, quote)][:3]  # yours: not Claude's, not pasted
     if corrections:
         out += ['', 'Corrections CSR recorded in this repo lately:']
         out += [f"- {short_date(epoch(ts)) if epoch(ts) else (ts or '')[:10]}: {quoted(quote, 200)} [session {sid[:8]}]"
@@ -1317,11 +1317,23 @@ def recall_act(item, now):
 _WHO = {}  # (transcript, byte) -> whether the words there are yours
 
 
-def typed_by_you(transcript, at):
+NOT_TYPED = re.compile(r'<(pasted_content|system-reminder|command-[\w-]+|local-command-[\w-]+)\b[^>]*>.*?</\1>', re.S)
+NOT_TYPED_TAIL = re.compile(r'<(?:pasted_content|system-reminder)\b[^>]*>.*', re.S)  # unclosed: to the end
+
+
+def own_words(text):
+    """What you typed yourself in a prompt: blocks you pasted (often another agent's words), injected
+    tags and quoted lines taken out."""
+    text = NOT_TYPED_TAIL.sub(' ', NOT_TYPED.sub(' ', text))
+    return '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('>'))
+
+
+def typed_by_you(transcript, at, quote=None):
     """Whether the words at this byte of a transcript are a prompt you typed: a person's message in the
-    main session, not Claude briefing a subagent, not a tool's output, not a headless run."""
-    if (transcript, at) in _WHO:
-        return _WHO[transcript, at]
+    main session, not Claude briefing a subagent, not a tool's output, not a headless run; and, given the
+    quote, whether it stands in your own words there, not in a block you pasted."""
+    if (transcript, at, quote) in _WHO:
+        return _WHO[transcript, at, quote]
     yours = False
     if '/subagents/' not in transcript:
         try:
@@ -1343,9 +1355,12 @@ def typed_by_you(transcript, at):
             yours = (entry.get('type') == 'user' and not entry.get('isSidechain') and not entry.get('isMeta')
                      and entry.get('entrypoint', 'cli') == 'cli' and entry.get('userType', 'external') == 'external'
                      and bool(text.strip()) and not text.lstrip().startswith('<'))
+            if yours and quote:
+                squash = lambda words: ' '.join(words.split())
+                yours = squash(quote)[:80] in squash(own_words(text))
         except (OSError, ValueError, AttributeError):
             yours = False
-    _WHO[transcript, at] = yours
+    _WHO[transcript, at, quote] = yours
     return yours
 
 
@@ -1371,7 +1386,7 @@ def page_main(data, s, now):
                 f"({marks}) and kind = 'correction' order by ts desc limit 200", tuple(projects)).fetchall():
             if len(rules) >= 3:
                 break
-            if not typed_by_you(transcript, at):
+            if not typed_by_you(transcript, at, quote):
                 continue
             day = short_date(epoch(when)) if epoch(when) else (when or '')[:10]
             here = ' · this session' if session == s['id'] else ''
