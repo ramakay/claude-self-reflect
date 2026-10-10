@@ -1,7 +1,7 @@
 """The CSR pane and the dreamer's memory, read from csr-engine.
 
-Read-only against csr-engine, no model calls here. The pane is a page of paper (one picture, its own
-type, where the terminal draws pictures; text elsewhere), what a senior architect wants first:
+Read-only against csr-engine, no model calls here. The pane is a page of paper in the terminal's own
+type (every row takes a click), the session's gauges on top, then what a senior architect wants first:
   Touching now         the code Claude reads and edits, by how much of the rest depends on it.
   Decisions at risk    past sessions' work on code a later commit changed: what they concluded may not hold.
   Your rules           corrections you made and approaches you dropped in this repo.
@@ -772,9 +772,9 @@ def session_png(s, cols, cell, now):
     for b in clock.breaks:
         bx = 2 * SS + b / clock.total * (w - 4 * SS)
         for y in range(0, int(3 * lane), 6 * SS):
-            draw.line([(bx, y), (bx, y + 2 * SS)], fill=(255, 255, 255, 70), width=SS)
+            draw.line([(bx, y), (bx, y + 2 * SS)], fill=(0, 0, 0, 60), width=SS)
     for t in s['compacts']:
-        draw.line([(x(t), lane), (x(t), 2 * lane)], fill=(255, 255, 255, 110), width=SS)
+        draw.line([(x(t), lane), (x(t), 2 * lane)], fill=(0, 0, 0, 90), width=SS)
     # you: one tick per prompt
     for t in s['prompts']:
         draw.line([(x(t), lane * 0.2), (x(t), lane * 0.8)], fill=INK['you'], width=2 * SS)
@@ -945,16 +945,17 @@ def fit_blocks(out, blocks, room, ui, tail=True):
     return out
 
 
-def opened(rows, name, detail, width, ui, key):
+def opened(rows, name, detail, width, ui, key, indent=None):
     """A row a click opened: its whole text, what more CSR knows, and what a second click does."""
     sent = ui.get('sent')
     if sent and sent[0] == key:
         hint = "✓ now in Claude's prompt" if sent[1] else "✗ couldn't reach Claude's pane"
     else:
         hint = "↳ click again → Claude's prompt"
-    room = width - INDENT
-    more = [' ' * INDENT + DIM + line + OFF for text in detail for line in wrap(text, room, 2)][:4]
-    last = ' ' * INDENT + ink(SECTION[name]) + fit(hint, room) + OFF
+    indent = INDENT if indent is None else indent
+    room = width - indent
+    more = [' ' * indent + DIM + line + OFF for text in detail for line in wrap(text, room, 2)][:4]
+    last = ' ' * indent + ink(SECTION[name]) + fit(hint, room) + OFF
     return [tinted(row, band(name)) for row in rows + more + [last]]
 
 
@@ -1051,18 +1052,27 @@ def entry(when, mark, text, tail, width, rows=2):
 
 
 def heading(name, title, right, width):
-    """A section's head in the text pane: its mark and title in its ink, a count at the right; no band."""
-    lead = f' {ink(SECTION[name])}{GLYPH[name]}{OFF} '
-    used = 1 + len(GLYPH[name]) + 1
-    room = width - used
+    """A section's head: its icon (pasted over two cells where the terminal draws pictures, its mark
+    elsewhere) and its title in its ink, a count at the right."""
+    glyph = '  ' if PIXELS else GLYPH[name]
+    lead = f' {ink(SECTION[name])}{glyph}{OFF} '
+    room = width - 2 - len(glyph)
     gap = room - len(title) - len(right) - 1
     if gap < 1:
         right, gap = '', room - len(title) - 1
     return lead + ink(SECTION[name]) + BOLD + fit(title, room - 1) + OFF + ' ' * max(1, gap) + ink('faint') + right + OFF
 
 
+LANE = 9  # the lanes' labels, then their picture
 
 
+def lanes_legend(s, width):
+    parts = [(ink('learn') + '▮', f"{short(len(s['learned']['chunks']))} learned"),
+             (ink('recall') + '↑', f"{len(s['gave']['recalls']) + len(s['gave']['carried'])} handed to Claude"),
+             (ink('asked') + '●', f"{len(s['asked'])} asked")]
+    while sum(2 + len(text) + 2 for _, text in parts) - 2 > width and len(parts) > 1:
+        parts.pop()
+    return '  '.join(f"{mark}{OFF} {ink('quiet')}{text}{OFF}" for mark, text in parts)
 
 
 def recall_act(item, now):
@@ -1118,7 +1128,7 @@ def page_main(data, s, now):
       Decisions at risk past sessions' work on code that a later commit changed: what they concluded may not hold
       Your rules        corrections you made and approaches you dropped, in this repo
       What if…          the dreamer's challenges
-    The past sessions CSR handed Claude are counted in the masthead."""
+    Above them, the session's gauges: your prompts, Claude's context and CSR's memory at work."""
     root = data['repo']
     con = connect()
     try:
@@ -1201,8 +1211,8 @@ def page_main(data, s, now):
     facts = [f"{len(s['prompts'])} prompts", span(clock.total)]
     if s['compacts']:
         facts.append(f"{len(s['compacts'])} compacts")
-    facts.append(f"{len(s['gave']['recalls']) + len(s['gave']['carried'])} memories handed to Claude")
-    return dict(head=dict(kicker='CSR · this session', title=s.get('title') or 'This session', facts=' · '.join(facts)),
+    return dict(head=dict(kicker='CSR · this session', title=s.get('title') or 'This session', facts=' · '.join(facts),
+                          session=s if s.get('learned') else None),
                 sections=[
         dict(name='touching', title='Touching now', right=f'{len(touching)} files' if touching else '', items=touching[:5],
              empty='Nothing yet. As Claude reads and edits code here, each file shows how much depends on it '
@@ -1243,234 +1253,79 @@ def page_log(data):
 
 MARK_WORD = {'changed': '~', 'removed': '−', 'came back': '+'}
 
-# ---------------------------------------------------------------- paper: the page drawn as one picture
-
-PAPER_FONTS = dict(
-    sans=['/System/Library/Fonts/SFNS.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 'DejaVuSans.ttf'],
-    serif=['/System/Library/Fonts/NewYork.ttf', '/System/Library/Fonts/Supplemental/Charter.ttc',
-           '/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf', 'DejaVuSerif.ttf'],
-    mono=['/System/Library/Fonts/SFNSMono.ttf', '/System/Library/Fonts/Menlo.ttc',
-          '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 'DejaVuSansMono.ttf'])
-_FONTS = {}
+ITEM = 5  # "   • ": an item's text starts here
 
 
-def paper_font(kind, size, weight=None, axes=None):
-    key = (kind, size, weight, axes)
-    if key not in _FONTS:
-        from PIL import ImageFont
-        font = None
-        for candidate in PAPER_FONTS[kind]:
-            try:
-                font = ImageFont.truetype(candidate, size)
-                break
-            except OSError:
-                continue
-        if font is None:
-            font = ImageFont.load_default(size)
-        try:
-            if axes:  # New York: a text optical size, as its display default draws H without a crossbar
-                font.set_variation_by_axes(list(axes))
-            elif weight:
-                font.set_variation_by_name(weight)
-        except Exception:  # not a variable font: the regular weight stands
-            pass
-        _FONTS[key] = font
-    return _FONTS[key]
-
-
-def wrap_px(text, font, width, most):
-    """Words to lines no wider than width pixels, at most `most` of them, an ellipsis if cut."""
-    words, lines, cur = ' '.join(str(text).split()).split(' '), [], ''
-    for i, word in enumerate(words):
-        trial = f'{cur} {word}' if cur else word
-        if font.getlength(trial) <= width or not cur:
-            cur = trial
-            continue
-        lines.append(cur)
-        cur = word
-        if len(lines) == most:
-            cur = None
-            break
-    if cur:
-        lines.append(cur)
-    cut = len(lines) > most or cur is None
-    lines = lines[:most]
-    if cut and lines:
-        last = lines[-1]
-        while last and font.getlength(last + '…') > width:
-            last = last[:-1]
-        lines[-1] = last.rstrip() + '…'
-    return lines
-
-
-def mix(color, amount):
-    return tuple(round(p + (c - p) * amount) for c, p in zip(color[:3], GROUND))
-
-
-LEGEND = dict(main='l  changed since your sessions   ·   q  quit',
-              log='d  back   ·   ~ changed   − removed   + back   ·   q  quit')
-
-
-def paper_png(page, cols, rows, cell, ui, footer=''):
-    """The page on paper, cols x rows cells: black ink, hairline rules, an icon and a pigment per section,
-    type sized to the cell, not to the terminal's font. Returns the PNG and where each row a click acts
-    on lies, as (top, bottom, item) in pixels."""
-    from PIL import Image, ImageDraw
-    w, h = cols * cell[0], rows * cell[1]
-    image = Image.new('RGB', (w, h), GROUND)
-    draw = ImageDraw.Draw(image)
-    draw.paper = GROUND
-    body = max(11, round(cell[1] * 0.4))
-    small = round(body * 0.82)
-    label = round(body * 0.7)
-    line, gap = round(body * 1.5), round(body * 0.6)
-    f_body, f_small = paper_font('sans', body), paper_font('sans', small)
-    f_label = paper_font('sans', label, 'Semibold')
-    f_mono, f_title = paper_font('mono', round(body * 0.92)), paper_font('serif', round(body * 1.3), axes=(28, 600, 0))
-    pad = round(body * 1.2)
-    x0, x1 = pad, w - pad
-    hits, y = [], pad
-    ink_, quiet, faint, hair = INK['you'][:3], INK['quiet'][:3], INK['faint'][:3], INK['hair'][:3]
-    if footer:  # the legend, small, in the last row: the terminal's font draws nothing on this page
-        h -= cell[1]
-        draw.line([(x0, h), (x1, h)], fill=hair, width=max(1, round(body / 14)))
-        draw.text((x0, h + cell[1] * 0.62), footer, font=paper_font('sans', round(body * 0.78)), fill=faint, anchor='ls')
-
-    def text(x, baseline, words, font, fill):
-        draw.text((x, baseline), words, font=font, fill=fill, anchor='ls')
-
-    def tracked(x, baseline, words, font, fill, track):
-        for ch in words:
-            text(x, baseline, ch, font, fill)
-            x += font.getlength(ch) + track
-        return x
-
-    head = page['head']
-    y += label
-    tracked(x0, y, head['kicker'].upper(), f_label, faint, label * 0.12)
-    y += round(label * 0.6)
-    for words in wrap_px(head['title'], f_title, x1 - x0, 2):
-        y += round(body * 1.6)
-        text(x0, y, words, f_title, ink_)
-    for words in wrap_px(head['facts'], f_small, x1 - x0, 2):
-        y += round(small * 1.5)
-        text(x0, y, words, f_small, quiet)
-    y += gap
-
-    for section in page['sections']:
-        color = INK[SECTION[section['name']]][:3]
-        if y + line * 3 > h:
-            break
-        y += gap
-        draw.line([(x0, y), (x1, y)], fill=hair, width=max(1, round(body / 14)))
-        y += round(label * 2.1)
-        icon = round(label * 1.25)
-        draw_icon(draw, section['name'], (x0, y - icon + round(label * 0.12), icon), color, max(1, round(body / 9)))
-        tracked(x0 + icon + round(label * 0.7), y, section['title'].upper(), f_label, color, label * 0.12)
-        if section['right']:
-            text(x1 - f_small.getlength(section['right']), y, section['right'], f_small, faint)
-        y += round(label * 0.5)
-        if not section['items']:
-            for words in wrap_px(section['empty'], f_small, x1 - x0, 3):
-                y += round(small * 1.45)
-                text(x0, y, words, f_small, faint)
-            y += round(gap * 0.6)
-            continue
-        indent = x0 + round(body * 1.1)
-        for item in section['items']:
-            is_open = ui.get('open') == item['key']
-            font = f_mono if item.get('mono') else f_body
-            title = wrap_px(item['title'].replace('`', ''), font, x1 - indent, 6 if is_open else 2)
-            meta = item.get('meta', '')
-            extra = []
-            if is_open:
-                extra = [words for d in item.get('detail') or [] if d
-                         for words in wrap_px(d.replace('`', ''), f_small, x1 - indent, 3)][:6]
-            need = round(gap * 0.7) + len(title) * line + round(small * 1.5) * (1 + len(extra) + (1 if is_open else 0))
-            if y + need > h - round(pad * 0.5):
-                more = len(section['items']) - section['items'].index(item)
-                y += round(small * 1.5)
-                text(indent, y, f'+{more} more', f_small, faint)
-                break
-            top = y + round(gap * 0.35)
-            if is_open:
-                draw.rounded_rectangle([x0 - round(body * 0.5), top, x1 + round(body * 0.5), y + need + round(gap * 0.3)],
-                                       radius=round(body * 0.4), fill=mix(color, TINT))
-            y += round(gap * 0.7)
-            for i, words in enumerate(title):
-                y += line
-                if i == 0:
-                    r = max(2, round(body * 0.16))
-                    cy = y - round(body * 0.34)
-                    draw.ellipse([x0 + r, cy - r, x0 + 3 * r, cy + r], fill=color)
-                text(indent, y, words, font, ink_)
-            y += round(small * 1.5)
-            x = indent
-            if item.get('flag'):
-                text(x, y, item['flag'], f_small, INK['turn'][:3])
-                x += f_small.getlength(item['flag'] + ' · ')
-                if meta:
-                    text(x - f_small.getlength(' · '), y, ' · ', f_small, faint)
-            text(x, y, fit(meta, 200), f_small, faint)
-            for words in extra:
-                y += round(small * 1.5)
-                text(indent, y, words, f_small, quiet)
-            if is_open:
-                sent = ui.get('sent')
-                hint = (("✓ now in Claude's prompt" if sent[1] else "✗ couldn't reach Claude's pane")
-                        if sent and sent[0] == item['key'] else "click again → Claude's prompt")
-                y += round(small * 1.5)
-                text(indent, y, hint, f_small, color)
-            hits.append((top, y + round(gap * 0.3), item))
-        y += round(gap * 0.4)
-    out = io.BytesIO()
-    image.save(out, 'PNG', optimize=True)
-    return out.getvalue(), hits
+def item_rows(item, name, width, is_open):
+    """One item: its title on one line (all of it once opened), then what CSR knows about it, quiet,
+    with a flag first in the risk ink."""
+    room = width - ITEM
+    title = wrap(item['title'].replace('`', ''), room, 6 if is_open else 1)
+    rows = ['   ' + ink(SECTION[name]) + '•' + OFF + ' ' + title[0]] + [' ' * ITEM + line for line in title[1:]]
+    flag, meta = item.get('flag') or '', item.get('meta') or ''
+    text = fit(' · '.join(x for x in (flag, meta) if x), room)
+    line = ink('faint') + text
+    if flag and text.startswith(flag):
+        line = ink('turn') + flag + ink('faint') + text[len(flag):]
+    return rows + [' ' * ITEM + line + OFF] if text else rows
 
 
 def page_lines(page, width, rows, ui):
-    """The page as text, for a terminal that draws no pictures: the same sections and rows."""
-    head = page['head']
-    out = Lines([' ' + ink('faint') + fit(head['kicker'].upper(), width - 1) + OFF,
-                 ' ' + BOLD + fit(head['title'], width - 1) + OFF,
+    """The page in the terminal's type on paper: masthead and gauges, then each section under a hairline.
+    Every section keeps its heading and first row; the room left goes to the earlier ones first."""
+    head, s = page['head'], page['head'].get('session')
+    out = Lines([' ' + BOLD + fit(head['title'], width - 1) + OFF,
                  ' ' + ink('quiet') + fit(head['facts'], width - 1) + OFF])
-    room = dict(touching=9, risk=7, rules=6, dreams=6, memory=5, changed=rows)
-    for section in page['sections']:
+    out.heads, out.lanes = [], None
+    if s:
         out.put([''])
+        if PIXELS and width - LANE > 8:
+            out.lanes = len(out)
+            out.put([' ' + ink('faint') + name.ljust(LANE - 1) + OFF for name in ('you', 'context', 'memory')])
+        out.put(['  ' + lanes_legend(s, width - 2)])
+    built = []
+    for section in page['sections']:
+        blocks = []
+        for item in section['items']:
+            is_open = ui.get('open') == item['key']
+            rows_ = item_rows(item, section['name'], width, is_open)
+            if is_open:
+                rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'], indent=ITEM)
+            blocks.append((rows_, item))
+        empty = [] if blocks else ['   ' + ink('faint') + l + OFF for l in wrap(section['empty'], width - 3, 2)]
+        base = 2 + (len(blocks[0][0]) if blocks else len(empty))  # rule, heading, first row
+        want = 2 + (sum(len(rows_) for rows_, _ in blocks) if blocks else len(empty))
+        built.append((section, blocks, empty, base, want))
+    left = rows - 1 - len(out) - sum(base for *_, base, _ in built)
+    for section, blocks, empty, base, want in built:
+        room = base + max(0, min(want - base, left))
+        left -= room - base
+        out.put([ink('hair') + '─' * width + OFF])
+        out.heads.append((len(out), section['name']))
         part = Lines([heading(section['name'], section['title'], section['right'], width)])
-        if not section['items']:
-            part.put(['   ' + ink('faint') + l + OFF for l in wrap(section['empty'], width - 3, 2)])
+        if empty:
+            part.put(empty)
         else:
-            blocks = []
-            for item in section['items']:
-                is_open = ui.get('open') == item['key']
-                tail = ' · '.join(x for x in (item.get('flag'), item.get('meta')) if x)
-                rows_ = entry('', ink(SECTION[section['name']]) + '•', item['title'].replace('`', ''), tail, width,
-                              rows=6 if is_open else 2)
-                if is_open:
-                    rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'])
-                blocks.append((rows_, item))
-            fit_blocks(part, blocks, room.get(section['name'], 6), ui, tail=False)
-        base = len(out)
+            fit_blocks(part, blocks, room - 1, ui, tail=False)
+        start = len(out)
         out.extend(part)
-        out.acts.update({base + i: act for i, act in part.acts.items()})
+        out.acts.update({start + i: act for i, act in part.acts.items()})
     return out
 
 
-def draw_page(page, cols, rows, ui, view='main'):
-    """The page for the screen: a picture of paper where the terminal draws pictures, its legend in it,
-    text elsewhere. Either way, which screen rows a click acts on."""
+def draw_page(page, cols, rows, ui):
+    """The page on paper in the terminal's own type, so every row takes a click; pictures only for the
+    gauges and the section icons, which no click needs."""
+    width = max(24, cols - 1)
+    lines = page_lines(page, width, rows, ui)
+    pictures = []
     if PIXELS:
         cell = cell_size()
-        png, hits = paper_png(page, cols, rows, cell, ui, footer=LEGEND[view])
-        lines = Lines([''] * (rows - 1))
-        for row in range(rows - 1):
-            middle = (row + 0.5) * cell[1]
-            for top, bottom, item in hits:
-                if top <= middle <= bottom:
-                    lines.acts[row] = item
-        return lines, [(0, 0, cols, rows, png)]
-    return page_lines(page, max(24, cols - 1), rows, ui), []
+        s = page['head'].get('session')
+        if s and lines.lanes is not None:
+            pictures.append((lines.lanes, LANE, width - LANE, 3, session_png(s, width - LANE, cell, time.time())))
+        pictures += [(row, 1, 2, 1, icon_png(name, cell)) for row, name in lines.heads if row < rows - 1]
+    return lines, pictures
 
 
 def draw_main(data, s, cols, rows, now, ui=None):
@@ -1481,7 +1336,7 @@ def draw_main(data, s, cols, rows, now, ui=None):
 
 
 def draw_log(data, cols, rows, ui=None):
-    return draw_page(page_log(data), cols, rows, ui or {}, view='log')
+    return draw_page(page_log(data), cols, rows, ui or {})
 
 
 
