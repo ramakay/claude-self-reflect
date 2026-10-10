@@ -325,12 +325,13 @@ def kept_file(folder, session_id):
 
 def claude_status(session_id, now):
     """Claude's status line as its command last drew it, kept for this pane while it is open; None when
-    there is none, or it is older than ten minutes."""
+    there is none, or it is a day old. Claude Code redraws it only when something happens, so an idle
+    session's line is old and still right: the model and the context have not moved."""
     try:
         with open(kept_file(STATUS_LINES, session_id) or '', encoding='utf-8') as handle:
             kept = json.load(handle)
         line = str(kept.get('line') or '').strip('\n')
-        return line if line and now - float(kept.get('at') or 0) < 600 else None
+        return line if line and now - float(kept.get('at') or 0) < 86400 else None
     except (OSError, ValueError, TypeError, AttributeError):
         return None
 
@@ -1752,10 +1753,12 @@ def watch(root, limit, session_id, agent=None):
     except KeyboardInterrupt:
         pass
     finally:
-        if mine:
+        if mine:  # only while it still names this pane: a pane opened in its place has written its own
             try:
-                os.remove(mine)
-            except OSError:
+                with open(mine, encoding='utf-8') as handle:
+                    if json.load(handle).get('pid') == os.getpid():
+                        os.remove(mine)
+            except (OSError, ValueError, AttributeError):
                 pass
         if saved:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
