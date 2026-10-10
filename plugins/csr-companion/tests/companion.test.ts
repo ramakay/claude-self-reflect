@@ -165,7 +165,7 @@ test('session start in herdr: status line, old pane closed, new split watches th
   expect(seen.runs).toContainEqual(['/bin/herdr', 'pane', 'rename', 'w2:p9', 'CSR'])
   const watcher = seen.runs.find(argv => argv.includes('--watch'))
   expect(watcher?.slice(0, 4)).toEqual(['/bin/herdr', 'pane', 'run', 'w2:p9'])
-  expect(watcher?.slice(-2)).toEqual(['--sid', 'sess-1'])
+  expect(watcher?.slice(-4)).toEqual(['--sid', 'sess-1', '--agent', 'w2:p1']) // a second click on a row types into Claude's pane
   expect(seen.runs.find(argv => argv[0] === 'python3')).toEqual(expect.arrayContaining(['--json', '--sid', 'sess-1']))
   expect(seen.opened).toEqual([])
 })

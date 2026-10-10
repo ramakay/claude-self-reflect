@@ -8,7 +8,8 @@ Read-only against csr-engine, no model calls here. The pane, top to bottom:
   l: Changed since     code a commit changed under your past sessions (Claude gets a Heads up there).
 
   pane.py --repo PATH --json                    status counts + rows, for the mod
-  pane.py --repo PATH --watch [--sid ID]      full-screen pane: d main, l log, q quits
+  pane.py --repo PATH --watch [--sid ID] [--agent PANE]  full-screen pane: d main, l log, q quits;
+      a click opens a row, a second click puts it in Claude's prompt (herdr pane PANE)
   pane.py --repo PATH --png DIR [--sid ID]    write the pane's pictures, for a look
   pane.py --repo PATH --note FILE [--sid ID]  what CSR remembers about FILE, as notes for the band
   pane.py --repo PATH --brief --sid ID        what CSR remembers near this session, for the dreamer
@@ -564,7 +565,8 @@ def remembered_items(con, recalls, questions, session_id):
         key, about = memory_of(con, kind, memory, conversation, parent)
         if not about or key == session_id:
             continue
-        item = items.setdefault(key, dict(kind='recall', at=0, text=about[0], when=about[1], project=about[2], times=0))
+        item = items.setdefault(key, dict(kind='recall', key=key, at=0, text=about[0], when=about[1], project=about[2],
+                                          times=0))
         item['at'], item['times'] = max(item['at'], epoch(at) or 0), item['times'] + 1
     for when, tool, ask in questions:
         items[('asked', when)] = dict(kind='asked', at=when, text=ask, tool=tool, times=1)
@@ -703,8 +705,14 @@ class Clock:
 
 # ---------------------------------------------------------------- pictures
 
-INK = dict(you=(225, 225, 225), ctx=(110, 160, 255), learn=(100, 210, 130), turn=(240, 95, 95),
-           dream=(240, 185, 70), recall=(90, 200, 225), asked=(205, 120, 235), rule=(255, 255, 255, 38))
+# pigment's dark-ground inks (its bloomberg archetype): the pane sits on black, and each section
+# keeps one ink for its icon, its band and its marks.
+INK = dict(you=(243, 242, 238), ctx=(58, 127, 224), learn=(36, 163, 114), turn=(232, 88, 44),
+           dream=(242, 182, 50), recall=(90, 200, 225), asked=(154, 123, 232), rule=(255, 255, 255, 38),
+           quiet=(166, 165, 158))
+SECTION = dict(session='ctx', remembered='recall', dreams='dream', kept='turn', changed='quiet')
+GLYPH = dict(session='◉', remembered='↑', dreams='☾', kept='◆', changed='~')  # where no pictures are drawn
+TINT = 0.16  # a section's band: its ink at this strength on black
 SS = 2  # draw at twice the size, then shrink: PIL draws no anti-aliased edges
 
 
@@ -792,6 +800,52 @@ def kitty(png, row, col, cols, rows):
     return ''.join(out)
 
 
+_ICONS = {}
+
+
+def icon_png(name, cell):
+    """A section's icon, two cells wide, in pigment's hairline: one ink, round strokes."""
+    if (name, cell) in _ICONS:
+        return _ICONS[name, cell]
+    image, draw = canvas(2, 1, cell)
+    size = min(image.width, image.height) * 0.8
+    x0, y0 = (image.width - size) / 2, (image.height - size) / 2
+    at = lambda fx, fy: (x0 + fx * size, y0 + fy * size)
+    color = INK[SECTION[name]][:3] + (255,)
+    width = max(2 * SS, round(size * 0.1))
+
+    def stroke(*points, thin=1.0):
+        pts, w = [at(*p) for p in points], max(SS, round(width * thin))
+        draw.line(pts, fill=color, width=w, joint='curve')
+        for x, y in (pts[0], pts[-1]):  # round caps
+            draw.ellipse([x - w / 2, y - w / 2, x + w / 2, y + w / 2], fill=color)
+
+    def disc(cx, cy, r, fill):
+        (x, y), (edge, _) = at(cx, cy), at(cx + r, cy)
+        draw.ellipse([x - (edge - x), y - (edge - x), edge, y + (edge - x)], fill=fill)
+
+    if name == 'session':  # a pulse: your prompts and Claude's replies over time
+        stroke((0.0, 0.56), (0.26, 0.56), (0.38, 0.18), (0.54, 0.9), (0.66, 0.4), (0.74, 0.56), (1.0, 0.56))
+    elif name == 'remembered':  # handed up to Claude, out of the tray of past sessions
+        stroke((0.1, 0.56), (0.1, 0.9), (0.9, 0.9), (0.9, 0.56))
+        stroke((0.5, 0.7), (0.5, 0.08))
+        stroke((0.27, 0.31), (0.5, 0.08), (0.73, 0.31))
+    elif name == 'dreams':  # a crescent and a spark
+        disc(0.42, 0.56, 0.4, color)
+        disc(0.6, 0.4, 0.34, (0, 0, 0, 0))
+        stroke((0.84, 0.04), (0.84, 0.36), thin=0.7)
+        stroke((0.68, 0.2), (1.0, 0.2), thin=0.7)
+    elif name == 'kept':  # a bookmark
+        stroke((0.26, 0.06), (0.74, 0.06), (0.74, 0.94), (0.5, 0.7), (0.26, 0.94), (0.26, 0.06))
+    else:  # a commit on its line
+        stroke((0.0, 0.5), (0.28, 0.5))
+        stroke((0.72, 0.5), (1.0, 0.5))
+        disc(0.5, 0.5, 0.24, color)
+        disc(0.5, 0.5, 0.24 - width / size, (0, 0, 0, 0))
+    _ICONS[name, cell] = shrink(image)
+    return _ICONS[name, cell]
+
+
 def strip_cells(values, width, chars='▁▂▃▄▅▆▇█'):
     if not values:
         return ' ' * width
@@ -802,11 +856,80 @@ def strip_cells(values, width, chars='▁▂▃▄▅▆▇█'):
 # ---------------------------------------------------------------- the screen
 
 DIM, BOLD, OFF = '\x1b[2m', '\x1b[1m', '\x1b[0m'
+BLACK, GROUND_BACK = '\x1b]11;rgb:00/00/00\x1b\\', '\x1b]111\x1b\\'  # the pane's own ground, and the terminal's back
+MOUSE_ON, MOUSE_OFF = '\x1b[?1000h\x1b[?1006h', '\x1b[?1000l\x1b[?1006l'  # clicks, as SGR reports
 
 
 def ink(name):
     r, g, b = INK[name][:3]
     return f'\x1b[38;2;{r};{g};{b}m'
+
+
+def band(name):
+    r, g, b = INK[SECTION[name]][:3]
+    return f'\x1b[48;2;{round(r * TINT)};{round(g * TINT)};{round(b * TINT)}m'
+
+
+def tinted(line, back):
+    """The line on a background that runs to the pane's edge, laid again after each reset in it."""
+    return back + line.replace(OFF, OFF + back) + '\x1b[K' + OFF
+
+
+class Lines(list):
+    """Lines for the screen, and what a click on each one acts on."""
+
+    def __init__(self, rows=()):
+        super().__init__(rows)
+        self.acts = {}
+
+    def put(self, rows, act=None):
+        if act:
+            self.acts.update({len(self) + i: act for i in range(len(rows))})
+        self.extend(rows)
+        return self
+
+
+def one_line(text, most=700):
+    return fit(' '.join(str(text).split()), most)
+
+
+def fit_blocks(out, blocks, room, ui, tail=True):
+    """A section's rows, (rows, act) newest first, under its heading and within its room. A row a click
+    opened always shows: newer ones above it give way, said in a line, and it is cut to the room if it
+    must be, its last line (what a second click does) kept."""
+    at = next((k for k, (_, act) in enumerate(blocks) if act and act['key'] == ui.get('open')), None)
+    first = 0
+    while at is not None and first < at and len(out) + 1 + sum(len(rows) for rows, _ in blocks[first:at + 1]) > room:
+        first += 1
+    if first:
+        out.put([' ' * INDENT + DIM + f'+{first} newer' + OFF])
+    shown = first
+    for k in range(first, len(blocks)):
+        rows, act = blocks[k]
+        more = len(blocks) - k - 1
+        if k == at:
+            if len(out) + len(rows) > room:
+                rows = rows[:max(1, room - len(out) - 1)] + rows[-1:]
+        elif len(out) + len(rows) + (1 if more and tail else 0) > room:
+            break
+        out.put(rows, act)
+        shown += 1
+    if tail and shown < len(blocks) and len(out) < room:
+        out.put([' ' * INDENT + DIM + f'+{len(blocks) - shown} earlier' + OFF])
+    return out
+
+
+def opened(rows, name, detail, width, ui, key):
+    """A row a click opened: its whole text, what more CSR knows, and what a second click does."""
+    sent = ui.get('sent')
+    if sent and sent[0] == key:
+        hint = "✓ now in Claude's prompt" if sent[1] else "✗ couldn't reach Claude's pane"
+    else:
+        hint = "↳ click again → Claude's prompt"
+    room = width - INDENT
+    more = [' ' * INDENT + DIM + line + OFF for text in detail for line in wrap(text, room, 2)][:4]
+    last = ' ' * INDENT + ink(SECTION[name]) + fit(hint, room) + OFF
+    return [tinted(row, band(name)) for row in rows + more + [last]]
 
 
 STAR = ink('asked') + '☾' + OFF  # CSR's mark, as in the band above Claude's prompt
@@ -901,11 +1024,16 @@ def entry(when, mark, text, tail, width, rows=2):
     return [head + mark + OFF + ' ' + lines[0]] + [' ' * INDENT + line for line in lines[1:]]
 
 
-def heading(mark, title, right, width):
-    gap = width - 2 - len(title) - len(right)
+def heading(name, title, right, width):
+    """A section's head: a band of its ink across the pane, its icon (pasted over the first two cells
+    where the terminal draws pictures, its mark where it does not) and its title in its ink."""
+    lead = '   ' if PIXELS else f' {ink(SECTION[name])}{GLYPH[name]} '
+    room = width - 3
+    gap = room - len(title) - len(right) - 1
     if gap < 1:
-        right, gap = '', width - 2 - len(title)
-    return f'{mark}{OFF} {BOLD}{fit(title, width - 2)}{OFF}' + ' ' * max(1, gap) + DIM + right + OFF
+        right, gap = '', room - len(title) - 1
+    text = ink(SECTION[name]) + BOLD + fit(title, room - 1) + '\x1b[22m' + ' ' * max(1, gap) + ink('quiet') + right
+    return tinted(lead + text, band(name))
 
 
 def session_head(s, width, now):
@@ -916,8 +1044,7 @@ def session_head(s, width, now):
         facts.insert(2, f"{len(s['compacts'])} compacts")
     while len(' · '.join(facts)) > width - 2 and len(facts) > 1:
         facts.pop()
-    return [STAR + ' ' + BOLD + fit(s.get('title') or 'This session', width - 2) + OFF,
-            '  ' + DIM + ' · '.join(facts) + OFF]
+    return [heading('session', s.get('title') or 'This session', '', width), '  ' + DIM + ' · '.join(facts) + OFF]
 
 
 def lanes_legend(s, width):
@@ -929,108 +1056,162 @@ def lanes_legend(s, width):
     return '  '.join(f'{mark}{OFF} {DIM}{text}{OFF}' for mark, text in parts)
 
 
-def draw_remembered(s, width, room, now):
-    """What CSR handed Claude this session: the past session each memory came from, and Claude's own asks."""
+def recall_act(item, now):
+    """What a click on a remembered past session hands Claude: the gist, and where the rest is."""
+    when = from_when(item['when'], now) if item.get('when') else ''
+    where = ' · '.join(part for part in (when, item.get('project')) if part)
+    if item['key'].startswith('reflection:'):
+        send = f"CSR remembered: “{item['text']}” ({where})." if where else f"CSR remembered: “{item['text']}”."
+        detail = [f"A note CSR stored{' ' + when if when else ''}; handed to Claude {item['times']}× this session."]
+    else:
+        send = (f"CSR remembered a past session: “{item['text']}” ({where}). "
+                f"The rest of it: csr_reflect_on_past(\"conv_{item['key']}\")")
+        detail = [f"Session {item['key'][:8]} · {where} · handed to Claude {item['times']}× this session."]
+    return dict(key='recall:' + item['key'], send=one_line(send), detail=detail)
+
+
+def draw_remembered(s, width, room, now, ui=None):
+    """What CSR handed Claude this session, each past session a row a click opens; Claude's own asks of
+    CSR, those in a row folded into one line."""
+    ui = ui or {}
     items = s['remembered']
     recalls = sum(1 for item in items if item['kind'] == 'recall')
-    out = [heading(ink('recall') + '↑', 'Remembered for you', f'{recalls} past sessions' if recalls else '', width)]
+    out = Lines([heading('remembered', 'Remembered for you', f'{recalls} past sessions' if recalls else '', width)])
     if not items:
         line = (f"Nothing yet. Each time you prompt, CSR looks through your {s['sessions']:,} past sessions "
                 f"and hands Claude what fits.")
-        return out + ['  ' + DIM + l + OFF for l in wrap(line, width - 2, max(1, min(3, room - 1)))]
-    shown, before = 0, None
-    for item in items:
-        when = stamp(item['at'], now, before, ink('recall'))
-        if when[0]:
-            before = when[0]
-        if item['kind'] == 'recall':
+        return out.put(['  ' + DIM + l + OFF for l in wrap(line, width - 2, max(1, min(3, room - 1)))])
+    blocks, before, i = [], None, 0  # (rows, act), newest first
+    while i < len(items):
+        item = items[i]
+        when = stamp(item['at'], now, before, ink('recall' if item['kind'] == 'recall' else 'asked'))
+        before = when[0] or before
+        if item['kind'] == 'asked':
+            run = [item]
+            while i + 1 < len(items) and items[i + 1]['kind'] == 'asked':
+                i += 1
+                run.append(items[i])
+            asks = [one_line(r['text'] or r['tool'], 34) for r in run]
+            text = (f'Claude asked CSR “{asks[0]}”' if len(run) == 1 else
+                    f'Claude asked CSR {len(run)} times: ' + ' · '.join(f'“{a}”' for a in asks))
+            blocks.append((entry(when, ink('asked') + '●', text, '', width), None))
+        else:
             tail = from_when(item['when'], now)
             if item.get('project') and item['project'] != s.get('project'):
                 tail = f"{tail} · {item['project']}"
-            rows = entry(when, ink('recall') + '↑', item['text'], tail, width)
-        else:
-            rows = entry(when, ink('asked') + '●', f"Claude asked CSR “{item['text'] or item['tool']}”", '', width)
-        more = len(items) - shown - 1
-        if len(out) + len(rows) + (1 if more else 0) > room:
-            break
-        out += rows
-        shown += 1
-    if shown < len(items):
-        out.append(' ' * INDENT + DIM + f'+{len(items) - shown} earlier' + OFF)
-    return out
+            act = recall_act(item, now)
+            is_open = ui.get('open') == act['key']
+            rows = entry(when, ink('recall') + '↑', item['text'], tail, width, rows=6 if is_open else 2)
+            blocks.append((opened(rows, 'remembered', act['detail'], width, ui, act['key']) if is_open else rows, act))
+        i += 1
+    return fit_blocks(out, blocks, room, ui)
 
 
-def draw_dreams(dreams, on, width, room, now):
+def draw_dreams(dreams, on, width, room, now, ui=None):
     """The dreamer's "what if...?" questions, newest first, each with what you answered."""
+    ui = ui or {}
     week = sum(1 for d in dreams if d['at'] >= now - 7 * 86400)
     right = 'on' + (f' · {week} this week' if week else '') if on else 'off'
-    out = [heading(ink('dream') + '☾', 'What if…', right, width)]
+    out = Lines([heading('dreams', 'What if…', right, width)])
     if not dreams:
         line = ('Nothing yet. The dreamer asks when CSR has something new near this work.' if on else
                 'A side agent that asks "what if…?" while Claude works. Turn it on in /config.')
-        return out + ['  ' + DIM + l + OFF for l in wrap(line, width - 2, 2)]
+        return out.put(['  ' + DIM + l + OFF for l in wrap(line, width - 2, 2)])
+    blocks = []
     for dream in dreams:
         mark = ANSWER_MARK.get(dream['answer'], ink('dream') + '☾')
-        rows = entry(stamp(dream['at'], now, lit=ink('dream')), mark, dream['line'], ANSWER_WORD.get(dream['answer'], ''), width)
-        if len(out) + len(rows) > room:
-            break
-        out += rows
-    return out
+        act = dict(key='dream:' + dream['id'], send=one_line(f"CSR's dreamer asked: “{dream['line']}”"),
+                   detail=[dream.get('title') or ''] + [re.sub(r'^[*-]\s*', '', line) for line in
+                                                        (dream.get('text') or '').splitlines() if line.strip()][:3])
+        is_open = ui.get('open') == act['key']
+        rows = entry(stamp(dream['at'], now, lit=ink('dream')), mark, dream['line'],
+                     ANSWER_WORD.get(dream['answer'], ''), width, rows=4 if is_open else 2)
+        if is_open:
+            rows = opened(rows, 'dreams', [d for d in act['detail'] if d], width, ui, act['key'])
+        blocks.append((rows, act))
+    return fit_blocks(out, blocks, room, ui, tail=False)
 
 
-def draw_kept(s, width, room, now):
+def draw_kept(s, width, room, now, ui=None):
     """Course changes this session that CSR carries into your next ones."""
+    ui = ui or {}
     turns = [(epoch(when), kind, quote) for when, kind, quote in s['learned']['turns'] if quote]
     if not turns:
-        return []
-    out = [heading(ink('turn') + '◆', 'Kept for next time', f'{len(turns)}', width)]
-    before = None
+        return Lines()
+    out = Lines([heading('kept', 'Kept for next time', f'{len(turns)}', width)])
+    blocks, before = [], None
     for when, kind, quote in reversed(turns):
         who = 'You' if kind == 'correction' else 'Claude'
         label = stamp(when or now, now, before, ink('turn'))
         before = label[0] or before
-        rows = entry(label, ink('turn') + '◆', f'{who}: “{quote}”', '', width)
-        if len(out) + len(rows) > room:
-            break
-        out += rows
-    return out if len(out) > 1 else []
+        said = 'you said' if kind == 'correction' else 'Claude said'
+        act = dict(key=f'kept:{when}:{quote[:40]}', send=one_line(f'Earlier this session {said}: “{quote}”'),
+                   detail=['A course change CSR carries into your next sessions.'])
+        is_open = ui.get('open') == act['key']
+        rows = entry(label, ink('turn') + '◆', f'{who}: “{quote}”', '', width, rows=6 if is_open else 2)
+        if is_open:
+            rows = opened(rows, 'kept', act['detail'], width, ui, act['key'])
+        blocks.append((rows, act))
+    fit_blocks(out, blocks, room, ui, tail=False)
+    return out if len(out) > 1 else Lines()
 
 
-def draw_main(data, s, cols, rows, now):
+def draw_main(data, s, cols, rows, now, ui=None):
+    ui = ui or {}
     width = max(24, cols - 1)
     budget = rows - 1
-    out, pictures = [], []
-    dreams = draw_dreams(data['dreams'], data.get('dreams_on'), width, 7, now)
+    out, pictures = Lines(), []
+    cell = cell_size() if PIXELS else None
+
+    def add(part, name=None):
+        if name and cell and part:
+            pictures.append((len(out), 0, 2, 1, icon_png(name, cell)))
+        base = len(out)
+        out.extend(part)
+        out.acts.update({base + i: act for i, act in getattr(part, 'acts', {}).items()})
+
+    is_open = lambda kind: str(ui.get('open') or '').startswith(kind)
     if s is None:
-        return dreams, pictures
-    out += session_head(s, width, now)
+        add(draw_dreams(data['dreams'], data.get('dreams_on'), width, budget, now, ui), 'dreams')
+        return out, pictures
+    add(session_head(s, width, now), 'session')
     pic_cols = width - 8
     names = ['you', 'context', 'memory']
-    if PIXELS and pic_cols > 8:
-        pictures.append((len(out), 8, pic_cols, 3, session_png(s, pic_cols, cell_size(), now)))
-        out += [DIM + name.ljust(8) + OFF for name in names]
+    if cell and pic_cols > 8:
+        pictures.append((len(out), 8, pic_cols, 3, session_png(s, pic_cols, cell, now)))
+        add([DIM + name.ljust(8) + OFF for name in names])
     else:
         first = (s['prompts'] or [now])[0]
         bins = lambda stamps: Counter(int((t - first) // 600) for t in stamps if t)
         for name, stamps in zip(names, (s['prompts'], [r[0] for r in s['replies']], s['gave']['recalls'])):
             counts = bins(stamps)
-            out.append(DIM + name.ljust(8) + OFF + strip_cells([counts.get(i, 0) for i in range(max(counts, default=0) + 1)][-pic_cols:], pic_cols))
-    out += ['  ' + lanes_legend(s, width - 2), '']
-    kept = draw_kept(s, width, 5, now)
+            add([DIM + name.ljust(8) + OFF + strip_cells([counts.get(i, 0) for i in range(max(counts, default=0) + 1)][-pic_cols:], pic_cols)])
+    add(['  ' + lanes_legend(s, width - 2), ''])
+    # Remembered for you leads: on a short pane the dreams and the kept lines give way first.
+    rest = budget - len(out)
+    roomy = rest >= 22 and not is_open('recall:')
+    dream_room = (7 if roomy else 5 if rest >= 16 else 3) + (6 if is_open('dream:') else 0)
+    kept_room = (5 if roomy else 3 if rest >= 18 else 0) + (5 if is_open('kept:') else 0)
+    dreams = draw_dreams(data['dreams'], data.get('dreams_on'), width, dream_room, now, ui)
+    kept = draw_kept(s, width, kept_room, now, ui) if kept_room else Lines()
     room = budget - len(out) - len(dreams) - 1 - (len(kept) + 1 if kept else 0)
-    out += draw_remembered(s, width, max(3, room), now) + [''] + dreams
+    add(draw_remembered(s, width, max(3, room), now, ui), 'remembered')
+    add([''])
+    add(dreams, 'dreams')
     if kept:
-        out += [''] + kept
+        add([''])
+        add(kept, 'kept')
     return out, pictures
 
 
-def draw_log(data, cols, rows):
+def draw_log(data, cols, rows, ui=None):
+    ui = ui or {}
     width = max(20, cols - 1)
-    out = [BOLD + fit(f"Changed since your sessions · {data['total']}", width) + OFF]
-    out += [DIM + l + OFF for l in wrap('Commits that changed code your past sessions worked on. When Claude '
-                                        'opens one of these files, CSR gives it a Heads up.', width, 3)] + ['']
+    out = Lines([heading('changed', 'Changed since your sessions', str(data['total']), width)])
+    out.put([DIM + l + OFF for l in wrap('Commits that changed code your past sessions worked on. When Claude '
+                                         'opens one of these files, CSR gives it a Heads up.', width, 3)] + [''])
     if not data['shifts']:
-        out.append(DIM + fit('Nothing changed under past conversations here.', width) + OFF)
+        out.put([DIM + fit('Nothing changed under past conversations here.', width) + OFF])
     commits = {}
     for shift in data['shifts']:
         commits.setdefault((shift['date'], shift['oid']), []).append(shift)
@@ -1038,14 +1219,20 @@ def draw_log(data, cols, rows):
     for (date, oid), group in commits.items():
         if len(out) + 3 > budget:
             break
-        out.append(BOLD + fit(f"{date[5:]} {oid[:7]} {group[0]['subject']}", width) + OFF)
         files = {}
         for shift in group:
             files.setdefault(shift['file'], []).append(shift)
+        named = ', '.join(f"{'/'.join(file.split('/')[-2:])} ({', '.join(c['symbol'] or 'whole file' for c in changes[:4])})"
+                          for file, changes in list(files.items())[:3])
+        act = dict(key=f'commit:{oid}', send=one_line(f"Since our past sessions, commit {oid[:7]} “{group[0]['subject']}” "
+                                                      f"({date}) changed code we worked on: {named}."),
+                   detail=[f"{oid[:12]} · {date} · {group[0]['subject']}"])
+        rows_here = Lines()
+        rows_here.put([BOLD + fit(f"{date[5:]} {oid[:7]} {group[0]['subject']}", width) + OFF])
         for file, changes in files.items():
-            if len(out) + 2 > budget:
+            if len(out) + len(rows_here) + 2 > budget:
                 break
-            out.append('  ' + DIM + fit('/'.join(file.split('/')[-2:]), width - 2) + OFF)
+            rows_here.put(['  ' + DIM + fit('/'.join(file.split('/')[-2:]), width - 2) + OFF])
             lines, cur, used = [], '    ', 4
             for i, change in enumerate(changes):
                 label = fit(change['symbol'] or '(whole file)', width - 6)
@@ -1058,21 +1245,59 @@ def draw_log(data, cols, rows):
                 cur += MARK.get(change['verb'], '') + label + OFF + ' '
                 used += len(label) + 2
             lines.append(cur)
-            out.extend(lines)
-        out.append('')
-    return out, []
+            rows_here.put(lines)
+        body = list(rows_here)
+        if ui.get('open') == act['key']:
+            body = opened(body[:1], 'changed', act['detail'], width, ui, act['key']) + body[1:]  # hint by the commit
+        out.put(body, act)
+        out.put([''])
+    pictures = [(0, 0, 2, 1, icon_png('changed', cell_size()))] if PIXELS else []
+    return out, pictures
 
 
 def legend(view, width):
-    text = 'l changed since your sessions · q' if view == 'main' else '~ changed  - removed  + back · d · q'
+    text = 'l changed since your sessions · q' if view == 'main' else '~ changed  - removed  + back · d back · q'
     return DIM + fit(text, width) + OFF
 
 
+def herdr(*argv):
+    """Run herdr's CLI; its answer, or None when it is not there or says no."""
+    binary = os.environ.get('HERDR_BIN_PATH') or shutil.which('herdr')
+    if not binary:
+        return None
+    try:
+        done = subprocess.run([binary, *argv], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def agent_pane(given):
+    """Claude's pane: the one the mod named, else this pane's neighbour on the left."""
+    if given:
+        return given
+    me = os.environ.get('HERDR_PANE_ID')
+    said = me and herdr('pane', 'neighbor', '--pane', me, '--direction', 'left')
+    try:
+        found = json.loads(said or '{}').get('result', {})
+    except ValueError:
+        return None
+    return (found.get('pane') or {}).get('pane_id') or found.get('pane_id')
+
+
+def focus_back():
+    """Keys stay Claude's: a click lands here, so hand the focus back to the pane on the left."""
+    me = os.environ.get('HERDR_PANE_ID')
+    if me:
+        herdr('pane', 'focus', '--pane', me, '--direction', 'left')
+
+
 class Pane:
-    def __init__(self, root, limit, session_id):
-        self.root, self.limit = root, limit
+    def __init__(self, root, limit, session_id, agent=None):
+        self.root, self.limit, self.agent = root, limit, agent
         self.session = Session(session_id) if session_id else None
         self.view, self.data, self.loaded, self.shown = 'main', None, 0.0, None
+        self.open, self.sent, self.acts = None, None, {}  # the row a click opened; what went to Claude
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -1088,7 +1313,11 @@ class Pane:
                              + '\n'.join(wrap(said, cols - 1, 4)) + f"{OFF}\n")
             sys.stdout.flush()
             return
-        sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'],
+        if self.sent and now - self.sent[2] > 6:  # the "in Claude's prompt" line has been read
+            self.open = None if self.open == self.sent[0] else self.open
+            self.sent = None
+        ui = dict(open=self.open, sent=self.sent)
+        sig = json.dumps([self.view, cols, rows, self.data['total'], self.data['dreams_on'], self.open, self.sent,
                           [(d['id'], d['answer']) for d in self.data['dreams']],
                           s and [len(s['replies']), len(s['prompts']), len(s['learned']['chunks']), s['title'],
                                  len(s['learned']['turns']), len(s['gave']['recalls']), len(s['remembered'])]])
@@ -1096,9 +1325,11 @@ class Pane:
             return
         self.shown = sig
         if self.view == 'main':
-            lines, pictures = draw_main(self.data, s, cols, rows, now)
+            lines, pictures = draw_main(self.data, s, cols, rows, now, ui)
         else:
-            lines, pictures = draw_log(self.data, cols, rows)
+            lines, pictures = draw_log(self.data, cols, rows, ui)
+        self.acts = {row: act for row, act in getattr(lines, 'acts', {}).items() if row < rows - 1}
+        self.acts[rows - 1] = dict(key='view:log' if self.view == 'main' else 'view:main')
         lines = lines[:rows - 1]
         screen = ['\x1b_Ga=d,d=A\x1b\\', '\x1b[H\x1b[2J', '\n'.join(lines),
                   f'\x1b[{rows};1H', legend(self.view, cols - 1)]
@@ -1107,39 +1338,63 @@ class Pane:
         sys.stdout.write(''.join(screen))
         sys.stdout.flush()
 
+    def click(self, row):
+        """One click opens a row; a second click on it puts it in Claude's prompt, unsent."""
+        act = self.acts.get(row)
+        if not act:
+            self.open = None
+        elif act['key'].startswith('view:'):
+            self.view, self.open = act['key'][5:], None
+        elif act['key'] != self.open:
+            self.open, self.sent = act['key'], None
+        else:
+            agent = agent_pane(self.agent)
+            went = bool(agent) and herdr('pane', 'send-text', agent, act['send']) is not None
+            self.sent = (act['key'], went, time.time())
+        focus_back()
 
-def watch(root, limit, session_id):
-    pane = Pane(root, limit, session_id)
+
+def watch(root, limit, session_id, agent=None):
+    pane = Pane(root, limit, session_id, agent)
     redraw = {'now': True}
     signal.signal(signal.SIGWINCH, lambda *_: redraw.update(now=True))
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd) if os.isatty(fd) else None
     if saved:
         tty.setcbreak(fd)
-    sys.stdout.write('\x1b]0;CSR\x07\x1b[?25l')
+    sys.stdout.write('\x1b]0;CSR\x07\x1b[?25l' + BLACK + (MOUSE_ON if saved else ''))
     try:
         last = 0.0
         while True:
-            if redraw['now'] or time.time() - last > 10:
+            if redraw['now'] or time.time() - last > (2 if pane.sent else 10):
                 pane.frame(redraw['now'])
                 redraw['now'], last = False, time.time()
             try:
                 ready, _, _ = select.select([sys.stdin] if saved else [], [], [], 1.0)
             except InterruptedError:
                 continue
-            if ready:
-                key = sys.stdin.read(1).lower()
-                if key == 'q':
-                    break
+            if not ready:
+                continue
+            data = os.read(fd, 1024).decode('utf-8', 'replace')
+            for button, _, y, kind in re.findall(r'\x1b\[<(\d+);(\d+);(\d+)([Mm])', data):
+                if kind == 'M' and int(button) == 0:  # a left press; releases and the wheel pass
+                    pane.click(int(y) - 1)
+                    redraw['now'] = True
+            keys = re.sub(r'\x1b\[<[\d;]*[Mm]', '', data).lower()
+            if 'q' in keys:
+                break
+            if keys == '\x1b':
+                pane.open, redraw['now'] = None, True
+            for key in keys:
                 if key in ('d', 'l'):
-                    pane.view = 'main' if key == 'd' else 'log'
+                    pane.view, pane.open = ('main' if key == 'd' else 'log'), None
                     redraw['now'] = True
     except KeyboardInterrupt:
         pass
     finally:
         if saved:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        sys.stdout.write('\x1b_Ga=d,d=A\x1b\\\x1b[?25h\n')
+        sys.stdout.write('\x1b_Ga=d,d=A\x1b\\' + (MOUSE_OFF if saved else '') + GROUND_BACK + '\x1b[?25h\n')
 
 
 def main():
@@ -1147,6 +1402,7 @@ def main():
     parser.add_argument('--repo', required=True)
     parser.add_argument('--limit', type=int, default=120)
     parser.add_argument('--sid', help='the Claude Code session id (herdr takes --session for itself)')
+    parser.add_argument('--agent', help="Claude's herdr pane, where a second click on a row puts it")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--json', action='store_true')
     mode.add_argument('--watch', action='store_true')
@@ -1207,7 +1463,7 @@ def main():
         if not root:
             print('not a git repository:', args.repo)
             return
-        watch(root, args.limit, args.sid)
+        watch(root, args.limit, args.sid, args.agent)
 
 
 if __name__ == '__main__':

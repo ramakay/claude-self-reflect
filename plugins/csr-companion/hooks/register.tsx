@@ -541,7 +541,7 @@ async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> 
   if (!id) return false
   await $.process.run([herdr, 'pane', 'rename', id, LABEL])
   const session = await $.session.id()
-  await $.process.run([herdr, 'pane', 'run', id, 'python3', '-I', script($), '--repo', cwd, '--watch', '--sid', session])
+  await $.process.run([herdr, 'pane', 'run', id, 'python3', '-I', script($), '--repo', cwd, '--watch', '--sid', session, '--agent', self])
   return true
 }
 
