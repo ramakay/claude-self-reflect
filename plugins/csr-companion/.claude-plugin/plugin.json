@@ -1,0 +1,19 @@
+{
+  "name": "csr-companion",
+  "version": "0.4.0",
+  "description": "Claude Self-Reflect beside Claude: a pane that shows what your memory handed Claude this session, a side agent that asks \"what if...?\" when your past sessions give it a reason, and a heads up when Claude opens code that changed since you last worked on it",
+  "author": { "name": "Rama Annaswamy" },
+  "homepage": "https://github.com/ramakay/claude-self-reflect",
+  "repository": "https://github.com/ramakay/claude-self-reflect",
+  "license": "MIT",
+  "keywords": ["memory", "side-pane", "dreams", "what-if", "claude-self-reflect"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "dreams": {
+      "type": "boolean",
+      "title": "Dreams",
+      "description": "While Claude works, CSR's dreamer asks one \"what if...?\" when its memory gives a reason. It looks only when CSR has something new, slows down when it finds nothing, and never spends more than 1 token for every 10 Claude spends.",
+      "default": false
+    }
+  }
+}

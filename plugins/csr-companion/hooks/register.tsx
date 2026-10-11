@@ -1,0 +1,1043 @@
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register, Settings, SettingsSource } from 'claude-code'
+
+import type { Note, NoteView, Shift, ShiftsData } from '../types'
+import { carryBlock } from './carry'
+import type { Thread } from './carry'
+import { askClaude, dreamId, dreamPrompt, parseDream, sameDream } from './dreamer'
+import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, hasNews, mayLook, median, paceText, spacing } from './pace'
+import type { Chapter, Pace } from './pace'
+import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, RELEASE, releaseFromGit } from './coach'
+
+// CSR beside Claude, patterned on Claude Code's own "You should know".
+//
+// The band speaks in two voices, one note at a time, never the same twice,
+// gone after two prompts unanswered:
+//  - Heads up / You should know: when Claude reads or edits a file, what CSR
+//    remembers about it (a past session's work there that a commit changed
+//    after that session ended, or a rule you set for it). Counters and misses,
+//    from CSR's memory, no model calls.
+//  - Dream: every few steps of Claude's work, the dreamer asks one "what if...?",
+//    the question you keep asking the agent, grounded in what CSR remembers.
+//    It forks this session the way You should know does, so it spends tokens:
+//    off by default, a /config row as You should know is a /plugin switch, and
+//    paced by what it earns (./pace.ts), not a daily number.
+//
+// The pane: this session live, the dreams by date, and code that changed since
+// your past sessions, in a herdr split beside Claude.
+const script = ($: EngineInterface) => `${$.plugin.root}/bin/pane.py`
+const PANE = 'csr'
+const LABEL = 'CSR'
+const STAR = '☾' // CSR's mark where You should know draws its ✦
+const REFRESH_MS = 10 * 60 * 1000
+const CLEAR_AFTER_PROMPTS = 2
+const KEPT = 200
+const FILE_TOOLS = new Set(['Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+// The dreamer: the last 50 dreams never asked again, and after dreams you typed
+// past, 1, 2, 4... up to 16 looks skipped, as You should know does. How often it
+// looks otherwise is ./pace.ts.
+const SEEN_KEPT = 50
+const SKIP_MAX = 16
+const FACTS_KEPT = 400
+const CHAPTERS_KEPT = 20
+const ADOPTED = new Set(['helpful', 'ask_claude']) // a dream you took up
+const OFF_ROW = 'csr-companion.dreams'
+
+const data = atom({ plugin: 'csr-companion', key: 'data' } as const, null as ShiftsData | null)
+const view = atom({ plugin: 'csr-companion', key: 'view' } as const, null as NoteView | null)
+
+type HerdrPane = { pane_id: string; tab_id?: string; workspace_id?: string; label?: string | null }
+
+async function run($: EngineInterface, argv: string[]): Promise<string | null> {
+  const ran = await $.process.run(['python3', '-I', script($), ...argv], { timeoutMs: 20_000 })
+  return ran.exitCode === 0 ? ran.stdout : null
+}
+
+// Where a push that names no branch lands: the current branch, its upstream, any configured push refspec.
+async function landsOnRelease($: EngineInterface, dir: string): Promise<boolean> {
+  const git = async (...args: string[]) => {
+    try {
+      const ran = await $.process.run(['git', '-C', dir, ...args], { timeoutMs: 2_000 })
+      return ran.exitCode === 0 ? ran.stdout : ''
+    } catch {
+      return ''
+    }
+  }
+  const [branch, upstream, config] = await Promise.all([
+    git('symbolic-ref', '-q', '--short', 'HEAD'),
+    git('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'),
+    git('config', '--get-regexp', '^remote\\..*\\.push$'),
+  ])
+  return releaseFromGit(branch, upstream, config)
+}
+
+async function json<T>($: EngineInterface, argv: string[]): Promise<T | null> {
+  const out = await run($, argv)
+  if (out === null) return null
+  try {
+    return JSON.parse(out) as T
+  } catch {
+    return null
+  }
+}
+
+async function strings($: EngineInterface, key: string): Promise<string[]> {
+  const value = await $.store.get(key).catch(() => undefined)
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+}
+
+async function count($: EngineInterface, key: string): Promise<number> {
+  const value = await $.store.get(key).catch(() => undefined)
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+async function remember($: EngineInterface, key: string, value: string, kept = KEPT): Promise<void> {
+  const list = await strings($, key)
+  if (!list.includes(value)) await $.store.set(key, [...list, value].slice(-kept))
+}
+
+// What each note came to, kept across sessions: the "at least 1 in 3 acted on" gate
+// reads this. A dream's answer also goes to the dream log, where the pane draws it.
+async function answered($: EngineInterface, note: Note, answer: string, logged = false): Promise<void> {
+  const at = await $.clock.now()
+  const value = await $.store.get('answers').catch(() => undefined)
+  const list = Array.isArray(value) ? value : []
+  await $.store.set('answers', [...list, { id: note.id, answer, at }].slice(-KEPT))
+  if (note.kind !== 'dream' || answer === 'shown') return
+  if (answer !== 'ignored') {
+    // You answered: the dreamer stops backing off.
+    await $.store.set('typedPastInARow', 0)
+    await $.store.set('looksToSkip', 0)
+  }
+  if (ADOPTED.has(answer)) {
+    // You adopted it: it gives its place in the chapter back, if it came in this chapter.
+    await changeChapter($, chapter => (note.at >= chapter.started ? { ...chapter, adopted: chapter.adopted + 1 } : chapter))
+  }
+  if (logged) return // the pane wrote it to the dream log already
+  await run($, ['--repo', await $.session.cwd(), '--keep', JSON.stringify({ kind: 'answer', id: note.id, answer, at: at / 1000 })])
+}
+
+const DREAM_LOG = '.claude-self-reflect/csr-companion/dreams.jsonl' // under HOME: the pane's answers land here
+const SETTLED_IN_PANE_MS = 15_000
+
+// A dream answered in the pane (its answer buttons write the dream log) leaves the band here too, and
+// paces the dreamer as an answer in the band would. The log is read only while a dream is up.
+async function settledInThePane($: EngineInterface): Promise<void> {
+  const up: { note?: Note } = {}
+  await update($, view, current => {
+    if (current && current.kind !== 'asked' && current.note.kind === 'dream') up.note = current.note
+    return current
+  })
+  const note = up.note
+  const home = note && (await $.env.get('HOME'))
+  if (!note || !home) return
+  const log = await $.fs.read(`${home}/${DREAM_LOG}`).catch(() => '')
+  let answer: string | undefined
+  for (const line of log.split('\n')) {
+    try {
+      const record = JSON.parse(line) as { kind?: string; id?: string; answer?: unknown; by?: string }
+      if (record.kind === 'answer' && record.id === note.id && record.by === 'pane' && typeof record.answer === 'string') {
+        answer = record.answer
+      }
+    } catch {}
+  }
+  if (!answer) return
+  await update($, view, current => (current?.note.id === note.id ? null : current))
+  await answered($, note, answer, true)
+}
+
+async function refresh($: EngineInterface, cwd: string): Promise<ShiftsData | null> {
+  const fresh = await json<ShiftsData>($, ['--repo', cwd, '--json', '--limit', '60', '--sid', await $.session.id()])
+  await update($, data, () => fresh)
+  return fresh
+}
+
+// Shows a note unless another is up; true when it was shown.
+async function show($: EngineInterface, note: Note, tag: NoteView['tag']): Promise<boolean> {
+  const shownAt = await $.clock.now()
+  let isShown = false
+  await update($, view, (current): NoteView | null => {
+    if (current && current.kind !== 'asked') return current // one note at a time
+    isShown = true
+    return { kind: 'offer', note, tag, shownAt, promptsSurvived: 0 }
+  })
+  if (isShown) await answered($, note, 'shown')
+  return isShown
+}
+
+async function isBusy($: EngineInterface): Promise<boolean> {
+  let busy = false
+  await update($, view, current => {
+    busy = !!current && current.kind !== 'asked'
+    return current
+  })
+  return busy
+}
+
+// ---------------------------------------------------------------- notes from CSR's memory
+
+const looked = new Set<string>() // files already looked up since this module loaded
+
+async function offerFor($: EngineInterface, file: string, tag: NoteView['tag']): Promise<void> {
+  if (looked.has(file)) return
+  looked.add(file)
+  const notes = await json<Note[]>($, ['--repo', file, '--note', file, '--sid', await $.session.id()])
+  if (!notes?.length) return
+  const skip = new Set([...(await strings($, 'seen')), ...(await strings($, 'known'))])
+  const note = notes.find(candidate => !skip.has(candidate.id))
+  if (note && (await show($, note, tag))) await remember($, 'seen', note.id)
+}
+
+function handoff(shown: NoteView): string {
+  const { note } = shown
+  if (note.kind === 'dream') return askClaude(note)
+  const receipts = [note.oid ? `commit ${note.oid.slice(0, 7)}` : '', `session ${note.conversation.slice(0, 8)}`]
+    .filter(Boolean)
+    .join(', ')
+  return [
+    'Here is a note offered by CSR (claude-self-reflect):',
+    '',
+    `> ${shown.tag} · ${note.line}`,
+    '>',
+    `> ${note.text}`,
+    '>',
+    `> Receipts: ${receipts}.`,
+  ].join('\n')
+}
+
+// ---------------------------------------------------------------- the dreamer
+
+async function paceOf($: EngineInterface): Promise<Pace> {
+  const session = await $.session.id()
+  const value = (await $.store.get('pace').catch(() => undefined)) as Pace | undefined
+  return value?.session === session ? { ...freshPace(session), ...value } : freshPace(session)
+}
+
+const tokensOf = (usage: ModelUsage) =>
+  usage.input_tokens + usage.output_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
+
+// This chapter of the session: a fresh one for a new session, and after two hours without a compaction.
+async function chapterOf($: EngineInterface): Promise<Chapter> {
+  const session = await $.session.id()
+  const value = (await $.store.get('chapter').catch(() => undefined)) as Chapter | undefined
+  const now = await $.clock.now()
+  if (value?.session === session && now - value.started < CHAPTER_MS) return { ...freshChapter(session, now), ...value }
+  return newChapter($, value?.session === session ? 'two hours' : 'start')
+}
+
+// A chapter starts over: five dreams again, the first look soon. A chapter a compaction ended teaches
+// how long your chapters run; the dream log gets a line, so the pane counts from here.
+async function newChapter($: EngineInterface, why: 'start' | 'compact' | 'two hours'): Promise<Chapter> {
+  const session = await $.session.id()
+  const old = (await $.store.get('chapter').catch(() => undefined)) as Chapter | undefined
+  if (why === 'compact' && old?.session === session && old.steps > 0) {
+    const lengths = (await $.store.get('chapterSteps').catch(() => undefined)) as number[] | undefined
+    await $.store.set('chapterSteps', [...(Array.isArray(lengths) ? lengths : []), old.steps].slice(-CHAPTERS_KEPT))
+  }
+  const at = await $.clock.now()
+  const chapter = { ...freshChapter(session, at), gen: (old?.session === session ? old.gen ?? 0 : 0) + 1 }
+  await $.store.set('chapter', chapter)
+  await run($, ['--repo', await $.session.cwd(), '--keep', JSON.stringify({
+    kind: 'chapter', at: at / 1000, session, why, left: dreamsLeft(chapter), of: allowance(chapter),
+  })])
+  return chapter
+}
+
+// Every change to the chapter goes through one queue: Claude's steps count while a look runs and an
+// answer lands, and two read-then-write changes at once would lose one.
+let chapterQueue: Promise<unknown> = Promise.resolve()
+function serially<T>(work: () => Promise<T>): Promise<T> {
+  const done = chapterQueue.then(work)
+  chapterQueue = done.catch(() => undefined)
+  return done
+}
+
+// The chapter as it is now, changed: read fresh inside the queue.
+function changeChapter($: EngineInterface, change: (chapter: Chapter) => Chapter): Promise<Chapter> {
+  return serially(async () => {
+    const chapter = change(await chapterOf($))
+    await $.store.set('chapter', chapter)
+    return chapter
+  })
+}
+
+async function usualSteps($: EngineInterface): Promise<number> {
+  const lengths = (await $.store.get('chapterSteps').catch(() => undefined)) as number[] | undefined
+  return median(Array.isArray(lengths) ? lengths : [])
+}
+
+// What came of a look, kept in the dream log: once you have answered the last dream, the pane shows it
+// in the dream's place, so a quiet dreamer reads as quiet, not as stuck. "every" is the steps from the
+// look to the next.
+async function lookCameTo($: EngineInterface, cwd: string, session: string, outcome: string, chapter: Chapter, base: number, tokens = 0) {
+  const at = await $.clock.now()
+  await run($, ['--repo', cwd, '--keep', JSON.stringify({
+    kind: 'look', at: at / 1000, session, outcome, every: Math.max(0, chapter.due - base), tokens,
+    left: dreamsLeft(chapter), of: allowance(chapter),
+  })])
+}
+
+// The next look, counted from the step that started this one (Claude's steps go on while a look runs):
+// soon after a look that cost nothing, else the chapter's dreams left spread over the rest of it.
+const soon = (base: number) => (chapter: Chapter): Chapter => ({ ...chapter, due: base + FIRST_EVERY })
+const spread = (base: number, usual: number) => (chapter: Chapter): Chapter => ({
+  ...chapter,
+  due: mayLook(chapter) ? base + spacing({ ...chapter, steps: base }, usual) : Number.MAX_SAFE_INTEGER,
+})
+
+// One look, when the chapter allows it: a fork of this session asking for one "what if...?". `base` is
+// the chapter step that started it.
+async function dream($: EngineInterface, lastStep: number, base: number): Promise<void> {
+  const cwd = await $.session.cwd()
+  const session = await $.session.id()
+  const usual = await usualSteps($)
+  let pace = await paceOf($)
+  const opening = await chapterOf($)
+  if (!mayLook(opening)) {
+    // The chapter's dreams are spent: no look until the next compaction starts a new one.
+    return lookCameTo($, cwd, session, 'spent', await changeChapter($, spread(base, usual)), base)
+  }
+  const skip = await count($, 'looksToSkip')
+  if (skip > 0) {
+    await $.store.set('looksToSkip', skip - 1)
+    return lookCameTo($, cwd, session, 'skip', await changeChapter($, spread(base, usual)), base)
+  }
+  if (await isBusy($)) return void (await changeChapter($, soon(base))) // a note is up: no question would be seen
+  if (!canAfford(pace, lastStep)) return lookCameTo($, cwd, session, 'budget', await changeChapter($, soon(base)), base)
+  const brief = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
+  const now = facts(brief)
+  const before = await strings($, 'briefFacts')
+  // A chapter's first look is always taken: after a compaction the work has moved on even when CSR's notes
+  // have not, and the feed must never wait on them forever. Later looks need a new note.
+  const fresh = opening.looks === 0
+  if (!fresh && !hasNews(now, before)) return lookCameTo($, cwd, session, 'quiet', await changeChapter($, soon(base)), base)
+  const seen = await strings($, 'seenDreams')
+  const known = await strings($, 'knownDreams')
+  const reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known) })
+  const used = 'usage' in reply ? tokensOf(reply.usage) : 0
+  await $.store.set('briefFacts', [...before.filter(line => !now.includes(line)), ...now].slice(-FACTS_KEPT))
+  pace = { ...(await paceOf($)), looks: pace.looks + 1, dreamer: pace.dreamer + used, lastLook: used || pace.lastLook }
+  // A compaction that started a new chapter while the fork ran: this answer was about the old one, whose
+  // context is gone. Its tokens count; the new chapter is left as the compaction made it.
+  const same = (chapter: Chapter) =>
+    chapter.started === opening.started && chapter.session === opening.session && chapter.gen === opening.gen
+  const ours = (change: (chapter: Chapter) => Chapter) => (current: Chapter) => (same(current) ? change(current) : current)
+  if (!same(await chapterOf($))) {
+    await $.store.set('pace', pace)
+    return lookCameTo($, cwd, session, 'stale', await chapterOf($), base, used)
+  }
+  // No grounding gate: one kept out the only dream acted on. The prompt asks for a receipt; you judge.
+  const found = reply.isAnswered ? parseDream(reply.text) : null
+  const repeat = !!found && [...seen, ...known].some(line => sameDream(line, found.line))
+  if (!found || repeat) {
+    await $.store.set('pace', pace)
+    const chapter = await changeChapter($, ours(current => spread(base, usual)({ ...current, looks: current.looks + 1 })))
+    return lookCameTo($, cwd, session, repeat ? 'repeat' : 'none', chapter, base, used)
+  }
+  await $.store.set('pace', { ...pace, dreams: pace.dreams + 1 })
+  const at = await $.clock.now()
+  const note: Note = {
+    id: dreamId(found.line, at),
+    kind: 'dream',
+    file: '',
+    line: found.line,
+    title: found.title,
+    text: found.text,
+    sketch: [],
+    symbol: null,
+    oid: null,
+    conversation: session,
+    at,
+    tokens: used,
+  }
+  const isShown = await show($, note, 'Dream')
+  const chapter = await changeChapter($, ours(current =>
+    spread(base, usual)({ ...current, looks: current.looks + 1, shown: current.shown + (isShown ? 1 : 0) })))
+  if (!isShown) return
+  await remember($, 'seenDreams', found.line, SEEN_KEPT)
+  await run($, ['--repo', cwd, '--keep', JSON.stringify({
+    kind: 'dream', id: note.id, at: at / 1000, session, line: note.line, title: note.title, text: note.text, tokens: used,
+    outcome: 'dream', every: Math.max(0, chapter.due - base), left: dreamsLeft(chapter), of: allowance(chapter),
+    brief, // what the dreamer read: with the answer that settles this dream, one labelled example
+  })])
+  void refresh($, cwd)
+}
+
+// Coaching: a word you have said in 2 sessions that Claude looked up each time, offered once as a band note
+// (bin/pane.py --coach works it out off the hot path). Nothing is written until you press 1.
+async function coachNote($: EngineInterface, cwd: string): Promise<void> {
+  const notes = await json<Note[]>($, ['--repo', cwd, '--coach'])
+  const skip = new Set(await strings($, 'coached'))
+  const note = notes?.find(candidate => candidate.kind === 'term' && !skip.has(candidate.id))
+  if (note && (await show($, note, 'Coaching'))) await remember($, 'coached', note.id)
+}
+
+// One line under "## Terms" of the global CLAUDE.md, written only when the person pressed the key.
+async function addToClaudeMd($: EngineInterface, line: string): Promise<boolean> {
+  const home = await $.env.get('HOME')
+  if (!home) return false
+  const file = `${home}/.claude/CLAUDE.md`
+  // Read it first: a file that is there but could not be read is left alone, never written over.
+  const text = (await $.fs.exists(file).catch(() => null)) === false ? '' : await $.fs.read(file).catch(() => null)
+  if (text === null) return false
+  return $.fs.write(file, addTerm(text, line)).then(() => true, () => false)
+}
+
+async function dreamsText($: EngineInterface, on: boolean): Promise<string> {
+  return paceText(on ? await paceOf($) : null, on ? await chapterOf($) : null, on)
+}
+
+// The /config row, found by its plugin's prefix: a folder-loaded plugin may carry "@inline".
+async function dreamsRow($: EngineInterface): Promise<string> {
+  const rows = await $.config.list().catch(() => [])
+  return rows.find(row => /^csr-companion(@[^.]+)?\.dreams$/.test(row.key))?.key ?? OFF_ROW
+}
+
+// Whether a band holds a Button with a hotkey: it is asking the person something.
+function asks(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false
+  const element = node as { type?: string; props?: { hotkey?: unknown }; children?: unknown[] }
+  if (element.type === 'Button' && element.props?.hotkey) return true
+  return (element.children ?? []).some(asks)
+}
+
+// ---------------------------------------------------------------- hooks
+
+export const register: Register = (on, options) => {
+  const dreamsOn = options.dreams === true
+  let dreaming = false
+  // True while another band (You should know's) asks, and the note waits behind it.
+  let waiting = false
+
+  on('turn.step', async function* ($, e, next) {
+    const result = yield* next(e)
+    if (!dreamsOn || e.agentId !== undefined) return result
+    // Count what Claude spends: the dreamer's share is measured against it.
+    const spent = result?.usage ? tokensOf(result.usage) : 0
+    const pace = await paceOf($)
+    if (spent) await $.store.set('pace', { ...pace, claude: pace.claude + spent })
+    // Steps counted in the store, so a reload of this module does not start the count over.
+    const chapter = await changeChapter($, current => ({ ...current, steps: current.steps + 1 }))
+    if (chapter.steps >= chapter.due && !dreaming) {
+      dreaming = true
+      void dream($, spent, chapter.steps)
+        .catch(() => undefined)
+        .finally(() => {
+          dreaming = false
+        })
+    }
+    return result
+  })
+
+  // A compaction ends the chapter: the context a dream was about is gone. The open dream folds into
+  // the pane's passed ones, and the next chapter starts with five.
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (!dreamsOn || e.agentId !== undefined || e.trigger === 'precompute' || result.skip !== undefined) return result
+    let expired: Note | null = null
+    await update($, view, current => {
+      if (current && current.kind !== 'asked' && current.note.kind === 'dream') {
+        expired = current.note
+        return null
+      }
+      return current
+    })
+    const note = expired as Note | null
+    if (note) await answered($, note, 'expired')
+    await serially(() => newChapter($, 'compact'))
+    return result
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
+
+  let held: { text: string; at: number } | null = null // a bare digit kept back, for 10 s
+  let bandAt = 0 // when another band (You should know's) last drew a question
+
+  // The push guard, kept to the two rules that are never right: --no-verify (it skips the pre-commit gate)
+  // and a push to release/v* (it publishes to npm). Every other git push goes through untouched.
+  // A push whose destination the words leave to the repository (bare `git push`, `git push origin HEAD`) is
+  // settled by asking git where it lands; a git that cannot answer lets the push go on.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const cwd = await $.session.cwd()
+    const verdict = gitVerdict(e.command, 0, cwd)
+    if (!verdict) return next(e)
+    if (verdict.kind === 'deny') return { deny: verdict.reason }
+    if (verdict.kind === 'check' && await landsOnRelease($, verdict.dir ?? cwd)) return { deny: RELEASE }
+    return next(e)
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
+
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId === undefined && FILE_TOOLS.has(e.tool)) {
+      const file = 'file_path' in e && typeof e.file_path === 'string'
+        ? e.file_path
+        : 'notebook_path' in e && typeof e.notebook_path === 'string' ? e.notebook_path : undefined
+      if (file) void offerFor($, file, e.tool === 'Read' ? 'You should know' : 'Heads up').catch(() => undefined)
+    }
+    return next(e)
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
+
+  on('prompt.submit', async ($, e, next) => {
+    // A prompt that is only a digit, just after a band note, is a hotkey that missed: held with a toast,
+    // sent on if the same digit comes again within 10 s. A held digit is not counted as typed past a note.
+    const at = await $.clock.now()
+    const yours = e.origin.kind === 'composer' || e.origin.kind === 'bridge' // you typed it, not a peer or a plugin
+    if (yours && isBareDigit(e.text)) {
+      const digit = e.text.trim()
+      const up = await read($, view)
+      if (held?.text === digit && at - held.at <= AGAIN_MS) held = null
+      else if ((!!up && up.kind !== 'asked' && at - up.shownAt <= BAND_WINDOW_MS) || (bandAt > 0 && at - bandAt <= BAND_WINDOW_MS)) {
+        held = { text: digit, at }
+        const said = `“${digit}” looks like a band hotkey. Press it on the band, or send it again within 10 s to give it to Claude.`
+        $.ui.toast(said)
+        return { drop: said }
+      }
+    }
+    await settledInThePane($).catch(() => undefined) // answered there: never counted as typed past
+    let ignored: Note | null = null
+    await update($, view, current => {
+      if (!current || waiting) return current // a note nobody saw was not typed past
+      const promptsSurvived = current.promptsSurvived + 1
+      if (promptsSurvived < CLEAR_AFTER_PROMPTS) return { ...current, promptsSurvived, message: undefined }
+      if (current.kind === 'offer') ignored = current.note
+      return null
+    })
+    const left = ignored as Note | null
+    if (left) {
+      await answered($, left, 'ignored')
+      if (left.kind === 'dream') {
+        // Typed past: ask less often, as You should know does.
+        const inARow = (await count($, 'typedPastInARow')) + 1
+        await $.store.set('typedPastInARow', inARow)
+        await $.store.set('looksToSkip', Math.min(SKIP_MAX, 2 ** (inARow - 1)))
+      }
+    }
+    return next(e)
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the prompt go on
+
+  // While a compaction runs, a marker file says so and when it began; the pane draws the timer from it. It
+  // is removed when the compaction ends, however it ends. Nothing here can fail the compaction.
+  // A matcher of its own: a compaction hook with none is registered once (the chapter's, above).
+  on('session.compact', { trigger: ['manual', 'auto', 'plugin'] }, async ($, e, next) => {
+    const marker = e.agentId === undefined ? await markCompacting($, e.trigger) : null
+    try {
+      return await next(e)
+    } finally {
+      if (marker) await unmarkCompacting($, marker)
+    }
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const beneath = await next(e)
+    if (asks(beneath)) bandAt = await $.clock.now()
+    if (e.props.hasSurvey) return beneath
+    const shown = await read($, view)
+    // One question at a time. Two bands both on 1, 2, 4 and 0 would answer
+    // the lower one ("two on one hotkey: the later wins"), so 4 under a dream
+    // would turn You should know off. The note waits until that band clears.
+    waiting = Boolean(shown) && asks(beneath)
+    if (!shown || waiting) return beneath
+    const { Box, Button, Code, Markdown, Text } = $.ui.resolve(e)
+    const { note } = shown
+    const isDream = note.kind === 'dream'
+
+    const close = async (answer: string, then: NoteView | null) => {
+      await answered($, note, answer)
+      await update($, view, () => then)
+    }
+    const ask = () => close('dismiss', { ...shown, kind: 'asked', message: undefined })
+    // You should know's way out: a dim 4 that asks for a second press, then turns dreams off.
+    const turnOff = async () => {
+      if (!shown.confirmOff) {
+        await update($, view, () => ({ ...shown, confirmOff: true }))
+        return
+      }
+      await answered($, note, 'turn_off')
+      const done = await $.config.set({ key: await dreamsRow($), value: false }).catch(() => ({ deny: 'failed' }))
+      await update($, view, () =>
+        'deny' in done && done.deny ? { ...shown, confirmOff: false, message: "Couldn't turn dreams off here. Use /config." } : null,
+      )
+    }
+    const wayOut = isDream
+      ? [{ hotkey: '4', label: shown.confirmOff ? 'Press again to turn dreams off' : 'Disable', onPress: turnOff, dim: true }]
+      : []
+    const buttons = (row: Array<{ hotkey: string; label: string; onPress: () => unknown; dismiss?: boolean; dim?: boolean }>) => (
+      <Box marginLeft={2} flexWrap="wrap">
+        {row.map(button => (
+          <Box marginRight={3}>
+            <Button
+              key={button.label}
+              hotkey={button.hotkey}
+              plain
+              label={button.label}
+              dimColor={button.dim}
+              role={button.dismiss ? 'dismiss' : undefined}
+              onPress={() => void button.onPress()}
+            />
+          </Box>
+        ))}
+      </Box>
+    )
+    const lead = (body: string) => (
+      <Box flexDirection="row" alignItems="flex-start">
+        <Box flexShrink={0} width={2}>
+          <Text color="suggestion">{STAR}</Text>
+        </Box>
+        <Text wrap="wrap">
+          <Text dimColor>{shown.tag} · </Text>
+          {body}
+        </Text>
+      </Box>
+    )
+
+    let ours
+    if (note.kind === 'term') {
+      // Coaching: one word, defined once in your CLAUDE.md, only if you press 1.
+      const add = async () => {
+        if (await addToClaudeMd($, note.text)) {
+          $.ui.toast('Added to your CLAUDE.md under Terms. Edit the line to say what you mean.')
+          await close('added', null)
+        } else await update($, view, () => ({ ...shown, message: "Couldn't write your CLAUDE.md. Nothing was changed." }))
+      }
+      ours = (
+        <Box flexDirection="column" marginTop={1}>
+          {lead(note.line)}
+          {buttons([
+            { hotkey: '1', label: 'Add to CLAUDE.md', onPress: add },
+            { hotkey: '0', label: 'Dismiss', onPress: () => close('dismiss', null), dismiss: true },
+          ])}
+          {shown.message ? <Box marginLeft={2}><Text color="warning" wrap="wrap">{shown.message}</Text></Box> : null}
+        </Box>
+      )
+    } else if (shown.kind === 'offer') {
+      ours = (
+        <Box flexDirection="column" marginTop={1}>
+          {lead(note.line)}
+          {buttons([
+            { hotkey: '1', label: 'Learn more', onPress: () => update($, view, () => ({ ...shown, kind: 'explained' })) },
+            {
+              hotkey: '2',
+              label: isDream ? 'Already thought of it' : 'Knew this already',
+              onPress: async () => {
+                if (isDream) await remember($, 'knownDreams', note.line, SEEN_KEPT)
+                else await remember($, 'known', note.id)
+                await close(isDream ? 'thought_of_it' : 'know_it', null)
+              },
+            },
+            ...wayOut,
+            { hotkey: '0', label: 'Dismiss', onPress: ask, dismiss: true },
+          ])}
+          {shown.message ? <Box marginLeft={2}><Text color="warning" wrap="wrap">{shown.message}</Text></Box> : null}
+        </Box>
+      )
+    } else if (shown.kind === 'explained') {
+      const chat = async () => {
+        const box = await $.prompt.read().catch(() => undefined)
+        if (box?.text.trim()) {
+          await update($, view, () => ({ ...shown, message: 'Your prompt box has text in it. Send or clear it, then press 2 again.' }))
+          return
+        }
+        const filled = await $.prompt.fill({ text: handoff(shown), mode: 'replace' }).catch(() => undefined)
+        if (filled?.isFilled) await close(isDream ? 'ask_claude' : 'chat', null)
+        else await update($, view, () => ({ ...shown, message: "The prompt box didn't take it. Press 2 to try again." }))
+      }
+      const source = isDream
+        ? `From CSR's dreamer · this look ${(note.tokens ?? 0).toLocaleString('en-US')} tokens, mostly re-read from the prompt cache`
+        : `From CSR's memory · 0 model tokens${note.oid ? ` · commit ${note.oid.slice(0, 7)}` : ''} · session ${note.conversation.slice(0, 8)}`
+      ours = (
+        <Box flexDirection="column" marginTop={1}>
+          {lead(note.line)}
+          <Box flexDirection="column" marginLeft={2} marginTop={1} marginBottom={1}>
+            <Text bold wrap="wrap">{note.title}</Text>
+            {isDream ? <Markdown text={note.text} /> : <Text wrap="wrap">{note.text}</Text>}
+            {note.sketch.length ? (
+              <Box marginTop={1}>
+                <Code source={note.sketch.join('\n')} language="text" wrap="truncate-end" />
+              </Box>
+            ) : null}
+            <Text dimColor wrap="truncate-end">{source}</Text>
+            {shown.message ? <Text color="warning" wrap="wrap">{shown.message}</Text> : null}
+          </Box>
+          {buttons([
+            { hotkey: '1', label: 'Understood', onPress: () => close('got_it', { ...shown, kind: 'asked', message: undefined }) },
+            { hotkey: '2', label: isDream ? 'Ask Claude' : 'Chat in main session', onPress: chat },
+            { hotkey: '3', label: 'Open the CSR pane', onPress: async () => openPane($, await $.session.cwd()) },
+            { hotkey: '0', label: 'Dismiss', onPress: ask, dismiss: true },
+          ])}
+        </Box>
+      )
+    } else {
+      ours = (
+        <Box flexDirection="row" marginTop={1} flexWrap="wrap">
+          <Box flexShrink={0} width={2}>
+            <Text color="suggestion">{STAR}</Text>
+          </Box>
+          <Box marginRight={3}>
+            <Text dimColor>{isDream ? 'Was that worth asking?' : 'Was that worth showing?'}</Text>
+          </Box>
+          {buttons([
+            { hotkey: '1', label: 'That was helpful', onPress: () => close('helpful', null) },
+            { hotkey: '2', label: 'Not relevant', onPress: () => close('not_relevant', null) },
+            ...wayOut,
+            { hotkey: '0', label: 'Close', onPress: () => update($, view, () => null), dismiss: true },
+          ])}
+        </Box>
+      )
+    }
+    return beneath ? (
+      <Box flexDirection="column">
+        {ours}
+        {beneath}
+      </Box>
+    ) : ours
+  })
+
+  // ---------------------------------------------------------------- the pane, /csr
+
+  on('session.start', async ($, e, next) => {
+    const started = await next(e)
+    if (!e.isInteractive) return started
+    $.ui.status(undefined) // CSR pins no line under the prompt: the pane carries what it knows
+    await $.command.register({
+      name: 'csr',
+      description:
+        'Open the CSR pane beside Claude; "/csr dreams" says how the dreamer is pacing itself; "/csr statusline" moves your status line into the pane',
+    })
+    void refreshWrapper($).catch(() => undefined) // never blocks or fails the start
+    void (async () => {
+      const fresh = await refresh($, e.cwd)
+      void coachNote($, e.cwd).catch(() => undefined) // a word you keep saying, offered once
+      if (fresh?.repo) await openPane($, e.cwd)
+      $.clock.every(REFRESH_MS, () => void refresh($, e.cwd))
+      $.clock.every(SETTLED_IN_PANE_MS, () => void settledInThePane($).catch(() => undefined))
+    })()
+    return started
+  })
+
+  on('command.run', { command: 'csr' }, async ($, e) => {
+    const [sub, choice] = e.args.trim().split(/\s+/)
+    if (sub === 'dreams') return { text: await dreamsText($, dreamsOn) }
+    if (sub === 'statusline') {
+      return { text: await statusline($, choice).catch((error: unknown) => `/csr statusline: ${String(error)}`) }
+    }
+    const cwd = await $.session.cwd()
+    const fresh = await refresh($, cwd)
+    const where = await openPane($, cwd)
+    const counts = fresh
+      ? `${fresh.dreams_7d} dreams this week, ${fresh.changes_total} changed since your sessions`
+      : 'csr-engine could not be read'
+    return { text: `${where === 'herdr' ? 'CSR pane opened beside this one' : 'CSR pane opened'} (${counts}). ${await dreamsText($, dreamsOn)}` }
+  })
+
+  // Prep-compact: the threads you set aside for later go to the summarizer as reminders. A failure, or
+  // a pane.py that takes over two seconds, lets the compaction run as it was. It names its triggers: the
+  // engine refuses two session.compact hooks that both match every one, and the chapter hook above is one.
+  on('session.compact', { trigger: /^(manual|auto|plugin|precompute)$/ }, async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
+    let block: string | null = null
+    try {
+      const ran = await $.process.run(
+        ['python3', '-I', script($), '--repo', await $.session.cwd(), '--lost', '--sid', await $.session.id()],
+        { timeoutMs: 2000 }, // past it the call rejects: the compaction goes on as it was
+      )
+      block = ran.exitCode === 0 ? carryBlock(JSON.parse(ran.stdout) as Thread[]) : null
+    } catch {
+      block = null
+    }
+    return next(block ? { ...e, instructions: e.instructions ? `${e.instructions}\n\n${block}` : block } : e)
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const shown = await read($, data)
+    const room = Math.max(3, (e.viewport?.rows ?? 24) - 4)
+    if (!shown) return <Text dimColor>csr-engine could not be read.</Text>
+    const lines: Array<{ text: string; bold?: boolean; dim?: boolean }> = [
+      { text: shown.status ?? '', dim: true },
+      { text: `${STAR} Dreams`, bold: true },
+    ]
+    if (!shown.dreams.length) lines.push({ text: dreamsOn ? '  None yet.' : '  Dreams are off: /config, csr-companion, Dreams.', dim: true })
+    for (const entry of shown.dreams.slice(0, 6)) {
+      const when = new Date(entry.at * 1000).toISOString().slice(5, 16).replace('T', ' ')
+      lines.push({ text: `  ${when} · ${entry.answer ?? 'open'}`, dim: true })
+      lines.push({ text: `  ${entry.line}` })
+    }
+    lines.push({ text: 'Changed since your sessions', bold: true })
+    for (const change of shown.changes) {
+      const latest = change.shifts[0]
+      lines.push({ text: `● ${change.talked.slice(5)} ${change.title}`, bold: true })
+      if (latest) {
+        const names = change.shifts.filter(s => s.oid === latest.oid).map(s => `${MARK[s.verb] ?? ''}${s.symbol ?? '(file)'}`)
+        lines.push({ text: `  ${latest.date.slice(5)} ${latest.oid.slice(0, 7)} ${names.join(' ')}`, dim: true })
+      }
+    }
+    lines.push({ text: 'Change log', bold: true })
+    for (const [head, group] of byCommit(shown.shifts)) {
+      lines.push({ text: head, bold: true })
+      for (const shift of group) {
+        const file = shift.file.split('/').slice(-2).join('/')
+        lines.push({ text: `  ${MARK[shift.verb] ?? ''}${shift.symbol ?? '(whole file)'}  ${file}` })
+      }
+    }
+    return (
+      <Box flexDirection="column">
+        {lines.slice(0, room).map(line => (
+          <Text bold={line.bold} dimColor={line.dim} wrap="truncate-end">
+            {line.text}
+          </Text>
+        ))}
+      </Box>
+    )
+  })
+}
+
+// A herdr split beside this pane: a real side pane in the terminal (Warp), at
+// any width, where the session strip and the date axes draw in pixels. One per
+// tab: an older pane is closed and opened fresh, so it follows this session.
+async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> {
+  const self = await $.env.get('HERDR_PANE_ID')
+  const herdr = (await $.env.get('HERDR_BIN_PATH')) ?? 'herdr'
+  if (!self) return false
+  // Claude's own space and tab, asked of herdr by its pane id: the old CSR pane is looked for there,
+  // whichever space you are looking at when the session starts.
+  const got = await $.process.run([herdr, 'pane', 'get', self])
+  let mine: HerdrPane | undefined
+  try {
+    mine = got.exitCode === 0 ? JSON.parse(got.stdout).result?.pane : undefined
+  } catch {}
+  const tab = mine?.tab_id
+  if (!tab) return false
+  const space = mine?.workspace_id ?? tab.split(':')[0] ?? ''
+  const listed = await $.process.run([herdr, 'pane', 'list', '--workspace', space])
+  if (listed.exitCode !== 0) return false
+  let panes: HerdrPane[] = []
+  try {
+    panes = JSON.parse(listed.stdout).result?.panes ?? []
+  } catch {
+    return false
+  }
+  for (const pane of panes) {
+    if (pane.tab_id === tab && (pane.label === LABEL || pane.label === 'Shifts')) await $.process.run([herdr, 'pane', 'close', pane.pane_id])
+  }
+  const split = await $.process.run([
+    herdr, 'pane', 'split', '--pane', self, '--direction', 'right', '--ratio', '0.62', '--cwd', cwd, '--no-focus',
+  ])
+  if (split.exitCode !== 0) return false
+  let id: string | undefined
+  try {
+    id = JSON.parse(split.stdout).result?.pane?.pane_id
+  } catch {
+    return false
+  }
+  if (!id) return false
+  await $.process.run([herdr, 'pane', 'rename', id, LABEL])
+  const session = await $.session.id()
+  await $.process.run([herdr, 'pane', 'run', id, 'python3', '-I', script($), '--repo', cwd, '--watch', '--sid', session, '--agent', self])
+  return true
+}
+
+async function openPane($: EngineInterface, cwd: string): Promise<'herdr' | 'pane'> {
+  if (await openHerdrPane($, cwd)) return 'herdr'
+  void $.ui.open({ id: PANE, title: LABEL })
+  return 'pane'
+}
+
+// ---------------------------------------------------------------- /csr statusline
+
+// Claude's own status line moves into the CSR pane only when you ask: the user
+// settings' statusLine.command is wrapped in bin/statusline.cjs, which passes the
+// line through unless a CSR pane is open beside the session. Settings point at a
+// stable copy of the wrapper, never into the plugin's folder: that path changes
+// on every update, and the line has to keep working after an uninstall.
+const shippedWrapper = ($: EngineInterface) => `${$.plugin.root}/bin/statusline.cjs`
+const IS_WRAPPED = /csr-companion\/statusline\.c?js|csr-pane-statusline\.js/
+const WRAPPING = 'statusline' // $.store: { original, wrapped }, what "off" puts back
+// The settings that win over the user's, lowest first.
+const OVER_USER: Array<[SettingsSource, string]> = [
+  ['project', 'project settings (.claude/settings.json)'],
+  ['local', 'local settings (.claude/settings.local.json)'],
+  ['flag', '--settings'],
+  ['policy', 'managed policy settings'],
+]
+
+type Places = { settings: string; wrapper: string; backup: string }
+type UserSettings = { raw: string; json: Record<string, unknown> }
+type Wrapping = { original: string; wrapped: string }
+
+async function places($: EngineInterface): Promise<Places | null> {
+  const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+  if (!home) return null
+  const config = (await $.env.get('CLAUDE_CONFIG_DIR'))?.replace(/\/+$/, '')
+  const keep = `${home}/.claude-self-reflect/csr-companion`
+  return {
+    settings: `${config || `${home}/.claude`}/settings.json`,
+    wrapper: `${keep}/statusline.cjs`,
+    backup: `${keep}/settings.before-statusline.json`,
+  }
+}
+
+// The user settings file as written, or why there is none to edit.
+async function userSettings($: EngineInterface, path: string): Promise<UserSettings | 'missing' | 'not JSON'> {
+  if (!(await $.fs.exists(path))) return 'missing'
+  const raw = await $.fs.read(path)
+  try {
+    const json: unknown = JSON.parse(raw)
+    if (json && typeof json === 'object' && !Array.isArray(json)) return { raw, json: json as Record<string, unknown> }
+  } catch {}
+  return 'not JSON'
+}
+
+function commandOf(settings: Settings): string | undefined {
+  const line = settings.statusLine as { command?: unknown } | undefined
+  return line && typeof line === 'object' && typeof line.command === 'string' && line.command.trim() ? line.command : undefined
+}
+
+// Only statusLine.command changes: every other key keeps its place; 2-space
+// JSON, ending in a newline when the file did.
+async function writeCommand($: EngineInterface, path: string, settings: UserSettings, command: string): Promise<void> {
+  const statusLine = { ...(settings.json.statusLine as Record<string, unknown>), command }
+  const text = JSON.stringify({ ...settings.json, statusLine }, null, 2)
+  await $.fs.write(path, settings.raw.endsWith('\n') ? `${text}\n` : text)
+}
+
+// Claude Code runs a statusLine command through a shell: the original rides as one single-quoted word.
+const shellWord = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`
+const wrapCommand = (wrapper: string, original: string) => `node "${wrapper}" --sh ${shellWord(original)}`
+
+// The command a wrapped one runs: --sh's word unquoted, or in the argv form set
+// up by hand (node csr-pane-statusline.js <command...>) the words after the wrapper.
+function unwrapCommand(command: string): string | null {
+  const sh = /\s--sh\s+([\s\S]*)$/.exec(command)
+  if (sh) return unquote((sh[1] ?? '').trim())
+  const argv = /^\s*node\s+("[^"]*"|'[^']*'|\S+)\s+([\s\S]+)$/.exec(command)
+  return argv && IS_WRAPPED.test(argv[1] ?? '') ? (argv[2] ?? '').trim() || null : null
+}
+
+// One shell word back to its text: '...' runs, \-escapes and bare characters; null for anything else.
+function unquote(word: string): string | null {
+  let text = ''
+  for (let i = 0; i < word.length; i++) {
+    const c = word.charAt(i)
+    if (c === "'") {
+      const end = word.indexOf("'", i + 1)
+      if (end < 0) return null
+      text += word.slice(i + 1, end)
+      i = end
+    } else if (c === '\\' && i + 1 < word.length) text += word.charAt(++i)
+    else if (/\s/.test(c)) return null // a second word: not what "on" wrote
+    else text += c
+  }
+  return text || null
+}
+
+// Each statusLine set where it wins over the user's, as "where: command".
+async function overrides($: EngineInterface): Promise<string[]> {
+  const found: string[] = []
+  for (const [source, label] of OVER_USER) {
+    const settings = await $.settings.read({ source }).catch((): Settings => ({}))
+    if (settings.statusLine !== undefined) found.push(`${label}: ${commandOf(settings) ?? '(no command)'}`)
+  }
+  return found
+}
+
+const overrideText = (found: string[]) =>
+  `Set where it wins over the user settings, so Claude Code runs it instead of yours:\n${found.map(line => `  ${line}`).join('\n')}`
+
+// "/csr statusline": a preview that writes nothing; "on" wraps the command; "off" puts it back.
+async function statusline($: EngineInterface, choice: string | undefined): Promise<string> {
+  if (choice && choice !== 'on' && choice !== 'off') {
+    return `/csr statusline ${choice}: unknown. "/csr statusline" shows what would change, "on" moves the line into the CSR pane, "off" puts it back.`
+  }
+  const where = await places($)
+  if (!where) return "/csr statusline: HOME isn't set, so there is no user settings file to read. Nothing changed."
+  const settings = await userSettings($, where.settings)
+  if (settings === 'not JSON') return `${where.settings} is not a JSON object CSR can edit. Nothing changed.`
+  const command = typeof settings === 'string' ? undefined : commandOf(settings.json)
+  if (!command || typeof settings === 'string') {
+    return `Your user settings (${where.settings}) have no statusLine command: there is nothing to ${choice === 'off' ? 'put back' : 'move'}. Nothing changed.`
+  }
+  if (choice === 'off') return unwrapStatusline($, where, settings, command)
+  if (IS_WRAPPED.test(command)) {
+    return `Your status line is already wrapped for the CSR pane:\n  ${command}\nNothing changed. "/csr statusline off" puts the original back.`
+  }
+  const wrapped = wrapCommand(where.wrapper, command)
+  const found = await overrides($)
+  if (choice !== 'on') {
+    return [
+      `Your status line, from ${where.settings}:`,
+      `  ${command}`,
+      '"/csr statusline on" would change it to:',
+      `  ${wrapped}`,
+      'That runs your command as now. Its line shows in the CSR pane while one is open beside the session, and under the prompt otherwise. Settings point at a copy of the wrapper outside the plugin, so the line keeps working after an update or an uninstall.',
+      found.length ? overrideText(found) : 'No project, local, --settings or policy statusLine wins over yours.',
+      'Nothing changed. Next: /csr statusline on',
+    ].join('\n')
+  }
+  // The wrapper runs under node: without one on PATH the status line would go blank.
+  const node = await $.process.run(['node', '--version'], { timeoutMs: 5_000 }).catch(() => null)
+  if (!node || node.exitCode !== 0) {
+    return `"/csr statusline on" runs your status line through a small node script, and node didn't run here. Nothing changed.`
+  }
+  await $.fs.write(where.wrapper, await $.fs.read(shippedWrapper($)))
+  await $.fs.write(where.backup, settings.raw)
+  await writeCommand($, where.settings, settings, wrapped)
+  await $.store.set(WRAPPING, { original: command, wrapped } satisfies Wrapping)
+  return [
+    `Status line wrapped for the CSR pane. ${where.settings} now runs:`,
+    `  ${wrapped}`,
+    `The settings as they were are saved at ${where.backup}. "/csr statusline off" puts your command back.`,
+    ...(found.length ? [overrideText(found)] : []),
+  ].join('\n')
+}
+
+async function unwrapStatusline($: EngineInterface, where: Places, settings: UserSettings, command: string): Promise<string> {
+  if (!IS_WRAPPED.test(command)) return `Your status line isn't wrapped for the CSR pane:\n  ${command}\nNothing changed.`
+  const kept = (await $.store.get(WRAPPING).catch(() => undefined)) as Partial<Wrapping> | undefined
+  // The kept original while settings still hold what "on" wrote; otherwise it is read off the command.
+  const original = kept?.wrapped === command && typeof kept.original === 'string' ? kept.original : unwrapCommand(command)
+  if (!original) {
+    return `Couldn't find the original command in:\n  ${command}\nNothing changed. Edit statusLine.command in ${where.settings} by hand.`
+  }
+  await writeCommand($, where.settings, settings, original)
+  await $.store.delete(WRAPPING).catch(() => undefined)
+  return `Status line back under the prompt. ${where.settings} runs your command again:\n  ${original}`
+}
+
+// The stable copy follows the wrapper the plugin ships. Only "/csr statusline on" makes one.
+async function refreshWrapper($: EngineInterface): Promise<void> {
+  const where = await places($)
+  if (!where || !(await $.fs.exists(where.wrapper))) return
+  const shipped = await $.fs.read(shippedWrapper($))
+  if (shipped !== (await $.fs.read(where.wrapper))) await $.fs.write(where.wrapper, shipped)
+}
+
+// ---------------------------------------------------------------- compaction marker
+
+// <HOME>/.claude-self-reflect/csr-companion/compacting/<session>.json, {at, trigger}: bin/pane.py reads it.
+async function markCompacting($: EngineInterface, trigger: string): Promise<string | null> {
+  try {
+    const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+    if (!home) return null
+    const path = `${home}/.claude-self-reflect/csr-companion/compacting/${await $.session.id()}.json`
+    await $.fs.write(path, JSON.stringify({ at: (await $.clock.now()) / 1000, trigger }))
+    return path
+  } catch {
+    return null
+  }
+}
+
+// Removed with rm; where that cannot run, the marker is overwritten as ended, which the pane reads as none.
+async function unmarkCompacting($: EngineInterface, path: string): Promise<void> {
+  try {
+    await $.process.run(['rm', '-f', path], { timeoutMs: 5_000 })
+    if (await $.fs.exists(path)) await $.fs.write(path, JSON.stringify({ ended: true }))
+  } catch {}
+}
+
+function byCommit(shifts: Shift[]): Array<[string, Shift[]]> {
+  const groups = new Map<string, Shift[]>()
+  for (const shift of shifts) {
+    const key = `${shift.date.slice(5)} ${shift.oid.slice(0, 7)} ${shift.subject ?? ''}`
+    groups.set(key, [...(groups.get(key) ?? []), shift])
+  }
+  return [...groups.entries()]
+}
+
+const MARK: Record<string, string> = { changed: '~', removed: '-', 'came back': '+' }

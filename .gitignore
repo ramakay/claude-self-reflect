@@ -181,3 +181,6 @@ RELEASE.local.md
 csr-engine/eval-kit/ag/bootstrap_results.json
 csr-engine/eval-kit/ag/results.json
 csr-engine/eval-kit/t3/mech_input.json
+
+# Claude Code mods: the engine lays type declarations beside a loaded plugin
+plugins/*/.claude-plugin/types/
