@@ -18,7 +18,7 @@
 
 pub mod consolidation;
 pub mod dream_cadence;
-mod index_sync;
+pub mod index_sync;
 pub mod ratification;
 pub mod trained_rerank;
 

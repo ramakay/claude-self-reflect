@@ -12,7 +12,9 @@ use crate::storage::{embedding_changes, Storage};
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 const BATCH_SIZE: usize = 128;
 
-pub(crate) fn spawn(
+/// Start the loop. Public for `examples/daemon_stall_probe.rs`, which runs it
+/// beside the real watcher and prompt socket; the daemon is its owner.
+pub fn spawn(
     storage: Arc<Storage>,
     search: Arc<RwLock<SearchEngine>>,
     shutdown: Arc<AtomicBool>,
@@ -85,8 +87,16 @@ fn sync_batch(
             break;
         }
         // One vector mutation per acquisition, allowing queued prompt readers
-        // to run between changes even during a large CLI import.
-        let mut index = search.blocking_write();
+        // to run between changes even during a large CLI import. While a
+        // flush is writing the index files under the read lock, waiting for
+        // the write lock would queue every prompt render behind this writer
+        // for the rest of the dump (seconds): yield instead, keep the cursor
+        // at the last change applied, and resume at the next poll.
+        let mut index = match search.try_write() {
+            Ok(index) => index,
+            Err(_) if crate::search::publish_in_progress() => break,
+            Err(_) => search.blocking_write(),
+        };
         if change.reflection {
             if change.invalidate || change.vector.is_none() {
                 index.remove_reflection(&change.id);
@@ -299,5 +309,31 @@ mod tests {
         shutdown.store(true, Ordering::SeqCst);
         sync.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn a_change_yields_rather_than_queue_behind_a_publish() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_reflection("r", "x", &[], &[0.1; 384])
+            .unwrap();
+        let search = RwLock::new(SearchEngine::new(100));
+        let shutdown = AtomicBool::new(false);
+        // A publish is writing the index files under the read lock.
+        let reader = search.try_read().unwrap();
+        let publishing = crate::search::hold_publishing_for_test();
+        let (cursor, generation, count) =
+            sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+        assert_eq!(
+            (cursor, count),
+            (0, 0),
+            "nothing applied, cursor kept, no wait"
+        );
+        drop(reader);
+        drop(publishing);
+        let (_, _, count) =
+            sync_batch(&storage, &search, &shutdown, cursor, Some(generation)).unwrap();
+        assert_eq!(count, 1);
+        assert!(search.try_read().unwrap().has_reflection("r"));
     }
 }

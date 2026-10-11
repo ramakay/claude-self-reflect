@@ -727,17 +727,22 @@ impl Engine {
         if self.skip_index_persistence {
             return Ok(());
         }
-        let mut idx = self.search.write().await;
-        if idx.is_dirty() {
-            // Query current DB counts for staleness-correct manifest
-            let chunk_count = self.storage.count_chunk_embeddings()?;
-            let refl_count = self.storage.count_reflection_embeddings()?;
-            idx.dump_to_disk(&self.index_dir, chunk_count, refl_count)
-                .with_context(|| {
-                    format!("persisting HNSW index to {}", self.index_dir.display())
-                })?;
+        // On the blocking pool, writing the files under a read lock: see
+        // `import::watcher::flush_index_blocking`. Current DB counts make the
+        // manifest staleness-correct; a failed count is an error here.
+        let storage = self.storage.clone();
+        let search = self.search.clone();
+        let index_dir = self.index_dir.clone();
+        let flushed = tokio::task::spawn_blocking(move || {
+            crate::import::watcher::flush_index_blocking(&storage, &search, &index_dir, true)
+        })
+        .await
+        .context("index flush task failed")?;
+        match flushed {
+            None => Ok(()),
+            Some(result) => result
+                .with_context(|| format!("persisting HNSW index to {}", self.index_dir.display())),
         }
-        Ok(())
     }
 
     /// Rebuild the in-memory search index from the vectors stored in SQLite

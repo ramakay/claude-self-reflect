@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use fs2::FileExt;
@@ -26,6 +26,19 @@ use serde::{Deserialize, Serialize};
 pub struct SearchResult {
     pub id: String,
     pub score: f32,
+}
+
+/// What [`SearchEngine::publish_to_disk`] published, for
+/// [`SearchEngine::settle_publish`] to record on the same engine.
+#[derive(Debug, Clone, Copy)]
+#[must_use = "settle the publish, or the published sides stay dirty"]
+pub struct Published {
+    /// Which engine published (see `SearchEngine::generation`).
+    generation: u64,
+    chunk_changes: u64,
+    reflection_changes: u64,
+    stale_generation: bool,
+    new_epoch: u64,
 }
 
 /// HNSW-backed search engine for chunks and reflections.
@@ -51,6 +64,14 @@ pub struct SearchEngine {
     chunk_dirty: bool,
     /// Reflection index dirty since the last `dump_to_disk`. See `chunk_dirty`.
     reflection_dirty: bool,
+    /// Count of chunk-side mutations (every time `chunk_dirty` is set). A
+    /// dump published from a shared borrow ([`Self::publish_to_disk`]) records
+    /// it, and [`Self::settle_publish`] clears `chunk_dirty` only if nothing
+    /// changed in between, so a mutation that landed after the files were
+    /// written is never marked as published.
+    chunk_changes: u64,
+    /// Reflection-side counterpart of `chunk_changes`.
+    reflection_changes: u64,
     /// Whether this engine's in-memory maps are currently known to
     /// correspond to the manifest that is (or, the instant this becomes
     /// true, was just made to be) on disk — i.e. an UNDIRTIED side's
@@ -187,6 +208,38 @@ const LEGACY_MANIFEST_VERSION: u32 = 1;
 static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ENGINE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Publishes running in this process ([`SearchEngine::publish_to_disk`]).
+/// Writers check it: a publish holds the index's read lock for seconds, and
+/// tokio's `RwLock` queues every later reader behind a waiting writer, so a
+/// writer that waits during a publish stalls every search with it.
+static PUBLISHING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a publish is writing index files right now (see [`PUBLISHING`]).
+pub(crate) fn publish_in_progress() -> bool {
+    PUBLISHING.load(Ordering::SeqCst) > 0
+}
+
+struct PublishingGuard;
+
+impl PublishingGuard {
+    fn enter() -> Self {
+        PUBLISHING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for PublishingGuard {
+    fn drop(&mut self) {
+        PUBLISHING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Hold the publish-in-progress flag, as a running publish does.
+#[cfg(test)]
+pub(crate) fn hold_publishing_for_test() -> impl Drop {
+    PublishingGuard::enter()
+}
+
 /// Metadata for validating a cached HNSW index.
 /// The `_expected` counts are DB row counts passed in from storage,
 /// used for staleness detection on reload.
@@ -254,6 +307,8 @@ impl SearchEngine {
             active_reflection_count: 0,
             chunk_dirty: false,
             reflection_dirty: false,
+            chunk_changes: 0,
+            reflection_changes: 0,
             manifest_backed: false,
             epoch: 0,
         }
@@ -261,6 +316,16 @@ impl SearchEngine {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    fn mark_chunk_dirty(&mut self) {
+        self.chunk_dirty = true;
+        self.chunk_changes += 1;
+    }
+
+    fn mark_reflection_dirty(&mut self) {
+        self.reflection_dirty = true;
+        self.reflection_changes += 1;
     }
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
@@ -271,7 +336,7 @@ impl SearchEngine {
         self.chunk_positions.insert(id.clone(), idx);
         self.chunk_id_map.push(id);
         self.chunk_index.insert((&embedding, idx));
-        self.chunk_dirty = true;
+        self.mark_chunk_dirty();
     }
 
     pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
@@ -283,7 +348,7 @@ impl SearchEngine {
         self.reflection_id_map.push(id);
         self.reflection_index.insert((&embedding, idx));
         self.active_reflection_count += 1;
-        self.reflection_dirty = true;
+        self.mark_reflection_dirty();
     }
 
     /// Remove a reflection from search results.
@@ -294,7 +359,7 @@ impl SearchEngine {
         if let Some(pos) = self.reflection_positions.remove(id) {
             self.reflection_id_map[pos].clear();
             self.active_reflection_count = self.active_reflection_count.saturating_sub(1);
-            self.reflection_dirty = true;
+            self.mark_reflection_dirty();
         }
     }
 
@@ -306,7 +371,7 @@ impl SearchEngine {
     pub fn remove_chunk(&mut self, id: &str) {
         if let Some(pos) = self.chunk_positions.remove(id) {
             self.chunk_id_map[pos].clear();
-            self.chunk_dirty = true;
+            self.mark_chunk_dirty();
         }
     }
 
@@ -333,7 +398,7 @@ impl SearchEngine {
         }
         if blanked > 0 {
             self.active_reflection_count = self.active_reflection_count.saturating_sub(blanked);
-            self.reflection_dirty = true;
+            self.mark_reflection_dirty();
         }
         blanked
     }
@@ -351,7 +416,7 @@ impl SearchEngine {
             }
         }
         if blanked > 0 {
-            self.chunk_dirty = true;
+            self.mark_chunk_dirty();
         }
         blanked
     }
@@ -762,6 +827,23 @@ impl SearchEngine {
         db_chunk_count: usize,
         db_reflection_count: usize,
     ) -> Result<()> {
+        let published = self.publish_to_disk(dir, db_chunk_count, db_reflection_count)?;
+        self.settle_publish(published);
+        Ok(())
+    }
+
+    /// The writing half of [`Self::dump_to_disk`], from a shared borrow: every
+    /// file, the manifest and the cleanup, exactly as `dump_to_disk` writes
+    /// them, but no change to `self`. A caller holding only a read lock can
+    /// run it while searches continue (the chunk generation alone is ~1.5 GB
+    /// to write), then take the write lock just for [`Self::settle_publish`].
+    pub fn publish_to_disk(
+        &self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+    ) -> Result<Published> {
+        let _publishing = PublishingGuard::enter();
         std::fs::create_dir_all(dir)?;
 
         // Advisory lock prevents concurrent dump/load from separate processes (H-2)
@@ -965,8 +1047,33 @@ impl SearchEngine {
         cleanup_stale_index_files(dir);
 
         // Lock is released when lock_file is dropped
-        self.chunk_dirty = false;
-        self.reflection_dirty = false;
+        Ok(Published {
+            generation: self.generation,
+            chunk_changes: self.chunk_changes,
+            reflection_changes: self.reflection_changes,
+            stale_generation,
+            new_epoch,
+        })
+    }
+
+    /// The bookkeeping half of [`Self::dump_to_disk`]: record what
+    /// [`Self::publish_to_disk`] published. A side's dirty flag clears only if
+    /// that side has not changed since the files were written (a later insert
+    /// stays dirty for the next dump); a `published` from a different engine
+    /// (a compaction swapped the index in between) is ignored. Otherwise the
+    /// same epoch and `manifest_backed` updates `dump_to_disk` always made.
+    pub fn settle_publish(&mut self, published: Published) {
+        if published.generation != self.generation {
+            return;
+        }
+        if self.chunk_changes == published.chunk_changes {
+            self.chunk_dirty = false;
+        }
+        if self.reflection_changes == published.reflection_changes {
+            self.reflection_dirty = false;
+        }
+        let stale_generation = published.stale_generation;
+        let new_epoch = published.new_epoch;
         // WP-D medium (second review): do NOT adopt `new_epoch` when this
         // dump was stale. Adopting it (`self.epoch = on_disk_epoch`)
         // used to make `self.epoch == on_disk_epoch` again, so the very
@@ -1006,7 +1113,6 @@ impl SearchEngine {
         // exactly as trustworthy for a future untouched-side carry-forward as
         // one that loaded a manifest at construction. See the field doc.
         self.manifest_backed = true;
-        Ok(())
     }
 
     /// Load HNSW indices from a cached directory.
@@ -1198,6 +1304,8 @@ impl SearchEngine {
             active_reflection_count: active_count,
             chunk_dirty: false,
             reflection_dirty: false,
+            chunk_changes: 0,
+            reflection_changes: 0,
             manifest_backed: true,
             epoch: manifest.epoch,
         })
@@ -3003,5 +3111,80 @@ mod tests {
             "blanked id must not resurrect on reload"
         );
         assert!(reloaded.has_chunk("c5"));
+    }
+
+    #[test]
+    fn a_write_after_the_files_are_written_stays_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut engine = SearchEngine::new(100);
+        for i in 0..5 {
+            engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+        }
+        engine.insert_reflection("r0".into(), distinct_embedding(9));
+        // Published from a shared borrow (a reader still searching), then a
+        // chunk lands before the bookkeeping takes the write lock.
+        let published = engine.publish_to_disk(dir, 5, 1).unwrap();
+        assert!(engine.is_chunk_dirty() && engine.is_reflection_dirty());
+        engine.insert_chunk("c5".into(), distinct_embedding(5));
+        engine.settle_publish(published);
+        assert!(engine.is_chunk_dirty(), "the late chunk is not on disk yet");
+        assert!(
+            !engine.is_reflection_dirty(),
+            "the reflection side was published"
+        );
+        // The next dump publishes it, and the manifest loads with all six.
+        engine.dump_to_disk(dir, 6, 1).unwrap();
+        assert!(!engine.is_dirty());
+        let reloaded = SearchEngine::load_from_disk(dir, 6, 1).unwrap();
+        assert!(reloaded.has_chunk("c5"));
+    }
+
+    #[test]
+    fn publish_and_settle_write_what_dump_to_disk_writes() {
+        let build = || {
+            let mut engine = SearchEngine::new(100);
+            for i in 0..5 {
+                engine.insert_chunk(format!("c{i}"), distinct_embedding(i));
+            }
+            engine
+        };
+        let (one, two) = (
+            tempfile::TempDir::new().unwrap(),
+            tempfile::TempDir::new().unwrap(),
+        );
+        let mut dumped = build();
+        dumped.dump_to_disk(one.path(), 5, 0).unwrap();
+        let mut split = build();
+        let published = split.publish_to_disk(two.path(), 5, 0).unwrap();
+        split.settle_publish(published);
+        assert_eq!(dumped.is_dirty(), split.is_dirty());
+        assert_eq!(dumped.epoch, split.epoch);
+        assert_eq!(dumped.manifest_backed, split.manifest_backed);
+        let manifest = |dir: &Path| -> IndexManifest {
+            serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap())
+                .unwrap()
+        };
+        let (a, b) = (manifest(one.path()), manifest(two.path()));
+        assert_eq!(a.chunk_id_map, b.chunk_id_map);
+        assert_eq!(a.epoch, b.epoch);
+        assert_eq!(a.chunk_embeddings_expected, b.chunk_embeddings_expected);
+    }
+
+    #[test]
+    fn a_publish_from_a_swapped_out_engine_is_not_settled_on_its_successor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut old = SearchEngine::new(100);
+        old.insert_chunk("c0".into(), distinct_embedding(0));
+        let published = old.publish_to_disk(tmp.path(), 1, 0).unwrap();
+        // A compaction swaps a different engine in before the bookkeeping.
+        let mut fresh = SearchEngine::new(100);
+        fresh.insert_chunk("c0".into(), distinct_embedding(0));
+        fresh.settle_publish(published);
+        assert!(
+            fresh.is_chunk_dirty(),
+            "another engine's publish says nothing about this one"
+        );
+        assert!(!fresh.manifest_backed);
     }
 }

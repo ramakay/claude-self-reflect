@@ -360,39 +360,44 @@ impl FileWatcher {
                 // See the const for why deferring the dump is safe.
                 let now = Instant::now();
                 if flush_is_due(last_flush, now) {
-                    let mut idx = self.search.write().await;
-                    if idx.is_dirty() {
-                        let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-                        let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-                        if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                            tracing::warn!(
-                                error = %e,
-                                "failed to flush HNSW index after watcher batch"
-                            );
+                    match self.flush_index().await {
+                        None => {}
+                        Some(result) => {
+                            if let Err(e) = result {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to flush HNSW index after watcher batch"
+                                );
+                            }
+                            // Recorded even when the dump failed: the index stays
+                            // dirty and will retry at the next interval, but a
+                            // failing dump must not reinstate the per-batch storm.
+                            last_flush = Some(now);
                         }
-                        // Recorded even when the dump failed: the index stays
-                        // dirty and will retry at the next interval, but a
-                        // failing dump must not reinstate the per-batch storm.
-                        last_flush = Some(now);
                     }
-                    drop(idx);
                 }
             }
         }
 
         // Channel closed. Dump once on the way out so a deferred batch is not
         // left for the next startup to backfill.
-        let mut idx = self.search.write().await;
-        if idx.is_dirty() {
-            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                tracing::warn!(error = %e, "failed to flush HNSW index on watcher shutdown");
-            }
+        if let Some(Err(e)) = self.flush_index().await {
+            tracing::warn!(error = %e, "failed to flush HNSW index on watcher shutdown");
         }
-        drop(idx);
 
         Ok(())
+    }
+
+    /// [`flush_index_blocking`] on the blocking pool. `None`: nothing was dirty.
+    async fn flush_index(&self) -> Option<Result<()>> {
+        let storage = Arc::clone(&self.storage);
+        let search = Arc::clone(&self.search);
+        let index_dir = self.index_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            flush_index_blocking(&storage, &search, &index_dir, false)
+        })
+        .await
+        .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("index flush task failed: {e}"))))
     }
 
     /// Import a single JSONL file: parse → embed → store → index.
@@ -657,6 +662,52 @@ fn needs_reindex(parsed: &ConversationChunk, stored: Option<&ConversationChunk>)
                 || stored.is_sidechain != parsed.is_sidechain
         }
     }
+}
+
+/// Dump a dirty index to `index_dir` with the write lock held only to record
+/// the result. The generation files (~1.5 GB for the chunk side) are written
+/// under a read lock ([`SearchEngine::publish_to_disk`]), so prompt renders
+/// keep searching while it runs; [`SearchEngine::settle_publish`] then clears
+/// what was published and leaves anything inserted meanwhile dirty. It used
+/// to hold the write lock for the whole dump, on an async worker. Blocks the
+/// calling thread: call it from the blocking pool. `None`: nothing was dirty.
+/// `strict_counts` propagates a failed DB count instead of describing that
+/// side as empty (the watcher's long-standing `unwrap_or(0)`).
+pub(crate) fn flush_index_blocking(
+    storage: &Storage,
+    search: &RwLock<SearchEngine>,
+    index_dir: &Path,
+    strict_counts: bool,
+) -> Option<Result<()>> {
+    let index = search.blocking_read();
+    if !index.is_dirty() {
+        return None;
+    }
+    let counts = storage
+        .count_chunk_embeddings()
+        .and_then(|chunks| Ok((chunks, storage.count_reflection_embeddings()?)));
+    let (chunk_count, reflection_count) = match counts {
+        Ok(counts) => counts,
+        Err(e) if strict_counts => return Some(Err(e)),
+        Err(_) => (
+            storage.count_chunk_embeddings().unwrap_or(0),
+            storage.count_reflection_embeddings().unwrap_or(0),
+        ),
+    };
+    let started = Instant::now();
+    let published = match index.publish_to_disk(index_dir, chunk_count, reflection_count) {
+        Ok(published) => published,
+        Err(e) => return Some(Err(e)),
+    };
+    drop(index);
+    let written = started.elapsed();
+    search.blocking_write().settle_publish(published);
+    tracing::info!(
+        written_ms = written.as_millis() as u64,
+        total_ms = started.elapsed().as_millis() as u64,
+        "HNSW index flushed (files written under the read lock)"
+    );
+    Some(Ok(()))
 }
 
 /// Wait for exclusive ownership of daemon heavy work. The owned RAII
@@ -935,5 +986,39 @@ mod tests {
         .unwrap_err();
         // The import's own error, not a wrapper: busy-retry reads this chain.
         assert_eq!(err.to_string(), "failed to canonicalize import path");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_flush_writes_under_a_read_lock_and_settles_under_the_write_lock() {
+        let storage = Storage::open_memory().unwrap();
+        let search = Arc::new(RwLock::new(SearchEngine::new(10)));
+        let index = tempfile::tempdir().unwrap();
+        let dir = index.path().to_path_buf();
+        let flush = |search: Arc<RwLock<SearchEngine>>, dir: PathBuf| {
+            let storage = Storage::open_memory().unwrap();
+            tokio::task::spawn_blocking(move || {
+                flush_index_blocking(&storage, &search, &dir, false)
+            })
+        };
+        assert!(
+            flush(search.clone(), dir.clone()).await.unwrap().is_none(),
+            "clean: nothing to do"
+        );
+        search
+            .write()
+            .await
+            .insert_chunk("c0".into(), vec![1.0; 384]);
+        drop(storage);
+        // A reader holding the lock does not keep the flush from writing.
+        let reader = search.clone().read_owned().await;
+        let flushed = flush(search.clone(), dir.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            dir.join("manifest.json").exists(),
+            "files written while a reader searched"
+        );
+        drop(reader);
+        assert!(flushed.await.unwrap().unwrap().is_ok());
+        assert!(!search.read().await.is_dirty());
     }
 }
