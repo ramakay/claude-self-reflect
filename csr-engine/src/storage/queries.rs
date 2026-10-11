@@ -2097,6 +2097,104 @@ pub fn get_reflections_by_tag(
     Ok(results)
 }
 
+/// For each conversation id, the `session_episode` rows among what
+/// [`get_reflections_by_tag`]`(&format!("conv_{id}"), window)` returns, as
+/// (content, timestamp) newest first — for every id in one covering scan of
+/// `idx_reflections_tags_timestamp` instead of one scan per id (the prompt
+/// render looks up to ~40 ids per prompt). Matching mirrors that LIKE: the
+/// tags text contains `conv_<id>`, ASCII-case-insensitively; an id holding a
+/// backslash (LIKE's escape character there) takes that exact SQL path.
+pub fn episode_rows_by_conversation(
+    conn: &Connection,
+    conv_ids: &[&str],
+    window: usize,
+) -> Result<std::collections::HashMap<String, Vec<(String, String)>>> {
+    let mut out: std::collections::HashMap<String, Vec<(String, String)>> = Default::default();
+    let mut needles: Vec<(&str, String)> = Vec::new();
+    for id in conv_ids {
+        if id.contains('\\') {
+            let rows = get_reflections_by_tag(conn, &format!("conv_{id}"), window)?;
+            out.insert(
+                id.to_string(),
+                rows.into_iter()
+                    .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+                    .map(|(_, content, _, ts)| (content, ts))
+                    .collect(),
+            );
+        } else if !needles.iter().any(|(seen, _)| seen == id) {
+            needles.push((id, format!("conv_{id}").to_ascii_lowercase()));
+        }
+    }
+    if needles.is_empty() {
+        return Ok(out);
+    }
+    // (timestamp, rowid, tags) of every match, per needle.
+    let mut hits: Vec<Vec<(String, i64, String)>> = vec![Vec::new(); needles.len()];
+    let mut stmt =
+        conn.prepare("SELECT rowid, tags, timestamp FROM reflections WHERE tags IS NOT NULL")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let tags: String = row.get(1)?;
+        let lower = tags.to_ascii_lowercase();
+        let mut matched: Vec<usize> = Vec::new();
+        for (at, _) in lower.match_indices("conv_") {
+            for (i, (_, needle)) in needles.iter().enumerate() {
+                if lower[at..].starts_with(needle.as_str()) && !matched.contains(&i) {
+                    matched.push(i);
+                }
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        let rowid: i64 = row.get(0)?;
+        let timestamp: String = row.get(2)?;
+        for i in matched {
+            hits[i].push((timestamp.clone(), rowid, tags.clone()));
+        }
+    }
+    // Newest `window` per id, as ORDER BY timestamp DESC LIMIT window; keep the
+    // episode rows and read their bodies in one pass.
+    let mut wanted: Vec<(usize, i64, String)> = Vec::new();
+    for (i, list) in hits.iter_mut().enumerate() {
+        list.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (timestamp, rowid, tags) in list.iter().take(window) {
+            let parsed: Vec<String> = serde_json::from_str(tags).unwrap_or_default();
+            if parsed.iter().any(|t| t == "session_episode") {
+                wanted.push((i, *rowid, timestamp.clone()));
+            }
+        }
+    }
+    let mut bodies: std::collections::HashMap<i64, String> = Default::default();
+    if !wanted.is_empty() {
+        let mut ids: Vec<i64> = wanted.iter().map(|w| w.1).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT rowid, content FROM reflections WHERE rowid IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, content) = row?;
+            bodies.insert(rowid, content);
+        }
+    }
+    for (id, _) in &needles {
+        out.entry(id.to_string()).or_default();
+    }
+    for (i, rowid, timestamp) in wanted {
+        if let Some(content) = bodies.get(&rowid) {
+            out.entry(needles[i].0.to_string())
+                .or_default()
+                .push((content.clone(), timestamp));
+        }
+    }
+    Ok(out)
+}
+
 /// Like `get_reflections_by_tag` but requires BOTH tags to be present. Used by the
 /// session-briefing hook to fetch a project's recent episodes directly
 /// (`project_<name>` AND `session_episode`) so the LIMIT applies AFTER both filters
@@ -7002,6 +7100,54 @@ mod tests {
                 .map(|(id, _, _, ts)| (id, ts))
                 .collect();
             assert_eq!(got, scan(tag, limit as i64), "{tag} {limit}");
+        }
+    }
+
+    #[test]
+    fn batched_episode_rows_match_one_tag_scan_per_conversation() {
+        let conn = mem();
+        let mut n = 0;
+        let mut put = |tags: &[&str], body: &str| {
+            n += 1;
+            let id = format!("r{n:03}");
+            let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+            insert_reflection(&conn, &id, body, &tags, &[0.0; 4]).unwrap();
+            conn.execute(
+                "UPDATE reflections SET timestamp = ?1 WHERE id = ?2",
+                params![
+                    format!("2026-09-{:02}T{:02}:00:00Z", 1 + (n * 5) % 28, n % 24),
+                    id
+                ],
+            )
+            .unwrap();
+        };
+        // An episode, its story and extract, and enough newer rows of one
+        // conversation to push its episode out of a 3-row window.
+        put(&["session_episode", "conv_aaa"], "{\"episode\":\"aaa\"}");
+        put(&["session_story", "conv_aaa"], "story aaa");
+        put(
+            &["session_episode", "conv_aaa-bbb"],
+            "{\"episode\":\"aaa-bbb\"}",
+        );
+        put(&["session_episode", "CONV_CCC"], "{\"episode\":\"ccc\"}");
+        for i in 0..6 {
+            put(&["context_cache", "conv_ddd"], &format!("cache {i}"));
+        }
+        put(&["session_episode", "conv_ddd"], "{\"episode\":\"ddd\"}");
+        put(&["narrative_extracted_v3", "conv_eee"], "no episode here");
+        let ids = ["aaa", "aaa-bbb", "ccc", "ddd", "eee", "missing", "aaa"];
+        for window in [3usize, 10] {
+            let batched = episode_rows_by_conversation(&conn, &ids, window).unwrap();
+            for id in ids {
+                let one: Vec<(String, String)> =
+                    get_reflections_by_tag(&conn, &format!("conv_{id}"), window)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
+                        .map(|(_, content, _, ts)| (content, ts))
+                        .collect();
+                assert_eq!(batched.get(id), Some(&one), "{id} window {window}");
+            }
         }
     }
 }

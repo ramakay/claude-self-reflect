@@ -516,6 +516,17 @@ impl Storage {
         queries::get_reflections_by_tag(&conn, tag, limit)
     }
 
+    /// The `session_episode` rows behind each conversation's `conv_<id>` tag
+    /// (see [`queries::episode_rows_by_conversation`]).
+    pub fn episode_rows_by_conversation(
+        &self,
+        conv_ids: &[&str],
+        window: usize,
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::episode_rows_by_conversation(&conn, conv_ids, window)
+    }
+
     pub fn get_reflections_by_two_tags(
         &self,
         tag_a: &str,

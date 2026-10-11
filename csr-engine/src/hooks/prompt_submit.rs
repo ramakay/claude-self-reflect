@@ -1288,11 +1288,11 @@ async fn correlate_episode(
     let project_tag = format!("project_{}", project);
     let now = chrono::Utc::now();
     let mut seen_convs: HashSet<String> = HashSet::new();
-    // Collect every eligible candidate, then rank recency-weighted — raw
-    // score order alone anchored a 3-week-old prompt-echo over the session
-    // that ended two hours earlier (see EPISODE_RECENCY_HALF_LIFE_DAYS).
-    let mut eligible: Vec<(f32, f32, crate::hooks::stop::Episode, String)> = Vec::new();
     let debug = std::env::var("CSR_DEBUG_CORRELATE").is_ok();
+    // First the cheap per-row checks, in score order; then every surviving
+    // conversation's episode in one lookup (one tag scan per conversation
+    // was a quarter of render time); then the episode checks, in that order.
+    let mut candidates: Vec<(f32, String)> = Vec::new();
     for r in &results {
         let Ok(Some((content, tags, _))) = engine.storage().get_reflection_by_id(&r.id) else {
             continue;
@@ -1329,7 +1329,15 @@ async fn correlate_episode(
         {
             continue;
         }
-        let Some((ep, ts)) = episode_for_conversation(engine, conv_id) else {
+        candidates.push((r.score, conv_id.to_string()));
+    }
+    let mut episodes = episodes_for_conversations(engine, &candidates);
+    // Collect every eligible candidate, then rank recency-weighted — raw
+    // score order alone anchored a 3-week-old prompt-echo over the session
+    // that ended two hours earlier (see EPISODE_RECENCY_HALF_LIFE_DAYS).
+    let mut eligible: Vec<(f32, f32, crate::hooks::stop::Episode, String)> = Vec::new();
+    for (score, conv_id) in &candidates {
+        let Some((ep, ts)) = episodes.remove(conv_id) else {
             continue;
         };
         if !crate::hooks::session_start::episode_carries_state(&ep) {
@@ -1347,13 +1355,13 @@ async fn correlate_episode(
             .map(|t| ((now - t).num_minutes() as f32 / 1440.0).max(0.0))
             .unwrap_or(f32::INFINITY);
         let age = crate::hooks::session_start::relative_time_label(&ts, &now);
-        if std::env::var("CSR_DEBUG_CORRELATE").is_ok() {
+        if debug {
             eprintln!(
                 "CSR correlate candidate: raw={:.3} age_days={:.2} conv={}",
-                r.score, age_days, ep.session_id
+                score, age_days, ep.session_id
             );
         }
-        eligible.push((r.score, age_days, ep, age));
+        eligible.push((*score, age_days, ep, age));
     }
     let scores: Vec<(f32, f32)> = eligible.iter().map(|e| (e.0, e.1)).collect();
     match pick_episode(&scores) {
@@ -1371,24 +1379,28 @@ async fn correlate_episode(
     }
 }
 
-/// Load the stored episode for a conversation via its `conv_<id>` tag.
-/// Returns the episode plus its reflection timestamp.
-fn episode_for_conversation(
+/// The stored episode of each conversation, via its `conv_<id>` tag: among the
+/// conversation's 10 newest tagged reflections, the newest `session_episode`
+/// row that parses, with that row's timestamp. One lookup for all of them.
+fn episodes_for_conversations(
     engine: &Engine,
-    conv_id: &str,
-) -> Option<(crate::hooks::stop::Episode, String)> {
-    let conv_tag = format!("conv_{}", conv_id);
-    let rows = engine
-        .storage()
-        .get_reflections_by_tag(&conv_tag, 10)
-        .ok()?;
+    candidates: &[(f32, String)],
+) -> HashMap<String, (crate::hooks::stop::Episode, String)> {
+    let ids: Vec<&str> = candidates.iter().map(|(_, id)| id.as_str()).collect();
+    let Ok(rows) = engine.storage().episode_rows_by_conversation(&ids, 10) else {
+        return HashMap::new();
+    };
     rows.into_iter()
-        .filter(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode"))
-        .find_map(|(_, content, _, ts)| {
-            serde_json::from_str::<crate::hooks::stop::Episode>(&content)
-                .ok()
-                .map(|ep| (ep, ts))
+        .filter_map(|(conv, rows)| {
+            rows.into_iter()
+                .find_map(|(content, ts)| {
+                    serde_json::from_str::<crate::hooks::stop::Episode>(&content)
+                        .ok()
+                        .map(|ep| (ep, ts))
+                })
+                .map(|found| (conv, found))
         })
+        .collect()
 }
 
 /// Log the best sub-threshold episode candidate for threshold tuning.
