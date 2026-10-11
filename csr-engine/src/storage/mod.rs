@@ -435,6 +435,13 @@ impl Storage {
         queries::get_most_recent_session(&conn, project)
     }
 
+    /// The newest chunk's conversation and timestamp for `project` (see
+    /// [`queries::latest_chunk_in_project`]).
+    pub fn latest_chunk_in_project(&self, project: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::latest_chunk_in_project(&conn, project)
+    }
+
     pub fn get_chunks_in_timerange(
         &self,
         start: &str,

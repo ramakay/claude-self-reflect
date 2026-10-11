@@ -2069,9 +2069,16 @@ pub fn get_reflections_by_tag(
     // Escape LIKE wildcards to prevent injection
     let escaped_tag = tag.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("%{}%", escaped_tag);
+    // The match runs on `idx_reflections_tags_timestamp` alone (a covering
+    // scan of ~2 MB): `tags` sits after `content` in the row, so filtering the
+    // table itself walks every reflection's overflow pages. Only the rows that
+    // win are read whole. Same filter, order and limit as before.
     let mut stmt = conn.prepare(
         "SELECT id, content, tags, timestamp FROM reflections
-         WHERE tags LIKE ?1 ESCAPE '\\' ORDER BY timestamp DESC LIMIT ?2",
+         WHERE rowid IN (SELECT rowid FROM reflections
+                         WHERE tags LIKE ?1 ESCAPE '\\'
+                         ORDER BY timestamp DESC LIMIT ?2)
+         ORDER BY timestamp DESC",
     )?;
     let rows = stmt.query_map(params![pattern, limit as i64], |row| {
         let id: String = row.get(0)?;
@@ -2530,6 +2537,37 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
         summary: row.get(5)?,
         enrichment: row.get(6)?,
     })
+}
+
+/// The newest chunk of a project: its conversation and timestamp, which is the
+/// `conversation_id` and `timestamp` [`get_most_recent_session`] reports (the
+/// conversation whose newest chunk is newest). Served by
+/// `idx_chunks_project_timestamp` instead of grouping every chunk of the
+/// project with three subqueries per conversation (live 2026-10-11: half of
+/// all prompt-render time, ~300 ms for 173k chunks at background priority).
+/// A tie on the timestamp goes to the smallest conversation id.
+pub fn latest_chunk_in_project(
+    conn: &Connection,
+    project: &str,
+) -> Result<Option<(String, String)>> {
+    let sql = if project == "all" {
+        "SELECT conversation_id, timestamp FROM chunks
+         ORDER BY timestamp DESC, conversation_id ASC LIMIT 1"
+    } else {
+        "SELECT conversation_id, timestamp FROM chunks WHERE project_name = ?1
+         ORDER BY timestamp DESC, conversation_id ASC LIMIT 1"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let row = if project == "all" {
+        stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+    } else {
+        stmt.query_row([project], |r| Ok((r.get(0)?, r.get(1)?)))
+    };
+    match row {
+        Ok(found) => Ok(Some(found)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Get the single most recent session for a project.
@@ -6876,5 +6914,94 @@ mod tests {
             "the pair must report exactly one parallel sibling: {}",
             chunks[1].content
         );
+    }
+
+    #[test]
+    fn latest_chunk_names_the_conversation_get_most_recent_session_names() {
+        let conn = mem();
+        let put = |id: &str, conv: &str, project: &str, ts: &str| {
+            let mut chunk = test_chunk(id, "body");
+            chunk.conversation_id = conv.into();
+            chunk.project_name = project.into();
+            chunk.timestamp = ts.into();
+            insert_chunk(&conn, &chunk, &[0.0; 4]).unwrap();
+        };
+        put("a1", "conv-a", "p", "2026-10-01T10:00:00Z");
+        put("a2", "conv-a", "p", "2026-10-03T10:00:00Z");
+        put("b1", "conv-b", "p", "2026-10-02T10:00:00Z");
+        put("b2", "conv-b", "p", "2026-10-04T09:00:00Z");
+        put("c1", "conv-c", "q", "2026-10-05T10:00:00Z");
+        for project in ["p", "q", "all"] {
+            let session = get_most_recent_session(&conn, project).unwrap().unwrap();
+            assert_eq!(
+                latest_chunk_in_project(&conn, project).unwrap(),
+                Some((session.conversation_id, session.timestamp)),
+                "{project}"
+            );
+        }
+        assert_eq!(latest_chunk_in_project(&conn, "none").unwrap(), None);
+        // A tie on the newest timestamp goes to the smallest conversation id.
+        put("z1", "conv-z", "p", "2026-10-04T09:00:00Z");
+        put("a3", "conv-0", "p", "2026-10-04T09:00:00Z");
+        assert_eq!(
+            latest_chunk_in_project(&conn, "p").unwrap(),
+            Some(("conv-0".into(), "2026-10-04T09:00:00Z".into()))
+        );
+    }
+
+    #[test]
+    fn reflections_by_tag_return_what_the_table_scan_returned() {
+        let conn = mem();
+        for i in 0..30 {
+            let tags: Vec<String> = match i % 3 {
+                0 => vec!["session_episode".into(), "conv_abc".into()],
+                1 => vec!["session_story".into(), "conv_abc-def".into()],
+                _ => vec!["conv_other".into()],
+            };
+            let id = format!("r{i:02}");
+            insert_reflection(
+                &conn,
+                &id,
+                &format!("body {i} {}", "x".repeat(5000)),
+                &tags,
+                &[0.0; 4],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE reflections SET timestamp = ?1 WHERE id = ?2",
+                params![
+                    format!("2026-09-{:02}T00:00:{:02}Z", 1 + (i * 7) % 28, i),
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        let scan = |tag: &str, limit: i64| -> Vec<(String, String)> {
+            let pattern = format!("%{}%", tag.replace('%', "\\%").replace('_', "\\_"));
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, timestamp FROM reflections
+                     WHERE tags LIKE ?1 ESCAPE '\\' ORDER BY timestamp DESC LIMIT ?2",
+                )
+                .unwrap();
+            stmt.query_map(params![pattern, limit], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        for (tag, limit) in [
+            ("conv_abc", 10),
+            ("conv_abc", 3),
+            ("session_episode", 50),
+            ("CONV_OTHER", 4),
+            ("nothing", 5),
+        ] {
+            let got: Vec<(String, String)> = get_reflections_by_tag(&conn, tag, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _, _, ts)| (id, ts))
+                .collect();
+            assert_eq!(got, scan(tag, limit as i64), "{tag} {limit}");
+        }
     }
 }

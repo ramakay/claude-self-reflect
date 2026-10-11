@@ -416,6 +416,13 @@ pub fn run(conn: &Connection) -> Result<()> {
             created_at TEXT DEFAULT (datetime('now'))
         );
 
+        -- Prompt-render lookups (hooks::prompt_submit): a project's newest
+        -- chunk, and a reflection-tag match that never reads row bodies.
+        -- Measured on a 697k-chunk / 11.9k-reflection copy at background
+        -- priority: 6.4 s and 36 MB, 0.1 s and 1.9 MB.
+        CREATE INDEX IF NOT EXISTS idx_chunks_project_timestamp ON chunks(project_name, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_reflections_tags_timestamp ON reflections(tags, timestamp);
+
         CREATE TABLE IF NOT EXISTS reflection_embeddings (
             reflection_id TEXT PRIMARY KEY REFERENCES reflections(id),
             embedding BLOB NOT NULL

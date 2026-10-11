@@ -1401,16 +1401,17 @@ fn log_episode_near_miss(score: f32, session_id: &str) {
 
 fn detect_continued_session_id(engine: &Engine, cwd: &Path) -> Option<String> {
     let project = resolve_project_from_cwd(&cwd.to_string_lossy())?;
-    let session = engine.storage().get_most_recent_session(&project).ok()??;
+    let (conversation_id, timestamp) =
+        engine.storage().latest_chunk_in_project(&project).ok()??;
 
-    let ts = temporal::parse_timestamp(&session.timestamp)?;
+    let ts = temporal::parse_timestamp(&timestamp)?;
     let age_minutes = (chrono::Utc::now() - ts).num_minutes();
     // C-2 fix: reject future timestamps (clock skew) and sessions beyond threshold
     if !(0..=CONTINUITY_THRESHOLD_MINUTES).contains(&age_minutes) {
         return None;
     }
 
-    Some(session.conversation_id)
+    Some(conversation_id)
 }
 
 /// Openings of blocks the harness writes into the user channel. A chunk that
