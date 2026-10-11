@@ -34,8 +34,6 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::ChunkProvenance;
 
-/// SQLite storage with FTS5 for full-text search.
-/// Thread-safe via Mutex around the Connection.
 /// Page cache and memory-mapped reads for a multi-GB database. SQLite's
 /// defaults (a 2 MB cache, no mmap) turn every prompt render into a stream of
 /// `pread` calls: sampled live 2026-10-11, the render's samples sat mostly in
@@ -50,6 +48,8 @@ use crate::provenance::ChunkProvenance;
 /// read through the cache.
 const READ_PATH_PRAGMAS: &str = "PRAGMA cache_size=-65536; PRAGMA mmap_size=2147418112;";
 
+/// SQLite storage with FTS5 for full-text search.
+/// Thread-safe via Mutex around the Connection.
 pub struct Storage {
     conn: Mutex<Connection>,
     /// Frame terms measured over this store's reflections (see
