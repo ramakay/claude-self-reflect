@@ -281,6 +281,10 @@ impl Drop for BoundSocket {
 
 /// Start an independent endpoint sharing the daemon's warm engine. Single
 /// flight bounds work even if a client disappears while SQLite/ONNX is busy.
+/// How often the daemon re-measures the reflection frame vocabulary; half its
+/// 6 h validity, so renders never find it stale.
+const COMMON_TERMS_REFRESH: Duration = Duration::from_secs(3 * 60 * 60);
+
 /// Prompt work never takes the daemon heavy-work permit: a stuck renderer must
 /// not prevent reconciliation, imports, or enrichment from making progress.
 pub fn spawn_for_daemon(
@@ -307,6 +311,23 @@ pub fn spawn_for_daemon(
                     return;
                 }
             };
+            // Measure the frame vocabulary (`injection::specificity`) off the
+            // prompt path: before the first prompt, then well inside each
+            // validity window, so a render only ever reads the cached copy.
+            {
+                let engine = engine.clone();
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    while !shutdown.load(Ordering::SeqCst) {
+                        let worker = engine.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            worker.storage().refresh_reflection_common_terms();
+                        })
+                        .await;
+                        tokio::time::sleep(COMMON_TERMS_REFRESH).await;
+                    }
+                });
+            }
             let slots = Arc::new(Semaphore::new(1));
             while !shutdown.load(Ordering::SeqCst) {
                 let accepted = tokio::select! {

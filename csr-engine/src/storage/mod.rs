@@ -17,6 +17,7 @@ pub mod recap_feeds;
 pub mod sidechain_provenance;
 pub mod trained_rerank;
 pub mod usage_reservation;
+pub mod vocabulary;
 pub mod witness_ledger;
 pub mod witness_verdicts;
 
@@ -37,6 +38,9 @@ use crate::provenance::ChunkProvenance;
 /// Thread-safe via Mutex around the Connection.
 pub struct Storage {
     conn: Mutex<Connection>,
+    /// Frame terms measured over this store's reflections (see
+    /// `injection::specificity`), with when they were measured.
+    common_terms: vocabulary::CommonTermsCache,
 }
 
 const CONTAMINATION_META_KEY: &str = "contamination_measurement_v1";
@@ -105,6 +109,7 @@ impl Storage {
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            common_terms: Default::default(),
         })
     }
 
@@ -114,6 +119,7 @@ impl Storage {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            common_terms: Default::default(),
         })
     }
 
@@ -124,6 +130,7 @@ impl Storage {
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            common_terms: Default::default(),
         })
     }
 

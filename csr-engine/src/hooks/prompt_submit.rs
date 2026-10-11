@@ -1191,6 +1191,7 @@ async fn correlate_episode(
         let idx = engine.search().read().await;
         idx.search_reflections(query_vec, 50, EPISODE_CORRELATION_FLOOR)
     };
+    let common = engine.storage().reflection_common_terms();
     let project_tag = format!("project_{}", project);
     let now = chrono::Utc::now();
     let mut seen_convs: HashSet<String> = HashSet::new();
@@ -1200,9 +1201,19 @@ async fn correlate_episode(
     let mut eligible: Vec<(f32, f32, crate::hooks::stop::Episode, String)> = Vec::new();
     let debug = std::env::var("CSR_DEBUG_CORRELATE").is_ok();
     for r in &results {
-        let Ok(Some((_, tags, _))) = engine.storage().get_reflection_by_id(&r.id) else {
+        let Ok(Some((content, tags, _))) = engine.storage().get_reflection_by_id(&r.id) else {
             continue;
         };
+        // A frame-only row ("Session in <p> project using <tools>") matches
+        // prompts by its frame, so it cannot vouch for its session.
+        if !tags.iter().any(|t| t == "session_episode")
+            && crate::injection::specificity::is_generic(
+                &formatter::truncate_item(&content, 300),
+                &common,
+            )
+        {
+            continue;
+        }
         if debug {
             eprintln!(
                 "CSR correlate raw hit: score={:.3} id={} tags={:?}",
@@ -1550,6 +1561,7 @@ async fn search_reflections_with_vec(
         let idx = search.read().await;
         idx.search_reflections(query_vec, limit, min_score)
     };
+    let common = storage.reflection_common_terms();
 
     let mut raw_results = Vec::new();
     for result in &results {
@@ -1578,6 +1590,15 @@ async fn search_reflections_with_vec(
                 continue;
             }
 
+            // A row whose rendered excerpt is its writer's frame alone
+            // ("Session in <p> project using <tools>", "[Heuristic] Project:
+            // … Messages: …") says nothing about the work. See
+            // `injection::specificity` for how the frame is measured.
+            let excerpt = formatter::truncate_item(&content, 300);
+            if crate::injection::specificity::is_generic(&excerpt, &common) {
+                continue;
+            }
+
             let source = if tags
                 .iter()
                 .any(|t| t == "outcome_incomplete" || t == "outcome_abandoned")
@@ -1593,7 +1614,7 @@ async fn search_reflections_with_vec(
                 )
                 .unwrap_or(crate::provenance::TrustTier::Unknown);
             raw_results.push(RawResult {
-                content: formatter::truncate_item(&content, 300),
+                content: excerpt,
                 score: result.score,
                 source: source.to_string(),
                 timestamp: Some(timestamp),
