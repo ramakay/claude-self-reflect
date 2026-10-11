@@ -195,6 +195,48 @@ pub fn is_generic(excerpt: &str, common: &CommonTerms) -> bool {
     informative_words(excerpt, common) < MIN_INFORMATIVE_WORDS
 }
 
+/// Openings of the parts a v3 session story (`extraction::story`) appends
+/// after the request it restates: what was modified, the outcome, open issues.
+const STORY_FINDING_OPENINGS: [&str; 7] = [
+    "Modified ",
+    "LANGUAGES:",
+    "Completed successfully",
+    "Partially completed",
+    "Failed — may need retry",
+    "Resolved errors during session",
+    "Unresolved:",
+];
+
+/// The part of a derived row's excerpt that says what happened rather than
+/// what was asked. A v3 extract loses its `## User Request` section, a v3
+/// session story (`story_` id) the request it opens with, and every row its
+/// `Signature:` trailer. Other derived rows (narrated stories, facts) are all
+/// account and are kept whole.
+pub fn finding_text(id: &str, excerpt: &str) -> String {
+    let body = excerpt
+        .find("Signature:")
+        .map_or(excerpt, |at| &excerpt[..at]);
+    if let Some(start) = body.find("## User Request") {
+        let after = &body[start + "## User Request".len()..];
+        let end = after.find("\n## ").unwrap_or(after.len());
+        return format!("{}{}", &body[..start], &after[end..]);
+    }
+    if id.starts_with("story_") {
+        return STORY_FINDING_OPENINGS
+            .iter()
+            .filter_map(|opening| body.find(opening))
+            .min()
+            .map_or_else(String::new, |at| body[at..].to_string());
+    }
+    body.to_string()
+}
+
+/// The row records an outcome, a lesson or a state reached, not only the ask
+/// that opened its session.
+pub fn states_a_finding(id: &str, excerpt: &str, common: &CommonTerms) -> bool {
+    informative_words(&finding_text(id, excerpt), common) >= MIN_INFORMATIVE_WORDS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +363,29 @@ mod tests {
         let w = words("touched prompt_submit.rs, intent.rs, provenance.rs and fixed the gate");
         assert!(w.contains("touched") && w.contains("fixed") && w.contains("gate"));
         assert!(!w.contains("intent") && !w.contains("provenance"));
+    }
+
+    #[test]
+    fn a_finding_is_what_happened_not_what_was_asked() {
+        let common = measured();
+        // Blind-labelled relevant, dropped by the 21-day bar (2026-10-11 replay).
+        let ota_read = "## User Request\nwhat is the latst on last nights OTA, adoption performance etc/\n\n## Active Issues\n\"=== 1.6.0 binary_status: testflight-only dau: 4\nlast_ota:\n  channel: anonymous-browsing\n  group_\n\n---\nSignature: {\"completion_status\":\"failed\"}";
+        assert!(states_a_finding("extracted_v3_x", ota_read, &common));
+        let story = "what is the latst on last nights OTA, adoption performance etc/. Failed — may need retry. Resolved errors during session. Unresolved: \"=== 1.6.0 binary_status: testflight-only dau: 4 last_ota: channel: anonymous-browsing --- Signature: {}";
+        assert!(states_a_finding("story_x", story, &common));
+        let lesson = "Saadhana promo video choppy-slideshow bug traced to audio track: argala stotram was slow, flat, missing surprise arc. Rewrote Suno prompt from sandhya-architecture to neo-soul-surprise";
+        assert!(states_a_finding(
+            "00000000-0000-4000-8000-0000000000ad",
+            lesson,
+            &common
+        ));
+        // Blind-labelled irrelevant request echoes: the ask and nothing else.
+        for stub in [
+            "## User Request\nreview 3f56dc2b - the prev session.. planning for an OTA, it went in multiple rounds provide a checllist TLDR of what the next moves are for today\n\n---\nSignature: {\"completion_status\":\"success\"}",
+            "## User Request\nDreaming, we researched it chatted around it never thought about it v10 of CSR brings dreaming - is this the kilelr feature?\n\n## Active Issues\n\n\n---\nSignature: {}",
+            "one aspect of dreams and why it ailed (check csr for recent sessions and discussions ) - gather info before getting biased. Partially completed. Unresolved: --- Signature: {}",
+        ] {
+            assert!(!states_a_finding(if stub.starts_with("##") { "extracted_v3_x" } else { "story_x" }, stub, &common), "{stub}");
+        }
     }
 }

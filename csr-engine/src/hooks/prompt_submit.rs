@@ -60,20 +60,47 @@ const MAX_CHUNK_AGE_DAYS: i64 = 21;
 /// chose to store; `mcp::tools::is_explicit_memory` rows keep it. Live
 /// 2026-10-10: 5- to 7-month-old stories at cosine 0.45-0.55 filled the block,
 /// the youngest of them "5 months ago".
+///
+/// A row that records what happened (an outcome, a lesson, a state reached;
+/// `injection::specificity::states_a_finding`) keeps the usual cosine floor
+/// for [`FINDING_MAX_AGE_DAYS`]; a row that only restates the ask that opened
+/// its session does not. Blind-labelled replay 2026-10-11 (15 prompts, grader
+/// without arm markers): of 21 items the 21-day bar removed, the 4 relevant
+/// ones were 56-72 days old and each carried a finding, while 9 of the 15
+/// irrelevant ones were request-only echoes. Cosine did not separate them:
+/// the relevant four sat at 0.452-0.476, below 11 of the 15 irrelevant.
+#[allow(clippy::too_many_arguments)]
 fn is_stale_derived(
     id: &str,
     tags: &[String],
+    excerpt: &str,
     timestamp: &str,
     raw_cosine: f32,
     now: chrono::DateTime<chrono::Utc>,
+    common: &crate::injection::specificity::CommonTerms,
 ) -> bool {
     if crate::mcp::tools::is_explicit_memory(id, tags) || raw_cosine >= crate::format::WEAK_BAND_TOP
     {
         return false;
     }
-    crate::temporal::parse_timestamp(timestamp)
-        .is_some_and(|at| (now - at).num_days() > MAX_CHUNK_AGE_DAYS)
+    let Some(age_days) =
+        crate::temporal::parse_timestamp(timestamp).map(|at| (now - at).num_days())
+    else {
+        return false;
+    };
+    if age_days <= MAX_CHUNK_AGE_DAYS {
+        return false;
+    }
+    !(age_days <= FINDING_MAX_AGE_DAYS
+        && crate::injection::specificity::states_a_finding(id, excerpt, common))
 }
+
+/// How long a derived row that records a finding keeps its standing on the
+/// usual cosine floor: one half-life of the search decay
+/// (`search::decay::DEFAULT_SCALE_DAYS`). Past it, as for every other derived
+/// row, a strong match is needed; the 5- to 7-month-old rows of the live
+/// 2026-10-10 injection stay out.
+const FINDING_MAX_AGE_DAYS: i64 = crate::search::decay::DEFAULT_SCALE_DAYS as i64;
 
 /// Handle the prompt-submit hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
@@ -1657,15 +1684,22 @@ async fn search_reflections_with_vec(
                 continue;
             }
 
-            if is_stale_derived(&result.id, &tags, &timestamp, result.score, now) {
-                continue;
-            }
-
             // A row whose rendered excerpt is its writer's frame alone
             // ("Session in <p> project using <tools>", "[Heuristic] Project:
             // … Messages: …") says nothing about the work. See
             // `injection::specificity` for how the frame is measured.
             let excerpt = formatter::truncate_item(&content, 300);
+            if is_stale_derived(
+                &result.id,
+                &tags,
+                &excerpt,
+                &timestamp,
+                result.score,
+                now,
+                &common,
+            ) {
+                continue;
+            }
             if crate::injection::specificity::is_generic(&excerpt, &common) {
                 continue;
             }
@@ -3361,6 +3395,20 @@ mod tests {
 
     #[test]
     fn derived_rows_age_like_their_chunks_and_memories_do_not() {
+        let common = crate::injection::specificity::CommonTerms::from_measurement(
+            [
+                "session",
+                "user",
+                "request",
+                "partially",
+                "completed",
+                "unresolved",
+            ]
+            .map(String::from)
+            .to_vec(),
+            10_000,
+        );
+        let note = "When claude is killed or closed it generates a session, can CSR retreive it";
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T20:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -3377,50 +3425,94 @@ mod tests {
         assert!(is_stale_derived(
             "00000000-0000-4000-8000-0000000000ab",
             &tags,
+            note,
             old,
             0.483,
-            now
+            now,
+            &common
         ));
         // A strong match still reaches old work.
         assert!(!is_stale_derived(
             "00000000-0000-4000-8000-0000000000ab",
             &tags,
+            note,
             old,
             0.855,
-            now
+            now,
+            &common
         ));
         // Extracts, heuristics and facts are derived by their id or tag.
         let v3 = vec!["narrative_extracted_v3".to_string(), "conv_x".to_string()];
         assert!(is_stale_derived(
             "extracted_v3_x",
             &v3,
+            note,
             "2026-02-21T00:00:00Z",
             0.59,
-            now
+            now,
+            &common
         ));
         assert!(is_stale_derived(
             "fact_convention_x",
             &[],
+            note,
             "2026-05-12T00:00:00Z",
             0.5,
-            now
+            now,
+            &common
         ));
         // Recent derived rows are not stale.
         assert!(!is_stale_derived(
             "story_x",
             &story("x"),
+            note,
             "2026-10-01T00:00:00Z",
             0.47,
-            now
+            now,
+            &common
+        ));
+        // A finding keeps the usual floor for one decay half-life, an echo of
+        // the ask does not, and past 90 days a strong match is needed either way.
+        let lesson = "Saadhana promo video choppy-slideshow bug traced to audio track: argala stotram was slow, flat, missing surprise arc. Rewrote Suno prompt";
+        let echo = "## User Request\nreview the prev session.. planning for an OTA, it went in multiple rounds provide a checllist\n\n---\nSignature: {}";
+        let seventy_two_days = "2026-07-31T00:00:00Z";
+        assert!(!is_stale_derived(
+            "00000000-0000-4000-8000-0000000000ae",
+            &story("y"),
+            lesson,
+            seventy_two_days,
+            0.476,
+            now,
+            &common
+        ));
+        assert!(is_stale_derived(
+            "extracted_v3_y",
+            &["narrative_extracted_v3".to_string()],
+            echo,
+            seventy_two_days,
+            0.594,
+            now,
+            &common
+        ));
+        assert!(is_stale_derived(
+            "00000000-0000-4000-8000-0000000000ae",
+            &story("y"),
+            lesson,
+            "2026-04-03T00:00:00Z",
+            0.565,
+            now,
+            &common
         ));
         // A memory someone chose to store keeps its long-term standing.
         let memory = vec!["dreaming".to_string(), "journal".to_string()];
         assert!(!is_stale_derived(
             "00000000-0000-4000-8000-0000000000ac",
             &memory,
+            note,
             "2026-08-15T23:57:02Z",
             0.498,
-            now
+            now,
+            &common
         ));
     }
 
