@@ -3918,7 +3918,7 @@ mod tests {
         // chain == the bare enclosing-def name, no closure nesting of its
         // own) IS visible to a call made from inside a NESTED closure
         // (`Component>anon7`) — the real-world shape `nearest_def_node`'s
-        // own doc comment describes (`anukriti-mvp-expo`'s radio-context.tsx).
+        // own doc comment describes (`private-app`'s audio-context.tsx).
         let conn = mem();
         upsert_node(&conn, &def("Component", "a.tsx", "Component")).unwrap();
         codegraph::replace_file_edges(

@@ -157,7 +157,7 @@ echo "---"
 
 # --- About ---
 version=$("$CSR_BIN" --version 2>/dev/null || echo "unknown")
-branch=$(cd /Users/ramakrishnanannaswamy/projects/claude-self-reflect && git branch --show-current 2>/dev/null || echo "unknown")
+branch=$(cd "${HOME}/projects/claude-self-reflect" && git branch --show-current 2>/dev/null || echo "unknown")
 echo "CSR Engine ${version} | size=10 color=#666666"
 echo "Branch: ${branch} | size=10 color=#666666"
 echo "Refresh | refresh=true sfimage=arrow.clockwise"

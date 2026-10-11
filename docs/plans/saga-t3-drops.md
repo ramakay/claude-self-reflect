@@ -35,22 +35,22 @@ verification, multi-hop audit, mechanical dedupe) but lost out in the final bala
 - **#37** — budget cut: solid plan-grounded design-rationale question, but the two plans it draws on are already represented via kept #1/#7/#9.
 - **#38** — budget cut: good multi-commit-sequence synthesis (not mech-redundant — spans 4 commits), but release-CI theme is already represented via kept #28 (orig)/final #10.
 
-## Anukriti / candidates_anukriti.md (14 dropped, of 30)
+## private-app / candidates_private-app.md (14 dropped, of 30)
 
-- **#40** — budget cut: redundant with kept #49; #49 tests the actual outcome/invariant (a richer question) on the same OTA-group-id feature.
-- **#41** — budget cut: redundant with kept #67 (same skill-directory subject); #67's finding (it's secretly its own git repo) is the sharper, more surprising question. Also, #41 has no git artifact to check at all.
-- **#43** — mech-redundant: full answer (ticket-vs-receipt distinction, 696-vs-305 numbers) stated in single commit `20e2cec`'s own body.
-- **#44** — budget cut: third question on the same OpenAI-Ads-pixel plan; kept #55/#63 already test the harder "shipped or not / which repo" angles on this material.
-- **#45** — mech-redundant AND leakage-adjacent: the commit *subject line itself* ("Saadhana tab replaces Japa tab behind kill-switch") already states the full answer verbatim — trivially retrievable, and risks leaking the answer into any grep-based search.
-- **#48** — budget cut: fourth question on the OpenAI-Ads plan; redundant with kept #55/#63.
-- **#50** — budget cut: valid B-type but least distinctive among the B-bucket candidates; kept #47/#49 instead.
-- **#51** — REDUNDANT (duplicate evidence): ground truth key is explicitly the same dataset as kept #61 ("See #51/#61's evidence" in the source file). Kept #61 as the sharper, more surprising framing (cross-repo split) over #51's simpler "did it ship" framing.
-- **#52** — budget cut: redundant with kept #55's "commit assertion alone doesn't prove X" epistemic-limit lesson; #55 tests the same limit with a more concrete (working-tree-file) payoff.
-- **#53** — budget cut: redundant with kept #64 (identical task, identical "not implemented" finding); #64 is the more rigorous version (broadened multi-repo, under-any-name search).
-- **#58** — budget cut: valid absence-check (Bajrang Baan never released to radio) but redundant in pattern with kept #61/#63/#64's abundant absence-checking; cut for space.
-- **#65** — REDUNDANT (duplicate evidence): identical evidence to kept #56 (ANR mitigation task looks abandoned, fix shipped next day under a different commit); #65 just reframes the same fact as a methodological/meta question. Kept #56.
-- **#66** — REDUNDANT (duplicate evidence): identical evidence to dropped #52 (receipt-reconciliation migration, no independent git proof of prod application) — drops for the same underlying reason plus direct duplication.
-- **#68** — budget cut / too meta: this is a synthesis question whose own ground truth key is just a comparative recap of #47/#57/#59/#60 (kept as #15/#20/#21/#22 in the final numbering) — already independently present in the final set; adds no new fact of its own.
+- **#40** — budget cut: [private repository candidate; details withheld]
+- **#41** — budget cut: [private repository candidate; details withheld]
+- **#43** — mech-redundant: [private repository candidate; details withheld]
+- **#44** — budget cut: [private repository candidate; details withheld]
+- **#45** — mech-redundant AND leakage-adjacent: [private repository candidate; details withheld]
+- **#48** — budget cut: [private repository candidate; details withheld]
+- **#50** — budget cut: [private repository candidate; details withheld]
+- **#51** — REDUNDANT (duplicate evidence): [private repository candidate; details withheld]
+- **#52** — budget cut: [private repository candidate; details withheld]
+- **#53** — budget cut: [private repository candidate; details withheld]
+- **#58** — budget cut: [private repository candidate; details withheld]
+- **#65** — REDUNDANT (duplicate evidence): [private repository candidate; details withheld]
+- **#66** — REDUNDANT (duplicate evidence): [private repository candidate; details withheld]
+- **#68** — budget cut / too meta: [private repository candidate; details withheld]
 
 ## Drop-reason tally
 
@@ -66,4 +66,4 @@ No candidates were dropped for LEAKAGE (criterion 1) or vague KEY VERIFICATION (
 the only leakage issue found (orig #30, a directly-quoted task ID) was fixed by rewording rather
 than dropped; it is kept as final #11.
 
-File: /private/tmp/claude-501/-Users-ramakrishnanannaswamy-projects-claude-self-reflect-csr-engine/efab2eb0-47e7-4b91-bb78-a962261c4214/scratchpad/t3-eval/drops.md
+File: /tmp/scratch/t3-eval/drops.md

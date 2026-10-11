@@ -221,10 +221,10 @@ mod tests {
 
     #[test]
     fn test_synthesize_from_heuristic() {
-        let heuristic = "[Heuristic] Project: anukriti Messages: 35 (17 user) Tools: Agent, Bash, Edit, Glob, Grep, Read";
-        let story = synthesize_story_from_heuristic(heuristic, "anukriti");
+        let heuristic = "[Heuristic] Project: private-app Messages: 35 (17 user) Tools: Agent, Bash, Edit, Glob, Grep, Read";
+        let story = synthesize_story_from_heuristic(heuristic, "private-app");
         assert!(!story.is_empty());
-        assert!(story.contains("anukriti"));
+        assert!(story.contains("private-app"));
     }
 
     #[test]

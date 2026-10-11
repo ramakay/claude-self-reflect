@@ -25,7 +25,7 @@
 
 ## Bug 4: Cross-project search finds irrelevant results
 - **Severity**: LOW (expected behavior)
-- **Reproduction**: `csr_reflect_on_past("Phase 3 HNSW persistence")` without project filter → finds EnhanceMe "Phase 3/4" conversations
+- **Reproduction**: `csr_reflect_on_past("Phase 3 HNSW persistence")` without project filter → finds a companion app's "Phase 3/4" conversations
 - **Root cause**: Generic terms like "Phase 3" match across all projects. User should pass `project` param.
 - **Possible improvement**: When results are from different projects, highlight the project name more prominently in output.
 

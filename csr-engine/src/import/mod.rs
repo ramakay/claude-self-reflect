@@ -1123,7 +1123,7 @@ mod tests {
     #[test]
     fn test_normalize_project_name() {
         assert_eq!(
-            normalize_project_name("-Users-ramakrishnanannaswamy-projects-claude-self-reflect"),
+            normalize_project_name("-Users-dev-projects-claude-self-reflect"),
             "claude-self-reflect"
         );
         assert_eq!(
