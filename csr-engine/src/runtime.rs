@@ -120,6 +120,23 @@ pub fn run_to_completion<F: std::future::Future>(
     result
 }
 
+/// Run an async job whose body is mostly synchronous (file parsing, SQLite,
+/// CPU-bound training) on the blocking pool, driven there by the current
+/// runtime, instead of on one of the daemon's few async workers. A worker
+/// stuck in such a job stalls every task scheduled behind it — the prompt
+/// socket's accept loop included. A panic in the job comes back as an error.
+pub(crate) async fn run_off_worker<F, Fut, T>(job: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T>,
+    T: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(job()))
+        .await
+        .map_err(|e| anyhow::anyhow!("off-worker job failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +334,15 @@ mod tests {
              abandoned blocking task instead of blocking for its full \
              remaining duration (~5s here); elapsed={elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_off_worker_job_returns_its_value_and_a_panic_as_an_error() {
+        assert_eq!(run_off_worker(|| async { 7 }).await.unwrap(), 7);
+        let failed = run_off_worker(|| async { panic!("boom") }).await;
+        assert!(failed
+            .unwrap_err()
+            .to_string()
+            .contains("off-worker job failed"));
     }
 }

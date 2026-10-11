@@ -977,7 +977,19 @@ pub async fn nightly_loop(
                 drop(permit);
                 return;
             }
-            let cycle_result = run_training_cycle(&storage, &embeddings, &search, &shutdown).await;
+            // Harvesting parses transcripts and training is CPU-bound: run the
+            // cycle off the async workers (see `runtime::run_off_worker`).
+            let (s, e, i, d) = (
+                storage.clone(),
+                embeddings.clone(),
+                search.clone(),
+                shutdown.clone(),
+            );
+            let cycle_result = crate::runtime::run_off_worker(move || async move {
+                run_training_cycle(&s, &e, &i, &d).await
+            })
+            .await
+            .and_then(|result| result);
             match cycle_result {
                 Ok(attempt) => {
                     tracing::info!(

@@ -1793,7 +1793,20 @@ async fn extraction_loop(
             tracing::info!("extraction loop: shutdown signal received");
             break;
         }
-        if let Err(e) = extraction_loop_inner(&storage, &embeddings, &search, &projects_dir).await {
+        // Each pass parses whole transcripts and runs extract_v3 synchronously:
+        // keep it off the async workers (see `runtime::run_off_worker`).
+        let (s, e, i, p) = (
+            storage.clone(),
+            embeddings.clone(),
+            search.clone(),
+            projects_dir.clone(),
+        );
+        let pass = crate::runtime::run_off_worker(move || async move {
+            extraction_loop_inner(&s, &e, &i, &p).await
+        })
+        .await
+        .and_then(|result| result);
+        if let Err(e) = pass {
             tracing::warn!(error = %e, "extraction loop iteration failed (non-fatal)");
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
