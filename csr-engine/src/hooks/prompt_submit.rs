@@ -51,6 +51,30 @@ const EPISODE_CORRELATION_MIN: f32 = 0.45;
 /// Prevents 3-month-old conversations from winning on semantic similarity alone.
 const MAX_CHUNK_AGE_DAYS: i64 = 21;
 
+/// A derived reflection (session story, v3 extract, heuristic narrative,
+/// context cache, convention fact) summarises a conversation and ages like
+/// that conversation's chunks: past [`MAX_CHUNK_AGE_DAYS`] it is handed over
+/// only on a strong match, raw cosine at or above `format::WEAK_BAND_TOP` (the
+/// top of the band where genuine and fabricated matches overlap on this
+/// corpus). The long-term exemption above was written for memories someone
+/// chose to store; `mcp::tools::is_explicit_memory` rows keep it. Live
+/// 2026-10-10: 5- to 7-month-old stories at cosine 0.45-0.55 filled the block,
+/// the youngest of them "5 months ago".
+fn is_stale_derived(
+    id: &str,
+    tags: &[String],
+    timestamp: &str,
+    raw_cosine: f32,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if crate::mcp::tools::is_explicit_memory(id, tags) || raw_cosine >= crate::format::WEAK_BAND_TOP
+    {
+        return false;
+    }
+    crate::temporal::parse_timestamp(timestamp)
+        .is_some_and(|at| (now - at).num_days() > MAX_CHUNK_AGE_DAYS)
+}
+
 /// Handle the prompt-submit hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code.
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
@@ -1562,6 +1586,7 @@ async fn search_reflections_with_vec(
         idx.search_reflections(query_vec, limit, min_score)
     };
     let common = storage.reflection_common_terms();
+    let now = chrono::Utc::now();
 
     let mut raw_results = Vec::new();
     for result in &results {
@@ -1587,6 +1612,10 @@ async fn search_reflections_with_vec(
             // Episode reflections are structured JSON surfaced via the Tier-0
             // CONTINUUM / pickup paths — never dump the raw blob as a context line.
             if tags.iter().any(|t| t == "session_episode") {
+                continue;
+            }
+
+            if is_stale_derived(&result.id, &tags, &timestamp, result.score, now) {
                 continue;
             }
 
@@ -3209,6 +3238,71 @@ mod tests {
         assert!(is_self_referential_noise(&format!("seen this? {block}")));
         assert!(!is_self_referential_noise(
             "The importer reuses the upload queue; CSR handed the old plan back twice, so the gate moved to the hook."
+        ));
+    }
+
+    #[test]
+    fn derived_rows_age_like_their_chunks_and_memories_do_not() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-10T20:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let story = |conv: &str| {
+            vec![
+                "session_story".to_string(),
+                "project_claude-self-reflect".to_string(),
+                format!("conv_{conv}"),
+            ]
+        };
+        // The 5-month-old story handed over live on 2026-10-10 at cosine 0.483.
+        let old = "2026-05-05T18:18:47.345352+00:00";
+        let tags = story("00000000-0000-4000-8000-0000000000aa");
+        assert!(is_stale_derived(
+            "00000000-0000-4000-8000-0000000000ab",
+            &tags,
+            old,
+            0.483,
+            now
+        ));
+        // A strong match still reaches old work.
+        assert!(!is_stale_derived(
+            "00000000-0000-4000-8000-0000000000ab",
+            &tags,
+            old,
+            0.855,
+            now
+        ));
+        // Extracts, heuristics and facts are derived by their id or tag.
+        let v3 = vec!["narrative_extracted_v3".to_string(), "conv_x".to_string()];
+        assert!(is_stale_derived(
+            "extracted_v3_x",
+            &v3,
+            "2026-02-21T00:00:00Z",
+            0.59,
+            now
+        ));
+        assert!(is_stale_derived(
+            "fact_convention_x",
+            &[],
+            "2026-05-12T00:00:00Z",
+            0.5,
+            now
+        ));
+        // Recent derived rows are not stale.
+        assert!(!is_stale_derived(
+            "story_x",
+            &story("x"),
+            "2026-10-01T00:00:00Z",
+            0.47,
+            now
+        ));
+        // A memory someone chose to store keeps its long-term standing.
+        let memory = vec!["dreaming".to_string(), "journal".to_string()];
+        assert!(!is_stale_derived(
+            "00000000-0000-4000-8000-0000000000ac",
+            &memory,
+            "2026-08-15T23:57:02Z",
+            0.498,
+            now
         ));
     }
 }
