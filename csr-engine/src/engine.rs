@@ -659,4 +659,39 @@ impl Engine {
 
         Ok(())
     }
+
+    /// Start the MCP server on Streamable HTTP instead of stdio, with the
+    /// same background enrichment loops.
+    ///
+    /// stdio gives every Claude Code session its own process and its own copy
+    /// of the index. This path is the other arrangement: one process holds
+    /// one loaded index and answers every session that registers
+    /// `http://<addr>/mcp`. No stdout claim is needed here: JSON-RPC travels
+    /// over HTTP, so a stray library print to fd 1 cannot corrupt it.
+    pub async fn serve_mcp_http(self, addr: std::net::SocketAddr) -> Result<()> {
+        let enrichment_handles = crate::daemon::spawn_enrichment_loops(
+            self.storage.clone(),
+            self.embeddings.clone(),
+            self.search.clone(),
+        );
+
+        let server = CsrServer::new(
+            self.storage,
+            self.embeddings,
+            self.search,
+            self.projects_dir,
+            self.index_dir,
+        );
+
+        let listener = crate::mcp::http::bind(addr).await?;
+        let bound = listener.local_addr()?;
+        eprintln!("{}", crate::mcp::http::ready_line(bound));
+        let result = crate::mcp::http::serve(server, listener).await;
+
+        for handle in enrichment_handles {
+            handle.abort();
+        }
+
+        result
+    }
 }

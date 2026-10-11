@@ -28,6 +28,19 @@ csr-engine setup
 # Restart Claude Code
 ```
 
+### HTTP endpoint not reachable
+Registered as an `http` server, nothing starts `csr-engine` for you: the
+process has to be listening before Claude Code connects.
+```bash
+curl -sS -X POST http://127.0.0.1:7391/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+A `serverInfo` block naming `csr-engine` means the endpoint is up. Connection
+refused means it is not: start `csr-engine --serve-http 127.0.0.1:7391` (or
+`csr-engine daemon --serve-http 127.0.0.1:7391`) first.
+
 ## Search
 
 ### No results

@@ -5,7 +5,14 @@ edition = "2021"
 description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 
 [dependencies]
-rmcp = { version = "3.1", features = ["server", "transport-io", "macros", "elicitation"] }
+rmcp = { version = "3.1", features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+    "macros",
+    "elicitation",
+] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 fastembed = "5.9"
 hnsw_rs = "0.3"
 rusqlite = { version = "0.40", features = ["bundled", "vtab"] }

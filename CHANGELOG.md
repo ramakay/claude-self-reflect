@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--serve-http <ADDR>`: serve MCP over Streamable HTTP from one process
+  instead of one stdio process per session. The same `ServerHandler` and the
+  same 15 tools, mounted at `http://<ADDR>/mcp`. Every session that registers
+  the endpoint is answered by that one process, so the index is loaded once
+  rather than once per session. The endpoint is unauthenticated, so it binds
+  loopback addresses only. Ctrl+C closes open sessions and exits.
+- `csr-engine daemon --serve-http <ADDR>`: the enrichment daemon hosts the
+  same endpoint, sharing the storage handle, embedding engine and search index
+  it already holds.
+- Registration: replace the stdio entry with
+  `{"type": "http", "url": "http://127.0.0.1:7391/mcp"}`, or run
+  `claude mcp add --transport http claude-self-reflect http://127.0.0.1:7391/mcp -s user`.
+  Prefer it when many sessions run at once; stdio stays the default and
+  remains simpler for a single session.
+- `initialize` now agrees to protocol revisions up to 2025-11-25 only. rmcp
+  3.1 accepts 2026-07-28 but never emits the `ttlMs`/`cacheScope` metadata
+  that revision requires on list results, so a Claude Code client that
+  negotiated it (as it does over HTTP) connected with 0 tools.
+
 ### Fixed: setup repoints the MCP registration, and the installers say when a different csr-engine is still in use
 
 - `csr-engine setup` now repoints the user-scope MCP registration. `claude mcp
