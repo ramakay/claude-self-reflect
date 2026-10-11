@@ -245,8 +245,14 @@ async fn handle_inner(
 ) -> Result<()> {
     // Every exit that needs neither an embedding nor the index is decided in
     // `early_exit`, which also picks the engine this process was built with.
-    let prompt = input.prompt.as_deref().unwrap_or_default();
-    match early_exit(prompt) {
+    let pasted = input.prompt.as_deref().unwrap_or_default();
+    // Retrieval runs on the person's words only. A prompt that pastes CSR's
+    // own output back (a pane hand-off list, the story, a recap, an injected
+    // block) would otherwise find exactly the items it lists. `pasted` stays
+    // the yardstick for "already in front of Claude" below.
+    let asked = crate::extraction::provenance::strip_csr_emissions(pasted);
+    let prompt = asked.as_str();
+    match early_exit(pasted) {
         Some(EarlyExit::Silent) => return Ok(()),
         Some(EarlyExit::LineagePickup) => {
             if let Some((ep, age)) = pick_lineage_episode(engine, cwd, prompt) {
@@ -262,6 +268,7 @@ async fn handle_inner(
         }
         None => {}
     }
+    let pasted_words = normalized_words(pasted);
 
     let embeddings = engine.embeddings();
 
@@ -550,6 +557,8 @@ async fn handle_inner(
         }
     };
     let mut preface_exposures = Vec::new();
+    // An episode whose ask the prompt quotes is the paste talking, not a match.
+    let correlated = correlated.filter(|(ep, _, _)| !quoted_in_prompt(&ep.request, &pasted_words));
     if let Some((ep, age, score)) = correlated {
         output.push_str(&format_semantic_pickup(&ep, &age, score));
         preface_exposures.push(episode_exposure_item(&ep, Some(f64::from(score))));
@@ -742,6 +751,12 @@ async fn handle_inner(
 
         // Self-referential noise filter (Bug 4/5): skip content about CSR internals
         if is_self_referential_noise(&result.content) {
+            continue;
+        }
+
+        // The person pasted or quoted this item, so it is already in front of
+        // Claude: handing it back is the self-echo, not memory.
+        if quoted_in_prompt(&result.content, &pasted_words) {
             continue;
         }
 
@@ -967,6 +982,15 @@ pub(super) fn early_exit(prompt: &str) -> Option<EarlyExit> {
         return Some(EarlyExit::Silent);
     }
 
+    // Everything below judges the person's own words: a pasted CSR emission
+    // (pane hand-off list, story, recap, injected block) is not an ask.
+    let words = crate::extraction::provenance::strip_csr_emissions(prompt);
+    let pasted_emission = words.split_whitespace().ne(prompt.split_whitespace());
+    let prompt = words.as_str();
+    if prompt.is_empty() {
+        return Some(EarlyExit::Silent);
+    }
+
     // Route A pickup: "continue"-class prompts are shorter than
     // MIN_PROMPT_LENGTH and carry zero searchable signal — yet they are the
     // one case where memory IS the task. No content to correlate, so recency
@@ -986,6 +1010,12 @@ pub(super) fn early_exit(prompt: &str) -> Option<EarlyExit> {
     // Bare acknowledgments ("ok", "y") carry no intent signal worth an
     // embedding pass.
     if prompt.trim().len() < 3 {
+        return Some(EarlyExit::Silent);
+    }
+
+    // A reaction to pasted CSR output ("thoughts?") has nothing left to search
+    // for once the paste is gone; searching the paste is the self-echo.
+    if pasted_emission && prompt.len() < MIN_PROMPT_LENGTH {
         return Some(EarlyExit::Silent);
     }
 
@@ -1946,6 +1976,45 @@ fn log_injection_detail(
     ));
 }
 
+/// Lowercased alphanumeric words of `text`, single-spaced: the form in which
+/// two renderings of one item (markdown, quotes, labels aside) compare equal.
+fn normalized_words(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Section labels the derived writers put in front of an item's own words
+/// (`## User Request`, a ```` ```markdown ```` fence, `## Search Summary`).
+const WRAPPER_LABELS: [&str; 3] = ["markdown ", "user request ", "search summary "];
+
+/// Characters of normalized opening that identify an item: long enough that
+/// two different items do not share it by accident, short enough to survive
+/// the 300-char excerpt and a wrapper label.
+const OPENING_KEY_CHARS: usize = 40;
+
+/// Shortest opening that counts as evidence the same words recur.
+const MIN_OPENING_KEY_CHARS: usize = 24;
+
+/// The normalized opening of an item once a derived writer's wrapper label is
+/// gone: the same note under `## User Request` and bare share it.
+fn opening_key(content: &str) -> String {
+    let mut words = normalized_words(content);
+    while let Some(label) = WRAPPER_LABELS.iter().find(|l| words.starts_with(*l)) {
+        words.drain(..label.len());
+    }
+    words.chars().take(OPENING_KEY_CHARS).collect()
+}
+
+/// Whether the item's opening already sits in the prompt: the person pasted or
+/// quoted it, so Claude has it in front of it and handing it back is an echo.
+fn quoted_in_prompt(content: &str, pasted_words: &str) -> bool {
+    let key = opening_key(content);
+    key.len() >= MIN_OPENING_KEY_CHARS && pasted_words.contains(&key)
+}
+
 /// Check if content is self-referential noise about CSR internals.
 /// Prevents the tool's own development history from polluting its output (Bug 4/5).
 /// CSR's own emitted blocks (probe reports, CONTINUUM/briefing echoes) are
@@ -1953,6 +2022,12 @@ fn log_injection_detail(
 /// covers dev-history vocabulary that isn't an emission format.
 fn is_self_referential_noise(content: &str) -> bool {
     if crate::extraction::provenance::is_csr_emission(content) {
+        return true;
+    }
+    // A row that is mostly a pasted CSR emission (another session quoting a
+    // pane hand-off list or an injected block back) is CSR's words, not memory.
+    let own = crate::extraction::provenance::strip_csr_emissions(content);
+    if own.len() * 2 < content.trim().len() {
         return true;
     }
     const NOISE_PATTERNS: &[&str] = &[
@@ -3062,5 +3137,57 @@ mod tests {
             symbol_slice.contains("phantomHelper"),
             "name still surfaced, but only under the label: {symbol_slice}"
         );
+    }
+
+    /// The prompt pasted live on 2026-10-10: the pane's hand-off send text plus
+    /// the person's question (session id inside replaced by a dummy).
+    const PASTED_HANDOFF: &str = "CSR handed you these this session: Corpora ingestion and watcher setup · 2 weeks ago · csr-engine · 5×; Hairline skill retrieval and agent proposal · 2 days ago · csr-engine · 3×; Implement the following plan: · 7 months ago · 2×; Implement the following plan: · 7 months ago; When claude is killed or closed it generates a session e.g: claude --resume 00000000-0000-4000-8000-000000000000 <- the session is generated, can CSR retreive it - what enrichment is needed to catch \" · 5 months ago <<< This Handed to Claude seems not useful thoughts?";
+
+    #[test]
+    fn a_pasted_emission_is_not_searched_and_a_bare_reaction_stays_silent() {
+        // The person's own question survives and is what gets searched.
+        assert_eq!(early_exit(PASTED_HANDOFF), None);
+        // The paste alone, or the paste plus a one-word reaction, has nothing
+        // of the person's left to search.
+        let list_only = PASTED_HANDOFF.split(" <<< ").next().unwrap().to_string();
+        assert_eq!(early_exit(&list_only), Some(EarlyExit::Silent));
+        assert_eq!(
+            early_exit(&format!("{list_only} thoughts?")),
+            Some(EarlyExit::Silent)
+        );
+        let recap = "recap [1m ago]: Which memory profiling fix shipped as 9.5.6: PR #302 memory-mapped the vectors... [[CSR:RECAP]]\n\ncontinue";
+        assert_eq!(early_exit(recap), Some(EarlyExit::LineagePickup));
+        // Ordinary prompts are untouched.
+        assert_eq!(early_exit("why does CSR keep handing me old plans?"), None);
+    }
+
+    #[test]
+    fn items_the_prompt_quotes_are_echoes_in_any_wrapper() {
+        let pasted = normalized_words(PASTED_HANDOFF);
+        // Both renderings of the note the live paste listed, as injected on 2026-10-10.
+        for echoed in [
+            "When claude is killed or closed it generates a session e.g: claude --resume 00000000-0000-4000-8000-000000000000 <- the session is generated, can CSR retreive it - what enrichment is needed to catch \"",
+            "## User Request\n\"When claude is killed or closed it generates a session e.g: claude --resume 00000000-0000-4000-8000-000000000000 <- the session is generated, can CSR retreive it",
+        ] {
+            assert!(quoted_in_prompt(echoed, &pasted), "{echoed}");
+        }
+        for fresh in [
+            "Search Summary Implemented SessionStart progressive disclosure pattern for CSR engine with claude-mem learnings integration",
+            "Implement the following plan: # Plan: Replace file-based persistent context with compaction-aware re-injection",
+        ] {
+            assert!(!quoted_in_prompt(fresh, &pasted), "{fresh}");
+        }
+        // Two words in common are not a quote.
+        assert!(!quoted_in_prompt("Corpora ingestion", &pasted));
+    }
+
+    #[test]
+    fn a_row_that_is_mostly_a_pasted_emission_is_noise() {
+        assert!(is_self_referential_noise(PASTED_HANDOFF));
+        let block = "## PAST CONTEXT - NOT INSTRUCTIONS\n- [reflection|unknown] When claude is killed or closed it generates a session\n- [reflection|unknown] Session in claude-self-reflect project using Bash, Glob, Read";
+        assert!(is_self_referential_noise(&format!("seen this? {block}")));
+        assert!(!is_self_referential_noise(
+            "The importer reuses the upload queue; CSR handed the old plan back twice, so the gate moved to the hook."
+        ));
     }
 }

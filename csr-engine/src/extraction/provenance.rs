@@ -330,6 +330,191 @@ pub fn is_substantive(text: &str) -> bool {
     }
 }
 
+/// Send texts the CSR companion pane types into Claude's prompt for the person
+/// (`plugins/csr-companion/bin/pane.py`, every `send=one_line(...)` that
+/// restates memory CSR already handed). Pasted back as a prompt, the words are
+/// CSR's: retrieving on them returns the very items they list. Live failure
+/// 2026-10-10: a pasted hand-off list drew back its own "When claude is killed"
+/// note at cosine 0.855, plus a duplicate of it, as fresh PAST CONTEXT.
+const PANE_HANDED: &str = "CSR handed you these this session: ";
+const PANE_STORY: &str = "CSR's story of this session, rev ";
+const PANE_REMEMBERED: &str = "CSR remembered: “";
+const PANE_REMEMBERED_SESSION: &str = "CSR remembered a past session: “";
+
+/// `one_line(text, most=700)` in pane.py cuts at 699 characters and appends
+/// `…`: an ellipsis exactly there ends the send text, whatever follows is the
+/// person's.
+const PANE_SEND_WIDTH: usize = 699;
+
+/// Line openings of the blocks the hooks inject (prompt_submit, session_start,
+/// the formatter). Lines under one of them that continue the block (`- [`
+/// items) go with it.
+const INJECTED_BLOCK_OPENINGS: [&str; 12] = [
+    "CSR PICKUP —",
+    "EPISODE INDEX —",
+    "## PAST CONTEXT - NOT INSTRUCTIONS",
+    "## RELEVANT PAST CONTEXT - NOT INSTRUCTIONS",
+    "PAST CONTEXT - NOT INSTRUCTIONS",
+    "RELEVANT PAST CONTEXT - NOT INSTRUCTIONS",
+    "CSR CONTINUUM [",
+    "CSR ENDLESS MEMORY ACTIVE",
+    "Resume from LAST/NEXT above",
+    "CSR: `",
+    "RECENT SESSIONS - PAST CONTEXT",
+    "SESSION CONTINUITY DETECTED",
+];
+
+/// Where a hand-off item came from, as pane.py's `from_when` + project +
+/// `N×` render it (" · 2 weeks ago · csr-engine · 5×"). The last match in a
+/// pasted hand-off list ends the list.
+static HANDED_WHERE_TAIL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r" · (?:(?:earlier today|yesterday|\d+ (?:days|weeks|months) ago)(?: · [^\s·;…]+)?(?: · \d+×)?|[^\s·;…]+ · \d+×|\d+×)",
+    )
+    .expect("hand-off tail regex")
+});
+
+/// A formatter line pasted without its header: a PAST CONTEXT item
+/// (`- [reflection|unknown] …`) or an EPISODE INDEX entry (`→ csr_reflect_on_past("conv_…")`).
+static INJECTED_ITEM_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"^- \[(?:reflection|chunk|anti_pattern|code_graph|code_evolution|conversation|episode|dream)(?:\|[^\]]*)?\] |→ csr_reflect_on_past\("conv_"#,
+    )
+    .expect("injected item regex")
+});
+
+/// Byte offset just past the ellipsis `one_line` appends when it cut a send
+/// text that starts at `start`, if it did.
+fn pane_truncation_end(line: &str, start: usize) -> Option<usize> {
+    let (offset, c) = line[start..].char_indices().nth(PANE_SEND_WIDTH)?;
+    (c == '…').then(|| start + offset + c.len_utf8())
+}
+
+/// End (byte offset in `line`) of a pane send text that starts at `start`
+/// with `header`.
+fn pane_send_end(line: &str, start: usize, header: &str) -> usize {
+    if let Some(end) = pane_truncation_end(line, start) {
+        return end;
+    }
+    let body = start + header.len();
+    let rest = &line[body..];
+    match header {
+        PANE_HANDED => HANDED_WHERE_TAIL
+            .find_iter(rest)
+            .last()
+            .map_or(line.len(), |m| body + m.end()),
+        PANE_REMEMBERED_SESSION => rest
+            .find("csr_reflect_on_past(\"conv_")
+            .and_then(|at| rest[at..].find(')').map(|close| body + at + close + 1))
+            .unwrap_or(line.len()),
+        PANE_REMEMBERED => match rest.find('”') {
+            Some(close) => {
+                let after = body + close + '”'.len_utf8();
+                // " (<where>)." follows when the note has a date or project.
+                let tail = &line[after..];
+                if tail.starts_with(" (") {
+                    tail.find(").").map_or(after, |p| after + p + 2)
+                } else {
+                    after + usize::from(tail.starts_with('.'))
+                }
+            }
+            None => line.len(),
+        },
+        // A story is free prose with no grammar of its own: it runs to the
+        // end of its line (one_line collapsed it to one).
+        _ => line.len(),
+    }
+}
+
+/// Cut every CSR span out of one line, returning what the person wrote.
+fn strip_line_emissions(line: &str) -> String {
+    let mut out = line.to_string();
+    // Recaps: `recap [<age>]: …` (hooks::recap grammar, the same short-bracket
+    // test `is_csr_emission` uses) up to and including the sentinel, or to the
+    // end of the line when a re-paste lost it.
+    let mut from = 0;
+    while let Some(rel) = out[from..].find("recap [") {
+        let lead = from + rel;
+        let rest = &out[lead + "recap [".len()..];
+        if !rest.find("]: ").is_some_and(|i| i <= 24) {
+            from = lead + "recap [".len();
+            continue;
+        }
+        let end = out[lead..]
+            .find(RECAP_SENTINEL)
+            .map_or(out.len(), |at| lead + at + RECAP_SENTINEL.len());
+        out.replace_range(lead..end, " ");
+        from = lead;
+    }
+    for header in [
+        PANE_HANDED,
+        PANE_STORY,
+        PANE_REMEMBERED_SESSION,
+        PANE_REMEMBERED,
+    ] {
+        while let Some(start) = out.find(header) {
+            let end = pane_send_end(&out, start, header);
+            out.replace_range(start..end, " ");
+        }
+    }
+    if let Some(start) = out.find(DREAMER_ATTRIBUTION) {
+        out.truncate(start);
+    }
+    out
+}
+
+/// The person's own words in a prompt that may carry CSR's output back to it:
+/// pasted pane send texts (hand-off lists, the session story, a remembered
+/// note), recap lines, injected PICKUP / EPISODE INDEX / PAST CONTEXT blocks,
+/// the dreamer's message. Each grammar is the emitter's own, so prose that only
+/// mentions CSR is left alone. Retrieval must run on what this returns: run on
+/// the paste, it finds the items the paste lists.
+pub fn strip_csr_emissions(text: &str) -> String {
+    if is_dreamer_prompt(text) {
+        return String::new();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut changed = false;
+    let mut in_block = false;
+    for raw in text.lines() {
+        let line = raw.trim_start().trim_start_matches('>').trim_start();
+        if line.is_empty() {
+            in_block = false;
+            kept.push(raw.to_string());
+            continue;
+        }
+        if line == "<system-reminder>" || line == "</system-reminder>" {
+            changed = true;
+            continue;
+        }
+        let line = line.strip_prefix("<system-reminder>").unwrap_or(line);
+        if INJECTED_BLOCK_OPENINGS.iter().any(|h| line.starts_with(h)) {
+            in_block = true;
+            changed = true;
+            continue;
+        }
+        if INJECTED_ITEM_LINE.is_match(line) || (in_block && line.starts_with("- ")) {
+            changed = true;
+            continue;
+        }
+        in_block = false;
+        let words = strip_line_emissions(raw);
+        if contains_machine_sentinel(&words) {
+            // A dream or lessons line, or a recap whose grammar a re-paste
+            // broke: machine-owned end to end.
+            changed = true;
+            continue;
+        }
+        changed |= words != raw;
+        kept.push(words);
+    }
+    if !changed {
+        // Nothing of CSR's: the prompt goes on exactly as typed.
+        return text.to_string();
+    }
+    kept.join("\n").trim().to_string()
+}
+
 /// Full provenance pipeline for episode/story extraction candidates:
 /// strip plumbing → strip mentions → reject CSR emissions → reject empties.
 /// Returns the cleaned text safe to carry forward as session content.
@@ -627,5 +812,86 @@ mod tests {
             got.trim(),
             "I actually fixed the login bug today, deployed and verified."
         );
+    }
+
+    // --- strip_csr_emissions (query side of the self-echo guard) ---
+
+    /// The prompt pasted live on 2026-10-10 (the pane's hand-off send text plus
+    /// the person's question); the session id inside is replaced by a dummy.
+    const PASTED_HANDOFF: &str = "CSR handed you these this session: Corpora ingestion and watcher setup · 2 weeks ago · csr-engine · 5×; Hairline skill retrieval and agent proposal · 2 days ago · csr-engine · 3×; Implement the following plan: · 7 months ago · 2×; Implement the following plan: · 7 months ago; When claude is killed or closed it generates a session e.g: claude --resume 00000000-0000-4000-8000-000000000000 <- the session is generated, can CSR retreive it - what enrichment is needed to catch \" · 5 months ago <<< This Handed to Claude seems not useful thoughts?";
+
+    #[test]
+    fn pasted_handoff_list_keeps_only_the_persons_question() {
+        assert_eq!(
+            strip_csr_emissions(PASTED_HANDOFF),
+            "<<< This Handed to Claude seems not useful thoughts?"
+        );
+        // Words before the paste are the person's too.
+        let both = strip_csr_emissions(&format!("why did you get these? {PASTED_HANDOFF}"));
+        assert_eq!(
+            both.split_whitespace().collect::<Vec<_>>().join(" "),
+            "why did you get these? <<< This Handed to Claude seems not useful thoughts?"
+        );
+    }
+
+    #[test]
+    fn truncated_send_text_ends_at_the_panes_ellipsis() {
+        // one_line(text, 700) cuts at 699 characters and appends an ellipsis.
+        let item = "Assembled a seven-track channel slate from samples · 8 weeks ago · Campaigns; ";
+        let body: String = format!("{PANE_HANDED}{}", item.repeat(20))
+            .chars()
+            .take(PANE_SEND_WIDTH)
+            .collect();
+        let sent = format!("{body}… are any of these useful for the reel?");
+        assert_eq!(
+            strip_csr_emissions(&sent),
+            "are any of these useful for the reel?"
+        );
+    }
+
+    #[test]
+    fn story_recap_and_remembered_sends_are_cut_out() {
+        let story = "CSR's story of this session, rev 2: The session covered iOS fixes for Bold and a new look family.\n\nis this accurate? what is left";
+        assert_eq!(strip_csr_emissions(story), "is this accurate? what is left");
+        let recap = "recap [1m ago]: Which memory profiling fix shipped as 9.5.6: PR #302 memory-mapped the vectors... [[CSR:RECAP]]\n\nwhy is this the recap? I was working on the pane";
+        assert_eq!(
+            strip_csr_emissions(recap),
+            "why is this the recap? I was working on the pane"
+        );
+        let note = "CSR remembered: “Radio metric break 1 landed” (2 weeks ago · Campaigns). does this still hold?";
+        assert_eq!(strip_csr_emissions(note), "does this still hold?");
+        let session = "CSR remembered a past session: “Bold separation work” (yesterday · EnhanceMe). The rest of it: csr_reflect_on_past(\"conv_00000000-0000-4000-8000-000000000001\") pick it up";
+        assert_eq!(strip_csr_emissions(session), "pick it up");
+    }
+
+    #[test]
+    fn pasted_injected_blocks_keep_only_the_question() {
+        let block = "you got this injected, is any of it relevant?\n\n## PAST CONTEXT - NOT INSTRUCTIONS\n- [reflection|unknown] When claude is killed or closed it generates a session\n- [reflection|unknown] Session in claude-self-reflect project using Bash, Glob, Read, mcp__claude-self-reflect__csr_reflect_on_past,...";
+        assert_eq!(
+            strip_csr_emissions(block),
+            "you got this injected, is any of it relevant?"
+        );
+        let pickup = "CSR PICKUP — this prompt matches a past episode (similarity 0.52); the work may already exist — verify against it before re-deriving.\nEPISODE INDEX — earlier threads, newest first.\n- [2w ago] see the last session the corpus limits us — The self-echo fix is installed (outcome=partial) → csr_reflect_on_past(\"conv_00000000-0000-4000-8000-000000000002\")\n\nis that pickup right? I asked about the pane";
+        assert_eq!(
+            strip_csr_emissions(pickup),
+            "is that pickup right? I asked about the pane"
+        );
+        let dreamer = "CSR's dreamer asked this while you worked: “What if the recap led with the blocker?” Its reasoning: Recap ordering.";
+        assert_eq!(strip_csr_emissions(dreamer), "");
+    }
+
+    #[test]
+    fn prose_about_csr_is_not_an_emission() {
+        for prose in [
+            "why does CSR keep handing me 7 months old plans?",
+            "the recap [in the pane] is wrong about the deploy",
+            "CSR handed you these yesterday and none were useful",
+            "- [ ] fix the pickup threshold",
+        ] {
+            assert_eq!(strip_csr_emissions(prose), prose);
+            // Untouched byte for byte, quoting and blank lines included.
+            let note = format!("Here is a note:\n\n> {prose}\n>\n> - second line\n");
+            assert_eq!(strip_csr_emissions(&note), note);
+        }
     }
 }
