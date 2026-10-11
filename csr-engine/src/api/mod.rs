@@ -12,6 +12,8 @@ use types::{BatchRequest, BatchResponse, BatchResultItem};
 
 /// Trait for testable batch API interaction.
 #[async_trait]
+// async_trait marks each boxed-future method `#[must_use]`; clippy 1.99 flags that as doubled.
+#[allow(clippy::double_must_use)]
 pub trait BatchClient: Send + Sync {
     /// Submit a batch of narrative requests. Returns the batch ID.
     async fn create_batch(&self, requests: Vec<BatchRequest>) -> Result<String>;
