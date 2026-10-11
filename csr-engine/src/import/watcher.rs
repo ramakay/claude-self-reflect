@@ -404,15 +404,44 @@ impl FileWatcher {
     /// the last chunk gets stamped as reimported without ever being
     /// re-embedded).
     async fn import_file(&self, file_path: &Path) -> Result<()> {
-        import_file_content_diff(
-            &self.storage,
-            &self.embeddings,
-            &self.search,
-            &self.projects_dir,
-            file_path,
+        import_file_content_diff_off_worker(
+            Arc::clone(&self.storage),
+            Arc::clone(&self.embeddings),
+            Arc::clone(&self.search),
+            self.projects_dir.clone(),
+            file_path.to_path_buf(),
         )
         .await
     }
+}
+
+/// [`import_file_content_diff`] on the blocking pool instead of an async
+/// worker. The import parses the whole transcript (a 104 MB session is
+/// re-parsed after every turn) and writes SQLite synchronously between its
+/// awaits; on an async worker that stalled every task queued behind it, the
+/// prompt socket's accept loop included (sampled live 2026-10-11: no
+/// connection accepted for >5 s while a worker sat in
+/// `parse_jsonl_file_with_stats_and_parent`). Errors come back unchanged, so
+/// the callers' busy-retry, gave-up and deferral handling sees what it saw.
+pub(crate) async fn import_file_content_diff_off_worker(
+    storage: Arc<Storage>,
+    embeddings: Arc<EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+    projects_dir: PathBuf,
+    file_path: PathBuf,
+) -> Result<()> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(import_file_content_diff(
+            &storage,
+            &embeddings,
+            &search,
+            &projects_dir,
+            &file_path,
+        ))
+    })
+    .await
+    .context("transcript import task failed")?
 }
 
 /// Import a single JSONL file: parse → embed → store → index, diffing every
@@ -887,5 +916,24 @@ mod tests {
         let outcome = process_batch(pending, |_p| async move { Ok(()) }, &mut retry_map).await;
         assert!(outcome.imported.contains(&path));
         assert!(retry_map.is_empty(), "successful import clears the entry");
+    }
+
+    #[tokio::test]
+    async fn an_off_worker_import_returns_the_import_error_unchanged() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(10)));
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let projects = tempfile::tempdir().unwrap();
+        let err = import_file_content_diff_off_worker(
+            storage,
+            embeddings,
+            search,
+            projects.path().to_path_buf(),
+            projects.path().join("missing.jsonl"),
+        )
+        .await
+        .unwrap_err();
+        // The import's own error, not a wrapper: busy-retry reads this chain.
+        assert_eq!(err.to_string(), "failed to canonicalize import path");
     }
 }

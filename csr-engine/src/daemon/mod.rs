@@ -1719,12 +1719,12 @@ async fn catchup_loop(
                         drop(permit);
                         return Err(anyhow::anyhow!(crate::import::catchup::DEFERRED_NOT_IDLE));
                     }
-                    let result = crate::import::watcher::import_file_content_diff(
-                        engine.storage(),
-                        engine.embeddings(),
-                        engine.search(),
-                        engine.projects_dir(),
-                        &path,
+                    let result = crate::import::watcher::import_file_content_diff_off_worker(
+                        engine.storage().clone(),
+                        engine.embeddings().clone(),
+                        engine.search().clone(),
+                        engine.projects_dir().to_path_buf(),
+                        path,
                     )
                     .await;
                     drop(permit);
