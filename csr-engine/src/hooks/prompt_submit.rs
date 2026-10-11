@@ -1197,7 +1197,8 @@ const EPISODE_CORRELATION_FLOOR: f32 = 0.30;
 /// the same question, so raw cosine alone anchors stale state — measured
 /// 2026-07-08: a 3-week-old prompt-echo reflection (0.56) outranked the
 /// 2-hour-old prior session (0.46). Ordering uses raw × 0.5^(age/half_life);
-/// eligibility still gates on the RAW score so old work stays resumable.
+/// eligibility gates on the RAW score (and, past the chunk window, a strong
+/// raw score: see `episode_may_anchor`) so old work stays resumable.
 const EPISODE_RECENCY_HALF_LIFE_DAYS: f32 = 7.0;
 
 /// Recency-weighted ranking score. Raw score decides *whether* a candidate
@@ -1206,14 +1207,29 @@ fn effective_episode_score(raw: f32, age_days: f32) -> f32 {
     raw * 0.5_f32.powf(age_days.max(0.0) / EPISODE_RECENCY_HALF_LIFE_DAYS)
 }
 
+/// Whether a candidate may anchor a PICKUP at all. Past the chunk window
+/// (`MAX_CHUNK_AGE_DAYS`) an episode needs a strong match, raw cosine at or
+/// above `format::WEAK_BAND_TOP`: old work stays resumable when the prompt
+/// really names it, but a weak-band resemblance to a months-old session is
+/// mostly coincidence. Measured on 95 real prompts 2026-10-10 (replay, hand
+/// labelled): 10 PICKUPs anchored episodes older than 21 days, all at
+/// 0.45-0.60, and 1 of the 10 was relevant; 5 of the 8 younger ones were.
+/// An unparseable timestamp (infinite age) keeps the raw gate only, as before.
+fn episode_may_anchor(raw: f32, age_days: f32) -> bool {
+    raw >= EPISODE_CORRELATION_MIN
+        && (!age_days.is_finite()
+            || age_days <= MAX_CHUNK_AGE_DAYS as f32
+            || raw >= crate::format::WEAK_BAND_TOP)
+}
+
 /// Pick the winning candidate from (raw_score, age_days) pairs: highest
-/// effective (recency-weighted) score among those whose raw score clears
-/// EPISODE_CORRELATION_MIN. Returns the index into `candidates`.
+/// effective (recency-weighted) score among those [`episode_may_anchor`]
+/// admits. Returns the index into `candidates`.
 fn pick_episode(candidates: &[(f32, f32)]) -> Option<usize> {
     candidates
         .iter()
         .enumerate()
-        .filter(|(_, (raw, _))| *raw >= EPISODE_CORRELATION_MIN)
+        .filter(|(_, (raw, age))| episode_may_anchor(*raw, *age))
         .max_by(|(_, a), (_, b)| {
             effective_episode_score(a.0, a.1).total_cmp(&effective_episode_score(b.0, b.1))
         })
@@ -2750,9 +2766,30 @@ mod tests {
 
     #[test]
     fn stale_episode_still_reachable_when_only_match() {
-        // Old work must stay resumable — recency weights the ordering, it
-        // does not gate eligibility.
+        // Old work must stay resumable — recency weights the ordering; past
+        // the chunk window it takes a strong match (see episode_may_anchor).
         assert_eq!(pick_episode(&[(0.56, 21.0)]), Some(0));
+        assert_eq!(pick_episode(&[(0.70, 72.0)]), Some(0));
+    }
+
+    #[test]
+    fn a_weak_resemblance_to_months_old_work_is_not_a_pickup() {
+        // The candidates the pasted hand-off list drew on 2026-10-10 (raw,
+        // age in days); only the 20.6-day-old one was young enough, and it
+        // fired at 0.515 on an unrelated episode. The person's own words in
+        // that prompt score 0.328 against the best episode.
+        let pasted = [
+            (0.542, 72.39),
+            (0.536, 95.68),
+            (0.526, 26.13),
+            (0.507, 121.24),
+        ];
+        assert_eq!(pick_episode(&pasted), None);
+        assert_eq!(pick_episode(&[(0.328, 6.37)]), None);
+        // Inside the chunk window the raw gate alone decides, as before.
+        assert_eq!(pick_episode(&[(0.515, 20.56)]), Some(0));
+        // Unknown age keeps the raw gate only.
+        assert_eq!(pick_episode(&[(0.50, f32::INFINITY)]), Some(0));
     }
 
     #[test]
