@@ -36,6 +36,20 @@ use crate::provenance::ChunkProvenance;
 
 /// SQLite storage with FTS5 for full-text search.
 /// Thread-safe via Mutex around the Connection.
+/// Page cache and memory-mapped reads for a multi-GB database. SQLite's
+/// defaults (a 2 MB cache, no mmap) turn every prompt render into a stream of
+/// `pread` calls: sampled live 2026-10-11, the render's samples sat mostly in
+/// `readDbPage`, and at background priority each read is throttled. Measured
+/// on a replay of 104 prompts at `taskpolicy -b nice -n 10` (8.3 GB copy):
+/// warm p50/p95 155/354 ms with the defaults, 96/257 ms with the 64 MiB cache,
+/// 92/236 ms with mmap added. The cache is a ceiling, filled only by pages a
+/// connection reads; mmap pages are clean, file-backed and shared with the OS
+/// page cache, so they count toward RSS but not the dirty footprint. The mmap
+/// value is the bundled SQLite's own ceiling (`SQLITE_MAX_MMAP_SIZE`
+/// 0x7fff0000), so the first ~2 GiB of the file are mapped and the rest is
+/// read through the cache.
+const READ_PATH_PRAGMAS: &str = "PRAGMA cache_size=-65536; PRAGMA mmap_size=2147418112;";
+
 pub struct Storage {
     conn: Mutex<Connection>,
     /// Frame terms measured over this store's reflections (see
@@ -106,6 +120,7 @@ impl Storage {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
         )?;
+        conn.execute_batch(READ_PATH_PRAGMAS)?;
         migrations::run(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -2211,6 +2226,22 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_store_reads_through_the_large_cache_and_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr.db")).unwrap();
+        let (cache, mmap): (i64, i64) = storage
+            .with_connection(|conn| {
+                Ok((
+                    conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?,
+                    conn.query_row("PRAGMA mmap_size", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(cache, -65536);
+        assert_eq!(mmap, 2147418112);
+    }
 
     #[test]
     fn chunk_without_spans_reads_as_unknown_and_evidence_updates_cached_floor() {
