@@ -99,6 +99,24 @@ thread_local! {
     static ANCESTRY_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Comparisons already answered in this process, by repository (common dir)
+/// and commit pair. Once both commits exist their ancestry never changes, so
+/// an answer holds for the life of the process; errors are not kept. The
+/// prompt render re-asks the same (generation HEAD, current HEAD) pairs on
+/// every prompt: sampled 2026-10-11 at background priority, merge-base walks
+/// were half of the slowest renders' time.
+type AncestryKey = (
+    std::path::PathBuf,
+    codewitness::ObjectId,
+    codewitness::ObjectId,
+);
+static ANCESTRY_MEMO: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<AncestryKey, codewitness::CausalOrder>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Bound on [`ANCESTRY_MEMO`]; it is emptied when full (~100 bytes an entry).
+const ANCESTRY_MEMO_MAX: usize = 100_000;
+
 fn compare_commits(
     auditor: &codewitness::Auditor,
     left: codewitness::ObjectId,
@@ -106,7 +124,22 @@ fn compare_commits(
 ) -> codewitness::Result<codewitness::CausalOrder> {
     #[cfg(test)]
     ANCESTRY_COMPARISONS.with(|count| count.set(count.get() + 1));
-    codewitness::causal::compare(auditor.repo(), left, right)
+    let key = (auditor.repo().common_dir().to_path_buf(), left, right);
+    if let Some(order) = ANCESTRY_MEMO
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&key).copied())
+    {
+        return Ok(order);
+    }
+    let order = codewitness::causal::compare(auditor.repo(), left, right)?;
+    if let Ok(mut memo) = ANCESTRY_MEMO.lock() {
+        if memo.len() >= ANCESTRY_MEMO_MAX {
+            memo.clear();
+        }
+        memo.insert(key, order);
+    }
+    Ok(order)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1652,6 +1685,36 @@ mod tests {
         assert!(
             out.contains_key("conv-last"),
             "last_conv_id must also resolve a binding"
+        );
+    }
+
+    #[test]
+    fn an_ancestry_answer_is_kept_for_the_process() {
+        let (repo, first) = initialized_repo();
+        std::fs::write(repo.path().join("history.txt"), "two\n").unwrap();
+        assert!(git(&["commit", "-qam", "two"], repo.path())
+            .status
+            .success());
+        let second = String::from_utf8(git(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let auditor = codewitness::Auditor::open(repo.path()).unwrap();
+        let (a, b) = (
+            first.parse::<codewitness::ObjectId>().unwrap(),
+            second.parse::<codewitness::ObjectId>().unwrap(),
+        );
+        let fresh = compare_commits(&auditor, a, b).unwrap();
+        assert_eq!(fresh, codewitness::CausalOrder::AncestorOf);
+        let key = (auditor.repo().common_dir().to_path_buf(), a, b);
+        assert_eq!(
+            ANCESTRY_MEMO.lock().unwrap().get(&key).copied(),
+            Some(fresh)
+        );
+        assert_eq!(compare_commits(&auditor, a, b).unwrap(), fresh);
+        assert_eq!(
+            compare_commits(&auditor, b, a).unwrap(),
+            codewitness::CausalOrder::DescendantOf
         );
     }
 }
