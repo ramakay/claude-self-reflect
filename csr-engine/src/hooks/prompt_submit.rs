@@ -583,9 +583,12 @@ async fn handle_inner(
     let mut preface_exposures = Vec::new();
     // An episode whose ask the prompt quotes is the paste talking, not a match.
     let correlated = correlated.filter(|(ep, _, _)| !quoted_in_prompt(&ep.request, &pasted_words));
+    // What the PICKUP line already says, so PAST CONTEXT does not say it again.
+    let mut handed = HandedOnce::default();
     if let Some((ep, age, score)) = correlated {
         output.push_str(&format_semantic_pickup(&ep, &age, score));
         preface_exposures.push(episode_exposure_item(&ep, Some(f64::from(score))));
+        handed.note_episode(&ep);
     }
 
     // 2. Search chunks (past conversations) — scoped to current project
@@ -619,6 +622,19 @@ async fn handle_inner(
     let mut raw_results: Vec<RawResult> = Vec::new();
     raw_results.extend(chunk_results);
     raw_results.extend(reflection_results);
+    // The session each candidate came from: a chunk's conversation, a derived
+    // reflection's `conv_` tag. Ranking drops tags, so record it here.
+    let source_conversation: HashMap<String, String> = raw_results
+        .iter()
+        .filter_map(|r| {
+            let conv = r.conversation_id.clone().or_else(|| {
+                r.tags
+                    .iter()
+                    .find_map(|t| t.strip_prefix("conv_").map(str::to_owned))
+            })?;
+            Some((r.memory_id.clone()?, conv))
+        })
+        .collect();
 
     let ancestry_chunks: Vec<(String, String)> = raw_results
         .iter()
@@ -781,6 +797,16 @@ async fn handle_inner(
         // The person pasted or quoted this item, so it is already in front of
         // Claude: handing it back is the self-echo, not memory.
         if quoted_in_prompt(&result.content, &pasted_words) {
+            continue;
+        }
+
+        // One session, one wrapper: the same work as a PICKUP episode, a
+        // story, a v3 extract and a chunk quoting its last message is one item.
+        let conversation = result
+            .memory_id
+            .as_ref()
+            .and_then(|id| source_conversation.get(id));
+        if !handed.admit(conversation, result.source != "chunk", &result.content) {
             continue;
         }
 
@@ -2058,6 +2084,61 @@ fn opening_key(content: &str) -> String {
     words.chars().take(OPENING_KEY_CHARS).collect()
 }
 
+/// What one injection has already handed over, by session and by opening
+/// words, so the same work never goes out twice in different wrappers. Live
+/// 2026-10-10: one block carried the "When claude is killed" note twice, bare
+/// and under `## User Request`; on 2026-10-09 an episode went out as the PICKUP
+/// line, its v3 extract and its story at once.
+#[derive(Default)]
+struct HandedOnce {
+    /// Sessions handed over, and whether a wrapper (episode, story, extract)
+    /// stood for one. Raw chunks of one session may sit side by side; nothing
+    /// follows a wrapper of the same session.
+    sessions: HashMap<String, bool>,
+    openings: Vec<String>,
+}
+
+impl HandedOnce {
+    fn note_episode(&mut self, episode: &crate::hooks::stop::Episode) {
+        self.sessions.insert(episode.session_id.clone(), true);
+        for text in [&episode.request, &episode.completed] {
+            self.note_opening(text);
+        }
+    }
+
+    fn note_opening(&mut self, text: &str) {
+        let key = opening_key(text);
+        if key.len() >= MIN_OPENING_KEY_CHARS {
+            self.openings.push(key);
+        }
+    }
+
+    /// Admit an item unless its session or its opening words are already out.
+    fn admit(&mut self, session: Option<&String>, wrapper: bool, content: &str) -> bool {
+        if let Some(session) = session {
+            if let Some(by_wrapper) = self.sessions.get(session) {
+                if wrapper || *by_wrapper {
+                    return false;
+                }
+            }
+        }
+        let key = opening_key(content);
+        if key.len() >= MIN_OPENING_KEY_CHARS
+            && self
+                .openings
+                .iter()
+                .any(|seen| seen.starts_with(&key) || key.starts_with(seen.as_str()))
+        {
+            return false;
+        }
+        if let Some(session) = session {
+            *self.sessions.entry(session.clone()).or_default() |= wrapper;
+        }
+        self.note_opening(content);
+        true
+    }
+}
+
 /// Whether the item's opening already sits in the prompt: the person pasted or
 /// quoted it, so Claude has it in front of it and handing it back is an echo.
 fn quoted_in_prompt(content: &str, pasted_words: &str) -> bool {
@@ -3303,6 +3384,78 @@ mod tests {
             "2026-08-15T23:57:02Z",
             0.498,
             now
+        ));
+    }
+
+    #[test]
+    fn one_session_goes_out_once_whatever_its_wrapper() {
+        let conv = |c: &str| Some(c.to_string());
+        // 2026-10-10: the story and the v3 extract of one session, both handed.
+        let mut handed = HandedOnce::default();
+        assert!(handed.admit(
+            conv("1da0504a").as_ref(),
+            true,
+            "When claude is killed or closed it generates a session e.g: claude --resume 00000000-0000-4000-8000-000000000000 <- the session is generated"
+        ));
+        assert!(!handed.admit(
+            conv("1da0504a").as_ref(),
+            true,
+            "User Request \"When claude is killed or closed it generates a session e.g: claude --resume 00000000-0000-4000-8000-000000000000"
+        ));
+        // Same words with no session recorded are still the same item.
+        assert!(!handed.admit(
+            None,
+            true,
+            "## User Request\n\"When claude is killed or closed it generates a session e.g:"
+        ));
+
+        // 2026-10-09: an episode as the PICKUP line, then its extract and story.
+        let mut ep = code_map_episode();
+        ep.session_id = "9f328931".into();
+        ep.request =
+            "one aspect of dreams and why it ailed (check csr for recent sessions and discussions)"
+                .into();
+        ep.completed =
+            "The dream backfill now produces receipts for every revelation it keeps".into();
+        let mut handed = HandedOnce::default();
+        handed.note_episode(&ep);
+        assert!(!handed.admit(
+            conv("9f328931").as_ref(),
+            true,
+            "## User Request one aspect of dreams and why it ailed (check csr for recent sessions and discussions )"
+        ));
+        assert!(!handed.admit(
+            conv("9f328931").as_ref(),
+            false,
+            "The dream backfill now produces receipts for every revelation it keeps, see the log"
+        ));
+        // Other sessions still get through.
+        assert!(handed.admit(
+            conv("585b0176").as_ref(),
+            true,
+            "The session disabled the CSR dream statusline segment by editing the statusline script"
+        ));
+    }
+
+    #[test]
+    fn raw_chunks_of_one_session_may_sit_side_by_side() {
+        let conv = Some("ae9660c6".to_string());
+        let mut handed = HandedOnce::default();
+        assert!(handed.admit(
+            conv.as_ref(),
+            false,
+            "Pulling the Seen. Sita. covers and captions for both reels now"
+        ));
+        assert!(handed.admit(
+            conv.as_ref(),
+            false,
+            "Hindi caption table, take 4: every viewer-facing string of the cut"
+        ));
+        // A wrapper of that session after them adds nothing new.
+        assert!(!handed.admit(
+            conv.as_ref(),
+            true,
+            "The previous session created the hindi and english reels"
         ));
     }
 }
