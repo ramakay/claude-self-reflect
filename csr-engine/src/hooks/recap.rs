@@ -1462,6 +1462,72 @@ mod tests {
         assert!(recap.chars().count() <= 700);
     }
 
+    // ---- read-only probe against a real transcript ----------------------
+    //
+    // `cargo test --release --lib probe_real_transcript_recap -- --ignored --nocapture`
+    // with CSR_RECAP_PROBE_TRANSCRIPT=<jsonl>, optional CSR_RECAP_PROBE_UNTIL
+    // (ISO timestamp; lines from the first one at or after it are dropped, so
+    // the episode is rebuilt as the Stop hook saw it then), CSR_RECAP_PROBE_AGE,
+    // CSR_RECAP_PROBE_PROJECT, and CSR_RECAP_PROBE_DB (opened with
+    // SQLITE_OPEN_READ_ONLY, no migrations; feeds are only read).
+    #[test]
+    #[ignore = "reads a real transcript named by CSR_RECAP_PROBE_TRANSCRIPT"]
+    fn probe_real_transcript_recap() {
+        let Ok(path) = std::env::var("CSR_RECAP_PROBE_TRANSCRIPT") else {
+            eprintln!("CSR_RECAP_PROBE_TRANSCRIPT unset; nothing to probe");
+            return;
+        };
+        let until = std::env::var("CSR_RECAP_PROBE_UNTIL").ok();
+        let age = std::env::var("CSR_RECAP_PROBE_AGE").unwrap_or_else(|_| "now".into());
+        let project = std::env::var("CSR_RECAP_PROBE_PROJECT").unwrap_or_else(|_| "probe".into());
+        let raw = std::fs::read_to_string(&path).expect("transcript readable");
+        let lines: Vec<&str> = raw
+            .lines()
+            .take_while(|line| {
+                let Some(until) = until.as_deref() else {
+                    return true;
+                };
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|v| v.get("timestamp")?.as_str().map(str::to_owned))
+                    .is_none_or(|ts| ts.as_str() < until)
+            })
+            .collect();
+        let session_id = std::path::Path::new(&path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ep = crate::hooks::stop::extract_episode(&lines, &session_id, &project);
+        let feeds = match std::env::var("CSR_RECAP_PROBE_DB") {
+            Ok(db) => {
+                let storage = crate::storage::Storage::open_read_only(std::path::Path::new(&db))
+                    .expect("read-only open");
+                let (settled, still_open) = storage
+                    .recap_ledger_feeds(&project, &ep.session_id)
+                    .unwrap_or_default();
+                let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+                RecapFeeds {
+                    settled,
+                    still_open,
+                    retired_while_away: storage
+                        .recap_retired_since(&project, &ep.timestamp)
+                        .unwrap_or_default(),
+                    corrections: storage
+                        .recap_corrections(&project, &since, 2)
+                        .unwrap_or_default(),
+                    open_proposals: storage.recap_open_proposals(&project).unwrap_or(0),
+                    top_dream: storage.recap_top_dream(&project).unwrap_or(None),
+                }
+            }
+            Err(_) => RecapFeeds::empty(),
+        };
+        eprintln!("lines kept: {}", lines.len());
+        eprintln!(
+            "RECAP>>>\n{}\n<<<RECAP",
+            compose_recap(&ep, &feeds, &age).unwrap_or_else(|| "(abstained)".into())
+        );
+    }
+
     // ---- negative corpus: genuine prose about recaps must stay extractable ----
 
     #[test]
