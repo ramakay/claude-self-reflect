@@ -1749,6 +1749,7 @@ mod tests {
             correction_count: None,
             recap_evidence_version: None,
             latest_request: None,
+            completions: vec![],
             anchors: vec![],
         };
         let verdicts = vec![
@@ -1810,6 +1811,7 @@ mod tests {
             correction_count: None,
             recap_evidence_version: None,
             latest_request: None,
+            completions: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -1850,6 +1852,7 @@ mod tests {
             correction_count: None,
             recap_evidence_version: None,
             latest_request: None,
+            completions: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -1892,6 +1895,7 @@ mod tests {
             correction_count: None,
             recap_evidence_version: None,
             latest_request: None,
+            completions: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -1935,6 +1939,7 @@ mod tests {
             correction_count: None,
             recap_evidence_version: None,
             latest_request: None,
+            completions: vec![],
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -2148,6 +2153,7 @@ mod tests {
             correction_count: None,
             recap_evidence_version: None,
             latest_request: None,
+            completions: vec![],
             anchors: vec![],
         }
     }
@@ -2194,11 +2200,15 @@ mod tests {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         std::env::remove_var("CSR_NO_RECAP");
         let storage = crate::storage::Storage::open_memory().unwrap();
-        let ep = minimal_episode(
+        let mut ep = minimal_episode(
             "Fix the auth middleware regression",
             "Fixed token validation",
             Some("Deploy to staging"),
         );
+        ep.completions = vec![crate::hooks::stop::CompletionReceipt {
+            claim: "Fixed token validation".into(),
+            receipt: "1a2b3c4".into(),
+        }];
         seed_recap_feeds(&storage, &ep);
         let verdicts = vec![("validate_token".to_string(), AnchorVerdict::Intact)];
 
@@ -2212,7 +2222,7 @@ mod tests {
         );
 
         assert!(block.starts_with(
-            "recap [2h ago]: Fix the auth middleware regression: Fixed token validation."
+            "recap [2h ago]: Fix the auth middleware regression: Fixed token validation (1a2b3c4)."
         ));
         assert!(block.contains("Settled: seeded fact (abcdef1)."));
         assert!(block.contains("1 proposals awaiting csr_resolve"));

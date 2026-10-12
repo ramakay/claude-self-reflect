@@ -429,11 +429,27 @@ fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
     extractable(&source).and_then(|text| clean_intent(&text))
 }
 
-/// The completed clause.
+/// The completed clause: receipted completions observed after the latest
+/// task, never assistant prose. Legacy episodes carry none and abstain.
 fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
-    crate::extraction::provenance::extractable(&ep.completed)
-        .map(|text| conclusion_preview(&text, 120))
-        .filter(|text| has_substance(text))
+    use crate::extraction::provenance::extractable;
+    const MAX_ENTRIES: usize = 2;
+    const MAX_CLAIM_CHARS: usize = 100;
+    let entries: Vec<String> = ep
+        .completions
+        .iter()
+        .rev()
+        .filter_map(|done| {
+            let receipt = normalize_feed_text(&done.receipt);
+            let claim = extractable(&done.claim).map(|claim| sanitize_preview(&claim))?;
+            (!receipt.is_empty()
+                && has_substance(&claim)
+                && claim.chars().count() <= MAX_CLAIM_CHARS)
+                .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
+        })
+        .take(MAX_ENTRIES)
+        .collect();
+    (!entries.is_empty()).then(|| entries.into_iter().rev().collect::<Vec<_>>().join("; "))
 }
 
 /// Render a typed prompt as a recap intent: its leading whole sentences, up
@@ -498,50 +514,6 @@ pub fn is_acknowledgement(text: &str) -> bool {
     !words.is_empty() && words.len() <= 6 && words.iter().all(|w| ACK_WORDS.contains(&w.as_str()))
 }
 
-fn conclusion_preview(content: &str, max_chars: usize) -> String {
-    let clean = sanitize_preview(content);
-    if clean.chars().count() <= max_chars {
-        return clean;
-    }
-
-    const ELLIPSIS: &str = " … ";
-    let sentences = split_preview_sentences(&clean);
-    if sentences.is_empty() {
-        return truncate_at_word_boundary(&clean, max_chars);
-    }
-
-    let verdict = if let Some((span_start, span_end)) = find_bold_verdict_span(&clean) {
-        let (start, end) = sentences
-            .iter()
-            .copied()
-            .find(|&(start, end)| start <= span_start && span_end <= end)
-            .unwrap_or((span_start, span_end));
-        strip_bold_markers(&clean[start..end])
-    } else {
-        let (start, end) = sentences[0];
-        strip_bold_markers(&clean[start..end])
-    };
-
-    let mut result = verdict;
-    if result.chars().count() < max_chars * 3 / 5 {
-        if let Some(last) = sentences.iter().rev().find_map(|&(start, end)| {
-            let sentence = clean[start..end].trim();
-            if sentence.is_empty() || is_non_sentence_fragment(sentence) {
-                return None;
-            }
-            let stripped = strip_bold_markers(sentence);
-            (stripped != result).then_some(stripped)
-        }) {
-            result = format!("{result}{ELLIPSIS}{last}");
-        }
-    }
-
-    if result.chars().count() > max_chars {
-        result = truncate_at_word_boundary(&result, max_chars);
-    }
-    result
-}
-
 fn split_preview_sentences(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
@@ -583,42 +555,6 @@ fn split_preview_sentences(text: &str) -> Vec<(usize, usize)> {
         }
     }
     sentences
-}
-
-fn find_bold_verdict_span(text: &str) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index + 1 < bytes.len() {
-        if bytes[index] == b'*' && bytes[index + 1] == b'*' {
-            let inner_start = index + 2;
-            let mut close = inner_start;
-            while close + 1 < bytes.len() {
-                if bytes[close] == b'*' && bytes[close + 1] == b'*' {
-                    if text[inner_start..close].trim().chars().count() >= 10 {
-                        return Some((index, close + 2));
-                    }
-                    index = close + 2;
-                    break;
-                }
-                close += 1;
-            }
-            if close + 1 >= bytes.len() {
-                break;
-            }
-            continue;
-        }
-        index += 1;
-    }
-    None
-}
-
-fn strip_bold_markers(text: &str) -> String {
-    text.replace("**", "")
-}
-
-fn is_non_sentence_fragment(text: &str) -> bool {
-    let trimmed = text.trim();
-    trimmed.starts_with('|') || trimmed.contains("```")
 }
 
 fn truncate_at_word_boundary(text: &str, max_chars: usize) -> String {
@@ -676,7 +612,7 @@ fn sanitize_preview(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
-    use crate::hooks::stop::{Episode, TodoItem};
+    use crate::hooks::stop::{CompletionReceipt, Episode, TodoItem};
 
     fn episode() -> Episode {
         Episode {
@@ -715,6 +651,10 @@ mod tests {
             correction_count: None,
             recap_evidence_version: Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION),
             latest_request: Some("Fix the recap composer".into()),
+            completions: vec![CompletionReceipt {
+                claim: "Implemented deterministic recap output".into(),
+                receipt: "abc1234".into(),
+            }],
             anchors: vec![],
         }
     }
@@ -757,7 +697,7 @@ mod tests {
         let got = compose_recap(&episode(), &full_feeds(), "28m ago").unwrap();
         assert_eq!(
             got,
-            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output. [[CSR:RECAP]]\n\
+            "recap [28m ago]: Fix the recap composer: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]\n\
              Settled: schema is stable (810283b); queries are indexed (T2 2026-07-27).\n\
              Now: waiting for storage migration | Windows path behavior (91abcde) | 2 proposals awaiting csr_resolve | 1 todos open.\n\
              Learnt-then-retired while away: old schema assumption (superseded 2026-08-06, 77fedca).\n\
@@ -769,7 +709,10 @@ mod tests {
     fn abstains_when_request_and_completed_are_provenance_filtered() {
         let mut ep = episode();
         ep.latest_request = Some("CSR CONTINUUM [2m ago]: prior state".into());
-        ep.completed = "## Session Intelligence (CSR v9.2)".into();
+        ep.completions = vec![CompletionReceipt {
+            claim: "## Session Intelligence (CSR v9.2)\nLAST: x\nNEXT: y".into(),
+            receipt: "abc1234".into(),
+        }];
         assert_eq!(compose_recap(&ep, &full_feeds(), "2m ago"), None);
     }
 
@@ -846,7 +789,10 @@ mod tests {
     fn abstains_when_request_and_completed_are_punctuation_only() {
         let mut ep = episode();
         ep.latest_request = Some("\u{2026}".into());
-        ep.completed = "/".into();
+        ep.completions = vec![CompletionReceipt {
+            claim: "/".into(),
+            receipt: "abc1234".into(),
+        }];
         assert!(compose_recap(&ep, &RecapFeeds::empty(), "1h ago").is_none());
     }
 
@@ -1029,7 +975,10 @@ mod tests {
     fn caps_output_and_drops_whole_receipted_entries() {
         let mut ep = episode();
         ep.latest_request = Some("r".repeat(INTENT_MAX_CHARS));
-        ep.completed = "c".repeat(250);
+        ep.completions = vec![CompletionReceipt {
+            claim: "c".repeat(100),
+            receipt: "abc1234".into(),
+        }];
         let feeds = RecapFeeds {
             settled: (0..4)
                 .map(|n| SettledFact {
@@ -1109,23 +1058,20 @@ mod tests {
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
         assert_eq!(
             got,
-            "recap [now]: Implemented deterministic recap output. [[CSR:RECAP]]"
+            "recap [now]: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]"
         );
     }
 
     #[test]
-    fn completed_preview_keeps_verdict_and_closing_state() {
+    fn assistant_prose_is_never_rendered_as_completed() {
         let mut ep = episode();
-        ep.completed = format!(
-            "Done. {} Final verdict: 52754 chunks live.",
-            "intermediate filler sentence. ".repeat(10)
-        );
+        ep.completed = "Done. Final verdict: 52754 chunks live.".into();
+        ep.completions.clear();
         ep.next_steps = None;
         ep.todos.clear();
         ep.blockers = None;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
-        assert!(got.contains("Done. … Final verdict: 52754 chunks live."));
-        assert!(!got.contains("intermediate filler"));
+        assert_eq!(got, "recap [now]: Fix the recap composer. [[CSR:RECAP]]");
     }
 
     #[test]
@@ -1341,7 +1287,7 @@ mod tests {
     fn correction_cannot_evict_first_settled_entry_at_701_chars() {
         let feeds = RecapFeeds {
             settled: vec![SettledFact {
-                claim: "s".repeat(393),
+                claim: "s".repeat(383),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
                 source: "user_confirmed".into(),
@@ -1369,7 +1315,7 @@ mod tests {
         ep.latest_request = Some("Corrected: note (abcdef12:9, 2026-09-01)".into());
         let feeds = RecapFeeds {
             settled: vec![SettledFact {
-                claim: "s".repeat(393),
+                claim: "s".repeat(383),
                 receipt: "abc1234".into(),
                 status: "resolved".into(),
                 source: "user_confirmed".into(),
@@ -1434,7 +1380,10 @@ mod tests {
     fn dream_clause_obeys_the_same_character_budget_as_every_other_clause() {
         let mut ep = episode();
         ep.latest_request = Some("r".repeat(INTENT_MAX_CHARS));
-        ep.completed = "c".repeat(250);
+        ep.completions = vec![CompletionReceipt {
+            claim: "c".repeat(100),
+            receipt: "abc1234".into(),
+        }];
         let feeds = RecapFeeds {
             settled: (0..4)
                 .map(|n| SettledFact {
@@ -1628,6 +1577,7 @@ mod tests {
         let mut ep = episode();
         ep.recap_evidence_version = None;
         ep.latest_request = None;
+        ep.completions.clear();
         ep.request = "anthropics codemod, when github links are bought up".into();
         ep.completed = String::new();
         ep.message_count = 30_393;
@@ -1643,6 +1593,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_completed_prose_is_never_rendered() {
+        let mut ep = episode();
+        ep.recap_evidence_version = None;
+        ep.latest_request = None;
+        ep.completions.clear();
+        ep.request = "Fix the recap composer".into();
+        ep.completed = "I'll recreate it headless: a real claude session runs in tmux.".into();
+        ep.next_steps = None;
+        ep.todos.clear();
+        ep.blockers = None;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "2m ago").unwrap();
+        assert_eq!(got, "recap [2m ago]: Fix the recap composer. [[CSR:RECAP]]");
+    }
+
+    #[test]
+    fn completed_clause_renders_the_two_latest_receipted_entries_whole() {
+        let mut ep = episode();
+        ep.completions = vec![
+            CompletionReceipt {
+                claim: "oldest".into(),
+                receipt: "0000000".into(),
+            },
+            CompletionReceipt {
+                claim: "x".repeat(101),
+                receipt: "1111111".into(),
+            },
+            CompletionReceipt {
+                claim: "unreceipted".into(),
+                receipt: " ".into(),
+            },
+            CompletionReceipt {
+                claim: "Write regression tests".into(),
+                receipt: "task #3 completed".into(),
+            },
+        ];
+        ep.next_steps = None;
+        ep.todos.clear();
+        ep.blockers = None;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer: oldest (0000000); Write regression tests \
+             (task #3 completed). [[CSR:RECAP]]"
+        );
+    }
+
+    // ---- read-only probe against a real transcript ----------------------
+    //
+    // `cargo test --release --lib probe_real_transcript_recap -- --ignored --nocapture`
+    // with CSR_RECAP_PROBE_TRANSCRIPT=<jsonl>, optional CSR_RECAP_PROBE_UNTIL
+    // (ISO timestamp; lines from the first one at or after it are dropped, so
+    // the episode is rebuilt as the Stop hook saw it then), CSR_RECAP_PROBE_AGE,
+    // CSR_RECAP_PROBE_PROJECT, and CSR_RECAP_PROBE_DB (opened with
+    // SQLITE_OPEN_READ_ONLY, no migrations; feeds are only read).
     #[test]
     #[ignore = "reads a real transcript named by CSR_RECAP_PROBE_TRANSCRIPT"]
     fn probe_real_transcript_recap() {
