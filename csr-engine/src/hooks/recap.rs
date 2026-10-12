@@ -414,7 +414,9 @@ const LEGACY_SINGLE_TOPIC_MAX_MESSAGES: usize = 40;
 const LEGACY_REQUEST_CAP_BYTES: usize = 200;
 
 /// The intent clause: the latest substantive task, as whole sentences.
-fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
+/// `None` when the episode has no clean, current intent. Shared with the
+/// `CSR CONTINUUM` fallback so neither can name a stale first prompt.
+pub(crate) fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
     use crate::extraction::provenance::extractable;
     let source = if ep.recap_evidence_version.is_some() {
         ep.latest_request.clone()?

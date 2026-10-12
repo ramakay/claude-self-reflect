@@ -967,9 +967,16 @@ fn format_tier0_block_with_recap(
     // may carry CSR's own output in any field — clean again at display time,
     // and compact to one line so a long `completed` can't dump paragraphs.
     use crate::extraction::provenance::extractable;
-    let request = extractable(&ep.request)
-        .map(|s| compact_preview(&s, 80))
-        .unwrap_or_else(|| "(command-only session)".into());
+    // The latest task (never a long session's stale first prompt), by the
+    // same rule as the recap's intent clause. A session whose prompts were
+    // all command plumbing keeps its old placeholder.
+    let request = crate::hooks::recap::recap_intent(ep).unwrap_or_else(|| {
+        if extractable(&ep.request).is_some() {
+            "(no clean intent)".into()
+        } else {
+            "(command-only session)".into()
+        }
+    });
     let last = extractable(&ep.completed)
         .map(|s| conclusion_preview(&s, 120))
         .unwrap_or_else(|| "(filtered: CSR meta)".into());
@@ -2344,6 +2351,50 @@ LAST: (filtered: CSR meta) (outcome=success, trust=unknown)\n\
 NEXT: continue work | TODOS: 0 open\n\
 Full state: csr_reflect_on_past(\"conv_s\")\n"
         );
+    }
+
+    #[test]
+    fn continuum_fallback_names_the_latest_task_not_the_first_prompt() {
+        let mut ep = minimal_episode(
+            "anthropics codemod, when github links are bought up or disccussed, can",
+            "",
+            Some("continue work"),
+        );
+        ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
+        ep.latest_request = Some("How do we show cost as % of max plan".into());
+        ep.message_count = 30_393;
+        let block = format_tier0_block(&ep, &[], "3h ago");
+        assert!(
+            block.starts_with("CSR CONTINUUM [3h ago]: How do we show cost as % of max plan\n"),
+            "{block}"
+        );
+        assert!(!block.contains("anthropics codemod"), "{block}");
+        // The provenance guard still recognises the emitted fallback.
+        assert!(crate::extraction::provenance::is_csr_emission(&block));
+        assert!(crate::extraction::provenance::extractable(&block).is_none());
+    }
+
+    #[test]
+    fn continuum_fallback_withholds_a_stale_first_prompt() {
+        let mut ep = minimal_episode(
+            "anthropics codemod, when github links are bought up or disccussed, can",
+            "",
+            Some("continue work"),
+        );
+        // Legacy episode from a long session: its first prompt is stale.
+        ep.message_count = 30_393;
+        let legacy = format_tier0_block(&ep, &[], "3h ago");
+        // Current episode whose latest task has no clean rendering.
+        ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
+        let current = format_tier0_block(&ep, &[], "3h ago");
+        for block in [legacy, current] {
+            assert!(
+                block.starts_with("CSR CONTINUUM [3h ago]: (no clean intent)\n"),
+                "{block}"
+            );
+            assert!(!block.contains("anthropics codemod"), "{block}");
+            assert!(crate::extraction::provenance::is_csr_emission(&block));
+        }
     }
 
     #[test]
