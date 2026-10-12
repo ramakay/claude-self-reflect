@@ -482,6 +482,9 @@ fn extract_episode_from_messages(
     // Recap evidence: the latest typed task, and what was provably completed
     // after it (reset whenever a newer task is asked).
     let mut segments: Vec<TaskSegment> = Vec::new();
+    // Whether the first typed row was seen, and if so whether it was a CSR
+    // agent prompt (then the transcript has no tasks at all).
+    let mut opening_seen: Option<bool> = None;
     // Whether the assistant finished a turn since the latest task was asked.
     // A task prompt arriving while that turn is still open continues it.
     let mut turn_finished = true;
@@ -526,10 +529,20 @@ fn extract_episode_from_messages(
         // continued, so it joins the current segment's text instead.
         if msg_type == "user" || msg_type == "human" {
             let raw_row = raw.get(index).unwrap_or(val);
+            // A transcript that opens with a CSR agent prompt (narrator,
+            // analyst, labeler child) is CSR talking to itself: none of its
+            // rows is the person's task. The importer skips it whole too.
+            if opening_seen.is_none() {
+                if let Some(text) = typed_row_text(raw_row) {
+                    if !text.trim().is_empty() {
+                        opening_seen = Some(crate::import::is_csr_agent_prompt(&text));
+                    }
+                }
+            }
             if let Some(TypedPrompt { prose, note }) =
                 forwarded_note(raw_row).or_else(|| typed_prompt(val))
             {
-                if note || is_task_prompt(&prose) {
+                if opening_seen != Some(true) && (note || is_task_prompt(&prose)) {
                     let sent_at = val
                         .get("timestamp")
                         .and_then(|v| v.as_str())
@@ -3493,5 +3506,25 @@ mod tests {
             extract(&lines).anchor_request.as_deref(),
             Some("stopped, check the render log now")
         );
+    }
+
+    #[test]
+    fn a_csr_agent_transcript_has_no_task() {
+        // CSR's own narrator children open with an agent-prompt signature;
+        // their later rows are CSR's inputs, never the person's task. Before
+        // this, the clause cut turned "TRANSCRIPT EXCERPT: ..." into an anchor.
+        let ep = extract(&[
+            typed_line(
+                "[[CSR:RECAP]] machine-marker: this is a CSR narrator side-session, never corpus material.\nYou are a post-turn rubber-duck narrator for a coding agent.",
+                "typed",
+            ),
+            assistant_stop_line("ok", "end_turn"),
+            typed_line(
+                "TRANSCRIPT EXCERPT: cal link targets: True missing: [] headings identical: True lines new 145 old 145 lines over 200 chars: 17 longest 481 273 5, plus the rest of the excerpt that runs on",
+                "typed",
+            ),
+        ]);
+        assert_eq!(ep.anchor_request, None);
+        assert!(ep.completions.is_empty());
     }
 }

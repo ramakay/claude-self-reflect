@@ -368,7 +368,7 @@ pub(crate) fn derive_conversation_attribution_canonical(
 /// paragraph holding a signature, so testing its output never matches: that
 /// ordering let 19,830 agent transcripts (48% of all chunks) into the corpus
 /// between 2026-09-01 and 2026-09-19.
-fn is_csr_agent_prompt(first_user_message: &str) -> bool {
+pub(crate) fn is_csr_agent_prompt(first_user_message: &str) -> bool {
     let mut trimmed = first_user_message.trim_start();
     // `claude -p -` (prompt via stdin) records the literal "-" argument as the
     // first line of the user message, with the piped prompt following it.
