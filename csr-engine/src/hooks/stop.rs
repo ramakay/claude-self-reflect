@@ -243,6 +243,167 @@ const COMMIT_WEIGHT: u32 = 10;
 /// anchor text.
 const JOIN_WINDOW_SECS: i64 = 120;
 
+/// A task-state change a tool call asks for. It is applied only when a
+/// matching tool_result succeeds (or at once when the call has no id).
+enum TaskOp {
+    /// TodoWrite: a full-list rewrite.
+    Write(Vec<TodoItem>),
+    /// TaskCreate: a new pending task with this subject.
+    Create(String),
+    /// TaskUpdate: status and/or subject of task `task_id`.
+    Update {
+        task_id: String,
+        status: Option<String>,
+        subject: Option<String>,
+    },
+}
+
+impl TaskOp {
+    fn from_tool_use(name: &str, block: &serde_json::Value) -> Option<Self> {
+        let input = block.get("input")?;
+        match name {
+            "TodoWrite" => {
+                let items = input.get("todos")?.as_array()?;
+                Some(TaskOp::Write(
+                    items
+                        .iter()
+                        .filter_map(|t| {
+                            Some(TodoItem {
+                                content: t.get("content")?.as_str()?.to_string(),
+                                status: t
+                                    .get("status")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("pending")
+                                    .to_string(),
+                            })
+                        })
+                        .take(10)
+                        .collect(),
+                ))
+            }
+            "TaskCreate" => Some(TaskOp::Create(input.get("subject")?.as_str()?.to_string())),
+            "TaskUpdate" => {
+                let task_id = input.get("taskId").and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(n) = v.as_i64() {
+                        Some(n.to_string())
+                    } else {
+                        v.as_u64().map(|n| n.to_string())
+                    }
+                })?;
+                Some(TaskOp::Update {
+                    task_id,
+                    status: input
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                    subject: input
+                        .get("subject")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The main session's task list as its successful tool calls left it.
+#[derive(Default)]
+struct TaskState {
+    todos: Vec<TodoItem>,
+    /// Numeric task id -> index into `todos`. Ids come only from tool_result
+    /// text ("Task #N created successfully"), never from ordinal position.
+    task_id_map: HashMap<String, usize>,
+    /// Creates applied without a tool_use id, awaiting an unlabeled result's
+    /// id binding (FIFO).
+    unbound_creates: Vec<usize>,
+    /// Calls awaiting their tool_result, by tool_use id.
+    pending: HashMap<String, TaskOp>,
+}
+
+impl TaskState {
+    /// Apply a successful change. `result` is the tool_result text when there
+    /// was one. Returns the completions it evidences, as (claim, receipt).
+    fn apply(&mut self, op: TaskOp, result: Option<&str>) -> Vec<(String, String)> {
+        match op {
+            TaskOp::Write(items) => {
+                // Full-list rewrite: replaces TaskCreate-derived state and
+                // invalidates id bindings (indices no longer apply).
+                let previous = std::mem::replace(&mut self.todos, items);
+                self.task_id_map.clear();
+                self.unbound_creates.clear();
+                self.todos
+                    .iter()
+                    .filter(|t| {
+                        t.status == "completed"
+                            && !previous
+                                .iter()
+                                .any(|p| p.content == t.content && p.status == "completed")
+                    })
+                    .map(|t| (t.content.clone(), "todo completed".to_string()))
+                    .collect()
+            }
+            TaskOp::Create(subject) => {
+                // Shared cap with TodoWrite: overflow is silently dropped.
+                if self.todos.len() >= 10 {
+                    return Vec::new();
+                }
+                let index = self.todos.len();
+                self.todos.push(TodoItem {
+                    content: subject,
+                    status: "pending".to_string(),
+                });
+                match result.and_then(|text| TASK_CREATED_RE.captures(text)) {
+                    Some(caps) => {
+                        self.task_id_map.insert(caps[1].to_string(), index);
+                    }
+                    None if result.is_none() => self.unbound_creates.push(index),
+                    None => {}
+                }
+                Vec::new()
+            }
+            TaskOp::Update {
+                task_id,
+                status,
+                subject,
+            } => {
+                let mut done = Vec::new();
+                let Some(item) = self
+                    .task_id_map
+                    .get(&task_id)
+                    .and_then(|&index| self.todos.get_mut(index))
+                else {
+                    return done;
+                };
+                if let Some(status) = status {
+                    if status == "completed" && item.status != "completed" {
+                        done.push((item.content.clone(), format!("task #{task_id} completed")));
+                    }
+                    item.status = status;
+                }
+                if let Some(subject) = subject {
+                    item.content = subject;
+                }
+                done
+            }
+        }
+    }
+
+    /// Bind a "Task #N created successfully" result that carries no
+    /// tool_use_id to the oldest create applied without one.
+    fn bind_unlabeled(&mut self, result: &str) {
+        let Some(caps) = TASK_CREATED_RE.captures(result) else {
+            return;
+        };
+        if !self.unbound_creates.is_empty() {
+            let index = self.unbound_creates.remove(0);
+            self.task_id_map.insert(caps[1].to_string(), index);
+        }
+    }
+}
+
 /// One task: a task prompt, its mid-turn continuations, and the work done
 /// until the next task prompt.
 #[derive(Default)]
@@ -491,15 +652,11 @@ fn extract_episode_from_messages(
     let mut completed = String::new();
     let mut error_signatures = Vec::new();
     let mut message_count: usize = 0;
-    let mut todos: Vec<TodoItem> = Vec::new();
     let mut approved_plan: Option<String> = None;
-    // TaskCreate/TaskUpdate tracking: numeric task id → index into `todos`.
-    // Ids come only from tool_result text ("Task #N created successfully"),
-    // never from transcript ordinal position (pre-existing/deleted tasks break that).
-    let mut task_id_map: HashMap<String, usize> = HashMap::new();
-    // TaskCreate blocks awaiting their tool_result binding: (tool_use_id, todos_index).
-    // tool_use_id may be empty if the block had no "id" field.
-    let mut pending_task_ids: Vec<(String, usize)> = Vec::new();
+    // Main-session task state (TodoWrite / TaskCreate / TaskUpdate). A call
+    // changes it only once a matching tool_result succeeds; sidechain rows
+    // never touch it.
+    let mut tasks = TaskState::default();
     // Recap evidence: the latest typed task, and what was provably completed
     // after it (reset whenever a newer task is asked).
     let mut segments: Vec<TaskSegment> = Vec::new();
@@ -511,9 +668,6 @@ fn extract_episode_from_messages(
     let mut turn_finished = true;
     // Bash tool_use ids whose command can print a commit success line.
     let mut git_tool_ids: HashSet<String> = HashSet::new();
-    // Task/todo completions claimed by a tool_use, keyed by its id. They
-    // become evidence only when a non-error tool_result answers that id.
-    let mut pending_completions: HashMap<String, Vec<(String, String)>> = HashMap::new();
     // The session's receipts, latest last, each with the index of the task
     // segment it was produced under (None before the first task).
     let mut completions: Vec<(CompletionReceipt, Option<usize>)> = Vec::new();
@@ -639,125 +793,22 @@ fn extract_episode_from_messages(
                                     }
                                 }
 
-                                if name == "TodoWrite" {
-                                    if let Some(items) = block
-                                        .get("input")
-                                        .and_then(|i| i.get("todos"))
-                                        .and_then(|t| t.as_array())
-                                    {
-                                        // Full-list rewrite — replaces any prior
-                                        // TaskCreate-derived state and invalidates
-                                        // id bindings (indices no longer apply).
-                                        let previous = std::mem::take(&mut todos);
-                                        todos = items
-                                            .iter()
-                                            .filter_map(|t| {
-                                                Some(TodoItem {
-                                                    content: t
-                                                        .get("content")?
-                                                        .as_str()?
-                                                        .to_string(),
-                                                    status: t
-                                                        .get("status")
-                                                        .and_then(|s| s.as_str())
-                                                        .unwrap_or("pending")
-                                                        .to_string(),
-                                                })
-                                            })
-                                            .take(10)
-                                            .collect();
-                                        let newly_done: Vec<(String, String)> = todos
-                                            .iter()
-                                            .filter(|t| {
-                                                t.status == "completed"
-                                                    && !previous.iter().any(|p| {
-                                                        p.content == t.content
-                                                            && p.status == "completed"
-                                                    })
-                                            })
-                                            .map(|t| {
-                                                (t.content.clone(), "todo completed".to_string())
-                                            })
-                                            .collect();
-                                        if let (false, Some(id)) =
-                                            (sidechain, block.get("id").and_then(|v| v.as_str()))
-                                        {
-                                            pending_completions
-                                                .entry(id.to_string())
-                                                .or_default()
-                                                .extend(newly_done);
-                                        }
-                                        task_id_map.clear();
-                                        pending_task_ids.clear();
-                                    }
-                                }
-                                if name == "TaskCreate" {
-                                    // Shared cap with TodoWrite — silently drop overflow.
-                                    if todos.len() < 10 {
-                                        if let Some(subject) = block
-                                            .get("input")
-                                            .and_then(|i| i.get("subject"))
-                                            .and_then(|s| s.as_str())
-                                        {
-                                            let index = todos.len();
-                                            todos.push(TodoItem {
-                                                content: subject.to_string(),
-                                                status: "pending".to_string(),
-                                            });
-                                            let tool_use_id = block
-                                                .get("id")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default()
-                                                .to_string();
-                                            pending_task_ids.push((tool_use_id, index));
-                                        }
-                                    }
-                                }
-                                if name == "TaskUpdate" {
-                                    // TODO: unknown task ids should bump an aux
-                                    // counter in the Stop handler; extract_episode
-                                    // stays pure and cannot report this out.
-                                    if let Some(input) = block.get("input") {
-                                        let task_id = input.get("taskId").and_then(|v| {
-                                            if let Some(s) = v.as_str() {
-                                                Some(s.to_string())
-                                            } else if let Some(n) = v.as_i64() {
-                                                Some(n.to_string())
-                                            } else {
-                                                v.as_u64().map(|n| n.to_string())
+                                if !sidechain {
+                                    if let Some(op) = TaskOp::from_tool_use(name, block) {
+                                        match block.get("id").and_then(|v| v.as_str()) {
+                                            Some(id) => {
+                                                tasks.pending.insert(id.to_string(), op);
                                             }
-                                        });
-                                        if let Some(id) = task_id {
-                                            if let Some(&idx) = task_id_map.get(&id) {
-                                                if let Some(status) =
-                                                    input.get("status").and_then(|s| s.as_str())
-                                                {
-                                                    if let Some(item) = todos.get_mut(idx) {
-                                                        if let (true, Some(use_id)) = (
-                                                            !sidechain
-                                                                && status == "completed"
-                                                                && item.status != "completed",
-                                                            block
-                                                                .get("id")
-                                                                .and_then(|v| v.as_str()),
-                                                        ) {
-                                                            pending_completions
-                                                                .entry(use_id.to_string())
-                                                                .or_default()
-                                                                .push((
-                                                                    item.content.clone(),
-                                                                    format!("task #{id} completed"),
-                                                                ));
-                                                        }
-                                                        item.status = status.to_string();
-                                                    }
-                                                }
-                                                if let Some(subject) =
-                                                    input.get("subject").and_then(|s| s.as_str())
-                                                {
-                                                    if let Some(item) = todos.get_mut(idx) {
-                                                        item.content = subject.to_string();
-                                                    }
+                                            // No id, so no result can ever answer
+                                            // it (synthetic or legacy rows): apply.
+                                            None => {
+                                                for (claim, receipt) in tasks.apply(op, None) {
+                                                    push_completion(
+                                                        &mut completions,
+                                                        segments.len().checked_sub(1),
+                                                        &claim,
+                                                        &receipt,
+                                                    );
                                                 }
                                             }
                                         }
@@ -864,13 +915,13 @@ fn extract_episode_from_messages(
                                 );
                             }
                         }
-                        if let Some(claimed) = block
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|id| pending_completions.remove(id))
-                        {
-                            if !failed && !sidechain {
-                                for (claim, receipt) in claimed {
+                        if sidechain {
+                            continue;
+                        }
+                        let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
+                        if let Some(op) = tool_use_id.and_then(|id| tasks.pending.remove(id)) {
+                            if !failed {
+                                for (claim, receipt) in tasks.apply(op, Some(&block_text)) {
                                     push_completion(
                                         &mut completions,
                                         segments.len().checked_sub(1),
@@ -879,37 +930,10 @@ fn extract_episode_from_messages(
                                     );
                                 }
                             }
-                        }
-                        let Some(caps) = TASK_CREATED_RE.captures(&block_text) else {
-                            continue;
-                        };
-                        let Some(numeric_id) = caps.get(1).map(|m| m.as_str().to_string()) else {
-                            continue;
-                        };
-                        let tool_use_id = block.get("tool_use_id").and_then(|v| v.as_str());
-                        let todos_index = if let Some(tuid) = tool_use_id {
-                            if let Some(pos) =
-                                pending_task_ids.iter().position(|(id, _)| id == tuid)
-                            {
-                                let (_, index) = pending_task_ids.remove(pos);
-                                Some(index)
-                            } else {
-                                // Explicit tool_use_id that matches nothing means
-                                // this result belongs to a capped, malformed, or
-                                // unrelated create — binding it anywhere would
-                                // corrupt later TaskUpdates (Codex). Leave unbound.
-                                None
-                            }
-                        } else if pending_task_ids.is_empty() {
-                            None
-                        } else {
-                            // No tool_use_id on the block at all: creations and
-                            // results arrive in order, so FIFO keeps unlabeled
-                            // creates aligned (CodeRabbit — LIFO cross-bound them).
-                            Some(pending_task_ids.remove(0).1)
-                        };
-                        if let Some(index) = todos_index {
-                            task_id_map.insert(numeric_id, index);
+                        } else if tool_use_id.is_none() && !failed {
+                            // A result with no tool_use_id at all: bind it FIFO
+                            // to a create that was applied without an id.
+                            tasks.bind_unlabeled(&block_text);
                         }
                     }
                 }
@@ -921,6 +945,7 @@ fn extract_episode_from_messages(
     // transcript path must too, or an all-deleted session gets capped at
     // "partial" on one path and not the other (CodeRabbit). Filtered after the
     // event loop because task_id_map holds indices into `todos` during it.
+    let mut todos = tasks.todos;
     todos.retain(|t| t.status != "deleted");
 
     // next_steps comes ONLY from structured task/todo state (first non-completed
@@ -2595,6 +2620,8 @@ mod tests {
                 "toolu_3",
                 serde_json::json!({"taskId": "2", "status": "completed"}),
             ),
+            // Task state changes only on a matching successful result.
+            tool_result_bound("toolu_3", "Updated task #2 status"),
         ];
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
         let ep = extract_episode(&lines, "sess-tc", "proj");
@@ -2646,6 +2673,7 @@ mod tests {
                 "toolu_c",
                 serde_json::json!({"taskId": "7", "status": "completed"}),
             ),
+            tool_result_bound("toolu_c", "Updated task #7 status"),
         ];
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
         let ep = extract_episode(&lines, "sess-ns", "proj");
@@ -2677,12 +2705,14 @@ mod tests {
                     ]
                 }),
             ),
+            tool_result_bound("toolu_2", "Todos have been modified successfully"),
             // Stale id from the cleared TaskCreate map must not corrupt the list.
             assistant_named_tool(
                 "TaskUpdate",
                 "toolu_3",
                 serde_json::json!({"taskId": "1", "status": "completed"}),
             ),
+            tool_result_bound("toolu_3", "Updated task #1 status"),
         ];
         let lines: Vec<&str> = lines_owned.iter().map(|s| s.as_str()).collect();
         let ep = extract_episode(&lines, "sess-prec", "proj");
@@ -3710,7 +3740,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_8_failed_task_creation_never_becomes_next() {
         let dreamer = "What if memory notes included their originating session?\n\n\
                        CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
