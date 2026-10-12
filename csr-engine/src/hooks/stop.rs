@@ -291,8 +291,10 @@ fn extract_episode_from_messages(
                             completions.clear();
                         }
                     }
-                    turn_finished = false;
                 }
+                // Any typed prompt, an ack included, opens a turn: "go" after
+                // a finished turn restarts work on the same task.
+                turn_finished = false;
             }
         }
         if ends_turn(val, msg_type) {
@@ -2726,6 +2728,21 @@ mod tests {
         assert_eq!(
             ep.latest_request.as_deref(),
             Some("How do we show cost as % of mac % of max plan if they have it or cents")
+        );
+    }
+
+    #[test]
+    fn an_ack_reopens_the_turn_so_a_clarification_joins_the_task() {
+        let ep = extract(&[
+            typed_line("Fix login validation", "typed"),
+            assistant_stop_line("Plan: tighten the email check. Go?", "end_turn"),
+            typed_line("go", "typed"),
+            assistant_stop_line("editing", "tool_use"),
+            typed_line("only for the signup form", "queued"),
+        ]);
+        assert_eq!(
+            ep.latest_request.as_deref(),
+            Some("Fix login validation only for the signup form")
         );
     }
 }
