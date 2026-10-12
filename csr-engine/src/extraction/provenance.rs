@@ -55,7 +55,10 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
 /// - agent prompts (AGENT_PROMPT_SIGNATURES, included via EMISSION_HEADERS)
 /// - the csr-companion dreamer's "ask Claude" prompt (plugins/csr-companion/hooks/dreamer.ts
 ///   `askClaude`): sent as a user turn, but the dreamer's words, not the person's
-const EMISSION_HEADERS: [&str; 15] = [
+/// - the csr-companion compaction's keep list (the summarizer's instructions, which a summary
+///   may echo) and the one-line notice it leaves after compacting (plugins/csr-companion/hooks/
+///   compact.ts `KEEP_HEADER`, `NOTICE_HEADER`)
+const EMISSION_HEADERS: [&str; 17] = [
     "CSR ENDLESS MEMORY ACTIVE",
     "CSR CONTINUUM [",
     "CSR PICKUP —",
@@ -71,6 +74,8 @@ const EMISSION_HEADERS: [&str; 15] = [
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
     "CSR's dreamer asked this while you worked",
+    "CSR COMPACT KEEP —",
+    "CSR compacted at",
 ];
 
 /// Field tokens CSR emits inside blocks (Tier-0 fields, continuity lines).
@@ -713,6 +718,21 @@ mod tests {
         ));
         assert!(!is_dreamer_prompt(
             "Q?\n\nCSR's dreamer asked this while you worked. Its reasoning:"
+        ));
+    }
+
+    #[test]
+    fn emission_detects_the_companions_compaction_keep_list_and_notice() {
+        assert!(is_csr_emission(
+            "CSR COMPACT KEEP — in the summary, keep these, in this order, ids and SHAs word for word:\n\
+             1. Running in the background: subagent a427c126 (Explore CapCut)."
+        ));
+        assert!(is_csr_emission(
+            "CSR compacted at 312k → 66k · pays back in 3 turns · kept: 2 running agents, 1 open decision"
+        ));
+        // The owner's own words about compacting stay theirs.
+        assert!(!is_csr_emission(
+            "compact at 250k from now on, and keep the agents running"
         ));
     }
 
