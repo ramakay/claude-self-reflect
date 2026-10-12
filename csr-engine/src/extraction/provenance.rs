@@ -283,7 +283,7 @@ pub fn is_csr_emission(text: &str) -> bool {
 }
 
 /// The attribution sentence the companion dreamer's "ask Claude" message carries.
-const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you worked";
+pub(crate) const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you worked";
 
 /// True when the WHOLE of `text` is the companion dreamer's "ask Claude"
 /// message, in the exact grammar `askClaude` (plugins/csr-companion/hooks/

@@ -233,6 +233,9 @@ const COMMIT_WEIGHT: u32 = 10;
 #[derive(Default)]
 struct TaskSegment {
     prose: String,
+    /// A forwarded side-agent note or dreamer what-if: its own task, never
+    /// joined with the prompts around it.
+    note: bool,
     tool_calls: u32,
     commits: u32,
     completions: Vec<CompletionReceipt>,
@@ -279,10 +282,77 @@ fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Vec<CompletionRe
     (None, segments[chosen].completions.clone())
 }
 
-/// The person's own prose in a user row, or `None` when the row is not a
-/// typed prompt: tool results, injected/meta rows, compact summaries,
-/// harness notices, command plumbing, and CSR's own emissions pasted back.
-fn typed_prompt_prose(val: &serde_json::Value) -> Option<String> {
+/// A typed prompt's text for the recap, and whether it is a forwarded note.
+struct TypedPrompt {
+    prose: String,
+    note: bool,
+}
+
+/// Opener of a side agent's note forwarded into the prompt.
+const SIDE_AGENT_NOTE_OPENER: &str = "Here is a note offered by a side agent:";
+/// Lead-in of a side agent note's one-line summary.
+const HEADS_UP: &str = "Heads up · ";
+
+/// The headline of a forwarded side-agent note or a dreamer what-if, or
+/// `None` when `text` is neither. A side-agent note's headline is its bold
+/// title line, else the first sentence after "Heads up ·". A dreamer
+/// what-if's headline is its question line. The words are the note's, not
+/// the person's, so callers render them behind a "note: " prefix.
+fn forwarded_note_headline(text: &str) -> Option<String> {
+    if let Some(rest) = text.trim_start().strip_prefix(SIDE_AGENT_NOTE_OPENER) {
+        let quoted: Vec<&str> = rest
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('>'))
+            .map(str::trim)
+            .collect();
+        let title = quoted.iter().find_map(|line| {
+            let inner = line.strip_prefix("**")?.strip_suffix("**")?.trim();
+            (!inner.contains("**") && inner.chars().any(char::is_alphanumeric))
+                .then(|| inner.to_string())
+        });
+        return title.or_else(|| {
+            quoted
+                .iter()
+                .find_map(|line| line.strip_prefix(HEADS_UP))
+                .and_then(crate::hooks::recap::first_sentence)
+        });
+    }
+    if crate::extraction::provenance::is_dreamer_prompt(text) {
+        let question = text.trim().split("\n\n").next()?.trim();
+        return (!question.starts_with(crate::extraction::provenance::DREAMER_ATTRIBUTION)
+            && !question.contains('\n'))
+        .then(|| question.to_string());
+    }
+    None
+}
+
+/// A typed row that forwards a side-agent note or a dreamer what-if, as
+/// "note: <headline>". Read from the RAW row: the search sanitizer blanks a
+/// dreamer prompt, since every word of it is CSR's.
+fn forwarded_note(val: &serde_json::Value) -> Option<TypedPrompt> {
+    // Rows the harness wrote (task notifications, peer messages) are never
+    // a forwarded note, whatever they quote.
+    let harness = val.get("promptSource").and_then(|v| v.as_str()) == Some("system")
+        || matches!(
+            val.get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(|k| k.as_str()),
+            Some("task-notification" | "peer")
+        );
+    if harness {
+        return None;
+    }
+    let text = typed_row_text(val)?;
+    let headline = forwarded_note_headline(&crate::extraction::provenance::strip_plumbing(&text))?;
+    Some(TypedPrompt {
+        prose: format!("note: {headline}"),
+        note: true,
+    })
+}
+
+/// The text of a typed user row, or `None` for tool results, injected/meta
+/// rows, compact summaries and harness notices.
+fn typed_row_text(val: &serde_json::Value) -> Option<String> {
     let flagged = ["isMeta", "isCompactSummary", "isSidechain"]
         .iter()
         .any(|key| val.get(key).and_then(|v| v.as_bool()).unwrap_or(false));
@@ -308,17 +378,24 @@ fn typed_prompt_prose(val: &serde_json::Value) -> Option<String> {
             .join("\n")
     };
     let trimmed = text.trim_start();
-    if HARNESS_USER_ROW_PREFIXES
+    (!HARNESS_USER_ROW_PREFIXES
         .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
-    {
-        return None;
-    }
+        .any(|prefix| trimmed.starts_with(prefix)))
+    .then_some(text)
+}
+
+/// The prompt's text for the recap, or `None` when the row is not a typed
+/// prompt: tool results, injected/meta rows, compact summaries, harness
+/// notices, command plumbing, and CSR's own emissions pasted back. A
+/// forwarded side-agent note or dreamer what-if is a real task and comes
+/// back as "note: <headline>".
+fn typed_prompt(val: &serde_json::Value) -> Option<TypedPrompt> {
+    let text = typed_row_text(val)?;
     // Plumbing first: strip_csr_emissions drops `<system-reminder>` tag lines
     // but keeps what sits between them, so run it after the whole block is gone.
     let unplumbed = crate::extraction::provenance::strip_plumbing(&text);
     let own = crate::extraction::provenance::strip_csr_emissions(&unplumbed);
-    crate::extraction::provenance::extractable(&own)
+    crate::extraction::provenance::extractable(&own).map(|prose| TypedPrompt { prose, note: false })
 }
 
 /// Whether this row closes an assistant turn: a `turn_duration` or
@@ -357,12 +434,16 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
         .iter()
         .filter_map(|line| serde_json::from_str(line.trim()).ok())
         .collect();
-    let (messages, _) = crate::import::sanitize_messages_for_search(&messages);
-    extract_episode_from_messages(&messages, session_id, project)
+    let (sanitized, _) = crate::import::sanitize_messages_for_search(&messages);
+    extract_episode_from_messages(&sanitized, &messages, session_id, project)
 }
 
+/// `messages` are sanitized for search; `raw` are the same rows untouched
+/// (index-aligned), read only to recognise forwarded notes and dreamer
+/// what-ifs, which the sanitizer blanks as CSR's own words.
 fn extract_episode_from_messages(
     messages: &[serde_json::Value],
+    raw: &[serde_json::Value],
     session_id: &str,
     project: &str,
 ) -> Episode {
@@ -402,7 +483,7 @@ fn extract_episode_from_messages(
     // Error signature patterns
     let error_patterns: &[&str] = &["error[", "Error:", "panic", "FAIL", "FAILED", "Exception"];
 
-    for val in messages {
+    for (index, val) in messages.iter().enumerate() {
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         message_count += 1;
         // A legacy in-file subagent row. It still counts toward tools/files,
@@ -426,15 +507,19 @@ fn extract_episode_from_messages(
         // mid-turn (no finished turn since the last task) is the same task
         // continued, so it joins the current segment's text instead.
         if msg_type == "user" || msg_type == "human" {
-            if let Some(prose) = typed_prompt_prose(val) {
-                if is_task_prompt(&prose) {
+            let raw_row = raw.get(index).unwrap_or(val);
+            if let Some(TypedPrompt { prose, note }) =
+                forwarded_note(raw_row).or_else(|| typed_prompt(val))
+            {
+                if note || is_task_prompt(&prose) {
                     match segments.last_mut() {
-                        Some(task) if !turn_finished => {
+                        Some(task) if !turn_finished && !note && !task.note => {
                             task.prose.push(' ');
                             task.prose.push_str(prose.trim());
                         }
                         _ => segments.push(TaskSegment {
                             prose,
+                            note,
                             ..TaskSegment::default()
                         }),
                     }
@@ -2670,35 +2755,67 @@ mod tests {
     }
 
     #[test]
-    fn dreamer_prompt_and_acks_never_become_the_latest_task() {
-        let mut lines = vec![typed_line(
-            "can you move things out of tmp to the right place",
-            "typed",
-        )];
-        lines.push(typed_line(
-            "What if Claude opening a memory note also pulled in its session?\n\n\
-             CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
-             > Notes are where Claude looks first.",
-            "typed",
-        ));
-        lines.push(typed_line("ok, do it please", "typed"));
-        let ep = extract(&lines);
+    fn dreamer_what_if_is_a_task_rendered_as_a_note() {
+        let ep = extract(&[
+            typed_line("can you move things out of tmp to the right place", "typed"),
+            // Sent mid-turn, yet a note never joins the task before it.
+            typed_line(
+                "What if Claude opening a memory note also pulled in its session?\n\n\
+                 CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
+                 > Notes are where Claude looks first.",
+                "typed",
+            ),
+            typed_line("ok, do it please", "typed"),
+        ]);
         assert_eq!(
             ep.anchor_request.as_deref(),
-            Some("can you move things out of tmp to the right place")
+            Some("note: What if Claude opening a memory note also pulled in its session?")
         );
     }
 
     #[test]
-    fn introducer_only_prompt_is_the_latest_task_but_has_no_clean_intent() {
+    fn forwarded_note_renders_its_bold_title() {
+        let ep = extract(&[typed_line(
+            "Here is a note offered by a side agent:\n\n\
+             > Heads up · Logic's bar lines in this project are a 120 BPM placeholder, not the song's real beat. A region you drag can snap off the music.\n\
+             >\n\
+             > **Logic's bar lines don't match the song's beat**\n\
+             > - The top bar shows **120 KEEP**. That means the project runs at a fixed 120 BPM.",
+            "typed",
+        )]);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("note: Logic's bar lines don't match the song's beat")
+        );
+    }
+
+    #[test]
+    fn forwarded_note_without_a_title_uses_its_first_heads_up_sentence() {
         let ep = extract(&[
             typed_line("can you move things out of tmp to the right place", "typed"),
             typed_line(
-                "Here is a note offered by a side agent:\n\n> Heads up · the recap came out garbled twice today.",
+                "Here is a note offered by a side agent:\n\n\
+                 > Heads up · The recap came out garbled twice today. Both runs cut the prompt.",
                 "typed",
             ),
         ]);
-        assert_eq!(ep.anchor_request, None);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("note: The recap came out garbled twice today.")
+        );
+    }
+
+    #[test]
+    fn rendered_notes_pass_the_guard_but_the_raw_dreamer_prompt_never_does() {
+        use crate::extraction::provenance::{extractable, is_csr_emission};
+        let raw = "What if Claude opening a memory note also pulled in its session?\n\n\
+                   CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
+                   > Notes are where Claude looks first.";
+        assert!(is_csr_emission(raw));
+        assert!(extractable(raw).is_none());
+        let rendered = "note: What if Claude opening a memory note also pulled in its session?";
+        assert!(!is_csr_emission(rendered));
+        assert_eq!(extractable(rendered).as_deref(), Some(rendered));
     }
 
     #[test]

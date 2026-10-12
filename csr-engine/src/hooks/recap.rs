@@ -533,6 +533,15 @@ fn ends_abbreviation(before: &str) -> bool {
     single_letter || ABBREVIATIONS.contains(&word.to_lowercase().as_str())
 }
 
+/// The first sentence of `text` (abbreviation-aware), or `None` when it
+/// has no substance.
+pub(crate) fn first_sentence(text: &str) -> Option<String> {
+    let clean = sanitize_preview(text);
+    let (start, end) = split_preview_sentences(&clean).into_iter().next()?;
+    let sentence = clean[start..end].trim();
+    has_substance(sentence).then(|| sentence.to_string())
+}
+
 fn split_preview_sentences(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
