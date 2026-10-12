@@ -250,7 +250,7 @@ struct TaskSegment {
     /// A forwarded side-agent note or dreamer what-if: its own task, never
     /// joined with the prompts around it.
     note: bool,
-    /// When the segment's last prompt was sent, if the row carried a time.
+    /// When the segment's last JOINED prompt was sent, if the row had a time.
     last_prompt_at: Option<chrono::DateTime<chrono::Utc>>,
     tool_calls: u32,
     commits: u32,
@@ -576,11 +576,14 @@ fn extract_episode_from_messages(
                                 }
                                 _ => true,
                             };
+                            // Only a prompt that joined moves the window: an
+                            // excluded late addition must not let its own
+                            // quick follow-up into the task's text.
                             if quick {
                                 task.prose.push(' ');
                                 task.prose.push_str(prose.trim());
+                                task.last_prompt_at = sent_at.or(task.last_prompt_at);
                             }
-                            task.last_prompt_at = sent_at.or(task.last_prompt_at);
                         }
                         _ => segments.push(TaskSegment {
                             prose,
@@ -3571,7 +3574,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_2_an_excluded_late_prompt_does_not_carry_its_follow_up_in() {
         let ep = extract(&[
             typed_at(
