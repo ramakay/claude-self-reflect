@@ -228,6 +228,14 @@ const MAX_COMPLETIONS: usize = 5;
 /// outweigh a median segment of real work.
 const COMMIT_WEIGHT: u32 = 10;
 
+/// Longest gap between two mid-turn prompts for the second to be the first
+/// one's text continued (a message sent in two halves). Live split messages
+/// arrived 24 s and 57 s apart; mid-turn additions ("ok one more now ...")
+/// 24 and 34 minutes into the work. A later mid-turn prompt still belongs
+/// to the segment and its work counts, but its words stay out of the
+/// anchor text.
+const JOIN_WINDOW_SECS: i64 = 120;
+
 /// One task: a task prompt, its mid-turn continuations, and the work done
 /// until the next task prompt.
 #[derive(Default)]
@@ -236,6 +244,8 @@ struct TaskSegment {
     /// A forwarded side-agent note or dreamer what-if: its own task, never
     /// joined with the prompts around it.
     note: bool,
+    /// When the segment's last prompt was sent, if the row carried a time.
+    last_prompt_at: Option<chrono::DateTime<chrono::Utc>>,
     tool_calls: u32,
     commits: u32,
     completions: Vec<CompletionReceipt>,
@@ -512,14 +522,29 @@ fn extract_episode_from_messages(
                 forwarded_note(raw_row).or_else(|| typed_prompt(val))
             {
                 if note || is_task_prompt(&prose) {
+                    let sent_at = val
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::temporal::parse_timestamp);
                     match segments.last_mut() {
                         Some(task) if !turn_finished && !note && !task.note => {
-                            task.prose.push(' ');
-                            task.prose.push_str(prose.trim());
+                            // Without both times, assume a split message.
+                            let quick = match (task.last_prompt_at, sent_at) {
+                                (Some(before), Some(now)) => {
+                                    (now - before).num_seconds() <= JOIN_WINDOW_SECS
+                                }
+                                _ => true,
+                            };
+                            if quick {
+                                task.prose.push(' ');
+                                task.prose.push_str(prose.trim());
+                            }
+                            task.last_prompt_at = sent_at.or(task.last_prompt_at);
                         }
                         _ => segments.push(TaskSegment {
                             prose,
                             note,
+                            last_prompt_at: sent_at,
                             ..TaskSegment::default()
                         }),
                     }
@@ -3203,10 +3228,15 @@ mod tests {
         (0..n)
             .flat_map(|i| {
                 let id = format!("toolu_{prefix}_{i}");
-                [
-                    assistant_named_tool("Bash", &id, serde_json::json!({"command": "ls"})),
-                    tool_result_bound(&id, "ok"),
-                ]
+                // A live tool call row: the turn stays open (stop_reason tool_use).
+                let mut call: serde_json::Value = serde_json::from_str(&assistant_named_tool(
+                    "Bash",
+                    &id,
+                    serde_json::json!({"command": "ls"}),
+                ))
+                .unwrap();
+                call["message"]["stop_reason"] = serde_json::Value::String("tool_use".into());
+                [call.to_string(), tool_result_bound(&id, "ok")]
             })
             .collect()
     }
@@ -3338,5 +3368,58 @@ mod tests {
             assistant_stop_line("Closed: it was already live.", "end_turn"),
         ]);
         assert_eq!(ep.anchor_request, None);
+    }
+
+    fn typed_at(text: &str, source: &str, timestamp: &str) -> String {
+        let mut line: serde_json::Value = serde_json::from_str(&typed_line(text, source)).unwrap();
+        line["timestamp"] = serde_json::Value::String(timestamp.into());
+        line.to_string()
+    }
+
+    #[test]
+    fn only_a_quick_mid_turn_follow_up_joins_the_task_text() {
+        // this-ai-life 76e2ddd2: an addition queued 24 minutes into the work
+        // stays in the segment (its work counts) but not in the anchor text.
+        let mut lines = vec![typed_at(
+            "in the pigment skill, can we add a vox style - review this gh repo for style etc and add it https://github.com/example/vox-director",
+            "typed",
+            "2026-10-11T18:52:19.078Z",
+        )];
+        lines.extend(work("a", 5));
+        lines.push(typed_at(
+            "ok one more now its called anatomy - use the anatomy repo as the second reference for this style",
+            "queued",
+            "2026-10-11T19:16:28.448Z",
+        ));
+        lines.extend(work("b", 5));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        lines.extend(segment(
+            "tell csr to go ahead with the jukebox build",
+            "c",
+            1,
+        ));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("in the pigment skill, can we add a vox style - review this gh repo for style etc and add it https://github.com/example/vox-director")
+        );
+
+        // Case 1 (lines 28444/28462): a split message 24 s apart still joins.
+        let ep = extract(&[
+            typed_at(
+                "How do we show cost as % of mac",
+                "queued",
+                "2026-10-11T21:26:26.000Z",
+            ),
+            assistant_stop_line("remote-cancel", "stop_sequence"),
+            typed_at(
+                "% of max plan if they have it or cents",
+                "queued",
+                "2026-10-11T21:26:50.000Z",
+            ),
+        ]);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("How do we show cost as % of mac % of max plan if they have it or cents")
+        );
     }
 }
