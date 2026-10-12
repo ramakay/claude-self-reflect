@@ -1660,6 +1660,19 @@ fn conversation_entrypoints(
     Ok(out)
 }
 
+/// The ids in `candidates` whose recorded entrypoint is headless (`sdk-*`).
+/// Ids with no recorded entrypoint are unknown and never returned.
+pub fn headless_conversation_ids(
+    conn: &Connection,
+    candidates: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    Ok(conversation_entrypoints(conn, candidates)?
+        .into_iter()
+        .filter(|(_, entrypoint)| is_headless_entrypoint(entrypoint))
+        .map(|(id, _)| id)
+        .collect())
+}
+
 /// Persist (or overwrite) `conversation_id`'s transcript `entrypoint`. Called
 /// once per import (live watcher + batch importer) right after parsing —
 /// see `import::ParsedConversation::entrypoint`'s doc comment for where the

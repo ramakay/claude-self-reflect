@@ -729,8 +729,20 @@ pub fn recent_episodes(engine: &Engine, cwd: &Path, limit: usize) -> Vec<(Episod
     let Some(project) = resolve_project_from_cwd(&cwd.to_string_lossy()) else {
         return Vec::new();
     };
+    recent_project_episodes(engine.storage(), &project, limit)
+}
+
+/// `recent_episodes` for an already-resolved project. Headless sessions
+/// (`claude -p` children, entrypoint `sdk-*`) store episodes too, and are
+/// never a project's previous session: they are dropped here. An entrypoint
+/// that was never recorded is unknown, not headless, and stays.
+pub(crate) fn recent_project_episodes(
+    storage: &crate::storage::Storage,
+    project: &str,
+    limit: usize,
+) -> Vec<(Episode, String)> {
     let project_tag = format!("project_{}", project);
-    let Ok(rows) = engine.storage().get_reflections_by_tag(&project_tag, 50) else {
+    let Ok(rows) = storage.get_reflections_by_tag(&project_tag, 50) else {
         return Vec::new();
     };
     let now = Utc::now();
@@ -746,6 +758,17 @@ pub fn recent_episodes(engine: &Engine, cwd: &Path, limit: usize) -> Vec<(Episod
                 .map(|ep| (ep, ts))
         })
         .collect();
+    let ids: Vec<String> = episodes
+        .iter()
+        .map(|(ep, _)| ep.session_id.clone())
+        .collect();
+    let headless = storage
+        .headless_conversation_ids(&ids)
+        .unwrap_or_else(|error| {
+            tracing::debug!(%error, "session-start headless lookup unavailable");
+            Default::default()
+        });
+    episodes.retain(|(ep, _)| !headless.contains(&ep.session_id));
     episodes.sort_by(|a, b| b.1.cmp(&a.1));
     episodes.truncate(limit);
     episodes
@@ -2431,6 +2454,43 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
                 .trim()
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn headless_sessions_are_never_a_projects_previous_session() {
+        // `claude -p` children (entrypoint sdk-*) store episodes too: 19 in
+        // the live DB, the newest of 4 projects. They must not anchor the
+        // recap, CONTINUUM or EPISODE INDEX.
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        for (session, entrypoint) in [
+            ("human", Some("cli")),
+            ("unrecorded", None),
+            ("headless", Some("sdk-cli")),
+        ] {
+            let mut ep = minimal_episode("Fix the auth middleware regression", "", None);
+            ep.session_id = session.into();
+            ep.project = "proj".into();
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &serde_json::to_string(&ep).unwrap(),
+                    &crate::hooks::stop::episode_tags(&ep),
+                    &[0.0; 4],
+                )
+                .unwrap();
+            if let Some(entrypoint) = entrypoint {
+                storage
+                    .set_conversation_entrypoint(session, entrypoint)
+                    .unwrap();
+            }
+        }
+        let mut sessions: Vec<String> = recent_project_episodes(&storage, "proj", 10)
+            .into_iter()
+            .map(|(ep, _)| ep.session_id)
+            .collect();
+        sessions.sort();
+        // An unrecorded entrypoint is unknown, not headless: it stays.
+        assert_eq!(sessions, ["human", "unrecorded"]);
     }
 
     #[test]

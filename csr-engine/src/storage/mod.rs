@@ -1062,6 +1062,15 @@ impl Storage {
         queries::set_conversation_entrypoint(&conn, conversation_id, entrypoint)
     }
 
+    /// See `queries::headless_conversation_ids`.
+    pub fn headless_conversation_ids(
+        &self,
+        candidates: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::headless_conversation_ids(&conn, candidates)
+    }
+
     /// The recorded `conversation_entrypoint` value for one conversation, or
     /// `None` when never recorded — test/inspection helper; the hot filter
     /// path uses the batched `queries::conversation_entrypoints` instead.
