@@ -223,7 +223,8 @@ const HARNESS_USER_ROW_PREFIXES: [&str; 4] = [
     "This session is being continued from a previous conversation",
 ];
 
-/// Most completions kept per session (the recap renders at most two).
+/// Most completions kept per session for each receipt kind (commits, and
+/// task/todo receipts); the recap renders at most two.
 const MAX_COMPLETIONS: usize = 5;
 
 /// Weight of one commit receipt, in tool calls. Across the newest 1,500
@@ -969,18 +970,25 @@ fn extract_episode_from_messages(
     }
 }
 
-/// Record a completion, keeping only the most recent `MAX_COMPLETIONS`.
+/// Record a completion. Commit receipts and task/todo receipts are capped
+/// separately (`MAX_COMPLETIONS` each, oldest dropped), so a run of todo
+/// completions can never evict the session's commits.
 fn push_completion(completions: &mut Vec<CompletionReceipt>, claim: &str, receipt: &str) {
     let claim = claim.split_whitespace().collect::<Vec<_>>().join(" ");
     if claim.is_empty() {
         return;
     }
+    let commit = crate::hooks::recap::is_commit_receipt(receipt);
     completions.push(CompletionReceipt {
         claim,
         receipt: receipt.to_string(),
     });
-    if completions.len() > MAX_COMPLETIONS {
-        completions.remove(0);
+    let same_kind =
+        |done: &CompletionReceipt| crate::hooks::recap::is_commit_receipt(&done.receipt) == commit;
+    if completions.iter().filter(|done| same_kind(done)).count() > MAX_COMPLETIONS {
+        if let Some(oldest) = completions.iter().position(same_kind) {
+            completions.remove(oldest);
+        }
     }
 }
 
@@ -3634,7 +3642,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_7_commit_receipts_outrank_todo_receipts() {
         let todo_write = |id: &str, items: Vec<&str>| {
             let todos: Vec<serde_json::Value> = items

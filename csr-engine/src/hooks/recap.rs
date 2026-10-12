@@ -438,27 +438,55 @@ pub(crate) fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
     extractable(&source).and_then(|text| clean_intent(&text))
 }
 
-/// The completed clause: receipted completions observed after the latest
-/// task, never assistant prose. Legacy episodes carry none and abstain.
+/// The completed clause: the receipts `displayed_receipts` picks, never
+/// assistant prose. Legacy episodes carry none and abstain.
 fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    let entries: Vec<String> = displayed_receipts(&ep.completions)
+        .into_iter()
+        .map(|(_, entry)| entry)
+        .collect();
+    (!entries.is_empty()).then(|| entries.join("; "))
+}
+
+/// A commit receipt: a short or full hex SHA (task and todo receipts read
+/// "task #N completed" / "todo completed").
+pub(crate) fn is_commit_receipt(receipt: &str) -> bool {
+    (7..=40).contains(&receipt.len()) && receipt.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The receipts the recap shows, oldest first, each with its index in
+/// `completions`: the latest two commit receipts, or the latest two task or
+/// todo receipts when the session made no commit. Entries are rendered
+/// whole as `<claim> (<receipt>)`; a claim over 100 chars is dropped, never
+/// cut.
+pub(crate) fn displayed_receipts(
+    completions: &[crate::hooks::stop::CompletionReceipt],
+) -> Vec<(usize, String)> {
     use crate::extraction::provenance::extractable;
     const MAX_ENTRIES: usize = 2;
     const MAX_CLAIM_CHARS: usize = 100;
-    let entries: Vec<String> = ep
-        .completions
-        .iter()
-        .rev()
-        .filter_map(|done| {
-            let receipt = normalize_feed_text(&done.receipt);
-            let claim = extractable(&done.claim).map(|claim| sanitize_preview(&claim))?;
-            (!receipt.is_empty()
-                && has_substance(&claim)
-                && claim.chars().count() <= MAX_CLAIM_CHARS)
-                .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
-        })
-        .take(MAX_ENTRIES)
-        .collect();
-    (!entries.is_empty()).then(|| entries.into_iter().rev().collect::<Vec<_>>().join("; "))
+    let render = |done: &crate::hooks::stop::CompletionReceipt| {
+        let receipt = normalize_feed_text(&done.receipt);
+        let claim = extractable(&done.claim).map(|claim| sanitize_preview(&claim))?;
+        (!receipt.is_empty() && has_substance(&claim) && claim.chars().count() <= MAX_CLAIM_CHARS)
+            .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
+    };
+    let pick = |commits: bool| -> Vec<(usize, String)> {
+        completions
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, done)| is_commit_receipt(done.receipt.trim()) == commits)
+            .filter_map(|(index, done)| render(done).map(|entry| (index, entry)))
+            .take(MAX_ENTRIES)
+            .collect()
+    };
+    let mut shown = pick(true);
+    if shown.is_empty() {
+        shown = pick(false);
+    }
+    shown.reverse();
+    shown
 }
 
 /// Render a typed prompt as a recap intent: its leading whole sentences, up
@@ -1722,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_clause_renders_the_two_latest_receipted_entries_whole() {
+    fn completed_clause_prefers_commits_and_renders_entries_whole() {
         let mut ep = episode();
         ep.completions = vec![
             CompletionReceipt {
@@ -1746,10 +1774,19 @@ mod tests {
         ep.todos.clear();
         ep.blockers = None;
         let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        // Commits come first: the only renderable commit (the 101-char claim
+        // is dropped, never cut) outranks the newer task receipt.
         assert_eq!(
             got,
-            "recap [now]: Fix the recap composer: oldest (0000000); Write regression tests \
-             (task #3 completed). [[CSR:RECAP]]"
+            "recap [now]: Fix the recap composer: oldest (0000000). [[CSR:RECAP]]"
+        );
+        // With no commit at all, the latest task receipts show.
+        ep.completions
+            .retain(|done| !is_commit_receipt(&done.receipt));
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer: Write regression tests (task #3 completed). [[CSR:RECAP]]"
         );
     }
 
