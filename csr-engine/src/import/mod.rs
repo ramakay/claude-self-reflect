@@ -386,7 +386,7 @@ pub(crate) fn is_csr_agent_prompt(first_user_message: &str) -> bool {
 /// row Claude Code did not inject (`isMeta` caveats, compact summaries) that
 /// still says something once CSR's own hook wrappers are removed. Wrappers are
 /// stripped from the returned text so a prompt behind one still leads.
-fn opening_prompt_candidate(parsed: &serde_json::Value) -> Option<String> {
+pub(crate) fn opening_prompt_candidate(parsed: &serde_json::Value) -> Option<String> {
     let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if msg_type != "user" && msg_type != "human" {
         return None;

@@ -552,11 +552,16 @@ fn extract_episode_from_messages(
             // A transcript that opens with a CSR agent prompt (narrator,
             // analyst, labeler child) is CSR talking to itself: none of its
             // rows is the person's task. The importer skips it whole too.
-            if opening_seen.is_none() {
-                if let Some(text) = typed_row_text(raw_row) {
-                    if !text.trim().is_empty() {
-                        opening_seen = Some(crate::import::is_csr_agent_prompt(&text));
-                    }
+            // The opening prompt is found the way the importer finds it
+            // (opening_prompt_candidate: injected rows and harness wrappers
+            // skipped), then any remaining hook wrapper is stripped, so a
+            // `<system-reminder>` ahead of the agent signature cannot hide it.
+            if opening_seen.is_none() && !sidechain {
+                if let Some(text) = crate::import::opening_prompt_candidate(raw_row)
+                    .map(|text| crate::extraction::provenance::strip_plumbing(&text))
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    opening_seen = Some(crate::import::is_csr_agent_prompt(&text));
                 }
             }
             if let Some(TypedPrompt { prose, note }) =
@@ -3616,7 +3621,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_5_a_wrapped_csr_agent_opening_still_has_no_task() {
         let ep = extract(&[
             typed_line(
