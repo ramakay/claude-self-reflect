@@ -123,10 +123,84 @@ pub const RECAP_EVIDENCE_VERSION: u32 = 1;
 static GIT_COMMIT_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\[[^\]\n]+? ([0-9a-f]{7,40})\] (\S[^\n]*)$").unwrap());
 
-/// Bash commands whose output can carry a commit success line.
-static GIT_COMMITTING_COMMAND_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bgit\b[^\n|;&]*\b(?:commit|cherry-pick|revert|merge)\b").unwrap()
-});
+/// Split a shell command into simple commands, each a list of words.
+/// Quote-aware (single and double quotes group words and are removed);
+/// unquoted `;`, `&`, `|`, `(`, `)` and newlines end a simple command.
+fn shell_simple_commands(command: &str) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in command.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => word.push(c),
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    in_word = true;
+                }
+                ';' | '&' | '|' | '(' | ')' | '\n' => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                    if !words.is_empty() {
+                        commands.push(std::mem::take(&mut words));
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                c => {
+                    word.push(c);
+                    in_word = true;
+                }
+            },
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    commands
+}
+
+/// Whether a Bash command runs a git subcommand that can print a commit
+/// success line: the first non-option word after `git` (global options
+/// `-c <k=v>`, `-C <path>`, `--no-pager` and other `--long` options skipped)
+/// must be commit, cherry-pick, revert or merge. `git log --grep=commit`
+/// does not qualify.
+fn is_git_committing_command(command: &str) -> bool {
+    shell_simple_commands(command).iter().any(|words| {
+        // Leading `VAR=value` assignments are part of the simple command.
+        let mut rest = words
+            .iter()
+            .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+        let Some(program) = rest.next() else {
+            return false;
+        };
+        if program != "git" && !program.ends_with("/git") {
+            return false;
+        }
+        while let Some(word) = rest.next() {
+            match word.as_str() {
+                "-c" | "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                    rest.next();
+                }
+                w if w.starts_with('-') => {}
+                w => return matches!(w, "commit" | "cherry-pick" | "revert" | "merge"),
+            }
+        }
+        false
+    })
+}
 
 /// Rows Claude Code writes into the user channel as plain text. Nobody typed
 /// them, so they are never a task.
@@ -326,7 +400,7 @@ fn extract_episode_from_messages(
                                         .get("input")
                                         .and_then(|i| i.get("command"))
                                         .and_then(|c| c.as_str())
-                                        .is_some_and(|c| GIT_COMMITTING_COMMAND_RE.is_match(c));
+                                        .is_some_and(is_git_committing_command);
                                     if let (true, Some(id)) =
                                         (commits, block.get("id").and_then(|v| v.as_str()))
                                     {
@@ -2852,5 +2926,35 @@ mod tests {
                 receipt: "todo completed".into(),
             }]
         );
+    }
+
+    fn commit_receipts_for(command: &str) -> Vec<CompletionReceipt> {
+        extract(&[
+            typed_line("fix the garbled recap", "typed"),
+            assistant_named_tool("Bash", "toolu_g", serde_json::json!({"command": command})),
+            tool_result_bound("toolu_g", "[main 1a2b3c4] fix(recap): subject"),
+        ])
+        .completions
+    }
+
+    #[test]
+    fn only_a_committing_git_subcommand_yields_a_commit_receipt() {
+        assert!(commit_receipts_for("git log -1 --format='[main %h] %s' --grep=commit").is_empty());
+        let one = vec![CompletionReceipt {
+            claim: "fix(recap): subject".into(),
+            receipt: "1a2b3c4".into(),
+        }];
+        assert_eq!(
+            commit_receipts_for(
+                r#"git -c user.name="Rama Annaswamy" -c user.email=x@y commit -m "fix""#
+            ),
+            one
+        );
+        assert_eq!(commit_receipts_for("cd x && git commit -m y"), one);
+        assert_eq!(
+            commit_receipts_for("git --no-pager -C /repo cherry-pick abc1234"),
+            one
+        );
+        assert!(commit_receipts_for("echo git commit").is_empty());
     }
 }
