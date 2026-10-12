@@ -181,21 +181,18 @@ fn typed_prompt_prose(val: &serde_json::Value) -> Option<String> {
 
 /// Whether this row closes an assistant turn: a `turn_duration` or
 /// `stop_hook_summary` system row, or an assistant message that ended its
-/// turn. Assistant rows without a `stop_reason` (older transcript formats)
+/// turn. Assistant rows with NO `stop_reason` key (older transcript formats)
 /// count as finished, so a transcript without turn markers never chains
-/// its prompts together.
+/// its prompts together. An explicit `null` is a row still streaming inside
+/// an open turn, not a finish.
 fn ends_turn(val: &serde_json::Value, msg_type: &str) -> bool {
     match msg_type {
         "system" => matches!(
             val.get("subtype").and_then(|v| v.as_str()),
             Some("turn_duration" | "stop_hook_summary")
         ),
-        "assistant" => match val
-            .get("message")
-            .and_then(|m| m.get("stop_reason"))
-            .and_then(|v| v.as_str())
-        {
-            Some(reason) => reason == "end_turn",
+        "assistant" => match val.get("message").and_then(|m| m.get("stop_reason")) {
+            Some(reason) => reason.as_str() == Some("end_turn"),
             None => true,
         },
         _ => false,
@@ -2704,5 +2701,31 @@ mod tests {
             typed_line("and also the side pane width", "queued"),
         ]);
         assert_eq!(ep.latest_request, None);
+    }
+
+    // ---- astra review round (findings 1-6) ----
+
+    fn assistant_null_stop_line(text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}], "stop_reason": null}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn explicit_null_stop_reason_is_not_a_finished_turn() {
+        // Only a MISSING stop_reason is a legacy finish; streamed rows carry
+        // an explicit null while the turn is still running.
+        let ep = extract(&[
+            turn_end_line(),
+            typed_line("How do we show cost as % of mac", "typed"),
+            assistant_null_stop_line("thinking about it"),
+            typed_line("% of max plan if they have it or cents", "queued"),
+        ]);
+        assert_eq!(
+            ep.latest_request.as_deref(),
+            Some("How do we show cost as % of mac % of max plan if they have it or cents")
+        );
     }
 }
