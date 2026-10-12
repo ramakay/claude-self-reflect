@@ -775,9 +775,7 @@ pub fn format_episode_index(episodes: &[(Episode, String)]) -> String {
     }
     let mut out = String::from(EPISODE_INDEX_HEADER);
     for (ep, age) in episodes {
-        let request = extractable(&ep.request)
-            .map(|s| compact_preview(&s, 70))
-            .unwrap_or_else(|| "(command-only session)".into());
+        let request = episode_intent_label(ep);
         let last = extractable(&ep.completed)
             .map(|s| compact_preview(&s, 70))
             .unwrap_or_else(|| "(filtered: CSR meta)".into());
@@ -788,6 +786,20 @@ pub fn format_episode_index(episodes: &[(Episode, String)]) -> String {
         ));
     }
     out
+}
+
+/// What an episode was about, for the CONTINUUM and EPISODE INDEX lines: its
+/// latest task (never a long session's stale first prompt), by the same rule
+/// as the recap's intent clause. A session whose prompts were all command
+/// plumbing keeps its old placeholder.
+pub(crate) fn episode_intent_label(ep: &Episode) -> String {
+    crate::hooks::recap::recap_intent(ep).unwrap_or_else(|| {
+        if crate::extraction::provenance::extractable(&ep.request).is_some() {
+            "(no clean intent)".into()
+        } else {
+            "(command-only session)".into()
+        }
+    })
 }
 
 /// Display outcome reconciled against the shown conclusion: episodes stored
@@ -967,16 +979,7 @@ fn format_tier0_block_with_recap(
     // may carry CSR's own output in any field — clean again at display time,
     // and compact to one line so a long `completed` can't dump paragraphs.
     use crate::extraction::provenance::extractable;
-    // The latest task (never a long session's stale first prompt), by the
-    // same rule as the recap's intent clause. A session whose prompts were
-    // all command plumbing keeps its old placeholder.
-    let request = crate::hooks::recap::recap_intent(ep).unwrap_or_else(|| {
-        if extractable(&ep.request).is_some() {
-            "(no clean intent)".into()
-        } else {
-            "(command-only session)".into()
-        }
-    });
+    let request = episode_intent_label(ep);
     let last = extractable(&ep.completed)
         .map(|s| conclusion_preview(&s, 120))
         .unwrap_or_else(|| "(filtered: CSR meta)".into());
@@ -2394,6 +2397,39 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             );
             assert!(!block.contains("anthropics codemod"), "{block}");
             assert!(crate::extraction::provenance::is_csr_emission(&block));
+        }
+    }
+
+    #[test]
+    fn episode_index_names_the_latest_task_and_stays_a_csr_emission() {
+        let mut ep = minimal_episode(
+            "anthropics codemod, when github links are bought up or disccussed, can",
+            "Shipped the pane",
+            None,
+        );
+        ep.message_count = 30_393;
+        ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
+        ep.latest_request = Some("How do we show cost as % of max plan".into());
+        let current = format_episode_index(&[(ep.clone(), "3h ago".into())]);
+        assert!(
+            current.contains("- [3h ago] How do we show cost as % of max plan — "),
+            "{current}"
+        );
+        assert!(!current.contains("anthropics codemod"), "{current}");
+        // Legacy long session: the stale first prompt is withheld.
+        ep.recap_evidence_version = None;
+        ep.latest_request = None;
+        let legacy = format_episode_index(&[(ep, "3h ago".into())]);
+        assert!(
+            legacy.contains("- [3h ago] (no clean intent) — "),
+            "{legacy}"
+        );
+        // The provenance guard still owns every line of the block.
+        for block in [current, legacy] {
+            assert!(crate::extraction::provenance::is_csr_emission(&block));
+            assert!(crate::extraction::provenance::strip_csr_emissions(&block)
+                .trim()
+                .is_empty());
         }
     }
 

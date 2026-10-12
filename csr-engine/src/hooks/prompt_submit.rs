@@ -609,7 +609,11 @@ async fn handle_inner(
     };
     let mut preface_exposures = Vec::new();
     // An episode whose ask the prompt quotes is the paste talking, not a match.
-    let correlated = correlated.filter(|(ep, _, _)| !quoted_in_prompt(&ep.request, &pasted_words));
+    let correlated = correlated.filter(|(ep, _, _)| {
+        !episode_asks(ep)
+            .iter()
+            .any(|ask| quoted_in_prompt(ask, &pasted_words))
+    });
     // What the PICKUP line already says, so PAST CONTEXT does not say it again.
     let mut handed = HandedOnce::default();
     if let Some((ep, age, score)) = correlated {
@@ -1158,6 +1162,26 @@ fn emit_pickup(output: &mut String, ep: &crate::hooks::stop::Episode, age: &str,
     );
 }
 
+/// What an episode asked: its first prompt, plus its latest task when that
+/// differs. The pickup lines now name the latest task, so echo and paste
+/// checks must see it too.
+fn episode_asks(ep: &crate::hooks::stop::Episode) -> Vec<String> {
+    let mut asks = vec![ep.request.clone()];
+    if let Some(intent) = crate::hooks::recap::recap_intent(ep) {
+        if intent != ep.request {
+            asks.push(intent);
+        }
+    }
+    asks
+}
+
+/// Whether the prompt restates any ask of the episode (see `is_pickup_echo`).
+fn is_episode_echo(prompt: &str, ep: &crate::hooks::stop::Episode) -> bool {
+    episode_asks(ep)
+        .iter()
+        .any(|ask| is_pickup_echo(prompt, ask))
+}
+
 /// Minimum length (both sides) before a prompt/episode-request containment
 /// check is a signal rather than coincidence. Mirrors QUERY_ECHO_MIN_LEN in
 /// search/reinstatement.rs::is_query_echo (verbatim/near-verbatim containment,
@@ -1197,7 +1221,7 @@ fn pick_lineage_episode(
 ) -> Option<(crate::hooks::stop::Episode, String)> {
     crate::hooks::session_start::recent_episodes(engine, cwd, LINEAGE_CANDIDATE_LIMIT)
         .into_iter()
-        .find(|(ep, _)| !is_pickup_echo(prompt, &ep.request))
+        .find(|(ep, _)| !is_episode_echo(prompt, ep))
 }
 
 /// Semantic-pickup rendering for a topically-matched-but-not-lineage
@@ -1346,7 +1370,7 @@ async fn correlate_episode(
         // Skip episodes whose stored request is a near-verbatim echo of the
         // current prompt — that episode was itself just asking the same
         // question, not state to resume as a pickup.
-        if is_pickup_echo(prompt, &ep.request) {
+        if is_episode_echo(prompt, &ep) {
             continue;
         }
         // Unparseable timestamps rank as infinitely old (effective score 0)
@@ -2164,9 +2188,10 @@ struct HandedOnce {
 impl HandedOnce {
     fn note_episode(&mut self, episode: &crate::hooks::stop::Episode) {
         self.sessions.insert(episode.session_id.clone(), true);
-        for text in [&episode.request, &episode.completed] {
-            self.note_opening(text);
+        for text in episode_asks(episode) {
+            self.note_opening(&text);
         }
+        self.note_opening(&episode.completed);
     }
 
     fn note_opening(&mut self, text: &str) {
@@ -3051,6 +3076,26 @@ mod tests {
             "status of the sessionstart debugging work",
             "what's the status of the sessionstart debugging work",
         ));
+    }
+
+    #[test]
+    fn an_episode_whose_latest_task_restates_the_prompt_is_an_echo() {
+        let mut ep = code_map_episode();
+        ep.request = "anthropics codemod side pane thoughts for herdr users".into();
+        ep.message_count = 30_393;
+        ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
+        ep.latest_request = Some("How do we show cost as % of max plan".into());
+        assert!(is_episode_echo("how do we show cost as % of max plan", &ep));
+        // The first prompt still counts, as before.
+        assert!(is_episode_echo(
+            "anthropics codemod side pane thoughts for herdr users",
+            &ep
+        ));
+        assert!(!is_episode_echo("fix the login validation for signup", &ep));
+
+        let mut handed = HandedOnce::default();
+        handed.note_episode(&ep);
+        assert!(!handed.admit(None, true, "How do we show cost as % of max plan, again"));
     }
 
     #[test]
