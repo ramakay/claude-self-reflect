@@ -179,6 +179,29 @@ fn typed_prompt_prose(val: &serde_json::Value) -> Option<String> {
     crate::extraction::provenance::extractable(&own)
 }
 
+/// Whether this row closes an assistant turn: a `turn_duration` or
+/// `stop_hook_summary` system row, or an assistant message that ended its
+/// turn. Assistant rows without a `stop_reason` (older transcript formats)
+/// count as finished, so a transcript without turn markers never chains
+/// its prompts together.
+fn ends_turn(val: &serde_json::Value, msg_type: &str) -> bool {
+    match msg_type {
+        "system" => matches!(
+            val.get("subtype").and_then(|v| v.as_str()),
+            Some("turn_duration" | "stop_hook_summary")
+        ),
+        "assistant" => match val
+            .get("message")
+            .and_then(|m| m.get("stop_reason"))
+            .and_then(|v| v.as_str())
+        {
+            Some(reason) => reason == "end_turn",
+            None => true,
+        },
+        _ => false,
+    }
+}
+
 /// Whether a typed prompt opens a new task, as opposed to an acknowledgement
 /// ("go", "ok do it") that continues the one before it.
 fn is_task_prompt(prose: &str) -> bool {
@@ -223,6 +246,9 @@ fn extract_episode_from_messages(
     // Recap evidence: the latest typed task, and what was provably completed
     // after it (reset whenever a newer task is asked).
     let mut latest_task_prose: Option<String> = None;
+    // Whether the assistant finished a turn since the latest task was asked.
+    // A task prompt arriving while that turn is still open continues it.
+    let mut turn_finished = true;
     let mut completions: Vec<CompletionReceipt> = Vec::new();
     // Bash tool_use ids whose command can print a commit success line.
     let mut git_tool_ids: HashSet<String> = HashSet::new();
@@ -251,15 +277,29 @@ fn extract_episode_from_messages(
             }
         }
 
-        // Latest task: every typed prompt that opens a task replaces the last
-        // one, and evidence gathered before it no longer belongs to it.
+        // Latest task: a typed prompt that opens a task replaces the last one,
+        // and evidence gathered before it no longer belongs to it. A prompt
+        // sent mid-turn (no finished turn since the last task) is the same
+        // task continued, so it joins the text instead.
         if msg_type == "user" || msg_type == "human" {
             if let Some(prose) = typed_prompt_prose(val) {
                 if is_task_prompt(&prose) {
-                    latest_task_prose = Some(prose);
-                    completions.clear();
+                    match latest_task_prose.as_mut() {
+                        Some(task) if !turn_finished => {
+                            task.push(' ');
+                            task.push_str(prose.trim());
+                        }
+                        _ => {
+                            latest_task_prose = Some(prose);
+                            completions.clear();
+                        }
+                    }
+                    turn_finished = false;
                 }
             }
+        }
+        if ends_turn(val, msg_type) {
+            turn_finished = true;
         }
 
         // Extract tool_use information
@@ -2601,5 +2641,68 @@ mod tests {
         );
         assert!(!got.contains("anthropics codemod"));
         assert!(!got.contains("How the share works"));
+    }
+
+    // ---- mid-turn continuation (case 1 follow-up) ----
+
+    fn turn_end_line() -> String {
+        serde_json::json!({"type": "system", "subtype": "turn_duration", "durationMs": 1000})
+            .to_string()
+    }
+
+    fn assistant_stop_line(text: &str, stop_reason: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": text}], "stop_reason": stop_reason}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn mid_turn_continuation_joins_the_prompt_it_continues() {
+        // Live shape (lines 28444/28462): the second message arrived while the
+        // first turn was cancelled ("remote-cancel"), never finished.
+        let ep = extract(&[
+            typed_line("fix the pane layout", "typed"),
+            assistant_stop_line("Done, the pane fits.", "end_turn"),
+            turn_end_line(),
+            typed_line("How do we show cost as % of mac", "queued"),
+            assistant_stop_line("remote-cancel", "stop_sequence"),
+            typed_line("% of max plan if they have it or cents", "queued"),
+        ]);
+        assert_eq!(
+            ep.latest_request.as_deref(),
+            Some("How do we show cost as % of mac % of max plan if they have it or cents")
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_separates_tasks() {
+        for finished in [
+            turn_end_line(),
+            assistant_stop_line("Here is the answer.", "end_turn"),
+        ] {
+            let ep = extract(&[
+                typed_line("How do we show cost as a share of the plan", "typed"),
+                finished,
+                typed_line("now fix the recap garble", "typed"),
+            ]);
+            assert_eq!(
+                ep.latest_request.as_deref(),
+                Some("now fix the recap garble")
+            );
+        }
+    }
+
+    #[test]
+    fn joined_continuation_that_fails_clean_intent_abstains() {
+        let long = format!("{} end", "word ".repeat(30));
+        let ep = extract(&[
+            turn_end_line(),
+            typed_line(&long, "typed"),
+            assistant_stop_line("working", "tool_use"),
+            typed_line("and also the side pane width", "queued"),
+        ]);
+        assert_eq!(ep.latest_request, None);
     }
 }
