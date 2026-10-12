@@ -3326,4 +3326,17 @@ mod tests {
         ));
         assert_eq!(extract(&lines).anchor_request, None);
     }
+
+    #[test]
+    fn a_lost_and_found_pane_paste_is_not_a_task() {
+        // Session 3002ab28: the only typed prompt was a pane send text.
+        let ep = extract(&[
+            typed_line(
+                "Lost and found: “The IG post time is a soft follow-up. Then ask for the release go-ahead (allowed, since publishing needs approval).” went quiet after 19:38. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+                "typed",
+            ),
+            assistant_stop_line("Closed: it was already live.", "end_turn"),
+        ]);
+        assert_eq!(ep.anchor_request, None);
+    }
 }

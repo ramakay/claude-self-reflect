@@ -338,6 +338,14 @@ pub fn is_substantive(text: &str) -> bool {
 /// note at cosine 0.855, plus a duplicate of it, as fresh PAST CONTEXT.
 const PANE_HANDED: &str = "CSR handed you these this session: ";
 const PANE_STORY: &str = "CSR's story of this session, rev ";
+/// pane.py `lost_asks`: `Lost and found: “<thread>” went quiet after HH:MM.`
+/// then one of two fixed asks, all CSR's words.
+const PANE_LOST: &str = "Lost and found: “";
+/// The fixed closing words of the two `lost_asks` send forms.
+const PANE_LOST_ENDINGS: [&str; 2] = [
+    "then tell me in one line.",
+    "report its result when it lands.",
+];
 const PANE_REMEMBERED: &str = "CSR remembered: “";
 const PANE_REMEMBERED_SESSION: &str = "CSR remembered a past session: “";
 
@@ -407,6 +415,20 @@ fn pane_send_end(line: &str, start: usize, header: &str) -> usize {
             .find("csr_reflect_on_past(\"conv_")
             .and_then(|at| rest[at..].find(')').map(|close| body + at + close + 1))
             .unwrap_or(line.len()),
+        PANE_LOST => {
+            // The thread text is quoted; the send ends at whichever fixed ask
+            // follows the close quote, or at the line end if a re-paste lost it.
+            let after_quote = rest.find("” went quiet after ").unwrap_or(0);
+            PANE_LOST_ENDINGS
+                .iter()
+                .filter_map(|ending| {
+                    rest[after_quote..]
+                        .find(ending)
+                        .map(|at| body + after_quote + at + ending.len())
+                })
+                .min()
+                .unwrap_or(line.len())
+        }
         PANE_REMEMBERED => match rest.find('”') {
             Some(close) => {
                 let after = body + close + '”'.len_utf8();
@@ -449,6 +471,7 @@ fn strip_line_emissions(line: &str) -> String {
     for header in [
         PANE_HANDED,
         PANE_STORY,
+        PANE_LOST,
         PANE_REMEMBERED_SESSION,
         PANE_REMEMBERED,
     ] {
@@ -847,6 +870,29 @@ mod tests {
             strip_csr_emissions(&sent),
             "are any of these useful for the reel?"
         );
+    }
+
+    /// pane.py `lost_asks`: both send forms, as typed into the prompt. The
+    /// thread text is from session 3002ab28 (anukriti-website).
+    const LOST_SIDE: &str = "Lost and found: “The IG post time is a soft follow-up. Then ask for the release go-ahead (allowed, since publishing needs approval). For example: on \"ship\", I'll pull the coda from the hub (or keep it if the app is updated first), merge PR #30, run IndexNo…” went quiet after 19:38. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.";
+
+    #[test]
+    fn lost_and_found_sends_are_cut_out() {
+        assert_eq!(strip_csr_emissions(LOST_SIDE), "");
+        let sub = "Lost and found: “Retry the upload” went quiet after 09:05. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.";
+        assert_eq!(strip_csr_emissions(sub), "");
+        // Words the person adds after the send text are theirs.
+        assert_eq!(
+            strip_csr_emissions(&format!("{LOST_SIDE} and check the hub first")),
+            "and check the hub first"
+        );
+        assert_eq!(
+            strip_csr_emissions(&format!("{LOST_SIDE}\nalso check the hub")),
+            "also check the hub"
+        );
+        // Prose that only mentions the section is left alone.
+        let prose = "Lost and found is the pane section I like most.";
+        assert_eq!(strip_csr_emissions(prose), prose);
     }
 
     #[test]
