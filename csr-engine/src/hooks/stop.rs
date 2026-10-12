@@ -175,7 +175,10 @@ fn typed_prompt_prose(val: &serde_json::Value) -> Option<String> {
     {
         return None;
     }
-    let own = crate::extraction::provenance::strip_csr_emissions(&text);
+    // Plumbing first: strip_csr_emissions drops `<system-reminder>` tag lines
+    // but keeps what sits between them, so run it after the whole block is gone.
+    let unplumbed = crate::extraction::provenance::strip_plumbing(&text);
+    let own = crate::extraction::provenance::strip_csr_emissions(&unplumbed);
     crate::extraction::provenance::extractable(&own)
 }
 
@@ -2744,5 +2747,14 @@ mod tests {
             ep.latest_request.as_deref(),
             Some("Fix login validation only for the signup form")
         );
+    }
+
+    #[test]
+    fn system_reminder_contents_never_become_the_intent() {
+        let ep = extract(&[typed_line(
+            "<system-reminder>\nBuild failed: missing foo.rs.\n</system-reminder>\n\nFix login validation.",
+            "typed",
+        )]);
+        assert_eq!(ep.latest_request.as_deref(), Some("Fix login validation."));
     }
 }
