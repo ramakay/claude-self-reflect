@@ -516,6 +516,23 @@ pub fn is_acknowledgement(text: &str) -> bool {
     !words.is_empty() && words.len() <= 6 && words.iter().all(|w| ACK_WORDS.contains(&w.as_str()))
 }
 
+/// Words whose trailing `.` abbreviates rather than ends a sentence.
+const ABBREVIATIONS: [&str; 9] = ["e.g", "i.e", "etc", "vs", "cf", "approx", "mr", "ms", "dr"];
+
+/// Whether `before` (text up to a single `.`) ends in an abbreviation
+/// or a lone letter (an initial, `Plan A.`), so the `.` is not a full stop.
+fn ends_abbreviation(before: &str) -> bool {
+    let word = before
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or("")
+        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    let mut letters = word.chars();
+    let single_letter =
+        matches!((letters.next(), letters.next()), (Some(c), None) if c.is_alphabetic());
+    single_letter || ABBREVIATIONS.contains(&word.to_lowercase().as_str())
+}
+
 fn split_preview_sentences(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut sentences = Vec::new();
@@ -531,7 +548,9 @@ fn split_preview_sentences(text: &str) -> Vec<(usize, usize)> {
             if bytes.get(end) == Some(&b'*') && bytes.get(end + 1) == Some(&b'*') {
                 end += 2;
             }
-            if end >= bytes.len() || bytes[end] == b' ' {
+            let abbreviation =
+                punctuation == b'.' && end == index + 1 && ends_abbreviation(&text[start..index]);
+            if !abbreviation && (end >= bytes.len() || bytes[end] == b' ') {
                 let slice = &text[start..end];
                 let trim_start = slice.len() - slice.trim_start().len();
                 let trim_end = slice.trim_end().len();
@@ -1639,6 +1658,35 @@ mod tests {
             got,
             "recap [now]: Fix the recap composer: oldest (0000000); Write regression tests \
              (task #3 completed). [[CSR:RECAP]]"
+        );
+    }
+
+    #[test]
+    fn abbreviations_do_not_end_a_sentence() {
+        let long = "the recap composer so that it never cuts a prompt in the middle of a \
+                    sentence, keeps soft wraps joined, reads only receipted completions, and \
+                    abstains when nothing clean is left to say.";
+        let text = format!("Please update e.g. {long}");
+        assert!(text.chars().count() > INTENT_MAX_CHARS);
+        assert_eq!(clean_intent(&text), None);
+
+        let sentences = |text: &str| -> Vec<String> {
+            split_preview_sentences(text)
+                .into_iter()
+                .map(|(start, end)| text[start..end].to_string())
+                .collect()
+        };
+        assert_eq!(
+            sentences("Use a tool, e.g. grep, i.e. fast, etc. vs. sed. Done."),
+            ["Use a tool, e.g. grep, i.e. fast, etc. vs. sed.", "Done."]
+        );
+        assert_eq!(
+            sentences("Ask Dr. Who and Mr. X, cf. approx. N. Smith. Done."),
+            ["Ask Dr. Who and Mr. X, cf. approx. N. Smith.", "Done."]
+        );
+        assert_eq!(
+            sentences("Ship 10.1 and fix stop.rs today. Then more."),
+            ["Ship 10.1 and fix stop.rs today.", "Then more."]
         );
     }
 
