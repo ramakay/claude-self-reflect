@@ -1035,6 +1035,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         };
         let feeds = RecapFeeds {

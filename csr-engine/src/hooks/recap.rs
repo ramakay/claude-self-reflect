@@ -124,6 +124,13 @@ pub fn compose_recap_with_deliveries(
     }
 
     let mut recap = match (intent.as_deref(), completed.as_deref()) {
+        // Receipts that are not the anchor's own completion get their own
+        // clause, so the recap never reads them as what the anchor achieved.
+        (Some(intent), Some(completed)) if ep.completions_untied => format!(
+            "recap [{age}]: {} Latest: {}",
+            terminate_clause(intent),
+            terminate_clause(completed)
+        ),
         (Some(intent), Some(completed)) => format!(
             "recap [{age}]: {}: {}",
             intent.trim_end().trim_end_matches(TRAILING_JUNK),
@@ -685,6 +692,7 @@ mod tests {
                 claim: "Implemented deterministic recap output".into(),
                 receipt: "abc1234".into(),
             }],
+            completions_untied: false,
             anchors: vec![],
         }
     }
@@ -1696,6 +1704,29 @@ mod tests {
         assert_eq!(
             sentences("Ship 10.1 and fix stop.rs today. Then more."),
             ["Ship 10.1 and fix stop.rs today.", "Then more."]
+        );
+    }
+
+    #[test]
+    fn untied_receipts_render_as_their_own_clause() {
+        let mut ep = episode();
+        ep.anchor_request = Some("Fix the recap composer".into());
+        ep.completions_untied = true;
+        ep.next_steps = None;
+        ep.todos.clear();
+        ep.blockers = None;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Fix the recap composer. Latest: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]"
+        );
+        assert!(crate::extraction::provenance::is_csr_emission(&got));
+        // Without an intent the receipts stand alone, as before.
+        ep.anchor_request = None;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]"
         );
     }
 

@@ -94,21 +94,27 @@ pub struct Episode {
     /// "no intent" from "never measured" and treats it as legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap_evidence_version: Option<u32>,
-    /// The session's anchor task (`anchor_segment`): the task segment with the
-    /// most work, or the latest one when it carries at least half that work,
-    /// as whole leading sentences (`hooks::recap::clean_intent`). `None` when
-    /// no candidate has a clean rendering — the recap then abstains.
-    /// Episodes written by the first version stored the latest task here.
+    /// The session's anchor task (`anchor_segment`): its first task, else the
+    /// segment with the most work, as whole leading sentences
+    /// (`hooks::recap::clean_intent`). `None` when neither has a clean
+    /// rendering — the recap then abstains. Episodes written by the first
+    /// version stored the latest task here.
     #[serde(
         default,
         alias = "latest_request",
         skip_serializing_if = "Option::is_none"
     )]
     pub anchor_request: Option<String>,
-    /// Completions observed inside the anchor segment: commits the session
-    /// made and tasks it marked completed. Each carries its receipt.
+    /// The session's latest completions: commits it made and tasks it marked
+    /// completed, each with its receipt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completions: Vec<CompletionReceipt>,
+    /// True when the anchor is not the session's latest task segment, so the
+    /// receipts are not its completion and the recap must not render them as
+    /// such. `false` (the default) for episodes written before this existed,
+    /// whose completions were the anchor's own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub completions_untied: bool,
 }
 
 /// A completion with the evidence that proves it.
@@ -217,7 +223,7 @@ const HARNESS_USER_ROW_PREFIXES: [&str; 4] = [
     "This session is being continued from a previous conversation",
 ];
 
-/// Most completions kept per segment (the recap renders at most two).
+/// Most completions kept per session (the recap renders at most two).
 const MAX_COMPLETIONS: usize = 5;
 
 /// Weight of one commit receipt, in tool calls. Across the newest 1,500
@@ -248,7 +254,6 @@ struct TaskSegment {
     last_prompt_at: Option<chrono::DateTime<chrono::Utc>>,
     tool_calls: u32,
     commits: u32,
-    completions: Vec<CompletionReceipt>,
 }
 
 impl TaskSegment {
@@ -257,39 +262,29 @@ impl TaskSegment {
     }
 }
 
-/// The anchor task and its completions. The heaviest segment anchors the
-/// recap unless the latest one carries at least half its weight. If the
-/// chosen segment has no clean rendering, the next heaviest segment with
-/// any work is tried; otherwise the intent abstains and the chosen
-/// segment's receipts stand alone.
-fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Vec<CompletionReceipt>) {
-    let Some(latest) = segments.len().checked_sub(1) else {
-        return (None, Vec::new());
-    };
-    // Heaviest first; on equal weight the later segment wins.
-    let mut by_weight: Vec<usize> = (0..segments.len()).collect();
-    by_weight.sort_by(|&a, &b| {
-        segments[b]
-            .weight()
-            .cmp(&segments[a].weight())
-            .then(b.cmp(&a))
-    });
-    let heaviest = by_weight[0];
-    let chosen = if segments[latest].weight() * 2 >= segments[heaviest].weight() {
-        latest
-    } else {
-        heaviest
-    };
-    let fallback = by_weight
-        .iter()
-        .copied()
-        .find(|&i| i != chosen && segments[i].weight() > 0);
-    for index in std::iter::once(chosen).chain(fallback) {
+/// The anchor task and its segment index. The first task anchors the recap
+/// (blind labels picked it in 9 of 11 sessions, the most-work segment in 7).
+/// If it has no clean rendering, the heaviest other segment with any work is
+/// tried; otherwise the intent abstains.
+fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Option<usize>) {
+    if segments.is_empty() {
+        return (None, None);
+    }
+    // Heaviest other segment; on equal weight the later one wins.
+    let heaviest = (1..segments.len())
+        .filter(|&i| segments[i].weight() > 0)
+        .max_by(|&a, &b| {
+            segments[a]
+                .weight()
+                .cmp(&segments[b].weight())
+                .then(a.cmp(&b))
+        });
+    for index in std::iter::once(0).chain(heaviest) {
         if let Some(intent) = crate::hooks::recap::clean_intent(&segments[index].prose) {
-            return (Some(intent), segments[index].completions.clone());
+            return (Some(intent), Some(index));
         }
     }
-    (None, segments[chosen].completions.clone())
+    (None, None)
 }
 
 /// A typed prompt's text for the recap, and whether it is a forwarded note.
@@ -484,6 +479,8 @@ fn extract_episode_from_messages(
     // Task/todo completions claimed by a tool_use, keyed by its id. They
     // become evidence only when a non-error tool_result answers that id.
     let mut pending_completions: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // The session's receipts, latest last (MAX_COMPLETIONS kept).
+    let mut completions: Vec<CompletionReceipt> = Vec::new();
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -800,12 +797,12 @@ fn extract_episode_from_messages(
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| git_tool_ids.contains(id));
                         let failed = block.get("is_error").and_then(|v| v.as_bool()) == Some(true);
-                        if let (true, Some(task)) =
-                            (from_git && !failed && !sidechain, segments.last_mut())
-                        {
+                        if from_git && !failed && !sidechain {
                             for commit in GIT_COMMIT_LINE_RE.captures_iter(&block_text) {
-                                task.commits += 1;
-                                push_completion(&mut task.completions, &commit[2], &commit[1][..7]);
+                                if let Some(task) = segments.last_mut() {
+                                    task.commits += 1;
+                                }
+                                push_completion(&mut completions, &commit[2], &commit[1][..7]);
                             }
                         }
                         if let Some(claimed) = block
@@ -813,10 +810,9 @@ fn extract_episode_from_messages(
                             .and_then(|v| v.as_str())
                             .and_then(|id| pending_completions.remove(id))
                         {
-                            if let (true, Some(task)) = (!failed && !sidechain, segments.last_mut())
-                            {
+                            if !failed && !sidechain {
                                 for (claim, receipt) in claimed {
-                                    push_completion(&mut task.completions, &claim, &receipt);
+                                    push_completion(&mut completions, &claim, &receipt);
                                 }
                             }
                         }
@@ -874,7 +870,8 @@ fn extract_episode_from_messages(
         .find(|t| t.status != "completed")
         .map(|t| t.content.clone());
 
-    let (anchor_request, completions) = anchor_segment(&segments);
+    let (anchor_request, anchor_index) = anchor_segment(&segments);
+    let completions_untied = anchor_index.is_some_and(|i| i + 1 != segments.len());
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let success_signal = crate::extraction::has_success_signal(&completed);
@@ -916,6 +913,7 @@ fn extract_episode_from_messages(
         recap_evidence_version: Some(RECAP_EVIDENCE_VERSION),
         anchor_request,
         completions,
+        completions_untied,
     }
 }
 
@@ -2011,6 +2009,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -2066,6 +2065,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
         };
 
         let tags = episode_tags(&ep);
@@ -2748,23 +2748,32 @@ mod tests {
     }
 
     #[test]
-    fn anchor_request_is_the_most_recent_task_not_the_first_prompt() {
+    fn anchor_is_the_first_task_whole_never_cut() {
         let ep = extract(&multi_topic_session());
-        // `request` keeps its documented meaning (first prompt) for its readers.
         assert!(ep.request.starts_with("anthropics codemod"));
         assert_eq!(ep.recap_evidence_version, Some(RECAP_EVIDENCE_VERSION));
         assert_eq!(
             ep.anchor_request.as_deref(),
-            Some("How do we show cost as % of max plan")
+            Some(
+                "anthropics codemod, when github links are bought up or disccussed, can \
+                 present a side pane (enhanced for herdr users) - thoughts?"
+            )
         );
     }
 
     #[test]
-    fn evidence_before_the_latest_task_does_not_belong_to_it() {
-        // The only commit predates the latest task; the closing prose is not
-        // evidence. Nothing is completed for the current task.
+    fn receipts_of_a_session_are_untied_when_a_later_task_followed() {
+        // The only commit came under the first topic, but a later task
+        // followed, so the recap must not read it as the anchor's result.
         let ep = extract(&multi_topic_session());
-        assert!(ep.completions.is_empty(), "{:?}", ep.completions);
+        assert_eq!(
+            ep.completions,
+            vec![CompletionReceipt {
+                claim: "feat(pane): first topic commit".into(),
+                receipt: "0aa11bb".into(),
+            }]
+        );
+        assert!(ep.completions_untied);
     }
 
     #[test]
@@ -2782,14 +2791,14 @@ mod tests {
     #[test]
     fn dreamer_what_if_is_a_task_rendered_as_a_note() {
         let ep = extract(&[
-            typed_line("can you move things out of tmp to the right place", "typed"),
-            // Sent mid-turn, yet a note never joins the task before it.
             typed_line(
                 "What if Claude opening a memory note also pulled in its session?\n\n\
                  CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
                  > Notes are where Claude looks first.",
                 "typed",
             ),
+            // Sent mid-turn, yet nothing joins onto a note.
+            typed_line("and check the pane width while you are at it", "queued"),
             typed_line("ok, do it please", "typed"),
         ]);
         assert_eq!(
@@ -2816,14 +2825,11 @@ mod tests {
 
     #[test]
     fn forwarded_note_without_a_title_uses_its_first_heads_up_sentence() {
-        let ep = extract(&[
-            typed_line("can you move things out of tmp to the right place", "typed"),
-            typed_line(
-                "Here is a note offered by a side agent:\n\n\
-                 > Heads up · The recap came out garbled twice today. Both runs cut the prompt.",
-                "typed",
-            ),
-        ]);
+        let ep = extract(&[typed_line(
+            "Here is a note offered by a side agent:\n\n\
+             > Heads up · The recap came out garbled twice today. Both runs cut the prompt.",
+            "typed",
+        )]);
         assert_eq!(
             ep.anchor_request.as_deref(),
             Some("note: The recap came out garbled twice today.")
@@ -2947,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn recap_for_the_live_garble_shape_uses_latest_task_and_abstains_on_prose() {
+    fn recap_for_the_live_garble_shape_names_the_whole_first_task_and_no_prose() {
         let ep = extract(&multi_topic_session());
         let got = crate::hooks::recap::compose_recap(
             &ep,
@@ -2964,9 +2970,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             got,
-            "recap [3h ago]: How do we show cost as % of max plan. [[CSR:RECAP]]"
+            "recap [3h ago]: anthropics codemod, when github links are bought up or disccussed, \
+             can present a side pane (enhanced for herdr users) - thoughts? Latest: \
+             feat(pane): first topic commit (0aa11bb). [[CSR:RECAP]]"
         );
-        assert!(!got.contains("anthropics codemod"));
         assert!(!got.contains("How the share works"));
     }
 
@@ -2990,9 +2997,6 @@ mod tests {
         // Live shape (lines 28444/28462): the second message arrived while the
         // first turn was cancelled ("remote-cancel"), never finished.
         let ep = extract(&[
-            typed_line("fix the pane layout", "typed"),
-            assistant_stop_line("Done, the pane fits.", "end_turn"),
-            turn_end_line(),
             typed_line("How do we show cost as % of mac", "queued"),
             assistant_stop_line("remote-cancel", "stop_sequence"),
             typed_line("% of max plan if they have it or cents", "queued"),
@@ -3009,15 +3013,19 @@ mod tests {
             turn_end_line(),
             assistant_stop_line("Here is the answer.", "end_turn"),
         ] {
-            let ep = extract(&[
+            let mut lines = vec![
                 typed_line("How do we show cost as a share of the plan", "typed"),
                 finished,
                 typed_line("now fix the recap garble", "typed"),
-            ]);
+            ];
+            lines.extend(committed("b", "1a2b3c4", "fix(recap): garble"));
+            let ep = extract(&lines);
             assert_eq!(
                 ep.anchor_request.as_deref(),
-                Some("now fix the recap garble")
+                Some("How do we show cost as a share of the plan")
             );
+            // The receipt belongs to a later, separate task.
+            assert!(ep.completions_untied);
         }
     }
 
@@ -3272,65 +3280,6 @@ mod tests {
     }
 
     #[test]
-    fn latest_segment_wins_at_half_the_heaviest_weight() {
-        let mut lines = segment("build me a vox explainer video for the above", "a", 10);
-        lines.extend(segment("now cut a vertical version for reels", "b", 5));
-        assert_eq!(
-            extract(&lines).anchor_request.as_deref(),
-            Some("now cut a vertical version for reels")
-        );
-        let mut lines = segment("build me a vox explainer video for the above", "a", 10);
-        lines.extend(segment("now cut a vertical version for reels", "b", 4));
-        assert_eq!(
-            extract(&lines).anchor_request.as_deref(),
-            Some("build me a vox explainer video for the above")
-        );
-    }
-
-    #[test]
-    fn a_commit_receipt_weighs_more_than_a_tool_call() {
-        // 12 calls vs 1 call + a commit (1 + 1 + COMMIT_WEIGHT = 12): the
-        // latest segment reaches half the heaviest only through its receipt.
-        let mut lines = segment("clean up the duplicate main layouts", "a", 12);
-        lines.push(typed_line("commit the cleanup now", "typed"));
-        lines.extend(work("b", 1));
-        lines.extend(committed("b", "1a2b3c4", "fix(app): one main layout"));
-        lines.push(assistant_stop_line("Committed.", "end_turn"));
-        let ep = extract(&lines);
-        assert_eq!(ep.anchor_request.as_deref(), Some("commit the cleanup now"));
-        assert_eq!(
-            ep.completions,
-            vec![CompletionReceipt {
-                claim: "fix(app): one main layout".into(),
-                receipt: "1a2b3c4".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn completed_comes_from_the_anchor_segment_only() {
-        let mut lines = vec![typed_line("clean up the duplicate main layouts", "typed")];
-        lines.extend(work("a", 20));
-        lines.extend(committed("a", "5e5e5e5", "fix(app): one main layout"));
-        lines.push(assistant_stop_line("Done.", "end_turn"));
-        lines.push(typed_line("what time is it in Chennai", "typed"));
-        lines.extend(committed("b", "6f6f6f6", "chore: unrelated"));
-        lines.push(assistant_stop_line("Done.", "end_turn"));
-        let ep = extract(&lines);
-        assert_eq!(
-            ep.anchor_request.as_deref(),
-            Some("clean up the duplicate main layouts")
-        );
-        assert_eq!(
-            ep.completions,
-            vec![CompletionReceipt {
-                claim: "fix(app): one main layout".into(),
-                receipt: "5e5e5e5".into(),
-            }]
-        );
-    }
-
-    #[test]
     fn an_unclean_anchor_falls_back_to_the_next_heaviest() {
         let long = format!("{} end", "word ".repeat(40));
         let mut lines = segment(&long, "a", 20);
@@ -3421,5 +3370,72 @@ mod tests {
             ep.anchor_request.as_deref(),
             Some("How do we show cost as % of mac % of max plan if they have it or cents")
         );
+    }
+
+    // ---- round 4 pivot: anchor = the first task (blind labels 9/11) ----
+
+    #[test]
+    fn pivot_first_task_anchors_whatever_work_follows() {
+        let mut lines = segment(
+            "whats the next song to attempt, with trap sophistication",
+            "a",
+            1,
+        );
+        lines.extend(segment("thats a copyright trap what else", "b", 30));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("whats the next song to attempt, with trap sophistication")
+        );
+    }
+
+    #[test]
+    fn pivot_unclean_first_task_falls_back_to_the_heaviest_segment() {
+        let long = format!("{} end", "word ".repeat(40));
+        let mut lines = segment(&long, "a", 2);
+        lines.extend(segment("clean up the duplicate main layouts", "b", 12));
+        lines.push(typed_line("commit the cleanup now", "typed"));
+        lines.extend(work("c", 1));
+        lines.extend(committed("c", "1a2b3c4", "fix(app): one main layout"));
+        lines.push(assistant_stop_line("Committed.", "end_turn"));
+        // 12 calls vs 2 calls + one receipt (2 + COMMIT_WEIGHT = 12, later wins).
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("commit the cleanup now")
+        );
+        // No segment with work besides the unclean first: abstain.
+        let mut lines = segment(&long, "a", 20);
+        lines.push(typed_line(
+            "Will the audio cause linkedin to not play it",
+            "typed",
+        ));
+        assert_eq!(extract(&lines).anchor_request, None);
+    }
+
+    #[test]
+    fn pivot_completed_is_the_sessions_latest_receipts_tied_only_to_a_latest_anchor() {
+        let mut lines = segment("clean up the duplicate main layouts", "a", 3);
+        lines.push(typed_line("and ship the radio reorder too", "typed"));
+        lines.extend(committed("b", "5e5e5e5", "fix(app): one main layout"));
+        lines.extend(committed(
+            "c",
+            "6f6f6f6",
+            "feat(radio): sundarakanda second",
+        ));
+        lines.extend(committed("d", "7a7a7a7", "chore: release notes"));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        let ep = extract(&lines);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("clean up the duplicate main layouts")
+        );
+        let receipts: Vec<&str> = ep.completions.iter().map(|c| c.receipt.as_str()).collect();
+        assert_eq!(receipts, ["5e5e5e5", "6f6f6f6", "7a7a7a7"]);
+        // The anchor is not the latest segment: the receipts are not its.
+        assert!(ep.completions_untied);
+
+        let mut lines = segment("clean up the duplicate main layouts", "a", 3);
+        lines.extend(committed("b", "5e5e5e5", "fix(app): one main layout"));
+        let ep = extract(&lines);
+        assert!(!ep.completions_untied);
     }
 }

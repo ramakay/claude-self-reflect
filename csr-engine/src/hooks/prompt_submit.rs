@@ -3163,6 +3163,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![crate::extraction::anchors::FunctionAnchor {
                 file: "src/radio/RadioSheet.swift".into(),
                 node_kind: "file".into(),

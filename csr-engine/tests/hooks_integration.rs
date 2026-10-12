@@ -1516,6 +1516,7 @@ fn test_explore_prompt_never_fails() {
         recap_evidence_version: None,
         anchor_request: None,
         completions: vec![],
+        completions_untied: false,
         anchors: vec![],
     };
 
@@ -2034,6 +2035,7 @@ fn test_episode_struct_serialization() {
         recap_evidence_version: None,
         anchor_request: None,
         completions: vec![],
+        completions_untied: false,
         anchors: vec![],
     };
 

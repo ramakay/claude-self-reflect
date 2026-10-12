@@ -1783,6 +1783,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         };
         let verdicts = vec![
@@ -1845,6 +1846,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -1886,6 +1888,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -1929,6 +1932,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -1973,6 +1977,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -2187,6 +2192,7 @@ mod tests {
             recap_evidence_version: None,
             anchor_request: None,
             completions: vec![],
+            completions_untied: false,
             anchors: vec![],
         }
     }
