@@ -520,6 +520,25 @@ fn is_path_or_url(token: &str) -> bool {
         || token.starts_with("../")
         || token.starts_with("www.")
         || token.contains("://")
+        || is_relative_path(token)
+}
+
+/// A repo-relative path such as `src/parser.rs` or `docs/plans/a/b`: a '/'
+/// plus a file extension on the last component, or two or more '/'. A lone
+/// slash in prose (`and/or`, `w/o`) is not a path.
+fn is_relative_path(token: &str) -> bool {
+    match token.matches('/').count() {
+        0 => false,
+        1 => token.split_once('/').is_some_and(|(dir, file)| {
+            !dir.is_empty()
+                && file.rsplit_once('.').is_some_and(|(stem, ext)| {
+                    !stem.is_empty()
+                        && (1..=8).contains(&ext.len())
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                })
+        }),
+        _ => true,
+    }
 }
 
 /// The anchor's intent: `clean_intent`, or, when no whole sentence fits in
@@ -1861,7 +1880,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_6_relative_paths_never_survive_a_clause_cut() {
         let text = format!(
             "Please fix the parser in src/parser.rs, {}",
