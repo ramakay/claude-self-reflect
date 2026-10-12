@@ -252,6 +252,9 @@ fn extract_episode_from_messages(
     let mut completions: Vec<CompletionReceipt> = Vec::new();
     // Bash tool_use ids whose command can print a commit success line.
     let mut git_tool_ids: HashSet<String> = HashSet::new();
+    // Task/todo completions claimed by a tool_use, keyed by its id. They
+    // become evidence only when a non-error tool_result answers that id.
+    let mut pending_completions: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -358,18 +361,24 @@ fn extract_episode_from_messages(
                                             })
                                             .take(10)
                                             .collect();
-                                        for item in todos.iter().filter(|t| {
-                                            t.status == "completed"
-                                                && !previous.iter().any(|p| {
-                                                    p.content == t.content
-                                                        && p.status == "completed"
-                                                })
-                                        }) {
-                                            push_completion(
-                                                &mut completions,
-                                                &item.content,
-                                                "todo completed",
-                                            );
+                                        let newly_done: Vec<(String, String)> = todos
+                                            .iter()
+                                            .filter(|t| {
+                                                t.status == "completed"
+                                                    && !previous.iter().any(|p| {
+                                                        p.content == t.content
+                                                            && p.status == "completed"
+                                                    })
+                                            })
+                                            .map(|t| {
+                                                (t.content.clone(), "todo completed".to_string())
+                                            })
+                                            .collect();
+                                        if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                                            pending_completions
+                                                .entry(id.to_string())
+                                                .or_default()
+                                                .extend(newly_done);
                                         }
                                         task_id_map.clear();
                                         pending_task_ids.clear();
@@ -417,14 +426,20 @@ fn extract_episode_from_messages(
                                                     input.get("status").and_then(|s| s.as_str())
                                                 {
                                                     if let Some(item) = todos.get_mut(idx) {
-                                                        if status == "completed"
-                                                            && item.status != "completed"
-                                                        {
-                                                            push_completion(
-                                                                &mut completions,
-                                                                &item.content,
-                                                                &format!("task #{id} completed"),
-                                                            );
+                                                        if let (true, Some(use_id)) = (
+                                                            status == "completed"
+                                                                && item.status != "completed",
+                                                            block
+                                                                .get("id")
+                                                                .and_then(|v| v.as_str()),
+                                                        ) {
+                                                            pending_completions
+                                                                .entry(use_id.to_string())
+                                                                .or_default()
+                                                                .push((
+                                                                    item.content.clone(),
+                                                                    format!("task #{id} completed"),
+                                                                ));
                                                         }
                                                         item.status = status.to_string();
                                                     }
@@ -531,6 +546,17 @@ fn extract_episode_from_messages(
                         if from_git && !failed {
                             for commit in GIT_COMMIT_LINE_RE.captures_iter(&block_text) {
                                 push_completion(&mut completions, &commit[2], &commit[1][..7]);
+                            }
+                        }
+                        if let Some(claimed) = block
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|id| pending_completions.remove(id))
+                        {
+                            if !failed {
+                                for (claim, receipt) in claimed {
+                                    push_completion(&mut completions, &claim, &receipt);
+                                }
                             }
                         }
                         let Some(caps) = TASK_CREATED_RE.captures(&block_text) else {
@@ -2597,6 +2623,7 @@ mod tests {
                 "toolu_t2",
                 serde_json::json!({"taskId": "3", "status": "completed"}),
             ),
+            tool_result_bound("toolu_t2", "Updated task #3 status"),
             assistant_named_tool(
                 "TodoWrite",
                 "toolu_t3",
@@ -2605,6 +2632,7 @@ mod tests {
                     {"content": "Commit", "status": "pending"}
                 ]}),
             ),
+            tool_result_bound("toolu_t3", "Todos have been modified successfully"),
         ]);
         assert_eq!(
             ep.completions,
@@ -2756,5 +2784,73 @@ mod tests {
             "typed",
         )]);
         assert_eq!(ep.latest_request.as_deref(), Some("Fix login validation."));
+    }
+
+    fn error_result(tool_use_id: &str, content: &str) -> String {
+        serde_json::json!({"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": tool_use_id, "is_error": true,
+            "content": content
+        }]}})
+        .to_string()
+    }
+
+    #[test]
+    fn task_completion_counts_only_on_a_successful_tool_result() {
+        let task = |result: String| {
+            extract(&[
+                typed_line("ship the deploy", "typed"),
+                assistant_named_tool(
+                    "TaskCreate",
+                    "toolu_c",
+                    serde_json::json!({"subject": "Deploy"}),
+                ),
+                tool_result_bound("toolu_c", "Task #3 created successfully"),
+                assistant_named_tool(
+                    "TaskUpdate",
+                    "toolu_u",
+                    serde_json::json!({"taskId": "3", "status": "completed"}),
+                ),
+                result,
+            ])
+        };
+        assert!(task(error_result("toolu_u", "Task not found"))
+            .completions
+            .is_empty());
+        assert_eq!(
+            task(tool_result_bound("toolu_u", "Updated task #3 status")).completions,
+            vec![CompletionReceipt {
+                claim: "Deploy".into(),
+                receipt: "task #3 completed".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn todo_completion_counts_only_on_a_successful_tool_result() {
+        let todo = |result: String| {
+            extract(&[
+                typed_line("ship the deploy", "typed"),
+                assistant_named_tool(
+                    "TodoWrite",
+                    "toolu_w",
+                    serde_json::json!({"todos": [{"content": "Deploy", "status": "completed"}]}),
+                ),
+                result,
+            ])
+        };
+        assert!(todo(error_result("toolu_w", "InputValidationError"))
+            .completions
+            .is_empty());
+        assert_eq!(
+            todo(tool_result_bound(
+                "toolu_w",
+                "Todos have been modified successfully"
+            ))
+            .completions,
+            vec![CompletionReceipt {
+                claim: "Deploy".into(),
+                receipt: "todo completed".into(),
+            }]
+        );
     }
 }
