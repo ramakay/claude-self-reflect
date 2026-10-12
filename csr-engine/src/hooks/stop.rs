@@ -279,7 +279,11 @@ fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Option<usize>) {
                 .cmp(&segments[b].weight())
                 .then(a.cmp(&b))
         });
-    for index in std::iter::once(0).chain(heaviest) {
+    // The first task may be cut at a clause when it is over-long.
+    if let Some(intent) = crate::hooks::recap::anchor_intent(&segments[0].prose) {
+        return (Some(intent), Some(0));
+    }
+    if let Some(index) = heaviest {
         if let Some(intent) = crate::hooks::recap::clean_intent(&segments[index].prose) {
             return (Some(intent), Some(index));
         }
@@ -3437,5 +3441,19 @@ mod tests {
         lines.extend(committed("b", "5e5e5e5", "fix(app): one main layout"));
         let ep = extract(&lines);
         assert!(!ep.completions_untied);
+    }
+
+    #[test]
+    fn an_over_long_first_task_anchors_on_its_clause_not_a_fallback() {
+        let mut lines = segment(
+            "This ia new Reycital challenge - there are two videos here /Users/r/Downloads/IMG_8550.mov /Users/r/Downloads/IMG_8546.mov - 8550 is the melodica, which is the primary melody and 8546 is the piano - your mission if you chose to take it on is to import both into logic.",
+            "a",
+            5,
+        );
+        lines.extend(segment("stopped check now", "b", 40));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("This ia new Reycital challenge")
+        );
     }
 }

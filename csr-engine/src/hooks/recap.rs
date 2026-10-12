@@ -468,6 +468,20 @@ fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
 /// before a quote or list). Soft line wraps inside a paragraph are joined;
 /// a blank line or a list item ends the paragraph.
 pub fn clean_intent(text: &str) -> Option<String> {
+    let clean = first_paragraph(text)?;
+    let mut taken = 0;
+    for (_, end) in split_preview_sentences(&clean) {
+        if clean[..end].chars().count() > INTENT_MAX_CHARS {
+            break;
+        }
+        taken = end;
+    }
+    (taken > 0).then(|| clean[..taken].to_string())
+}
+
+/// The prompt's opening paragraph, sanitized, or `None` when it only
+/// introduces material that follows (ends with ':') or has no substance.
+fn first_paragraph(text: &str) -> Option<String> {
     let mut paragraph: Vec<&str> = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -487,17 +501,59 @@ pub fn clean_intent(text: &str) -> Option<String> {
         paragraph.push(trimmed);
     }
     let clean = sanitize_preview(&paragraph.join(" "));
-    if clean.ends_with(':') || !has_substance(&clean) {
-        return None;
+    (!clean.ends_with(':') && has_substance(&clean)).then_some(clean)
+}
+
+/// Clause boundaries an over-long first sentence may be cut at.
+const CLAUSE_BOUNDARIES: [&str; 5] = [", ", " - ", " \u{2013} ", "; ", ": "];
+
+/// Fewest words a clause cut may keep.
+const MIN_CLAUSE_WORDS: usize = 4;
+
+/// A file path or URL token: the cut never keeps one, so a clause never runs
+/// into `/Users/...` or ends on a link.
+fn is_path_or_url(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| matches!(c, '(' | ')' | '"' | '\'' | ',' | ';'));
+    token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("www.")
+        || token.contains("://")
+}
+
+/// The anchor's intent: `clean_intent`, or, when no whole sentence fits in
+/// [`INTENT_MAX_CHARS`], the opening clause cut at the LAST clause boundary at
+/// or before that limit. The clause keeps at least [`MIN_CLAUSE_WORDS`] words
+/// and no file path or URL (so the cut lands before the first one), loses its
+/// trailing punctuation, and gets no ellipsis. `None` when no boundary
+/// qualifies.
+pub fn anchor_intent(text: &str) -> Option<String> {
+    if let Some(intent) = clean_intent(text) {
+        return Some(intent);
     }
-    let mut taken = 0;
-    for (_, end) in split_preview_sentences(&clean) {
-        if clean[..end].chars().count() > INTENT_MAX_CHARS {
+    let clean = first_paragraph(text)?;
+    let mut best: Option<String> = None;
+    for (at, _) in clean.char_indices() {
+        if clean[..at].chars().count() > INTENT_MAX_CHARS {
             break;
         }
-        taken = end;
+        if !CLAUSE_BOUNDARIES.iter().any(|b| clean[at..].starts_with(b)) {
+            continue;
+        }
+        let clause = clean[..at].trim_end_matches(|c: char| {
+            c.is_whitespace() || c.is_ascii_punctuation() || c == '\u{2013}' || c == '\u{2014}'
+        });
+        let words: Vec<&str> = clause.split_whitespace().collect();
+        if words.iter().any(|w| is_path_or_url(w)) {
+            // Every later clause contains this path too.
+            break;
+        }
+        if words.len() >= MIN_CLAUSE_WORDS && has_substance(clause) {
+            best = Some(clause.to_string());
+        }
     }
-    (taken > 0).then(|| clean[..taken].to_string())
+    best
 }
 
 /// Words that only acknowledge or green-light the previous turn.
@@ -1728,6 +1784,80 @@ mod tests {
             got,
             "recap [now]: Implemented deterministic recap output (abc1234). [[CSR:RECAP]]"
         );
+    }
+
+    // ---- round 5: clause cut for an over-long first task ----
+
+    const REYCITAL_1: &str = "This ia new Reycital challenge - there are two videos here /Users/ramakrishnanannaswamy/Downloads/IMG_8550.mov /Users/ramakrishnanannaswamy/Downloads/IMG_8546.mov - 8550 is the melodica, which is the primary melody and 8546 is the piano - your mission if you chose to take it on is to import both into logic get the bounce out - then for the video propose your thoughts. do initia probes and tell me any questions on concept";
+    const SELF_BRANDING_1: &str = "I am visualizing a atlantic style essay about how ai usage trends have changed and why even though things look different they are thes same, this is a research and extrapolation task. the eassay looks at what has truly materially changed";
+
+    #[test]
+    fn anchor_intent_cuts_an_over_long_first_sentence_at_a_clause() {
+        assert_eq!(clean_intent(REYCITAL_1), None);
+        assert_eq!(
+            anchor_intent(REYCITAL_1).as_deref(),
+            Some("This ia new Reycital challenge")
+        );
+        assert_eq!(clean_intent(SELF_BRANDING_1), None);
+        assert_eq!(
+            anchor_intent(SELF_BRANDING_1).as_deref(),
+            Some(
+                "I am visualizing a atlantic style essay about how ai usage trends have changed \
+                 and why even though things look different they are thes same"
+            )
+        );
+        // A whole sentence that fits still wins over any cut.
+        assert_eq!(
+            anchor_intent("Fix the recap composer, please. Then more.").as_deref(),
+            Some("Fix the recap composer, please. Then more.")
+        );
+    }
+
+    #[test]
+    fn clause_cut_needs_four_words_and_never_ends_in_a_path_or_url() {
+        let long_tail = "word ".repeat(40);
+        // Only boundary gives three words: abstain.
+        assert_eq!(anchor_intent(&format!("Fix the pane, {long_tail}")), None);
+        // A clause ending in a URL or path is never the cut.
+        assert_eq!(
+            anchor_intent(&format!(
+                "review this repo https://github.com/x/y, {long_tail}"
+            )),
+            None
+        );
+        assert_eq!(
+            anchor_intent(&format!(
+                "compare the two takes in ~/Movies/take.mov; {long_tail}"
+            )),
+            None
+        );
+        // The last valid boundary at or before 160 chars wins; no ellipsis.
+        let got = anchor_intent(&format!(
+            "Build the reel from both clips, sync the melodica first; then {long_tail}"
+        ))
+        .unwrap();
+        assert_eq!(
+            got,
+            "Build the reel from both clips, sync the melodica first"
+        );
+    }
+
+    #[test]
+    fn a_clipped_anchor_is_still_recognised_as_a_csr_emission() {
+        let mut ep = episode();
+        ep.anchor_request = anchor_intent(REYCITAL_1);
+        ep.completions.clear();
+        ep.next_steps = None;
+        ep.todos.clear();
+        ep.blockers = None;
+        let got = compose_recap(&ep, &RecapFeeds::empty(), "11h ago").unwrap();
+        assert_eq!(
+            got,
+            "recap [11h ago]: This ia new Reycital challenge. [[CSR:RECAP]]"
+        );
+        assert!(crate::extraction::provenance::is_csr_emission(&got));
+        assert!(crate::extraction::provenance::extractable(&got).is_none());
+        assert_eq!(crate::extraction::provenance::strip_csr_emissions(&got), "");
     }
 
     // ---- read-only probe against a real transcript ----------------------
