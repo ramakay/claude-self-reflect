@@ -325,6 +325,22 @@ fn forwarded_note_headline(text: &str) -> Option<String> {
             .filter_map(|line| line.trim().strip_prefix('>'))
             .map(str::trim)
             .collect();
+        // A forwarded note that carries CSR's own output (a recap, an
+        // injected block, any machine sentinel) is CSR's words. Clipping its
+        // headline would drop the sentinel and launder it as a note.
+        let body: String = quoted
+            .iter()
+            .map(|line| line.trim_matches('*').trim())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if crate::extraction::provenance::contains_machine_sentinel(rest)
+            || crate::extraction::provenance::is_csr_emission(&body)
+            || quoted.iter().any(|line| {
+                crate::extraction::provenance::is_csr_emission(line.trim_matches('*').trim())
+            })
+        {
+            return None;
+        }
         let title = quoted.iter().find_map(|line| {
             let inner = line.strip_prefix("**")?.strip_suffix("**")?.trim();
             (!inner.contains("**") && inner.chars().any(char::is_alphanumeric))
@@ -3546,7 +3562,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_1_a_forwarded_note_holding_a_recap_is_never_a_note() {
         let ep = extract(&[typed_line(
             "Here is a note offered by a side agent:\n\n> **recap [1h ago]: Fix login validation. Latest: fix(auth): preserve form errors until the next submitted validation request (abc1234); test(auth): cover retries and stale error clearing when the validation request changes (def5678). [[CSR:RECAP]]**",
