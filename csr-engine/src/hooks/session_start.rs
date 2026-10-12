@@ -455,7 +455,10 @@ fn detect_continued_session(
     project_name: &str,
     now: &DateTime<Utc>,
 ) -> Option<ContinuedSession> {
-    let session = storage.get_most_recent_session(project_name).ok()??;
+    // Never continue from a headless `claude -p` run (entrypoint sdk-*).
+    let session = storage
+        .get_most_recent_interactive_session(project_name)
+        .ok()??;
 
     // Check if it's recent enough (guard against future timestamps from clock skew)
     let ts = temporal::parse_timestamp(&session.timestamp)?;
@@ -2497,7 +2500,6 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_4_continued_from_never_names_a_headless_session() {
         let storage = crate::storage::Storage::open_memory().unwrap();
         let now = Utc::now();

@@ -2571,6 +2571,32 @@ pub fn get_recent_sessions(
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<SessionInfo>> {
+    recent_sessions(conn, limit, project, false)
+}
+
+/// The newest session of `project` that is not a known headless run
+/// (`claude -p` child, entrypoint `sdk-*`). The exclusion is in the query,
+/// before its LIMIT, so a fresh headless run cannot hide the newest
+/// interactive session. An unrecorded entrypoint is unknown and stays.
+pub fn get_most_recent_interactive_session(
+    conn: &Connection,
+    project: &str,
+) -> Result<Option<SessionInfo>> {
+    Ok(recent_sessions(conn, 1, Some(project), true)?.pop())
+}
+
+fn recent_sessions(
+    conn: &Connection,
+    limit: usize,
+    project: Option<&str>,
+    exclude_headless: bool,
+) -> Result<Vec<SessionInfo>> {
+    let headless_clause = if exclude_headless {
+        "AND c.conversation_id NOT IN (SELECT conversation_id FROM conversation_entrypoint \
+         WHERE entrypoint LIKE 'sdk-%')"
+    } else {
+        ""
+    };
     // Enrichment subquery: COALESCE across enrichment types with priority.
     // Heuristic reflection may be deleted by v3 supersession, so fall through.
     let enrichment_subquery = "COALESCE(
@@ -2602,7 +2628,7 @@ pub fn get_recent_sessions(
                  ORDER BY c2.rowid ASC LIMIT 1) as summary,
                 {enrichment_subquery}
          FROM chunks c
-         WHERE c.project_name = ?1
+         WHERE c.project_name = ?1 {headless_clause}
          GROUP BY c.conversation_id
          ORDER BY MAX(c.timestamp) DESC LIMIT ?2"
         )
@@ -2617,6 +2643,7 @@ pub fn get_recent_sessions(
                  ORDER BY c2.rowid ASC LIMIT 1) as summary,
                 {enrichment_subquery}
          FROM chunks c
+         WHERE 1 = 1 {headless_clause}
          GROUP BY c.conversation_id
          ORDER BY MAX(c.timestamp) DESC LIMIT ?1"
         )

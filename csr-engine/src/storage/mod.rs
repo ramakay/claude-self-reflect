@@ -445,6 +445,15 @@ impl Storage {
         queries::get_recent_sessions(&conn, limit, project)
     }
 
+    /// See `queries::get_most_recent_interactive_session`.
+    pub fn get_most_recent_interactive_session(
+        &self,
+        project: &str,
+    ) -> Result<Option<queries::SessionInfo>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_most_recent_interactive_session(&conn, project)
+    }
+
     pub fn get_most_recent_session(&self, project: &str) -> Result<Option<queries::SessionInfo>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_most_recent_session(&conn, project)
