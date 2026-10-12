@@ -3084,7 +3084,7 @@ mod tests {
         ep.request = "anthropics codemod side pane thoughts for herdr users".into();
         ep.message_count = 30_393;
         ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
-        ep.latest_request = Some("How do we show cost as % of max plan".into());
+        ep.anchor_request = Some("How do we show cost as % of max plan".into());
         assert!(is_episode_echo("how do we show cost as % of max plan", &ep));
         // The first prompt still counts, as before.
         assert!(is_episode_echo(
@@ -3161,7 +3161,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![crate::extraction::anchors::FunctionAnchor {
                 file: "src/radio/RadioSheet.swift".into(),

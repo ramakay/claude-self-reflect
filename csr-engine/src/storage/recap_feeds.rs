@@ -1033,7 +1033,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         };

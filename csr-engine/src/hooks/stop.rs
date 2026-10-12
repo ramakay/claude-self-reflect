@@ -89,18 +89,24 @@ pub struct Episode {
     // Recap evidence (hooks::recap). `request` stays the session's FIRST
     // prompt for its other readers; the recap must not use it as the current
     // intent of a long session, which is what these fields are for.
-    /// Which extractor generation wrote `latest_request`/`completions`.
+    /// Which extractor generation wrote `anchor_request`/`completions`.
     /// `None` = an episode written before they existed: the recap cannot tell
     /// "no intent" from "never measured" and treats it as legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recap_evidence_version: Option<u32>,
-    /// The most recent substantive user task of the session, as whole leading
-    /// sentences (`hooks::recap::clean_intent`). `None` when the latest task
-    /// has no clean rendering — the recap then abstains from the intent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_request: Option<String>,
-    /// Completions observed AFTER the latest task was asked: commits the
-    /// session made and tasks it marked completed. Each carries its receipt.
+    /// The session's anchor task (`anchor_segment`): the task segment with the
+    /// most work, or the latest one when it carries at least half that work,
+    /// as whole leading sentences (`hooks::recap::clean_intent`). `None` when
+    /// no candidate has a clean rendering — the recap then abstains.
+    /// Episodes written by the first version stored the latest task here.
+    #[serde(
+        default,
+        alias = "latest_request",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub anchor_request: Option<String>,
+    /// Completions observed inside the anchor segment: commits the session
+    /// made and tasks it marked completed. Each carries its receipt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completions: Vec<CompletionReceipt>,
 }
@@ -211,8 +217,67 @@ const HARNESS_USER_ROW_PREFIXES: [&str; 4] = [
     "This session is being continued from a previous conversation",
 ];
 
-/// Most completions kept per episode (the recap renders at most two).
+/// Most completions kept per segment (the recap renders at most two).
 const MAX_COMPLETIONS: usize = 5;
+
+/// Weight of one commit receipt, in tool calls. Across the newest 1,500
+/// transcripts (main sessions and subagents) the median work behind one
+/// commit was ~50 tool calls (quartiles 33/50/92). A receipt adds a fifth of
+/// that: enough to favour the segment that landed something over one of
+/// similar size, too little for a short "commit it" segment (2-3 calls) to
+/// outweigh a median segment of real work.
+const COMMIT_WEIGHT: u32 = 10;
+
+/// One task: a task prompt, its mid-turn continuations, and the work done
+/// until the next task prompt.
+#[derive(Default)]
+struct TaskSegment {
+    prose: String,
+    tool_calls: u32,
+    commits: u32,
+    completions: Vec<CompletionReceipt>,
+}
+
+impl TaskSegment {
+    fn weight(&self) -> u32 {
+        self.tool_calls + COMMIT_WEIGHT * self.commits
+    }
+}
+
+/// The anchor task and its completions. The heaviest segment anchors the
+/// recap unless the latest one carries at least half its weight. If the
+/// chosen segment has no clean rendering, the next heaviest segment with
+/// any work is tried; otherwise the intent abstains and the chosen
+/// segment's receipts stand alone.
+fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Vec<CompletionReceipt>) {
+    let Some(latest) = segments.len().checked_sub(1) else {
+        return (None, Vec::new());
+    };
+    // Heaviest first; on equal weight the later segment wins.
+    let mut by_weight: Vec<usize> = (0..segments.len()).collect();
+    by_weight.sort_by(|&a, &b| {
+        segments[b]
+            .weight()
+            .cmp(&segments[a].weight())
+            .then(b.cmp(&a))
+    });
+    let heaviest = by_weight[0];
+    let chosen = if segments[latest].weight() * 2 >= segments[heaviest].weight() {
+        latest
+    } else {
+        heaviest
+    };
+    let fallback = by_weight
+        .iter()
+        .copied()
+        .find(|&i| i != chosen && segments[i].weight() > 0);
+    for index in std::iter::once(chosen).chain(fallback) {
+        if let Some(intent) = crate::hooks::recap::clean_intent(&segments[index].prose) {
+            return (Some(intent), segments[index].completions.clone());
+        }
+    }
+    (None, segments[chosen].completions.clone())
+}
 
 /// The person's own prose in a user row, or `None` when the row is not a
 /// typed prompt: tool results, injected/meta rows, compact summaries,
@@ -319,11 +384,10 @@ fn extract_episode_from_messages(
     let mut pending_task_ids: Vec<(String, usize)> = Vec::new();
     // Recap evidence: the latest typed task, and what was provably completed
     // after it (reset whenever a newer task is asked).
-    let mut latest_task_prose: Option<String> = None;
+    let mut segments: Vec<TaskSegment> = Vec::new();
     // Whether the assistant finished a turn since the latest task was asked.
     // A task prompt arriving while that turn is still open continues it.
     let mut turn_finished = true;
-    let mut completions: Vec<CompletionReceipt> = Vec::new();
     // Bash tool_use ids whose command can print a commit success line.
     let mut git_tool_ids: HashSet<String> = HashSet::new();
     // Task/todo completions claimed by a tool_use, keyed by its id. They
@@ -357,22 +421,22 @@ fn extract_episode_from_messages(
             }
         }
 
-        // Latest task: a typed prompt that opens a task replaces the last one,
-        // and evidence gathered before it no longer belongs to it. A prompt
-        // sent mid-turn (no finished turn since the last task) is the same
-        // task continued, so it joins the text instead.
+        // Task segments: a typed prompt that opens a task starts a segment;
+        // the work and receipts that follow belong to it. A prompt sent
+        // mid-turn (no finished turn since the last task) is the same task
+        // continued, so it joins the current segment's text instead.
         if msg_type == "user" || msg_type == "human" {
             if let Some(prose) = typed_prompt_prose(val) {
                 if is_task_prompt(&prose) {
-                    match latest_task_prose.as_mut() {
+                    match segments.last_mut() {
                         Some(task) if !turn_finished => {
-                            task.push(' ');
-                            task.push_str(prose.trim());
+                            task.prose.push(' ');
+                            task.prose.push_str(prose.trim());
                         }
-                        _ => {
-                            latest_task_prose = Some(prose);
-                            completions.clear();
-                        }
+                        _ => segments.push(TaskSegment {
+                            prose,
+                            ..TaskSegment::default()
+                        }),
                     }
                 }
                 // Any typed prompt, an ack included, opens a turn: "go" after
@@ -397,6 +461,9 @@ fn extract_episode_from_messages(
                                     continue;
                                 }
                                 tools_used.insert(name.to_string());
+                                if let (false, Some(task)) = (sidechain, segments.last_mut()) {
+                                    task.tool_calls += 1;
+                                }
 
                                 if name == "Bash" && !sidechain {
                                     let commits = block
@@ -623,9 +690,12 @@ fn extract_episode_from_messages(
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| git_tool_ids.contains(id));
                         let failed = block.get("is_error").and_then(|v| v.as_bool()) == Some(true);
-                        if from_git && !failed && !sidechain {
+                        if let (true, Some(task)) =
+                            (from_git && !failed && !sidechain, segments.last_mut())
+                        {
                             for commit in GIT_COMMIT_LINE_RE.captures_iter(&block_text) {
-                                push_completion(&mut completions, &commit[2], &commit[1][..7]);
+                                task.commits += 1;
+                                push_completion(&mut task.completions, &commit[2], &commit[1][..7]);
                             }
                         }
                         if let Some(claimed) = block
@@ -633,9 +703,10 @@ fn extract_episode_from_messages(
                             .and_then(|v| v.as_str())
                             .and_then(|id| pending_completions.remove(id))
                         {
-                            if !failed && !sidechain {
+                            if let (true, Some(task)) = (!failed && !sidechain, segments.last_mut())
+                            {
                                 for (claim, receipt) in claimed {
-                                    push_completion(&mut completions, &claim, &receipt);
+                                    push_completion(&mut task.completions, &claim, &receipt);
                                 }
                             }
                         }
@@ -693,6 +764,8 @@ fn extract_episode_from_messages(
         .find(|t| t.status != "completed")
         .map(|t| t.content.clone());
 
+    let (anchor_request, completions) = anchor_segment(&segments);
+
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let success_signal = crate::extraction::has_success_signal(&completed);
     let outcome = compute_outcome(message_count, &error_signatures, success_signal, &todos);
@@ -731,9 +804,7 @@ fn extract_episode_from_messages(
         instrumentation_version: None,
         correction_count: None,
         recap_evidence_version: Some(RECAP_EVIDENCE_VERSION),
-        latest_request: latest_task_prose
-            .as_deref()
-            .and_then(crate::hooks::recap::clean_intent),
+        anchor_request,
         completions,
     }
 }
@@ -1828,7 +1899,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
         };
 
@@ -1883,7 +1954,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
         };
 
@@ -2533,7 +2604,7 @@ mod tests {
     }
 
     fn multi_topic_session() -> Vec<String> {
-        vec![
+        let mut lines = vec![
             typed_line(FIRST_PROMPT, "typed"),
             assistant_text_line("Here is how a side pane could work."),
             git_commit("toolu_old"),
@@ -2550,11 +2621,15 @@ mod tests {
             flagged_user_line("Base directory for this skill: /x/skill with a long body", "isMeta"),
             user_line("[Request interrupted by user for tool use]"),
             typed_line("go", "typed"),
-            assistant_text_line(
-                "How the share works: your 7D meter × CSR's cost ÷ everything this machine \
+        ];
+        // The latest task did real work too (6 calls vs the first topic's
+        // 1 call + 1 commit = 11), so it anchors under the half-weight rule.
+        lines.extend(work("cost", 6));
+        lines.extend([assistant_text_line(
+            "How the share works: your 7D meter × CSR's cost ÷ everything this machine \
                  spent with Claude in the same plan week.",
-            ),
-        ]
+        )]);
+        lines
     }
 
     fn extract(lines: &[String]) -> Episode {
@@ -2563,13 +2638,13 @@ mod tests {
     }
 
     #[test]
-    fn latest_request_is_the_most_recent_task_not_the_first_prompt() {
+    fn anchor_request_is_the_most_recent_task_not_the_first_prompt() {
         let ep = extract(&multi_topic_session());
         // `request` keeps its documented meaning (first prompt) for its readers.
         assert!(ep.request.starts_with("anthropics codemod"));
         assert_eq!(ep.recap_evidence_version, Some(RECAP_EVIDENCE_VERSION));
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some("How do we show cost as % of max plan")
         );
     }
@@ -2586,7 +2661,7 @@ mod tests {
     fn single_prompt_intent_keeps_whole_sentence_across_soft_wrap() {
         let ep = extract(&[typed_line(FIRST_PROMPT, "typed")]);
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some(
                 "anthropics codemod, when github links are bought up or disccussed, can \
                  present a side pane (enhanced for herdr users) - thoughts?"
@@ -2609,7 +2684,7 @@ mod tests {
         lines.push(typed_line("ok, do it please", "typed"));
         let ep = extract(&lines);
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some("can you move things out of tmp to the right place")
         );
     }
@@ -2623,7 +2698,7 @@ mod tests {
                 "typed",
             ),
         ]);
-        assert_eq!(ep.latest_request, None);
+        assert_eq!(ep.anchor_request, None);
     }
 
     #[test]
@@ -2781,7 +2856,7 @@ mod tests {
             typed_line("% of max plan if they have it or cents", "queued"),
         ]);
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some("How do we show cost as % of mac % of max plan if they have it or cents")
         );
     }
@@ -2798,7 +2873,7 @@ mod tests {
                 typed_line("now fix the recap garble", "typed"),
             ]);
             assert_eq!(
-                ep.latest_request.as_deref(),
+                ep.anchor_request.as_deref(),
                 Some("now fix the recap garble")
             );
         }
@@ -2813,7 +2888,7 @@ mod tests {
             assistant_stop_line("working", "tool_use"),
             typed_line("and also the side pane width", "queued"),
         ]);
-        assert_eq!(ep.latest_request, None);
+        assert_eq!(ep.anchor_request, None);
     }
 
     // ---- astra review round (findings 1-6) ----
@@ -2837,7 +2912,7 @@ mod tests {
             typed_line("% of max plan if they have it or cents", "queued"),
         ]);
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some("How do we show cost as % of mac % of max plan if they have it or cents")
         );
     }
@@ -2852,7 +2927,7 @@ mod tests {
             typed_line("only for the signup form", "queued"),
         ]);
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some("Fix login validation only for the signup form")
         );
     }
@@ -2863,7 +2938,7 @@ mod tests {
             "<system-reminder>\nBuild failed: missing foo.rs.\n</system-reminder>\n\nFix login validation.",
             "typed",
         )]);
-        assert_eq!(ep.latest_request.as_deref(), Some("Fix login validation."));
+        assert_eq!(ep.anchor_request.as_deref(), Some("Fix login validation."));
     }
 
     fn error_result(tool_use_id: &str, content: &str) -> String {
@@ -2996,11 +3071,142 @@ mod tests {
             typed_line("only for the signup form", "queued"),
         ]);
         assert_eq!(
-            ep.latest_request.as_deref(),
+            ep.anchor_request.as_deref(),
             Some("Fix login validation only for the signup form")
         );
         assert!(ep.completions.is_empty(), "{:?}", ep.completions);
         // tools_used keeps its existing behaviour: sidechain tools still count.
         assert!(ep.tools_used.iter().any(|t| t == "Bash"));
+    }
+
+    // ---- round 4: anchor = the task segment with the most work ----
+
+    /// `n` successful non-git Bash calls, as the main session makes them.
+    fn work(prefix: &str, n: usize) -> Vec<String> {
+        (0..n)
+            .flat_map(|i| {
+                let id = format!("toolu_{prefix}_{i}");
+                [
+                    assistant_named_tool("Bash", &id, serde_json::json!({"command": "ls"})),
+                    tool_result_bound(&id, "ok"),
+                ]
+            })
+            .collect()
+    }
+
+    fn segment(prompt: &str, prefix: &str, calls: usize) -> Vec<String> {
+        let mut lines = vec![typed_line(prompt, "typed")];
+        lines.extend(work(prefix, calls));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        lines
+    }
+
+    fn committed(prefix: &str, sha: &str, subject: &str) -> Vec<String> {
+        let id = format!("toolu_{prefix}_commit");
+        vec![
+            git_commit(&id),
+            tool_result_bound(&id, &format!("[main {sha}] {subject}")),
+        ]
+    }
+
+    #[test]
+    fn anchor_is_the_heaviest_segment_when_the_latest_is_light() {
+        let mut lines = segment("build me a vox explainer video for the above", "a", 10);
+        lines.extend(segment(
+            "Will the audio cause linkedin to not play it",
+            "b",
+            1,
+        ));
+        let ep = extract(&lines);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("build me a vox explainer video for the above")
+        );
+    }
+
+    #[test]
+    fn latest_segment_wins_at_half_the_heaviest_weight() {
+        let mut lines = segment("build me a vox explainer video for the above", "a", 10);
+        lines.extend(segment("now cut a vertical version for reels", "b", 5));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("now cut a vertical version for reels")
+        );
+        let mut lines = segment("build me a vox explainer video for the above", "a", 10);
+        lines.extend(segment("now cut a vertical version for reels", "b", 4));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("build me a vox explainer video for the above")
+        );
+    }
+
+    #[test]
+    fn a_commit_receipt_weighs_more_than_a_tool_call() {
+        // 12 calls vs 1 call + a commit (1 + 1 + COMMIT_WEIGHT = 12): the
+        // latest segment reaches half the heaviest only through its receipt.
+        let mut lines = segment("clean up the duplicate main layouts", "a", 12);
+        lines.push(typed_line("commit the cleanup now", "typed"));
+        lines.extend(work("b", 1));
+        lines.extend(committed("b", "1a2b3c4", "fix(app): one main layout"));
+        lines.push(assistant_stop_line("Committed.", "end_turn"));
+        let ep = extract(&lines);
+        assert_eq!(ep.anchor_request.as_deref(), Some("commit the cleanup now"));
+        assert_eq!(
+            ep.completions,
+            vec![CompletionReceipt {
+                claim: "fix(app): one main layout".into(),
+                receipt: "1a2b3c4".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn completed_comes_from_the_anchor_segment_only() {
+        let mut lines = vec![typed_line("clean up the duplicate main layouts", "typed")];
+        lines.extend(work("a", 20));
+        lines.extend(committed("a", "5e5e5e5", "fix(app): one main layout"));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        lines.push(typed_line("what time is it in Chennai", "typed"));
+        lines.extend(committed("b", "6f6f6f6", "chore: unrelated"));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        let ep = extract(&lines);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("clean up the duplicate main layouts")
+        );
+        assert_eq!(
+            ep.completions,
+            vec![CompletionReceipt {
+                claim: "fix(app): one main layout".into(),
+                receipt: "5e5e5e5".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unclean_anchor_falls_back_to_the_next_heaviest() {
+        let long = format!("{} end", "word ".repeat(40));
+        let mut lines = segment(&long, "a", 20);
+        lines.extend(segment(
+            "build me a vox explainer video for the above",
+            "b",
+            8,
+        ));
+        lines.extend(segment(
+            "Will the audio cause linkedin to not play it",
+            "c",
+            1,
+        ));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("build me a vox explainer video for the above")
+        );
+        // No second segment with work: abstain.
+        let mut lines = segment(&long, "a", 20);
+        lines.push(typed_line(
+            "Will the audio cause linkedin to not play it",
+            "typed",
+        ));
+        assert_eq!(extract(&lines).anchor_request, None);
     }
 }

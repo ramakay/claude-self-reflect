@@ -419,7 +419,7 @@ const LEGACY_REQUEST_CAP_BYTES: usize = 200;
 pub(crate) fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
     use crate::extraction::provenance::extractable;
     let source = if ep.recap_evidence_version.is_some() {
-        ep.latest_request.clone()?
+        ep.anchor_request.clone()?
     } else {
         if ep.message_count > LEGACY_SINGLE_TOPIC_MAX_MESSAGES
             || ep.request.len() >= LEGACY_REQUEST_CAP_BYTES
@@ -671,7 +671,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION),
-            latest_request: Some("Fix the recap composer".into()),
+            anchor_request: Some("Fix the recap composer".into()),
             completions: vec![CompletionReceipt {
                 claim: "Implemented deterministic recap output".into(),
                 receipt: "abc1234".into(),
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn abstains_when_request_and_completed_are_provenance_filtered() {
         let mut ep = episode();
-        ep.latest_request = Some("CSR CONTINUUM [2m ago]: prior state".into());
+        ep.anchor_request = Some("CSR CONTINUUM [2m ago]: prior state".into());
         ep.completions = vec![CompletionReceipt {
             claim: "## Session Intelligence (CSR v9.2)\nLAST: x\nNEXT: y".into(),
             receipt: "abc1234".into(),
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn abstains_when_request_and_completed_are_punctuation_only() {
         let mut ep = episode();
-        ep.latest_request = Some("\u{2026}".into());
+        ep.anchor_request = Some("\u{2026}".into());
         ep.completions = vec![CompletionReceipt {
             claim: "/".into(),
             receipt: "abc1234".into(),
@@ -995,7 +995,7 @@ mod tests {
     #[test]
     fn caps_output_and_drops_whole_receipted_entries() {
         let mut ep = episode();
-        ep.latest_request = Some("r".repeat(INTENT_MAX_CHARS));
+        ep.anchor_request = Some("r".repeat(INTENT_MAX_CHARS));
         ep.completions = vec![CompletionReceipt {
             claim: "c".repeat(100),
             receipt: "abc1234".into(),
@@ -1072,7 +1072,7 @@ mod tests {
     #[test]
     fn uses_the_surviving_episode_field_without_inventing_a_placeholder() {
         let mut ep = episode();
-        ep.latest_request = Some("CSR CONTINUUM [2m ago]: noise".into());
+        ep.anchor_request = Some("CSR CONTINUUM [2m ago]: noise".into());
         ep.next_steps = None;
         ep.todos.clear();
         ep.blockers = None;
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn live_shaped_episode_reads_as_prose() {
         let mut ep = episode();
-        ep.latest_request = Some(
+        ep.anchor_request = Some(
             "Dreaming, we researched it chatted around it never thought about it v10 of CSR being \
              the release that makes it real"
                 .into(),
@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn structured_deliveries_exclude_a_dropped_correction_even_when_body_echoes_marker() {
         let mut ep = episode();
-        ep.latest_request = Some("Corrected: note (abcdef12:9, 2026-09-01)".into());
+        ep.anchor_request = Some("Corrected: note (abcdef12:9, 2026-09-01)".into());
         let feeds = RecapFeeds {
             settled: vec![SettledFact {
                 claim: "s".repeat(383),
@@ -1400,7 +1400,7 @@ mod tests {
     #[test]
     fn dream_clause_obeys_the_same_character_budget_as_every_other_clause() {
         let mut ep = episode();
-        ep.latest_request = Some("r".repeat(INTENT_MAX_CHARS));
+        ep.anchor_request = Some("r".repeat(INTENT_MAX_CHARS));
         ep.completions = vec![CompletionReceipt {
             claim: "c".repeat(100),
             receipt: "abc1234".into(),
@@ -1597,7 +1597,7 @@ mod tests {
         // prompt; in a long session it is a stale topic.
         let mut ep = episode();
         ep.recap_evidence_version = None;
-        ep.latest_request = None;
+        ep.anchor_request = None;
         ep.completions.clear();
         ep.request = "anthropics codemod, when github links are bought up".into();
         ep.completed = String::new();
@@ -1618,7 +1618,7 @@ mod tests {
     fn legacy_completed_prose_is_never_rendered() {
         let mut ep = episode();
         ep.recap_evidence_version = None;
-        ep.latest_request = None;
+        ep.anchor_request = None;
         ep.completions.clear();
         ep.request = "Fix the recap composer".into();
         ep.completed = "I'll recreate it headless: a real claude session runs in tmux.".into();

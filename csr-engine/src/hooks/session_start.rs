@@ -1758,7 +1758,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         };
@@ -1820,7 +1820,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         };
@@ -1861,7 +1861,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         };
@@ -1904,7 +1904,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         };
@@ -1948,7 +1948,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         };
@@ -2162,7 +2162,7 @@ mod tests {
             instrumentation_version: None,
             correction_count: None,
             recap_evidence_version: None,
-            latest_request: None,
+            anchor_request: None,
             completions: vec![],
             anchors: vec![],
         }
@@ -2364,7 +2364,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             Some("continue work"),
         );
         ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
-        ep.latest_request = Some("How do we show cost as % of max plan".into());
+        ep.anchor_request = Some("How do we show cost as % of max plan".into());
         ep.message_count = 30_393;
         let block = format_tier0_block(&ep, &[], "3h ago");
         assert!(
@@ -2409,7 +2409,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         );
         ep.message_count = 30_393;
         ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
-        ep.latest_request = Some("How do we show cost as % of max plan".into());
+        ep.anchor_request = Some("How do we show cost as % of max plan".into());
         let current = format_episode_index(&[(ep.clone(), "3h ago".into())]);
         assert!(
             current.contains("- [3h ago] How do we show cost as % of max plan — "),
@@ -2418,7 +2418,7 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         assert!(!current.contains("anthropics codemod"), "{current}");
         // Legacy long session: the stale first prompt is withheld.
         ep.recap_evidence_version = None;
-        ep.latest_request = None;
+        ep.anchor_request = None;
         let legacy = format_episode_index(&[(ep, "3h ago".into())]);
         assert!(
             legacy.contains("- [3h ago] (no clean intent) — "),
