@@ -514,8 +514,9 @@ fn extract_episode_from_messages(
     // Task/todo completions claimed by a tool_use, keyed by its id. They
     // become evidence only when a non-error tool_result answers that id.
     let mut pending_completions: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    // The session's receipts, latest last (MAX_COMPLETIONS kept).
-    let mut completions: Vec<CompletionReceipt> = Vec::new();
+    // The session's receipts, latest last, each with the index of the task
+    // segment it was produced under (None before the first task).
+    let mut completions: Vec<(CompletionReceipt, Option<usize>)> = Vec::new();
 
     // Tool names whose file_path inputs count as "investigated"
     let read_tools: HashSet<&str> = ["Read", "Glob", "Grep"].into_iter().collect();
@@ -855,7 +856,12 @@ fn extract_episode_from_messages(
                                 if let Some(task) = segments.last_mut() {
                                     task.commits += 1;
                                 }
-                                push_completion(&mut completions, &commit[2], &commit[1][..7]);
+                                push_completion(
+                                    &mut completions,
+                                    segments.len().checked_sub(1),
+                                    &commit[2],
+                                    &commit[1][..7],
+                                );
                             }
                         }
                         if let Some(claimed) = block
@@ -865,7 +871,12 @@ fn extract_episode_from_messages(
                         {
                             if !failed && !sidechain {
                                 for (claim, receipt) in claimed {
-                                    push_completion(&mut completions, &claim, &receipt);
+                                    push_completion(
+                                        &mut completions,
+                                        segments.len().checked_sub(1),
+                                        &claim,
+                                        &receipt,
+                                    );
                                 }
                             }
                         }
@@ -924,7 +935,13 @@ fn extract_episode_from_messages(
         .map(|t| t.content.clone());
 
     let (anchor_request, anchor_index) = anchor_segment(&segments);
-    let completions_untied = anchor_index.is_some_and(|i| i + 1 != segments.len());
+    let (completions, origins): (Vec<CompletionReceipt>, Vec<Option<usize>>) =
+        completions.into_iter().unzip();
+    // Receipts read as the anchor's result only when every receipt the recap
+    // shows was produced under the anchor segment; otherwise "Latest:".
+    let completions_untied = crate::hooks::recap::displayed_receipts(&completions)
+        .iter()
+        .any(|(index, _)| anchor_index.is_none() || origins[*index] != anchor_index);
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let success_signal = crate::extraction::has_success_signal(&completed);
@@ -973,19 +990,28 @@ fn extract_episode_from_messages(
 /// Record a completion. Commit receipts and task/todo receipts are capped
 /// separately (`MAX_COMPLETIONS` each, oldest dropped), so a run of todo
 /// completions can never evict the session's commits.
-fn push_completion(completions: &mut Vec<CompletionReceipt>, claim: &str, receipt: &str) {
+fn push_completion(
+    completions: &mut Vec<(CompletionReceipt, Option<usize>)>,
+    segment: Option<usize>,
+    claim: &str,
+    receipt: &str,
+) {
     let claim = claim.split_whitespace().collect::<Vec<_>>().join(" ");
     if claim.is_empty() {
         return;
     }
     let commit = crate::hooks::recap::is_commit_receipt(receipt);
-    completions.push(CompletionReceipt {
-        claim,
-        receipt: receipt.to_string(),
-    });
-    let same_kind =
-        |done: &CompletionReceipt| crate::hooks::recap::is_commit_receipt(&done.receipt) == commit;
-    if completions.iter().filter(|done| same_kind(done)).count() > MAX_COMPLETIONS {
+    completions.push((
+        CompletionReceipt {
+            claim,
+            receipt: receipt.to_string(),
+        },
+        segment,
+    ));
+    let same_kind = |(done, _): &(CompletionReceipt, Option<usize>)| {
+        crate::hooks::recap::is_commit_receipt(&done.receipt) == commit
+    };
+    if completions.iter().filter(|entry| same_kind(entry)).count() > MAX_COMPLETIONS {
         if let Some(oldest) = completions.iter().position(same_kind) {
             completions.remove(oldest);
         }
@@ -2822,9 +2848,9 @@ mod tests {
     }
 
     #[test]
-    fn receipts_of_a_session_are_untied_when_a_later_task_followed() {
-        // The only commit came under the first topic, but a later task
-        // followed, so the recap must not read it as the anchor's result.
+    fn receipts_produced_under_the_anchor_stay_tied_to_it() {
+        // The only commit came under the first topic, which is the anchor:
+        // it is the anchor's own result even though a later task followed.
         let ep = extract(&multi_topic_session());
         assert_eq!(
             ep.completions,
@@ -2833,7 +2859,7 @@ mod tests {
                 receipt: "0aa11bb".into(),
             }]
         );
-        assert!(ep.completions_untied);
+        assert!(!ep.completions_untied);
     }
 
     #[test]
@@ -3031,7 +3057,7 @@ mod tests {
         assert_eq!(
             got,
             "recap [3h ago]: anthropics codemod, when github links are bought up or disccussed, \
-             can present a side pane (enhanced for herdr users) - thoughts? Latest: \
+             can present a side pane (enhanced for herdr users) - thoughts?: \
              feat(pane): first topic commit (0aa11bb). [[CSR:RECAP]]"
         );
         assert!(!got.contains("How the share works"));
@@ -3608,7 +3634,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "pending astra r5 fix"]
     fn astra_r5_3_earlier_receipts_never_read_as_a_fallback_anchors_result() {
         let long = "word ".repeat(40);
         let mut lines = vec![typed_line(&long, "typed")];
