@@ -262,6 +262,9 @@ impl TaskSegment {
     }
 }
 
+/// Fewest words a heaviest-segment fallback intent may have.
+const MIN_FALLBACK_WORDS: usize = 6;
+
 /// The anchor task and its segment index. The first task anchors the recap
 /// (blind labels picked it in 9 of 11 sessions, the most-work segment in 7).
 /// If it has no clean rendering, the heaviest other segment with any work is
@@ -283,8 +286,12 @@ fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Option<usize>) {
     if let Some(intent) = crate::hooks::recap::anchor_intent(&segments[0].prose) {
         return (Some(intent), Some(0));
     }
+    // A fallback must say enough to stand for the session on its own: a
+    // short side request ("stopped check now.") abstains instead.
     if let Some(index) = heaviest {
-        if let Some(intent) = crate::hooks::recap::clean_intent(&segments[index].prose) {
+        if let Some(intent) = crate::hooks::recap::clean_intent(&segments[index].prose)
+            .filter(|intent| intent.split_whitespace().count() >= MIN_FALLBACK_WORDS)
+        {
             return (Some(intent), Some(index));
         }
     }
@@ -3397,14 +3404,14 @@ mod tests {
         let long = format!("{} end", "word ".repeat(40));
         let mut lines = segment(&long, "a", 2);
         lines.extend(segment("clean up the duplicate main layouts", "b", 12));
-        lines.push(typed_line("commit the cleanup now", "typed"));
+        lines.push(typed_line("commit the cleanup now and tag it", "typed"));
         lines.extend(work("c", 1));
         lines.extend(committed("c", "1a2b3c4", "fix(app): one main layout"));
         lines.push(assistant_stop_line("Committed.", "end_turn"));
         // 12 calls vs 2 calls + one receipt (2 + COMMIT_WEIGHT = 12, later wins).
         assert_eq!(
             extract(&lines).anchor_request.as_deref(),
-            Some("commit the cleanup now")
+            Some("commit the cleanup now and tag it")
         );
         // No segment with work besides the unclean first: abstain.
         let mut lines = segment(&long, "a", 20);
@@ -3454,6 +3461,37 @@ mod tests {
         assert_eq!(
             extract(&lines).anchor_request.as_deref(),
             Some("This ia new Reycital challenge")
+        );
+    }
+
+    #[test]
+    fn a_short_fallback_abstains_on_every_path() {
+        // The first task has no clean rendering and no clause to cut; the
+        // heaviest other segment is a 3-word side request: abstain.
+        let long = format!("{} end", "word ".repeat(40));
+        let mut lines = segment(&long, "a", 5);
+        lines.extend(segment("stopped check now", "b", 40));
+        let ep = extract(&lines);
+        assert_eq!(ep.anchor_request, None);
+        // The recap, CONTINUUM fallback and EPISODE INDEX (which the pickup
+        // renders through) all read the same anchor.
+        assert_eq!(crate::hooks::recap::recap_intent(&ep), None);
+        let continuum = crate::hooks::session_start::format_tier0_block(&ep, &[], "now");
+        assert!(
+            continuum.starts_with("CSR CONTINUUM [now]: (no clean intent)\n"),
+            "{continuum}"
+        );
+        let index =
+            crate::hooks::session_start::format_episode_index(&[(ep.clone(), "now".into())]);
+        assert!(index.contains("- [now] (no clean intent) — "), "{index}");
+        assert!(!index.contains("stopped check now"), "{index}");
+
+        // Six words or more: the fallback stands.
+        let mut lines = segment(&long, "a", 5);
+        lines.extend(segment("stopped, check the render log now", "b", 40));
+        assert_eq!(
+            extract(&lines).anchor_request.as_deref(),
+            Some("stopped, check the render log now")
         );
     }
 }
