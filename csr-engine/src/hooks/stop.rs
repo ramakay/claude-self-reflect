@@ -341,6 +341,9 @@ fn extract_episode_from_messages(
     for val in messages {
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         message_count += 1;
+        // A legacy in-file subagent row. It still counts toward tools/files,
+        // but never toward the recap's task, turn or completion state.
+        let sidechain = val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true);
 
         // Extract request from the first user message that survives provenance
         // filtering — command wrappers, caveats, and pasted CSR output are
@@ -377,7 +380,7 @@ fn extract_episode_from_messages(
                 turn_finished = false;
             }
         }
-        if ends_turn(val, msg_type) {
+        if !sidechain && ends_turn(val, msg_type) {
             turn_finished = true;
         }
 
@@ -395,7 +398,7 @@ fn extract_episode_from_messages(
                                 }
                                 tools_used.insert(name.to_string());
 
-                                if name == "Bash" {
+                                if name == "Bash" && !sidechain {
                                     let commits = block
                                         .get("input")
                                         .and_then(|i| i.get("command"))
@@ -448,7 +451,9 @@ fn extract_episode_from_messages(
                                                 (t.content.clone(), "todo completed".to_string())
                                             })
                                             .collect();
-                                        if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                                        if let (false, Some(id)) =
+                                            (sidechain, block.get("id").and_then(|v| v.as_str()))
+                                        {
                                             pending_completions
                                                 .entry(id.to_string())
                                                 .or_default()
@@ -501,7 +506,8 @@ fn extract_episode_from_messages(
                                                 {
                                                     if let Some(item) = todos.get_mut(idx) {
                                                         if let (true, Some(use_id)) = (
-                                                            status == "completed"
+                                                            !sidechain
+                                                                && status == "completed"
                                                                 && item.status != "completed",
                                                             block
                                                                 .get("id")
@@ -617,7 +623,7 @@ fn extract_episode_from_messages(
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| git_tool_ids.contains(id));
                         let failed = block.get("is_error").and_then(|v| v.as_bool()) == Some(true);
-                        if from_git && !failed {
+                        if from_git && !failed && !sidechain {
                             for commit in GIT_COMMIT_LINE_RE.captures_iter(&block_text) {
                                 push_completion(&mut completions, &commit[2], &commit[1][..7]);
                             }
@@ -627,7 +633,7 @@ fn extract_episode_from_messages(
                             .and_then(|v| v.as_str())
                             .and_then(|id| pending_completions.remove(id))
                         {
-                            if !failed {
+                            if !failed && !sidechain {
                                 for (claim, receipt) in claimed {
                                     push_completion(&mut completions, &claim, &receipt);
                                 }
@@ -2956,5 +2962,45 @@ mod tests {
             one
         );
         assert!(commit_receipts_for("echo git commit").is_empty());
+    }
+
+    fn sidechain(line: String) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        v["isSidechain"] = serde_json::Value::Bool(true);
+        v.to_string()
+    }
+
+    #[test]
+    fn sidechain_rows_never_touch_recap_state() {
+        let ep = extract(&[
+            typed_line("Fix login validation", "typed"),
+            assistant_stop_line("editing", "tool_use"),
+            // A legacy in-file subagent: its turn end, prompt, commit and task
+            // completion are not the main session's.
+            sidechain(assistant_stop_line("subagent done", "end_turn")),
+            sidechain(typed_line("Refactor the whole billing module", "typed")),
+            sidechain(git_commit("toolu_side")),
+            sidechain(tool_result_bound(
+                "toolu_side",
+                "[main 5e5e5e5] refactor(billing): subagent commit",
+            )),
+            sidechain(assistant_named_tool(
+                "TodoWrite",
+                "toolu_side_todo",
+                serde_json::json!({"todos": [{"content": "Billing", "status": "completed"}]}),
+            )),
+            sidechain(tool_result_bound(
+                "toolu_side_todo",
+                "Todos have been modified successfully",
+            )),
+            typed_line("only for the signup form", "queued"),
+        ]);
+        assert_eq!(
+            ep.latest_request.as_deref(),
+            Some("Fix login validation only for the signup form")
+        );
+        assert!(ep.completions.is_empty(), "{:?}", ep.completions);
+        // tools_used keeps its existing behaviour: sidechain tools still count.
+        assert!(ep.tools_used.iter().any(|t| t == "Bash"));
     }
 }
