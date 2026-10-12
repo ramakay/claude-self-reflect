@@ -1513,6 +1513,8 @@ fn test_explore_prompt_never_fails() {
         steers: vec![],
         instrumentation_version: None,
         correction_count: None,
+        recap_evidence_version: None,
+        latest_request: None,
         anchors: vec![],
     };
 
@@ -2028,6 +2030,8 @@ fn test_episode_struct_serialization() {
         steers: vec![],
         instrumentation_version: None,
         correction_count: None,
+        recap_evidence_version: None,
+        latest_request: None,
         anchors: vec![],
     };
 

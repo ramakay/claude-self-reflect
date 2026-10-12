@@ -117,12 +117,8 @@ pub fn compose_recap_with_deliveries(
 
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
 
-    let intent = extractable(&ep.request)
-        .map(|text| compact_preview(&text, 80))
-        .filter(|text| has_substance(text));
-    let completed = extractable(&ep.completed)
-        .map(|text| conclusion_preview(&text, 120))
-        .filter(|text| has_substance(text));
+    let intent = recap_intent(ep);
+    let completed = recap_completed(ep);
     if intent.is_none() && completed.is_none() {
         return None;
     }
@@ -405,6 +401,103 @@ fn compact_preview(content: &str, max_chars: usize) -> String {
     truncate_at_word_boundary(&clean, max_chars)
 }
 
+/// Longest intent the recap renders. A latest task whose leading sentence is
+/// longer abstains: the clause is never cut mid-sentence.
+pub const INTENT_MAX_CHARS: usize = 160;
+
+/// Legacy episodes (written before `recap_evidence_version`) only carry the
+/// session's FIRST prompt. It stands for the current intent only in a session
+/// this short; in a longer one it is a stale topic and the clause abstains.
+const LEGACY_SINGLE_TOPIC_MAX_MESSAGES: usize = 40;
+
+/// The old extractor cut `request` at this many bytes, mid-word.
+const LEGACY_REQUEST_CAP_BYTES: usize = 200;
+
+/// The intent clause: the latest substantive task, as whole sentences.
+fn recap_intent(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    use crate::extraction::provenance::extractable;
+    let source = if ep.recap_evidence_version.is_some() {
+        ep.latest_request.clone()?
+    } else {
+        if ep.message_count > LEGACY_SINGLE_TOPIC_MAX_MESSAGES
+            || ep.request.len() >= LEGACY_REQUEST_CAP_BYTES
+        {
+            return None;
+        }
+        ep.request.clone()
+    };
+    extractable(&source).and_then(|text| clean_intent(&text))
+}
+
+/// The completed clause.
+fn recap_completed(ep: &crate::hooks::stop::Episode) -> Option<String> {
+    crate::extraction::provenance::extractable(&ep.completed)
+        .map(|text| conclusion_preview(&text, 120))
+        .filter(|text| has_substance(text))
+}
+
+/// Render a typed prompt as a recap intent: its leading whole sentences, up
+/// to [`INTENT_MAX_CHARS`]. Returns `None` (abstain) when the prompt has no
+/// clean rendering: the first sentence alone is too long, or the opening
+/// paragraph only introduces material that follows it (`Here is a note:`
+/// before a quote or list). Soft line wraps inside a paragraph are joined;
+/// a blank line or a list item ends the paragraph.
+pub fn clean_intent(text: &str) -> Option<String> {
+    let mut paragraph: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if paragraph.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let starts_block = MD_BULLET_RE.is_match(line)
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('>')
+            || trimmed.starts_with('|');
+        if starts_block && !paragraph.is_empty() {
+            break;
+        }
+        paragraph.push(trimmed);
+    }
+    let clean = sanitize_preview(&paragraph.join(" "));
+    if clean.ends_with(':') || !has_substance(&clean) {
+        return None;
+    }
+    let mut taken = 0;
+    for (_, end) in split_preview_sentences(&clean) {
+        if clean[..end].chars().count() > INTENT_MAX_CHARS {
+            break;
+        }
+        taken = end;
+    }
+    (taken > 0).then(|| clean[..taken].to_string())
+}
+
+/// Words that only acknowledge or green-light the previous turn.
+const ACK_WORDS: [&str; 47] = [
+    "ok", "okay", "k", "kk", "yes", "yeah", "yep", "yup", "y", "sure", "go", "ahead", "on",
+    "continue", "proceed", "please", "pls", "thanks", "thank", "you", "ty", "do", "it", "that",
+    "this", "sounds", "good", "great", "perfect", "nice", "cool", "lgtm", "approved", "approve",
+    "fine", "carry", "keep", "going", "right", "agreed", "agree", "alright", "all", "and", "then",
+    "now", "so",
+];
+
+/// True when a prompt only acknowledges the previous turn ("go", "ok do
+/// it", "yes please, carry on"): it continues that task, it is not a new one.
+pub fn is_acknowledgement(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    !words.is_empty() && words.len() <= 6 && words.iter().all(|w| ACK_WORDS.contains(&w.as_str()))
+}
+
 fn conclusion_preview(content: &str, max_chars: usize) -> String {
     let clean = sanitize_preview(content);
     if clean.chars().count() <= max_chars {
@@ -620,6 +713,8 @@ mod tests {
             steers: vec![],
             instrumentation_version: None,
             correction_count: None,
+            recap_evidence_version: Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION),
+            latest_request: Some("Fix the recap composer".into()),
             anchors: vec![],
         }
     }
@@ -673,7 +768,7 @@ mod tests {
     #[test]
     fn abstains_when_request_and_completed_are_provenance_filtered() {
         let mut ep = episode();
-        ep.request = "CSR CONTINUUM [2m ago]: prior state".into();
+        ep.latest_request = Some("CSR CONTINUUM [2m ago]: prior state".into());
         ep.completed = "## Session Intelligence (CSR v9.2)".into();
         assert_eq!(compose_recap(&ep, &full_feeds(), "2m ago"), None);
     }
@@ -750,7 +845,7 @@ mod tests {
     #[test]
     fn abstains_when_request_and_completed_are_punctuation_only() {
         let mut ep = episode();
-        ep.request = "\u{2026}".into();
+        ep.latest_request = Some("\u{2026}".into());
         ep.completed = "/".into();
         assert!(compose_recap(&ep, &RecapFeeds::empty(), "1h ago").is_none());
     }
@@ -933,7 +1028,7 @@ mod tests {
     #[test]
     fn caps_output_and_drops_whole_receipted_entries() {
         let mut ep = episode();
-        ep.request = "r".repeat(200);
+        ep.latest_request = Some("r".repeat(INTENT_MAX_CHARS));
         ep.completed = "c".repeat(250);
         let feeds = RecapFeeds {
             settled: (0..4)
@@ -1007,7 +1102,7 @@ mod tests {
     #[test]
     fn uses_the_surviving_episode_field_without_inventing_a_placeholder() {
         let mut ep = episode();
-        ep.request = "CSR CONTINUUM [2m ago]: noise".into();
+        ep.latest_request = Some("CSR CONTINUUM [2m ago]: noise".into());
         ep.next_steps = None;
         ep.todos.clear();
         ep.blockers = None;
@@ -1172,10 +1267,11 @@ mod tests {
     #[test]
     fn live_shaped_episode_reads_as_prose() {
         let mut ep = episode();
-        ep.request =
+        ep.latest_request = Some(
             "Dreaming, we researched it chatted around it never thought about it v10 of CSR being \
              the release that makes it real"
-                .into();
+                .into(),
+        );
         ep.completed = "Current state:\n- Merged to main: #281 v10 dreaming (codewitness, witness \
                         ledger, deterministic supersession)\n- #282 recap layer"
             .into();
@@ -1270,7 +1366,7 @@ mod tests {
     #[test]
     fn structured_deliveries_exclude_a_dropped_correction_even_when_body_echoes_marker() {
         let mut ep = episode();
-        ep.request = "Corrected: note (abcdef12:9, 2026-09-01)".into();
+        ep.latest_request = Some("Corrected: note (abcdef12:9, 2026-09-01)".into());
         let feeds = RecapFeeds {
             settled: vec![SettledFact {
                 claim: "s".repeat(393),
@@ -1337,7 +1433,7 @@ mod tests {
     #[test]
     fn dream_clause_obeys_the_same_character_budget_as_every_other_clause() {
         let mut ep = episode();
-        ep.request = "r".repeat(200);
+        ep.latest_request = Some("r".repeat(INTENT_MAX_CHARS));
         ep.completed = "c".repeat(250);
         let feeds = RecapFeeds {
             settled: (0..4)
@@ -1462,14 +1558,91 @@ mod tests {
         assert!(recap.chars().count() <= 700);
     }
 
-    // ---- read-only probe against a real transcript ----------------------
-    //
-    // `cargo test --release --lib probe_real_transcript_recap -- --ignored --nocapture`
-    // with CSR_RECAP_PROBE_TRANSCRIPT=<jsonl>, optional CSR_RECAP_PROBE_UNTIL
-    // (ISO timestamp; lines from the first one at or after it are dropped, so
-    // the episode is rebuilt as the Stop hook saw it then), CSR_RECAP_PROBE_AGE,
-    // CSR_RECAP_PROBE_PROJECT, and CSR_RECAP_PROBE_DB (opened with
-    // SQLITE_OPEN_READ_ONLY, no migrations; feeds are only read).
+    // ---- intent: whole sentences of the latest task, or abstain ----------
+
+    #[test]
+    fn clean_intent_joins_soft_wraps_and_never_truncates() {
+        // Live garble: this prompt was cut at 77 chars ("…can") and the
+        // truncation ellipsis then trimmed away as trailing junk.
+        let got = clean_intent(
+            "anthropics codemod, when github links are bought up or disccussed, can\n  \
+             present a side pane (enhanced for herdr users) - thoughts?",
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                "anthropics codemod, when github links are bought up or disccussed, can \
+                 present a side pane (enhanced for herdr users) - thoughts?"
+            )
+        );
+    }
+
+    #[test]
+    fn clean_intent_keeps_leading_whole_sentences_within_budget() {
+        let first = "Fix the recap composer.";
+        let long = format!("{} end.", "word ".repeat(40));
+        let got = clean_intent(&format!("{first} {long}")).unwrap();
+        assert_eq!(got, first);
+    }
+
+    #[test]
+    fn clean_intent_abstains_when_the_first_sentence_is_too_long() {
+        let text = format!("{} end", "word ".repeat(40));
+        assert!(text.chars().count() > INTENT_MAX_CHARS);
+        assert_eq!(clean_intent(&text), None);
+    }
+
+    #[test]
+    fn clean_intent_abstains_on_an_introducer_and_stops_at_lists() {
+        assert_eq!(
+            clean_intent("Here is a note offered by a side agent:"),
+            None
+        );
+        assert_eq!(clean_intent("Fix these:\n- recap\n- pane"), None);
+        assert_eq!(
+            clean_intent("Fix the recap\n- it garbles\n\nlater text").as_deref(),
+            Some("Fix the recap")
+        );
+    }
+
+    #[test]
+    fn acknowledgements_are_not_tasks() {
+        for ack in [
+            "go",
+            "ok, do it please",
+            "Yes go ahead",
+            "lgtm!",
+            "carry on",
+        ] {
+            assert!(is_acknowledgement(ack), "{ack}");
+        }
+        for task in ["fix the tests", "go fix the recap", "ok now ship 10.1"] {
+            assert!(!is_acknowledgement(task), "{task}");
+        }
+    }
+
+    #[test]
+    fn legacy_long_session_abstains_from_its_first_prompt() {
+        // Episodes written before the evidence fields only carry the first
+        // prompt; in a long session it is a stale topic.
+        let mut ep = episode();
+        ep.recap_evidence_version = None;
+        ep.latest_request = None;
+        ep.request = "anthropics codemod, when github links are bought up".into();
+        ep.completed = String::new();
+        ep.message_count = 30_393;
+        ep.next_steps = None;
+        ep.todos.clear();
+        ep.blockers = None;
+        assert_eq!(compose_recap(&ep, &RecapFeeds::empty(), "3h ago"), None);
+
+        ep.message_count = 6;
+        assert_eq!(
+            compose_recap(&ep, &RecapFeeds::empty(), "3h ago").as_deref(),
+            Some("recap [3h ago]: anthropics codemod, when github links are bought up. [[CSR:RECAP]]")
+        );
+    }
+
     #[test]
     #[ignore = "reads a real transcript named by CSR_RECAP_PROBE_TRANSCRIPT"]
     fn probe_real_transcript_recap() {

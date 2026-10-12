@@ -1032,6 +1032,8 @@ mod tests {
             steers: vec![],
             instrumentation_version: None,
             correction_count: None,
+            recap_evidence_version: None,
+            latest_request: None,
             anchors: vec![],
         };
         let feeds = RecapFeeds {
