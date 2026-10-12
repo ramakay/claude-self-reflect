@@ -466,7 +466,9 @@ struct TypedPrompt {
     note: bool,
 }
 
-/// Opener of a side agent's note forwarded into the prompt.
+/// Opener of a Claude Code side agent's note forwarded into the prompt. The
+/// import scrub keys on the shared `provenance::SIDE_AGENT_NOTE_PREFIX`; this
+/// stays the full YSK line because the recap reads RAW rows.
 const SIDE_AGENT_NOTE_OPENER: &str = "Here is a note offered by a side agent:";
 /// Lead-in of a side agent note's one-line summary.
 const HEADS_UP: &str = "Heads up · ";
@@ -2921,6 +2923,12 @@ mod tests {
             ep.anchor_request.as_deref(),
             Some("note: What if Claude opening a memory note also pulled in its session?")
         );
+    }
+
+    #[test]
+    fn note_opener_shares_the_import_prefix() {
+        assert!(SIDE_AGENT_NOTE_OPENER
+            .starts_with(crate::extraction::provenance::SIDE_AGENT_NOTE_PREFIX));
     }
 
     #[test]

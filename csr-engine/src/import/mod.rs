@@ -69,6 +69,17 @@ pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
     if crate::extraction::provenance::is_dreamer_prompt(text) {
         return None;
     }
+    // A forwarded side-agent note is the side agent's words, not the person's:
+    // cut the opener and its blockquote, keep what the person typed after it.
+    let forwarded;
+    let text = match crate::extraction::provenance::strip_forwarded_note(text) {
+        Some(remainder) if remainder.is_empty() => return None,
+        Some(remainder) => {
+            forwarded = remainder;
+            forwarded.as_str()
+        }
+        None => text,
+    };
     let without_wrappers = CSR_SYSTEM_REMINDER_RE.replace_all(text, "");
     let clean = without_wrappers
         .split("\n\n")
@@ -2212,6 +2223,46 @@ mod tests {
     #[test]
     fn prose_that_merely_mentions_the_dreamer_is_kept() {
         let kept = "what if the dreamer asked fewer questions while I work?";
+        assert_eq!(scrub_contaminated_text(kept).as_deref(), Some(kept));
+    }
+
+    const YSK_FORWARD: &str = "Here is a note offered by a side agent:\n\n> **Retry storm fixed**\n>\n> Heads up \u{b7} the importer retry loop was capped [commit f154ead].\n> It no longer re-queues failed chunks.";
+
+    #[test]
+    fn a_forwarded_side_agent_note_alone_is_dropped() {
+        assert_eq!(scrub_contaminated_text(YSK_FORWARD), None);
+    }
+
+    #[test]
+    fn prose_typed_after_a_forwarded_note_is_kept() {
+        let text = format!("{YSK_FORWARD}\n\nwhat do you think about this?");
+        assert_eq!(
+            scrub_contaminated_text(&text).as_deref(),
+            Some("what do you think about this?")
+        );
+    }
+
+    #[test]
+    fn a_forwarded_csr_band_note_is_dropped() {
+        let text = "Here is a note offered by CSR (claude-self-reflect):\n\n> **Settled**\n>\n> The cap landed [commit f154ead].";
+        assert_eq!(scrub_contaminated_text(text), None);
+    }
+
+    #[test]
+    fn a_crlf_forwarded_note_is_dropped() {
+        let text = YSK_FORWARD.replace('\n', "\r\n");
+        assert_eq!(scrub_contaminated_text(&text), None);
+    }
+
+    #[test]
+    fn a_crlf_forwarded_note_keeps_trailing_prose() {
+        let text = format!("{YSK_FORWARD}\n\nship it").replace('\n', "\r\n");
+        assert_eq!(scrub_contaminated_text(&text).as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn prose_that_merely_mentions_the_note_phrase_is_kept() {
+        let kept = "I wonder why here is a note offered by YSK shows up";
         assert_eq!(scrub_contaminated_text(kept).as_deref(), Some(kept));
     }
 

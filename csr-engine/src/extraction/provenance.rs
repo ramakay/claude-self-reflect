@@ -315,6 +315,37 @@ pub fn is_dreamer_prompt(text: &str) -> bool {
         && paragraphs[at + 1..].iter().all(|p| quoted(p))
 }
 
+/// Opener shared by every side-agent note a person can forward into the
+/// prompt: Claude Code's "You should know" agent writes `... offered by a side
+/// agent:` and CSR's own band writes `... offered by CSR (claude-self-reflect):`.
+pub const SIDE_AGENT_NOTE_PREFIX: &str = "Here is a note offered by";
+
+/// If `text` is a forwarded side-agent note, the person's own words after it.
+///
+/// A forward is the opener line (starts with [`SIDE_AGENT_NOTE_PREFIX`], ends
+/// with `:`) followed by the note as a contiguous blockquote. Blank lines and
+/// bare `>` lines between and inside the quote belong to it. The opener and
+/// the quote are the side agent's words, not the person's, so they are cut;
+/// any unquoted prose after them is the person's own and is returned (empty
+/// when there is none). `None` means `text` is not a forward at all, so a
+/// sentence that merely mentions the phrase is never touched. CRLF is
+/// normalised first, so the remainder uses `\n`.
+pub fn strip_forwarded_note(text: &str) -> Option<String> {
+    let normalized = text.replace("\r\n", "\n");
+    let trimmed = normalized.trim();
+    if !trimmed.starts_with(SIDE_AGENT_NOTE_PREFIX) {
+        return None;
+    }
+    let mut lines = trimmed.lines();
+    if !lines.next()?.trim_end().ends_with(':') {
+        return None;
+    }
+    let rest: Vec<&str> = lines
+        .skip_while(|line| line.trim().is_empty() || line.trim_start().starts_with('>'))
+        .collect();
+    Some(rest.join("\n").trim().to_string())
+}
+
 /// True if `text` is a substantive description of real work — it survives
 /// provenance filtering AND carries actual prose (alphabetic content, not a
 /// bare timestamp/number/path like "20260611-122252"). Used to pick a real
@@ -564,6 +595,33 @@ pub fn extractable(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_forwarded_note_cuts_opener_and_quote_keeps_prose() {
+        let note = "Here is a note offered by a side agent:\n\n> **T**\n>\n> body [commit f154ead]\n\n> second quote";
+        assert_eq!(strip_forwarded_note(note).as_deref(), Some(""));
+        let with_prose = format!("{note}\n\nwhat now?\nand more");
+        assert_eq!(
+            strip_forwarded_note(&with_prose).as_deref(),
+            Some("what now?\nand more")
+        );
+        let csr = "Here is a note offered by CSR (claude-self-reflect):\n> x";
+        assert_eq!(strip_forwarded_note(csr).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn strip_forwarded_note_is_none_for_non_forwards() {
+        assert_eq!(strip_forwarded_note("plain prose"), None);
+        assert_eq!(
+            strip_forwarded_note("I wonder why here is a note offered by YSK shows up"),
+            None
+        );
+        // opener line does not end with a colon: not a forward
+        assert_eq!(
+            strip_forwarded_note("Here is a note offered by a side agent\n> x"),
+            None
+        );
+    }
 
     // --- strip_plumbing ---
 
