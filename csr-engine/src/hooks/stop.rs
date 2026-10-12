@@ -315,6 +315,10 @@ const HEADS_UP: &str = "Heads up · ";
 /// what-if's headline is its question line. The words are the note's, not
 /// the person's, so callers render them behind a "note: " prefix.
 fn forwarded_note_headline(text: &str) -> Option<String> {
+    // Recognition and extraction must see the same text: a CRLF prompt has
+    // "\r\n\r\n" paragraph breaks that a "\n\n" split would miss.
+    let normalized = text.replace("\r\n", "\n");
+    let text = normalized.as_str();
     if let Some(rest) = text.trim_start().strip_prefix(SIDE_AGENT_NOTE_OPENER) {
         let quoted: Vec<&str> = rest
             .lines()
@@ -3526,5 +3530,174 @@ mod tests {
         ]);
         assert_eq!(ep.anchor_request, None);
         assert!(ep.completions.is_empty());
+    }
+
+    // ---- astra review r5 (1cace86..5257ed3) ----
+
+    fn no_feeds() -> crate::hooks::recap::RecapFeeds {
+        crate::hooks::recap::RecapFeeds {
+            settled: vec![],
+            still_open: vec![],
+            retired_while_away: vec![],
+            corrections: vec![],
+            open_proposals: 0,
+            top_dream: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_1_a_forwarded_note_holding_a_recap_is_never_a_note() {
+        let ep = extract(&[typed_line(
+            "Here is a note offered by a side agent:\n\n> **recap [1h ago]: Fix login validation. Latest: fix(auth): preserve form errors until the next submitted validation request (abc1234); test(auth): cover retries and stale error clearing when the validation request changes (def5678). [[CSR:RECAP]]**",
+            "typed",
+        )]);
+        assert_eq!(ep.anchor_request, None);
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_2_an_excluded_late_prompt_does_not_carry_its_follow_up_in() {
+        let ep = extract(&[
+            typed_at(
+                "Fix the checkout validation bug",
+                "typed",
+                "2026-10-12T12:00:00Z",
+            ),
+            typed_at(
+                "Also build the billing dashboard",
+                "queued",
+                "2026-10-12T12:24:00Z",
+            ),
+            typed_at("and show failed invoices", "queued", "2026-10-12T12:24:30Z"),
+        ]);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("Fix the checkout validation bug")
+        );
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_3_earlier_receipts_never_read_as_a_fallback_anchors_result() {
+        let long = "word ".repeat(40);
+        let mut lines = vec![typed_line(&long, "typed")];
+        lines.extend(committed("a", "abc1234", "fix(auth): validate checkout"));
+        lines.push(assistant_stop_line("Done.", "end_turn"));
+        lines.push(typed_line(
+            "Review the new billing dashboard implementation",
+            "typed",
+        ));
+        lines.extend(work("b", 1));
+        lines.push(assistant_stop_line("Reviewed.", "end_turn"));
+        let ep = extract(&lines);
+        let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: Review the new billing dashboard implementation. Latest: fix(auth): validate checkout (abc1234). [[CSR:RECAP]]"
+        );
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_5_a_wrapped_csr_agent_opening_still_has_no_task() {
+        let ep = extract(&[
+            typed_line(
+                "<system-reminder>CSR ENDLESS MEMORY ACTIVE\npast context</system-reminder>\n\nYou are CSR Episode Analyst. Generate a brief.",
+                "typed",
+            ),
+            assistant_stop_line("ok", "end_turn"),
+            typed_line("Summarize the release notes for the narrator.", "typed"),
+        ]);
+        assert_eq!(ep.anchor_request, None);
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_7_commit_receipts_outrank_todo_receipts() {
+        let todo_write = |id: &str, items: Vec<&str>| {
+            let todos: Vec<serde_json::Value> = items
+                .iter()
+                .map(|c| serde_json::json!({"content": c, "status": "completed"}))
+                .collect();
+            vec![
+                assistant_named_tool("TodoWrite", id, serde_json::json!({ "todos": todos })),
+                tool_result_bound(id, "Todos have been modified successfully"),
+            ]
+        };
+        let mut lines = vec![typed_line("ship the auth fixes", "typed")];
+        lines.extend(committed("a", "1111111", "fix(auth): one"));
+        lines.extend(committed("b", "2222222", "fix(auth): two"));
+        lines.extend(todo_write(
+            "toolu_t",
+            vec!["Write regression tests", "Run gates"],
+        ));
+        let got = crate::hooks::recap::compose_recap(&extract(&lines), &no_feeds(), "now").unwrap();
+        assert_eq!(
+            got,
+            "recap [now]: ship the auth fixes: fix(auth): one (1111111); fix(auth): two (2222222). [[CSR:RECAP]]"
+        );
+        // Five or more todo receipts never evict the stored commits.
+        let mut lines = vec![typed_line("ship the auth fixes", "typed")];
+        lines.extend(committed("a", "1111111", "fix(auth): one"));
+        lines.extend(committed("b", "2222222", "fix(auth): two"));
+        lines.extend(todo_write(
+            "toolu_t",
+            vec![
+                "a1 task", "a2 task", "a3 task", "a4 task", "a5 task", "a6 task",
+            ],
+        ));
+        let receipts: Vec<String> = extract(&lines)
+            .completions
+            .iter()
+            .map(|c| c.receipt.clone())
+            .collect();
+        assert!(receipts.contains(&"1111111".to_string()), "{receipts:?}");
+        assert!(receipts.contains(&"2222222".to_string()), "{receipts:?}");
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_8_failed_task_creation_never_becomes_next() {
+        let dreamer = "What if memory notes included their originating session?\n\n\
+                       CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
+                       > Notes should show their origin.";
+        let ep = extract(&[
+            typed_line(dreamer, "typed"),
+            sidechain(assistant_named_tool(
+                "TaskCreate",
+                "toolu_side_create",
+                serde_json::json!({"subject": "Publish package"}),
+            )),
+            sidechain(error_result("toolu_side_create", "permission denied")),
+        ]);
+        assert!(ep.todos.is_empty(), "{:?}", ep.todos);
+        assert_eq!(ep.next_steps, None);
+        let got = crate::hooks::recap::compose_recap(&ep, &no_feeds(), "now").unwrap();
+        assert!(!got.contains("Next:"), "{got}");
+        assert!(!got.contains("todos open"), "{got}");
+        // The main session too: a create that failed is no task.
+        let ep = extract(&[
+            typed_line("publish the package", "typed"),
+            assistant_named_tool(
+                "TaskCreate",
+                "toolu_create",
+                serde_json::json!({"subject": "Publish package"}),
+            ),
+            error_result("toolu_create", "permission denied"),
+        ]);
+        assert!(ep.todos.is_empty(), "{:?}", ep.todos);
+    }
+
+    #[test]
+    fn astra_r5_9_a_crlf_dreamer_prompt_keeps_its_headline() {
+        let ep = extract(&[typed_line(
+            "What if memory notes included their originating session?\r\n\r\nCSR's dreamer asked this while you worked. It is a question, not a task.\r\n\r\n> Notes should show their origin.",
+            "typed",
+        )]);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("note: What if memory notes included their originating session?")
+        );
     }
 }

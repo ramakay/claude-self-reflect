@@ -1860,6 +1860,19 @@ mod tests {
         assert_eq!(crate::extraction::provenance::strip_csr_emissions(&got), "");
     }
 
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_6_relative_paths_never_survive_a_clause_cut() {
+        let text = format!(
+            "Please fix the parser in src/parser.rs, {}",
+            "word ".repeat(40)
+        );
+        assert_eq!(anchor_intent(&text), None);
+        // A slash in prose is not a path.
+        assert!(!is_path_or_url("and/or"));
+        assert!(is_path_or_url("csr-engine/src/hooks/stop.rs"));
+    }
+
     // ---- read-only probe against a real transcript ----------------------
     //
     // `cargo test --release --lib probe_real_transcript_recap -- --ignored --nocapture`

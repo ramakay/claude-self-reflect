@@ -77,7 +77,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     let event = input.source.as_deref().unwrap_or("startup");
 
     // Check for session continuity: was there a session in this project that ended recently?
-    let continued_session = detect_continued_session(engine, project_name, &now);
+    let continued_session = detect_continued_session(engine.storage(), project_name, &now);
 
     // v9.5 episode-first continuity: stored episodes are the primary record.
     // The latest anchors the inline CONTINUUM (zero-retrieval resume for the
@@ -451,14 +451,11 @@ fn strip_unrelated_asides(briefing: &str) -> String {
 }
 
 fn detect_continued_session(
-    engine: &Engine,
+    storage: &crate::storage::Storage,
     project_name: &str,
     now: &DateTime<Utc>,
 ) -> Option<ContinuedSession> {
-    let session = engine
-        .storage()
-        .get_most_recent_session(project_name)
-        .ok()??;
+    let session = storage.get_most_recent_session(project_name).ok()??;
 
     // Check if it's recent enough (guard against future timestamps from clock skew)
     let ts = temporal::parse_timestamp(&session.timestamp)?;
@@ -2497,6 +2494,36 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         sessions.sort();
         // An unrecorded entrypoint is unknown, not headless: it stays.
         assert_eq!(sessions, ["human", "unrecorded"]);
+    }
+
+    #[test]
+    #[ignore = "pending astra r5 fix"]
+    fn astra_r5_4_continued_from_never_names_a_headless_session() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let now = Utc::now();
+        let put = |id: &str, conv: &str, minutes_ago: i64, summary: &str| {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conv.into(),
+                project_name: "p".into(),
+                timestamp: (now - chrono::Duration::minutes(minutes_ago)).to_rfc3339(),
+                content: format!("work recorded for {summary}"),
+                message_count: 6,
+                summary: Some(summary.into()),
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+        };
+        put("h1", "human", 120, "Fix the checkout validation bug");
+        put("s1", "headless", 5, "Review the authentication changes");
+        storage.set_conversation_entrypoint("human", "cli").unwrap();
+        storage
+            .set_conversation_entrypoint("headless", "sdk-cli")
+            .unwrap();
+        let continued = detect_continued_session(&storage, "p", &now).unwrap();
+        assert_eq!(continued.conversation_id, "human");
     }
 
     #[test]
