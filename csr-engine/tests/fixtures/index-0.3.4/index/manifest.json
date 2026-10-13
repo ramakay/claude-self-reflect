@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "created_at": "2026-10-13T04:42:17.848486+00:00",
+  "chunk_id_map": [
+    "8ae51d44-15c3-5340-bde4-e2ddd94c93f6",
+    "96fe16a5-6343-53d6-950f-ecff8af83c57"
+  ],
+  "reflection_id_map": [
+    "heuristic_sample_conversation",
+    "heuristic_sample_conversation2"
+  ],
+  "chunk_embeddings_expected": 2,
+  "reflection_embeddings_expected": 2,
+  "active_reflection_count": 2,
+  "chunk_basename": "chunks-78693-0",
+  "reflection_basename": "reflections-78693-1",
+  "epoch": 1
+}

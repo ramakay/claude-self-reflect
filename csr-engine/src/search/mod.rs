@@ -1431,6 +1431,25 @@ impl SearchEngine {
         // those stale vectors. Gating on the id map treats that manifest as empty and
         // rebuilds from the DB instead.
         let lock_held = _lock_guard.is_some();
+        // hnsw_rs exits the process (`std::process::exit(1)`), rather than
+        // returning an error, on several damaged-dump paths: a data record it
+        // cannot read in heap mode, a pre-format-3 description, a file its
+        // mmap path cannot open. Check what can be checked before handing
+        // it the files; a damaged generation is rebuilt from SQLite instead.
+        for (basename, points) in [
+            (&manifest.chunk_basename, manifest.chunk_id_map.len()),
+            (
+                &manifest.reflection_basename,
+                manifest.reflection_id_map.len(),
+            ),
+        ] {
+            if points > 0 {
+                if let Err(problem) = check_generation_files(dir, basename, points) {
+                    tracing::warn!(basename, problem, "index generation damaged; rebuilding");
+                    return None;
+                }
+            }
+        }
         let chunk_use_mmap = should_mmap_generation(
             dir,
             &manifest.chunk_basename,
@@ -1539,6 +1558,58 @@ impl SearchEngine {
             _mapped: mapped,
         })
     }
+}
+
+/// Graph description magics hnsw_rs 0.3.5 loads without exiting (format 3
+/// and 4; format 2 reaches a `process::exit`).
+const LOADABLE_GRAPH_MAGICS: [u32; 2] = [0x002a_6771, 0x002a_6779];
+/// The data file's leading magic.
+const DATA_MAGIC: u32 = 0xa67f_0000;
+
+/// Check a generation's files against what loading `points` points needs:
+/// a loadable graph description magic, the data magic, and a data file of
+/// exactly `12 + points * (20 + 4 * dimension)` bytes (header: magic +
+/// dimension; record: magic, id, length, the f32 vector). `Err` names the
+/// first problem.
+fn check_generation_files(
+    dir: &Path,
+    basename: &str,
+    points: usize,
+) -> std::result::Result<(), String> {
+    use std::io::Read;
+    let read_head =
+        |extension: &str, bytes: usize| -> std::result::Result<(Vec<u8>, u64), String> {
+            let path = dir.join(format!("{basename}{extension}"));
+            let mut file =
+                std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let len = file.metadata().map_err(|e| e.to_string())?.len();
+            let mut head = vec![0u8; bytes];
+            file.read_exact(&mut head)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            Ok((head, len))
+        };
+    let (graph, _) = read_head(".hnsw.graph", 4)?;
+    let magic = u32::from_ne_bytes([graph[0], graph[1], graph[2], graph[3]]);
+    if !LOADABLE_GRAPH_MAGICS.contains(&magic) {
+        return Err(format!("graph magic {magic:#x} is not a loadable format"));
+    }
+    let (data, len) = read_head(".hnsw.data", 12)?;
+    let magic = u32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != DATA_MAGIC {
+        return Err(format!("data magic {magic:#x}"));
+    }
+    let mut dimension = [0u8; 8];
+    dimension.copy_from_slice(&data[4..12]);
+    let dimension = u64::from_ne_bytes(dimension);
+    let expected = (points as u64)
+        .checked_mul(20 + 4 * dimension)
+        .and_then(|records| records.checked_add(12));
+    if expected != Some(len) {
+        return Err(format!(
+            "data file is {len} bytes, {points} points of dimension {dimension} need {expected:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn next_generation_basename(dir: &Path, prefix: &str) -> String {

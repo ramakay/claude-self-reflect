@@ -3059,3 +3059,162 @@ mod proxied_server_stays_responsive {
         assert!(ping < Duration::from_secs(1), "ping took {ping:?}");
     }
 }
+
+/// Review item 8: a generation dumped by the hnsw_rs 0.3.4 build (the
+/// format every installed index is in) loads in this binary, and a damaged
+/// generation is rebuilt from SQLite instead of killing the server — with
+/// stdout carrying nothing but JSON-RPC either way. The fixture was written
+/// by the b1d7de23 build (`csr-engine --import` of two sample transcripts).
+#[cfg(unix)]
+mod index_compatibility_and_damage {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    fn fixture_copy() -> tempfile::TempDir {
+        let from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/index-0.3.4");
+        let to = tempfile::tempdir().unwrap();
+        std::fs::copy(from.join("csr-engine.db"), to.path().join("csr-engine.db")).unwrap();
+        std::fs::create_dir(to.path().join("index")).unwrap();
+        for entry in std::fs::read_dir(from.join("index")).unwrap().flatten() {
+            std::fs::copy(
+                entry.path(),
+                to.path().join("index").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        // Present in a live index dir; its absence forces the heap load path.
+        std::fs::write(to.path().join("index/index.lock"), b"").unwrap();
+        to
+    }
+
+    fn generation(dir: &Path, side: &str, extension: &str) -> PathBuf {
+        std::fs::read_dir(dir.join("index"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.starts_with(&format!("{side}-")) && name.ends_with(extension)
+            })
+            .unwrap()
+    }
+
+    /// One in-process MCP session (no daemon): initialize, then a search.
+    /// Returns (exit success, every stdout line, stderr).
+    fn serve_once(dir: &Path) -> (bool, Vec<serde_json::Value>, String) {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .arg("--db-path")
+            .arg(dir.join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.join("projects"))
+            .env("CSR_NO_DAEMON_PROXY", "1")
+            .env("CSR_ENRICH_INITIAL_DELAY_SECS", "3600")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let requests = [
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "csr_reflect_on_past", "arguments": {"query": "hello", "project": "all", "min_score": 0.0}}}),
+        ];
+        let mut stdin = child.stdin.take().unwrap();
+        for request in requests {
+            writeln!(stdin, "{request}").unwrap();
+        }
+        drop(stdin);
+        let output = child.wait_with_output().unwrap();
+        let lines = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("stdout carries only JSON-RPC"))
+            .collect();
+        (
+            output.status.success(),
+            lines,
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    fn assert_served(case: &str, dir: &Path, startup: &str) {
+        let (ok, lines, stderr) = serve_once(dir);
+        assert!(
+            ok,
+            "{case}: the server must not exit on a damaged cache: {stderr}"
+        );
+        let ids: Vec<_> = lines.iter().map(|line| line["id"].clone()).collect();
+        assert_eq!(
+            ids,
+            vec![serde_json::json!(1), serde_json::json!(2)],
+            "{case}"
+        );
+        assert!(lines.iter().all(|line| line["jsonrpc"] == "2.0"), "{case}");
+        assert!(
+            lines[1]["result"]["content"].is_array(),
+            "{case}: {}",
+            lines[1]
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("CSR startup") && line.contains(startup)),
+            "{case}: expected a {startup} startup: {stderr}"
+        );
+    }
+
+    #[test]
+    fn a_0_3_4_generation_loads_from_cache() {
+        let dir = fixture_copy();
+        assert_served("intact 0.3.4 dump", dir.path(), "cached");
+    }
+
+    #[test]
+    fn damaged_generations_are_rebuilt_not_fatal() {
+        type Damage = fn(&Path);
+        let cases: [(&str, Damage); 4] = [
+            ("truncated data, heap load", |dir| {
+                std::fs::remove_file(dir.join("index/index.lock")).unwrap();
+                let data = generation(dir, "chunks", ".hnsw.data");
+                let len = std::fs::metadata(&data).unwrap().len();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&data)
+                    .unwrap()
+                    .set_len(len - 100)
+                    .unwrap();
+            }),
+            ("truncated data, mapped load", |dir| {
+                let data = generation(dir, "chunks", ".hnsw.data");
+                let len = std::fs::metadata(&data).unwrap().len();
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&data)
+                    .unwrap()
+                    .set_len(len / 2)
+                    .unwrap();
+            }),
+            ("unsupported graph header (format 2)", |dir| {
+                let graph = generation(dir, "chunks", ".hnsw.graph");
+                let mut bytes = std::fs::read(&graph).unwrap();
+                bytes[..4].copy_from_slice(&0x002a_677f_u32.to_ne_bytes());
+                std::fs::write(&graph, bytes).unwrap();
+            }),
+            ("garbage graph header", |dir| {
+                let graph = generation(dir, "reflections", ".hnsw.graph");
+                let mut bytes = std::fs::read(&graph).unwrap();
+                bytes[..4].copy_from_slice(&[0, 0, 0, 0]);
+                std::fs::write(&graph, bytes).unwrap();
+            }),
+        ];
+        for (case, damage) in cases {
+            let dir = fixture_copy();
+            damage(dir.path());
+            assert_served(case, dir.path(), "rebuilt");
+        }
+    }
+}
