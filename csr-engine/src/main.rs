@@ -84,7 +84,7 @@ enum Commands {
     },
     /// Handle Claude Code hook events
     Hook {
-        /// Hook name: session-start, session-end, precompact, stop, subagent-stop, post-tool-use, prompt-submit, install
+        /// Hook name: session-start, session-end, precompact, stop, post-tool-use, prompt-submit, install, subagent-stop (deprecated, no-op)
         name: String,
 
         /// For install: auto-apply to settings.json
@@ -662,6 +662,12 @@ fn main() -> Result<()> {
         );
     }
     let args = Args::parse();
+    // Retired hooks still named by older settings.json files: exit before the
+    // maintenance lock, stdin, storage or runtime so they cost only the spawn.
+    if matches!(&args.command, Some(Commands::Hook { name, .. }) if csr_engine::hooks::is_retired_hook(name))
+    {
+        return Ok(());
+    }
     let _hook_operation = match &args.command {
         Some(Commands::Hook { name, .. }) if name != "install" => {
             let Some(operation) = csr_engine::hooks::try_start(&args.db_path) else {

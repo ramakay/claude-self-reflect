@@ -1036,28 +1036,46 @@ fn test_hook_input_stop_hook_active_missing() {
     assert_eq!(input.stop_hook_active, None);
 }
 
+/// `hook subagent-stop` is retired but may still sit in an old settings.json
+/// until the user re-installs: it must stay accepted and do nothing — no
+/// output, no database, no engine — whatever Claude Code pipes to it.
+#[cfg(unix)]
 #[test]
-fn test_hook_input_subagent_stop_fields() {
-    let json = r#"{
-        "session_id":"parent-1",
-        "transcript_path":"/tmp/parent-1.jsonl",
-        "agent_id":"child-7",
-        "agent_type":"general-purpose",
-        "agent_transcript_path":"/tmp/parent-1/subagents/agent-child-7.jsonl",
-        "last_assistant_message":"finished the task"
-    }"#;
-    let input: csr_engine::hooks::HookInput = serde_json::from_str(json).unwrap();
-    assert_eq!(input.session_id.as_deref(), Some("parent-1"));
-    assert_eq!(input.agent_id.as_deref(), Some("child-7"));
-    assert_eq!(input.agent_type.as_deref(), Some("general-purpose"));
-    assert_eq!(
-        input.agent_transcript_path.as_deref(),
-        Some("/tmp/parent-1/subagents/agent-child-7.jsonl")
-    );
-    assert_eq!(
-        input.last_assistant_message.as_deref(),
-        Some("finished the task")
-    );
+fn retired_subagent_stop_hook_is_a_silent_noop() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let payloads: [&[u8]; 4] = [
+        b"",
+        b"not json at all",
+        br#"{"session_id":"parent-1","agent_id":"child-7","agent_transcript_path":"/nonexistent/agent-child-7.jsonl"}"#,
+        br#"{"session_id":"parent-1","transcript_path":"/nonexistent/parent-1.jsonl"}"#,
+    ];
+    for payload in payloads {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "subagent-stop", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // The no-op may exit before reading; a broken pipe here is fine.
+        let _ = child.stdin.take().unwrap().write_all(payload);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "the retired hook must not create a database or any other file"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

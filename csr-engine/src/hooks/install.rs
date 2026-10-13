@@ -83,9 +83,6 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
             "Stop": [{
                 "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path)}]
             }],
-            "SubagentStop": [{
-                "hooks": [{"type": "command", "command": format!("{} hook subagent-stop", binary_path)}]
-            }],
             "PostToolUse": [{
                 "matcher": "Edit|Write|MultiEdit|NotebookEdit",
                 "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path)}]
@@ -131,6 +128,10 @@ fn is_csr_entry(entry: &serde_json::Value) -> bool {
 
 /// Merge CSR hook config into existing settings JSON. Removes stale CSR entries,
 /// appends fresh ones. Preserves non-CSR hooks (GSD, Moshi, etc).
+///
+/// Event groups the new config no longer registers (SubagentStop, retired) are
+/// swept too: a CSR entry left there would keep spawning the binary on every
+/// event. A group is deleted only when that sweep emptied it.
 fn merge_hook_config(
     settings: &mut serde_json::Value,
     config: &serde_json::Value,
@@ -152,6 +153,20 @@ fn merge_hook_config(
             } else {
                 hooks_obj[hook_type] = entries.clone();
             }
+        }
+
+        if let Some(existing) = hooks_obj.as_object_mut() {
+            existing.retain(|hook_type, group| {
+                if new_hooks.contains_key(hook_type) {
+                    return true;
+                }
+                let Some(entries) = group.as_array_mut() else {
+                    return true;
+                };
+                let before = entries.len();
+                entries.retain(|entry| !is_csr_entry(entry));
+                !(entries.is_empty() && before > 0)
+            });
         }
     }
     Ok(())
@@ -342,9 +357,10 @@ mod tests {
         let cmd = stop[0]["hooks"][0]["command"].as_str().unwrap();
         assert!(cmd.contains("csr-engine hook stop"));
 
-        let subagent_stop = hooks.get("SubagentStop").unwrap();
-        let cmd = subagent_stop[0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(cmd.contains("csr-engine hook subagent-stop"));
+        assert!(
+            hooks.get("SubagentStop").is_none(),
+            "the SubagentStop hook is retired"
+        );
 
         let post_tool_use = hooks.get("PostToolUse").unwrap();
         let cmd = post_tool_use[0]["hooks"][0]["command"].as_str().unwrap();
@@ -393,6 +409,78 @@ mod tests {
         assert_eq!(briefing_hook["hooks"][0]["timeout"].as_u64().unwrap(), 150);
         // Briefing only on startup|resume (not compact — compact doesn't need fresh briefing)
         assert_eq!(briefing_hook["matcher"].as_str().unwrap(), "startup|resume");
+    }
+
+    fn csr_subagent_stop_entry() -> serde_json::Value {
+        serde_json::json!({
+            "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook subagent-stop"}]
+        })
+    }
+
+    fn user_subagent_stop_entry() -> serde_json::Value {
+        serde_json::json!({
+            "hooks": [{"type": "command", "command": "/Users/me/bin/notify-subagent.sh"}]
+        })
+    }
+
+    #[test]
+    fn test_generated_config_registers_no_subagent_stop() {
+        let config = generate_hook_config("/usr/local/bin/csr-engine");
+        assert!(config["hooks"].get("SubagentStop").is_none());
+        assert!(!config.to_string().contains("subagent-stop"));
+    }
+
+    #[test]
+    fn test_merge_drops_retired_csr_entry_but_keeps_the_users() {
+        let mut settings = serde_json::json!({
+            "hooks": {"SubagentStop": [csr_subagent_stop_entry(), user_subagent_stop_entry()]}
+        });
+
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        assert_eq!(
+            settings["hooks"]["SubagentStop"],
+            serde_json::json!([user_subagent_stop_entry()]),
+            "only the user's own SubagentStop hook may remain"
+        );
+    }
+
+    #[test]
+    fn test_merge_removes_a_group_that_only_held_retired_csr_entries() {
+        let mut settings = serde_json::json!({
+            "hooks": {"SubagentStop": [csr_subagent_stop_entry()]}
+        });
+
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        assert!(settings["hooks"].get("SubagentStop").is_none());
+        assert!(
+            settings["hooks"].get("Stop").is_some(),
+            "current hooks are still installed"
+        );
+    }
+
+    #[test]
+    fn test_merge_leaves_groups_it_did_not_empty_alone() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "Notification": [],
+                "SubagentStart": [user_subagent_stop_entry()]
+            },
+            "model": "opus"
+        });
+
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        assert_eq!(settings["hooks"]["Notification"], serde_json::json!([]));
+        assert_eq!(
+            settings["hooks"]["SubagentStart"],
+            serde_json::json!([user_subagent_stop_entry()])
+        );
+        assert_eq!(settings["model"], "opus");
     }
 
     /// The installers tell a user whose hooks point at a different copy of
