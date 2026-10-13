@@ -17,6 +17,9 @@ pub struct ScrubReport {
     pub chunks_rewritten: usize,
     pub chunks_dropped: usize,
     pub vectors_replaced: usize,
+    /// Conversations whose re-parse plan would have wiped most of the stored
+    /// corpus. Nothing is written for them.
+    pub refused: usize,
     /// Conversations removed whole because their transcript is a CSR agent prompt.
     pub agent_transcripts_purged: usize,
     pub agent_chunks_purged: usize,
@@ -34,12 +37,13 @@ impl ScrubReport {
             output.push('\n');
         }
         output.push_str(&format!(
-            "{} summary\nconversations scrubbed: {}\nchunks rewritten: {}\nchunks dropped: {}\nvectors replaced: {}\n",
+            "{} summary\nconversations scrubbed: {}\nchunks rewritten: {}\nchunks dropped: {}\nvectors replaced: {}\nrefused: {}\n",
             if dry_run { "scrub dry-run" } else { "scrub" },
             self.conversations_scrubbed,
             self.chunks_rewritten,
             self.chunks_dropped,
-            self.vectors_replaced
+            self.vectors_replaced,
+            self.refused
         ));
         output.push_str(&format!(
             "agent transcripts purged: {} ({} chunks, {} reflections)\n",
@@ -69,6 +73,58 @@ enum ScrubPlanKind {
         rewritten: Vec<ConversationChunk>,
         dropped_ids: Vec<String>,
     },
+    /// A re-parse that would rebuild nothing, or drop most of what is stored,
+    /// is a parser mismatch rather than a scrub. No writes.
+    Refused { reason: String },
+}
+
+/// Chunk sources the Claude transcript parser produced. Anything else
+/// (`codex_rollout`, `plan`, future adapters) has its own on-disk format and
+/// must never be re-parsed as a Claude transcript.
+fn is_claude_transcript_source(source: &str) -> bool {
+    matches!(source, "conversation" | "sidechain")
+}
+
+fn is_claude_transcript_conversation(
+    conversation_id: &str,
+    sources: &HashMap<String, String>,
+) -> bool {
+    !conversation_id.starts_with("codex:")
+        && !conversation_id.starts_with("plan:")
+        && sources
+            .values()
+            .all(|source| is_claude_transcript_source(source))
+}
+
+/// `Some(reason)` when a re-parse plan must not be applied: it rebuilds zero
+/// chunks, or drops more than half of the conversation's stored chunks.
+fn reparse_refusal(
+    old_chunks: &[ConversationChunk],
+    new_chunks: &[ConversationChunk],
+    source_path: &std::path::Path,
+) -> Option<String> {
+    if old_chunks.is_empty() {
+        return None;
+    }
+    let new_ids = new_chunks
+        .iter()
+        .map(|chunk| chunk.id.as_str())
+        .collect::<HashSet<_>>();
+    let dropped = old_chunks
+        .iter()
+        .filter(|chunk| !new_ids.contains(chunk.id.as_str()))
+        .count();
+    if new_chunks.is_empty() || dropped * 2 > old_chunks.len() {
+        Some(format!(
+            "refused, re-parse would rebuild {} chunks and drop {} of {} stored from {}; no writes",
+            new_chunks.len(),
+            dropped,
+            old_chunks.len(),
+            source_path.display()
+        ))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -120,7 +176,10 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
 
     let path = source_path(storage, conversation_id)?;
     let mut structural_evidence = HashMap::new();
-    let kind = if let Some(path) = path.filter(|path| path.exists()) {
+    let reparse_path = path
+        .filter(|path| path.exists())
+        .filter(|_| is_claude_transcript_conversation(conversation_id, &sources));
+    let kind = if let Some(path) = reparse_path {
         let project = old_chunks
             .first()
             .map(|chunk| chunk.project_name.as_str())
@@ -140,7 +199,9 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
             .iter()
             .map(|chunk| chunk.id.clone())
             .collect::<Vec<_>>();
-        if old_ids == new_ids {
+        if let Some(reason) = reparse_refusal(&old_chunks, &chunks, &path) {
+            ScrubPlanKind::Refused { reason }
+        } else if old_ids == new_ids {
             let old_content = old_chunks
                 .iter()
                 .map(|chunk| (chunk.id.as_str(), chunk.content.as_str()))
@@ -207,8 +268,16 @@ fn provenance_for(
 }
 
 fn summarize_plan(plan: &ScrubPlan, report: &mut ScrubReport) {
+    if let ScrubPlanKind::Refused { reason } = &plan.kind {
+        report.refused += 1;
+        report
+            .actions
+            .push(format!("{}: {reason}", plan.conversation_id));
+        return;
+    }
     report.conversations_scrubbed += 1;
     match &plan.kind {
+        ScrubPlanKind::Refused { .. } => unreachable!("returned above"),
         ScrubPlanKind::Stable {
             source_path,
             changed_ids,
@@ -507,12 +576,16 @@ pub async fn run_scrub(
     } else {
         selected_plans(engine.storage(), conversation)?
     };
-    if !plans.is_empty() {
+    if plans
+        .iter()
+        .any(|plan| !matches!(plan.kind, ScrubPlanKind::Refused { .. }))
+    {
         engine.invalidate_index_manifest()?;
     }
     for plan in plans {
         summarize_plan(&plan, &mut report);
         match &plan.kind {
+            ScrubPlanKind::Refused { .. } => {}
             ScrubPlanKind::Stable {
                 source_path,
                 chunks,
@@ -968,6 +1041,197 @@ mod tests {
         assert_eq!(rowid_after, rewrite_rowid);
         assert!(storage.get_chunk_content(&drop_id).unwrap().is_none());
         assert!(!search.read().await.has_chunk(&drop_id));
+    }
+
+    fn rollout_fixture(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "timestamp": "2026-09-01T00:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "codex rollout line"}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn seed_source_chunk(
+        storage: &Storage,
+        embeddings: &EmbeddingEngine,
+        conversation: &str,
+        seq: usize,
+        content: &str,
+        source: &str,
+    ) -> String {
+        let id = super::super::generate_chunk_id(conversation, seq);
+        let vector = embeddings.embed(&[content]).unwrap().remove(0);
+        storage
+            .insert_chunk_with_source(
+                &ConversationChunk {
+                    id: id.clone(),
+                    conversation_id: conversation.into(),
+                    project_name: "project".into(),
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                    content: content.into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq,
+                    is_sidechain: false,
+                },
+                &vector,
+                source,
+            )
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn scrub_codex_rollout_with_existing_file_is_scrubbed_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let rollout = temp.path().join("rollout-2026-09-01T00-00-00-abc.jsonl");
+        rollout_fixture(&rollout);
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(4)));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            search.clone(),
+            projects,
+        );
+        let conversation = "codex:01a06d1b-0000-0000-0000-000000000000";
+        let keep = seed_source_chunk(
+            &storage,
+            &embeddings,
+            conversation,
+            0,
+            "Real codex work, no emission here.",
+            "codex_rollout",
+        );
+        let rewrite = seed_source_chunk(
+            &storage,
+            &embeddings,
+            conversation,
+            1,
+            "Keep this fact.\n\n[[CSR:RECAP]] generated recap",
+            "codex_rollout",
+        );
+        let drop = seed_source_chunk(
+            &storage,
+            &embeddings,
+            conversation,
+            2,
+            "[[CSR:RECAP]] generated only",
+            "codex_rollout",
+        );
+        storage
+            .upsert_import_state_explicit(
+                rollout.to_string_lossy().as_ref(),
+                conversation,
+                3,
+                "fixture",
+            )
+            .unwrap();
+
+        let dry = super::dry_run_scrub(&storage, Some(conversation), false).unwrap();
+        assert_eq!(
+            (dry.chunks_rewritten, dry.chunks_dropped, dry.refused),
+            (1, 1, 0)
+        );
+
+        let report = super::run_scrub(&engine, false, Some(conversation), false)
+            .await
+            .unwrap();
+        assert_eq!(report.conversations_scrubbed, 1);
+        assert_eq!(report.chunks_rewritten, 1);
+        assert_eq!(report.chunks_dropped, 1);
+        assert_eq!(report.refused, 0);
+        assert_eq!(
+            storage.get_chunk_content(&keep).unwrap().as_deref(),
+            Some("Real codex work, no emission here.")
+        );
+        assert_eq!(
+            storage.get_chunk_content(&rewrite).unwrap().as_deref(),
+            Some("Keep this fact.")
+        );
+        assert!(storage.get_chunk_content(&drop).unwrap().is_none());
+        assert_eq!(
+            storage.get_chunk_source(&keep).unwrap().as_deref(),
+            Some("codex_rollout")
+        );
+        assert_eq!(
+            storage.get_chunk_source(&rewrite).unwrap().as_deref(),
+            Some("codex_rollout")
+        );
+    }
+
+    #[tokio::test]
+    async fn scrub_refuses_a_reparse_that_would_rebuild_zero_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        // Parses to no chunks under the Claude parser.
+        let source = projects.join("zero-rebuild.jsonl");
+        std::fs::write(&source, "{\"type\":\"summary\",\"summary\":\"x\"}\n").unwrap();
+
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(4)));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            search.clone(),
+            projects,
+        );
+        let first = seed_source_chunk(
+            &storage,
+            &embeddings,
+            "zero-rebuild",
+            0,
+            "Real work one.",
+            "conversation",
+        );
+        let second = seed_source_chunk(
+            &storage,
+            &embeddings,
+            "zero-rebuild",
+            1,
+            "Real work two.\n\n[[CSR:RECAP]] generated recap",
+            "conversation",
+        );
+        storage
+            .upsert_import_state_explicit(
+                source.to_string_lossy().as_ref(),
+                "zero-rebuild",
+                2,
+                "fixture",
+            )
+            .unwrap();
+
+        let dry = super::dry_run_scrub(&storage, Some("zero-rebuild"), false).unwrap();
+        assert_eq!(dry.refused, 1);
+        assert_eq!(dry.conversations_scrubbed, 0);
+        assert_eq!(dry.chunks_dropped, 0);
+        assert!(dry.actions[0].contains("refused, re-parse would rebuild 0 chunks"));
+        assert!(dry.format_text(true).contains("refused: 1"));
+
+        let report = super::run_scrub(&engine, false, Some("zero-rebuild"), false)
+            .await
+            .unwrap();
+        assert_eq!(report.refused, 1);
+        assert_eq!(report.chunks_dropped, 0);
+        assert_eq!(report.chunks_rewritten, 0);
+        assert!(storage.get_chunk_content(&first).unwrap().is_some());
+        assert_eq!(
+            storage.get_chunk_content(&second).unwrap().as_deref(),
+            Some("Real work two.\n\n[[CSR:RECAP]] generated recap"),
+            "a refused conversation is not written at all"
+        );
     }
 
     fn seed_chunk(
