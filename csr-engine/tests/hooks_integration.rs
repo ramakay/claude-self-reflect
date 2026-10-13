@@ -30,7 +30,34 @@ mod prompt_process {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    /// Launch the binary once, untimed, before any test times a spawn.
+    ///
+    /// The first exec of a newly linked `csr-engine` blocks before `main`
+    /// while macOS evaluates the new image: measured on this harness at
+    /// 0.6 s idle and 1.1–1.8 s under the parallel test load, with zero CPU
+    /// in the child, while every later exec reaches `main` in ~4 ms. Every
+    /// gate run follows a relink, so whichever test spawned first absorbed
+    /// that one-off cost inside its own wall-clock bound, and
+    /// `cold_process_ignores_large_index_and_missing_database`'s 3 s bound
+    /// tripped whenever it was first and the evaluation ran long. Installed
+    /// hooks pay it once per install, not per prompt; the bounds below are
+    /// about the hook process, so the evaluation is taken here, once.
+    fn warm_launch() {
+        static WARM: std::sync::Once = std::sync::Once::new();
+        WARM.call_once(|| {
+            let status = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        });
+    }
+
     fn command(dir: &std::path::Path) -> Command {
+        warm_launch();
         let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
         command
             .args(["hook", "prompt-submit", "--db-path"])
@@ -72,8 +99,13 @@ mod prompt_process {
                 .unwrap();
         }
         for _ in 0..5 {
+            let mut command = command(dir.path());
+            let parent_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let started = Instant::now();
-            let mut child = command(dir.path()).spawn().unwrap();
+            let mut child = command.spawn().unwrap();
             child
                 .stdin
                 .take()
@@ -81,9 +113,21 @@ mod prompt_process {
                 .write_all(&payload(dir.path()))
                 .unwrap();
             let output = child.wait_with_output().unwrap();
+            let wall = started.elapsed();
             assert!(output.status.success());
             assert!(output.stdout.is_empty(), "{:?}", output.stdout);
-            assert!(started.elapsed() < Duration::from_secs(3));
+            // On failure, say where the time went: before `main` (the OS
+            // launch phase `warm_launch` exists for) or inside the hook.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let before_main = stderr
+                .lines()
+                .find_map(|line| line.strip_prefix("CSR timing-probe main_unix_ns="))
+                .and_then(|ns| ns.parse::<u128>().ok())
+                .map(|ns| Duration::from_nanos(ns.saturating_sub(parent_ns) as u64));
+            assert!(
+                wall < Duration::from_secs(3),
+                "wall={wall:?} before_main={before_main:?} stderr={stderr}"
+            );
         }
         assert!(!dir.path().join("csr-engine.db").exists());
         assert_eq!(
