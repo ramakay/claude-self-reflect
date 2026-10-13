@@ -256,7 +256,7 @@ impl BoundSocket {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir.join(lock))?;
-        fs2::FileExt::try_lock_exclusive(&lock)?;
+        let lock = lock_within(lock, LOCK_WAIT)?;
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(&path)?,
             Ok(_) => {
@@ -275,6 +275,46 @@ impl BoundSocket {
             path,
             _lock: lock,
         })
+    }
+}
+
+/// How long a bind waits for the endpoint lock before deciding another
+/// server holds it.
+#[cfg(unix)]
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Take `file`'s exclusive flock, waiting up to `wait` for it.
+///
+/// Not a plain try-lock: on macOS, `posix_spawn` copies the parent's whole
+/// descriptor table into the child and only closes close-on-exec entries
+/// once the new image is activated, so a lock this process released a
+/// moment ago can still be held, through the child's transient copy, by
+/// whatever another thread was spawning when it was released. Measured: a
+/// re-bind straight after a release failed with WouldBlock in 1,794 of
+/// 3,000 attempts while six threads spawned /usr/bin/true. The blocking
+/// flock returns the moment that copy is closed. A thread that is still
+/// waiting when `wait` runs out keeps waiting, and drops the lock as soon
+/// as it gets it, since nobody receives it.
+#[cfg(unix)]
+fn lock_within(file: std::fs::File, wait: Duration) -> std::io::Result<std::fs::File> {
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => return Ok(file),
+        Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e),
+        Err(_) => {}
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("endpoint-lock".into())
+        .spawn(move || {
+            let locked = fs2::FileExt::lock_exclusive(&file).map(|()| file);
+            let _ = tx.send(locked);
+        })?;
+    match rx.recv_timeout(wait) {
+        Ok(locked) => locked,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "endpoint lock held by another server",
+        )),
     }
 }
 
@@ -310,7 +350,12 @@ pub fn spawn_for_daemon(
                     .to_owned())
             });
             let Ok(database) = database else { return };
-            let bound = match BoundSocket::bind(data_dir) {
+            // Off the async workers: a contended lock waits (see `lock_within`).
+            let owned_dir = data_dir.to_path_buf();
+            let bound = match tokio::task::spawn_blocking(move || BoundSocket::bind(&owned_dir))
+                .await
+                .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+            {
                 Ok(bound) => bound,
                 Err(e) => {
                     tracing::warn!(%e, "prompt socket unavailable");
@@ -523,26 +568,16 @@ mod tests {
         let stale = std::os::unix::net::UnixListener::bind(socket_path(dir.path())).unwrap();
         drop(stale);
         assert!(request(dir.path(), input(dir.path())).await.is_none());
-        // Re-taking the lock this test just released can briefly see it held
-        // when another test's child process is being spawned at that moment
-        // (the open lock descriptor is shared until the child's exec closes
-        // it): retry instead of failing on that unrelated window.
-        let recovered = {
-            let mut attempts = 0;
-            loop {
-                match BoundSocket::bind(dir.path()) {
-                    Ok(bound) => break bound,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempts < 50 => {
-                        attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    Err(e) => panic!("{e}"),
-                }
-            }
-        };
+        let recovered = BoundSocket::bind(dir.path()).unwrap();
         drop(recovered);
+        // Prime the renderer in-process first: the request below measures the
+        // endpoint's recovery, not a cold first render against the budget.
+        let engine = fixture(dir.path());
+        super::super::prompt_submit::render(&input(dir.path()), &engine, dir.path())
+            .await
+            .unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let server = spawn_for_daemon(fixture(dir.path()), shutdown.clone());
+        let server = spawn_for_daemon(engine, shutdown.clone());
         ready(dir.path()).await;
         assert!(request(dir.path(), input(dir.path()))
             .await
@@ -750,5 +785,49 @@ mod tests {
             std::fs::read_to_string(socket_path(dir.path())).unwrap(),
             "keep me"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod endpoint_lock_tests {
+    use super::*;
+
+    /// A released endpoint can be bound again at once even while other
+    /// threads spawn child processes (see `lock_within`).
+    #[tokio::test]
+    async fn rebinding_a_released_endpoint_survives_concurrent_spawns() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let _ = std::process::Command::new("/usr/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = (0..300).try_for_each(|_| BoundSocket::bind(dir.path()).map(drop));
+        stop.store(true, Ordering::SeqCst);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        outcome.unwrap();
+    }
+
+    /// A live endpoint still refuses a second server.
+    #[tokio::test]
+    async fn a_held_endpoint_is_refused_after_the_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = BoundSocket::bind(dir.path()).unwrap();
+        let started = std::time::Instant::now();
+        let error = BoundSocket::bind(dir.path())
+            .err()
+            .expect("second bind refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() >= LOCK_WAIT);
+        drop(held);
+        BoundSocket::bind(dir.path()).unwrap();
     }
 }

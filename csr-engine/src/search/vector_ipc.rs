@@ -664,11 +664,18 @@ fn spawn_for_daemon_with(
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let bound = match crate::hooks::prompt_transport::BoundSocket::bind_named(
-                &data_dir,
-                "vector.sock",
-                "vector.lock",
-            ) {
+            // Off the async workers: a contended lock waits.
+            let owned_dir = data_dir.clone();
+            let bound = match tokio::task::spawn_blocking(move || {
+                crate::hooks::prompt_transport::BoundSocket::bind_named(
+                    &owned_dir,
+                    "vector.sock",
+                    "vector.lock",
+                )
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+            {
                 Ok(bound) => bound,
                 Err(error) => {
                     tracing::warn!(%error, "vector socket unavailable");
