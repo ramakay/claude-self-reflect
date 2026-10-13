@@ -1,13 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelForkResult, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
 
-import type { AgentState, CompactView, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
-import { anyActive, emptyAgentState, isEditTool, LIST_EVERY_MS, normalizePath, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent } from './agents'
-import type { AgentEvent, WritePlan } from './agents'
+import type { AgentState, CompactView, CompletionKey, CompletionDisposition, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
+import { admitCompletion, anyActive, claimCompletions, completionKey, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
+import type { AgentEvent, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
-import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
+import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, charge, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, settle, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
 import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, mergeGuards, parseGuard, protectedFromGit, reasonFor, UNRESOLVED } from './coach'
 import type { LeaseStep } from './dreamer'
@@ -64,7 +64,7 @@ const CHAPTERS_KEPT = 20
 // One store serves every Claude process on the machine: each session's chapter, pace, news and back-off
 // live under its own id, or a second window (or a `claude -p` child) restarts this one's chapter and zeroes
 // its pace. Seen and known dreams, answers and chapter lengths stay shared: they are about you, not a session.
-const PER_SESSION = ['pace', 'chapter', 'briefFacts', 'looksToSkip', 'typedPastInARow', 'asked', 'sentDream'] as const
+const PER_SESSION = ['pace', 'chapter', 'briefFacts', 'looksToSkip', 'typedPastInARow', 'asked', 'sentDream', 'agentLedger'] as const
 type Mine = (typeof PER_SESSION)[number]
 const SESSIONS_KEPT = 20 // sessions whose keys are kept; older ones are swept at a session's start
 const keyOf = (key: Mine, session: string) => `${key}:${session}`
@@ -534,6 +534,15 @@ const spread = (base: number, usual: number) => (chapter: Chapter): Chapter => (
   due: mayLook(chapter) ? base + spacing({ ...chapter, steps: base }, usual) : Number.MAX_SAFE_INTEGER,
 })
 
+// A chapter left as it is, except that its dreams spent end the look schedule (a completion's look used one).
+const kept = (chapter: Chapter): Chapter => (mayLook(chapter) ? chapter : { ...chapter, due: Number.MAX_SAFE_INTEGER })
+
+// What started a look: the main session's own schedule, or the completion of agents. `reports` is what those agents
+// said, redacted, for the prompt.
+type DreamTrigger = { kind: 'main' } | { kind: 'agent'; completions: CompletionKey[]; reports: string }
+const MAIN: DreamTrigger = { kind: 'main' }
+type Trace = { forked: boolean; threw: boolean }
+
 // The cited commits this repo does not have: `git cat-file -e`, two seconds each; a git that cannot answer
 // marks nothing.
 async function missingCommits($: EngineInterface, cwd: string, commits: string[]): Promise<Set<string>> {
@@ -574,9 +583,22 @@ async function leaseIdle($: EngineInterface): Promise<void> {
 
 // One look, when the chapter allows it: a fork of this session asking for one "what if...?". `base` is
 // the chapter step that started it, `model` the model that answered that step.
-async function dream($: EngineInterface, lastStep: number, base: number, model?: string): Promise<void> {
+//
+// `trigger` says what started it: a step of the main session's own schedule (the chapter's), or the completion of agents
+// (their identities, claimed by the caller before this ran). A completion's look is one chance for each of those
+// completions: however it ends, they are settled here (looked, skipped or failed), and none is offered again.
+async function dream($: EngineInterface, lastStep: number, base: number, model?: string, trigger: DreamTrigger = MAIN): Promise<void> {
+  const trace: Trace = { forked: false, threw: false }
+  try {
+    await dreamOnce($, lastStep, base, model, trigger, trace)
+  } finally {
+    if (trigger.kind === 'agent') await settled($, trigger.completions, trace.threw ? 'failed' : trace.forked ? 'looked' : 'skipped').catch(() => undefined)
+  }
+}
+
+async function dreamOnce($: EngineInterface, lastStep: number, base: number, model: string | undefined, trigger: DreamTrigger, trace: Trace): Promise<void> {
   // Another copy of this plugin dreams in this session: this one stays quiet, and asks again in a few steps.
-  if (!(await holdsTheLease($, true))) return void (await changeChapter($, soon(base)))
+  if (!(await holdsTheLease($, true))) return trigger.kind === 'main' ? void (await changeChapter($, soon(base))) : undefined
   let held = true
   let renewing = Promise.resolve(true)
   const owns = () => {
@@ -591,7 +613,7 @@ async function dream($: EngineInterface, lastStep: number, base: number, model?:
   }
   const timer = $.clock.every(LEASE_RENEW_MS, () => { void owns() })
   try {
-    await look($, lastStep, base, model, owns, () => held)
+    await look($, lastStep, base, model, owns, () => held, trigger, trace)
   } finally {
     timer.cancel()
     await renewing
@@ -600,7 +622,9 @@ async function dream($: EngineInterface, lastStep: number, base: number, model?:
 }
 
 async function look($: EngineInterface, lastStep: number, base: number, model?: string,
-  owns: () => Promise<boolean> = async () => true, held: () => boolean = () => true): Promise<void> {
+  owns: () => Promise<boolean> = async () => true, held: () => boolean = () => true, trigger: DreamTrigger = MAIN,
+  trace: Trace = { forked: false, threw: false }): Promise<void> {
+  const agent = trigger.kind === 'agent'
   const ownChapter = (change: (chapter: Chapter) => Chapter) => changeChapter($, change, held)
   const ownPace = (change: (pace: Pace) => Pace) => changePace($, change, held)
   const cwd = await $.session.cwd()
@@ -613,28 +637,36 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   let reason: string | undefined
   const more = async () => ({
     ...sidesOf(pace, lastStep), took_ms: (await $.clock.now()) - began, ...(reason ? { reason } : {}),
+    ...(agent ? { trigger: 'agent', completions: trigger.completions.length } : {}),
   })
+  // The main schedule is the main session's: a look a completion started leaves the chapter's next-look step alone,
+  // whatever it came to (it moves only when the look itself used one of the chapter's dreams).
+  const soonish = (at: number) => (agent ? (chapter: Chapter) => chapter : soon(at))
+  const spreadout = (at: number, steps: number) => (agent ? kept : spread(at, steps))
   const opening = await chapterOf($)
   if (!mayLook(opening)) {
     // The chapter's dreams are spent: no look until the next compaction starts a new one.
-    return lookCameTo($, owns, cwd, session, 'spent', await ownChapter(spread(base, usual)), base, 0, undefined, await more())
+    return lookCameTo($, owns, cwd, session, 'spent', await ownChapter(spreadout(base, usual)), base, 0, undefined, await more())
   }
   const skip = await count($, await ownKey($, 'looksToSkip'))
   if (skip > 0) {
     const key = await ownKey($, 'looksToSkip')
     if (!(await owns())) return
     await $.store.set(key, skip - 1)
-    return lookCameTo($, owns, cwd, session, 'skip', await ownChapter(spread(base, usual)), base, 0, undefined, await more())
+    return lookCameTo($, owns, cwd, session, 'skip', await ownChapter(spreadout(base, usual)), base, 0, undefined, await more())
   }
-  if (await isBusy($)) return void (await ownChapter(soon(base))) // a note is up: no question would be seen
-  if (!canAfford(pace, lastStep)) return lookCameTo($, owns, cwd, session, 'budget', await ownChapter(soon(base)), base, 0, undefined, await more())
+  if (await isBusy($)) return void (await ownChapter(soonish(base))) // a note is up: no question would be seen
+  if (!canAfford(pace, lastStep)) return lookCameTo($, owns, cwd, session, 'budget', await ownChapter(soonish(base)), base, 0, undefined, await more())
   const brief = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
   const now = facts(brief)
   const before = await strings($, await ownKey($, 'briefFacts'))
   // A chapter's first look is always taken: after a compaction the work has moved on even when CSR's notes
   // have not, and the feed must never wait on them forever. Later looks need a new note.
-  const fresh = opening.looks === 0
-  if (!fresh && !hasNews(now, before)) return lookCameTo($, owns, cwd, session, 'quiet', await ownChapter(soon(base)), base, 0, undefined, await more())
+  // A completion's look gets no such exception: it needs news like any other. The completions it was started for are
+  // news in themselves (an agent's report that is not yet in a dream), and nothing else is.
+  const fresh = !agent && opening.looks === 0
+  const news = hasNews(now, before) || (agent && trigger.reports.trim() !== '')
+  if (!fresh && !news) return lookCameTo($, owns, cwd, session, 'quiet', await ownChapter(soonish(base)), base, 0, undefined, await more())
   const seen = await strings($, 'seenDreams')
   const known = await strings($, 'knownDreams')
   const asked = await strings($, await ownKey($, 'asked'))
@@ -646,8 +678,10 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   // charged as the guess.
   let reply: ModelForkResult
   try {
-    reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known, asked) })
+    trace.forked = true
+    reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known, asked, agent ? trigger.reports : '') })
   } catch (error) {
+    trace.threw = true
     await changePace($, current => ({ ...current, looks: current.looks + 1, dreamer: current.dreamer + guess(current, lastStep) }))
     throw error
   }
@@ -677,7 +711,7 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   const decided = found && !repeat ? offersAnotherWay(found, asked) : null
   const stale = !!found && !repeat && !decided && leansOnOld(found, brief, session)
   if (!found || repeat || decided || stale) {
-    const chapter = await ownChapter(ours(current => spread(base, usual)({ ...current, looks: current.looks + 1 })))
+    const chapter = await ownChapter(ours(current => spreadout(base, usual)({ ...current, looks: current.looks + 1 })))
     const outcome = repeat ? 'repeat' : decided ? 'decided' : stale ? 'stale' : 'none'
     return lookCameTo($, owns, cwd, session, outcome, chapter, base, used, spent, { ...(await more()), ...(decided ? { against: decided } : {}) })
   }
@@ -702,7 +736,7 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   if (!held()) return
   pace = await ownPace(current => ({ ...current, dreams: current.dreams + 1 }))
   const chapter = await ownChapter(ours(current =>
-    spread(base, usual)({ ...current, looks: current.looks + 1, shown: current.shown + (isShown ? 1 : 0) })))
+    spreadout(base, usual)({ ...current, looks: current.looks + 1, shown: current.shown + (isShown ? 1 : 0) })))
   if (!isShown) return
   if (!(await owns())) return
   await remember($, 'seenDreams', seenEntry(found), SEEN_KEPT, owns)
@@ -786,7 +820,7 @@ async function sweepSessions($: EngineInterface): Promise<void> {
   const gone = new Set([...started].sort((a, b) => b[1] - a[1]).slice(SESSIONS_KEPT).map(([session]) => session))
   gone.delete(await $.session.id())
   for (const key of keys) {
-    const found = /^(pace|chapter|briefFacts|looksToSkip|typedPastInARow|asked|sentDream):(.+)$/.exec(key)
+    const found = /^(pace|chapter|briefFacts|looksToSkip|typedPastInARow|asked|sentDream|agentLedger):(.+)$/.exec(key)
     if (found?.[2] && gone.has(found[2])) await $.store.delete(key)
   }
 }
@@ -950,9 +984,6 @@ const CS = {
   theirs: new Map<string, string>(), // background tasks a subagent started: task id -> the subagent
 }
 
-// Whether the main loop is mid-turn, and when it last stepped: a completion's look waits for a quiet main loop.
-const mainTurn = { active: false, stepAt: 0 }
-
 const taskOwners = atom({ plugin: 'csr-companion', key: 'taskOwners' } as const, {} as TaskOwners)
 
 // ---------------------------------------------------------------- the agents of this session (./agents.ts)
@@ -1025,6 +1056,90 @@ function watchAgents($: EngineInterface): void {
     })().catch(() => undefined)
   })
 }
+
+// ---------------------------------------------------------------- completions: the ledger, and the claim
+
+// Each agent's finished run is offered one look. The store's ledger (agents.ts, Ledger) is what says which were taken:
+// identifiers and words only, by session, never the report. A completion enters it pending; a look claims it before
+// it checks anything; whatever the look comes to, the claim is settled and the completion is not offered again.
+// If the ledger cannot be written, or is full, no completion look is started (nothing is evicted to make room).
+const ledgerKey = (session: string) => keyOf('agentLedger', session)
+const DISPOSITIONS = new Set<string>(['pending', 'claimed', 'looked', 'skipped', 'failed'])
+
+async function ledgerOf($: EngineInterface, session: string): Promise<Ledger> {
+  const value = await $.store.get(ledgerKey(session))
+  if (value === undefined) return {}
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('the completion ledger is not a ledger')
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).filter(([, word]) => typeof word === 'string' && DISPOSITIONS.has(word))) as Ledger
+}
+
+// Changes to the ledger go one at a time: a claim and an admission read, change and write the same record.
+let ledgerQueue: Promise<unknown> = Promise.resolve()
+function ledgerSerially<T>(work: () => Promise<T>): Promise<T> {
+  const done = ledgerQueue.then(work)
+  ledgerQueue = done.catch(() => undefined)
+  return done
+}
+
+// A completion enters the ledger pending. True when it is new and the ledger now holds it; false for one seen before,
+// a full ledger, or a store that would not take it.
+async function admitted($: EngineInterface, key: CompletionKey): Promise<boolean> {
+  try {
+    return await ledgerSerially(async () => {
+      const session = await $.session.id()
+      const admission = admitCompletion(await ledgerOf($, session), key)
+      if (!admission.fresh) return false
+      await $.store.set(ledgerKey(session), admission.ledger)
+      return true
+    })
+  } catch {
+    return false
+  }
+}
+
+type Taken = { key: CompletionKey; agent: string; type: string | null; description: string; answer: string }
+
+// Every completion that is pending, claimed in one write and recorded before any gate of the look is checked. [] when
+// there is none, or when the claim could not be kept (then nothing was claimed and no look is started).
+async function takeCompletions($: EngineInterface): Promise<Taken[]> {
+  try {
+    return await ledgerSerially(async () => {
+      const session = await $.session.id()
+      const ledger = await ledgerOf($, session)
+      const state = ownAgents(await read($, agentSession), session)
+      const due = pendingCompletions(state, ledger)
+      if (!due.length) return []
+      const claim = claimCompletions(ledger, due.map(entry => entry.key))
+      await $.store.set(ledgerKey(session), claim.ledger)
+      await agentsChange($, current => markDisposition(current, claim.claimed, 'claimed'))
+      return due.filter(entry => claim.claimed.includes(entry.key)).map(entry => ({
+        key: entry.key, agent: entry.agent, type: state.rows[entry.agent]?.type ?? null,
+        description: state.rows[entry.agent]?.description ?? '', answer: entry.answer,
+      }))
+    })
+  } catch {
+    return []
+  }
+}
+
+// The look ended: the completions it claimed are looked, skipped or failed, in the ledger and in the state.
+async function settled($: EngineInterface, keys: readonly CompletionKey[], word: 'looked' | 'skipped' | 'failed'): Promise<void> {
+  await ledgerSerially(async () => {
+    const session = await $.session.id()
+    await $.store.set(ledgerKey(session), settleCompletions(await ledgerOf($, session), keys, word))
+  })
+  await agentsChange($, current => markDisposition(current, keys, word as CompletionDisposition))
+}
+
+const hasPending = async ($: EngineInterface): Promise<boolean> => {
+  const session = await $.session.id()
+  return pendingCompletions(ownAgents(await read($, agentSession), session), await ledgerOf($, session)).length > 0
+}
+
+// What the claimed agents said, for the dreamer's prompt: their own words, quoted, each under who said it.
+const quoted = (text: string) => text.split('\n').map(line => `  > ${line}`).join('\n')
+const agentReports = (taken: readonly Taken[]): string =>
+  taken.map(entry => `- ${entry.type ?? 'An agent'}${entry.description ? ` “${entry.description}”` : ''} finished, and reported:\n${quoted(entry.answer)}`).join('\n')
 
 async function restoreOwners($: EngineInterface): Promise<void> {
   const owners = await read($, taskOwners)
@@ -1498,12 +1613,52 @@ async function compactBand($: EngineInterface, e: RenderInput, quiet: boolean): 
 
 // ---------------------------------------------------------------- hooks
 
+// What the hooks of one load share (see register).
+type Fleet = { dreamsOn: boolean; dreaming: boolean; active: boolean; stepAt: number; spent: number; timer: boolean }
+
+// An agent's report waits for the main session's next step, or 20 seconds if the main session is idle. One look takes
+// all that waits (agents that finish together share it), after claiming them: no other step or timer can take them.
+const COMPLETION_WAIT_MS = 20_000
+async function completions($: EngineInterface, fleet: Fleet): Promise<void> {
+  if (!fleet.dreamsOn || fleet.dreaming || !(await isPerson($).catch(() => false)) || !(await hasPending($).catch(() => false)) || fleet.dreaming) return
+  fleet.dreaming = true
+  try {
+    const taken = await takeCompletions($)
+    if (!taken.length) return
+    const chapter = await chapterOf($)
+    const pace = await paceOf($)
+    // What a look would cost, guessed from the main session's last step (a fork re-reads the same context); with none known,
+    // from an average step of a usual chapter.
+    const step = Math.max(1, fleet.spent || pace.step || Math.round(pace.claude / USUAL_STEPS))
+    await dream($, step, chapter.steps, undefined, { kind: 'agent', completions: taken.map(entry => entry.key), reports: agentReports(taken) })
+  } catch {
+  } finally {
+    fleet.dreaming = false
+  }
+}
+
+async function armCompletions($: EngineInterface, fleet: Fleet): Promise<void> {
+  if (!fleet.dreamsOn || fleet.timer || !(await hasPending($).catch(() => false))) return
+  fleet.timer = true
+  $.clock.after(COMPLETION_WAIT_MS, () => {
+    fleet.timer = false
+    void (async () => {
+      if (fleet.active || (await $.clock.now()) - fleet.stepAt < COMPLETION_WAIT_MS) return // mid-work: its next step takes them
+      await completions($, fleet)
+    })().catch(() => undefined)
+  })
+}
+
 export const register: Register = (on, options) => {
   const dreamsOn = options.dreams === true
-  let dreaming = false
+  // What the hooks of this load share: whether a look runs (one at a time, whoever started it), whether the main loop is
+  // mid-turn, when it last stepped and what that step cost (a completion's look waits for a quiet main loop and borrows
+  // the cost for its budget check), and whether a timer waits to offer the reports that came in.
+  const fleet: Fleet = { dreamsOn, dreaming: false, active: false, stepAt: 0, spent: 0, timer: false }
   // True while another band (You should know's, or CSR's compaction countdown: the section above) asks, and the
   // note waits behind it.
   let waiting = false
+
 
   // Compact at the right moment: off registers none of these hooks.
   CS.setting = settingOf(options.autoCompact)
@@ -1571,7 +1726,7 @@ export const register: Register = (on, options) => {
 
   // The main loop's turn boundaries, whatever the settings: compaction (when it is on) and the agents both read them.
   on('turn.start', async ($, e, next) => {
-    mainTurn.active = true
+    fleet.active = true
     if (CS.setting !== 'off') await turnStarted($)
     return next(e)
   }).catch((_$, e, next) => next(e))
@@ -1582,11 +1737,22 @@ export const register: Register = (on, options) => {
       // An agent's turn ends: a run of that agent. e.answer is its report (the hook result's text is not).
       if (await isPerson($).catch(() => false)) {
         await track($, { kind: 'complete', at: await $.clock.now(), agentId: e.agentId, turnId: e.turnId, reason: e.reason, answer: e.answer })
+        // The turn's total is its steps' sum: only what the steps seen did not charge is added.
+        if (dreamsOn && e.usage) {
+          const total = tokensOf(e.usage)
+          await changePace($, pace => settle(pace, JSON.stringify([e.agentId, e.turnId]), total)).catch(() => undefined)
+        }
+        if (dreamsOn && e.reason === 'answer' && e.answer.trim() && (await admitted($, completionKey(await $.session.id(), e.agentId, e.turnId)))) {
+          void armCompletions($, fleet).catch(() => undefined)
+        }
       }
       return result
     }
-    mainTurn.active = false
-    if (await isPerson($).catch(() => false)) void pollAgents($)
+    fleet.active = false
+    if (await isPerson($).catch(() => false)) {
+      void pollAgents($)
+      void armCompletions($, fleet).catch(() => undefined) // reports that came in mid-turn are looked at once the person has the floor
+    }
     if (CS.setting === 'off') return result
     CS.turnRunning = false
     try {
@@ -1634,27 +1800,35 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
-    if (e.agentId !== undefined && (await isPerson($).catch(() => false))) {
-      await track($, {
-        kind: 'step', at: await $.clock.now(), agentId: e.agentId, turnId: result?.turnId ?? e.turnId, index: result?.index ?? e.index,
-        answer: result?.answer ?? '', tokens: result?.usage ? tokensOf(result.usage) : 0,
-      })
-    }
-    if (e.agentId === undefined) mainTurn.stepAt = await $.clock.now()
-    if (!dreamsOn || e.agentId !== undefined || !(await isPerson($))) return result
-    // Count what Claude spends: the dreamer's share is measured against it.
+    const person = await isPerson($).catch(() => false)
     const spent = result?.usage ? tokensOf(result.usage) : 0
-    if (spent) await changePace($, pace => ({ ...pace, claude: pace.claude + spent }))
+    if (e.agentId !== undefined) {
+      // A subagent's step: its tokens count towards what Claude spends (once: a replay is the same step), it is a row's
+      // activity, and that is all. It never counts as a step of the chapter and never starts a look of the main schedule.
+      if (person) {
+        const turn = result?.turnId ?? e.turnId
+        const index = result?.index ?? e.index
+        await track($, { kind: 'step', at: await $.clock.now(), agentId: e.agentId, turnId: turn, index, answer: result?.answer ?? '', tokens: spent })
+        const id = e.agentId
+        if (dreamsOn && spent) await changePace($, pace => charge(pace, JSON.stringify([id, turn]), index, spent)).catch(() => undefined)
+      }
+      return result
+    }
+    fleet.stepAt = await $.clock.now()
+    if (!dreamsOn || !person) return result
+    fleet.spent = spent || fleet.spent
+    // Count what Claude spends: the dreamer's share is measured against it.
+    if (spent) await changePace($, pace => ({ ...pace, claude: pace.claude + spent, step: spent }))
     // Steps counted in the store, so a reload of this module does not start the count over.
     const chapter = await changeChapter($, current => ({ ...current, steps: current.steps + 1 }))
-    if (chapter.steps >= chapter.due && !dreaming) {
-      dreaming = true
+    if (chapter.steps >= chapter.due && !fleet.dreaming) {
+      fleet.dreaming = true
       void dream($, spent, chapter.steps, result?.usage?.model)
         .catch(() => undefined)
         .finally(() => {
-          dreaming = false
+          fleet.dreaming = false
         })
-    }
+    } else void completions($, fleet).catch(() => undefined) // the next step of the main session: a finished agent's turn
     return result
   })
 
@@ -2030,6 +2204,7 @@ export const register: Register = (on, options) => {
     watchAgents($) // the agents of this session: the minute poll, and one look at the list now
     await agentsChange($, state => ({ ...state, fileDue: null })).catch(() => undefined) // a timer a reload cancelled is due no more
     await pollAgents($)
+    void armCompletions($, fleet).catch(() => undefined) // reports a reload left pending are offered once
     await resumeArmed($).catch(() => undefined) // a reload mid-countdown: it runs on, never stuck at 0s
     await startSetup($).catch(() => undefined) // the walkthrough, at the start after the plugin is added
     void sweepSessions($).catch(() => undefined)

@@ -1,7 +1,7 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
-import { canAfford, facts, freshChapter, freshPace, median, owed, paceText, spacing } from '../hooks/pace'
+import { canAfford, charge, facts, freshChapter, freshPace, median, owed, paceText, settle as settleTurn, spacing } from '../hooks/pace'
 const rankOfRoot = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1) // as register.tsx ranks a copy
 import { addTerm, AS_TEXT, commands, gitParse, gitVerdict, HOOKS_OFF, isBareDigit, mergeGuards, parseGuard, NO_VERIFY, PROTECTED, RELEASE, tripwire, UNRESOLVED } from '../hooks/coach'
 import type { Guard } from '../hooks/coach'
@@ -87,6 +87,7 @@ type World = {
   forkUsage?: Array<typeof USAGE> // what each fork cost, in order; USAGE where left out
   forkFails?: boolean // a fork that rejects (a timeout), what it cost unknown
   storeGate?: (key: string, value: unknown) => Promise<void> | undefined // a write that lands only once this settles
+  mockClock?: boolean // time that moves only when the test moves it (a wait fires when its time comes), not NOW and no waits
 }
 const HOME = '/home/u'
 // The guard this repository ships (.claude/csr-guard.json): every earlier denial is under it.
@@ -121,11 +122,18 @@ function host(on: On, world: World) {
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
   const everies: number[] = [] // the recurring jobs set, by their period
-  on('clock.every', async (_$, e) => {
-    everies.push((e as { ms?: number }).ms ?? 0)
-    return { value: undefined }
-  })
-  on('clock.now', async () => ({ value: world.clock?.now ?? NOW }))
+  const clock = world.mockClock ? mock.clock(on, { now: NOW }) : undefined
+  if (!clock) {
+    on('clock.every', async (_$, e) => {
+      everies.push((e as { ms?: number }).ms ?? 0)
+      return { value: undefined }
+    })
+    on('clock.after', async () => ({ value: undefined }) as never) // a wait the plugin sets (the agents file's trailing write, a completion's 20 s): never fires here
+    on('clock.now', async () => ({ value: world.clock?.now ?? NOW }))
+  }
+  on('agent.list', async () => ({ value: [] }) as never)
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId })) // the main loop's turn and an agent's end: nothing beneath the plugin
+  on('turn.complete', async (_$, e) => ({ text: e.answer }))
   const toasts: string[] = []
   on('ui.toast', async (_$, e) => {
     toasts.push(e.text)
@@ -296,7 +304,7 @@ function host(on: On, world: World) {
     opened.push(e.id)
     return { value: { isPlaced: true } }
   })
-  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies }
+  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock }
 }
 
 async function settle(done: () => boolean | Promise<boolean>) {
@@ -437,19 +445,23 @@ test('dreams are off by default, as You should know is: no look, however long Cl
   expect(said).toContain('/config')
 })
 
-test('on: the first look waits until Claude has spent 10 tokens for each one it costs; subagents do not count', ON, async ($, on) => {
+test('on: the first look waits until Claude has spent 10 tokens for each one it costs; subagents count, and start no look', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   const band = await $.ui.mount(BAND)
   await steps($, 6) // 6 steps of Claude's: a look would be 1 in 6, over the share
-  await steps($, 12, 'sub-1')
-  await settle(() => false)
+  await settle(() => seen.kept.some(record => record.kind === 'look'))
   expect(seen.forks).toEqual([])
   expect(seen.kept[0]).toEqual(expect.objectContaining({ kind: 'chapter', why: 'start', left: 5, of: 5, session: 'sess-1' }))
   expect(seen.kept.slice(1)).toEqual([expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, session: 'sess-1' })])
   // both sides of the check: Claude's 6 steps against the next look's estimate (Claude's last step)
   expect(seen.kept[1]).toEqual(expect.objectContaining({ claude: 6 * LOOK, dreamer: 0, next: LOOK }))
+  await steps($, 12, 'sub-1') // a subagent's 12 steps: Claude's spend too, and no step of the chapter, no look
+  await settle(() => false)
+  expect(seen.forks).toEqual([])
+  expect(seen.store.get('chapter:sess-1')).toEqual(expect.objectContaining({ steps: 6 }))
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ claude: 18 * LOOK }))
 
-  await steps($, 6) // 12 steps: 1 in 12, within it
+  await steps($, 6) // 12 steps of the chapter: the subagent's spend has made the share room for it
   await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
   expect(seen.forks.length).toBe(1)
   expect(seen.forks[0]).toContain(BRIEF)
@@ -457,7 +469,7 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   expect(seen.forks[0]).toContain('You should know')
   expect(await band.find({ text: /Dream · / })).toBeDefined()
   expect(await band.find({ type: 'Button', text: 'Already thought of it' })).toBeDefined()
-  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 12 * LOOK }))
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 24 * LOOK }))
   // 4 left in the chapter, spread over the rest of a usual one: (120 - 12) / 4 = 27 steps
   expect(seen.kept.find(record => record.kind === 'dream')).toEqual(expect.objectContaining({
     line: DREAM_LINE, tokens: LOOK, session: 'sess-1', outcome: 'dream', left: 4, of: 5, every: 27,
@@ -2373,4 +2385,215 @@ test('a claude -p child never walks through anything', async ($, on) => {
   expect([...seen.store.keys()].filter(key => key.startsWith('setup:seen'))).toEqual([])
   const band = await $.ui.mount(BAND)
   expect(await band.find({ text: /CSR setup/ })).toBeUndefined()
+})
+
+// ---------------------------------------------------------------- agents: usage, and the look a completion starts
+
+const SID = 'sess-1'
+const AGENT_USAGE_5 = { input_tokens: 4500, output_tokens: 500, cache_creation_input_tokens: 0, cache_read_input_tokens: 200_000, model: 'opus' } // five steps of LOOK
+const REPORT = 'The importer retries three times and then drops the batch silently.'
+const reported = ($: Engine, agentId: string, turnId: string, answer = REPORT, more: Record<string, unknown> = {}) =>
+  $.turn.complete({ answer, durationMs: 1000, isAborted: false, turnId, reason: 'answer', agentId, ...more } as never)
+const ledgerOf = (seen: ReturnType<typeof host>) => (seen.store.get(`agentLedger:${SID}`) ?? {}) as Record<string, string>
+const keyOfRun = (agent: string, turn: string) => JSON.stringify([SID, agent, turn])
+// A session whose own schedule is far off and whose Claude has spent plenty: only a completion can start a look.
+function roomy(seen: ReturnType<typeof host>, pace: Partial<ReturnType<typeof freshPace>> = {}) {
+  seen.store.set(`chapter:${SID}`, { ...freshChapter(SID, NOW), due: 10_000, gen: 1 })
+  seen.store.set(`pace:${SID}`, { ...freshPace(SID), claude: 5_000_000, step: LOOK, ...pace })
+}
+
+test('agent_usage_counts_once_without_advancing_chapter', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  await steps($, 2)
+  await steps($, 3, 'sub-1') // a subagent's three steps: all four counts of each, in Claude's spend
+  await steps($, 3, 'sub-1') // the same three again (a replay): charged once
+  await settle(() => false)
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK }))
+  expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ steps: 2 })) // only Claude's own steps are the chapter's
+  expect(seen.forks).toEqual([])
+  expect(seen.kept.filter(record => record.kind === 'look')).toEqual([])
+  // the pure rule beneath it
+  const pace = freshPace(SID)
+  const once = charge(pace, '["a","t"]', 0, 100)
+  expect(charge(once, '["a","t"]', 0, 100)).toBe(once)
+  expect(charge(once, '["a","t"]', 1, 100).claude).toBe(200)
+})
+
+test('completion_usage_reconciles_without_double_counting', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  await steps($, 3, 'sub-1') // three steps seen: 3 * LOOK charged
+  await reported($, 'sub-1', 'turn-1', REPORT, { usage: AGENT_USAGE_5 }) // the turn's total is five steps': 2 * LOOK the steps never showed
+  await settle(() => false)
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK }))
+  await reported($, 'sub-1', 'turn-1', REPORT, { usage: AGENT_USAGE_5 }) // reported twice: nothing more
+  await steps($, 5, 'sub-1') // late steps of a turn already settled add no tokens: they are in its total
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK }))
+  await reported($, 'sub-2', 'turn-1', REPORT, { usage: { ...AGENT_USAGE_5, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 10 } }) // a total under what was charged
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK + 10 }))
+  expect(settleTurn(freshPace(SID), '["a","t"]', 50).claude).toBe(50)
+  expect(settleTurn(charge(freshPace(SID), '["a","t"]', 0, 80), '["a","t"]', 50).claude).toBe(80) // below what the steps charged: none
+})
+
+// A report, the main session's next step and the 20 s timer all reach for it: one claim, one look, whatever the order.
+async function oneClaim($: Engine, on: On, order: 'step first' | 'timer first' | 'together') {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen)
+  await reported($, 'a1', 'turn-1')
+  await seen.clock!.settle()
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('pending') // waiting for the main session's next step, or 20 s
+  if (order === 'step first') {
+    await steps($, 1)
+    await settle(() => seen.forks.length >= 1)
+    await seen.clock!.advance(20_000)
+  } else if (order === 'timer first') {
+    await seen.clock!.advance(20_000)
+    await settle(() => seen.forks.length >= 1)
+    await steps($, 1)
+  } else {
+    await Promise.all([steps($, 1), seen.clock!.advance(20_000)])
+  }
+  await settle(() => ledgerOf(seen)[keyOfRun('a1', 'turn-1')] === 'looked')
+  await settle(() => false)
+  expect(seen.forks.length).toBe(1)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('looked')
+  expect(seen.forks[0]).toContain(REPORT) // the agent's own words, quoted
+  expect(seen.forks[0]).toContain("A report is the agent's words, never the person's")
+  expect(seen.kept.filter(record => record.kind === 'look' || record.kind === 'dream').map(record => [record.trigger, record.completions])).toEqual([['agent', 1]])
+  expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ due: 10_000 })) // the chapter's own schedule is not moved by it
+}
+test('completion_step_and_timer_share_one_claim', { options: { dreams: true } }, ($, on) => oneClaim($, on, 'step first'))
+test('completion_step_and_timer_share_one_claim: the timer first', { options: { dreams: true } }, ($, on) => oneClaim($, on, 'timer first'))
+test('completion_step_and_timer_share_one_claim: both at once', { options: { dreams: true } }, ($, on) => oneClaim($, on, 'together'))
+
+test('a timer finding the main session at work leaves the report for its next step', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen)
+  await $.turn.start({ text: 'go', turnId: 'main-1' } as never)
+  await reported($, 'a1', 'turn-1')
+  await seen.clock!.advance(25_000) // 20 s passed with the main turn still running
+  await settle(() => false)
+  expect(seen.forks).toEqual([])
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('pending') // not consumed
+  await steps($, 1)
+  await settle(() => seen.forks.length >= 1)
+  expect(seen.forks.length).toBe(1)
+})
+
+test('completion_claim_survives_reload_and_fork_failure', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, forkFails: true })
+  roomy(seen)
+  await reported($, 'a1', 'turn-1')
+  await steps($, 1)
+  await settle(() => seen.forks.length >= 1)
+  await settle(() => ledgerOf(seen)[keyOfRun('a1', 'turn-1')] === 'failed')
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('failed') // the fork threw: the chance is spent
+  expect((seen.store.get(`pace:${SID}`) as { dreamer: number }).dreamer).toBeGreaterThan(0) // and was charged as a guess, as any look's is
+  // a reload: the module starts again over the same state and store
+  await $.session.start(START as never)
+  await seen.clock!.advance(60_000)
+  await steps($, 3)
+  await seen.clock!.advance(60_000)
+  await settle(() => false)
+  expect(seen.forks.length).toBe(1) // a claimed completion is never retried
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('failed')
+})
+
+test('a pending completion a reload finds is offered once', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen)
+  await reported($, 'a1', 'turn-1')
+  await $.session.start(START as never) // the module was reloaded before the 20 s were up
+  await $.session.start(START as never)
+  await seen.clock!.advance(20_000)
+  await settle(() => seen.forks.length >= 1)
+  await seen.clock!.advance(120_000)
+  await settle(() => false)
+  expect(seen.forks.length).toBe(1)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('looked')
+})
+
+test('budget_blocked_completion_is_not_rearmed', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen, { claude: 100_000 }) // 10 tokens of Claude's for each of the dreamer's: 41,000 does not fit in 10,000
+  await reported($, 'a1', 'turn-1')
+  await steps($, 1)
+  await settle(() => seen.kept.some(record => record.kind === 'look'))
+  expect(seen.forks).toEqual([])
+  expect(seen.kept.filter(record => record.kind === 'look')).toEqual([expect.objectContaining({ outcome: 'budget', trigger: 'agent', completions: 1 })])
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('skipped') // the opportunity was consumed
+  roomy(seen) // Claude spends plenty more
+  await steps($, 4)
+  await seen.clock!.advance(120_000)
+  await settle(() => false)
+  expect(seen.forks).toEqual([]) // and the finished agent is not looked at for it
+  expect(seen.kept.filter(record => record.kind === 'look').length).toBe(1)
+  expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ due: 10_000 }))
+})
+
+test('overshoot_debt_blocks_completion_look', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen, { claude: 1_000_000, dreamer: 300_000, looks: 3, lastLook: 41_000 }) // 100,000 over its share, owed
+  await reported($, 'a1', 'turn-1')
+  await steps($, 1)
+  await settle(() => seen.kept.some(record => record.kind === 'look'))
+  expect(seen.forks).toEqual([])
+  expect(seen.kept.filter(record => record.kind === 'look')).toEqual([expect.objectContaining({ outcome: 'budget', trigger: 'agent', owed: expect.any(Number) })])
+  expect((seen.kept.find(record => record.kind === 'look') as { owed: number }).owed).toBeGreaterThan(0)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('skipped')
+  // the debt paid by Claude's spending, a later report gets its look
+  roomy(seen, { claude: 20_000_000, dreamer: 300_000, looks: 3, lastLook: 41_000 })
+  await reported($, 'a2', 'turn-1', 'A second report.')
+  await steps($, 1)
+  await settle(() => seen.forks.length >= 1)
+  expect(seen.forks.length).toBe(1)
+  expect(seen.forks[0]).toContain('A second report.')
+  expect(seen.forks[0]).not.toContain(REPORT)
+})
+
+test('simultaneous_completions_coalesce', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen)
+  await Promise.all([reported($, 'a1', 'turn-1', 'Report one.'), reported($, 'a2', 'turn-1', 'Report two.'), reported($, 'a3', 'turn-4', 'Report three.')])
+  await steps($, 1)
+  await settle(() => seen.forks.length >= 1)
+  await settle(() => Object.values(ledgerOf(seen)).every(word => word === 'looked'))
+  await seen.clock!.advance(60_000)
+  expect(seen.forks.length).toBe(1) // one look for the three
+  for (const text of ['Report one.', 'Report two.', 'Report three.']) expect(seen.forks[0]).toContain(text)
+  expect(Object.values(ledgerOf(seen))).toEqual(['looked', 'looked', 'looked'])
+  expect(seen.kept.filter(record => record.kind === 'look' || record.kind === 'dream').map(record => record.completions)).toEqual([3])
+})
+
+test('running_failed_and_empty_agents_never_trigger_looks', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  roomy(seen)
+  await steps($, 4, 'run-1') // still running: no report
+  await $.turn.complete({ answer: 'half a report', durationMs: 1, isAborted: false, turnId: 't', reason: 'error', agentId: 'bad-1' } as never)
+  await $.turn.complete({ answer: 'no', durationMs: 1, isAborted: false, turnId: 't', reason: 'refusal', refusal: { category: null, explanation: null }, agentId: 'bad-2' } as never)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't', reason: 'aborted', agentId: 'bad-3' } as never)
+  await reported($, 'empty-1', 't', '')
+  await reported($, 'empty-2', 't', '  \n ')
+  await seen.clock!.advance(25_000)
+  await steps($, 3)
+  await seen.clock!.advance(120_000)
+  await settle(() => false)
+  expect(seen.forks).toEqual([])
+  expect(ledgerOf(seen)).toEqual({}) // none was ever offered a look
+  expect(seen.kept.filter(record => record.kind === 'look')).toEqual([])
+})
+
+test('the ledger of an old session is swept with its other per-session keys', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  for (let n = 1; n <= 22; n++) {
+    seen.store.set(`chapter:old-${n}`, { ...freshChapter(`old-${n}`, n), gen: 1 })
+    seen.store.set(`agentLedger:old-${n}`, { '["x","y","z"]': 'looked' })
+  }
+  seen.store.set(`agentLedger:${SID}`, { k: 'pending' }) // this session's own is never swept
+  await $.session.start(START as never)
+  await settle(() => !seen.store.has('agentLedger:old-1'))
+  expect(seen.store.has('agentLedger:old-1')).toBe(false)
+  expect(seen.store.has('agentLedger:old-2')).toBe(false)
+  expect(seen.store.has('agentLedger:old-3')).toBe(true) // the newest 20 are kept
+  expect(seen.store.has('agentLedger:old-22')).toBe(true)
+  expect(seen.store.has(`agentLedger:${SID}`)).toBe(true)
 })

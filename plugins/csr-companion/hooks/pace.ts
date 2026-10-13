@@ -31,7 +31,38 @@ export type Pace = {
   looks: number
   dreams: number
   lastLook: number // tokens the last look cost: the estimate for the next
+  step?: number // tokens the main session's last step spent: the estimate for a look no step of its own started
+  turns?: Record<string, Receipt> // what a subagent's turns have been charged, so a replay or a reload never charges twice
 }
+
+// What one subagent turn has been charged to `claude`: the step indexes charged, their tokens, and whether the turn's
+// own total (turn.complete's usage, a sum of its steps, not more usage) has been settled against them.
+export type Receipt = { tokens: number; steps: number[]; closed?: boolean }
+export const TURNS_KEPT = 60
+
+// The pace with a subagent step's tokens charged to the main session's spend (the share is measured against everything
+// Claude spends), once: a step already charged changes nothing. After the turn's total was settled a late step adds no
+// tokens (they are in the total) but is remembered.
+export function charge(pace: Pace, turn: string, index: number, tokens: number): Pace {
+  const seen = pace.turns?.[turn]
+  if (seen?.steps.includes(index)) return pace
+  const add = seen?.closed ? 0 : Math.max(0, tokens)
+  const { [turn]: _old, ...others } = pace.turns ?? {}
+  const turns = { ...others, [turn]: { ...seen, tokens: (seen?.tokens ?? 0) + add, steps: [...(seen?.steps ?? []), index] } }
+  return { ...pace, claude: pace.claude + add, turns: keepTurns(turns) }
+}
+
+// turn.complete's usage is the turn's total, steps included. Only what the steps seen did not already charge is added
+// (steps the hooks never saw), never the total again; a total below what was charged adds nothing.
+export function settle(pace: Pace, turn: string, total: number): Pace {
+  const seen = pace.turns?.[turn]
+  const more = Math.max(0, total - (seen?.tokens ?? 0))
+  const { [turn]: _old, ...others } = pace.turns ?? {}
+  const turns = { ...others, [turn]: { tokens: (seen?.tokens ?? 0) + more, steps: seen?.steps ?? [], closed: true } }
+  return { ...pace, claude: pace.claude + more, turns: keepTurns(turns) }
+}
+
+const keepTurns = (turns: Record<string, Receipt>) => Object.fromEntries(Object.entries(turns).slice(-TURNS_KEPT))
 
 export const freshPace = (session: string): Pace => ({
   session,
