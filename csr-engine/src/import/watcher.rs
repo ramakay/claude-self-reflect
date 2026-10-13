@@ -1253,9 +1253,22 @@ mod maintenance_probes {
         assert!(prepare.await.is_none());
         assert_eq!(retries.values().next().unwrap().attempts, 0);
         drop(owner);
-        let operation =
-            prepare_batch_operation(&storage, Some(&heavy), &pending, &mut retries).await;
-        assert!(operation.is_some());
+        // A concurrently spawned child can retain the inherited lock descriptor
+        // until exec, even after this process drops its last owner.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if prepare_batch_operation(&storage, Some(&heavy), &pending, &mut retries)
+                    .await
+                    .is_some()
+                {
+                    break;
+                }
+                assert_eq!(retries.values().next().unwrap().attempts, 0);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance owner must release within the retry window");
     }
 
     use super::*;

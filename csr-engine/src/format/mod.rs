@@ -397,12 +397,21 @@ pub(crate) fn format_search_results_with_rank_scores(
     display_rank_scores: &[DisplayRankScore],
 ) -> String {
     let mut out = String::new();
+    let keyword_only = !results.is_empty()
+        && results
+            .iter()
+            .all(|r| r.chunk.content.starts_with("[keyword] "));
 
     // Upfront summary
     if results.is_empty() {
         out.push_str(&format!(
             "❌ NO RESULTS: No conversations found matching '{}'\n",
             query
+        ));
+    } else if keyword_only {
+        out.push_str(&format!(
+            "🎯 RESULTS: {} matches (keyword relevance; semantic confidence unavailable)\n",
+            results.len()
         ));
     } else {
         let top_score = results
@@ -425,7 +434,18 @@ pub(crate) fn format_search_results_with_rank_scores(
     out.push_str("\n<search>\n");
 
     // Summary
-    if !results.is_empty() {
+    if keyword_only {
+        out.push_str(&format!(
+            "  <summary count=\"{}\" relevance=\"keyword\">\n",
+            results.len()
+        ));
+        out.push_str("    <confidence>semantic confidence unavailable</confidence>\n");
+        out.push_str(&format!(
+            "    <preview>{}</preview>\n",
+            xml_escape(truncate_chars(&results[0].chunk.content, 100))
+        ));
+        out.push_str("  </summary>\n");
+    } else if !results.is_empty() {
         let top_score = results
             .iter()
             .map(|result| result.score)
@@ -545,7 +565,7 @@ pub(crate) fn format_search_results_with_rank_scores(
         xml_escape(project_scope)
     ));
     out.push_str(&format!("    <count>{}</count>\n", results.len()));
-    if !results.is_empty() {
+    if !results.is_empty() && !keyword_only {
         let min_score = results
             .iter()
             .map(|result| result.score)
@@ -571,7 +591,9 @@ pub(crate) fn format_search_results_with_rank_scores(
     out.push_str("  <results>\n");
     for (i, r) in results.iter().enumerate() {
         out.push_str(&format!("    <r rank=\"{}\">\n", i + 1));
-        if let Some(rank_score) = display_rank_scores
+        if r.chunk.content.starts_with("[keyword] ") {
+            out.push_str("      <relevance>keyword</relevance>\n");
+        } else if let Some(rank_score) = display_rank_scores
             .iter()
             .find(|rank_score| rank_score.chunk_id == r.chunk.id)
         {
@@ -762,6 +784,9 @@ pub fn format_search_insights(results: &[EnrichedResult], query: &str) -> String
         return "<search_summary><message>No matches found</message></search_summary>".into();
     }
 
+    let keyword_only = results
+        .iter()
+        .all(|r| r.chunk.content.starts_with("[keyword] "));
     let avg_score: f32 = results.iter().map(|r| r.score).sum::<f32>() / results.len() as f32;
 
     out.push_str("<search_summary>\n");
@@ -770,16 +795,28 @@ pub fn format_search_insights(results: &[EnrichedResult], query: &str) -> String
         "  <total_matches>{}</total_matches>\n",
         results.len()
     ));
-    out.push_str(&format!(
-        "  <average_score>{:.3}</average_score>\n",
-        avg_score
-    ));
+    if keyword_only {
+        out.push_str("  <relevance>keyword</relevance>\n");
+        out.push_str("  <confidence>semantic confidence unavailable</confidence>\n");
+    } else {
+        out.push_str(&format!(
+            "  <average_score>{:.3}</average_score>\n",
+            avg_score
+        ));
+    }
     out.push_str("  <collections_matched>1</collections_matched>\n");
-    out.push_str(&format!(
-        "  <insight>Found {} matches with average relevance of {:.3}</insight>\n",
-        results.len(),
-        avg_score,
-    ));
+    if keyword_only {
+        out.push_str(&format!(
+            "  <insight>Found {} matches with keyword relevance</insight>\n",
+            results.len()
+        ));
+    } else {
+        out.push_str(&format!(
+            "  <insight>Found {} matches with average relevance of {:.3}</insight>\n",
+            results.len(),
+            avg_score,
+        ));
+    }
     out.push_str("</search_summary>\n");
     out
 }
@@ -897,12 +934,20 @@ pub fn format_recency_results(
         } else {
             r.chunk.content.clone()
         };
-        out.push_str(&format!(
-            "  <result rank='{}' score='{:.3}' time='{}'>\n",
-            i + 1,
-            r.score,
-            relative
-        ));
+        if r.chunk.content.starts_with("[keyword] ") {
+            out.push_str(&format!(
+                "  <result rank='{}' relevance='keyword' time='{}'>\n",
+                i + 1,
+                relative
+            ));
+        } else {
+            out.push_str(&format!(
+                "  <result rank='{}' score='{:.3}' time='{}'>\n",
+                i + 1,
+                r.score,
+                relative
+            ));
+        }
         out.push_str(&format!(
             "    <preview>{}</preview>\n",
             xml_escape(&preview)
@@ -992,7 +1037,11 @@ pub fn format_more_results(
             r.chunk.content.clone()
         };
         out.push_str(&format!("  <result index=\"{}\">\n", offset + i + 1));
-        out.push_str(&format!("    <score>{:.3}</score>\n", r.score));
+        if r.chunk.content.starts_with("[keyword] ") {
+            out.push_str("    <relevance>keyword</relevance>\n");
+        } else {
+            out.push_str(&format!("    <score>{:.3}</score>\n", r.score));
+        }
         out.push_str(&format!(
             "    <timestamp>{}</timestamp>\n",
             xml_escape(&age_stamp(&r.chunk.timestamp))

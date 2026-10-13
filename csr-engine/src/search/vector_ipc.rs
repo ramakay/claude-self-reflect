@@ -16,9 +16,8 @@
 //! of it live), and nine servers falling back together brought the fleet
 //! back. While the daemon does not answer, vector-backed tools answer from
 //! SQLite's keyword index with a one-line note; every call tries the daemon
-//! again, and when it answers they use it. A server whose data dir has no
-//! fresh heartbeat (no daemon was ever run) is the full in-process engine,
-//! unchanged.
+//! again, and when it answers they use it. Without a configured daemon the
+//! server uses the full in-process engine.
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
@@ -112,23 +111,49 @@ pub fn write_heartbeat(data_dir: &Path) {
 }
 
 /// Whether a daemon is configured for `data_dir`: `CSR_NO_DAEMON_PROXY=1`
-/// says no, `CSR_DAEMON_PROXY=1` says yes, otherwise a heartbeat written in
-/// the last 24 h. Configured means proxied, even while the daemon restarts.
+/// says no; an explicit opt-in, installed launchd job, fresh heartbeat or any
+/// typed ping reply says yes. Configuration survives outages and saturation.
 pub fn daemon_configured(data_dir: &Path) -> bool {
     daemon_configured_for_database(&data_dir.join("csr-engine.db"))
 }
 
 pub(crate) fn daemon_configured_for_database(db_path: &Path) -> bool {
+    let set = |name: &str| std::env::var(name).is_ok_and(|v| v == "1" || v == "true");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    daemon_configured_with(
+        db_path,
+        home.as_deref(),
+        set("CSR_NO_DAEMON_PROXY"),
+        set("CSR_DAEMON_PROXY"),
+        |db| {
+            VectorClient::for_database(db)
+                .context("no vector client")?
+                .ping_reply(Duration::from_millis(250))
+        },
+    )
+}
+
+fn daemon_configured_with(
+    db_path: &Path,
+    home: Option<&Path>,
+    disabled: bool,
+    enabled: bool,
+    ping: impl FnOnce(&Path) -> Result<Reply>,
+) -> bool {
+    if disabled {
+        return false;
+    }
+    if enabled
+        || home.is_some_and(|home| {
+            home.join("Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist")
+                .is_file()
+        })
+    {
+        return true;
+    }
     let Some(data_dir) = db_path.parent() else {
         return false;
     };
-    let set = |name: &str| std::env::var(name).is_ok_and(|v| v == "1" || v == "true");
-    if set("CSR_NO_DAEMON_PROXY") {
-        return false;
-    }
-    if set("CSR_DAEMON_PROXY") {
-        return true;
-    }
     let fresh = std::fs::metadata(heartbeat_path(data_dir))
         .and_then(|meta| meta.modified())
         .ok()
@@ -137,14 +162,8 @@ pub(crate) fn daemon_configured_for_database(db_path: &Path) -> bool {
                 .duration_since(modified)
                 .unwrap_or_default()
         })
-        .is_some_and(|age| age <= CONFIGURED_WITHIN);
-    fresh
-        || VectorClient::for_database(db_path).is_some_and(|client| {
-            matches!(
-                client.call(Op::Ping, Duration::from_millis(250)),
-                Ok(Reply::Pong)
-            )
-        })
+        .is_some_and(|age| age < CONFIGURED_WITHIN);
+    fresh || ping(db_path).is_ok()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,8 +281,22 @@ impl VectorClient {
         self.send(&request, Instant::now() + timeout)
     }
 
-    #[cfg(unix)]
+    // Configuration accepts any typed reply, even when serving slots are busy.
+    fn ping_reply(&self, timeout: Duration) -> Result<Reply> {
+        let request = self.encode(Op::Ping)?;
+        self.send_reply(&request, Instant::now() + timeout)
+    }
+
     fn send(&self, request: &[u8], deadline: Instant) -> Result<Reply> {
+        let reply = self.send_reply(request, deadline)?;
+        if let Reply::Error { code, message } = reply {
+            bail!("daemon rejected request ({code:?}): {message}");
+        }
+        Ok(reply)
+    }
+
+    #[cfg(unix)]
+    fn send_reply(&self, request: &[u8], deadline: Instant) -> Result<Reply> {
         let mut stream = connect_by(&self.socket, deadline)
             .with_context(|| format!("connecting {}", self.socket.display()))?;
         let mut frame = Vec::with_capacity(4 + request.len());
@@ -282,14 +315,11 @@ impl VectorClient {
         if response.version != VERSION {
             bail!("daemon speaks vector protocol {}", response.version);
         }
-        if let Reply::Error { code, message } = response.reply {
-            bail!("daemon rejected request ({code:?}): {message}");
-        }
         Ok(response.reply)
     }
 
     #[cfg(not(unix))]
-    fn send(&self, _request: &[u8], _deadline: Instant) -> Result<Reply> {
+    fn send_reply(&self, _request: &[u8], _deadline: Instant) -> Result<Reply> {
         bail!("no vector socket on this platform")
     }
 
@@ -1196,7 +1226,7 @@ mod tests {
         // retrievals evolve two identical databases identically.
         let local_dir = tempfile::TempDir::new().unwrap();
         copy_data_dir(tmp.path(), local_dir.path());
-        let local = Engine::new_for_hook(
+        let local = Engine::new(
             &local_dir.path().join("csr-engine.db"),
             &local_dir.path().join("projects"),
         )
@@ -1588,18 +1618,22 @@ mod tests {
     }
 
     #[test]
-    fn a_daemon_is_configured_by_a_fresh_heartbeat_only() {
+    fn a_fresh_heartbeat_configures_an_otherwise_unconfigured_daemon() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let (db, projects) = seed(tmp.path());
-        assert!(!daemon_configured(tmp.path()), "never ran a daemon");
-        assert!(Engine::new_proxied(&db, &projects).unwrap().is_none());
+        let db = tmp.path().join("csr-engine.db");
+        let projects = tmp.path().join("projects");
+        let offline = |_: &Path| anyhow::bail!("no daemon reply");
+        // No dependency on the user's launchd installation or proxy environment.
+        assert!(!daemon_configured_with(&db, None, false, false, offline));
         write_heartbeat(tmp.path());
-        assert!(daemon_configured(tmp.path()));
+        assert!(daemon_configured_with(&db, None, false, false, |_| panic!(
+            "a fresh heartbeat does not require a ping"
+        )));
         assert!(
             Engine::new_proxied(&db, &projects).unwrap().is_some(),
             "socket absent is fine"
         );
-        // A heartbeat older than a day: the daemon was retired.
+        // Without durable configuration or a typed reply, an old heartbeat expires.
         let stale = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
         std::fs::File::options()
             .write(true)
@@ -1607,8 +1641,7 @@ mod tests {
             .unwrap()
             .set_modified(stale)
             .unwrap();
-        assert!(!daemon_configured(tmp.path()));
-        assert!(Engine::new_proxied(&db, &projects).unwrap().is_none());
+        assert!(!daemon_configured_with(&db, None, false, false, offline));
     }
 
     #[test]
@@ -1747,27 +1780,31 @@ mod tests {
         assert_eq!(proxy.path(), PATH_KEYWORD_ONLY);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn r3_missing_or_stale_heartbeat_pings_the_actual_database() {
+    #[test]
+    fn r3_missing_or_stale_heartbeat_pings_the_actual_database() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("alternate.db");
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let server = spawn_for_daemon(
-            Arc::new(EmbeddingEngine::new().unwrap()),
-            Arc::new(RwLock::new(SearchEngine::new(8))),
-            &db,
-            shutdown.clone(),
-            Arc::new(Notify::new()),
-        );
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while !socket_path(dir.path()).exists() {
-                assert!(!server.is_finished(), "vector socket bind failed");
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        for stale in [false, true] {
+            if stale {
+                write_heartbeat(dir.path());
+                std::fs::File::options()
+                    .write(true)
+                    .open(heartbeat_path(dir.path()))
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(25 * 3600))
+                    .unwrap();
             }
-        })
-        .await
-        .unwrap();
-        assert!(daemon_configured_for_database(&db));
+            assert!(daemon_configured_with(&db, None, false, false, |actual| {
+                assert_eq!(actual, db);
+                Ok(Reply::Pong)
+            }));
+        }
+    }
+
+    #[test]
+    fn r3_durable_daemon_configuration_survives_stale_heartbeat_and_busy_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("alternate.db");
         write_heartbeat(dir.path());
         std::fs::File::options()
             .write(true)
@@ -1775,13 +1812,41 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(25 * 3600))
             .unwrap();
-        assert!(daemon_configured_for_database(&db));
-        let hook = Engine::new_for_hook(&db, &dir.path().join("projects")).unwrap();
-        assert!(hook.is_proxied());
-        assert!(!hook.embeddings().is_loaded());
-        assert!(!hook.index_dir().exists());
-        shutdown.store(true, Ordering::SeqCst);
-        server.await.unwrap();
+        assert!(daemon_configured_with(&db, None, false, false, |_| Ok(
+            Reply::Error {
+                code: ErrorCode::Busy,
+                message: "all serving slots occupied".into(),
+            }
+        )));
+        let plist = dir
+            .path()
+            .join("Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist");
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, b"installed").unwrap();
+        assert!(daemon_configured_with(
+            &db,
+            Some(dir.path()),
+            false,
+            false,
+            |_| panic!("installed daemon must not need a ping")
+        ));
+        assert!(!daemon_configured_with(
+            &db,
+            Some(dir.path()),
+            true,
+            true,
+            |_| panic!("opt-out wins")
+        ));
+        assert!(daemon_configured_with(&db, None, false, true, |_| panic!(
+            "explicit proxy wins"
+        )));
+        assert!(!daemon_configured_with(
+            &db,
+            None,
+            false,
+            false,
+            |_| anyhow::bail!("offline")
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

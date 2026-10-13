@@ -602,6 +602,17 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    pub fn fts5_search_in_window(
+        &self,
+        query: &str,
+        limit: usize,
+        project: Option<&str>,
+        window: Option<(&str, &str)>,
+    ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search_in_window(&conn, query, limit, project, window)
+    }
+
     /// Keyword hits over reflections, `(id, ordinal, bm25)` in bm25 order.
     pub fn fts5_search_reflections(
         &self,

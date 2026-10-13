@@ -656,16 +656,22 @@ fn keyword_candidates(
     storage: &Arc<Storage>,
     query: &str,
     project: Option<&str>,
+    window: Option<(&str, &str)>,
 ) -> Result<Vec<EnrichedResult>> {
     let scope = resolve_search_scope(storage, project)?;
     let mut hits = if scope.effective_project.is_some() {
         let mut hits = Vec::new();
         for project in &scope.family_projects {
-            hits.extend(storage.fts5_search(query, GET_MORE_WINDOW, Some(project))?);
+            hits.extend(storage.fts5_search_in_window(
+                query,
+                GET_MORE_WINDOW,
+                Some(project),
+                window,
+            )?);
         }
         hits
     } else {
-        storage.fts5_search(query, GET_MORE_WINDOW, None)?
+        storage.fts5_search_in_window(query, GET_MORE_WINDOW, None, window)?
     };
     hits.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.id.cmp(&b.0.id)));
     hits.dedup_by(|a, b| a.0.id == b.0.id);
@@ -677,12 +683,16 @@ fn keyword_candidates(
             score: 0.0,
         })
         .collect();
-    enrich_results_with_active_forgetting(
+    let mut enriched = enrich_results_with_active_forgetting(
         storage,
         &results,
         consumption_mode_for_partition(validity_partition_enabled()),
         active_forgetting_enabled(),
-    )
+    )?;
+    for result in &mut enriched {
+        result.chunk.content.insert_str(0, "[keyword] ");
+    }
+    Ok(enriched)
 }
 
 /// Render an outage through the tool's own response contract.
@@ -702,7 +712,25 @@ pub(crate) async fn keyword_fallback(
     if matches!(tool, KeywordTool::Recall) {
         return reflect_keyword_only(storage, search, query, limit, project).await;
     }
-    let mut results = keyword_candidates(storage, query, project)?;
+    let window = match tool {
+        KeywordTool::Recency {
+            time_range,
+            since,
+            until,
+        } => Some(recency_window(time_range, since, until)?),
+        _ => None,
+    };
+    let dates = window
+        .as_ref()
+        .map(|(start, end)| (start.to_rfc3339(), end.to_rfc3339()));
+    let mut results = keyword_candidates(
+        storage,
+        query,
+        project,
+        dates
+            .as_ref()
+            .map(|(start, end)| (start.as_str(), end.as_str())),
+    )?;
     match tool {
         KeywordTool::Recall => unreachable!(),
         KeywordTool::Quick => Ok(format::format_keyword_quick_check(&results)),
@@ -710,16 +738,8 @@ pub(crate) async fn keyword_fallback(
             results.truncate(limit);
             Ok(format::format_search_insights(&results, query))
         }
-        KeywordTool::Recency {
-            time_range,
-            since,
-            until,
-        } => {
-            let (start, end) = recency_window(time_range, since, until)?;
-            results.retain(|r| {
-                chrono::DateTime::parse_from_rfc3339(&r.chunk.timestamp)
-                    .is_ok_and(|date| date >= start && date <= end)
-            });
+        KeywordTool::Recency { .. } => {
+            let (start, end) = window.expect("recency window resolved before FTS");
             results.truncate(limit);
             let desc = format!("{} to {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"));
             Ok(format::format_recency_results(&results, query, &desc))
@@ -10136,7 +10156,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let candidates = keyword_candidates(&storage, "quartzneedle", Some("alpha")).unwrap();
+        let candidates = keyword_candidates(&storage, "quartzneedle", Some("alpha"), None).unwrap();
         assert_eq!(candidates.len(), 7);
         assert!(candidates.iter().all(|r| r.chunk.project_name == "alpha"));
         let page = keyword_fallback(
@@ -10190,6 +10210,88 @@ mod tests {
         }
         assert!(validate_page(usize::MAX, 1).is_err());
         assert!(validate_page(0, usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn r3_recency_fts_filters_before_candidate_limit() {
+        let mut rows: Vec<_> = (0..500)
+            .map(|n| (format!("old{n}"), "quartzdated".to_string()))
+            .collect();
+        rows.push((
+            "recent".into(),
+            format!("quartzdated {}", "padding ".repeat(100)),
+        ));
+        rows.push(("unrelated".into(), "quartzdated".into()));
+        let input: Vec<_> = rows
+            .iter()
+            .map(|(id, text)| (id.as_str(), "alpha", text.as_str(), [1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        let (storage, search) = quick_check_fixture(&input);
+        storage.with_connection(|conn| {
+            conn.execute("UPDATE chunks SET timestamp='2020-01-01T00:00:00Z'", [])?;
+            conn.execute("UPDATE chunks SET timestamp='2026-10-02T00:00:00Z' WHERE id IN ('recent', 'unrelated')", [])?;
+            conn.execute("UPDATE chunks SET project_name='beta' WHERE id='unrelated'", [])?;
+            Ok(())
+        }).unwrap();
+        assert!(storage
+            .fts5_search("quartzdated", 500, Some("alpha"))
+            .unwrap()
+            .iter()
+            .all(|(chunk, _, _)| chunk.id != "recent"));
+        for project in [None, Some("alpha")] {
+            let reply = keyword_fallback(
+                &storage,
+                &search,
+                "quartzdated",
+                10,
+                project,
+                KeywordTool::Recency {
+                    time_range: None,
+                    since: Some("2026-10-01"),
+                    until: Some("2026-10-03"),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(reply.contains("padding"), "{reply}");
+            assert!(!reply.contains("conv-old"), "{reply}");
+            if project.is_some() {
+                assert!(!reply.contains("conv-unrelated"), "{reply}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r3_keyword_fallback_formatters_omit_semantic_confidence() {
+        let (storage, search) =
+            quick_check_fixture(&[("lexical", "alpha", "quartzlexical", [1.0, 0.0, 0.0, 0.0])]);
+        for tool in [
+            KeywordTool::Concept,
+            KeywordTool::Insights,
+            KeywordTool::Quick,
+            KeywordTool::More { offset: 0 },
+            KeywordTool::Recency {
+                time_range: None,
+                since: Some("2000-01-01"),
+                until: Some("2100-01-01"),
+            },
+        ] {
+            let reply =
+                keyword_fallback(&storage, &search, "quartzlexical", 5, Some("alpha"), tool)
+                    .await
+                    .unwrap();
+            assert!(reply.contains("keyword"), "{reply}");
+            for forbidden in [
+                "0.000",
+                "weak",
+                "calibrat",
+                "<average_score>",
+                "<range>",
+                "<s>",
+            ] {
+                assert!(!reply.contains(forbidden), "{forbidden}: {reply}");
+            }
+        }
     }
 
     #[tokio::test]

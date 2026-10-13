@@ -2055,6 +2055,18 @@ pub fn fts5_search(
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+    fts5_search_in_window(conn, query, limit, project, None)
+}
+
+/// Apply the optional date window before ranking and limiting FTS candidates.
+pub fn fts5_search_in_window(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    project: Option<&str>,
+    window: Option<(&str, &str)>,
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+    let (start, end) = window.map_or((None, None), |(start, end)| (Some(start), Some(end)));
     let Some(fts_query) = fts5_match_expr(query) else {
         return Ok(Vec::new());
     };
@@ -2066,10 +2078,11 @@ pub fn fts5_search(
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1 AND c.project_name = ?2
+               AND (?4 IS NULL OR julianday(c.timestamp) BETWEEN julianday(?4) AND julianday(?5))
              ORDER BY fts.rank
              LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![fts_query, p, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, p, limit as i64, start, end], |row| {
             Ok((row_to_chunk(row)?, row.get::<_, f64>(8)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2080,10 +2093,11 @@ pub fn fts5_search(
              FROM chunks c
              JOIN chunks_fts fts ON fts.rowid = c.rowid
              WHERE chunks_fts MATCH ?1
+               AND (?3 IS NULL OR julianday(c.timestamp) BETWEEN julianday(?3) AND julianday(?4))
              ORDER BY fts.rank
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_query, limit as i64, start, end], |row| {
             Ok((row_to_chunk(row)?, row.get::<_, f64>(8)?))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?

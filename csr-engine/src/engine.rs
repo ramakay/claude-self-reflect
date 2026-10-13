@@ -2606,7 +2606,9 @@ mod tests {
             insert_test_chunk(&storage, &format!("c{i}"));
         }
         let start = std::time::Instant::now();
-        let engine = Engine::new_for_hook(&db, &dir.path().join("projects")).unwrap();
+        // Exercise the unconfigured hook path independently of the host's launchd job.
+        let engine =
+            Engine::new_with_persistence(&db, &dir.path().join("projects"), false, None).unwrap();
         let input = crate::hooks::HookInput {
             prompt: Some("How did we fix the authentication token refresh?".into()),
             cwd: Some(dir.path().display().to_string()),
@@ -2679,7 +2681,8 @@ mod tests {
         insert_test_chunk(&storage, "cached");
         drop(Engine::new(&db, &projects).unwrap());
         insert_test_chunk(&storage, "missing");
-        let cached_hook = Engine::new_for_hook(&db, &projects).unwrap();
+        // A host-level daemon installation must not turn this local-cache test into IPC.
+        let cached_hook = Engine::new_with_persistence(&db, &projects, false, None).unwrap();
         let import_hook = Engine::new_import_only(&db, &projects).unwrap();
         for (engine, count) in [(cached_hook, 1), (import_hook, 0)] {
             let mut search = engine.search.blocking_write();
