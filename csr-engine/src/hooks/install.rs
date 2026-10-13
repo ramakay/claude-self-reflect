@@ -94,18 +94,24 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
     })
 }
 
-/// Split the first `limit` shell words off `command`, undoing the quoting
-/// `shell_quote` (and hand-written quoting) produces. Returns None on an
-/// unterminated quote or when a word holds a shell operator, so the caller
-/// treats anything it cannot read as someone else's command.
-fn leading_shell_words(command: &str, limit: usize) -> Option<Vec<String>> {
+/// Split a hook command into shell words, undoing the quoting `shell_quote` (and
+/// hand-written quoting) produces. Returns None unless the whole command reads
+/// as one simple command: an unterminated quote, an unquoted newline, `;`, `&`,
+/// `|`, `(`, `)`, a backslash-newline continuation, or a backtick / `$(`
+/// substitution (even inside double quotes) means a compound or unreadable
+/// line, which the caller must treat as someone else's. `<` and `>` are
+/// rejected only in the first two words, so `... hook stop 2>/dev/null` still
+/// reads as a CSR invocation.
+fn shell_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
-    let mut chars = command.trim_start().chars().peekable();
-    while words.len() < limit {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        chars.peek()?;
+    let mut chars = command.trim().chars().peekable();
+    loop {
+        while chars.next_if(|c| matches!(c, ' ' | '\t')).is_some() {}
+        if chars.peek().is_none() {
+            return Some(words);
+        }
         let mut word = String::new();
-        while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+        while let Some(c) = chars.next_if(|c| !matches!(c, ' ' | '\t')) {
             match c {
                 '\'' => loop {
                     match chars.next()? {
@@ -116,6 +122,8 @@ fn leading_shell_words(command: &str, limit: usize) -> Option<Vec<String>> {
                 '"' => loop {
                     match chars.next()? {
                         '"' => break,
+                        '`' => return None,
+                        '$' if chars.peek() == Some(&'(') => return None,
                         '\\' => match chars.next()? {
                             escaped @ ('"' | '\\' | '$' | '`') => word.push(escaped),
                             other => {
@@ -126,26 +134,33 @@ fn leading_shell_words(command: &str, limit: usize) -> Option<Vec<String>> {
                         other => word.push(other),
                     }
                 },
-                '\\' => word.push(chars.next()?),
-                ';' | '|' | '&' | '<' | '>' | '(' | ')' => return None,
+                '\\' => match chars.next()? {
+                    '\n' | '\r' => return None,
+                    escaped => word.push(escaped),
+                },
+                '\n' | '\r' | ';' | '&' | '|' | '(' | ')' | '`' => return None,
+                '$' if chars.peek() == Some(&'(') => return None,
+                '<' | '>' if words.len() < 2 => return None,
                 other => word.push(other),
             }
         }
         words.push(word);
     }
-    Some(words)
 }
 
-/// True for a command that runs a csr-engine binary's `hook` subcommand, with
-/// the binary path quoted or not. Deliberately narrower than a substring
+/// True for a command that is a single invocation of a csr-engine binary's
+/// `hook` subcommand, with the binary path quoted or not. Deliberately narrower than a substring
 /// match: a user's `notify.sh` under a claude-self-reflect checkout, or
 /// `echo csr-engine down`, is not a CSR hook.
 fn is_csr_hook_command(command: &str) -> bool {
-    let Some(words) = leading_shell_words(command, 2) else {
+    let Some(words) = shell_words(command) else {
         return false;
     };
-    let binary = words[0].rsplit('/').next().unwrap_or_default();
-    matches!(binary, "csr-engine" | "csr-engine.exe") && words[1] == "hook"
+    let [binary, subcommand, ..] = words.as_slice() else {
+        return false;
+    };
+    let binary = binary.rsplit('/').next().unwrap_or_default();
+    matches!(binary, "csr-engine" | "csr-engine.exe") && subcommand == "hook"
 }
 
 /// Legacy CSR agent-type hooks carry no command, so they are recognised by the
@@ -604,6 +619,55 @@ mod tests {
         ]);
         let settings = merged(serde_json::json!({"hooks": {"Notification": user_entries}}));
         assert_eq!(settings["hooks"]["Notification"], user_entries);
+    }
+
+    /// A CSR-looking prefix does not make a compound or unreadable line CSR's:
+    /// the user's command rides along, so the whole entry is kept.
+    #[test]
+    fn test_sweep_keeps_compound_and_unreadable_commands() {
+        let kept = [
+            "/usr/local/bin/csr-engine hook subagent-stop; notify-send done",
+            "/usr/local/bin/csr-engine hook subagent-stop && notify-send done",
+            "/usr/local/bin/csr-engine hook subagent-stop || true",
+            "/usr/local/bin/csr-engine hook subagent-stop | tee /tmp/log",
+            "/usr/local/bin/csr-engine hook subagent-stop &",
+            "/usr/local/bin/csr-engine hook subagent-stop 2>&1",
+            "/usr/local/bin/csr-engine hook subagent-stop\nrm -rf /tmp/x",
+            "/usr/local/bin/csr-engine hook subagent-stop `whoami`",
+            "/usr/local/bin/csr-engine hook subagent-stop $(whoami)",
+            "/usr/local/bin/csr-engine hook subagent-stop \"$(whoami)\"",
+            "/usr/local/bin/csr-engine hook subagent-stop \"`whoami`\"",
+            "/usr/local/bin/csr-engine hook subagent-stop 'unterminated",
+            "/usr/local/bin/csr-engine hook subagent-stop \"unterminated",
+            "/usr/local/bin/csr-engine hook subagent-stop \\\n  --extra",
+            "(/usr/local/bin/csr-engine hook subagent-stop)",
+            "/usr/local/bin/csr-engine > /tmp/out hook subagent-stop",
+        ];
+        for command in kept {
+            let entries = serde_json::json!([{"hooks": [hook_cmd(command)]}]);
+            let settings = merged(serde_json::json!({"hooks": {"SubagentStop": entries}}));
+            assert_eq!(
+                settings["hooks"]["SubagentStop"], entries,
+                "{command:?} must be kept"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sweep_still_removes_a_plain_invocation_with_quoted_operators_and_redirects() {
+        for command in [
+            "/usr/local/bin/csr-engine hook subagent-stop 2>/dev/null",
+            "/usr/local/bin/csr-engine hook subagent-stop 'a;b' \"c|d\"",
+            "  /usr/local/bin/csr-engine   hook\tsubagent-stop  ",
+        ] {
+            let settings = merged(serde_json::json!({
+                "hooks": {"SubagentStop": [{"hooks": [hook_cmd(command)]}]}
+            }));
+            assert!(
+                settings["hooks"].get("SubagentStop").is_none(),
+                "{command:?} should have been swept"
+            );
+        }
     }
 
     #[test]

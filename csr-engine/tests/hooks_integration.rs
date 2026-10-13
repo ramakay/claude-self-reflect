@@ -1036,6 +1036,53 @@ fn test_hook_input_stop_hook_active_missing() {
     assert_eq!(input.stop_hook_active, None);
 }
 
+/// A non-UTF-8 path argument is a valid Unix argv; the pre-parse argv scan must
+/// not panic on it, for the retired hook or any other, probe or no probe.
+#[cfg(unix)]
+#[test]
+fn non_utf8_path_arguments_do_not_panic_startup() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let bad = std::ffi::OsStr::from_bytes(b"/tmp/csr-\xff\xfe-projects");
+    for (hook, probe) in [
+        ("subagent-stop", false),
+        ("subagent-stop", true),
+        ("stop", true),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        if probe {
+            command.env("CSR_HOOK_TIMING_PROBE", "1");
+        }
+        let output = command
+            .args(["hook", hook, "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(bad)
+            // A live hook name exits at the recursion guard, before any engine
+            // startup, which is as far as this test needs it to get.
+            .env("CSR_DISABLE_RECURSIVE_HOOKS", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{hook} probe={probe}: {stderr}");
+        assert!(
+            !stderr.contains("panicked"),
+            "{hook} probe={probe}: {stderr}"
+        );
+        if hook == "subagent-stop" {
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        } else {
+            // The probe still prints for a live hook name.
+            assert!(stderr.contains("timing-probe"), "{stderr}");
+        }
+    }
+}
+
 /// `hook subagent-stop` is retired but may still sit in an old settings.json
 /// until the user re-installs: it must stay accepted and do nothing — no
 /// output, no database, no engine — whatever Claude Code pipes to it.

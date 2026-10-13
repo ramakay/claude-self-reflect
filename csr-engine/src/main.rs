@@ -654,7 +654,8 @@ fn main() -> Result<()> {
     let started = std::time::Instant::now();
     // A retired hook must stay silent even when probed, and the probe has to
     // print before argument parsing, so the name is spotted straight from argv.
-    let retired_hook = std::env::args().any(|arg| csr_engine::hooks::is_retired_hook(&arg));
+    // `args_os`: a non-UTF-8 path argument is legal and must not panic here.
+    let retired_hook = csr_engine::hooks::argv_names_retired_hook(std::env::args_os().skip(1));
     if !retired_hook && std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some() {
         eprintln!(
             "CSR timing-probe main_unix_ns={}",

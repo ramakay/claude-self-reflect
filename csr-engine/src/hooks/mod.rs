@@ -541,6 +541,44 @@ pub fn is_retired_hook(hook_name: &str) -> bool {
     matches!(hook_name, "subagent-stop")
 }
 
+/// Whether this argv is `hook <retired name>`, read straight from the OS
+/// strings. `main` needs the answer before clap runs (the timing probe prints
+/// first), and `std::env::args()` would panic on a non-UTF-8 `--db-path`, so
+/// the walk is over `OsString` and mirrors clap: global flags may precede or
+/// follow `hook`, and only the first non-flag token after it is the name — a
+/// flag's value (`--db-path subagent-stop`) is never mistaken for it.
+pub fn argv_names_retired_hook<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    const VALUE_FLAGS: [&str; 3] = ["--db-path", "--projects-dir", "--limit"];
+    let mut args = args.into_iter();
+    let mut seen_hook = false;
+    while let Some(arg) = args.next() {
+        let Some(text) = arg.to_str() else {
+            if arg.as_encoded_bytes().starts_with(b"-") {
+                continue;
+            }
+            return false;
+        };
+        if text.starts_with('-') {
+            if VALUE_FLAGS.contains(&text) {
+                args.next();
+            }
+            continue;
+        }
+        if !seen_hook {
+            if text != "hook" {
+                return false;
+            }
+            seen_hook = true;
+            continue;
+        }
+        return is_retired_hook(text);
+    }
+    false
+}
+
 /// Whether this invocation will query the HNSW index, decided from the hook
 /// name and its parsed input before the engine is built.
 ///
@@ -920,6 +958,64 @@ mod tests {
             "stop",
             &with_prompt("fix the statusline badge count")
         ));
+    }
+
+    #[test]
+    fn argv_names_the_retired_hook_only_as_the_hook_name() {
+        let argv = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for yes in [
+            &["csr-engine", "hook", "subagent-stop"][..],
+            &["csr-engine", "hook", "subagent-stop", "--db-path", "/x"],
+            &["csr-engine", "--db-path", "/x", "hook", "subagent-stop"],
+            &[
+                "csr-engine",
+                "hook",
+                "--projects-dir",
+                "/x",
+                "subagent-stop",
+            ],
+            &["csr-engine", "hook", "--db-path=/x", "subagent-stop"],
+        ] {
+            assert!(
+                argv_names_retired_hook(argv(&yes[0..]).into_iter().skip(1)),
+                "{yes:?}"
+            );
+        }
+        for no in [
+            &["csr-engine", "hook", "--db-path", "subagent-stop", "stop"][..],
+            &["csr-engine", "--db-path", "subagent-stop", "hook", "stop"],
+            &["csr-engine", "hook", "stop", "subagent-stop"],
+            &["csr-engine", "status", "subagent-stop"],
+            &["csr-engine", "subagent-stop"],
+            &["csr-engine", "hook"],
+            &["csr-engine"],
+        ] {
+            assert!(
+                !argv_names_retired_hook(argv(&no[0..]).into_iter().skip(1)),
+                "{no:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn argv_scan_survives_non_utf8_values() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe]);
+        let argv = |name: &str| vec!["hook".into(), name.into(), "--db-path".into(), bad.clone()];
+        assert!(argv_names_retired_hook(argv("subagent-stop")));
+        assert!(!argv_names_retired_hook(argv("stop")));
+        assert!(!argv_names_retired_hook(vec![
+            "hook".into(),
+            "--db-path".into(),
+            bad.clone(),
+            "stop".into()
+        ]));
     }
 
     #[test]
