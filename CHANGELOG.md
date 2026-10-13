@@ -316,8 +316,12 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   has zero reverts; the demote channel (`full`) is unmeasured; CRLF/Windows stamping is untested; the ledger does
   not record a witness's repo (447994c4). Strategy dreams are below their kill bar [untraced].
 - Contamination figures depend on corpus and date: 58 of 1,330 embedded conversations (4.4%) on 2026-08-08
-  (1f9e4c74); 674 of 2,077 (32.5%) on a 2026-09-01 copy before scrub (d90c2ebc). Text that only quotes the recap
-  sentinel is dropped; measured: 2 chunks (1f9e4c74).
+  (1f9e4c74); 674 of 2,077 (32.5%) on a 2026-09-01 copy before scrub (d90c2ebc).
+- **`backfill scrub` also cuts text that quotes CSR's markers.** Any paragraph containing a CSR marker goes,
+  including code listings, tool output and written analyses that quote CSR's templates; code and tool output
+  often has no blank lines, so one quoted marker takes the whole chunk. On a clone of the maintainer's database
+  (4753d717, 733,388 chunks) the scrub dropped 552 chunks, at least 322 of them code, tool output or analyses
+  quoting markers, and cut 233,686 characters from 7,300 more. The scrub runs only when invoked; back up first.
 - `CSR_DREAM_CONSUMPTION=off` does not gate the static report, live journal feeds or badge; `status` has no field
   for `CSR_NO_CODEX_IMPORT` (2c32256f; both still true at rc2 HEAD by code check).
 - hnsw_rs 0.3.5 still calls `process::exit(1)` on load errors (2c32256f; checked in the crate source).
