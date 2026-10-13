@@ -783,6 +783,37 @@ impl Storage {
         })
     }
 
+    /// Settle an unfinished item after its batch ended or became unavailable.
+    /// Three failed batches exhaust the retry budget. The batch/status guard
+    /// makes repeated polls and restarts idempotent, including partial writes.
+    pub(crate) fn retry_narrative_batch_item(
+        &self,
+        conversation_id: &str,
+        batch_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE enrichment_state SET
+                   status = CASE
+                     WHEN EXISTS (SELECT 1 FROM reflections WHERE id = 'ai_narrative_' || ?1)
+                       THEN 'completed'
+                     WHEN batch_failures + 1 >= 3 THEN 'failed' ELSE 'pending' END,
+                   reflection_id = CASE
+                     WHEN EXISTS (SELECT 1 FROM reflections WHERE id = 'ai_narrative_' || ?1)
+                       THEN 'ai_narrative_' || ?1 ELSE reflection_id END,
+                   batch_failures = batch_failures + CASE
+                     WHEN EXISTS (SELECT 1 FROM reflections WHERE id = 'ai_narrative_' || ?1)
+                       THEN 0 ELSE 1 END,
+                   batch_id = NULL, error_message = ?3, updated_at = datetime('now')
+                 WHERE conversation_id = ?1 AND enrichment_type = 'ai_narrative'
+                   AND batch_id = ?2 AND status = 'processing'",
+                rusqlite::params![conversation_id, batch_id, reason],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_conversations_by_batch(&self, batch_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_conversations_by_batch(&conn, batch_id)

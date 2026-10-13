@@ -535,12 +535,14 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
 
 /// Split the same-line prefix as P + M + D: D is one touching ASCII digit,
 /// M is the longest run of spaces, tabs and quote markers immediately before it.
-/// Only a standalone hotkey is cut; prose and multi-digit numbers stay whole.
-fn forward_prefix_start(piece: &str) -> usize {
+/// P includes any earlier kept non-whitespace text on this same line, even
+/// across another forward. Only a standalone hotkey is cut; prose and
+/// multi-digit numbers stay whole.
+fn forward_prefix_start(piece: &str, earlier_prose: bool) -> usize {
     let digit = piece.as_bytes().last().is_some_and(u8::is_ascii_digit);
     let before_digit = piece.len() - usize::from(digit);
     let prefix = piece[..before_digit].trim_end_matches([' ', '\t', '>']);
-    if prefix.trim().is_empty() {
+    if prefix.trim().is_empty() && !earlier_prose {
         0
     } else if !digit {
         prefix.len()
@@ -555,6 +557,8 @@ pub(crate) struct ForwardSpan {
     pub start: usize,
     pub end: usize,
     pub needs_message_end: bool,
+    /// Insert the same joining space extraction places between kept pieces.
+    pub join: bool,
 }
 
 /// Cut one-line forwards using the same prefix and span grammar as scrub.
@@ -565,25 +569,37 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize, V
     let mut first = None;
     while let Some((start, end, bounded)) = next_one_line_forward(line, cursor, others) {
         first.get_or_insert(start);
-        let from = cursor + forward_prefix_start(&line[cursor..start]);
+        let from = cursor
+            + forward_prefix_start(
+                &line[cursor..start],
+                pieces.iter().any(|piece: &&str| !piece.trim().is_empty()),
+            );
         pieces.push(&line[cursor..from]);
         spans.push(ForwardSpan {
             start: from,
             end,
             needs_message_end: end == line.len() && !bounded,
+            join: false,
         });
         cursor = end.max(start + 1);
     }
     let first = first?;
     pieces.push(&line[cursor..]);
     let mut own = String::new();
-    for piece in pieces {
-        let piece = piece.trim_start();
+    for (index, piece) in pieces.into_iter().enumerate() {
+        let trimmed = piece.trim_start();
+        if index > 0 {
+            // Include whitespace removed from the next kept piece in the
+            // mapped cut, so persistence uses precisely this same join rule.
+            spans[index - 1].end += piece.len() - trimmed.len();
+        }
+        let piece = trimmed;
         if piece.is_empty() {
             continue;
         }
         if !own.is_empty() && !own.ends_with(char::is_whitespace) {
             own.push(' ');
+            spans[index - 1].join = true;
         }
         own.push_str(piece);
     }
@@ -608,6 +624,7 @@ pub(crate) fn forward_spans(text: &str) -> Vec<ForwardSpan> {
         .into_iter()
         .map(|span| ForwardSpan {
             start: offsets[leading + span.start],
+            join: span.join,
             end: offsets[leading + span.end],
             // A newline present in the stored text supplies the line's end even
             // when trimming removed it before parsing.
@@ -693,6 +710,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
         };
         spans.push(ForwardSpan {
             start: span_start,
+            join: false,
             end: span_end,
             needs_message_end: to == lines.len(),
         });
@@ -717,6 +735,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
             Some((own, at, cuts)) => {
                 spans.extend(cuts.into_iter().map(|cut| ForwardSpan {
                     start: starts[index] + cut.start,
+                    join: cut.join,
                     end: starts[index] + cut.end,
                     needs_message_end: cut.needs_message_end && index + 1 == lines.len(),
                 }));
@@ -1178,34 +1197,14 @@ mod tests {
 
     #[test]
     fn r5_ordered_forward_prefix_table_extraction_and_scrub() {
-        let rows = [
-            ("I vote 2 ", "I vote 2 "),
-            ("2 > ", "2 "),
-            ("2> ", "2 "),
-            ("> 2", ""),
-            (">2", ""),
-            (">>2", ""),
-            ("2", ""),
-            ("42", "42 "),
-            ("2 > >", "2 "),
-            ("2 ", "2 "),
-            ("I vote 2 > ", "I vote 2 "),
-            ("42 > ", "42 "),
-            ("1 > 2 ", "1 > 2 "),
-            ("I vote 2", "I vote 2 "),
-            ("I vote 2\n", "I vote 2\n"),
-        ];
+        for (raw, expected) in ordered_forward_prefix_cases() {
+            own_words_agree(&raw, Some(&expected));
+        }
         for forward in [
             "CSR's compaction card (compacting), quoted: “One.”",
             "CSR's story of this session, rev 1, quoted: “One.”",
             "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “One.”",
         ] {
-            for (prefix, kept) in rows {
-                own_words_agree(
-                    &format!("{prefix}{forward} Keep the deployment frozen."),
-                    Some(&format!("{kept}Keep the deployment frozen.")),
-                );
-            }
             let quoted = format!("> I vote 2 {forward} Keep the deployment frozen.");
             // Extraction excludes quoted personal lines, as before. Import
             // scrub keeps quoted personal text while removing the CSR forward.
@@ -2012,4 +2011,53 @@ mod tests {
             assert_eq!(strip_csr_emissions(&note), note);
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn ordered_forward_prefix_cases() -> Vec<(String, String)> {
+    let mut cases = Vec::new();
+    let rows = [
+        ("I vote 2 ", "I vote 2 "),
+        ("2 > ", "2 "),
+        ("2> ", "2 "),
+        ("> 2", ""),
+        (">2", ""),
+        (">>2", ""),
+        ("2", ""),
+        ("42", "42 "),
+        ("2 > >", "2 "),
+        ("2 ", "2 "),
+        ("I vote 2 > ", "I vote 2 "),
+        ("42 > ", "42 "),
+        ("1 > 2 ", "1 > 2 "),
+        ("I vote 2", "I vote 2 "),
+        ("I vote 2\n", "I vote 2\n"),
+    ];
+    for forward in [
+        "CSR's compaction card (compacting), quoted: “One.”",
+        "CSR's story of this session, rev 1, quoted: “One.”",
+        "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “One.”",
+    ] {
+        for (prefix, kept) in rows {
+            cases.push((
+                format!("{prefix}{forward} Keep the deployment frozen."),
+                format!("{kept}Keep the deployment frozen."),
+            ));
+        }
+        for (prefix, kept) in [
+            (format!("I vote {forward} 2"), "I vote 2 "),
+            (format!("{forward} 2"), ""),
+            (format!("2{forward} 3"), ""),
+        ] {
+            cases.push((
+                format!("{prefix}{forward} Keep the deployment frozen."),
+                format!("{kept}Keep the deployment frozen."),
+            ));
+        }
+        cases.push((
+            format!("The code is 4 {forward}2."),
+            "The code is 4 2.".into(),
+        ));
+    }
+    cases
 }

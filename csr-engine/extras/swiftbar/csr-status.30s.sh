@@ -32,7 +32,7 @@ chunks=$(echo "$STATUS_JSON" | jq -r '.chunks // 0')
 reflections=$(echo "$STATUS_JSON" | jq -r '.reflections // 0')
 projects=$(echo "$STATUS_JSON" | jq -r '.projects // 0')
 import_pct=$(echo "$STATUS_JSON" | jq -r '.import_percent // 0')
-healthy=$(echo "$STATUS_JSON" | jq -r '.healthy // false')
+healthy=$(echo "$STATUS_JSON" | jq -r '.healthy')
 db_bytes=$(echo "$STATUS_JSON" | jq -r '.db_size_bytes // 0')
 db_path=$(echo "$STATUS_JSON" | jq -r '.db_path // "unknown"')
 
@@ -49,10 +49,14 @@ if [ "$healthy" = "true" ]; then
     health_icon="✓"
     health_color="#4ade80"
     health_text="Healthy"
-else
+elif [ "$healthy" = "false" ]; then
     health_icon="✗"
     health_color="#ff6b6b"
     health_text="Unhealthy"
+else
+    health_icon="?"
+    health_color="#888888"
+    health_text="Integrity unknown"
 fi
 
 # Last hook timing from log

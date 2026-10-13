@@ -2479,7 +2479,8 @@ pub fn get_unenriched_conversations(
          JOIN import_state i ON i.conversation_id = g.conversation_id
          LEFT JOIN enrichment_state e
              ON e.conversation_id = g.conversation_id AND e.enrichment_type = ?1
-         WHERE e.status IS NULL OR e.status IN ('failed', 'pending')
+         WHERE (e.status IS NULL OR e.status IN ('failed', 'pending'))
+           AND NOT (?1 = 'ai_narrative' AND COALESCE(e.batch_failures, 0) >= 3)
          ORDER BY g.latest DESC
          LIMIT ?2",
     )?;

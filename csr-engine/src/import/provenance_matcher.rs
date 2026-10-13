@@ -188,11 +188,11 @@ impl MessageIndex {
 
     /// Map complete-message forward cuts onto an exact stored slice.
     /// Repeated source text is usable only when every occurrence agrees.
-    pub(super) fn without_forwards(&self, content: &str) -> Option<String> {
+    fn forward_cuts(&self, content: &str) -> Option<Vec<(usize, usize, bool)>> {
         if content.is_empty() {
             return None;
         }
-        let mut agreed: Option<Vec<(usize, usize)>> = None;
+        let mut agreed: Option<Vec<(usize, usize, bool)>> = None;
         for document in &self.documents {
             for &start in document
                 .anchors
@@ -216,7 +216,13 @@ impl MessageIndex {
                         let lo = start.max(piece.start + span.start);
                         let hi = end.min(piece.start + span.end);
                         if lo < hi {
-                            cuts.push((lo - start, hi - start));
+                            cuts.push((lo - start, hi - start, false));
+                        }
+                        // As in mapped chunk cuts, the next kept text's slice
+                        // owns the joining space (including an exact boundary).
+                        let join = piece.start + span.end;
+                        if span.join && join >= start && join < end {
+                            cuts.push((join - start, join - start, true));
                         }
                     }
                 }
@@ -228,9 +234,47 @@ impl MessageIndex {
                 agreed = Some(cuts);
             }
         }
-        let mut own = content.to_string();
-        for (start, end) in agreed?.into_iter().rev() {
-            own.replace_range(start..end, "");
+        agreed
+    }
+
+    pub(super) fn without_forwards(&self, content: &str) -> Option<String> {
+        self.without_forwards_in_chunks(&[content])
+            .map(|mut own| own.remove(0))
+    }
+
+    /// Match the complete stored sequence before splitting its edits back into
+    /// chunks. A short suffix can also occur in a sanitized representation;
+    /// matching it alone cannot prove whether a preceding cut needs a space.
+    pub(super) fn without_forwards_in_chunks(&self, contents: &[&str]) -> Option<Vec<String>> {
+        let joined = contents.concat();
+        let cuts = self.forward_cuts(&joined)?;
+        let mut offset = 0;
+        let mut offsets = contents
+            .iter()
+            .map(|text| {
+                let start = offset;
+                offset += text.len();
+                start
+            })
+            .collect::<Vec<_>>();
+        offsets.push(offset);
+        let mut own = contents
+            .iter()
+            .map(|text| text.to_string())
+            .collect::<Vec<_>>();
+        for (start, end, join) in cuts.into_iter().rev() {
+            if join {
+                let owner = offsets.partition_point(|&offset| offset <= start) - 1;
+                own[owner].insert(start - offsets[owner], ' ');
+            } else {
+                for (index, text) in own.iter_mut().enumerate() {
+                    let lo = start.max(offsets[index]);
+                    let hi = end.min(offsets[index + 1]);
+                    if lo < hi {
+                        text.replace_range(lo - offsets[index]..hi - offsets[index], "");
+                    }
+                }
+            }
         }
         Some(own)
     }

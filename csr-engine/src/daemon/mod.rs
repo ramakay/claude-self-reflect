@@ -2307,77 +2307,89 @@ async fn poll_batch_results(
     poll_interval_secs: u64,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut stored = std::collections::HashSet::new();
+    let mut settled = std::collections::HashSet::new();
     let mut completed = None;
+    let mut failure = None;
+    let base_delay = tokio::time::Duration::from_secs(poll_interval_secs.clamp(1, 300));
+    let mut retry_delay = base_delay;
+    let mut delay = tokio::time::Duration::from_secs(poll_interval_secs);
     loop {
         if shutdown.load(Ordering::SeqCst) {
             tracing::info!("batch polling: shutdown signal received");
             return Ok(());
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval_secs)).await;
-        let status = if completed.is_some() {
-            crate::api::types::BatchResponse {
-                id: batch_id.to_string(),
-                processing_status: "ended".to_string(),
-            }
-        } else {
-            client.get_batch_status(batch_id).await?
-        };
-
-        if status.processing_status == "ended" {
-            tracing::info!(batch_id = %batch_id, "batch completed");
-            if completed.is_none() {
-                completed = Some(client.get_batch_results(batch_id).await?);
-            }
-            let results = completed.as_ref().expect("completed batch results");
-
-            let mut deferred = false;
-            for item in results {
-                if stored.contains(&item.custom_id) {
-                    continue;
-                }
-                match store_narrative(
-                    storage,
-                    embeddings,
-                    search,
-                    &item.custom_id,
-                    &item.narrative,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        stored.insert(item.custom_id.clone());
-                    }
-                    Err(error) => {
-                        tracing::warn!(conv = %item.custom_id, %error, "narrative storage deferred; retaining batch for retry");
-                        deferred = true;
-                    }
-                }
-            }
-            if !deferred {
-                return Ok(());
-            }
-            // Keep results in memory for retry. On shutdown the stored batch id
-            // lets startup fetch them again; processing prevents resubmission.
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        } else if status.processing_status == "errored"
-            || status.processing_status == "expired"
-            || status.processing_status == "canceled"
-        {
-            tracing::warn!(
-                batch_id = %batch_id,
-                status = %status.processing_status,
-                "batch failed"
-            );
-            for (conv_id, _) in unenriched {
-                let _ = storage.mark_enrichment_failed(
-                    conv_id,
-                    "ai_narrative",
-                    &format!("batch {}", status.processing_status),
-                );
-            }
+        tokio::time::sleep(delay).await;
+        if shutdown.load(Ordering::SeqCst) {
             return Ok(());
         }
+        if completed.is_none() && failure.is_none() {
+            let fetched = async {
+                let status = client.get_batch_status(batch_id).await?;
+                match status.processing_status.as_str() {
+                    "ended" => completed = Some(client.get_batch_results(batch_id).await?),
+                    "errored" | "expired" | "canceled" => {
+                        failure = Some(format!("batch {}", status.processing_status));
+                    }
+                    _ => {}
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = fetched {
+                if crate::api::permanent_batch_error(&error) {
+                    failure = Some(error.to_string());
+                } else {
+                    tracing::warn!(batch_id, %error, ?retry_delay, "batch provider error; retrying");
+                    delay = retry_delay;
+                    retry_delay = (retry_delay * 2).min(tokio::time::Duration::from_secs(300));
+                    continue;
+                }
+            } else {
+                retry_delay = base_delay;
+                delay = tokio::time::Duration::from_secs(poll_interval_secs);
+            }
+        }
+        if completed.is_none() && failure.is_none() {
+            continue;
+        }
+        // Reconcile every expected ID, not just the provider's successful items.
+        // Failed writes stay in this loop, and the durable batch ID lets startup
+        // repeat reconciliation after shutdown or a crash.
+        let mut deferred = false;
+        for (conv_id, _) in unenriched {
+            if settled.contains(conv_id) {
+                continue;
+            }
+            let item = completed.as_ref().and_then(|results| {
+                results
+                    .iter()
+                    .find(|item| item.custom_id == *conv_id && !item.narrative.is_empty())
+            });
+            let result = if let Some(item) = item {
+                store_narrative(storage, embeddings, search, conv_id, &item.narrative).await
+            } else {
+                storage.retry_narrative_batch_item(
+                    conv_id,
+                    batch_id,
+                    failure
+                        .as_deref()
+                        .unwrap_or("ended batch omitted or errored item"),
+                )
+            };
+            match result {
+                Ok(()) => {
+                    settled.insert(conv_id.clone());
+                }
+                Err(error) => {
+                    tracing::warn!(conv = %conv_id, %error, "batch state write deferred; retaining for retry");
+                    deferred = true;
+                }
+            }
+        }
+        if !deferred {
+            return Ok(());
+        }
+        delay = base_delay;
     }
 }
 
@@ -2394,6 +2406,12 @@ async fn store_narrative(
     if storage.is_conversation_enriched(conv_id, "ai_narrative")? {
         return Ok(());
     }
+    // A crash may leave the reflection durable before completion was marked.
+    let reflection_id = format!("ai_narrative_{conv_id}");
+    if storage.get_reflection_by_id(&reflection_id)?.is_some() {
+        storage.mark_enrichment_completed(conv_id, "ai_narrative", &reflection_id)?;
+        return Ok(());
+    }
     let narrative_owned = narrative.to_string();
     let emb = embeddings.clone();
     let embeddings_vec =
@@ -2403,7 +2421,6 @@ async fn store_narrative(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("narrative embedding missing"))?;
-    let reflection_id = format!("ai_narrative_{conv_id}");
     let tags = vec!["narrative_ai".to_string(), format!("conv_{conv_id}")];
 
     // Only the frozen request manifest supports this output; a missing or
@@ -3923,5 +3940,398 @@ mod r4_daemon_audit_probes {
                 .as_deref(),
             Some("ai_narrative_r4-batch")
         );
+    }
+}
+
+#[cfg(test)]
+mod r6_batch_recovery_tests {
+    use super::*;
+    use crate::api::types::{BatchResponse, BatchResultItem};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Failure {
+        Poll404,
+        Results404,
+        Poll503,
+        Results503,
+        Omitted,
+        Errored,
+        Expired,
+    }
+
+    struct Provider {
+        failure: Failure,
+        polls: AtomicUsize,
+        fetches: AtomicUsize,
+        stop_after_transient: Option<Arc<AtomicBool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BatchClient for Provider {
+        async fn create_batch(&self, _: Vec<BatchRequest>) -> Result<String> {
+            anyhow::bail!("test must never submit or contact a provider")
+        }
+
+        async fn get_batch_status(&self, id: &str) -> Result<BatchResponse> {
+            let call = self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.failure == Failure::Poll404 {
+                anyhow::bail!("Anthropic batch status failed (404 Not Found): expired batch")
+            }
+            if self.failure == Failure::Poll503 && call == 0 {
+                if let Some(shutdown) = &self.stop_after_transient {
+                    shutdown.store(true, Ordering::SeqCst);
+                }
+                anyhow::bail!("503 Service Unavailable")
+            }
+            Ok(BatchResponse {
+                id: id.into(),
+                processing_status: if self.failure == Failure::Expired {
+                    "expired"
+                } else {
+                    "ended"
+                }
+                .into(),
+            })
+        }
+
+        async fn get_batch_results(&self, _: &str) -> Result<Vec<BatchResultItem>> {
+            let call = self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.failure == Failure::Results404 {
+                anyhow::bail!("batch results not found")
+            }
+            if self.failure == Failure::Results503 && call == 0 {
+                if let Some(shutdown) = &self.stop_after_transient {
+                    shutdown.store(true, Ordering::SeqCst);
+                }
+                anyhow::bail!("503 Service Unavailable")
+            }
+            let item = |id: &str, narrative: &str| BatchResultItem {
+                custom_id: id.into(),
+                narrative: narrative.into(),
+            };
+            let mut items = vec![
+                item("a", "Keep the deployment frozen."),
+                item("a", "Duplicate."),
+                item("unexpected", "Not in this batch."),
+            ];
+            if self.failure != Failure::Omitted {
+                items.push(item(
+                    "b",
+                    if self.failure == Failure::Errored {
+                        ""
+                    } else {
+                        "Check the rollback plan."
+                    },
+                ));
+            }
+            Ok(items)
+        }
+    }
+
+    fn seed(storage: &Storage) {
+        for id in ["a", "b"] {
+            storage
+                .insert_chunk(
+                    &crate::import::ConversationChunk {
+                        id: format!("chunk-{id}"),
+                        conversation_id: id.into(),
+                        project_name: "fixture".into(),
+                        timestamp: "2026-09-01T00:00:00Z".into(),
+                        content: "Keep the deployment frozen.".into(),
+                        message_count: 1,
+                        summary: None,
+                        author: crate::provenance::Speaker::User,
+                        seq: 0,
+                        is_sidechain: false,
+                    },
+                    &vec![0.1; 384],
+                )
+                .unwrap();
+            storage
+                .upsert_import_state_explicit(&format!("{id}.jsonl"), id, 1, "fixture")
+                .unwrap();
+            storage.set_batch_id(id, "batch-r6", "hash").unwrap();
+        }
+    }
+
+    fn states(db: &std::path::Path) -> Vec<(String, String)> {
+        // Verification is read-only, including while maintenance excludes writers.
+        // A concurrent fork can briefly retain an inherited lock after its drop.
+        let storage = Storage::open_read_only(db).unwrap();
+        storage.with_connection(|conn| {
+            let mut stmt = conn.prepare("SELECT conversation_id, status FROM enrichment_state WHERE enrichment_type = 'ai_narrative' ORDER BY conversation_id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }).unwrap()
+    }
+
+    async fn exercise(failure: Failure, restart: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let mut storage = Arc::new(Storage::open(&db).unwrap());
+        seed(&storage);
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let mut search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        let transient = matches!(failure, Failure::Poll503 | Failure::Results503);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(Provider {
+            failure,
+            polls: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            stop_after_transient: (restart && transient).then(|| shutdown.clone()),
+        });
+        let client: Arc<dyn BatchClient> = provider.clone();
+        let conversations = storage
+            .recover_narrative_batches()
+            .unwrap()
+            .remove("batch-r6")
+            .unwrap();
+        if restart {
+            let lock = (!transient)
+                .then(|| crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap());
+            let mut poll = Box::pin(poll_batch_results(
+                &storage,
+                &embeddings,
+                &search,
+                &client,
+                "batch-r6",
+                &conversations,
+                0,
+                &shutdown,
+            ));
+            if transient {
+                poll.await.unwrap();
+            } else {
+                assert!(tokio::time::timeout(Duration::from_millis(100), &mut poll)
+                    .await
+                    .is_err());
+                shutdown.store(true, Ordering::SeqCst);
+                poll.await.unwrap();
+            }
+            drop(lock);
+            // Real file locks can survive briefly in a concurrently forked
+            // test child. Wait for release before simulating the next startup.
+            drop(
+                crate::maintenance::wait_shared(dir.path(), Duration::from_secs(5))
+                    .await
+                    .unwrap(),
+            );
+            assert!(states(&db).iter().all(|(_, status)| status == "processing"));
+            // Reopen SQLite and discard all task/index state, just as startup does.
+            drop(storage);
+            drop(search);
+            storage = Arc::new(Storage::open(&db).unwrap());
+            search = Arc::new(RwLock::new(SearchEngine::new(16)));
+            assert_eq!(
+                storage.recover_narrative_batches().unwrap()["batch-r6"],
+                conversations
+            );
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            poll_batch_results(
+                &storage,
+                &embeddings,
+                &search,
+                &client,
+                "batch-r6",
+                &conversations,
+                0,
+                &shutdown,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let expected = match failure {
+            Failure::Poll404 | Failure::Results404 | Failure::Expired => ["pending", "pending"],
+            Failure::Omitted | Failure::Errored => ["completed", "pending"],
+            _ => ["completed", "completed"],
+        };
+        assert_eq!(
+            states(&db),
+            vec![
+                ("a".into(), expected[0].into()),
+                ("b".into(), expected[1].into())
+            ]
+        );
+        assert!(storage.recover_narrative_batches().unwrap().is_empty());
+        assert_eq!(
+            storage.count_reflection_embeddings().unwrap(),
+            expected.iter().filter(|&&s| s == "completed").count()
+        );
+        assert_eq!(
+            storage
+                .get_unenriched_conversations("ai_narrative", 10)
+                .unwrap()
+                .len(),
+            expected.iter().filter(|&&s| s == "pending").count()
+        );
+        // Repeated polls must neither rewrite embeddings nor spend another retry.
+        let seq = storage.latest_embedding_change_seq().unwrap();
+        poll_batch_results(
+            &storage,
+            &embeddings,
+            &search,
+            &client,
+            "batch-r6",
+            &conversations,
+            0,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        assert_eq!(storage.latest_embedding_change_seq().unwrap(), seq);
+        if transient {
+            assert!(provider.polls.load(Ordering::SeqCst) >= 2);
+        }
+        drop(storage);
+        let storage = Storage::open(&db).unwrap();
+        assert!(storage.recover_narrative_batches().unwrap().is_empty());
+        assert!(!states(&db).iter().any(|(_, status)| status == "processing"));
+    }
+
+    #[tokio::test]
+    async fn r6_batch_poll_404_requeues_across_restart() {
+        for restart in [false, true] {
+            exercise(Failure::Poll404, restart).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r6_batch_results_404_requeues_across_restart() {
+        for restart in [false, true] {
+            exercise(Failure::Results404, restart).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn r6_batch_transient_503_retries_in_process_and_across_restart() {
+        for failure in [Failure::Poll503, Failure::Results503] {
+            for restart in [false, true] {
+                exercise(failure, restart).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r6_batch_ended_reconciles_omitted_and_errored_across_restart() {
+        for failure in [Failure::Omitted, Failure::Errored, Failure::Expired] {
+            for restart in [false, true] {
+                exercise(failure, restart).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r6_batch_maintenance_retries_state_write_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        seed(&storage);
+        let conversations = storage
+            .recover_narrative_batches()
+            .unwrap()
+            .remove("batch-r6")
+            .unwrap();
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        let client: Arc<dyn BatchClient> = Arc::new(Provider {
+            failure: Failure::Omitted,
+            polls: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            stop_after_transient: None,
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let lock = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let mut poll = Box::pin(poll_batch_results(
+            &storage,
+            &embeddings,
+            &search,
+            &client,
+            "batch-r6",
+            &conversations,
+            0,
+            &shutdown,
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut poll)
+            .await
+            .is_err());
+        drop(lock);
+        poll.await.unwrap();
+        assert_eq!(
+            states(&db),
+            vec![
+                ("a".into(), "completed".into()),
+                ("b".into(), "pending".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn r6_batch_retry_budget_and_orphan_reflection_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let mut storage = Arc::new(Storage::open(&db).unwrap());
+        seed(&storage);
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        store_narrative(&storage, &embeddings, &search, "a", "Already stored.")
+            .await
+            .unwrap();
+        storage.set_batch_id("a", "batch-r6", "hash").unwrap();
+        let seq = storage.latest_embedding_change_seq().unwrap();
+        let client: Arc<dyn BatchClient> = Arc::new(Provider {
+            failure: Failure::Results404,
+            polls: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            stop_after_transient: None,
+        });
+        for attempt in 1..=3 {
+            let conversations = storage
+                .recover_narrative_batches()
+                .unwrap()
+                .remove("batch-r6")
+                .unwrap();
+            poll_batch_results(
+                &storage,
+                &embeddings,
+                &search,
+                &client,
+                "batch-r6",
+                &conversations,
+                0,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                states(&db),
+                vec![
+                    ("a".into(), "completed".into()),
+                    (
+                        "b".into(),
+                        if attempt < 3 { "pending" } else { "failed" }.into()
+                    )
+                ]
+            );
+            assert_eq!(storage.latest_embedding_change_seq().unwrap(), seq);
+            drop(storage);
+            storage = Arc::new(Storage::open(&db).unwrap());
+            assert_eq!(
+                storage
+                    .get_unenriched_conversations("ai_narrative", 10)
+                    .unwrap()
+                    .len(),
+                usize::from(attempt < 3)
+            );
+            if attempt < 3 {
+                storage.set_batch_id("b", "batch-r6", "hash").unwrap();
+            }
+        }
+        assert!(storage.recover_narrative_batches().unwrap().is_empty());
     }
 }

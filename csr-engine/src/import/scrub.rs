@@ -366,7 +366,7 @@ fn cut_forwards_across_chunks(
             joined.push_str(&chunk.content);
         }
         offsets.push(joined.len());
-        let mut cuts: Vec<Vec<(usize, usize)>> = vec![Vec::new(); end - start];
+        let mut cuts: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); end - start];
         for span in crate::extraction::provenance::forward_spans(&joined) {
             let first = offsets.partition_point(|&offset| offset <= span.start) - 1;
             let last = offsets.partition_point(|&offset| offset < span.end) - 1;
@@ -391,14 +391,22 @@ fn cut_forwards_across_chunks(
                 let lo = span.start.max(offsets[chunk]) - offsets[chunk];
                 let hi = span.end.min(offsets[chunk + 1]) - offsets[chunk];
                 if lo < hi {
-                    cut.push((lo, hi));
+                    cut.push((lo, hi, false));
                 }
+            }
+            if span.join {
+                // The chunk containing the next kept text owns the separator,
+                // even if the forward ends exactly at a chunk boundary. This
+                // never leaves the joining space alone in a dropped chunk.
+                let owner = offsets.partition_point(|&offset| offset <= span.end) - 1;
+                let at = span.end - offsets[owner];
+                cuts[owner].push((at, at, true));
             }
         }
         for (chunk, mut cut) in cuts.into_iter().enumerate() {
             cut.sort_unstable();
-            for (lo, hi) in cut.into_iter().rev() {
-                out[start + chunk].replace_range(lo..hi, "");
+            for (lo, hi, join) in cut.into_iter().rev() {
+                out[start + chunk].replace_range(lo..hi, if join { " " } else { "" });
             }
         }
         start = end;
@@ -445,16 +453,27 @@ fn source_forward_cuts(
         .iter()
         .map(|chunk| chunk.content.as_str())
         .collect::<Vec<_>>();
+    let joined = needles.concat();
+    let mut indexed = needles.clone();
+    indexed.push(&joined);
     let Ok(index) = super::provenance_matcher::MessageIndex::read(
         path,
         conversation_id,
         codex,
         plan,
         None,
-        &needles,
+        &indexed,
     ) else {
         return HashMap::new();
     };
+    // Exact full-sequence source matches prove context across chunk boundaries.
+    if let Some(own) = index.without_forwards_in_chunks(&needles) {
+        return chunks
+            .iter()
+            .zip(own)
+            .map(|(chunk, own)| (chunk.id.clone(), own))
+            .collect();
+    }
     chunks
         .iter()
         .filter_map(|chunk| {
@@ -493,7 +512,21 @@ fn in_place(
         if ambiguous[index] {
             continue;
         }
-        match scrub_contaminated_text(carried) {
+        let clean = scrub_contaminated_text(carried).map(|mut content| {
+            // Preserve whitespace at proven slice boundaries, including the
+            // separator carried by the chunk containing the next kept text.
+            // Source-mapped cuts prove their joins even without stored spans.
+            if continues.get(index + 1) == Some(&true) && carried.ends_with(char::is_whitespace) {
+                content.push_str(&carried[carried.trim_end().len()..]);
+            }
+            if (continues[index] || source_cuts.contains_key(&chunk.id))
+                && carried.starts_with(char::is_whitespace)
+            {
+                content.insert_str(0, &carried[..carried.len() - carried.trim_start().len()]);
+            }
+            content
+        });
+        match clean {
             Some(content) if content != chunk.content => {
                 let mut clean = chunk.clone();
                 clean.content = content;
@@ -1318,6 +1351,156 @@ pub async fn run_scrub(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn r6_ordered_forward_prefix_table_persisted_scrub() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            Arc::new(RwLock::new(SearchEngine::new(128))),
+            temp.path().to_path_buf(),
+        );
+        let cases = crate::extraction::provenance::ordered_forward_prefix_cases();
+        for (index, (raw, _)) in cases.iter().enumerate() {
+            let conversation = format!("prefix-{index}");
+            let chunk = chunk_at(&conversation, 0, raw);
+            storage.insert_chunk(&chunk, &vec![0.1; 384]).unwrap();
+            // The source proves message starts for standalone hotkeys. Other
+            // rows deliberately exercise the mapped, missing-source path.
+            if raw.starts_with(['>', '2', 'C']) {
+                let source = temp.path().join(format!("{conversation}.jsonl"));
+                std::fs::write(&source, user_line(raw)).unwrap();
+                storage
+                    .upsert_import_state_explicit(
+                        source.to_str().unwrap(),
+                        &conversation,
+                        1,
+                        "fixture",
+                    )
+                    .unwrap();
+            }
+        }
+        for (index, (raw, _)) in cases.iter().enumerate() {
+            let conversation = format!("codex:prefix-{index}");
+            storage
+                .insert_chunk(&chunk_at(&conversation, 0, raw), &vec![0.1; 384])
+                .unwrap();
+            let source = temp.path().join(format!("codex-{index}.jsonl"));
+            std::fs::write(&source, serde_json::json!({"timestamp":"2026-09-01T00:00:00Z", "type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":raw}]}}).to_string()).unwrap();
+            storage
+                .upsert_import_state_explicit(source.to_str().unwrap(), &conversation, 1, "fixture")
+                .unwrap();
+        }
+        let report = super::run_scrub(&engine, false, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_ambiguous_source, 0);
+        for (index, (raw, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                crate::extraction::provenance::extractable(raw).as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                conversation_text(&storage, &format!("prefix-{index}")),
+                *expected,
+                "row {index}: {raw}"
+            );
+        }
+        for (index, (_, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                conversation_text(&storage, &format!("codex:prefix-{index}")),
+                *expected,
+                "source adapter row {index}"
+            );
+        }
+        println!(
+            "{} cases: extraction = persisted scrub (mapped and source adapter); ambiguity = 0",
+            cases.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn r6_persisted_join_space_crosses_chunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let shell = "The code is 4 CSR's compaction card (compacting), quoted: “”";
+        let short = "The code is 4 CSR's compaction card (compacting), quoted: “One.”2.";
+        let cases = [
+            (
+                format!(
+                    "The code is 4 CSR's compaction card (compacting), quoted: “{}”2.",
+                    "x".repeat(950)
+                ),
+                None,
+            ),
+            (
+                format!(
+                    "The code is 4 CSR's compaction card (compacting), quoted: “{}”2.",
+                    "x".repeat(900 - shell.len())
+                ),
+                None,
+            ),
+            (short.to_string(), short.find("card")),
+            (short.to_string(), Some(short.len() - 2)),
+        ];
+        // Long/short spans, crossing a boundary or ending exactly on one.
+        for (case, (raw, split)) in cases.into_iter().enumerate() {
+            for source in [false, true] {
+                let conversation = format!("codex:join-{case}-{source}");
+                let ids = if let Some(split) = split {
+                    seed_message_chunks(
+                        &storage,
+                        &embeddings,
+                        &conversation,
+                        vec![
+                            chunk_at(&conversation, 0, &raw[..split]),
+                            chunk_at(&conversation, 1, &raw[split..]),
+                        ],
+                        !source,
+                    )
+                } else {
+                    seed_split_message(&storage, &embeddings, &conversation, &raw, !source)
+                };
+                assert_eq!(ids.len(), 2);
+                if source {
+                    let path = temp.path().join(format!("join-{case}.jsonl"));
+                    std::fs::write(&path, serde_json::json!({"timestamp":"2026-09-01T00:00:00Z", "type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":raw}]}}).to_string()).unwrap();
+                    storage
+                        .upsert_import_state_explicit(
+                            path.to_str().unwrap(),
+                            &conversation,
+                            2,
+                            "fixture",
+                        )
+                        .unwrap();
+                }
+                let report = super::run_scrub(&engine, false, Some(&conversation), false, true)
+                    .await
+                    .unwrap();
+                assert_eq!(report.unresolved_ambiguous_source, 0);
+                let persisted = ids
+                    .iter()
+                    .filter_map(|id| storage.get_chunk_content(id).unwrap())
+                    .collect::<String>();
+                assert_eq!(
+                    persisted,
+                    crate::extraction::provenance::extractable(&raw).unwrap(),
+                    "case {case}, source {source}"
+                );
+                assert_eq!(persisted, "The code is 4 2.");
+            }
+        }
+    }
+
     #[test]
     fn round3_guard_does_not_guess_message_continuity() {
         let old = vec![
@@ -2138,6 +2321,16 @@ mod tests {
             false,
         );
         assert!(chunks.len() >= 2, "the message must span chunks");
+        seed_message_chunks(storage, embeddings, conversation, chunks, spans)
+    }
+
+    fn seed_message_chunks(
+        storage: &Storage,
+        embeddings: &EmbeddingEngine,
+        conversation: &str,
+        chunks: Vec<ConversationChunk>,
+        spans: bool,
+    ) -> Vec<String> {
         for chunk in &chunks {
             let vector = embeddings
                 .embed(&[chunk.content.as_str()])

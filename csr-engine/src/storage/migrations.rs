@@ -468,6 +468,12 @@ pub fn run(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    if !has_column(conn, "enrichment_state", "batch_failures")? {
+        conn.execute_batch(
+            "ALTER TABLE enrichment_state ADD COLUMN batch_failures INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+
     // TAD: retrieval events — tracks which memories were surfaced and session outcomes
     conn.execute_batch(
         "

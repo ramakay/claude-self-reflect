@@ -25,6 +25,38 @@ pub trait BatchClient: Send + Sync {
     async fn get_batch_results(&self, batch_id: &str) -> Result<Vec<BatchResultItem>>;
 }
 
+/// Provider failures that cannot be recovered by polling the same batch.
+/// Transport errors, timeouts, rate limits and server failures stay retryable.
+#[derive(Debug)]
+struct BatchHttpError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for BatchHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Anthropic batch failed ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for BatchHttpError {}
+
+pub(crate) fn permanent_batch_error(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<BatchHttpError>() {
+        return error.status.is_client_error()
+            && error.status != reqwest::StatusCode::TOO_MANY_REQUESTS
+            && error.status != reqwest::StatusCode::REQUEST_TIMEOUT;
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return error.status().is_some_and(|status| {
+            status.is_client_error() && status.as_u16() != 429 && status.as_u16() != 408
+        });
+    }
+    // Alternate providers may expose a semantic error without an HTTP status.
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("404") || message.contains("not found") || message.contains("expired")
+}
+
 /// Default model for AI narrative generation.
 const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 
@@ -53,7 +85,10 @@ impl AnthropicClient {
         let api_version = std::env::var("CSR_ANTHROPIC_VERSION")
             .unwrap_or_else(|_| DEFAULT_API_VERSION.to_string());
         Some(Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .ok()?,
             api_key,
             base_url: "https://api.anthropic.com".to_string(),
             model,
@@ -132,11 +167,7 @@ impl BatchClient for AnthropicClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Anthropic batch status failed ({}): {}",
-                status,
-                text
-            ));
+            return Err(BatchHttpError { status, body: text }.into());
         }
 
         let result: serde_json::Value = serde_json::from_str(&text)?;
@@ -167,14 +198,12 @@ impl BatchClient for AnthropicClient {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "Anthropic batch results failed ({}): {}",
-                status,
-                text
-            ));
+            return Err(BatchHttpError { status, body: text }.into());
         }
 
-        // Results come as JSONL (one JSON object per line)
+        // Results come as JSONL (one JSON object per line). Only successful
+        // narratives are returned; the daemon reconciles missing/errored IDs
+        // against the durable request set once the batch has ended.
         let mut results = Vec::new();
         for line in text.lines() {
             if line.trim().is_empty() {
@@ -244,6 +273,37 @@ impl BatchClient for MockBatchClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r6_batch_error_classification_preserves_transient_retries() {
+        for (code, permanent) in [
+            (404, true),
+            (410, true),
+            (400, true),
+            (408, false),
+            (429, false),
+            (500, false),
+            (503, false),
+        ] {
+            let error = anyhow::Error::new(BatchHttpError {
+                status: reqwest::StatusCode::from_u16(code).unwrap(),
+                body: "batch expired".into(),
+            })
+            .context("provider request");
+            assert_eq!(permanent_batch_error(&error), permanent, "HTTP {code}");
+        }
+        for message in [
+            "network disconnected",
+            "request timed out",
+            "429 rate limited",
+            "503 Service Unavailable",
+        ] {
+            assert!(!permanent_batch_error(&anyhow::anyhow!(message)));
+        }
+        for message in ["batch not found", "batch expired", "404 Not Found"] {
+            assert!(permanent_batch_error(&anyhow::anyhow!(message)));
+        }
+    }
 
     #[test]
     fn test_is_configured_without_key() {
