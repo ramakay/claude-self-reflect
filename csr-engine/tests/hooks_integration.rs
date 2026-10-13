@@ -1051,9 +1051,18 @@ fn retired_subagent_stop_hook_is_a_silent_noop() {
         br#"{"session_id":"parent-1","agent_id":"child-7","agent_transcript_path":"/nonexistent/agent-child-7.jsonl"}"#,
         br#"{"session_id":"parent-1","transcript_path":"/nonexistent/parent-1.jsonl"}"#,
     ];
-    for payload in payloads {
+    // The timing probe prints to stderr from the top of `main`; it must not
+    // make the retired hook audible.
+    for (payload, probe) in payloads
+        .into_iter()
+        .flat_map(|payload| [(payload, false), (payload, true)])
+    {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        if probe {
+            command.env("CSR_HOOK_TIMING_PROBE", "1");
+        }
+        let mut child = command
             .args(["hook", "subagent-stop", "--db-path"])
             .arg(dir.path().join("csr-engine.db"))
             .arg("--projects-dir")

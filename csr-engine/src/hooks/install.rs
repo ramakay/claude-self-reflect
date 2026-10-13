@@ -94,6 +94,104 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
     })
 }
 
+/// Split the first `limit` shell words off `command`, undoing the quoting
+/// `shell_quote` (and hand-written quoting) produces. Returns None on an
+/// unterminated quote or when a word holds a shell operator, so the caller
+/// treats anything it cannot read as someone else's command.
+fn leading_shell_words(command: &str, limit: usize) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut chars = command.trim_start().chars().peekable();
+    while words.len() < limit {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        chars.peek()?;
+        let mut word = String::new();
+        while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+            match c {
+                '\'' => loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        other => word.push(other),
+                    }
+                },
+                '"' => loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => match chars.next()? {
+                            escaped @ ('"' | '\\' | '$' | '`') => word.push(escaped),
+                            other => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                        },
+                        other => word.push(other),
+                    }
+                },
+                '\\' => word.push(chars.next()?),
+                ';' | '|' | '&' | '<' | '>' | '(' | ')' => return None,
+                other => word.push(other),
+            }
+        }
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// True for a command that runs a csr-engine binary's `hook` subcommand, with
+/// the binary path quoted or not. Deliberately narrower than a substring
+/// match: a user's `notify.sh` under a claude-self-reflect checkout, or
+/// `echo csr-engine down`, is not a CSR hook.
+fn is_csr_hook_command(command: &str) -> bool {
+    let Some(words) = leading_shell_words(command, 2) else {
+        return false;
+    };
+    let binary = words[0].rsplit('/').next().unwrap_or_default();
+    matches!(binary, "csr-engine" | "csr-engine.exe") && words[1] == "hook"
+}
+
+/// Legacy CSR agent-type hooks carry no command, so they are recognised by the
+/// prompt they shipped with.
+fn is_csr_agent_hook(hook: &serde_json::Value) -> bool {
+    hook.get("type").and_then(|t| t.as_str()) == Some("agent")
+        && hook
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .is_some_and(|prompt| {
+                prompt.contains("CSR Episode Analyst") || prompt.contains("session_episode")
+            })
+}
+
+/// A single nested hook CSR registered, judged narrowly enough to run over
+/// event groups CSR never wrote to.
+fn is_csr_hook(hook: &serde_json::Value) -> bool {
+    hook.get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(is_csr_hook_command)
+        || is_csr_agent_hook(hook)
+}
+
+/// Remove CSR's hooks from each entry of an event group CSR no longer
+/// registers. Filters the nested hooks one by one so a user's command and the
+/// entry's matcher survive next to CSR's, in either order; an entry goes only
+/// when CSR emptied it. Returns true if CSR removed anything and left the group
+/// empty.
+fn sweep_retired_group(entries: &mut Vec<serde_json::Value>) -> bool {
+    let before = entries.len();
+    let mut swept = false;
+    entries.retain_mut(|entry| {
+        let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+            return true;
+        };
+        let had = hooks.len();
+        hooks.retain(|hook| !is_csr_hook(hook));
+        if hooks.len() == had {
+            return true;
+        }
+        swept = true;
+        !hooks.is_empty()
+    });
+    swept && before > 0 && entries.is_empty()
+}
+
 /// Returns true if a settings hook entry was registered by CSR — covers both
 /// command-type hooks (matched by command path) and agent-type hooks (matched by
 /// prompt content). Used by merge_hook_config to evict stale CSR entries before
@@ -163,9 +261,7 @@ fn merge_hook_config(
                 let Some(entries) = group.as_array_mut() else {
                     return true;
                 };
-                let before = entries.len();
-                entries.retain(|entry| !is_csr_entry(entry));
-                !(entries.is_empty() && before > 0)
+                !sweep_retired_group(entries)
             });
         }
     }
@@ -481,6 +577,108 @@ mod tests {
             serde_json::json!([user_subagent_stop_entry()])
         );
         assert_eq!(settings["model"], "opus");
+    }
+
+    fn hook_cmd(command: &str) -> serde_json::Value {
+        serde_json::json!({"type": "command", "command": command})
+    }
+
+    fn merged(mut settings: serde_json::Value) -> serde_json::Value {
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+        settings
+    }
+
+    /// The sweep covers events CSR never installed, so it must only match a
+    /// real `csr-engine hook ...` invocation: a user's script that merely lives
+    /// under a `claude-self-reflect` checkout or mentions `csr-engine` is theirs.
+    #[test]
+    fn test_sweep_keeps_user_commands_that_only_mention_csr() {
+        let user_entries = serde_json::json!([
+            {"hooks": [hook_cmd("bash /Users/x/projects/claude-self-reflect/scripts/notify.sh")]},
+            {"hooks": [hook_cmd("echo csr-engine down")]},
+            {"hooks": [hook_cmd("/opt/csr-engine-tools/bin/notify hook subagent-stop")]},
+            {"hooks": [hook_cmd("/usr/local/bin/csr-engine status")]},
+            {"hooks": [hook_cmd("/Users/x/claude-self-reflect/target/release/csr-engine")]},
+            {"hooks": [hook_cmd("'unterminated /usr/bin/csr-engine hook stop")]},
+        ]);
+        let settings = merged(serde_json::json!({"hooks": {"Notification": user_entries}}));
+        assert_eq!(settings["hooks"]["Notification"], user_entries);
+    }
+
+    #[test]
+    fn test_sweep_removes_csr_invocations_however_the_path_is_written() {
+        for command in [
+            "/usr/local/bin/csr-engine hook subagent-stop",
+            "'/Users/me/CSR Tools/bin/csr-engine' hook subagent-stop",
+            "\"/Users/me/CSR Tools/bin/csr-engine\" hook subagent-stop",
+            "'/tmp/o'\\''brien/csr-engine' hook subagent-stop",
+            "csr-engine hook subagent-stop",
+            "C:/Users/me/bin/csr-engine.exe hook subagent-stop",
+        ] {
+            let settings = merged(serde_json::json!({
+                "hooks": {"SubagentStop": [{"hooks": [hook_cmd(command)]}]}
+            }));
+            assert!(
+                settings["hooks"].get("SubagentStop").is_none(),
+                "{command} should have been swept"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sweep_removes_legacy_csr_agent_hooks_from_unregistered_groups() {
+        let settings = merged(serde_json::json!({
+            "hooks": {"SubagentStop": [{"hooks": [
+                {"type": "agent", "prompt": "You are CSR Episode Analyst. Summarize..."}
+            ]}]}
+        }));
+        assert!(settings["hooks"].get("SubagentStop").is_none());
+    }
+
+    /// An entry holds several hooks and the matcher belongs to the entry: the
+    /// sweep removes CSR's hook alone, in either order, and drops the entry
+    /// only when nothing is left in it.
+    #[test]
+    fn test_sweep_filters_individual_hooks_in_mixed_entries() {
+        let csr = hook_cmd("/usr/local/bin/csr-engine hook subagent-stop");
+        let user = hook_cmd("/Users/me/bin/notify-subagent.sh");
+        for hooks in [
+            serde_json::json!([csr.clone(), user.clone()]),
+            serde_json::json!([user.clone(), csr.clone()]),
+        ] {
+            let settings = merged(serde_json::json!({
+                "hooks": {"SubagentStop": [{"matcher": "general-purpose", "hooks": hooks}]}
+            }));
+            assert_eq!(
+                settings["hooks"]["SubagentStop"],
+                serde_json::json!([{"matcher": "general-purpose", "hooks": [user.clone()]}]),
+                "matcher and the user's command survive, CSR's goes"
+            );
+        }
+
+        let settings = merged(serde_json::json!({
+            "hooks": {"SubagentStop": [
+                {"matcher": "x", "hooks": [csr.clone(), csr.clone()]},
+                {"hooks": [user.clone()]}
+            ]}
+        }));
+        assert_eq!(
+            settings["hooks"]["SubagentStop"],
+            serde_json::json!([{"hooks": [user]}]),
+            "an entry CSR emptied is removed, the rest stay"
+        );
+    }
+
+    #[test]
+    fn test_sweep_leaves_entries_without_a_hooks_array_and_empty_ones_alone() {
+        let odd = serde_json::json!([
+            {"matcher": "x"},
+            {"hooks": []},
+            "not an entry"
+        ]);
+        let settings = merged(serde_json::json!({"hooks": {"SubagentStop": odd}}));
+        assert_eq!(settings["hooks"]["SubagentStop"], odd);
     }
 
     /// The installers tell a user whose hooks point at a different copy of

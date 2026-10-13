@@ -652,7 +652,10 @@ fn main() -> Result<()> {
     // `binary_identity::current_exe_path_and_identity`'s doc.
     let startup_exe = csr_engine::binary_identity::current_exe_path_and_identity();
     let started = std::time::Instant::now();
-    if std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some() {
+    // A retired hook must stay silent even when probed, and the probe has to
+    // print before argument parsing, so the name is spotted straight from argv.
+    let retired_hook = std::env::args().any(|arg| csr_engine::hooks::is_retired_hook(&arg));
+    if !retired_hook && std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some() {
         eprintln!(
             "CSR timing-probe main_unix_ns={}",
             std::time::SystemTime::now()
