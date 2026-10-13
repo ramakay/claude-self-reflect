@@ -151,9 +151,9 @@ impl Daemon {
 
     /// Build an `Engine` over this daemon's real storage/embeddings/search
     /// Arcs and its REAL `index_dir` (next to the database, independent of
-    /// `projects_dir` — e.g. `~/.claude-self-reflect/index` vs
+    /// `projects_dir` — e.g. `~/.claude-self-reflect/index-v3` vs
     /// `~/.claude/projects`). `Engine::from_parts` derives `index_dir` as
-    /// `projects_dir.join("index")`, which resolves to the wrong place for
+    /// `projects_dir.join("index-v3")`, which resolves to the wrong place for
     /// the daemon; only `from_parts_with_index_dir` is correct here.
     ///
     /// The compaction loop is the caller that matters: its
@@ -2856,7 +2856,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         // Deliberately NOT index_dir.parent() — mirrors the real daemon,
         // whose projects_dir is `~/.claude/projects` and whose index_dir is
-        // `~/.claude-self-reflect/index`, two unrelated directories.
+        // `~/.claude-self-reflect/index-v3`, two unrelated directories.
         let projects_dir = tmp.path().join("claude_projects");
         std::fs::create_dir_all(&projects_dir).unwrap();
         let index_dir = tmp.path().join("real_index");
@@ -2926,8 +2926,8 @@ mod tests {
             "manifest.json in the real index_dir must be rewritten"
         );
         assert!(
-            !projects_dir.join("index").exists(),
-            "nothing must be written under projects_dir/index — from_parts's wrong derivation"
+            !projects_dir.join("index-v3").exists(),
+            "nothing must be written under projects_dir/index-v3 — from_parts's wrong derivation"
         );
 
         // A second call with no marker present must be a no-op.
@@ -2942,7 +2942,7 @@ mod tests {
     // existing daemon test green. This test goes through `Daemon::new` and
     // the (now-extracted) `Daemon::compaction_engine` method instead, with
     // `projects_dir != index_dir.parent()` (mirrors the real daemon:
-    // `~/.claude/projects` vs `~/.claude-self-reflect/index`), and asserts
+    // `~/.claude/projects` vs `~/.claude-self-reflect/index-v3`), and asserts
     // the constructed engine's `index_dir()` is the daemon's real one. ---
 
     #[tokio::test]
@@ -2979,8 +2979,8 @@ mod tests {
         );
         assert_ne!(
             engine.index_dir(),
-            projects_dir.join("index").as_path(),
-            "sanity: projects_dir/index must not be the real index_dir in this rig"
+            projects_dir.join("index-v3").as_path(),
+            "sanity: projects_dir/index-v3 must not be the real index_dir in this rig"
         );
     }
 

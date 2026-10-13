@@ -17,6 +17,7 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 /// are about to embed and want the load off the hot path (import/daemon)
 /// should call `warm()` right after construction.
 pub struct EmbeddingEngine {
+    disabled: bool,
     model: Mutex<Option<TextEmbedding>>,
     /// An MCP server of a configured daemon embeds there and never loads the
     /// model itself (see `search::vector_ipc`).
@@ -84,14 +85,25 @@ impl EmbeddingEngine {
     /// infallible in practice (no I/O beyond what `Mutex::new` does).
     pub fn new() -> Result<Self> {
         Ok(Self {
+            disabled: false,
             model: Mutex::new(None),
             remote: None,
         })
     }
 
+    /// A cache-missing hook cannot perform semantic work or initialize a model.
+    pub fn disabled() -> Self {
+        Self {
+            disabled: true,
+            model: Mutex::new(None),
+            remote: None,
+        }
+    }
+
     /// An engine that embeds through the daemon first (see `remote`).
     pub fn with_remote(proxy: std::sync::Arc<crate::search::vector_ipc::VectorProxy>) -> Self {
         Self {
+            disabled: false,
             model: Mutex::new(None),
             remote: Some(proxy),
         }
@@ -117,6 +129,10 @@ impl EmbeddingEngine {
     /// lock-and-check. A failed load leaves the cell empty so the next
     /// call retries from scratch.
     fn ensure_loaded(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.disabled && self.remote.is_none(),
+            "local semantic model is unavailable in this process"
+        );
         let mut guard = self
             .model
             .lock()

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fs2::FileExt;
 use hnsw_rs::api::AnnT;
 use hnsw_rs::hnsw::Hnsw;
@@ -49,11 +49,14 @@ pub struct Published {
 /// Uses `hnsw_rs` with cosine distance. Scores are converted from
 /// distance (1.0 - cosine_similarity) back to similarity (1.0 - distance).
 pub struct SearchEngine {
+    allow_local_mutations: bool,
     chunk_index: Hnsw<'static, f32, DistCosine>,
     reflection_index: Hnsw<'static, f32, DistCosine>,
     chunk_id_map: Vec<String>,
     reflection_id_map: Vec<String>,
     chunk_positions: HashMap<String, usize>,
+    chunk_hashes: Vec<blake3::Hash>,
+    reflection_hashes: Vec<blake3::Hash>,
     reflection_positions: HashMap<String, usize>,
     /// Process-local identity, stable across mutations and distinct after index swaps.
     generation: u64,
@@ -188,6 +191,7 @@ impl Drop for MappedGeneration {
 // runs on its own thread, so concurrent tests cannot disturb the count).
 #[cfg(test)]
 thread_local! {
+    pub(crate) static HNSW_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIVE_MAPPED_GENERATIONS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
@@ -302,8 +306,7 @@ pub fn clear_needs_compaction(index_dir: &Path) {
     }
 }
 
-const MANIFEST_VERSION: u32 = 2;
-const LEGACY_MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 3;
 static INDEX_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ENGINE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -345,6 +348,7 @@ pub(crate) fn hold_publishing_for_test() -> impl Drop {
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexManifest {
     version: u32,
+    files: HashMap<String, FileIntegrity>,
     created_at: String,
     chunk_id_map: Vec<String>,
     reflection_id_map: Vec<String>,
@@ -381,6 +385,66 @@ struct IndexManifest {
     reflection_change_cursor: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FileIntegrity {
+    bytes: u64,
+    blake3: String,
+}
+
+fn file_integrity(path: &Path) -> Result<FileIntegrity> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening index file {}", path.display()))?;
+    let bytes = file.metadata().context("reading index file length")?.len();
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).context("hashing index file")?;
+    Ok(FileIntegrity {
+        bytes,
+        blake3: hasher.finalize().to_hex().to_string(),
+    })
+}
+
+fn verify_manifest_files(dir: &Path, manifest: &IndexManifest) -> Result<()> {
+    for (basename, nonempty) in [
+        (&manifest.chunk_basename, !manifest.chunk_id_map.is_empty()),
+        (
+            &manifest.reflection_basename,
+            !manifest.reflection_id_map.is_empty(),
+        ),
+    ] {
+        anyhow::ensure!(
+            Path::new(basename).file_name().and_then(|s| s.to_str()) == Some(basename.as_str()),
+            "invalid index basename"
+        );
+        if nonempty {
+            for extension in ["hnsw.graph", "hnsw.data"] {
+                let name = format!("{basename}.{extension}");
+                anyhow::ensure!(
+                    manifest.files.contains_key(&name),
+                    "missing integrity metadata for {name}"
+                );
+            }
+        }
+    }
+    for (name, expected) in &manifest.files {
+        anyhow::ensure!(
+            Path::new(name).file_name().and_then(|s| s.to_str()) == Some(name.as_str()),
+            "invalid index filename"
+        );
+        let path = dir.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("checking {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() == expected.bytes,
+            "index file length or type mismatch: {name}"
+        );
+        anyhow::ensure!(
+            file_integrity(&path)? == *expected,
+            "index hash mismatch: {name}"
+        );
+    }
+    Ok(())
+}
+
 fn default_chunk_basename() -> String {
     "chunks".to_string()
 }
@@ -392,6 +456,7 @@ fn default_reflection_basename() -> String {
 impl SearchEngine {
     pub fn new(estimated_size: usize) -> Self {
         Self {
+            allow_local_mutations: true,
             chunk_index: Hnsw::new(
                 MAX_NB_CONNECTION,
                 estimated_size,
@@ -409,6 +474,8 @@ impl SearchEngine {
             chunk_id_map: Vec::new(),
             reflection_id_map: Vec::new(),
             chunk_positions: HashMap::new(),
+            chunk_hashes: Vec::new(),
+            reflection_hashes: Vec::new(),
             reflection_positions: HashMap::new(),
             generation: ENGINE_GENERATION.fetch_add(1, Ordering::Relaxed),
             active_reflection_count: 0,
@@ -428,6 +495,12 @@ impl SearchEngine {
             _mapped: Vec::new(),
             rebuilt_at_generation: None,
         }
+    }
+
+    /// Hook imports persist to SQLite without constructing or changing local graphs.
+    pub(crate) fn for_hook(mut self) -> Self {
+        self.allow_local_mutations = false;
+        self
     }
 
     /// An engine that searches through `proxy` (see the `proxy` field).
@@ -528,10 +601,38 @@ impl SearchEngine {
         self.reflection_cursor = self.reflection_cursor.max(seq);
     }
 
+    /// Apply a stored vector only when it differs from the current vector.
+    pub(crate) fn apply_vector(&mut self, id: String, vector: Option<Vec<f32>>, reflection: bool) {
+        let (positions, hashes) = if reflection {
+            (&self.reflection_positions, &self.reflection_hashes)
+        } else {
+            (&self.chunk_positions, &self.chunk_hashes)
+        };
+        if let (Some(position), Some(vector)) = (positions.get(&id), vector.as_ref()) {
+            if hashes[*position] == vector_hash(vector) {
+                return;
+            }
+        }
+        if reflection {
+            self.remove_reflection(&id);
+            if let Some(vector) = vector {
+                self.insert_reflection(id, vector);
+            }
+        } else {
+            self.remove_chunk(&id);
+            if let Some(vector) = vector {
+                self.insert_chunk(id, vector);
+            }
+        }
+    }
+
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
         if let Some(proxy) = &self.proxy {
             // SQLite holds the change; the daemon applies it before answering.
             proxy.sync_committed();
+            return;
+        }
+        if !self.allow_local_mutations {
             return;
         }
         if self.chunk_positions.contains_key(&id) {
@@ -540,25 +641,30 @@ impl SearchEngine {
         let idx = self.chunk_id_map.len();
         self.chunk_positions.insert(id.clone(), idx);
         self.chunk_id_map.push(id);
+        self.chunk_hashes.push(vector_hash(&embedding));
         self.chunk_index.insert((&embedding, idx));
         self.mark_chunk_dirty();
     }
 
-    pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
+    pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) -> bool {
         if let Some(proxy) = &self.proxy {
             // SQLite holds the change; the daemon applies it before answering.
-            proxy.sync_committed();
-            return;
+            return proxy.sync_committed();
+        }
+        if !self.allow_local_mutations {
+            return false;
         }
         if self.reflection_positions.contains_key(&id) {
-            return; // Already indexed — skip duplicate
+            return true; // Already indexed — skip duplicate
         }
         let idx = self.reflection_id_map.len();
         self.reflection_positions.insert(id.clone(), idx);
         self.reflection_id_map.push(id);
+        self.reflection_hashes.push(vector_hash(&embedding));
         self.reflection_index.insert((&embedding, idx));
         self.active_reflection_count += 1;
         self.mark_reflection_dirty();
+        true
     }
 
     /// Remove a reflection from search results.
@@ -569,6 +675,9 @@ impl SearchEngine {
         if let Some(proxy) = &self.proxy {
             // SQLite holds the change; the daemon applies it before answering.
             proxy.sync_committed();
+            return;
+        }
+        if !self.allow_local_mutations {
             return;
         }
         if let Some(pos) = self.reflection_positions.remove(id) {
@@ -587,6 +696,9 @@ impl SearchEngine {
         if let Some(proxy) = &self.proxy {
             // SQLite holds the change; the daemon applies it before answering.
             proxy.sync_committed();
+            return;
+        }
+        if !self.allow_local_mutations {
             return;
         }
         if let Some(pos) = self.chunk_positions.remove(id) {
@@ -1316,8 +1428,9 @@ impl SearchEngine {
         };
 
         // Write manifest atomically (tmp + rename)
-        let manifest = IndexManifest {
+        let mut manifest = IndexManifest {
             version: MANIFEST_VERSION,
+            files: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             chunk_id_map,
             reflection_id_map,
@@ -1331,6 +1444,34 @@ impl SearchEngine {
             reflection_change_cursor,
         };
 
+        for (basename, nonempty, written) in [
+            (
+                &manifest.chunk_basename,
+                !manifest.chunk_id_map.is_empty(),
+                chunk_actually_dumped,
+            ),
+            (
+                &manifest.reflection_basename,
+                !manifest.reflection_id_map.is_empty(),
+                reflection_actually_dumped,
+            ),
+        ] {
+            if nonempty {
+                for extension in ["hnsw.graph", "hnsw.data"] {
+                    let name = format!("{basename}.{extension}");
+                    let integrity = if written {
+                        file_integrity(&dir.join(&name))?
+                    } else {
+                        existing_manifest
+                            .as_ref()
+                            .and_then(|m| m.files.get(&name))
+                            .cloned()
+                            .with_context(|| format!("missing integrity metadata for {name}"))?
+                    };
+                    manifest.files.insert(name, integrity);
+                }
+            }
+        }
         write_manifest_atomically(dir, &manifest)?;
         if !self.manifest_backed {
             // A full rebuild: keep the maintenance generation level with the
@@ -1447,12 +1588,16 @@ impl SearchEngine {
         let manifest_data = std::fs::read_to_string(&manifest_path).ok()?;
         let manifest: IndexManifest = serde_json::from_str(&manifest_data).ok()?;
 
-        if manifest.version != MANIFEST_VERSION && manifest.version != LEGACY_MANIFEST_VERSION {
+        if manifest.version != MANIFEST_VERSION {
             tracing::info!(
-                expected = "1 or 2",
+                expected = MANIFEST_VERSION,
                 found = manifest.version,
                 "index cache version mismatch"
             );
+            return None;
+        }
+        if let Err(error) = verify_manifest_files(dir, &manifest) {
+            tracing::warn!(%error, "index integrity mismatch; rebuilding");
             return None;
         }
         // Published from a graph loaded before the last maintenance pass (an
@@ -1624,7 +1769,12 @@ impl SearchEngine {
         // Use non-blank map count — orphans will be blanked by Engine::new reconciliation
         let active_count = reflection_positions.len();
 
+        let chunk_hashes = index_hashes(&chunk_hnsw, manifest.chunk_id_map.len());
+        let reflection_hashes = index_hashes(&refl_hnsw, manifest.reflection_id_map.len());
         Some(Self {
+            allow_local_mutations: true,
+            chunk_hashes,
+            reflection_hashes,
             chunk_index: chunk_hnsw,
             reflection_index: refl_hnsw,
             chunk_id_map: manifest.chunk_id_map,
@@ -1650,6 +1800,27 @@ impl SearchEngine {
             rebuilt_at_generation: None,
         })
     }
+}
+
+fn vector_hash(vector: &[f32]) -> blake3::Hash {
+    // SAFETY: f32 has no padding and the byte slice borrows only initialized vector storage.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(vector.as_ptr().cast::<u8>(), std::mem::size_of_val(vector))
+    };
+    blake3::hash(bytes)
+}
+
+fn index_hashes(index: &Hnsw<'static, f32, DistCosine>, count: usize) -> Vec<blake3::Hash> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut hashes = vec![blake3::hash(&[]); count];
+    for point in index.get_point_indexation() {
+        if let Some(hash) = hashes.get_mut(point.get_origin_id()) {
+            *hash = vector_hash(point.get_v());
+        }
+    }
+    hashes
 }
 
 /// Graph description magics hnsw_rs 0.3.5 loads without exiting (format 3
@@ -1693,8 +1864,10 @@ fn check_generation_files(
     let mut dimension = [0u8; 8];
     dimension.copy_from_slice(&data[4..12]);
     let dimension = u64::from_ne_bytes(dimension);
-    let expected = (points as u64)
-        .checked_mul(20 + 4 * dimension)
+    let expected = dimension
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(20))
+        .and_then(|record| (points as u64).checked_mul(record))
         .and_then(|records| records.checked_add(12));
     if expected != Some(len) {
         return Err(format!(
@@ -1941,6 +2114,8 @@ impl PendingHnswIo {
     }
 
     fn load(&mut self) -> std::result::Result<Hnsw<'static, f32, DistCosine>, HnswLoadFailure> {
+        #[cfg(test)]
+        HNSW_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: `self` uniquely owns this allocation until `leak`; the pointer
             // remains stable, and a failed/unwound call cannot return a borrowing Hnsw.
@@ -2917,6 +3092,7 @@ mod tests {
         // files.
         let manifest = IndexManifest {
             version: MANIFEST_VERSION,
+            files: HashMap::new(),
             created_at: "2026-08-19T00:00:00Z".into(),
             chunk_id_map: Vec::new(),
             reflection_id_map: Vec::new(),
@@ -2945,7 +3121,7 @@ mod tests {
     }
 
     #[test]
-    fn load_accepts_v1_manifest_with_canonical_files() {
+    fn r3_load_rejects_v1_manifest_with_canonical_files() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let mut engine = SearchEngine::new(10);
@@ -2972,7 +3148,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(SearchEngine::load_from_disk(dir, 1, 0).is_some());
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).is_none());
     }
 
     #[test]
@@ -3121,7 +3297,7 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(tmp.path().join("manifest.json")).unwrap())
                 .unwrap();
-        assert_eq!(manifest["version"], 2);
+        assert_eq!(manifest["version"], 3);
     }
 
     #[test]
@@ -3131,6 +3307,7 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), "old").unwrap();
         let manifest = IndexManifest {
             version: MANIFEST_VERSION,
+            files: HashMap::new(),
             created_at: "2026-08-17T00:00:00Z".into(),
             chunk_id_map: Vec::new(),
             reflection_id_map: Vec::new(),
@@ -3206,6 +3383,7 @@ mod tests {
             dir.join("manifest.json"),
             serde_json::to_vec(&serde_json::json!({
                 "version": MANIFEST_VERSION,
+                "files": {},
                 "created_at": "2026-08-17T00:00:00Z",
                 "chunk_id_map": [],
                 "reflection_id_map": [],
@@ -3394,7 +3572,15 @@ mod tests {
         .unwrap();
         let mut legacy = serde_json::to_value(&manifest).unwrap();
         legacy["chunk_basename"] = serde_json::json!("chunks");
-        legacy["version"] = serde_json::json!(1);
+        let mut files = serde_json::Map::new();
+        for extension in ["hnsw.graph", "hnsw.data"] {
+            let name = format!("chunks.{extension}");
+            files.insert(
+                name.clone(),
+                serde_json::to_value(file_integrity(&dir.join(&name)).unwrap()).unwrap(),
+            );
+        }
+        legacy["files"] = serde_json::Value::Object(files);
         std::fs::write(
             dir.join("manifest.json"),
             serde_json::to_vec_pretty(&legacy).unwrap(),
@@ -3828,5 +4014,89 @@ mod tests {
             "another engine's publish says nothing about this one"
         );
         assert!(!fresh.manifest_backed);
+    }
+
+    #[test]
+    fn r3_manifest_requires_hashes_and_rejects_graph_corruption_before_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = SearchEngine::new(8);
+        index.insert_chunk("a".into(), vec![0.1; 384]);
+        index.dump_to_disk(dir.path(), 1, 0).unwrap();
+        let path = dir.path().join("manifest.json");
+        let original = std::fs::read(&path).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        manifest.as_object_mut().unwrap().remove("files");
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0).is_none());
+        std::fs::write(&path, original).unwrap();
+        let manifest: IndexManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let graph = dir
+            .path()
+            .join(format!("{}.hnsw.graph", manifest.chunk_basename));
+        let mut bytes = std::fs::read(&graph).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x80;
+        std::fs::write(graph, bytes).unwrap();
+        HNSW_LOAD_CALLS.with(|calls| calls.set(0));
+        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0).is_none());
+        HNSW_LOAD_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn r3_dump_size_formula_checks_dimension_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("chunks.hnsw.graph"),
+            LOADABLE_GRAPH_MAGICS[0].to_ne_bytes(),
+        )
+        .unwrap();
+        let mut bytes = DATA_MAGIC.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&u64::MAX.to_ne_bytes());
+        std::fs::write(dir.path().join("chunks.hnsw.data"), bytes).unwrap();
+        assert!(check_generation_files(dir.path(), "chunks", 1).is_err());
+    }
+
+    #[test]
+    fn r3_identical_vector_apply_has_no_tombstone_or_publication_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = SearchEngine::new(8);
+        index.insert_chunk("a".into(), vec![0.1; 384]);
+        index.insert_reflection("r".into(), vec![0.2; 384]);
+        index.dump_to_disk(dir.path(), 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1).unwrap();
+        for current in [&mut index, &mut loaded] {
+            current.apply_vector("a".into(), Some(vec![0.1; 384]), false);
+            current.apply_vector("r".into(), Some(vec![0.2; 384]), true);
+            assert_eq!(current.unpublished_changes(), 0);
+            assert_eq!(current.chunk_tombstone_count(), 0);
+            assert_eq!(current.reflection_tombstone_count(), 0);
+            current.apply_vector("a".into(), Some(vec![0.3; 384]), false);
+            assert_eq!(current.unpublished_changes(), 2);
+            assert_eq!(current.chunk_tombstone_count(), 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "writes and hashes a 1.5 GiB file for the release validation benchmark"]
+    fn r3_hash_verification_realistic_file_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("realistic.hnsw.data");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let block: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
+        for _ in 0..1536 {
+            file.write_all(&block).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let start = std::time::Instant::now();
+        let integrity = file_integrity(&path).unwrap();
+        println!(
+            "r3_hash_timing bytes={} elapsed_ms={:.3} digest={}",
+            integrity.bytes,
+            start.elapsed().as_secs_f64() * 1000.0,
+            integrity.blake3
+        );
+        assert_eq!(integrity.bytes, 1_610_612_736);
     }
 }

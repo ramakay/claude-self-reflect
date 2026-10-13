@@ -1687,7 +1687,9 @@ async fn run(
             // makes `Engine::new` rebuild through hnsw_rs, which prints to
             // stdout; keep that off the channel until the handler owns it.
             let _quiet = csr_engine::hooks::StdoutQuarantine::begin();
-            if csr_engine::hooks::hook_needs_index(name, &input) {
+            if let Some(proxied) = engine::Engine::new_proxied(&args.db_path, &args.projects_dir)? {
+                proxied
+            } else if csr_engine::hooks::hook_needs_index(name, &input) {
                 engine::Engine::new_for_hook(&args.db_path, &args.projects_dir)?
             } else {
                 engine::Engine::new_import_only(&args.db_path, &args.projects_dir)?
@@ -1729,15 +1731,17 @@ async fn run(
     // through hnsw_rs at any point in the session, not only at startup. A
     // scoped guard around `Engine::new` alone (as the hook path uses) would
     // not cover that. Claim fd 1 for the rest of the process up front; `None`
-    // when the claim fails or on non-unix falls back to the unmodified stdio
-    // transport inside `serve_mcp`. Once the claim succeeds, `serve_mcp` is
+    // for non-serving commands. A failed claim returns an error before startup.
+    // Once the claim succeeds, `serve_mcp` is
     // reached unless the process instead exits on an error from `Engine::new`
     // or one of `--import`/`--enrich`/`--backfill-saga` via `?` — and in that
     // case the leaked descriptor dies with the process, since `--bench` (the
     // one branch that would otherwise return early past this point) has
     // already been handled above.
     let jsonrpc_stdout = if should_serve {
-        csr_engine::hooks::ClaimedStdout::claim()
+        Some(csr_engine::hooks::ClaimedStdout::require(
+            csr_engine::hooks::ClaimedStdout::claim(),
+        )?)
     } else {
         None
     };

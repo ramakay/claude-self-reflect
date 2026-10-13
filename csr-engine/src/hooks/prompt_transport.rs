@@ -283,38 +283,22 @@ impl BoundSocket {
 #[cfg(unix)]
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
-/// Take `file`'s exclusive flock, waiting up to `wait` for it.
-///
-/// Not a plain try-lock: on macOS, `posix_spawn` copies the parent's whole
-/// descriptor table into the child and only closes close-on-exec entries
-/// once the new image is activated, so a lock this process released a
-/// moment ago can still be held, through the child's transient copy, by
-/// whatever another thread was spawning when it was released. Measured: a
-/// re-bind straight after a release failed with WouldBlock in 1,794 of
-/// 3,000 attempts while six threads spawned /usr/bin/true. The blocking
-/// flock returns the moment that copy is closed. A thread that is still
-/// waiting when `wait` runs out keeps waiting, and drops the lock as soon
-/// as it gets it, since nobody receives it.
+/// Take the exclusive endpoint lock before the deadline, releasing the file on failure.
 #[cfg(unix)]
 fn lock_within(file: std::fs::File, wait: Duration) -> std::io::Result<std::fs::File> {
-    match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => return Ok(file),
-        Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e),
-        Err(_) => {}
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("endpoint-lock".into())
-        .spawn(move || {
-            let locked = fs2::FileExt::lock_exclusive(&file).map(|()| file);
-            let _ = tx.send(locked);
-        })?;
-    match rx.recv_timeout(wait) {
-        Ok(locked) => locked,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "endpoint lock held by another server",
-        )),
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(file),
+            Err(error) if error.kind() != std::io::ErrorKind::WouldBlock => return Err(error),
+            Err(error) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+        }
     }
 }
 
@@ -502,7 +486,7 @@ mod tests {
                 10,
             ))),
             dir.to_path_buf(),
-            dir.join("index"),
+            dir.join("index-v3"),
         ))
     }
 
@@ -545,7 +529,7 @@ mod tests {
         ready(dir.path()).await;
         assert_eq!(request(dir.path(), input).await, Some(expected));
         assert!(!engine.embeddings().is_loaded());
-        assert!(!dir.path().join("index").exists());
+        assert!(!dir.path().join("index-v3").exists());
         assert_eq!(
             std::fs::read_to_string(transcript).unwrap(),
             "do not import this transcript"
@@ -829,5 +813,21 @@ mod endpoint_lock_tests {
         assert!(started.elapsed() >= LOCK_WAIT);
         drop(held);
         BoundSocket::bind(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn r3_endpoint_lock_timeout_closes_the_attempt_descriptor() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.lock");
+        let held = std::fs::File::create(&path).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let attempt = std::fs::File::open(&path).unwrap();
+        let fd = attempt.as_raw_fd();
+        let start = std::time::Instant::now();
+        assert!(lock_within(attempt, Duration::from_millis(30)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(200));
+        // SAFETY: fcntl only probes the descriptor and does not take ownership.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
     }
 }

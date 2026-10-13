@@ -8,7 +8,7 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn searching_hook_startup_cannot_publish_a_rebuilt_index() {
     let dir = TempDir::new().unwrap();
-    let index = dir.path().join("index");
+    let index = dir.path().join("index-v3");
     std::fs::create_dir(&index).unwrap();
     std::fs::write(index.join("manifest.json"), "invalid cache sentinel").unwrap();
     let engine = csr_engine::engine::Engine::new_for_hook(
@@ -84,7 +84,7 @@ mod prompt_process {
     #[test]
     fn cold_process_ignores_large_index_and_missing_database() {
         let dir = tempfile::tempdir().unwrap();
-        let index = dir.path().join("index");
+        let index = dir.path().join("index-v3");
         std::fs::create_dir(&index).unwrap();
         // Sparse poison files: loading even the manifest would fail. The hook
         // must not create a DB, rebuild the index, or touch any of these files.
@@ -2151,7 +2151,7 @@ fn import_only_engine_does_not_load_the_disk_cache() {
     let db_path = tmp.path().join("csr-engine.db");
     // Engine derives index_dir from db_path.parent(); seed BOTH the DB and a
     // matching on-disk cache so a normal engine would genuinely load them.
-    let index_dir = tmp.path().join("index");
+    let index_dir = tmp.path().join("index-v3");
     std::fs::create_dir_all(&index_dir).unwrap();
     seed_db(&db_path, 50);
     dump_seed_index(&index_dir, 50);
@@ -2191,7 +2191,7 @@ fn import_only_engine_does_not_load_the_disk_cache() {
 fn import_only_flush_preserves_the_on_disk_cache() {
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("csr-engine.db");
-    let index_dir = tmp.path().join("index");
+    let index_dir = tmp.path().join("index-v3");
     std::fs::create_dir_all(&index_dir).unwrap();
     dump_seed_index(&index_dir, 50);
     assert_eq!(read_manifest_chunk_count(&index_dir), Some(50));
@@ -2222,7 +2222,7 @@ fn import_only_flush_preserves_the_on_disk_cache() {
 #[test]
 fn full_engine_flush_rewrites_the_manifest() {
     let tmp = TempDir::new().unwrap();
-    let index_dir = tmp.path().join("index");
+    let index_dir = tmp.path().join("index-v3");
     std::fs::create_dir_all(&index_dir).unwrap();
     dump_seed_index(&index_dir, 50);
     assert_eq!(read_manifest_chunk_count(&index_dir), Some(50));
@@ -2232,7 +2232,7 @@ fn full_engine_flush_rewrites_the_manifest() {
     let search = std::sync::Arc::new(tokio::sync::RwLock::new(
         csr_engine::search::SearchEngine::new(100),
     ));
-    // from_parts derives index_dir = projects_dir.join("index"), so point
+    // from_parts derives index_dir = projects_dir.join("index-v3"), so point
     // projects_dir at tmp to reuse the seeded cache dir.
     let eng = csr_engine::engine::Engine::from_parts(
         storage,

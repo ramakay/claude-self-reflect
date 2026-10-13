@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
         embeddings,
         Arc::new(tokio::sync::RwLock::new(search)),
         projects.clone(),
-        temp.path().join("index"),
+        temp.path().join("index-v3"),
     ));
     // The real daemon already runs embedding/search work. Prime one complete
     // pipeline, and report its cost separately instead of conflating initial

@@ -745,6 +745,15 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     out
 }
 
+/// Keyword quick checks report lexical matches without inventing cosine confidence.
+pub fn format_keyword_quick_check(results: &[EnrichedResult]) -> String {
+    let Some(top) = results.first() else {
+        return "<quick_search>\n  <found>false</found>\n  <count>0</count>\n  <collections_with_matches>0</collections_with_matches>\n  <message>No keyword matches found</message>\n</quick_search>\n".into();
+    };
+    format!("<quick_search>\n  <found>true</found>\n  <count>1</count>\n  <relevance>keyword</relevance>\n  <collections_with_matches>1</collections_with_matches>\n  <top_result>\n    <score>n/a</score>\n    <margin>n/a</margin>\n    <timestamp>{}</timestamp>\n    <preview>{}</preview>\n  </top_result>\n</quick_search>\n",
+        age_stamp(&top.chunk.timestamp), xml_escape(truncate_chars(&top.chunk.content, PREVIEW_CHARS)))
+}
+
 /// Format search insights/summary as XML.
 pub fn format_search_insights(results: &[EnrichedResult], query: &str) -> String {
     let mut out = String::new();

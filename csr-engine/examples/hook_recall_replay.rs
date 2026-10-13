@@ -1021,7 +1021,7 @@ async fn run(config: Config) -> Result<(), String> {
     let index_dir = config
         .db_path
         .parent()
-        .map(|p| p.join("index"))
+        .map(|p| p.join("index-v3"))
         .unwrap_or_else(|| PathBuf::from("index"));
     let index_manifest = read_index_manifest_identity(&index_dir);
     if let Some(expected) = &config.expect_manifest {

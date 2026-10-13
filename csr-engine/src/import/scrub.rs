@@ -2737,7 +2737,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let index_dir = projects.join("index");
+        let index_dir = projects.join("index-v3");
         std::fs::create_dir_all(&index_dir).unwrap();
         let manifest = index_dir.join("manifest.json");
         std::fs::write(&manifest, "stale manifest").unwrap();

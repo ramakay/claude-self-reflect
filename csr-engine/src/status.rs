@@ -15,6 +15,44 @@ use crate::storage::Storage;
 #[path = "dream_state.rs"]
 pub(crate) mod dream_state;
 
+#[derive(Serialize)]
+pub struct LegacyIndexStatus {
+    pub path: String,
+    pub size_bytes: u64,
+    pub note: &'static str,
+}
+
+fn legacy_index_status(db_path: &Path) -> Option<LegacyIndexStatus> {
+    fn directory_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| {
+                let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+                    return 0;
+                };
+                if meta.is_dir() {
+                    directory_bytes(&entry.path())
+                } else if meta.is_file() {
+                    meta.len()
+                } else {
+                    0
+                }
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+    let path = db_path.parent()?.join("index");
+    if !path.is_dir() {
+        return None;
+    }
+    Some(LegacyIndexStatus {
+        size_bytes: directory_bytes(&path),
+        path: path.display().to_string(),
+        note: "Legacy cache can be removed once no 10.0-or-older csr-engine runs.",
+    })
+}
+
 /// Status data gathered from SQLite and disk.
 #[derive(Serialize)]
 pub struct StatusReport {
@@ -36,6 +74,7 @@ pub struct StatusReport {
     pub ratification: RatificationStatus,
     pub newest_chunk: Option<String>,
     pub db_size_bytes: u64,
+    pub legacy_index: Option<LegacyIndexStatus>,
     pub db_path: String,
     pub healthy: bool,
     /// True when any live `mcp_stdio` process in [`stale_processes`] is
@@ -822,6 +861,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             ratification: RatificationStatus::default(),
             newest_chunk: None,
             db_size_bytes: 0,
+            legacy_index: legacy_index_status(db_path),
             db_path: db_path.to_string_lossy().to_string(),
             healthy: false,
             aux: AuxStatus::default(),
@@ -956,6 +996,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         ratification,
         newest_chunk,
         db_size_bytes,
+        legacy_index: legacy_index_status(db_path),
         db_path: db_path.to_string_lossy().to_string(),
         healthy,
         aux,
@@ -2066,6 +2107,7 @@ mod tests {
             ratification: RatificationStatus::default(),
             newest_chunk: None,
             db_size_bytes: 100_000_000,
+            legacy_index: None,
             db_path: "/tmp/test.db".to_string(),
             healthy: true,
             aux: AuxStatus::default(),
@@ -3306,5 +3348,17 @@ Body text with a [[some-slug]] wikilink and more prose.
         let status = gather_memory_registry(&storage);
         assert_eq!(status.schema_misses, 1);
         assert_eq!(status.files, 1);
+    }
+
+    #[test]
+    fn r3_status_reports_legacy_cache_bytes_and_retirement_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("index");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("old.data"), [0u8; 37]).unwrap();
+        let status = legacy_index_status(&dir.path().join("csr-engine.db")).unwrap();
+        assert_eq!(status.size_bytes, 37);
+        assert!(status.note.contains("no 10.0-or-older csr-engine runs"));
+        assert!(legacy.join("old.data").exists());
     }
 }

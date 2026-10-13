@@ -442,6 +442,11 @@ pub struct ClaimedStdout {
 }
 
 impl ClaimedStdout {
+    /// Refuse to serve MCP unless its output channel was claimed.
+    pub fn require(claim: Option<Self>) -> anyhow::Result<Self> {
+        claim.ok_or_else(|| anyhow::anyhow!("cannot claim stdout for the MCP channel"))
+    }
+
     /// Flushes Rust's stdout buffer, then diverts fd 1 to fd 2 and hands back a
     /// handle to the saved original. Returns `None` (nothing redirected, the
     /// caller falls back to the existing `rmcp::transport::io::stdio()` path)
@@ -993,5 +998,20 @@ mod tests {
             let input = hook_input_from(unusable);
             assert!(input.prompt.is_none() && input.transcript_path.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod r3_stdout_tests {
+    #[test]
+    fn r3_mcp_refuses_an_unclaimed_stdout_channel() {
+        #[cfg(unix)]
+        let failed = super::ClaimedStdout::claim_on(-1, -1);
+        #[cfg(not(unix))]
+        let failed = None;
+        let error = super::ClaimedStdout::require(failed).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("cannot claim stdout for the MCP channel"));
     }
 }

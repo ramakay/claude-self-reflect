@@ -2098,7 +2098,7 @@ fn test_hnsw_dedup_insert() {
 #[test]
 fn test_hnsw_persistence_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Build index with 50 chunks + 5 reflections
     let mut engine = SearchEngine::new(100);
@@ -2139,7 +2139,7 @@ fn test_hnsw_persistence_roundtrip() {
 #[test]
 fn test_hnsw_stale_index_detection() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Build and dump with 10 chunks
     let mut engine = SearchEngine::new(100);
@@ -2190,7 +2190,7 @@ fn test_hnsw_missing_files_fallback() {
 #[test]
 fn test_hnsw_persistence_soft_delete() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Insert 5 reflections, remove 1
     let mut engine = SearchEngine::new(100);
@@ -2228,7 +2228,7 @@ fn test_hnsw_persistence_soft_delete() {
 #[test]
 fn test_hnsw_cached_load_timing() {
     let dir = tempfile::tempdir().unwrap();
-    let index_dir = dir.path().join("index");
+    let index_dir = dir.path().join("index-v3");
 
     // Build a 1000-vector index
     let mut engine = SearchEngine::new(2000);
@@ -2749,10 +2749,10 @@ fn rebuild_index_command_fails_loudly_when_the_index_directory_cannot_be_created
         storage.insert_chunk(&chunk, &embedding).unwrap();
     }
 
-    // `Engine::new` derives `index_dir` as `db_path.parent().join("index")`
+    // `Engine::new` derives `index_dir` as `db_path.parent().join("index-v3")`
     // — put a REGULAR FILE there so `create_dir_all` inside `dump_to_disk`
     // fails (not a directory), instead of an actual directory.
-    std::fs::write(db_dir.join("index"), b"not a directory").unwrap();
+    std::fs::write(db_dir.join("index-v3"), b"not a directory").unwrap();
 
     let projects_dir = tmp.path().join("projects");
     std::fs::create_dir_all(&projects_dir).unwrap();
@@ -3075,21 +3075,21 @@ mod index_compatibility_and_damage {
         let from = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/index-0.3.4");
         let to = tempfile::tempdir().unwrap();
         std::fs::copy(from.join("csr-engine.db"), to.path().join("csr-engine.db")).unwrap();
-        std::fs::create_dir(to.path().join("index")).unwrap();
-        for entry in std::fs::read_dir(from.join("index")).unwrap().flatten() {
+        std::fs::create_dir(to.path().join("index-v3")).unwrap();
+        for entry in std::fs::read_dir(from.join("index-v3")).unwrap().flatten() {
             std::fs::copy(
                 entry.path(),
-                to.path().join("index").join(entry.file_name()),
+                to.path().join("index-v3").join(entry.file_name()),
             )
             .unwrap();
         }
         // Present in a live index dir; its absence forces the heap load path.
-        std::fs::write(to.path().join("index/index.lock"), b"").unwrap();
+        std::fs::write(to.path().join("index-v3/index.lock"), b"").unwrap();
         to
     }
 
     fn generation(dir: &Path, side: &str, extension: &str) -> PathBuf {
-        std::fs::read_dir(dir.join("index"))
+        std::fs::read_dir(dir.join("index-v3"))
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
@@ -3178,7 +3178,7 @@ mod index_compatibility_and_damage {
         type Damage = fn(&Path);
         let cases: [(&str, Damage); 4] = [
             ("truncated data, heap load", |dir| {
-                std::fs::remove_file(dir.join("index/index.lock")).unwrap();
+                std::fs::remove_file(dir.join("index-v3/index.lock")).unwrap();
                 let data = generation(dir, "chunks", ".hnsw.data");
                 let len = std::fs::metadata(&data).unwrap().len();
                 std::fs::OpenOptions::new()

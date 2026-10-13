@@ -30,6 +30,8 @@ use crate::storage::Storage;
 /// How an evidence item was reached during the walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Via {
+    /// A keyword match while semantic retrieval is unavailable.
+    Keyword,
     /// Hop-1 direct semantic seed hit.
     Seed,
     /// The single permitted semantic seed in the 0.20..0.30 fallback band.
@@ -47,6 +49,7 @@ pub enum Via {
 impl std::fmt::Display for Via {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            Via::Keyword => "keyword",
             Via::Seed => "seed",
             Via::SeedLowConfidence => "seed-low-confidence",
             Via::Blend => "blend",

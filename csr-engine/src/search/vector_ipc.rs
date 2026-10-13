@@ -60,6 +60,9 @@ const BACKOFF_TOTAL: Duration = Duration::from_secs(20);
 const DOWN_WINDOW: Duration = Duration::from_secs(15);
 /// Requests the daemon serves at once; more wait for a slot.
 const SERVER_SLOTS: usize = 8;
+const WAITING_CONNECTIONS: usize = 32;
+const MAX_EMBED_TEXTS: usize = 256;
+const MAX_EMBED_BYTES: usize = 1 << 20;
 /// A heartbeat this recent means a daemon is configured for this data dir.
 const CONFIGURED_WITHIN: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the daemon refreshes its heartbeat.
@@ -112,6 +115,13 @@ pub fn write_heartbeat(data_dir: &Path) {
 /// says no, `CSR_DAEMON_PROXY=1` says yes, otherwise a heartbeat written in
 /// the last 24 h. Configured means proxied, even while the daemon restarts.
 pub fn daemon_configured(data_dir: &Path) -> bool {
+    daemon_configured_for_database(&data_dir.join("csr-engine.db"))
+}
+
+pub(crate) fn daemon_configured_for_database(db_path: &Path) -> bool {
+    let Some(data_dir) = db_path.parent() else {
+        return false;
+    };
     let set = |name: &str| std::env::var(name).is_ok_and(|v| v == "1" || v == "true");
     if set("CSR_NO_DAEMON_PROXY") {
         return false;
@@ -119,11 +129,22 @@ pub fn daemon_configured(data_dir: &Path) -> bool {
     if set("CSR_DAEMON_PROXY") {
         return true;
     }
-    std::fs::metadata(heartbeat_path(data_dir))
+    let fresh = std::fs::metadata(heartbeat_path(data_dir))
         .and_then(|meta| meta.modified())
         .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age <= CONFIGURED_WITHIN)
+        .map(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default()
+        })
+        .is_some_and(|age| age <= CONFIGURED_WITHIN);
+    fresh
+        || VectorClient::for_database(db_path).is_some_and(|client| {
+            matches!(
+                client.call(Op::Ping, Duration::from_millis(250)),
+                Ok(Reply::Pong)
+            )
+        })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +186,29 @@ enum Reply {
     Vectors { vectors: Vec<Vec<f32>> },
     Hits { hits: Vec<(String, f32)> },
     Synced { applied: bool },
+    Error { code: ErrorCode, message: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ErrorCode {
+    Busy,
+    EmbeddingLimit,
+}
+
+fn validate_work(op: &Op) -> Option<Reply> {
+    if let Op::Embed { texts } = op {
+        let bytes = texts
+            .iter()
+            .try_fold(0usize, |sum, text| sum.checked_add(text.len()));
+        if texts.len() > MAX_EMBED_TEXTS || bytes.is_none_or(|bytes| bytes > MAX_EMBED_BYTES) {
+            return Some(Reply::Error {
+                code: ErrorCode::EmbeddingLimit,
+                message: "embedding request exceeds 256 texts or 1 MiB of text".into(),
+            });
+        }
+    }
+    None
 }
 
 #[derive(Serialize, Deserialize)]
@@ -225,18 +269,21 @@ impl VectorClient {
         let mut frame = Vec::with_capacity(4 + request.len());
         frame.extend_from_slice(&(request.len() as u32).to_be_bytes());
         frame.extend_from_slice(request);
-        io_by(&mut stream, deadline, |s| s.write_all(&frame)).context("writing request")?;
+        write_by(&mut stream, deadline, &frame).context("writing request")?;
         let mut header = [0u8; 4];
-        io_by(&mut stream, deadline, |s| s.read_exact(&mut header)).context("reading reply")?;
+        read_by(&mut stream, deadline, &mut header).context("reading reply")?;
         let size = u32::from_be_bytes(header) as usize;
         if size > MAX_FRAME {
             bail!("reply of {size} bytes exceeds the frame cap");
         }
         let mut body = vec![0; size];
-        io_by(&mut stream, deadline, |s| s.read_exact(&mut body)).context("reading reply")?;
+        read_by(&mut stream, deadline, &mut body).context("reading reply")?;
         let response: Response = serde_json::from_slice(&body)?;
         if response.version != VERSION {
             bail!("daemon speaks vector protocol {}", response.version);
+        }
+        if let Reply::Error { code, message } = response.reply {
+            bail!("daemon rejected request ({code:?}): {message}");
         }
         Ok(response.reply)
     }
@@ -261,6 +308,9 @@ impl VectorClient {
 fn connect_by(path: &Path, deadline: Instant) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::io::FromRawFd;
+    if Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: plain socket calls on a descriptor this function owns; it is
     // closed on every error path and handed to UnixStream on success.
@@ -325,40 +375,114 @@ fn connect_by(path: &Path, deadline: Instant) -> std::io::Result<std::os::unix::
                 return close_with(std::io::Error::from_raw_os_error(so_error));
             }
         }
-        if libc::fcntl(fd, libc::F_SETFL, flags) < 0 {
-            return close_with(std::io::Error::last_os_error());
-        }
-        let stream = std::os::unix::net::UnixStream::from_raw_fd(fd);
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1));
-        stream.set_read_timeout(Some(remaining))?;
-        stream.set_write_timeout(Some(remaining))?;
-        Ok(stream)
+        Ok(std::os::unix::net::UnixStream::from_raw_fd(fd))
     }
 }
 
-/// Run one blocking stream operation with the time left until `deadline`
-/// as its socket timeout, failing once the deadline has passed.
+/// Poll and perform one nonblocking operation before the absolute deadline.
 #[cfg(unix)]
 fn io_by(
     stream: &mut std::os::unix::net::UnixStream,
     deadline: Instant,
-    op: impl FnOnce(&mut std::os::unix::net::UnixStream) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "deadline passed",
-        ));
+    events: libc::c_short,
+    mut op: impl FnMut(&mut std::os::unix::net::UnixStream) -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    stream.set_nonblocking(true)?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let millis = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: poll borrows the live stream descriptor for this call only.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        match op(stream) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue
+            }
+            result => return result,
+        }
     }
-    // macOS refuses SO_RCVTIMEO/SO_SNDTIMEO (EINVAL) once the peer has
-    // closed — i.e. after a fast reply. The timeouts set right after connect
-    // still bound the operation then, so a refused tightening is ignored.
-    let _ = stream.set_read_timeout(Some(remaining));
-    let _ = stream.set_write_timeout(Some(remaining));
-    op(stream)
+}
+
+#[cfg(unix)]
+fn read_by(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+    mut bytes: &mut [u8],
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match io_by(stream, deadline, libc::POLLIN, |s| s.read(bytes)) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_by(
+    stream: &mut std::os::unix::net::UnixStream,
+    deadline: Instant,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        match io_by(stream, deadline, libc::POLLOUT, |s| s.write(bytes)) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_sync(
+    search: &RwLock<SearchEngine>,
+    seq: i64,
+    nudge: &Notify,
+    deadline: Instant,
+) -> bool {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        if search
+            .try_read()
+            .is_ok_and(|index| index.change_cursor() >= seq)
+        {
+            return true;
+        }
+        nudge.notify_one();
+        std::thread::sleep(remaining.min(Duration::from_millis(5)));
+    }
 }
 
 /// Backoff and down-window timing, adjustable so tests need not wait 20 s.
@@ -491,17 +615,26 @@ impl VectorProxy {
     }
 
     /// Re-ping the daemon with doubling backoff; `true` once it answers.
-    fn await_daemon(&self) -> bool {
+    fn await_daemon(&self, deadline: Instant) -> bool {
         let timings = self.timings();
         let started = Instant::now();
         let mut delay = timings.backoff_first;
         loop {
-            let remaining = timings.backoff_total.saturating_sub(started.elapsed());
+            let remaining = timings
+                .backoff_total
+                .saturating_sub(started.elapsed())
+                .min(deadline.saturating_duration_since(Instant::now()));
             if remaining.is_zero() {
                 return false;
             }
             std::thread::sleep(delay.min(remaining));
-            if self.client.ping().is_ok() {
+            if matches!(
+                self.client.call(
+                    Op::Ping,
+                    PING_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()))
+                ),
+                Ok(Reply::Pong)
+            ) {
                 return true;
             }
             delay = delay.saturating_mul(2);
@@ -511,11 +644,18 @@ impl VectorProxy {
     /// Whether the daemon answers now, waiting out the backoff unless it
     /// failed within the down window. Blocking: call it off the runtime.
     pub fn available(&self) -> bool {
-        if self.client.ping().is_ok() {
+        let deadline = Instant::now() + self.timings().backoff_total;
+        if matches!(
+            self.client.call(
+                Op::Ping,
+                PING_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()))
+            ),
+            Ok(Reply::Pong)
+        ) {
             self.mark_up();
             return true;
         }
-        if !self.recently_down() && self.await_daemon() {
+        if !self.recently_down() && self.await_daemon(deadline) {
             self.mark_up();
             return true;
         }
@@ -525,8 +665,15 @@ impl VectorProxy {
 
     fn remote(&self, op: Op, timeout: Duration) -> Option<Reply> {
         off_worker(|| {
-            let request = self.client.encode(op).ok()?;
-            let error = match self.client.send(&request, Instant::now() + timeout) {
+            let deadline = Instant::now() + timeout;
+            let request = match self.client.encode(op) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.mark_down(&error);
+                    return None;
+                }
+            };
+            let error = match self.client.send(&request, deadline) {
                 Ok(reply) => {
                     self.calls.fetch_add(1, Ordering::Relaxed);
                     self.mark_up();
@@ -534,8 +681,8 @@ impl VectorProxy {
                 }
                 Err(error) => error,
             };
-            if !self.recently_down() && self.await_daemon() {
-                if let Ok(reply) = self.client.send(&request, Instant::now() + timeout) {
+            if !self.recently_down() && self.await_daemon(deadline) {
+                if let Ok(reply) = self.client.send(&request, deadline) {
                     self.calls.fetch_add(1, Ordering::Relaxed);
                     self.mark_up();
                     return Some(reply);
@@ -685,12 +832,30 @@ fn spawn_for_daemon_with(
                     return;
                 }
             };
+            let waiting = Arc::new(Semaphore::new(WAITING_CONNECTIONS));
             while !shutdown.load(Ordering::SeqCst) {
                 let accepted = tokio::select! {
                     accepted = bound.listener.accept() => accepted,
                     _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
                 };
                 let Ok((stream, _)) = accepted else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let Ok(waiting_slot) = waiting.clone().try_acquire_owned() else {
+                    let bytes = serde_json::to_vec(&Response {
+                        version: VERSION,
+                        reply: Reply::Error {
+                            code: ErrorCode::Busy,
+                            message: "vector daemon is busy".into(),
+                        },
+                    })
+                    .expect("busy reply encodes");
+                    let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+                    frame.extend_from_slice(&bytes);
+                    let _ = stream
+                        .into_std()
+                        .and_then(|mut stream| stream.write_all(&frame));
                     continue;
                 };
                 let (embeddings, search) = (embeddings.clone(), search.clone());
@@ -706,6 +871,7 @@ fn spawn_for_daemon_with(
                     else {
                         return;
                     };
+                    drop(waiting_slot);
                     let _ = tokio::time::timeout(
                         serve_timeout,
                         serve_one(stream, embeddings, search, database, nudge, slot),
@@ -740,66 +906,58 @@ async fn serve_one(
     if request.version != VERSION || request.database != database {
         return None;
     }
-    let reply = tokio::task::spawn_blocking(move || -> Result<Reply> {
-        let _slot = slot;
-        Ok(match request.op {
-            Op::Ping => Reply::Pong,
-            Op::Embed { texts } => {
-                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-                Reply::Vectors {
-                    vectors: embeddings.embed(&refs)?,
-                }
-            }
-            Op::SearchChunks {
-                vector,
-                limit,
-                min_score,
-                allowed,
-            } => {
-                let index = search.blocking_read();
-                let hits = match allowed {
-                    Some(ids) => {
-                        let allowed: HashSet<String> = ids.into_iter().collect();
-                        index.search_chunks_filtered(&vector, limit, min_score, &allowed)
+    let reply = if let Some(error) = validate_work(&request.op) {
+        error
+    } else {
+        tokio::task::spawn_blocking(move || -> Result<Reply> {
+            let _slot = slot;
+            Ok(match request.op {
+                Op::Ping => Reply::Pong,
+                Op::Embed { texts } => {
+                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                    Reply::Vectors {
+                        vectors: embeddings.embed(&refs)?,
                     }
-                    None => index.search_chunks(&vector, limit, min_score),
-                };
-                Reply::Hits {
-                    hits: hits.into_iter().map(|hit| (hit.id, hit.score)).collect(),
                 }
-            }
-            Op::SearchReflections {
-                vector,
-                limit,
-                min_score,
-            } => Reply::Hits {
-                hits: search
-                    .blocking_read()
-                    .search_reflections(&vector, limit, min_score)
-                    .into_iter()
-                    .map(|hit| (hit.id, hit.score))
-                    .collect(),
-            },
-            Op::Sync { seq } => {
-                // Answer once the index sync has applied the caller's
-                // committed changes, or after SYNC_WAIT regardless.
-                let deadline = Instant::now() + SYNC_WAIT;
-                loop {
-                    if search.blocking_read().change_cursor() >= seq {
-                        break Reply::Synced { applied: true };
+                Op::SearchChunks {
+                    vector,
+                    limit,
+                    min_score,
+                    allowed,
+                } => {
+                    let index = search.blocking_read();
+                    let hits = match allowed {
+                        Some(ids) => {
+                            let allowed: HashSet<String> = ids.into_iter().collect();
+                            index.search_chunks_filtered(&vector, limit, min_score, &allowed)
+                        }
+                        None => index.search_chunks(&vector, limit, min_score),
+                    };
+                    Reply::Hits {
+                        hits: hits.into_iter().map(|hit| (hit.id, hit.score)).collect(),
                     }
-                    if Instant::now() >= deadline {
-                        break Reply::Synced { applied: false };
-                    }
-                    nudge.notify_one();
-                    std::thread::sleep(Duration::from_millis(5));
                 }
-            }
+                Op::SearchReflections {
+                    vector,
+                    limit,
+                    min_score,
+                } => Reply::Hits {
+                    hits: search
+                        .blocking_read()
+                        .search_reflections(&vector, limit, min_score)
+                        .into_iter()
+                        .map(|hit| (hit.id, hit.score))
+                        .collect(),
+                },
+                Op::Sync { seq } => Reply::Synced {
+                    applied: wait_for_sync(&search, seq, &nudge, Instant::now() + SYNC_WAIT),
+                },
+            })
         })
-    })
-    .await
-    .ok()?
-    .ok()?;
+        .await
+        .ok()?
+        .ok()?
+    };
     let bytes = serde_json::to_vec(&Response {
         version: VERSION,
         reply,
@@ -897,8 +1055,9 @@ pub(crate) mod test_support {
             let storage = Arc::new(Storage::open(db).unwrap());
             let chunks = storage.count_chunk_embeddings().unwrap();
             let reflections = storage.count_reflection_embeddings().unwrap();
-            let index = SearchEngine::load_from_disk(&data_dir.join("index"), chunks, reflections)
-                .expect("published generation");
+            let index =
+                SearchEngine::load_from_disk(&data_dir.join("index-v3"), chunks, reflections)
+                    .expect("published generation");
             let search = Arc::new(RwLock::new(index));
             let shutdown = Arc::new(AtomicBool::new(false));
             let nudge = Arc::new(Notify::new());
@@ -998,7 +1157,7 @@ mod tests {
     }
 
     fn copy_data_dir(from: &Path, to: &Path) {
-        std::fs::create_dir_all(to.join("index")).unwrap();
+        std::fs::create_dir_all(to.join("index-v3")).unwrap();
         std::fs::create_dir_all(to.join("projects")).unwrap();
         for entry in std::fs::read_dir(from).unwrap().flatten() {
             if entry.path().is_file()
@@ -1010,8 +1169,8 @@ mod tests {
                 std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
             }
         }
-        for entry in std::fs::read_dir(from.join("index")).unwrap().flatten() {
-            std::fs::copy(entry.path(), to.join("index").join(entry.file_name())).unwrap();
+        for entry in std::fs::read_dir(from.join("index-v3")).unwrap().flatten() {
+            std::fs::copy(entry.path(), to.join("index-v3").join(entry.file_name())).unwrap();
         }
     }
 
@@ -1326,7 +1485,7 @@ mod tests {
         let (db, _) = seed(tmp.path());
         let storage = Arc::new(Storage::open(&db).unwrap());
         let index = SearchEngine::load_from_disk(
-            &tmp.path().join("index"),
+            &tmp.path().join("index-v3"),
             storage.count_chunk_embeddings().unwrap(),
             storage.count_reflection_embeddings().unwrap(),
         )
@@ -1344,9 +1503,14 @@ mod tests {
             serve_timeout,
             slots.clone(),
         );
-        while !socket_path(tmp.path()).exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !socket_path(tmp.path()).exists() {
+                assert!(!server.is_finished(), "vector socket bind failed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("vector socket became ready");
         // Every search now blocks on the index lock.
         let held = search.write().await;
         let dir = tmp.path().to_path_buf();
@@ -1430,5 +1594,253 @@ mod tests {
             .unwrap();
         assert!(!daemon_configured(tmp.path()));
         assert!(Engine::new_proxied(&db, &projects).unwrap().is_none());
+    }
+
+    #[test]
+    fn r3_dripping_reads_obey_one_absolute_deadline() {
+        let (mut client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..12 {
+                std::thread::sleep(Duration::from_millis(25));
+                if peer.write_all(&[1]).is_err() {
+                    break;
+                }
+            }
+        });
+        let start = Instant::now();
+        let result = read_by(
+            &mut client,
+            start + Duration::from_millis(100),
+            &mut [0u8; 12],
+        );
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_millis(220));
+        drop(client);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn r3_sync_wait_does_not_block_on_a_writer() {
+        let search = Arc::new(RwLock::new(SearchEngine::new(8)));
+        let held = search.blocking_write();
+        let other = search.clone();
+        let start = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            wait_for_sync(
+                &other,
+                1,
+                &Notify::new(),
+                Instant::now() + Duration::from_millis(50),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            waiter.is_finished(),
+            "Sync must expire while the write lock is still held"
+        );
+        drop(held);
+        assert!(!waiter.join().unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn r3_future_heartbeat_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        write_heartbeat(dir.path());
+        std::fs::File::options()
+            .write(true)
+            .open(heartbeat_path(dir.path()))
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        assert!(daemon_configured(dir.path()));
+        let hook = Engine::new_for_hook(
+            &dir.path().join("csr-engine.db"),
+            &dir.path().join("projects"),
+        )
+        .unwrap();
+        assert!(hook.is_proxied());
+        assert!(!hook.embeddings().is_loaded());
+        assert_eq!(hook.search().blocking_read().chunk_count(), 0);
+        assert!(!hook.index_dir().exists());
+    }
+
+    #[test]
+    fn r3_embedding_work_is_rejected_before_dispatch() {
+        for op in [
+            Op::Embed {
+                texts: vec![String::new(); 257],
+            },
+            Op::Embed {
+                texts: vec!["x".repeat(MAX_EMBED_BYTES + 1)],
+            },
+        ] {
+            assert!(matches!(
+                validate_work(&op),
+                Some(Reply::Error {
+                    code: ErrorCode::EmbeddingLimit,
+                    ..
+                })
+            ));
+        }
+        assert!(validate_work(&Op::Embed {
+            texts: vec![String::new(); 256]
+        })
+        .is_none());
+        assert!(validate_work(&Op::Embed {
+            texts: vec!["x".repeat(MAX_EMBED_BYTES)]
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn r3_encode_failure_counts_as_a_failed_keyword_only_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let client = VectorClient::for_database(&dir.path().join("csr-engine.db")).unwrap();
+        let proxy = VectorProxy::new(client, storage);
+        let reply = proxy.remote(
+            Op::Embed {
+                texts: vec!["x".repeat(MAX_FRAME)],
+            },
+            Duration::from_millis(1),
+        );
+        assert!(reply.is_none());
+        assert_eq!(proxy.failures(), 1);
+        assert_eq!(proxy.path(), PATH_KEYWORD_ONLY);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r3_missing_or_stale_heartbeat_pings_the_actual_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("alternate.db");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_for_daemon(
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(8))),
+            &db,
+            shutdown.clone(),
+            Arc::new(Notify::new()),
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !socket_path(dir.path()).exists() {
+                assert!(!server.is_finished(), "vector socket bind failed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(daemon_configured_for_database(&db));
+        write_heartbeat(dir.path());
+        std::fs::File::options()
+            .write(true)
+            .open(heartbeat_path(dir.path()))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(25 * 3600))
+            .unwrap();
+        assert!(daemon_configured_for_database(&db));
+        let hook = Engine::new_for_hook(&db, &dir.path().join("projects")).unwrap();
+        assert!(hook.is_proxied());
+        assert!(!hook.embeddings().is_loaded());
+        assert!(!hook.index_dir().exists());
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn r3_waiting_connections_are_capped_with_a_busy_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let slots = Arc::new(Semaphore::new(0));
+        let server = spawn_for_daemon_with(
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(8))),
+            &db,
+            shutdown.clone(),
+            Arc::new(Notify::new()),
+            Duration::from_secs(5),
+            slots,
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !socket_path(dir.path()).exists() {
+                assert!(!server.is_finished(), "vector socket bind failed");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut waiting = Vec::new();
+        for _ in 0..WAITING_CONNECTIONS {
+            waiting.push(
+                tokio::net::UnixStream::connect(socket_path(dir.path()))
+                    .await
+                    .unwrap(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut extra = tokio::net::UnixStream::connect(socket_path(dir.path()))
+            .await
+            .unwrap();
+        let size = tokio::time::timeout(Duration::from_secs(1), extra.read_u32())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = vec![0; size as usize];
+        extra.read_exact(&mut bytes).await.unwrap();
+        let response: Response = serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(
+            response.reply,
+            Reply::Error {
+                code: ErrorCode::Busy,
+                ..
+            }
+        ));
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
+    }
+    #[test]
+    fn r3_draining_writes_obey_one_absolute_deadline() {
+        let (mut client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            while !stopped.load(Ordering::SeqCst) {
+                if peer.read(&mut bytes).unwrap_or(0) == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let start = Instant::now();
+        let result = write_by(
+            &mut client,
+            start + Duration::from_millis(100),
+            &vec![0; 2 << 20],
+        );
+        stop.store(true, Ordering::SeqCst);
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_millis(300));
+        drop(client);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn r3_retry_backoff_shares_the_original_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let proxy = VectorProxy::new(
+            VectorClient::for_database(&dir.path().join("csr-engine.db")).unwrap(),
+            Arc::new(Storage::open_memory().unwrap()),
+        );
+        proxy.set_timings(ProxyTimings {
+            backoff_first: Duration::from_millis(10),
+            backoff_total: Duration::from_secs(1),
+            down_window: Duration::from_secs(30),
+        });
+        let start = Instant::now();
+        assert!(proxy.remote(Op::Ping, Duration::from_millis(60)).is_none());
+        assert!(start.elapsed() < Duration::from_millis(250));
+        assert_eq!(proxy.failures(), 1);
     }
 }

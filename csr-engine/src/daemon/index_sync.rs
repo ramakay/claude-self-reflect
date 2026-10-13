@@ -170,20 +170,9 @@ fn apply_batch(
         // after it) is not re-applied: that would mint a tombstone and an
         // unpublished mutation for content already on disk.
         let held = change.seq <= index.side_cursor(change.reflection);
-        if !held && change.reflection {
-            if change.invalidate || change.vector.is_none() {
-                index.remove_reflection(&change.id);
-            }
-            if let Some(vector) = change.vector {
-                index.insert_reflection(change.id, vector);
-            }
-        } else if !held {
-            if change.invalidate || change.vector.is_none() {
-                index.remove_chunk(&change.id);
-            }
-            if let Some(vector) = change.vector {
-                index.insert_chunk(change.id, vector);
-            }
+        if !held {
+            tracing::trace!(invalidate = change.invalidate, "applying stored vector");
+            index.apply_vector(change.id, change.vector, change.reflection);
         }
         index.advance_change_cursor(change.seq);
         drop(index);
@@ -204,7 +193,7 @@ mod tests {
     #[test]
     fn scrub_changes_survive_sync_and_a_batch_read_before_the_rebuild() {
         let tmp = tempfile::tempdir().unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
         let storage = Storage::open_memory().unwrap();
         storage.insert_chunk(&chunk("keep"), &axis(0)).unwrap();
         storage.insert_chunk(&chunk("drop"), &axis(1)).unwrap();
@@ -309,7 +298,7 @@ mod tests {
             embeddings,
             search.clone(),
             dir.path().to_path_buf(),
-            dir.path().join("index"),
+            dir.path().join("index-v3"),
         ));
         // Prime the renderer before measuring eventual retrieval; ONNX cold
         // startup is independently bounded by the client, not this sync test.
@@ -612,7 +601,7 @@ mod tests {
     #[test]
     fn published_updates_stay_settled_across_dump_remap_and_sync() {
         let dir = tempfile::tempdir().unwrap();
-        let index_dir = dir.path().join("index");
+        let index_dir = dir.path().join("index-v3");
         let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
         for i in 0..300 {
             storage

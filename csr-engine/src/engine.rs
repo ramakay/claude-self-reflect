@@ -63,10 +63,10 @@ pub struct Engine {
 impl Engine {
     /// Create an engine from pre-built components (for testing).
     ///
-    /// Derives `index_dir` as `projects_dir.join("index")`. That derivation
+    /// Derives `index_dir` as `projects_dir.join("index-v3")`. That derivation
     /// is only correct when the caller's real index directory actually lives
     /// there — true for tests, but **not** for the daemon, whose real index
-    /// directory sits next to the database (`~/.claude-self-reflect/index`),
+    /// directory sits next to the database (`~/.claude-self-reflect/index-v3`),
     /// not under `projects_dir` (`~/.claude/projects`). A daemon-assembled
     /// engine that persists the index (`flush_index`/`dump_to_disk`/
     /// `rebuild_search_index`) must use [`Self::from_parts_with_index_dir`]
@@ -79,7 +79,7 @@ impl Engine {
         search: Arc<RwLock<SearchEngine>>,
         projects_dir: PathBuf,
     ) -> Self {
-        let index_dir = projects_dir.join("index");
+        let index_dir = projects_dir.join("index-v3");
         Self::from_parts_with_index_dir(storage, embeddings, search, projects_dir, index_dir)
     }
 
@@ -87,7 +87,7 @@ impl Engine {
     /// `index_dir`, independent of `projects_dir`. Use this whenever the
     /// caller already knows its real on-disk index directory (the daemon
     /// does — see `Daemon::index_dir`) instead of relying on `from_parts`'s
-    /// `projects_dir.join("index")` derivation, which is wrong for any
+    /// `projects_dir.join("index-v3")` derivation, which is wrong for any
     /// caller whose database and projects tree live in different places.
     pub fn from_parts_with_index_dir(
         storage: Arc<Storage>,
@@ -141,9 +141,11 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Search-capable hook engine: load/reconcile in memory, never publish or
-    /// clean up the daemon-owned index, including on a cache miss.
+    /// Hooks proxy to a configured daemon and never rebuild a missing cache.
     pub fn new_for_hook(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        if let Some(engine) = Self::new_proxied(db_path, projects_dir)? {
+            return Ok(engine);
+        }
         Self::new_with_persistence(db_path, projects_dir, false)
     }
 
@@ -155,11 +157,11 @@ impl Engine {
         let t_storage = t0.elapsed();
 
         tracing::info!("initializing embedding engine");
-        let embeddings = Arc::new(EmbeddingEngine::new()?);
+        let mut embeddings = Arc::new(EmbeddingEngine::new()?);
         let t_embed = t0.elapsed();
 
         // Compute index cache directory alongside the database
-        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
+        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index-v3");
 
         // Fast O(1) counts for staleness check (~1ms)
         let chunk_count = storage.count_chunk_embeddings()?;
@@ -169,9 +171,18 @@ impl Engine {
         // Try loading from disk cache first
         let mut index_freshly_rebuilt = false;
         let mut startup_backfill = (0, 0);
-        let search = if let Some(loaded) =
-            load_reconciled(&storage, &index_dir, chunk_count, reflection_count, persist)
-        {
+        let cached = if persist {
+            load_reconciled(&storage, &index_dir, chunk_count, reflection_count, true)
+        } else {
+            SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count).map(|search| {
+                LoadedIndex {
+                    search,
+                    chunks_added: 0,
+                    reflections_added: 0,
+                }
+            })
+        };
+        let search = if let Some(loaded) = cached {
             let cache_age = std::fs::metadata(index_dir.join("manifest.json"))
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -203,6 +214,9 @@ impl Engine {
             }
             startup_backfill = (loaded.chunks_added, loaded.reflections_added);
             loaded.search
+        } else if !persist {
+            embeddings = Arc::new(EmbeddingEngine::disabled());
+            SearchEngine::new(16)
         } else {
             // Cache miss — rebuild from SQLite vectors, streaming in bounded
             // batches so peak transient memory is O(batch) instead of
@@ -269,6 +283,8 @@ impl Engine {
             search
         };
 
+        let search = if persist { search } else { search.for_hook() };
+
         // Clean stale numbered HNSW files from previous sessions (crash resilience).
         if persist {
             // Acquire exclusive lock to avoid racing with concurrent dump_to_disk writers.
@@ -314,11 +330,13 @@ impl Engine {
     /// daemon; while it does not answer, they answer keyword-only (see
     /// `mcp::CsrServer`) and try the daemon again on every call.
     pub fn new_proxied(db_path: &Path, projects_dir: &Path) -> Result<Option<Self>> {
-        use crate::search::vector_ipc::{daemon_configured, VectorClient, VectorProxy};
+        use crate::search::vector_ipc::{
+            daemon_configured_for_database, VectorClient, VectorProxy,
+        };
         let Some(data_dir) = db_path.parent() else {
             return Ok(None);
         };
-        if !daemon_configured(data_dir) {
+        if !daemon_configured_for_database(db_path) {
             return Ok(None);
         }
         let Some(client) = VectorClient::for_database(db_path) else {
@@ -332,7 +350,7 @@ impl Engine {
             embeddings: Arc::new(EmbeddingEngine::with_remote(proxy.clone())),
             search: Arc::new(RwLock::new(SearchEngine::proxied(proxy))),
             projects_dir: projects_dir.to_path_buf(),
-            index_dir: data_dir.join("index"),
+            index_dir: data_dir.join("index-v3"),
             skip_index_persistence: true,
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
@@ -358,10 +376,9 @@ impl Engine {
     pub fn new_import_only(db_path: &Path, projects_dir: &Path) -> Result<Self> {
         let storage = Arc::new(Storage::open(db_path)?);
         let embeddings = Arc::new(EmbeddingEngine::new()?);
-        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
-        // Small empty index: import inserts land here and are discarded on
-        // process exit. Never dumped, so no on-disk cache is touched.
-        let search = SearchEngine::new(IMPORT_ONLY_INDEX_CAPACITY);
+        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index-v3");
+        // Imports persist vectors to SQLite without constructing a local graph.
+        let search = SearchEngine::new(IMPORT_ONLY_INDEX_CAPACITY).for_hook();
         Ok(Self {
             storage,
             embeddings,
@@ -841,8 +858,19 @@ impl Engine {
                     attempt += 1;
                 }
                 Err(error) => return Err(error),
-                Ok((fresh, chunk_count, reflection_count)) => {
-                    *self.search.write().await = fresh;
+                Ok((mut fresh, chunk_count, reflection_count)) => {
+                    let search = self.search.clone();
+                    let storage = self.storage.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut live = search.blocking_write();
+                        catch_up_replacement(&storage, &mut fresh, &live)?;
+                        let previous = std::mem::replace(&mut *live, fresh);
+                        drop(live);
+                        drop(previous);
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+                    .context("replacement catch-up task failed")??;
                     // Compact by construction — clears any pending compaction
                     // request (`needs_compaction` marker) a foreground process
                     // may have left.
@@ -1206,7 +1234,11 @@ pub(crate) fn remap_published_generation(
     } = loaded;
     fresh.note_unpublished(chunks_added, reflections_added);
     let mut index = search.blocking_write();
-    if index.generation() != generation {
+    if index.generation() != generation || index.unpublished_changes() > 0 {
+        return Ok(false);
+    }
+    catch_up_replacement(storage, &mut fresh, &index)?;
+    if !replacement_covers_live(&fresh, &index) {
         return Ok(false);
     }
     let previous = std::mem::replace(&mut *index, fresh);
@@ -1221,6 +1253,57 @@ pub(crate) fn remap_published_generation(
         "index remapped from the published generation"
     );
     Ok(true)
+}
+
+/// A replacement must cover the applied cursor of each live side.
+fn replacement_covers_live(fresh: &SearchEngine, live: &SearchEngine) -> bool {
+    fresh.side_cursor(false) >= live.side_cursor(false)
+        && fresh.side_cursor(true) >= live.side_cursor(true)
+}
+
+fn catch_up_replacement(
+    storage: &Storage,
+    fresh: &mut SearchEngine,
+    live: &SearchEngine,
+) -> Result<()> {
+    // The change log coalesces updates by id. One SQLite snapshot keeps a
+    // later update from moving a required row past the fence between batches.
+    storage.with_connection(|conn| {
+        let snapshot = conn
+            .unchecked_transaction()
+            .context("opening replacement catch-up snapshot")?;
+        let target = crate::storage::embedding_changes::latest_seq(&snapshot)?;
+        anyhow::ensure!(
+            target >= live.side_cursor(false).max(live.side_cursor(true)),
+            "stored change cursor is behind the live replacement fence"
+        );
+        while fresh.change_cursor() < target {
+            let changes = crate::storage::embedding_changes::read(
+                &snapshot,
+                fresh.change_cursor(),
+                RECONCILE_BATCH,
+            )
+            .context("reading changes through replacement fence")?;
+            anyhow::ensure!(
+                !changes.is_empty(),
+                "replacement cannot reach change cursor {target}"
+            );
+            for change in changes {
+                if change.seq > fresh.side_cursor(change.reflection) {
+                    fresh.apply_vector(change.id, change.vector, change.reflection);
+                }
+                fresh.advance_change_cursor(change.seq);
+            }
+        }
+        snapshot
+            .commit()
+            .context("closing replacement catch-up snapshot")?;
+        anyhow::ensure!(
+            replacement_covers_live(fresh, live),
+            "replacement does not cover live cursor"
+        );
+        Ok(())
+    })
 }
 
 /// A loaded cache is rebuilt when orphan slots in either index exceed 1/N of
@@ -1882,7 +1965,7 @@ mod tests {
     #[test]
     fn remap_serves_the_published_generation_from_the_map() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
         let storage = Storage::open(&tmp.path().join("csr-engine.db")).unwrap();
         for i in 0..400 {
             insert_direction(&storage, &format!("c{i}"), i);
@@ -1960,7 +2043,7 @@ mod tests {
     #[test]
     fn remap_refuses_a_generation_another_writer_published() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
         let storage = Storage::open(&tmp.path().join("csr-engine.db")).unwrap();
         for i in 0..300 {
             insert_direction(&storage, &format!("c{i}"), i);
@@ -1996,7 +2079,7 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         let projects_dir = tmp.path().join("projects");
         std::fs::create_dir_all(&projects_dir).unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
 
         // Seed 40 chunks directly (bypassing Engine, matching the pattern
         // other tests here use) so the first `Engine::new` has a real corpus
@@ -2072,7 +2155,7 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         let projects_dir = tmp.path().join("projects");
         std::fs::create_dir_all(&projects_dir).unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
 
         {
             let storage = Storage::open(&db_path).unwrap();
@@ -2172,7 +2255,7 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         let projects_dir = tmp.path().join("projects");
         std::fs::create_dir_all(&projects_dir).unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
 
         {
             let storage = Storage::open(&db_path).unwrap();
@@ -2255,7 +2338,7 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         let projects_dir = tmp.path().join("projects");
         std::fs::create_dir_all(&projects_dir).unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
 
         {
             let storage = Storage::open(&db_path).unwrap();
@@ -2340,7 +2423,7 @@ mod tests {
         let db_path = tmp.path().join("test.db");
         let projects_dir = tmp.path().join("projects");
         std::fs::create_dir_all(&projects_dir).unwrap();
-        let index_dir = tmp.path().join("index");
+        let index_dir = tmp.path().join("index-v3");
 
         {
             let storage = Storage::open(&db_path).unwrap();
@@ -2423,5 +2506,150 @@ mod tests {
              never publish from memory again once it has deferred once, \
              not just on its first post-compaction flush"
         );
+    }
+
+    #[test]
+    fn r3_middle_data_corruption_is_a_cache_miss_and_rebuilds_without_hnsw_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let projects = dir.path().join("projects");
+        let storage = Storage::open(&db).unwrap();
+        for i in 0..32 {
+            insert_test_chunk(&storage, &format!("c{i}"));
+        }
+        drop(Engine::new(&db, &projects).unwrap());
+        let index_dir = dir.path().join("index-v3");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(index_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        let data = index_dir.join(format!(
+            "{}.hnsw.data",
+            manifest["chunk_basename"].as_str().unwrap()
+        ));
+        let mut bytes = std::fs::read(&data).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x01;
+        std::fs::write(data, bytes).unwrap();
+        crate::search::HNSW_LOAD_CALLS.with(|calls| calls.set(0));
+        assert!(SearchEngine::load_from_disk(&index_dir, 32, 0).is_none());
+        let engine = Engine::new(&db, &projects).unwrap();
+        assert!(engine.index_freshly_rebuilt());
+        assert_eq!(engine.search.blocking_read().chunk_count(), 32);
+        crate::search::HNSW_LOAD_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        assert!(SearchEngine::load_from_disk(&index_dir, 32, 0).is_some());
+    }
+
+    #[test]
+    fn r3_versioned_cache_leaves_legacy_publications_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("index");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("manifest.json"), b"legacy owner sentinel").unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&db).unwrap();
+        insert_test_chunk(&storage, "new");
+        let engine = Engine::new(&db, &dir.path().join("projects")).unwrap();
+        assert_eq!(engine.index_dir(), dir.path().join("index-v3"));
+        assert!(engine.index_freshly_rebuilt());
+        assert_eq!(
+            std::fs::read(legacy.join("manifest.json")).unwrap(),
+            b"legacy owner sentinel"
+        );
+        assert_eq!(std::fs::read_dir(legacy).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn r3_hook_cache_miss_finishes_in_budget_without_building() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&db).unwrap();
+        for i in 0..300 {
+            insert_test_chunk(&storage, &format!("c{i}"));
+        }
+        let start = std::time::Instant::now();
+        let engine = Engine::new_for_hook(&db, &dir.path().join("projects")).unwrap();
+        let input = crate::hooks::HookInput {
+            prompt: Some("How did we fix the authentication token refresh?".into()),
+            cwd: Some(dir.path().display().to_string()),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::hooks::prompt_submit::render(&input, &engine, dir.path()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        let search = engine.search.read().await;
+        assert_eq!(search.chunk_count(), 0);
+        assert_eq!(search.unpublished_changes(), 0);
+        assert!(!engine.index_freshly_rebuilt());
+        assert!(!engine.embeddings.is_loaded());
+        assert!(!engine.index_dir().exists());
+    }
+
+    #[test]
+    fn r3_remap_defers_an_acknowledged_existing_id_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&db).unwrap();
+        insert_test_chunk_with(&storage, "a", &axis(0));
+        let engine = Engine::new(&db, &dir.path().join("projects")).unwrap();
+        insert_test_chunk_with(&storage, "a", &axis(1));
+        let cursor = storage.latest_embedding_change_seq().unwrap();
+        {
+            let mut live = engine.search.blocking_write();
+            live.apply_vector("a".into(), Some(axis(1)), false);
+            live.advance_change_cursor(cursor);
+        }
+        assert!(!remap_published_generation(&storage, &engine.search, engine.index_dir()).unwrap());
+        assert_eq!(
+            engine
+                .search
+                .blocking_read()
+                .search_chunks(&axis(1), 1, 0.99)[0]
+                .id,
+            "a"
+        );
+    }
+
+    #[test]
+    fn r3_replacement_catches_up_through_live_cursor_before_exposure() {
+        let storage = Storage::open_memory().unwrap();
+        insert_test_chunk_with(&storage, "a", &axis(0));
+        let (mut fresh, _, _, _) = rebuild_search_index_streaming(&storage, 8, 0).unwrap();
+        insert_test_chunk_with(&storage, "a", &axis(1));
+        insert_test_chunk_with(&storage, "b", &axis(2));
+        let mut live = SearchEngine::new(8);
+        live.insert_chunk("a".into(), axis(1));
+        live.insert_chunk("b".into(), axis(2));
+        live.set_change_cursor(storage.latest_embedding_change_seq().unwrap());
+        assert!(!replacement_covers_live(&fresh, &live));
+        catch_up_replacement(&storage, &mut fresh, &live).unwrap();
+        assert!(replacement_covers_live(&fresh, &live));
+        assert_eq!(fresh.search_chunks(&axis(1), 1, 0.99)[0].id, "a");
+        assert!(fresh.has_chunk("b"));
+    }
+    #[test]
+    fn r3_hooks_never_backfill_or_build_a_local_graph_for_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let projects = dir.path().join("projects");
+        let storage = Storage::open(&db).unwrap();
+        insert_test_chunk(&storage, "cached");
+        drop(Engine::new(&db, &projects).unwrap());
+        insert_test_chunk(&storage, "missing");
+        let cached_hook = Engine::new_for_hook(&db, &projects).unwrap();
+        let import_hook = Engine::new_import_only(&db, &projects).unwrap();
+        for (engine, count) in [(cached_hook, 1), (import_hook, 0)] {
+            let mut search = engine.search.blocking_write();
+            assert_eq!(search.chunk_count(), count);
+            search.insert_chunk("missing".into(), axis(1));
+            assert!(!search.insert_reflection("r".into(), axis(2)));
+            assert_eq!(search.chunk_count(), count);
+            assert_eq!(search.reflection_count(), 0);
+            assert_eq!(search.unpublished_changes(), 0);
+        }
     }
 }

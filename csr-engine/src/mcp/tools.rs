@@ -529,6 +529,7 @@ pub async fn reflect_on_past(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    validate_page(0, limit)?;
     let search_mode = search_mode_from(std::env::var("CSR_SEARCH_MODE").ok().as_deref());
     // `partition_enabled` (the pre-existing `CSR_NO_VALIDITY_PARTITION` kill
     // switch) gates ancestry availability too, so it must NOT be folded with
@@ -600,6 +601,7 @@ pub async fn reflect_keyword_only(
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
+    validate_page(0, limit)?;
     let partition_enabled = validity_partition_enabled();
     reflect_on_past_with_vec_mode(
         storage,
@@ -619,6 +621,147 @@ pub async fn reflect_keyword_only(
         true,
     )
     .await
+}
+
+/// Reject unbounded pagination before embedding, IPC or storage access.
+pub(crate) fn validate_page(offset: usize, limit: usize) -> Result<()> {
+    let end = offset
+        .checked_add(limit)
+        .ok_or_else(|| anyhow::anyhow!("offset + limit overflow"))?;
+    anyhow::ensure!(
+        offset <= GET_MORE_WINDOW && limit <= GET_MORE_WINDOW && end <= GET_MORE_WINDOW * 2,
+        "offset and limit must each be at most {GET_MORE_WINDOW}"
+    );
+    Ok(())
+}
+
+pub(crate) enum KeywordTool<'a> {
+    Recall,
+    Quick,
+    Insights,
+    Recency {
+        time_range: Option<&'a str>,
+        since: Option<&'a str>,
+        until: Option<&'a str>,
+    },
+    Concept,
+    More {
+        offset: usize,
+    },
+    Why,
+}
+
+/// Keyword candidates keep the same project family and fixed pagination window.
+fn keyword_candidates(
+    storage: &Arc<Storage>,
+    query: &str,
+    project: Option<&str>,
+) -> Result<Vec<EnrichedResult>> {
+    let scope = resolve_search_scope(storage, project)?;
+    let mut hits = if scope.effective_project.is_some() {
+        let mut hits = Vec::new();
+        for project in &scope.family_projects {
+            hits.extend(storage.fts5_search(query, GET_MORE_WINDOW, Some(project))?);
+        }
+        hits
+    } else {
+        storage.fts5_search(query, GET_MORE_WINDOW, None)?
+    };
+    hits.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.0.id.cmp(&b.0.id)));
+    hits.dedup_by(|a, b| a.0.id == b.0.id);
+    hits.truncate(GET_MORE_WINDOW);
+    let results: Vec<_> = hits
+        .into_iter()
+        .map(|(chunk, _, _)| crate::search::SearchResult {
+            id: chunk.id,
+            score: 0.0,
+        })
+        .collect();
+    enrich_results_with_active_forgetting(
+        storage,
+        &results,
+        consumption_mode_for_partition(validity_partition_enabled()),
+        active_forgetting_enabled(),
+    )
+}
+
+/// Render an outage through the tool's own response contract.
+pub(crate) async fn keyword_fallback(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    limit: usize,
+    project: Option<&str>,
+    tool: KeywordTool<'_>,
+) -> Result<String> {
+    let offset = match tool {
+        KeywordTool::More { offset } => offset,
+        _ => 0,
+    };
+    validate_page(offset, limit)?;
+    if matches!(tool, KeywordTool::Recall) {
+        return reflect_keyword_only(storage, search, query, limit, project).await;
+    }
+    let mut results = keyword_candidates(storage, query, project)?;
+    match tool {
+        KeywordTool::Recall => unreachable!(),
+        KeywordTool::Quick => Ok(format::format_keyword_quick_check(&results)),
+        KeywordTool::Insights => {
+            results.truncate(limit);
+            Ok(format::format_search_insights(&results, query))
+        }
+        KeywordTool::Recency {
+            time_range,
+            since,
+            until,
+        } => {
+            let (start, end) = recency_window(time_range, since, until)?;
+            results.retain(|r| {
+                chrono::DateTime::parse_from_rfc3339(&r.chunk.timestamp)
+                    .is_ok_and(|date| date >= start && date <= end)
+            });
+            results.truncate(limit);
+            let desc = format!("{} to {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"));
+            Ok(format::format_recency_results(&results, query, &desc))
+        }
+        KeywordTool::Concept => {
+            results.truncate(limit);
+            let (_, label) = cross_project::normalize_project_scope(storage, project)?;
+            Ok(format::format_search_results(&results, query, &label, 0, 0))
+        }
+        KeywordTool::More { offset } => {
+            let total = results.len();
+            let page: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
+            Ok(format::format_more_results(&page, query, offset, total))
+        }
+        KeywordTool::Why => {
+            use crate::search::reinstatement::{EvidenceItem, ReinstateTrace, Via};
+            let items: Vec<_> = results
+                .into_iter()
+                .take(limit)
+                .map(|r| EvidenceItem {
+                    chunk_id: r.chunk.id,
+                    conversation_id: r.chunk.conversation_id,
+                    score: 0.0,
+                    best_route: Via::Keyword,
+                    routes: [Via::Keyword].into_iter().collect(),
+                    route_scores: [(Via::Keyword, 0.0)].into_iter().collect(),
+                    timestamp: r.chunk.timestamp,
+                    excerpt: crate::format::truncate_chars(
+                        &r.chunk.content.replace(['\n', '\r'], " "),
+                        200,
+                    )
+                    .to_string(),
+                    ratification: None,
+                    trust: r.trust,
+                })
+                .collect();
+            let mut rendered =
+                format_why(query, &items, &HashSet::new(), &ReinstateTrace::default());
+            append_memory_provenance_hop(storage, &items, &mut rendered)?;
+            Ok(rendered)
+        }
+    }
 }
 
 /// Reranker selection for the production recall pipeline. Runtime honors the
@@ -1226,6 +1369,11 @@ async fn reflect_gather_pass(
     search_mode: SearchMode,
     rerank_mode: RecallRerankMode<'_>,
 ) -> Result<GatherPass> {
+    let fetch = if search_mode == SearchMode::Fts {
+        fetch.min(GET_MORE_WINDOW)
+    } else {
+        fetch
+    };
     let search_start = Instant::now();
 
     // Search BOTH chunks and reflections unless keyword-only ablation is active.
@@ -1933,17 +2081,29 @@ pub async fn store_reflection_internal(
         tokio::task::spawn_blocking(move || emb.embed_single(&text)).await??
     };
 
+    store_embedded_reflection(storage, search, id, content, tags, embedding).await
+}
+
+async fn store_embedded_reflection(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    id: String,
+    content: &str,
+    tags: &[String],
+    embedding: Vec<f32>,
+) -> Result<String> {
     storage.insert_reflection(&id, content, tags, &embedding)?;
 
-    {
+    let acknowledged = {
         let mut idx = search.write().await;
-        idx.insert_reflection(id.clone(), embedding);
-    }
-
-    Ok(format!(
-        "Reflection stored successfully.\nID: {}\nTags: {:?}",
-        id, tags
-    ))
+        idx.insert_reflection(id.clone(), embedding)
+    };
+    let status = if acknowledged {
+        "Reflection stored successfully."
+    } else {
+        "Reflection stored; semantic indexing is pending."
+    };
+    Ok(format!("{status}\nID: {id}\nTags: {tags:?}"))
 }
 
 /// Store an EXPLICIT memory write for future search: the MCP `store_reflection`
@@ -2112,22 +2272,12 @@ pub async fn get_recent_work(
     Ok(format::format_recent_work(&chunks, group_by))
 }
 
-/// Time-constrained semantic search.
-#[allow(clippy::too_many_arguments)]
-pub async fn search_by_recency(
-    storage: &Arc<Storage>,
-    embeddings: &Arc<EmbeddingEngine>,
-    search: &Arc<RwLock<SearchEngine>>,
-    query: &str,
+fn recency_window(
     time_range: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
-    limit: usize,
-    min_score: f32,
-    project: Option<&str>,
-) -> Result<String> {
-    // Parse time constraints
-    let (start, end) = if let Some(tr) = time_range {
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    Ok(if let Some(tr) = time_range {
         temporal::parse_time_expression(tr)?
     } else if since.is_some() || until.is_some() {
         let s = if let Some(s) = since {
@@ -2144,7 +2294,25 @@ pub async fn search_by_recency(
     } else {
         let now = chrono::Utc::now();
         (now - chrono::Duration::days(7), now)
-    };
+    })
+}
+
+/// Time-constrained semantic search.
+#[allow(clippy::too_many_arguments)]
+pub async fn search_by_recency(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    time_range: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+    limit: usize,
+    min_score: f32,
+    project: Option<&str>,
+) -> Result<String> {
+    validate_page(0, limit)?;
+    let (start, end) = recency_window(time_range, since, until)?;
 
     let start_str = start.to_rfc3339();
     let end_str = end.to_rfc3339();
@@ -2782,6 +2950,7 @@ pub async fn get_more_results(
     min_score: f32,
     project: Option<&str>,
 ) -> Result<String> {
+    validate_page(offset, limit)?;
     let consumption_mode = consumption_mode_for_partition(validity_partition_enabled());
     let active_forgetting = active_forgetting_enabled();
     let query_vec = embed_query(embeddings, query).await?;
@@ -2913,6 +3082,7 @@ async fn get_more_results_in_scope(
     consumption_mode: ConsumptionMode,
     active_forgetting: bool,
 ) -> Result<String> {
+    validate_page(offset, limit)?;
     let mut all_results = if scope.effective_project.is_some() {
         let mut ids = HashSet::new();
         for family_project in &scope.family_projects {
@@ -9900,6 +10070,154 @@ mod tests {
         assert!(out.contains("ambiguous"));
         assert!(out.contains("abc123-one"));
         assert!(out.contains("abc123-two"));
+    }
+    #[tokio::test]
+    async fn r3_missing_store_ack_reports_pending_id_and_reflection_fts_finds_it() {
+        use crate::search::vector_ipc::{ProxyTimings, VectorClient, VectorProxy};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let proxy = Arc::new(VectorProxy::new(
+            VectorClient::for_database(&db).unwrap(),
+            storage.clone(),
+        ));
+        proxy.set_timings(ProxyTimings {
+            backoff_first: std::time::Duration::from_millis(1),
+            backoff_total: std::time::Duration::from_millis(5),
+            down_window: std::time::Duration::from_secs(30),
+        });
+        let search = Arc::new(RwLock::new(SearchEngine::proxied(proxy)));
+        let reply = store_embedded_reflection(
+            &storage,
+            &search,
+            "pending-id".into(),
+            "quartzpending acknowledgment",
+            &[],
+            vec![0.1; 384],
+        )
+        .await
+        .unwrap();
+        assert!(reply.contains("semantic indexing is pending"), "{reply}");
+        assert!(reply.contains("ID: pending-id"));
+        assert!(!reply.contains("successfully"));
+        assert!(storage
+            .fts5_search("quartzpending", 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage
+                .fts5_search_reflections("quartzpending", 10)
+                .unwrap()[0]
+                .0,
+            "pending-id"
+        );
+    }
+
+    #[tokio::test]
+    async fn r3_keyword_fallback_preserves_dates_scope_pagination_and_formats() {
+        let rows: Vec<_> = (0..8)
+            .map(|n| (format!("id{n}"), format!("quartzneedle unique{n}")))
+            .collect();
+        let input: Vec<_> = rows
+            .iter()
+            .map(|(id, text)| (id.as_str(), "alpha", text.as_str(), [1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        let (storage, search) = quick_check_fixture(&input);
+        storage
+            .with_connection(|conn| {
+                conn.execute("UPDATE chunks SET timestamp='2026-10-02T00:00:00Z'", [])?;
+                conn.execute(
+                    "UPDATE chunks SET timestamp='2020-01-01T00:00:00Z' WHERE id='id0'",
+                    [],
+                )?;
+                conn.execute("UPDATE chunks SET project_name='beta' WHERE id='id1'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let candidates = keyword_candidates(&storage, "quartzneedle", Some("alpha")).unwrap();
+        assert_eq!(candidates.len(), 7);
+        assert!(candidates.iter().all(|r| r.chunk.project_name == "alpha"));
+        let page = keyword_fallback(
+            &storage,
+            &search,
+            "quartzneedle",
+            3,
+            Some("alpha"),
+            KeywordTool::More { offset: 3 },
+        )
+        .await
+        .unwrap();
+        assert!(page.contains("<offset>3</offset>"), "{page}");
+        assert!(
+            page.contains("<results_returned>3</results_returned>"),
+            "{page}"
+        );
+        for row in candidates.iter().skip(3).take(3) {
+            assert!(page.contains(&row.chunk.content));
+        }
+        for row in candidates.iter().take(3) {
+            assert!(!page.contains(&row.chunk.content));
+        }
+        let recency = keyword_fallback(
+            &storage,
+            &search,
+            "quartzneedle",
+            10,
+            Some("alpha"),
+            KeywordTool::Recency {
+                time_range: None,
+                since: Some("2026-10-01"),
+                until: Some("2026-10-03"),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!recency.contains("unique0"), "{recency}");
+        assert!(!recency.contains("unique1"), "{recency}");
+        assert!(recency.contains("unique2"), "{recency}");
+        for (tool, marker) in [
+            (KeywordTool::Quick, "<quick_search>"),
+            (KeywordTool::Insights, "<search_summary>"),
+            (KeywordTool::Why, "WHY: quartzneedle"),
+        ] {
+            let reply = keyword_fallback(&storage, &search, "quartzneedle", 5, Some("alpha"), tool)
+                .await
+                .unwrap();
+            assert!(reply.starts_with(marker), "{reply}");
+            assert!(!reply.contains("unique1"));
+        }
+        assert!(validate_page(usize::MAX, 1).is_err());
+        assert!(validate_page(0, usize::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn r3_keyword_pagination_stays_inside_the_500_candidate_window() {
+        let rows: Vec<_> = (0..510)
+            .map(|n| (format!("id{n:04}"), format!("quartzwindow unique{n:04}")))
+            .collect();
+        let input: Vec<_> = rows
+            .iter()
+            .map(|(id, text)| (id.as_str(), "alpha", text.as_str(), [1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        let (storage, search) = quick_check_fixture(&input);
+        let page = keyword_fallback(
+            &storage,
+            &search,
+            "quartzwindow",
+            10,
+            Some("alpha"),
+            KeywordTool::More { offset: 499 },
+        )
+        .await
+        .unwrap();
+        assert!(
+            page.contains("<total_available>500</total_available>"),
+            "{page}"
+        );
+        assert!(
+            page.contains("<results_returned>1</results_returned>"),
+            "{page}"
+        );
     }
 }
 

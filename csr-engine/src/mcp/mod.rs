@@ -333,10 +333,8 @@ impl CsrServer {
     /// instead of loading the index or the model in-process.
     async fn vector_backed(
         &self,
-        query: &str,
-        limit: usize,
-        project: Option<&str>,
         run: impl std::future::Future<Output = anyhow::Result<String>>,
+        fallback: impl std::future::Future<Output = anyhow::Result<String>>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let Some(proxy) = self.proxy.clone() else {
             return tool_result(run.await);
@@ -352,10 +350,9 @@ impl CsrServer {
                 return tool_result(result);
             }
         }
-        let keyword =
-            tools::reflect_keyword_only(&self.storage, &self.search, query, limit, project)
-                .await
-                .map(|text| format!("{}\n\n{text}", crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
+        let keyword = fallback
+            .await
+            .map(|text| format!("{}\n\n{text}", crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
         tool_result(keyword)
     }
 
@@ -400,6 +397,8 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let limit = p.limit.unwrap_or(5);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
         let min_score = p.min_score.unwrap_or(0.3);
 
         let run = tools::reflect_on_past(
@@ -411,8 +410,18 @@ impl CsrServer {
             min_score,
             p.project.as_deref(),
         );
-        self.vector_backed(&p.query, limit, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.query,
+                limit,
+                p.project.as_deref(),
+                tools::KeywordTool::Recall,
+            ),
+        )
+        .await
     }
 
     #[tool(
@@ -503,8 +512,18 @@ impl CsrServer {
             min_score,
             p.project.as_deref(),
         );
-        self.vector_backed(&p.query, 2, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.query,
+                2,
+                p.project.as_deref(),
+                tools::KeywordTool::Quick,
+            ),
+        )
+        .await
     }
 
     // ─── Insights & aggregation (1) ───
@@ -531,8 +550,18 @@ impl CsrServer {
             &p.query,
             p.project.as_deref(),
         );
-        self.vector_backed(&p.query, 10, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.query,
+                10,
+                p.project.as_deref(),
+                tools::KeywordTool::Insights,
+            ),
+        )
+        .await
     }
 
     // ─── Temporal tools (3) ───
@@ -553,6 +582,8 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let limit = p.limit.unwrap_or(10);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
         let group_by = p.group_by.as_deref().unwrap_or("conversation");
 
         let result =
@@ -577,6 +608,8 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let limit = p.limit.unwrap_or(10);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
         let min_score = p.min_score.unwrap_or(0.3);
 
         let run = tools::search_by_recency(
@@ -591,8 +624,22 @@ impl CsrServer {
             min_score,
             p.project.as_deref(),
         );
-        self.vector_backed(&p.query, limit, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.query,
+                limit,
+                p.project.as_deref(),
+                tools::KeywordTool::Recency {
+                    time_range: p.time_range.as_deref(),
+                    since: p.since.as_deref(),
+                    until: p.until.as_deref(),
+                },
+            ),
+        )
+        .await
     }
 
     #[tool(
@@ -637,6 +684,8 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let limit = p.limit.unwrap_or(10);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
 
         let result =
             tools::search_by_file(&self.storage, &p.file_path, limit, p.project.as_deref()).await;
@@ -660,6 +709,8 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let limit = p.limit.unwrap_or(10);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
 
         let run = tools::search_by_concept(
             &self.storage,
@@ -669,8 +720,18 @@ impl CsrServer {
             limit,
             p.project.as_deref(),
         );
-        self.vector_backed(&p.concept, limit, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.concept,
+                limit,
+                p.project.as_deref(),
+                tools::KeywordTool::Concept,
+            ),
+        )
+        .await
     }
 
     // ─── Pagination (1) ───
@@ -691,7 +752,11 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let offset = p.offset.unwrap_or(3);
+        tools::validate_page(offset, p.limit.unwrap_or(3))
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
         let limit = p.limit.unwrap_or(3);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
         let min_score = p.min_score.unwrap_or(0.3);
 
         let run = tools::get_more_results(
@@ -704,8 +769,18 @@ impl CsrServer {
             min_score,
             p.project.as_deref(),
         );
-        self.vector_backed(&p.query, offset + limit, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.query,
+                limit,
+                p.project.as_deref(),
+                tools::KeywordTool::More { offset },
+            ),
+        )
+        .await
     }
 
     // ─── Conversation & session (2) ───
@@ -749,6 +824,8 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let limit = p.limit.unwrap_or(50);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
 
         let result = tools::get_session_learnings(&self.storage, &p.session_id, limit);
         tool_result(result)
@@ -825,6 +902,8 @@ impl CsrServer {
         let p = params.0;
         let mode = p.mode.as_deref().unwrap_or("neighbors");
         let limit = p.limit.unwrap_or(20) as usize;
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
 
         let result = tools::code_graph(
             &self.storage,
@@ -855,7 +934,10 @@ impl CsrServer {
         // clamp(1, 50): limit 0 would short-circuit reinstate() into an
         // empty trace before any machinery ran — an inert 0/0/0 receipt that
         // looks like an honest "no evidence" (DoD review blocker 3).
-        let limit = p.limit.unwrap_or(10).clamp(1, 50);
+        let limit = p.limit.unwrap_or(10);
+        tools::validate_page(0, limit)
+            .map_err(|e| rmcp::ErrorData::invalid_params(e.to_string(), None))?;
+        let limit = limit.clamp(1, 50);
         let cfg = crate::search::reinstatement::ReinstateConfig {
             k: limit,
             ..Default::default()
@@ -869,8 +951,18 @@ impl CsrServer {
             p.project.as_deref(),
             &cfg,
         );
-        self.vector_backed(&p.query, limit, p.project.as_deref(), run)
-            .await
+        self.vector_backed(
+            run,
+            tools::keyword_fallback(
+                &self.storage,
+                &self.search,
+                &p.query,
+                limit,
+                p.project.as_deref(),
+                tools::KeywordTool::Why,
+            ),
+        )
+        .await
     }
 
     #[tool(
@@ -1174,7 +1266,7 @@ mod tests {
             engine.embeddings().clone(),
             engine.search().clone(),
             projects.clone(),
-            tmp.path().join("index"),
+            tmp.path().join("index-v3"),
             None,
             None,
         );
@@ -1331,5 +1423,127 @@ mod tests {
     fn find_tool_resolves_csr_transcript_but_not_a_bogus_name() {
         assert!(CsrServer::find_tool("csr_transcript").is_some());
         assert!(CsrServer::find_tool("not_a_real_tool").is_none());
+    }
+    #[tokio::test]
+    async fn r3_tool_boundaries_reject_unbounded_pages_with_and_without_a_proxy() {
+        for proxied in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(Storage::open_memory().unwrap());
+            let search = if proxied {
+                let client = crate::search::vector_ipc::VectorClient::for_database(
+                    &dir.path().join("csr-engine.db"),
+                )
+                .unwrap();
+                SearchEngine::proxied(Arc::new(crate::search::vector_ipc::VectorProxy::new(
+                    client,
+                    storage.clone(),
+                )))
+            } else {
+                SearchEngine::new(8)
+            };
+            let search = Arc::new(RwLock::new(search));
+            let server = CsrServer::new(
+                storage,
+                Arc::new(EmbeddingEngine::disabled()),
+                search.clone(),
+                dir.path().to_path_buf(),
+                dir.path().join("index-v3"),
+                None,
+                None,
+            );
+            for (offset, limit) in [(usize::MAX, 1), (0, usize::MAX)] {
+                let reply = server
+                    .get_more_results(Parameters(GetMoreResultsParams {
+                        query: "needle".into(),
+                        offset: Some(offset),
+                        limit: Some(limit),
+                        min_score: None,
+                        project: Some("all".into()),
+                    }))
+                    .await;
+                assert!(reply.is_err());
+            }
+            let reply = server
+                .reflect_on_past(Parameters(ReflectOnPastParams {
+                    query: "needle".into(),
+                    limit: Some(usize::MAX),
+                    min_score: None,
+                    project: Some("all".into()),
+                }))
+                .await;
+            assert!(reply.is_err());
+            let reply = server
+                .why(Parameters(WhyParams {
+                    query: "needle".into(),
+                    limit: Some(usize::MAX),
+                    project: Some("all".into()),
+                }))
+                .await;
+            assert!(reply.is_err());
+            if let Some(proxy) = search.read().await.proxy() {
+                assert_eq!(proxy.failures(), 0);
+            };
+        }
+    }
+
+    #[tokio::test]
+    async fn r3_outage_notes_keep_each_tool_response_contract() {
+        use crate::search::vector_ipc::{
+            ProxyTimings, VectorClient, VectorProxy, KEYWORD_ONLY_NOTE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let proxy = Arc::new(VectorProxy::new(
+            VectorClient::for_database(&dir.path().join("csr-engine.db")).unwrap(),
+            storage.clone(),
+        ));
+        proxy.set_timings(ProxyTimings {
+            backoff_first: std::time::Duration::from_millis(1),
+            backoff_total: std::time::Duration::from_millis(2),
+            down_window: std::time::Duration::from_secs(30),
+        });
+        let server = CsrServer::new(
+            storage,
+            Arc::new(EmbeddingEngine::disabled()),
+            Arc::new(RwLock::new(SearchEngine::proxied(proxy))),
+            dir.path().to_path_buf(),
+            dir.path().join("index-v3"),
+            None,
+            None,
+        );
+        let quick = text(
+            server
+                .quick_check(Parameters(QuickCheckParams {
+                    query: "needle".into(),
+                    min_score: None,
+                    project: Some("all".into()),
+                }))
+                .await,
+        );
+        let insights = text(
+            server
+                .search_insights(Parameters(SearchInsightsParams {
+                    query: "needle".into(),
+                    project: Some("all".into()),
+                }))
+                .await,
+        );
+        let why = text(
+            server
+                .why(Parameters(WhyParams {
+                    query: "needle".into(),
+                    limit: None,
+                    project: Some("all".into()),
+                }))
+                .await,
+        );
+        for (reply, marker) in [
+            (quick, "<quick_search>"),
+            (insights, "<search_summary>"),
+            (why, "WHY: needle"),
+        ] {
+            assert!(reply.starts_with(KEYWORD_ONLY_NOTE), "{reply}");
+            assert!(reply.contains(marker), "{reply}");
+        }
     }
 }
