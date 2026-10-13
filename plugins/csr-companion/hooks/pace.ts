@@ -38,7 +38,8 @@ export type Pace = {
 // What one subagent turn has been charged to `claude`: the step indexes charged, their tokens, and whether the turn's
 // own total (turn.complete's usage, a sum of its steps, not more usage) has been settled against them.
 export type Receipt = { tokens: number; steps: number[]; closed?: boolean }
-export const TURNS_KEPT = 60
+export const TURNS_KEPT = 60 // closed receipts kept (oldest go first): they only guard a late step or a second settle
+export const OPEN_KEPT = 1000 // a safety bound on receipts of turns that never closed; far above any fan-out
 
 // The pace with a subagent step's tokens charged to the main session's spend (the share is measured against everything
 // Claude spends), once: a step already charged changes nothing. After the turn's total was settled a late step adds no
@@ -62,7 +63,16 @@ export function settle(pace: Pace, turn: string, total: number): Pace {
   return { ...pace, claude: pace.claude + more, turns: keepTurns(turns) }
 }
 
-const keepTurns = (turns: Record<string, Receipt>) => Object.fromEntries(Object.entries(turns).slice(-TURNS_KEPT))
+// An open receipt is what stops settle() charging a turn's whole total again on top of its steps, so a fan-out of any width
+// keeps them all: only closed receipts are trimmed, oldest first (OPEN_KEPT is a bound for turns that never close).
+const keepTurns = (turns: Record<string, Receipt>) => {
+  const entries = Object.entries(turns)
+  const closed = entries.filter(([, receipt]) => receipt.closed)
+  const open = entries.filter(([, receipt]) => !receipt.closed).slice(-OPEN_KEPT)
+  const drop = new Set(closed.slice(0, Math.max(0, closed.length - TURNS_KEPT)).map(([key]) => key))
+  const keep = new Set([...open.map(([key]) => key), ...closed.map(([key]) => key)].filter(key => !drop.has(key)))
+  return Object.fromEntries(entries.filter(([key]) => keep.has(key)))
+}
 
 export const freshPace = (session: string): Pace => ({
   session,

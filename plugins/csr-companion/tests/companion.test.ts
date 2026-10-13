@@ -2443,6 +2443,24 @@ test('completion_usage_reconciles_without_double_counting', ON, async ($, on) =>
   expect(settleTurn(charge(freshPace(SID), '["a","t"]', 0, 80), '["a","t"]', 50).claude).toBe(80) // below what the steps charged: none
 })
 
+test('a fan-out of more than 60 open subagent turns evicts no receipt: the first one settles to its true total', () => {
+  const key = (n: number) => JSON.stringify([`agent-${n}`, 'turn'])
+  let pace = freshPace(SID)
+  for (let step = 0; step < 2; step++) for (let n = 0; n < 70; n++) pace = charge(pace, key(n), step, 10) // 70 turns, interleaved
+  expect(pace.claude).toBe(70 * 20)
+  pace = settleTurn(pace, key(0), 20) // the first turn's total is its two steps: nothing more
+  expect(pace.claude).toBe(70 * 20)
+  pace = settleTurn(pace, key(0), 25) // a total with 5 tokens the steps never showed: only those
+  expect(pace.claude).toBe(70 * 20 + 5)
+  // closed receipts are what is trimmed, oldest first, and an open one is never in their count
+  for (let n = 0; n < 70; n++) pace = settleTurn(pace, key(n), 20)
+  const kept = Object.values(pace.turns ?? {})
+  expect(kept.filter(receipt => receipt.closed).length).toBeLessThanOrEqual(60)
+  expect(pace.claude).toBe(70 * 20 + 5)
+  pace = charge(pace, key(69), 0, 10) // the newest closed receipt remembers its step
+  expect(pace.claude).toBe(70 * 20 + 5)
+})
+
 // A report, the main session's next step and the 20 s timer all reach for it: one claim, one look, whatever the order.
 async function oneClaim($: Engine, on: On, order: 'step first' | 'timer first' | 'together') {
   const seen = host(on, { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
