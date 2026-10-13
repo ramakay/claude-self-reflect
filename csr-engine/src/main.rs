@@ -1660,7 +1660,18 @@ async fn run(
         None
     };
 
-    let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+    // A plain MCP server leaves the index, the model, imports and enrichment
+    // to a live daemon. Explicit maintenance flags keep the full engine.
+    let maintenance = args.import || args.enrich || args.backfill_saga;
+    let proxied = if should_serve && !maintenance {
+        engine::Engine::new_proxied(&args.db_path, &args.projects_dir)?
+    } else {
+        None
+    };
+    let eng = match proxied {
+        Some(eng) => eng,
+        None => engine::Engine::new(&args.db_path, &args.projects_dir)?,
+    };
 
     if args.import || args.enrich {
         // Both paths embed heavily and immediately — warm eagerly instead
@@ -1691,7 +1702,10 @@ async fn run(
     }
 
     // Start file watcher if requested (runs as background task)
-    let _watcher_handle = if args.watch {
+    let _watcher_handle = if args.watch && eng.is_proxied() {
+        tracing::info!("daemon live: it imports transcripts, --watch not started");
+        None
+    } else if args.watch {
         Some(eng.start_watcher())
     } else {
         None

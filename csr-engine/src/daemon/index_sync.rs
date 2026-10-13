@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::search::SearchEngine;
 use crate::storage::{embedding_changes, Storage};
@@ -19,7 +19,18 @@ pub fn spawn(
     search: Arc<RwLock<SearchEngine>>,
     shutdown: Arc<AtomicBool>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run(storage, search, shutdown, POLL_INTERVAL))
+    spawn_with_nudge(storage, search, shutdown, Arc::new(Notify::new()))
+}
+
+/// [`spawn`], also polling as soon as `nudge` is notified — a proxied MCP
+/// server that just stored a reflection asks for it over the vector socket.
+pub fn spawn_with_nudge(
+    storage: Arc<Storage>,
+    search: Arc<RwLock<SearchEngine>>,
+    shutdown: Arc<AtomicBool>,
+    nudge: Arc<Notify>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run(storage, search, shutdown, POLL_INTERVAL, nudge))
 }
 
 async fn run(
@@ -27,6 +38,7 @@ async fn run(
     search: Arc<RwLock<SearchEngine>>,
     shutdown: Arc<AtomicBool>,
     interval: Duration,
+    nudge: Arc<Notify>,
 ) {
     // Resume after the loaded generation's change cursor (see
     // `SearchEngine::change_cursor`): the startup id backfill cannot see an
@@ -60,7 +72,10 @@ async fn run(
         // Responsive shutdown without detaching an index-mutating worker.
         let until = Instant::now() + interval;
         while !shutdown.load(Ordering::SeqCst) && Instant::now() < until {
-            tokio::time::sleep(Duration::from_millis(100).min(interval)).await;
+            tokio::select! {
+                _ = nudge.notified() => break,
+                _ = tokio::time::sleep(Duration::from_millis(100).min(interval)) => {}
+            }
         }
     }
 }

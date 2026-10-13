@@ -215,8 +215,8 @@ async fn request_with_delivery(
 }
 
 #[cfg(unix)]
-struct BoundSocket {
-    listener: tokio::net::UnixListener,
+pub(crate) struct BoundSocket {
+    pub(crate) listener: tokio::net::UnixListener,
     path: PathBuf,
     // Held until the listener and socket path have been removed. A second
     // daemon must never unlink the first daemon's active endpoint.
@@ -226,10 +226,16 @@ struct BoundSocket {
 #[cfg(unix)]
 impl BoundSocket {
     fn bind(data_dir: &Path) -> std::io::Result<Self> {
+        Self::bind_named(data_dir, "prompt.sock", "server.lock")
+    }
+
+    /// Bind `<data_dir>/hook-ipc-v1/<socket>` under the same private
+    /// directory and single-owner lock rules as the prompt socket.
+    pub(crate) fn bind_named(data_dir: &Path, socket: &str, lock: &str) -> std::io::Result<Self> {
         use std::os::unix::fs::{
             DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
         };
-        let path = socket_path(data_dir);
+        let path = socket_path(data_dir).with_file_name(socket);
         let dir = path.parent().expect("socket has parent");
         match std::fs::DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
@@ -249,7 +255,7 @@ impl BoundSocket {
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(dir.join("server.lock"))?;
+            .open(dir.join(lock))?;
         fs2::FileExt::try_lock_exclusive(&lock)?;
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(&path)?,

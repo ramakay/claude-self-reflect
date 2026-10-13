@@ -186,10 +186,13 @@ impl Daemon {
         std::fs::create_dir_all(&lock_dir)?;
         let lock_path = lock_dir.join("daemon.lock");
 
+        // Not truncated on open: a second `csr-engine daemon` that fails to
+        // lock must leave the running daemon's pid readable — MCP servers
+        // check it (`vector_ipc::daemon_lock_live`) before proxying.
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&lock_path)?;
 
         // Try non-blocking exclusive lock — fails if another daemon holds it
@@ -200,8 +203,9 @@ impl Daemon {
             )
         })?;
 
-        // Write PID for diagnostics (after acquiring lock)
+        // Write PID (after acquiring lock)
         use std::io::Write;
+        file.set_len(0)?;
         let mut locked = &file;
         write!(locked, "{}", std::process::id())?;
 
@@ -319,8 +323,13 @@ impl Daemon {
 
         // Hooks/MCP/CLI writers have their own engines. Observe their SQLite
         // mutations independently of the transcript watcher's import-state skip.
-        let index_sync_handle =
-            index_sync::spawn(self.storage.clone(), self.search.clone(), shutdown.clone());
+        let sync_nudge = Arc::new(tokio::sync::Notify::new());
+        let index_sync_handle = index_sync::spawn_with_nudge(
+            self.storage.clone(),
+            self.search.clone(),
+            shutdown.clone(),
+            sync_nudge.clone(),
+        );
 
         // Start file watcher
         let watcher = crate::import::watcher::FileWatcher::new(
@@ -1206,6 +1215,26 @@ impl Daemon {
         if journal_handle.is_some() {
             tracing::info!("journal server started (v10.1 journal v4)");
         }
+        // MCP servers started while this daemon is live search through it
+        // instead of loading their own index and model.
+        let vector_handle = crate::search::vector_ipc::spawn_for_daemon(
+            self.embeddings.clone(),
+            self.search.clone(),
+            &self.index_dir.parent().unwrap_or(Path::new(".")).join(
+                self.storage
+                    .with_connection(|conn| {
+                        Ok(conn
+                            .path()
+                            .and_then(|path| Path::new(path).file_name())
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("csr-engine.db")
+                            .to_owned())
+                    })
+                    .unwrap_or_else(|_| "csr-engine.db".to_owned()),
+            ),
+            shutdown.clone(),
+            sync_nudge,
+        );
 
         // Wait for Ctrl+C/SIGTERM, OR for the binary on disk to be replaced
         // (gap-G2, watched by `replacement_watch_handle` spawned above) —
@@ -1237,8 +1266,9 @@ impl Daemon {
         // Signal all loops to stop
         shutdown.store(true, Ordering::SeqCst);
 
-        // Stop admitting prompt requests and remove the private socket.
+        // Stop admitting prompt and vector requests and remove the sockets.
         let _ = prompt_handle.await;
+        let _ = vector_handle.await;
         let _ = index_sync_handle.await;
 
         // Give loops time to finish current work (5s timeout)

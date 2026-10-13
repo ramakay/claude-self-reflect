@@ -18,6 +18,9 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 /// should call `warm()` right after construction.
 pub struct EmbeddingEngine {
     model: Mutex<Option<TextEmbedding>>,
+    /// An MCP server proxied to the live daemon embeds there and only loads
+    /// the model itself if that fails (see `search::vector_ipc`).
+    remote: Option<std::sync::Arc<crate::search::vector_ipc::VectorProxy>>,
 }
 
 /// Serializes first-run model downloads within this process. Concurrent
@@ -82,7 +85,16 @@ impl EmbeddingEngine {
     pub fn new() -> Result<Self> {
         Ok(Self {
             model: Mutex::new(None),
+            remote: None,
         })
+    }
+
+    /// An engine that embeds through the daemon first (see `remote`).
+    pub fn with_remote(proxy: std::sync::Arc<crate::search::vector_ipc::VectorProxy>) -> Self {
+        Self {
+            model: Mutex::new(None),
+            remote: Some(proxy),
+        }
     }
 
     /// True once the ONNX model has been loaded into memory. Never
@@ -150,6 +162,9 @@ impl EmbeddingEngine {
     /// Embed a batch of texts. Returns one 384-dim vector per input.
     /// Loads the model on first call if it hasn't been `warm()`ed already.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if let Some(vectors) = self.remote.as_ref().and_then(|proxy| proxy.embed(texts)) {
+            return Ok(vectors);
+        }
         self.ensure_loaded()?;
         let docs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
         let mut guard = self

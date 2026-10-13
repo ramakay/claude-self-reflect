@@ -55,6 +55,9 @@ pub struct Engine {
     /// generation, `(chunks, reflections)`: what that generation is missing
     /// relative to SQLite. The daemon counts them toward its dump budget.
     startup_backfill: (usize, usize),
+    /// An MCP server that found the daemon live: vector search and query
+    /// embedding go to the daemon (see [`Self::new_proxied`]).
+    proxied: bool,
 }
 
 impl Engine {
@@ -102,6 +105,7 @@ impl Engine {
             skip_index_persistence: false,
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
+            proxied: false,
         }
     }
 
@@ -247,7 +251,64 @@ impl Engine {
             skip_index_persistence: !persist,
             index_freshly_rebuilt,
             startup_backfill,
+            proxied: false,
         })
+    }
+
+    /// An MCP server engine that leaves the index and the embedding model to
+    /// the live daemon, or `None` when no daemon answers for this database
+    /// (the caller then builds the full engine, as before).
+    ///
+    /// Single owner: such a server never loads the HNSW index or the ONNX
+    /// model up front, never starts the watcher or the enrichment loops,
+    /// never imports and never publishes. Its tools read SQLite directly and
+    /// send the vector primitives to the daemon; if the daemon stops
+    /// answering, the proxy loads the index in-process once (as a hook
+    /// would, without publishing) and the model on first embed.
+    pub fn new_proxied(db_path: &Path, projects_dir: &Path) -> Result<Option<Self>> {
+        use crate::search::vector_ipc::{daemon_lock_live, VectorClient, VectorProxy};
+        // Escape hatch: `CSR_NO_DAEMON_PROXY=1` keeps a server fully in-process.
+        if std::env::var("CSR_NO_DAEMON_PROXY").is_ok_and(|v| v == "1" || v == "true") {
+            return Ok(None);
+        }
+        let Some(data_dir) = db_path.parent() else {
+            return Ok(None);
+        };
+        if !daemon_lock_live(data_dir) {
+            return Ok(None);
+        }
+        let Some(client) = VectorClient::for_database(db_path) else {
+            return Ok(None);
+        };
+        if let Err(error) = client.ping() {
+            tracing::info!(%error, "daemon live but its vector socket is not answering");
+            return Ok(None);
+        }
+        let storage = Arc::new(Storage::open(db_path)?);
+        let index_dir = data_dir.join("index");
+        let loader = {
+            let storage = storage.clone();
+            let index_dir = index_dir.clone();
+            Box::new(move || load_index_in_process(&storage, &index_dir))
+        };
+        let proxy = Arc::new(VectorProxy::new(client, loader));
+        tracing::info!("daemon live: MCP vector search and embedding go to the daemon");
+        Ok(Some(Self {
+            storage,
+            embeddings: Arc::new(EmbeddingEngine::with_remote(proxy.clone())),
+            search: Arc::new(RwLock::new(SearchEngine::proxied(proxy))),
+            projects_dir: projects_dir.to_path_buf(),
+            index_dir,
+            skip_index_persistence: true,
+            index_freshly_rebuilt: false,
+            startup_backfill: (0, 0),
+            proxied: true,
+        }))
+    }
+
+    /// See the `proxied` field.
+    pub fn is_proxied(&self) -> bool {
+        self.proxied
     }
 
     /// Construct an engine for write-only hooks (precompact, session-end) that
@@ -276,6 +337,7 @@ impl Engine {
             skip_index_persistence: true,
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
+            proxied: false,
         })
     }
 
@@ -765,13 +827,18 @@ impl Engine {
         startup_identity: Option<crate::binary_identity::FileIdentity>,
         startup_exe_path: Option<std::path::PathBuf>,
     ) -> Result<()> {
-        // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
-        let enrichment_handles = crate::daemon::spawn_enrichment_loops(
-            self.storage.clone(),
-            self.embeddings.clone(),
-            self.search.clone(),
-            self.projects_dir().to_path_buf(),
-        );
+        // Spawn enrichment loops as background tasks (extraction, narrator,
+        // consolidation) — unless the daemon is live and already runs them.
+        let enrichment_handles = if self.proxied {
+            Vec::new()
+        } else {
+            crate::daemon::spawn_enrichment_loops(
+                self.storage.clone(),
+                self.embeddings.clone(),
+                self.search.clone(),
+                self.projects_dir().to_path_buf(),
+            )
+        };
 
         let server = CsrServer::new(
             self.storage,
@@ -821,6 +888,20 @@ impl Engine {
 
         Ok(())
     }
+}
+
+/// The in-process index a proxied server falls back to: the published
+/// generation reconciled with SQLite, or a rebuild from SQLite when there is
+/// none — the same as a searching hook's, and never published.
+fn load_index_in_process(storage: &Storage, index_dir: &Path) -> Result<SearchEngine> {
+    let chunk_count = storage.count_chunk_embeddings()?;
+    let reflection_count = storage.count_reflection_embeddings()?;
+    if let Some(loaded) = load_reconciled(storage, index_dir, chunk_count, reflection_count, false)
+    {
+        return Ok(loaded.search);
+    }
+    let (search, _, _) = rebuild_search_index_streaming(storage, RECONCILE_BATCH)?;
+    Ok(search)
 }
 
 /// A cached generation reconciled against SQLite (see [`load_reconciled`]).

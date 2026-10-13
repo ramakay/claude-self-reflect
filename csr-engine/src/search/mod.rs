@@ -4,6 +4,7 @@ pub mod decay;
 pub mod reinstatement;
 pub mod rerank;
 pub mod trained_rerank;
+pub mod vector_ipc;
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -140,6 +141,11 @@ pub struct SearchEngine {
     published_basenames: Option<(String, String)>,
     /// Whether the loaded vectors live in a memory map (see `is_mapped`).
     vectors_mapped: bool,
+    /// Set on an MCP server's engine while the daemon is live: searches go
+    /// to the daemon (falling back to an index the proxy loads itself), and
+    /// this engine's own indexes stay empty and never dirty — see
+    /// [`vector_ipc`].
+    proxy: Option<std::sync::Arc<vector_ipc::VectorProxy>>,
     /// The `HnswIo`s a loaded engine's indexes borrow from (their memory
     /// maps, when mapped). Declared after the indexes, so those drop first
     /// and the maps are released with the engine. They used to be leaked
@@ -378,8 +384,21 @@ impl SearchEngine {
             epoch: 0,
             published_basenames: None,
             vectors_mapped: false,
+            proxy: None,
             _mapped: Vec::new(),
         }
+    }
+
+    /// An engine that searches through `proxy` (see the `proxy` field).
+    pub fn proxied(proxy: std::sync::Arc<vector_ipc::VectorProxy>) -> Self {
+        let mut engine = Self::new(16);
+        engine.proxy = Some(proxy);
+        engine
+    }
+
+    /// The daemon proxy, when this engine has one.
+    pub fn proxy(&self) -> Option<&std::sync::Arc<vector_ipc::VectorProxy>> {
+        self.proxy.as_ref()
     }
 
     /// Whether an index reads its loaded vectors from a memory-mapped
@@ -444,6 +463,10 @@ impl SearchEngine {
     }
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
+        if let Some(proxy) = &self.proxy {
+            proxy.note_mutation(|index| index.insert_chunk(id, embedding));
+            return;
+        }
         if self.chunk_positions.contains_key(&id) {
             return; // Already indexed — skip duplicate
         }
@@ -455,6 +478,10 @@ impl SearchEngine {
     }
 
     pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
+        if let Some(proxy) = &self.proxy {
+            proxy.note_mutation(|index| index.insert_reflection(id, embedding));
+            return;
+        }
         if self.reflection_positions.contains_key(&id) {
             return; // Already indexed — skip duplicate
         }
@@ -471,6 +498,10 @@ impl SearchEngine {
     /// so search results won't include this reflection. The vector stays in the
     /// index but maps to nothing.
     pub fn remove_reflection(&mut self, id: &str) {
+        if let Some(proxy) = &self.proxy {
+            proxy.note_mutation(|index| index.remove_reflection(id));
+            return;
+        }
         if let Some(pos) = self.reflection_positions.remove(id) {
             self.reflection_id_map[pos].clear();
             self.active_reflection_count = self.active_reflection_count.saturating_sub(1);
@@ -484,6 +515,10 @@ impl SearchEngine {
     /// re-inserting a reused deterministic id was skipped as a duplicate (Codex
     /// HIGH), so stale plan content kept matching forever.
     pub fn remove_chunk(&mut self, id: &str) {
+        if let Some(proxy) = &self.proxy {
+            proxy.note_mutation(|index| index.remove_chunk(id));
+            return;
+        }
         if let Some(pos) = self.chunk_positions.remove(id) {
             self.chunk_id_map[pos].clear();
             self.mark_chunk_dirty();
@@ -573,6 +608,9 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.search_chunks(query_vec, limit, min_score);
+        }
         if self.chunk_id_map.is_empty() {
             return Vec::new();
         }
@@ -593,6 +631,9 @@ impl SearchEngine {
         limit: usize,
         min_score: f32,
     ) -> Vec<SearchResult> {
+        if let Some(proxy) = &self.proxy {
+            return proxy.search_reflections(query_vec, limit, min_score);
+        }
         if self.reflection_id_map.is_empty() {
             return Vec::new();
         }
@@ -829,6 +870,12 @@ impl SearchEngine {
         min_score: f32,
         allowed_ids: &HashSet<String>,
     ) -> Vec<SearchResult> {
+        if let Some(proxy) = &self.proxy {
+            if allowed_ids.is_empty() || limit == 0 {
+                return Vec::new();
+            }
+            return proxy.search_chunks_filtered(query_vec, limit, min_score, allowed_ids);
+        }
         if self.chunk_id_map.is_empty() || allowed_ids.is_empty() || limit == 0 {
             return Vec::new();
         }
@@ -1448,6 +1495,7 @@ impl SearchEngine {
             epoch: manifest.epoch,
             published_basenames: Some((manifest.chunk_basename, manifest.reflection_basename)),
             vectors_mapped,
+            proxy: None,
             _mapped: mapped,
         })
     }
