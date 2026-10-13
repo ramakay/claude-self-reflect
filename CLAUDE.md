@@ -159,7 +159,7 @@ cargo bench --bench spike_bench
 
 ## Hooks
 
-7 hooks fire at strategic moments:
+6 hooks fire at strategic moments:
 
 | Hook | When | What |
 |------|------|------|
@@ -167,11 +167,10 @@ cargo bench --bench spike_bench
 | UserPromptSubmit | Every prompt | Predictive context injection |
 | PostToolUse | After Edit/Write | Tracks file changes |
 | Stop | Every response | Stores iteration learnings |
-| SubagentStop | Subagent finishes | Captures intent events from the child transcript under the parent session |
 | PreCompact | Before compaction | Backs up state |
 | SessionEnd | Session ends | Stores narrative |
 
-Hook CLI: `csr-engine hook session-start|session-end|precompact|stop|subagent-stop|post-tool-use|prompt-submit|install`
+Hook CLI: `csr-engine hook session-start|session-end|precompact|stop|post-tool-use|prompt-submit|install` (`subagent-stop` is a deprecated no-op kept so old settings.json entries don't fail; `hook install --apply` removes them)
 
 ## File Layout
 

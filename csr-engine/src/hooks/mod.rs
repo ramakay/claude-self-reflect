@@ -21,7 +21,6 @@ pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
 pub mod stop;
-pub mod subagent_stop;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -39,8 +38,6 @@ pub struct HookInput {
     pub session_id: Option<String>,
     #[serde(alias = "transcriptPath")]
     pub transcript_path: Option<String>,
-    #[serde(alias = "agentTranscriptPath")]
-    pub agent_transcript_path: Option<String>,
     pub cwd: Option<String>,
     pub reason: Option<String>,
     /// Tool name for PostToolUse hook
@@ -56,13 +53,6 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Hook event source (e.g. "startup", "resume", "compact", "clear") for SessionStart
     pub source: Option<String>,
-    /// SubagentStop child identifier and metadata (Claude Code payload).
-    #[serde(alias = "agentId", alias = "agentName")]
-    pub agent_id: Option<String>,
-    #[serde(alias = "agentType", alias = "agentDisplayName")]
-    pub agent_type: Option<String>,
-    #[serde(alias = "lastAssistantMessage")]
-    pub last_assistant_message: Option<String>,
 }
 
 /// How long the hook waits for the piped JSON before giving up.
@@ -528,20 +518,65 @@ impl ClaimedStdout {
 /// Edit/Write. On a 300k-chunk corpus each invocation was paying a full
 /// `HnswIo::load_hnsw` walk plus a ~644MB dump of the graph and data files.
 ///
-/// `subagent-stop` reads a child transcript, embeds its intent events and
-/// writes them to SQLite; it never queries or inserts into the index. It is
-/// the most frequent hook in an agent-heavy session (275 of 728 fires in one
-/// measured 10-hour window) and was paying a ~700ms graph load for an ~11ms
-/// body.
-///
 /// Everything else stays on the full engine. `session-start` and
 /// `prompt-submit` query the index (recap, predictive injection) and genuinely
 /// need it loaded, except for the prompts [`hook_needs_index`] rules out.
 pub fn is_import_only_hook(hook_name: &str) -> bool {
     matches!(
         hook_name,
-        "precompact" | "session-end" | "stop" | "post-tool-use" | "subagent-stop"
+        "precompact" | "session-end" | "stop" | "post-tool-use"
     )
+}
+
+/// Hooks that no longer do anything but may still be registered in a
+/// settings.json that predates their removal. They stay accepted so Claude
+/// Code never sees a failing command, and `main` returns before the lock, the
+/// stdin read or any engine startup. `hook install --apply` drops the stale
+/// registration.
+///
+/// `subagent-stop` captured nothing by design: `intent_events::is_foreign`
+/// treats sidechain transcripts as foreign, so it cost a process spawn per
+/// finished subagent for zero rows.
+pub fn is_retired_hook(hook_name: &str) -> bool {
+    matches!(hook_name, "subagent-stop")
+}
+
+/// Whether this argv is `hook <retired name>`, read straight from the OS
+/// strings. `main` needs the answer before clap runs (the timing probe prints
+/// first), and `std::env::args()` would panic on a non-UTF-8 `--db-path`, so
+/// the walk is over `OsString` and mirrors clap: global flags may precede or
+/// follow `hook`, and only the first non-flag token after it is the name — a
+/// flag's value (`--db-path subagent-stop`) is never mistaken for it.
+pub fn argv_names_retired_hook<I>(args: I) -> bool
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    const VALUE_FLAGS: [&str; 3] = ["--db-path", "--projects-dir", "--limit"];
+    let mut args = args.into_iter();
+    let mut seen_hook = false;
+    while let Some(arg) = args.next() {
+        let Some(text) = arg.to_str() else {
+            if arg.as_encoded_bytes().starts_with(b"-") {
+                continue;
+            }
+            return false;
+        };
+        if text.starts_with('-') {
+            if VALUE_FLAGS.contains(&text) {
+                args.next();
+            }
+            continue;
+        }
+        if !seen_hook {
+            if text != "hook" {
+                return false;
+            }
+            seen_hook = true;
+            continue;
+        }
+        return is_retired_hook(text);
+    }
+    false
 }
 
 /// Whether this invocation will query the HNSW index, decided from the hook
@@ -629,7 +664,6 @@ pub async fn dispatch_hook(
         "session-end" => session_end::handle(&input, engine, &cwd).await,
         "precompact" => precompact::handle(&input, engine, &cwd).await,
         "stop" => stop::handle(&input, engine, &cwd).await,
-        "subagent-stop" => subagent_stop::handle(&input, engine, &cwd).await,
         "post-tool-use" => post_tool_use::handle(&input, engine, &cwd).await,
         "prompt-submit" => prompt_submit::handle(&input, engine, &cwd).await,
         _ => {
@@ -883,8 +917,6 @@ mod tests {
         // durable copy went to SQLite first.
         assert!(is_import_only_hook("stop"));
         assert!(is_import_only_hook("post-tool-use"));
-        // subagent-stop embeds intent events and writes them to SQLite.
-        assert!(is_import_only_hook("subagent-stop"));
         // session-start/prompt-submit query the index and MUST keep it loaded.
         // A regression that added either here would make it search an empty
         // index and silently return nothing.
@@ -929,12 +961,86 @@ mod tests {
     }
 
     #[test]
+    fn argv_names_the_retired_hook_only_as_the_hook_name() {
+        let argv = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for yes in [
+            &["csr-engine", "hook", "subagent-stop"][..],
+            &["csr-engine", "hook", "subagent-stop", "--db-path", "/x"],
+            &["csr-engine", "--db-path", "/x", "hook", "subagent-stop"],
+            &[
+                "csr-engine",
+                "hook",
+                "--projects-dir",
+                "/x",
+                "subagent-stop",
+            ],
+            &["csr-engine", "hook", "--db-path=/x", "subagent-stop"],
+        ] {
+            assert!(
+                argv_names_retired_hook(argv(&yes[0..]).into_iter().skip(1)),
+                "{yes:?}"
+            );
+        }
+        for no in [
+            &["csr-engine", "hook", "--db-path", "subagent-stop", "stop"][..],
+            &["csr-engine", "--db-path", "subagent-stop", "hook", "stop"],
+            &["csr-engine", "hook", "stop", "subagent-stop"],
+            &["csr-engine", "status", "subagent-stop"],
+            &["csr-engine", "subagent-stop"],
+            &["csr-engine", "hook"],
+            &["csr-engine"],
+        ] {
+            assert!(
+                !argv_names_retired_hook(argv(&no[0..]).into_iter().skip(1)),
+                "{no:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn argv_scan_survives_non_utf8_values() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe]);
+        let argv = |name: &str| vec!["hook".into(), name.into(), "--db-path".into(), bad.clone()];
+        assert!(argv_names_retired_hook(argv("subagent-stop")));
+        assert!(!argv_names_retired_hook(argv("stop")));
+        assert!(!argv_names_retired_hook(vec![
+            "hook".into(),
+            "--db-path".into(),
+            bad.clone(),
+            "stop".into()
+        ]));
+    }
+
+    #[test]
+    fn only_subagent_stop_is_retired() {
+        assert!(is_retired_hook("subagent-stop"));
+        for live in [
+            "session-start",
+            "session-briefing",
+            "session-end",
+            "precompact",
+            "stop",
+            "post-tool-use",
+            "prompt-submit",
+            "install",
+        ] {
+            assert!(!is_retired_hook(live), "{live} is a live hook");
+        }
+    }
+
+    #[test]
     fn no_hook_may_persist_the_index() {
         for hook in [
             "prompt-submit",
             "post-tool-use",
             "stop",
-            "subagent-stop",
             "session-start",
             "session-briefing",
             "precompact",

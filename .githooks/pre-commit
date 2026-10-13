@@ -1,6 +1,126 @@
 #!/bin/sh
+# Pre-commit gate, scoped to what the commit stages. The full suites run at the
+# release gate, not on every commit.
+#
+#   csr-engine/** (anything)                 cargo fmt --check, clippy on all targets
+#   csr-engine/src/<module>[/...]            + that module's lib tests
+#   csr-engine/src/lib.rs, Cargo.toml/.lock,
+#     build.rs                               + the whole lib suite
+#   csr-engine/tests/<target>.rs             + that integration target
+#   csr-engine/tests/fixtures/<name>         + the modules and targets that read it
+#   plugins/csr-companion/**                 the plugin's Python tests
+#   anything else                            nothing
+#
+# Cargo and the tests run under nice, on half the cores.
+# CSR_PRECOMMIT_FULL=1 runs the whole lib suite.
+# CSR_PRECOMMIT_PLAN=1 prints what would run and runs nothing.
 set -e
+
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+[ -n "$staged" ] || exit 0
+
+# git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks. Tests that run git in their own temp repos
+# would act on this repository's index instead, so nothing below inherits them.
+for var in $(env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p'); do
+  unset "$var"
+done
+
+cpus=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+jobs=$((cpus / 2))
+[ "$jobs" -ge 1 ] || jobs=1
+plan=${CSR_PRECOMMIT_PLAN:-0}
+
+run() {
+  if [ "$plan" = 1 ]; then
+    echo "plan: $*"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
+module_of() {
+  m=${1#csr-engine/src/}
+  m=${m%%/*}
+  echo "${m%.rs}"
+}
+
+plugin=0
+rust=0
+full=${CSR_PRECOMMIT_FULL:-0}
+mods=""
+targets=""
+
+IFS='
+'
+for f in $staged; do
+  case "$f" in
+    plugins/csr-companion/*) plugin=1 ;;
+    csr-engine/Cargo.toml | csr-engine/Cargo.lock | csr-engine/build.rs | csr-engine/src/lib.rs)
+      rust=1
+      full=1
+      ;;
+    csr-engine/src/main.rs) rust=1 ;;
+    csr-engine/src/*)
+      rust=1
+      mods="$mods $(module_of "$f")"
+      ;;
+    csr-engine/tests/fixtures/*)
+      rust=1
+      name=${f#csr-engine/tests/fixtures/}
+      name=${name%%/*}
+      # a path literal, or a bare name joined onto a fixtures dir: join("x.jsonl")
+      readers=$(cd csr-engine && grep -rlF -e "fixtures/$name" -e "\"$name\"" -e "\"$name/" src tests 2>/dev/null | grep '\.rs$' || true)
+      [ -n "$readers" ] || full=1
+      for r in $readers; do
+        case "$r" in
+          src/lib.rs | src/main.rs) full=1 ;;
+          src/*) mods="$mods $(module_of "csr-engine/$r")" ;;
+          tests/*.rs)
+            t=${r#tests/}
+            targets="$targets ${t%.rs}"
+            ;;
+        esac
+      done
+      ;;
+    csr-engine/tests/*.rs)
+      rust=1
+      t=${f#csr-engine/tests/}
+      targets="$targets ${t%.rs}"
+      ;;
+    csr-engine/*) rust=1 ;;
+  esac
+done
+unset IFS
+
+if [ "$plugin" = 1 ]; then
+  if [ "$plan" = 1 ]; then
+    echo "plan: python3 -m pytest plugins/csr-companion/tests -q -s"
+  else
+    home=$(mktemp -d /private/tmp/precommit-plugin-home.XXXXXX)
+    status=0
+    (cd plugins/csr-companion && HOME="$home" nice -n 10 python3 -m pytest tests -q -s </dev/null) || status=$?
+    rm -rf "$home"
+    [ "$status" = 0 ] || exit "$status"
+  fi
+fi
+
+[ "$rust" = 1 ] || exit 0
+
 cd csr-engine
-cargo fmt -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --lib 2>/dev/null
+export CARGO_BUILD_JOBS="$jobs"
+run cargo fmt -- --check
+run cargo clippy --all-targets -- -D warnings
+
+if [ "$full" = 1 ]; then
+  run cargo test --lib -- --test-threads="$jobs"
+elif [ -n "$mods" ]; then
+  filters=$(printf '%s\n' $mods | sort -u | sed 's/$/::/')
+  # shellcheck disable=SC2086
+  run cargo test --lib -- --test-threads="$jobs" $filters
+fi
+
+for t in $(printf '%s\n' $targets | sort -u); do
+  run cargo test --test "$t" -- --test-threads="$jobs"
+done
