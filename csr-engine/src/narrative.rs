@@ -37,13 +37,84 @@ pub fn model_candidates() -> Vec<Option<String>> {
     chain
 }
 
-/// Opt-out for [`isolation_args`]: keep loading the user's settings files in
-/// headless children. For installs whose credentials live there (`apiKeyHelper`,
-/// an `env` block selecting Bedrock or Vertex); hooks are still switched off.
+/// Keys inside a settings file's `env` object that select how, or as whom,
+/// Claude Code authenticates. Their presence means the credentials live in the
+/// settings files and a headless child needs those files loaded.
+const AUTH_ENV_KEYS: [&str; 9] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+];
+
+/// Names (never values) of the auth-bearing keys found across the given
+/// settings file texts. A text that does not parse as a JSON object counts as
+/// carrying none.
+fn auth_keys_in_settings(texts: &[&str]) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for text in texts {
+        let Ok(Value::Object(root)) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        if root.contains_key("apiKeyHelper") && !found.contains(&"apiKeyHelper") {
+            found.push("apiKeyHelper");
+        }
+        if let Some(Value::Object(env)) = root.get("env") {
+            for key in AUTH_ENV_KEYS {
+                if env.contains_key(key) && !found.contains(&key) {
+                    found.push(key);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Pure decision for [`isolation_args`]: keep the user's settings files in
+/// headless children? `override_env` is the raw `CSR_HEADLESS_USER_SETTINGS`
+/// value: `1`/`true` keeps, `0`/`false` isolates even when auth is detected,
+/// anything else (including unset) defers to the settings texts.
+fn keeps_user_settings(override_env: Option<&str>, settings_texts: &[&str]) -> bool {
+    if let Some(v) = override_env {
+        let v = v.trim();
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            return true;
+        }
+        if v == "0" || v.eq_ignore_ascii_case("false") {
+            return false;
+        }
+    }
+    !auth_keys_in_settings(settings_texts).is_empty()
+}
+
+/// Reads `settings.json` and `settings.local.json` from `CLAUDE_CONFIG_DIR`
+/// (else `$HOME/.claude`) and decides via [`keeps_user_settings`]. Unreadable
+/// files are skipped, which fails toward isolation. Only key names are logged.
 fn headless_keeps_user_settings() -> bool {
-    std::env::var("CSR_HEADLESS_USER_SETTINGS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    let override_env = std::env::var("CSR_HEADLESS_USER_SETTINGS").ok();
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    let texts: Vec<String> = dir
+        .iter()
+        .flat_map(|d| ["settings.json", "settings.local.json"].map(|f| d.join(f)))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let keep = keeps_user_settings(override_env.as_deref(), &refs);
+    tracing::debug!(
+        keep,
+        override_set = override_env.is_some(),
+        auth_keys = ?auth_keys_in_settings(&refs),
+        "headless user-settings decision"
+    );
+    keep
 }
 
 /// Argv that cuts a headless `claude -p` child off from the machine's Claude
@@ -59,8 +130,20 @@ fn headless_keeps_user_settings() -> bool {
 ///   14,186 files in one project directory, re-imported by the watcher as if
 ///   they were conversations, and 19,852 of 20,159 re-ranker harvest sources.
 ///
-/// Both are checked against `claude --help` once per process (~55ms): a CLI
-/// that predates an option rejects it outright, which would fail every call.
+/// Isolating settings would break users whose credentials live in them, so the
+/// settings files are kept (hooks still off, via `--settings
+/// {"disableAllHooks":true}`) when `CSR_HEADLESS_USER_SETTINGS=1|true`, or when
+/// `settings.json` / `settings.local.json` under `CLAUDE_CONFIG_DIR` (default
+/// `$HOME/.claude`) carry auth: a top-level `apiKeyHelper`, or an `env` object
+/// holding `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+/// `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `AWS_PROFILE`,
+/// `AWS_REGION`, `ANTHROPIC_VERTEX_PROJECT_ID` or `CLOUD_ML_REGION`.
+/// `CSR_HEADLESS_USER_SETTINGS=0|false` forces isolation regardless. A missing,
+/// unreadable or invalid file counts as no auth. Settings values are never
+/// logged.
+///
+/// Both options are checked against `claude --help` once per process (~55ms): a
+/// CLI that predates an option rejects it outright, which would fail every call.
 pub fn isolation_args() -> Vec<String> {
     static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     ARGS.get_or_init(|| {
@@ -287,6 +370,81 @@ mod tests {
                 "--no-session-persistence"
             ]
         );
+    }
+
+    const PLAIN: &str = r#"{"hooks":{"SessionStart":[]},"permissions":{"allow":["Bash"]},"env":{"FOO":"bar"},"model":"opus"}"#;
+
+    #[test]
+    fn api_key_helper_keeps_user_settings() {
+        assert!(keeps_user_settings(
+            None,
+            &[r#"{"apiKeyHelper":"/usr/local/bin/get-key"}"#]
+        ));
+    }
+
+    #[test]
+    fn env_selecting_a_provider_keeps_user_settings() {
+        assert!(keeps_user_settings(
+            None,
+            &[r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#]
+        ));
+        assert!(keeps_user_settings(
+            None,
+            &[r#"{"env":{"ANTHROPIC_BASE_URL":"https://gw.example"}}"#]
+        ));
+    }
+
+    #[test]
+    fn auth_only_in_settings_local_keeps_user_settings() {
+        assert!(keeps_user_settings(
+            None,
+            &[PLAIN, r#"{"env":{"AWS_PROFILE":"work"}}"#]
+        ));
+    }
+
+    #[test]
+    fn plain_settings_stay_isolated() {
+        assert!(!keeps_user_settings(None, &[PLAIN]));
+        assert!(!keeps_user_settings(None, &[]));
+        // A non-auth `env` key and a nested look-alike are not auth.
+        assert!(!keeps_user_settings(
+            None,
+            &[r#"{"permissions":{"apiKeyHelper":1},"env":{"EDITOR":"vim"}}"#]
+        ));
+    }
+
+    #[test]
+    fn invalid_settings_stay_isolated() {
+        assert!(!keeps_user_settings(None, &["{not json"]));
+        assert!(!keeps_user_settings(None, &[""]));
+        assert!(!keeps_user_settings(None, &["[1,2]"]));
+        // One bad file does not hide auth in the other.
+        assert!(keeps_user_settings(
+            None,
+            &["{not json", r#"{"apiKeyHelper":"x"}"#]
+        ));
+    }
+
+    #[test]
+    fn override_zero_isolates_even_with_auth() {
+        let auth = r#"{"apiKeyHelper":"x"}"#;
+        assert!(!keeps_user_settings(Some("0"), &[auth]));
+        assert!(!keeps_user_settings(Some("false"), &[auth]));
+        assert!(keeps_user_settings(Some("garbage"), &[auth]));
+    }
+
+    #[test]
+    fn override_one_keeps_without_auth() {
+        assert!(keeps_user_settings(Some("1"), &[PLAIN]));
+        assert!(keeps_user_settings(Some("TRUE"), &[]));
+    }
+
+    #[test]
+    fn auth_keys_report_names_only() {
+        let keys = auth_keys_in_settings(&[
+            r#"{"apiKeyHelper":"SECRET-HELPER","env":{"AWS_REGION":"SECRET-REGION"}}"#,
+        ]);
+        assert_eq!(keys, ["apiKeyHelper", "AWS_REGION"]);
     }
 
     const FIXTURE: &str = include_str!("../tests/fixtures/claude_p_result.json");
