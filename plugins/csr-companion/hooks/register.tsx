@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelForkResult, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
 
 import type { AgentState, CompactView, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
-import { anyActive, emptyAgentState, isEditTool, LIST_EVERY_MS, normalizePath, reconcileAgentList, reduceAgentEvent } from './agents'
-import type { AgentEvent } from './agents'
+import { anyActive, emptyAgentState, isEditTool, LIST_EVERY_MS, normalizePath, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent } from './agents'
+import type { AgentEvent, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
@@ -972,6 +972,7 @@ async function agentsChange($: EngineInterface, change: (state: AgentState) => A
 async function track($: EngineInterface, event: AgentEvent): Promise<void> {
   try {
     await agentsChange($, state => reduceAgentEvent(state, event))
+    void scheduleAgents($)
   } catch {}
 }
 
@@ -981,6 +982,37 @@ async function pollAgents($: EngineInterface): Promise<void> {
     const list = await $.agent.list()
     const at = await $.clock.now()
     await agentsChange($, state => reconcileAgentList(state, list, at))
+    void scheduleAgents($)
+  } catch {}
+}
+
+// The agents file, <HOME>/.claude-self-reflect/csr-companion/agents/<session>.json, what the pane draws In flight from:
+// a bounded projection of the state (agents.ts, projectAgentsFile), written through bin/private.py as JSON (0600, its
+// strings redacted again). The session id is checked before it is made a file name.
+const AGENTS_DIR = '.claude-self-reflect/csr-companion/agents' // under HOME
+const SESSION_NAME = /^[A-Za-z0-9_-]{1,128}$/
+
+async function writeAgents($: EngineInterface): Promise<void> {
+  const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+  const session = await $.session.id()
+  if (!home || !SESSION_NAME.test(session)) return
+  const file = projectAgentsFile(ownAgents(await read($, agentSession), session), await $.clock.now())
+  if (file.agents.length) await keepWrite($, `${home}/${AGENTS_DIR}/${session}.json`, JSON.stringify(file), 'json')
+}
+
+// At most one write in five seconds. The first goes at once; a change inside the interval sets one timer for its end
+// and the writes it covers are one (the state says when it is due, so a reload that lost the timer sets it again).
+async function scheduleAgents($: EngineInterface): Promise<void> {
+  try {
+    const now = await $.clock.now()
+    let plan = { act: 'none', wait: 0 } as Pick<WritePlan, 'act' | 'wait'>
+    await agentsChange($, state => {
+      const decided = planWrite(state, now)
+      plan = decided
+      return decided.state
+    })
+    if (plan.act === 'now') await writeAgents($)
+    else if (plan.act === 'later') $.clock.after(plan.wait, () => void scheduleAgents($))
   } catch {}
 }
 
@@ -1996,6 +2028,7 @@ export const register: Register = (on, options) => {
     person = e.isInteractive
     if (!e.isInteractive) return started
     watchAgents($) // the agents of this session: the minute poll, and one look at the list now
+    await agentsChange($, state => ({ ...state, fileDue: null })).catch(() => undefined) // a timer a reload cancelled is due no more
     await pollAgents($)
     await resumeArmed($).catch(() => undefined) // a reload mid-countdown: it runs on, never stuck at 0s
     await startSetup($).catch(() => undefined) // the walkthrough, at the start after the plugin is added

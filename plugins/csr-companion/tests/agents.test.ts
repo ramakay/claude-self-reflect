@@ -4,7 +4,8 @@ import type { On } from 'claude-code'
 import type { AgentState } from '../types'
 import {
   admitCompletion, claimCompletions, completionKey, emptyAgentState, fingerprint, isStalled, LEDGER_MAX, markDisposition, normalizePath,
-  pendingCompletions, reconcileAgentList, reduceAgentEvent, redactAgentValue, settleCompletions, stepKey, STALL_MS,
+  FILE_BYTES, FILE_EVERY_MS, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, redactAgentValue,
+  settleCompletions, stepKey, STALL_MS, utf8Length,
 } from '../hooks/agents'
 import type { Ledger } from '../hooks/agents'
 
@@ -60,6 +61,8 @@ type World = {
   spawn?: (e: { tool_use_id: string }) => Promise<unknown> | unknown // what a spawn comes to; the agent a1 on opus where left out
   toolRuns?: { count: number } // how many times the tool itself ran
   breakId?: { on: boolean } // the session id cannot be read: every observer fails
+  writes?: Array<{ path: string; text: string; flags: string[] }> // what bin/private.py was asked to keep
+  session?: string // the session id; sess-a where left out
 }
 
 // A session with a person at it, the agents' tools beneath the plugin, and the clock and store in memory.
@@ -73,7 +76,7 @@ function host(on: On, world: World = {}) {
   })
   on('session.id', async () => {
     if (world.breakId?.on) throw new Error('the session id is gone')
-    return { value: SESSION }
+    return { value: world.session ?? SESSION }
   })
   on('session.cwd', async () => ({ value: '/repo' }))
   on('session.surfaces', async () => ({ value: ['terminal'] }) as never)
@@ -82,6 +85,13 @@ function host(on: On, world: World = {}) {
   on('tool.call', async () => {
     if (world.toolRuns) world.toolRuns.count++
     return { result: 'ok', text: 'Saved' } as never
+  })
+  on('env.get', async (_$, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
+  on('process.run', async (_$, e) => {
+    if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/private.py')) { // private.py write PATH [--redact-json], text on stdin
+      world.writes?.push({ path: e.argv[4] as string, text: e.init?.stdin ?? '', flags: e.argv.slice(5) })
+    }
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('turn.step', async function* (_$, e) {
     return { turnId: e.turnId, index: e.index, answer: 'Looking at the files', toolUses: [], stopReason: 'end_turn', usage: USAGE } as never
@@ -332,4 +342,74 @@ test('redaction by agents.ts is the helper\'s table, and then some', async () =>
   expect(redactAgentValue('\x1b[31mred\x1b[0m \x1b]0;title\x07 bell\x07 ok')).toBe('red  bell ok')
   expect(redactAgentValue({ a: ['password=hunter2'], n: 3 })).toEqual({ a: ['password=[redacted]'], n: 3 })
   expect(redactAgentValue(redactAgentValue('password=hunter2 and sk-abcdefghijklmnopqrstuv'))).toBe('password=[redacted] and [redacted]')
+})
+
+test('the agents file is written at once, then at most every five seconds, terminal events included', async ($, on) => {
+  const writes: NonNullable<World['writes']> = []
+  const clock = host(on, { writes })
+  await spawn($, 'tu-1')
+  await settle(() => writes.length === 1)
+  expect(writes[0]!.path).toBe('/home/u/.claude-self-reflect/csr-companion/agents/sess-a.json')
+  expect(writes[0]!.flags).toEqual(['--redact-json']) // through the helper, as JSON: its strings redacted, then serialized
+  for (let n = 0; n < 10; n++) await edit($, 'a1', `tool-${n}`, `/repo/f${n}.ts`)
+  await step($, 'a1', 'turn-1', 0)
+  await finish($, 'a1', 'turn-1', 'The report.')
+  await clock.advance(FILE_EVERY_MS - 1)
+  expect(writes.length).toBe(1) // the burst is held back
+  await clock.advance(1)
+  await settle(() => writes.length === 2)
+  await clock.advance(FILE_EVERY_MS * 3)
+  expect(writes.length).toBe(2) // and it was one write: nothing changed since
+  const file = JSON.parse(writes[1]!.text)
+  expect(file.session).toBe(SESSION)
+  expect(file.agents[0].tools).toBe(10)
+  expect(file.agents[0].status).toBe('completed') // the terminal event reached the file within the interval
+  expect(file.agents[0].completion.answer).toBe('The report.')
+  expect(utf8Length(writes[1]!.text)).toBeLessThanOrEqual(FILE_BYTES)
+})
+
+test('a session id that could name another file is never written', async ($, on) => {
+  const writes: NonNullable<World['writes']> = []
+  host(on, { writes, session: '../../etc/x' })
+  await spawn($, 'tu-1')
+  await new Promise<void>(resolve => setTimeout(() => resolve(), 50))
+  expect(writes).toEqual([])
+})
+
+test('planWrite: the first write at once, the rest one trailing write, a lost timer counts for nothing', async () => {
+  let state = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'touch', at: T0, agentId: 'a1', tool: 'Bash' })
+  let plan = planWrite(state, T0)
+  expect(plan.act).toBe('now')
+  state = plan.state
+  plan = planWrite(state, T0 + 1000)
+  expect([plan.act, plan.wait]).toEqual(['later', FILE_EVERY_MS - 1000])
+  state = plan.state
+  expect(planWrite(state, T0 + 2000).act).toBe('none') // a timer is due: this change is covered by its write
+  expect(planWrite(state, T0 + FILE_EVERY_MS + 1).act).toBe('now') // the timer never fired (a reload): due is in the past
+  expect(planWrite(emptyAgentState(SESSION), T0).act).toBe('none') // no agents, no file
+})
+
+test('one parent and seven children, and multibyte reports, stay within 16 KB and 12 rows', async () => {
+  let state = emptyAgentState(SESSION)
+  const rec = (id: string, parent: string | null) => reduceAgentEvent(state, { kind: 'touch', at: T0, agentId: id, tool: 'Bash' }).rows[id]!
+  state = { ...state, rows: { p: { ...rec('p', null), type: 'Plan', model: 'opus' } } }
+  for (let n = 0; n < 7; n++) {
+    state = reduceAgentEvent(state, { kind: 'spawn', at: T0, toolUseId: `t${n}`, description: `Child ${n}`, type: 'Explore', parent: 'p', model: null })
+    state = reduceAgentEvent(state, { kind: 'spawned', at: T0, toolUseId: `t${n}`, agentId: `c${n}`, model: 'opus' })
+    state = reduceAgentEvent(state, { kind: 'complete', at: T0 + n, agentId: `c${n}`, turnId: 'turn-1', reason: 'answer', answer: '界'.repeat(700) })
+  }
+  const file = projectAgentsFile(state, T0 + 1000)
+  expect(file.agents.map(row => row.id).sort()).toEqual(['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'p'])
+  expect(file.agents[0]!.id).toBe('p') // the parent first
+  expect(file.agents.length).toBe(8)
+  expect(file.agents.slice(1).every(row => row.parent === 'p')).toBe(true)
+  const bytes = utf8Length(JSON.stringify(file))
+  expect(bytes).toBeLessThanOrEqual(FILE_BYTES)
+  expect(file.agents.every(row => row.completion === null || row.completion.answer.length > 0)).toBe(true) // squeezed, not emptied
+  // fourteen agents: twelve rows, the rest counted
+  for (let n = 0; n < 14; n++) state = reduceAgentEvent(state, { kind: 'touch', at: T0 + n, agentId: `z${n}`, tool: 'Bash' })
+  const many = projectAgentsFile(state, T0 + 1000)
+  expect(many.agents.length).toBeLessThanOrEqual(12)
+  expect(many.agents.length + many.omitted_agents).toBe(Object.keys(state.rows).length)
+  expect(utf8Length(JSON.stringify(many))).toBeLessThanOrEqual(FILE_BYTES)
 })

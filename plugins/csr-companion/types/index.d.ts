@@ -174,6 +174,8 @@ export type AgentState = {
   seen: CompletionKey[] // completions already taken in, newest last
   pending: Record<CompletionKey, PendingCompletion>
   listedAt: number | null
+  fileAt: number | null // when the agents file was last written
+  fileDue: number | null // when a write that was held back is due (a timer sets it off; a reload sets it again)
 }
 
 declare module 'claude-code' {

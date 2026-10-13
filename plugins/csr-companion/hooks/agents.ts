@@ -1,5 +1,5 @@
 import type {
-  AgentCompletion, AgentRec, AgentState, AgentStatusWord, CompletionDisposition, CompletionKey, PendingCompletion, PendingSpawn, StepKey,
+  AgentCompletion, AgentRec, AgentRow, AgentsFile, AgentState, AgentStatusWord, CompletionDisposition, CompletionKey, PendingCompletion, PendingSpawn, StepKey,
 } from '../types'
 
 // The agents of a session, as the typed events of Claude Code 2.1.296 tell them: a lifecycle reducer, a reconciler
@@ -36,7 +36,7 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 export const isEditTool = (tool: string) => EDIT_TOOLS.has(tool)
 
 export const emptyAgentState = (session: string): AgentState => ({
-  version: 1, session, rows: {}, spawns: {}, bound: {}, main: {}, mainOmitted: 0, seen: [], pending: {}, listedAt: null,
+  version: 1, session, rows: {}, spawns: {}, bound: {}, main: {}, mainOmitted: 0, seen: [], pending: {}, listedAt: null, fileAt: null, fileDue: null,
 })
 
 // ---------------------------------------------------------------- text that is kept
@@ -345,4 +345,158 @@ export function markDisposition(state: AgentState, keys: readonly CompletionKey[
   const rows = Object.fromEntries(Object.entries(state.rows).map(([id, row]) =>
     [id, row.completion && gone.has(row.completion.key) ? { ...row, completion: { ...row.completion, disposition } } : row]))
   return { ...state, pending, rows }
+}
+
+// ---------------------------------------------------------------- the agents file
+
+// <HOME>/.claude-self-reflect/csr-companion/agents/<session>.json is what the pane reads: a bounded projection, not the
+// lifecycle's truth (the state is). It is valid JSON of at most FILE_BYTES UTF-8 bytes and FILE_ROWS agents, written at
+// most once in FILE_EVERY_MS through bin/private.py (0600, credentials redacted again as JSON strings).
+export const FILE_BYTES = 16384
+export const FILE_ROWS = 12
+export const FILE_EVERY_MS = 5000
+export const EDITS_SHOWN = 8
+const ID = /^[A-Za-z0-9_.:@-]{1,128}$/
+export const safeId = (id: string) => ID.test(id)
+
+export function utf8Length(text: string): number {
+  let n = 0
+  for (const char of text) {
+    const code = char.codePointAt(0) as number
+    n += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4
+  }
+  return n
+}
+
+const clean = (text: string | null, most: number): string => cap(redactAgentValue(text ?? '').replace(/\s+/g, ' ').trim(), most)
+const cleanOrNull = (text: string | null, most: number): string | null => (text ? clean(text, most) || null : null)
+
+// A record as the file's row: its lists cut from what it wrote (the files the main loop also wrote first), every
+// free text redacted first and cut after.
+function rowOf(rec: AgentRec, main: Record<string, string>): AgentRow {
+  const prints = Object.keys(rec.paths)
+  const overlapping = prints.filter(print => print in main)
+  const named = (list: string[]) => list.map(print => rec.paths[print] as string).filter(path => path !== '').map(path => clean(path, 300)).sort()
+  const overlaps = named(overlapping)
+  const rest = named(prints.filter(print => !(print in main)))
+  const edits = [...overlaps, ...rest].slice(0, EDITS_SHOWN)
+  const shownOverlaps = overlaps.slice(0, EDITS_SHOWN)
+  const { paths: _paths, seenTools: _tools, seenSteps: _steps, ...row } = rec
+  return {
+    ...row,
+    id: rec.id,
+    parent: rec.parent && safeId(rec.parent) ? rec.parent : null,
+    description: clean(rec.description, DESC_MAX),
+    type: cleanOrNull(rec.type, 60),
+    model: cleanOrNull(rec.model, 80),
+    last: clean(rec.last, LAST_MAX),
+    last_tool: cleanOrNull(rec.last_tool, 60),
+    current_turn: rec.current_turn && safeId(rec.current_turn) ? rec.current_turn : null,
+    completion: rec.completion ? { ...rec.completion, answer: cap(redactAgentValue(rec.completion.answer), ANSWER_MAX) } : null,
+    edits,
+    edits_omitted: prints.length - edits.length,
+    overlaps: shownOverlaps,
+    overlaps_omitted: overlapping.length - shownOverlaps.length,
+  }
+}
+
+// Which agents the file shows: the running ones first, then the newest finished, parents with their children. A parent
+// the file cannot spare a place for is not left out when a child shown needs it (a minimal row stands in for it).
+const rank = (rec: AgentRec) => [isActive(rec.status) ? 0 : 1, -rec.last_at] as const
+function selection(state: AgentState): { chosen: AgentRec[]; omitted: number; minimal: Set<string> } {
+  const all = Object.values(state.rows).filter(rec => safeId(rec.id))
+  const byId = new Map(all.map(rec => [rec.id, rec]))
+  const ordered = [...all].sort((a, b) => rank(a)[0] - rank(b)[0] || rank(a)[1] - rank(b)[1] || (a.id < b.id ? -1 : 1))
+  const taken = new Set<string>()
+  for (const rec of ordered) {
+    if (taken.has(rec.id)) continue
+    const need: string[] = []
+    const seen = new Set<string>()
+    for (let at: AgentRec | undefined = rec; at && !seen.has(at.id); at = at.parent ? byId.get(at.parent) : undefined) {
+      seen.add(at.id)
+      if (!taken.has(at.id)) need.push(at.id)
+    }
+    if (taken.size + need.length > FILE_ROWS) continue
+    for (const id of need) taken.add(id)
+  }
+  // Those the order itself would show are full rows; an ancestor taken only for the child below it is a stand-in.
+  const own = new Set(ordered.slice(0, FILE_ROWS).map(rec => rec.id))
+  const minimal = new Set([...taken].filter(id => !own.has(id)))
+  const chosen = ordered.filter(rec => taken.has(rec.id))
+  return { chosen, omitted: all.length - chosen.length, minimal }
+}
+
+// Parents before children, each agent once; the order within a level is the selection's.
+function parentsFirst(rows: AgentRow[]): AgentRow[] {
+  const ids = new Set(rows.map(row => row.id))
+  const out: AgentRow[] = []
+  const done = new Set<string>()
+  const visit = (row: AgentRow, path: Set<string>) => {
+    if (done.has(row.id) || path.has(row.id)) return
+    const parent = row.parent && ids.has(row.parent) ? rows.find(other => other.id === row.parent) : undefined
+    if (parent) visit(parent, new Set([...path, row.id]))
+    if (!done.has(row.id)) {
+      done.add(row.id)
+      out.push(row)
+    }
+  }
+  for (const row of rows) visit(row, new Set())
+  return out
+}
+
+// What may go from a row to make the file fit, a step at a time, the least useful first. Each step cuts a field and
+// says how many paths it took out; none cuts serialized JSON.
+type Squeeze = (row: AgentRow) => AgentRow
+const cutLists = (most: number): Squeeze => row => ({
+  ...row,
+  edits: row.edits.slice(0, most), edits_omitted: row.edits_omitted + Math.max(0, row.edits.length - most),
+  overlaps: row.overlaps.slice(0, most), overlaps_omitted: row.overlaps_omitted + Math.max(0, row.overlaps.length - most),
+})
+const SQUEEZES: Squeeze[] = [
+  row => ({ ...row, last: cap(row.last, 120) }),
+  row => (row.completion ? { ...row, completion: { ...row.completion, answer: cap(row.completion.answer, 400) } } : row),
+  row => ({ ...row, description: cap(row.description, 80), last: cap(row.last, 60) }),
+  cutLists(4),
+  row => (row.completion ? { ...row, completion: { ...row.completion, answer: cap(row.completion.answer, 160) } } : row),
+  row => ({ ...row, last: '', description: cap(row.description, 40) }),
+  cutLists(1),
+  row => (row.completion ? { ...row, completion: { ...row.completion, answer: cap(row.completion.answer, 40) } } : row),
+  cutLists(0),
+  row => (row.completion ? { ...row, completion: { ...row.completion, answer: '' } } : row),
+]
+
+export function projectAgentsFile(state: AgentState, now: number): AgentsFile {
+  const { chosen, omitted, minimal } = selection(state)
+  let rows = parentsFirst(chosen.map(rec => rowOf(rec, state.main)))
+  // A stand-in ancestor carries its place in the tree and nothing more.
+  rows = rows.map(row => (minimal.has(row.id) ? cutLists(0)({ ...row, last: '', completion: row.completion && { ...row.completion, answer: '' } }) : row))
+  const file = (list: AgentRow[], gone: number): AgentsFile => ({ version: 1, session: state.session, at: now, agents: list, omitted_agents: gone })
+  let gone = omitted
+  const size = () => utf8Length(JSON.stringify(file(rows, gone)))
+  for (const squeeze of SQUEEZES) {
+    if (size() <= FILE_BYTES) break
+    rows = rows.map(squeeze)
+  }
+  // Still too big: the rows farthest down the order go, finished ones first, a parent only after its children.
+  while (rows.length > 1 && size() > FILE_BYTES) {
+    const parents = new Set(rows.map(row => row.parent))
+    const candidates = rows.filter(row => !parents.has(row.id))
+    const victim = [...candidates].sort((a, b) => Number(isActive(a.status)) - Number(isActive(b.status)) || a.last_at - b.last_at)[0] as AgentRow
+    rows = rows.filter(row => row !== victim)
+    gone += 1
+  }
+  return file(rows, gone)
+}
+
+// Whether the file is to be written now, later or not at all, and the state with that decided: at most one write in
+// FILE_EVERY_MS, the updates in between coalesced into one write when the interval is up. `fileDue` in the past is a timer
+// that never fired (a reload cancelled it): it counts for nothing.
+export type WritePlan = { act: 'now' | 'later' | 'none'; wait: number; state: AgentState }
+export function planWrite(state: AgentState, now: number): WritePlan {
+  if (!Object.keys(state.rows).length) return { act: 'none', wait: 0, state }
+  if (state.fileDue !== null && state.fileDue > now) return { act: 'none', wait: 0, state }
+  const since = state.fileAt === null ? Infinity : now - state.fileAt
+  if (since >= FILE_EVERY_MS || since < 0) return { act: 'now', wait: 0, state: { ...state, fileAt: now, fileDue: null } }
+  const due = (state.fileAt as number) + FILE_EVERY_MS
+  return { act: 'later', wait: due - now, state: { ...state, fileDue: due } }
 }

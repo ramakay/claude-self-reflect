@@ -60,6 +60,7 @@ def sibling(name):
 
 
 private = sibling('private')  # every write below goes through it: folders 0700, files 0600, credentials redacted
+agents_lib = sibling('agents')  # the agents of a session, as the hooks keep them (hooks/agents.ts writes, this reads)
 DB = os.path.join(HOME, '.claude-self-reflect', 'csr-engine.db')
 VERB = {'superseded_by': 'changed', 'anchor_obsolete': 'removed', 'anchor_reinstated': 'came back'}
 NESTED = ('/.claude/worktrees/', '/.worktrees/')
@@ -80,6 +81,7 @@ FORMER_DREAM_LOG = os.path.join(HOME, '.claude-self-reflect', 'csr-shifts', 'dre
 DREAMER_SAID = "CSR's dreamer asked this while you worked"
 PANES = os.path.join(KEEP, 'panes')  # <session>.json: the pid of the pane open beside that session
 STATUS_LINES = os.path.join(KEEP, 'statusline')  # <session>.json: Claude's status line, moved into the pane
+AGENTS = os.path.join(KEEP, 'agents')  # <session>.json: the session's agents, written by hooks/agents.ts
 
 
 def epoch(ts):
@@ -1782,6 +1784,7 @@ SECTION['told'], GLYPH['told'] = 'recall', '↑'  # what CSR told Claude at the 
 SECTION['last'], GLYPH['last'] = 'ctx', '§'  # the session before this one
 SECTION['todos'], GLYPH['todos'] = 'sepia', '◆'  # its leftover todos
 SECTION['compacted'], GLYPH['compacted'] = 'ctx', '§'  # CSR's own compaction: what it kept and learnt
+SECTION['flight'], GLYPH['flight'] = 'ctx', '»'  # In flight: the session's agents, and the Codex runs beside it
 DARK = (PIGMENT['payne'], PIGMENT['night'])  # the masthead's ground, each row a step darker in CIELAB from
 # payne, which sits clear of a dark terminal's own ground (herdr's is 40) so the masthead keeps its edge, down to
 # night; the cockpit's inks lie on top. The vertical tape runs on down the pane's edge in the last step.
@@ -2937,11 +2940,13 @@ def card_edge(rows, name, indent):
     return [tinted(line, band(name)) for line in lines[:-1]] + lines[-1:]
 
 
-def opened(rows, name, detail, width, ui, key, indent=None, whole=False):
+def opened(rows, name, detail, width, ui, key, indent=None, whole=False, hint=None):
     """A row a click opened: its whole text, what more CSR knows (four rows of it, each in two; whole: all of
-    it, never cut), and what a second click does."""
+    it, never cut), and what a second click does (hint, when the row says something else than "→ Claude's prompt")."""
     sent = ui.get('sent')
-    if sent and sent[0] == key:
+    if hint:
+        pass
+    elif sent and sent[0] == key:
         hint = "✓ now in Claude's prompt" if sent[1] else "✗ couldn't reach Claude's pane"
     else:
         hint = "↳ click again → Claude's prompt"
@@ -3663,15 +3668,112 @@ def page_main(data, s, now, ui=None):
         dict(name='rules', title='Your rules', right='', items=rules, empty='', at=latest(rules_at),
              brief=counted(len(rules), 'rule')),
     ]
-    sections[2:2] = lost_sections(s, now, 3 * more)
+    names = [section['name'] for section in sections]
+    after_dreams = names.index('dreams') + 1  # by name: the sections above it are not counted by position
+    sections[after_dreams:after_dreams] = lost_sections(s, now, 3 * more)
+    flight = flight_section(data.get('agents'), now, ui)
+    if flight:  # after the story, before What if…
+        sections.insert(names.index('story') + 1, flight)
     card = compact_section((data.get('infinite') or {}).get('card'), data.get('compacting'), lost_waiting(s.get('lost')))
     if card:  # CSR's own compaction: under the story, which is pinned on top (the feed keeps it there)
-        sections.insert(1, card)
+        sections.insert(names.index('story') + 1, card)
     head = dict(gauges=gauges(data.get('claude_fields'), data.get('claude_at'), s, now, data.get('limits'),
                               data.get('sts'), data.get('compacting')),
                 session=s if s.get('learned') else None, status=data.get('claude_line'))
     return dict(head=head, quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=sections)
+
+
+# ---------------------------------------------------------------- In flight: the session's agents
+
+FLIGHT_SHOWN = 4  # agents drawn before "and N more"
+FLIGHT_HINT = "the agent's words, not yours: click again to fold"
+
+
+def agents_of(session_id, folder=None):
+    """The session's agents as hooks/agents.ts last wrote them, checked: a file of another session or version, malformed,
+    over its size, a link or unreadable reads as no agents (bin/agents.py, read_agents)."""
+    if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)):
+        return agents_lib.empty()
+    return agents_lib.read_agents(os.path.join(folder or AGENTS, f'{session_id}.json'), str(session_id))
+
+
+def flight_minutes(row, now):
+    """Minutes an agent has worked: from its start (else when it was first seen) to now while it runs, else to its last event."""
+    begun = (row['started'] or row['first_seen']) / 1000
+    end = now if agents_lib.is_active(row) else row['last_at'] / 1000
+    return max(0, int((end - begun) // 60))
+
+
+def flight_item(row, depth, unknown, now):
+    """One agent as a row: type and model (and "done" once it ended) on the title, which a minute passing never changes;
+    minutes, tools and its last words under it; a flag when it stalled, failed, was killed, said nothing, or wrote a file
+    Claude also wrote. A finished one opens to its report, the agent's words, which is never put in Claude's prompt."""
+    status = row['status']
+    base = ' · '.join(x for x in (row['type'] or 'agent', row['model'], {'completed': 'done', 'failed': 'failed', 'killed': 'killed'}.get(status)) if x)
+    last = row['last'] or (f"using {row['last_tool']}" if row['last_tool'] else '')
+    body = ' · '.join(x for x in (f"{flight_minutes(row, now)}m", counted(row['tools'], 'tool'), one_line(last, 200)) if x)
+    report = agents_lib.reported(row)
+    overlap = ('also edited by Claude this session' + (f": {short_path(row['overlaps'][0], 2)}" if row['overlaps'] else '')
+               + (f" (+{len(row['overlaps']) - 1 + row['overlaps_omitted']})" if len(row['overlaps']) - 1 + row['overlaps_omitted'] > 0 else ''))
+    if agents_lib.stalled(row, now):
+        flag = f"stalled {int((now - row['last_at'] / 1000) // 60)}m"
+    elif status in ('failed', 'killed'):
+        flag = status
+    elif agents_lib.no_report(row):
+        flag = 'no report'
+    else:
+        flag = ''
+    flags = [x for x in (flag, overlap if row['overlaps'] or row['overlaps_omitted'] else '') if x]
+    detail = []
+    if report:
+        detail = ['What it found — the agent’s words', one_line(report, 700)]
+    if row['edits'] or row['edits_omitted']:
+        shown = ', '.join(short_path(path, 2) for path in row['edits'][:4])
+        detail.append('Wrote: ' + shown + (f" (+{len(row['edits']) - 4 + row['edits_omitted']} more)" if len(row['edits']) > 4 or row['edits_omitted'] else ''))
+    if unknown:
+        detail.append('Its parent is not in this list.')
+    guide = '│ ' * (depth - 1) + '└ ' if depth else ''  # a title is wrapped by words, so a tree is drawn in marks, not spaces
+    return dict(key='flight:' + row['id'], title=guide + base, lines=1, body=[' ' * (2 * depth) + body] if body else [],
+                fit_body=True, flag=flags[0] if flags else '', meta=flags[1] if len(flags) > 1 else '', detail=detail,
+                whole_detail=True, send='', nosend=True, hint=FLIGHT_HINT, unrated=True)
+
+
+def flight_section(agents, now, ui=None):
+    """In flight: the session's agents depth-first, four by default and "and N more" after them. Open while any agent is
+    pending, running or waiting, or a report came in the last 30 minutes; else one folded row. None without agents."""
+    rows = (agents or {}).get('agents') or []
+    if not rows:
+        return None
+    folds = (ui or {}).get('folds') or ()
+    tree = agents_lib.tree(rows)
+    live = sum(1 for row in rows if agents_lib.is_active(row))
+    recent = agents_lib.recent_completion(rows, now)
+    is_open = bool(live or recent is not None)
+    times = [row['last_at'] / 1000 for row in rows]
+    left = (agents or {}).get('omitted_agents') or 0
+    if is_open:
+        right = ' · '.join(x for x in (f'{live} running' if live else 'all finished', f'+{left} not shown' if left else '') if x)
+    else:
+        right = f'{len(rows)} finished'
+    items = []
+    unfolded = 'flight' in folds
+    if not is_open and not unfolded:
+        ago_text = age_of(now - max(times))
+        items.append(dict(key='fold:flight', quiet=True, lines=1, title=f"› {counted(len(rows), 'agent')} finished · {ago_text} ago",
+                          detail=[], send=''))
+    else:
+        if not is_open:
+            items.append(dict(key='fold:flight', quiet=True, lines=1, title='⌄ ' + f"{counted(len(rows), 'agent')} finished", detail=[], send=''))
+        more = 'flight-more' in folds or not is_open
+        shown = tree if more else tree[:FLIGHT_SHOWN]
+        items += [flight_item(row, depth, unknown, now) for row, depth, unknown in shown]
+        if is_open and len(tree) > FLIGHT_SHOWN:
+            hidden = len(tree) - FLIGHT_SHOWN
+            items.append(dict(key='fold:flight-more', quiet=True, lines=1, detail=[], send='',
+                              title=('⌄ fewer' if more else f'› and {hidden} more'), unsigned=True))
+    return dict(name='flight', title='In flight', right=right, items=items, empty='', count=live or len(rows), live=True,
+                active=is_open, at=max(times), brief=f"{live} running" if live else counted(len(rows), 'agent'))
 
 
 # ---------------------------------------------------------------- the default view
@@ -3962,7 +4064,7 @@ def page_lines(page, width, rows, ui):
             rows_ = item_rows(item, section['name'], width, is_open, at, heart)
             if is_open:
                 rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'], indent=at,
-                               whole=item.get('whole_detail', False))
+                               whole=item.get('whole_detail', False), hint=item.get('hint'))
             blocks.append((rows_, item))
             blocks += answer_rows(item, width, ui) + lost_rows(item, width, ui, is_open)
         if blocks:
@@ -4054,7 +4156,10 @@ def draw_main(data, s, cols, rows, now, ui=None, hold=None, hold_quiet=None, fee
     if feed is not None and hold is None:
         page = feed.page(page, now)
     if hold is not None:  # held still while Claude works, but a notice whose time is up leaves all the same
-        page['sections'] = living(hold, now)
+        fresh = [section for section in page['sections'] if section['name'] == 'flight' and section['items']]
+        kept = [section for section in living(hold, now) if section['name'] != 'flight']  # In flight is never held
+        at = 1 if kept and kept[0]['name'] in PINNED else 0
+        page['sections'] = kept[:at] + fresh + kept[at:]
         page['quiet'] = hold_quiet if hold_quiet is not None else page.get('quiet')
     lines, pictures = draw_page(page, cols, rows, ui or {})
     lines.sections, lines.quiet = page['sections'], page.get('quiet')
@@ -4201,7 +4306,7 @@ class Feed:
             # a notice's clock starts at its own event; with none, when the pane first saw this content. born may
             # be set to None on purpose (the default view's cards): their news is this session's start
             born = section['born'] if 'born' in section else section.get('at')
-            entry['born'], entry['timed'] = born or entry['since'], timed(section)
+            entry['born'], entry['timed'], entry['active'] = born or entry['since'], timed(section), bool(section.get('active'))
         self.primed = True
 
     def when(self, name):
@@ -4218,7 +4323,7 @@ class Feed:
         back waits out SEEN_MIN on screen again, however old. The story never sinks (it is pinned), nor does a
         notice: it leaves on its clock instead."""
         entry = self.entries.get(name)
-        if not entry or entry['seen'] is None or name in PINNED or entry.get('timed'):
+        if not entry or entry['seen'] is None or name in PINNED or entry.get('timed') or entry.get('active'):
             return False
         return now - entry['seen'] >= SEEN_MIN or (not entry['back'] and now - self.when(name) > STALE)
 
@@ -6387,6 +6492,7 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
+            self.data['agents'] = fail_open(agents_of, agents_lib.empty(), self.session and self.session.id)
             # each of these reads a file of someone else's: one that fails is empty, it never blanks the pane
             self.data['claude_fields'], self.data['claude_at'] = fail_open(
                 kept_status, ({}, None), self.session and self.session.id, now)
@@ -6436,7 +6542,7 @@ class Pane:
                           [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held, self.data.get('agents'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
                           value_pieces(self.data.get('value')),  # what it says: the dollars under it move each step
@@ -6618,6 +6724,8 @@ class Pane:
         elif act['key'] != self.open:
             self.open, self.sent = act['key'], None
             self.anchor = (act['key'], row) if self.view == 'main' else None
+        elif act.get('nosend'):  # an agent's report is its words, not yours: a second click folds the row, it sends nothing
+            self.open, self.sent = None, None
         else:
             agent = agent_pane(self.agent)
             went = send_text(agent, act['send'])
