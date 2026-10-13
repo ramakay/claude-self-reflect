@@ -7,7 +7,7 @@ import {
   FILE_BYTES, FILE_EVERY_MS, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, redactAgentValue,
   settleCompletions, stepKey, STALL_MS, utf8Length,
 } from '../hooks/agents'
-import { associateHandoff, completionNews, ENVELOPE_CLOSE, ENVELOPE_OPEN, HANDOFF_INSTRUCTION, parseAgentEnvelope, parseAgentEnvelopes, stripEnvelopes } from '../hooks/agents'
+import { associateHandoff, completionNews, ENVELOPE_CLOSE, ENVELOPE_MAX, ENVELOPE_OPEN, HANDOFF_INSTRUCTION, parseAgentEnvelope, parseAgentEnvelopes, stripEnvelopes } from '../hooks/agents'
 import type { Ledger } from '../hooks/agents'
 import { ownWords } from '../hooks/dreamer'
 
@@ -464,6 +464,23 @@ test('the envelope is read, taken out of the person\'s words, and only a whole v
     expect(parseAgentEnvelope(kept)).toBe(null)
   }
   expect(ownWords('Mind [[CSR:AGENTS:v1]] in prose')).toBe('Mind [[CSR:AGENTS:v1]] in prose')
+})
+
+test('the size limit is on the bytes the envelope takes in the text, line endings included', async () => {
+  const handoff = { kind: 'handoff', session: SESSION, request: 'req-1', thread: '0123456789ab', instruction: HANDOFF_INSTRUCTION }
+  const json = JSON.stringify(handoff)
+  const exactly = (ends: string) => {
+    const plain = `${ENVELOPE_OPEN}\n${json}\n${ENVELOPE_CLOSE}\n`
+    const body = json + ' '.repeat(ENVELOPE_MAX - utf8Length(plain)) // JSON ignores the padding: the LF envelope is exactly at the limit
+    return `${ENVELOPE_OPEN}\n${body}\n${ENVELOPE_CLOSE}\n`.replace(/\n/g, ends)
+  }
+  const lf = exactly('\n')
+  expect(utf8Length(lf)).toBe(ENVELOPE_MAX)
+  expect(parseAgentEnvelope(lf)?.payload).toEqual(handoff) // at the limit with LF: read
+  const crlf = lf.replace(/\n/g, '\r\n')
+  expect(utf8Length(crlf)).toBe(ENVELOPE_MAX + 3)
+  expect(parseAgentEnvelope(crlf)).toBe(null) // the same envelope with CRLF takes 3 more bytes: over
+  expect(stripEnvelopes(crlf)).toBe(crlf)
 })
 
 test('completion news is the claimed runs the envelope reports, by identity', async () => {

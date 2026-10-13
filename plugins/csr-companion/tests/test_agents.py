@@ -485,6 +485,19 @@ class TheEnvelope(unittest.TestCase):
         fitted = agents_lib.context_envelope(dict(agents=wide['agents'], omitted_agents=0, at=1.0), SESSION) if False else None
         self.assertIsNone(fitted)
 
+    def test_the_size_limit_is_on_the_bytes_the_text_takes_line_endings_included(self):
+        payload = dict(kind='handoff', session=SESSION, request='req-1', thread='0123456789ab', instruction=agents_lib.HANDOFF_INSTRUCTION)
+        text = agents_lib.format_agents_context(payload)
+        body = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        pad = agents_lib.MAX_ENVELOPE - len(text.encode('utf-8'))
+        lf = f'{agents_lib.OPEN}\n{body}{" " * pad}\n{agents_lib.CLOSE}\n'  # JSON ignores the padding: exactly at the limit
+        self.assertEqual(len(lf.encode('utf-8')), agents_lib.MAX_ENVELOPE)
+        self.assertEqual([p for _, _, p in agents_lib.parse_envelopes(lf)], [payload])
+        crlf = lf.replace('\n', '\r\n')
+        self.assertEqual(len(crlf.encode('utf-8')), agents_lib.MAX_ENVELOPE + 3)
+        self.assertEqual(agents_lib.parse_envelopes(crlf), [])  # the same envelope with CRLF takes 3 more bytes
+        self.assertEqual(agents_lib.strip_envelopes(crlf), crlf)
+
     def test_a_handoff_envelope_carries_its_instruction_word_for_word(self):
         payload = dict(kind='handoff', session=SESSION, request='req-1', thread='0123456789ab', instruction=agents_lib.HANDOFF_INSTRUCTION)
         text = agents_lib.format_agents_context(payload)

@@ -607,7 +607,12 @@ export function parseAgentEnvelopes(source: string): Envelope[] {
     const middle = unr(lines[i + 1] as string)
     const tail = unr(lines[i + 2] as string)
     if (head !== ENVELOPE_OPEN || tail !== ENVELOPE_CLOSE || middle.includes('\r')) continue
-    if (utf8Length(`${ENVELOPE_OPEN}\n${middle}\n${ENVELOPE_CLOSE}\n`) > ENVELOPE_MAX) continue
+    const last = i + 2 === lines.length - 1
+    const end = last ? source.length : (starts[i + 2] as number) + (lines[i + 2] as string).length + 1
+    // The bytes the text spends on it, line endings included (a CRLF envelope is longer than its LF twin); a closing line
+    // that stops the text counts its newline, as the formatter writes it.
+    const span = source.slice(starts[i] as number, end)
+    if (utf8Length(span) + (span.endsWith('\n') ? 0 : 1) > ENVELOPE_MAX) continue
     let payload: unknown
     try {
       payload = JSON.parse(middle)
@@ -615,8 +620,7 @@ export function parseAgentEnvelopes(source: string): Envelope[] {
       continue
     }
     if (!isObject(payload) || !(validContext(payload) || validHandoff(payload))) continue
-    const last = i + 2 === lines.length - 1
-    found.push({ start: starts[i] as number, end: last ? source.length : (starts[i + 2] as number) + (lines[i + 2] as string).length + 1, payload: payload as ContextPayload | HandoffPayload })
+    found.push({ start: starts[i] as number, end, payload: payload as ContextPayload | HandoffPayload })
     i += 2
   }
   return found

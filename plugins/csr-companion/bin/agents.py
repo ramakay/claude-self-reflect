@@ -310,10 +310,13 @@ def parse_envelopes(text):
                 payload = json.loads(middle)
             except (ValueError, RecursionError):
                 payload = None
-            size = len(f'{OPEN}\n{middle}\n{CLOSE}\n'.encode('utf-8', 'surrogatepass'))
+            last = i + 2 == len(lines) - 1
+            end = len(text) if last else starts[i + 2] + len(lines[i + 2]) + 1
+            # The bytes the text spends on it, line endings included (a CRLF envelope is longer than its LF twin); a closing
+            # line that stops the text counts its newline, as format_agents_context writes it.
+            span = text[starts[i]:end]
+            size = len(span.encode('utf-8', 'surrogatepass')) + (0 if span.endswith('\n') else 1)
             if payload is not None and size <= MAX_ENVELOPE and valid_payload(payload):
-                last = i + 2 == len(lines) - 1
-                end = len(text) if last else starts[i + 2] + len(lines[i + 2]) + 1
                 found.append((starts[i], end, payload))
                 i += 3
                 continue
