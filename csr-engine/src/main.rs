@@ -451,6 +451,11 @@ enum BackfillAction {
         /// (narrator, ratification, briefing children); skip the emission scrub.
         #[arg(long)]
         agent_transcripts: bool,
+        /// Also scrub conversations active in the last 15 minutes (source file
+        /// or newest chunk). Off by default: a live session's hooks may be
+        /// writing them.
+        #[arg(long)]
+        include_active: bool,
     },
 }
 
@@ -1332,6 +1337,7 @@ async fn run(
                 dry_run,
                 conversation,
                 agent_transcripts,
+                include_active,
             },
     }) = &args.command
     {
@@ -1341,6 +1347,7 @@ async fn run(
                 &storage,
                 conversation.as_deref(),
                 *agent_transcripts,
+                *include_active,
             )?
         } else {
             let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
@@ -1349,6 +1356,7 @@ async fn run(
                 false,
                 conversation.as_deref(),
                 *agent_transcripts,
+                *include_active,
             )
             .await?
         };

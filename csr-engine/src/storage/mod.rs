@@ -960,6 +960,20 @@ impl Storage {
         Ok(chunks)
     }
 
+    /// Run `apply` in one `BEGIN IMMEDIATE` transaction: the write lock is taken
+    /// before the first read, so what `apply` reads cannot change before it
+    /// writes. Commits when `apply` returns `Ok`; any error rolls everything back.
+    pub fn with_immediate_transaction<T>(
+        &self,
+        apply: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let value = apply(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     /// How long this connection waits for another writer before SQLITE_BUSY.
     /// Maintenance commands raise it: they share the database with live hooks.
     pub fn set_busy_timeout(&self, timeout: std::time::Duration) -> Result<()> {
