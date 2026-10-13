@@ -511,6 +511,25 @@ pub fn spawn_for_daemon(
     shutdown: Arc<AtomicBool>,
     sync_nudge: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_for_daemon_with(
+        embeddings,
+        search,
+        db_path,
+        shutdown,
+        sync_nudge,
+        CALL_TIMEOUT,
+    )
+}
+
+/// [`spawn_for_daemon`] giving up on a connection after `serve_timeout`.
+fn spawn_for_daemon_with(
+    embeddings: Arc<EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+    db_path: &Path,
+    shutdown: Arc<AtomicBool>,
+    sync_nudge: Arc<Notify>,
+    serve_timeout: Duration,
+) -> tokio::task::JoinHandle<()> {
     let data_dir = db_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let database = db_path
         .file_name()
@@ -544,9 +563,18 @@ pub fn spawn_for_daemon(
                 let (database, nudge, slots) =
                     (database.clone(), sync_nudge.clone(), slots.clone());
                 tokio::spawn(async move {
+                    // Admission before anything is read or allocated: at most
+                    // SERVER_SLOTS requests are buffered or computing, and a
+                    // slot is held until its blocking work has finished, not
+                    // just until this connection gives up waiting for it.
+                    let Ok(Ok(slot)) =
+                        tokio::time::timeout(serve_timeout, slots.acquire_owned()).await
+                    else {
+                        return;
+                    };
                     let _ = tokio::time::timeout(
-                        CALL_TIMEOUT,
-                        serve_one(stream, embeddings, search, database, nudge, slots),
+                        serve_timeout,
+                        serve_one(stream, embeddings, search, database, nudge, slot),
                     )
                     .await;
                 });
@@ -564,7 +592,7 @@ async fn serve_one(
     search: Arc<RwLock<SearchEngine>>,
     database: String,
     nudge: Arc<Notify>,
-    slots: Arc<Semaphore>,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> Option<()> {
     let size = stream.read_u32().await.ok()? as usize;
     if size > MAX_FRAME {
@@ -578,8 +606,8 @@ async fn serve_one(
     if request.version != VERSION || request.database != database {
         return None;
     }
-    let _slot = slots.acquire_owned().await.ok()?;
     let reply = tokio::task::spawn_blocking(move || -> Result<Reply> {
+        let _slot = slot;
         Ok(match request.op {
             Op::Ping => Reply::Pong,
             Op::Embed { texts } => {
@@ -1014,6 +1042,146 @@ mod tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].search_path.as_deref(), Some(PATH_DAEMON));
         daemon.stop().await;
+    }
+
+    /// Send raw bytes; `Some(reply)` if the server answered a full frame.
+    fn raw(data_dir: &Path, bytes: &[u8], close_after: bool) -> Option<Vec<u8>> {
+        let mut stream = std::os::unix::net::UnixStream::connect(socket_path(data_dir)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        stream.write_all(bytes).ok()?;
+        if close_after {
+            stream.shutdown(std::net::Shutdown::Write).ok()?;
+        }
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).ok()?;
+        let mut body = vec![0; u32::from_be_bytes(header) as usize];
+        stream.read_exact(&mut body).ok()?;
+        Some(body)
+    }
+
+    fn frame(json: &str) -> Vec<u8> {
+        let mut bytes = (json.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(json.as_bytes());
+        bytes
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn malformed_and_oversized_frames_get_no_answer_and_break_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, _) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let dir = tmp.path().to_path_buf();
+        let ping = r#"{"version":1,"database":"csr-engine.db","op":{"op":"ping"}}"#;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("not json", frame("not json")),
+            (
+                "wrong version",
+                frame(r#"{"version":9,"database":"csr-engine.db","op":{"op":"ping"}}"#),
+            ),
+            (
+                "other database",
+                frame(r#"{"version":1,"database":"other.db","op":{"op":"ping"}}"#),
+            ),
+            (
+                "unknown op",
+                frame(r#"{"version":1,"database":"csr-engine.db","op":{"op":"drop"}}"#),
+            ),
+            ("oversized", ((MAX_FRAME + 1) as u32).to_be_bytes().to_vec()),
+            ("truncated", {
+                let mut bytes = 100u32.to_be_bytes().to_vec();
+                bytes.extend_from_slice(b"{\"version\"");
+                bytes
+            }),
+        ];
+        let answered = tokio::task::spawn_blocking(move || {
+            let mut answered = Vec::new();
+            for (name, bytes) in cases {
+                answered.push((name, raw(&dir, &bytes, true).is_some()));
+            }
+            (answered, raw(&dir, &frame(ping), false))
+        })
+        .await
+        .unwrap();
+        for (name, got_reply) in answered.0 {
+            assert!(!got_reply, "{name} must get no answer");
+        }
+        let pong: Response = serde_json::from_slice(&answered.1.expect("still serving")).unwrap();
+        assert!(matches!(pong.reply, Reply::Pong));
+        daemon.stop().await;
+    }
+
+    /// Review finding #6: a connection that gives up must not free its slot
+    /// while its blocking work still runs, or waves of slow requests pile up
+    /// unbounded work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slots_stay_held_until_the_blocking_work_finishes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, _) = seed(tmp.path());
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let index = SearchEngine::load_from_disk(
+            &tmp.path().join("index"),
+            storage.count_chunk_embeddings().unwrap(),
+            storage.count_reflection_embeddings().unwrap(),
+        )
+        .unwrap();
+        let search = Arc::new(RwLock::new(index));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server = spawn_for_daemon_with(
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            search.clone(),
+            &db,
+            shutdown.clone(),
+            Arc::new(Notify::new()),
+            Duration::from_millis(200),
+        );
+        while !socket_path(tmp.path()).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Every search now blocks on the index lock.
+        let held = search.write().await;
+        let dir = tmp.path().to_path_buf();
+        let vector: Vec<f32> = direction(1);
+        let search_frame = frame(
+            &serde_json::to_string(&Request {
+                version: VERSION,
+                database: "csr-engine.db".into(),
+                op: Op::SearchChunks {
+                    vector,
+                    limit: 3,
+                    min_score: -1.0,
+                    allowed: None,
+                },
+            })
+            .unwrap(),
+        );
+        let ping = frame(r#"{"version":1,"database":"csr-engine.db","op":{"op":"ping"}}"#);
+        let stuck: Vec<_> = (0..SERVER_SLOTS)
+            .map(|_| {
+                let (dir, bytes) = (dir.clone(), search_frame.clone());
+                std::thread::spawn(move || raw(&dir, &bytes, false))
+            })
+            .collect();
+        // Well past the server's give-up time: the old code freed the slots here.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let (d, p) = (dir.clone(), ping.clone());
+        let refused = tokio::task::spawn_blocking(move || raw(&d, &p, false))
+            .await
+            .unwrap();
+        assert!(
+            refused.is_none(),
+            "no slot while eight jobs are still blocked"
+        );
+        drop(held);
+        for thread in stuck {
+            let _ = thread.join();
+        }
+        let (d, p) = (dir.clone(), ping.clone());
+        let answered = tokio::task::spawn_blocking(move || raw(&d, &p, false))
+            .await
+            .unwrap();
+        assert!(answered.is_some(), "slots come back once the work finishes");
+        shutdown.store(true, Ordering::SeqCst);
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

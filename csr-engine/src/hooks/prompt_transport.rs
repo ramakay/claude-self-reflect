@@ -523,7 +523,23 @@ mod tests {
         let stale = std::os::unix::net::UnixListener::bind(socket_path(dir.path())).unwrap();
         drop(stale);
         assert!(request(dir.path(), input(dir.path())).await.is_none());
-        let recovered = BoundSocket::bind(dir.path()).unwrap();
+        // Re-taking the lock this test just released can briefly see it held
+        // when another test's child process is being spawned at that moment
+        // (the open lock descriptor is shared until the child's exec closes
+        // it): retry instead of failing on that unrelated window.
+        let recovered = {
+            let mut attempts = 0;
+            loop {
+                match BoundSocket::bind(dir.path()) {
+                    Ok(bound) => break bound,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempts < 50 => {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        };
         drop(recovered);
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = spawn_for_daemon(fixture(dir.path()), shutdown.clone());
