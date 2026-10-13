@@ -897,9 +897,15 @@ impl SearchEngine {
         // both sides — a compaction is a single atomic swap of the whole
         // manifest, so a stale engine must not publish EITHER side from
         // memory, not just the one whose dirty flag happens to be set.
-        let on_disk_epoch = existing_manifest.as_ref().map(|m| m.epoch).unwrap_or(0);
-        let stale_generation =
-            self.manifest_backed && existing_manifest.is_some() && on_disk_epoch > self.epoch;
+        // The maintenance generation counts too: a maintenance pass removes the
+        // manifest but leaves the generation it raised, so an engine loaded
+        // before the pass stays stale whether or not a manifest is on disk.
+        let on_disk_epoch = existing_manifest
+            .as_ref()
+            .map(|m| m.epoch)
+            .unwrap_or(0)
+            .max(read_maintenance_generation(dir));
+        let stale_generation = self.manifest_backed && on_disk_epoch > self.epoch;
         if stale_generation {
             tracing::warn!(
                 on_disk_epoch,
@@ -909,6 +915,19 @@ impl SearchEngine {
                  Any genuine new content already in SQLite is picked up by the next load's \
                  additive backfill."
             );
+        }
+
+        // Stale, and no manifest to carry forward (a maintenance pass removed it
+        // and has not published yet): there is nothing true this engine can
+        // publish. Write nothing; the next load rebuilds or loads the pass's.
+        if stale_generation && existing_manifest.is_none() {
+            return Ok(Published {
+                generation: self.generation,
+                chunk_changes: self.chunk_changes,
+                reflection_changes: self.reflection_changes,
+                stale_generation,
+                new_epoch: on_disk_epoch,
+            });
         }
 
         // Dump a side to a NEW generation only when it actually changed (skip empty
@@ -1042,6 +1061,11 @@ impl SearchEngine {
         };
 
         write_manifest_atomically(dir, &manifest)?;
+        if !self.manifest_backed {
+            // A full rebuild: keep the maintenance generation level with the
+            // epoch it published, so it never depends on the manifest surviving.
+            write_maintenance_generation(dir, new_epoch)?;
+        }
 
         // Clean numbered generations not referenced by the newly committed manifest.
         cleanup_stale_index_files(dir);
@@ -1152,6 +1176,17 @@ impl SearchEngine {
                 expected = "1 or 2",
                 found = manifest.version,
                 "index cache version mismatch"
+            );
+            return None;
+        }
+        // Published from a graph loaded before the last maintenance pass (an
+        // older binary that does not read the generation): not to be trusted.
+        let floor = read_maintenance_generation(dir);
+        if manifest.epoch < floor {
+            tracing::info!(
+                manifest_epoch = manifest.epoch,
+                maintenance_generation = floor,
+                "index cache predates the last maintenance pass"
             );
             return None;
         }
@@ -1340,6 +1375,69 @@ fn sync_index_pair(dir: &Path, basename: &str) -> Result<()> {
         std::fs::File::open(dir.join(format!("{basename}{extension}")))?.sync_all()?;
     }
     Ok(())
+}
+
+/// Index-dir file holding the maintenance generation: a counter that only
+/// grows and, unlike the manifest's `epoch`, survives manifest invalidation.
+/// Every publisher reads it under `index.lock`; an engine whose epoch is below
+/// it loaded its graph before a maintenance pass and must never publish from
+/// memory again (astra #6: invalidation used to delete the only epoch record,
+/// so the pass's rebuild republished epoch 1 and a pre-scrub engine still at 1
+/// restored the old vectors).
+const MAINTENANCE_GENERATION_FILE: &str = "generation";
+
+/// The maintenance generation recorded in `dir`; 0 when none is.
+pub fn read_maintenance_generation(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(MAINTENANCE_GENERATION_FILE))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_maintenance_generation(dir: &Path, generation: u64) -> Result<()> {
+    let tmp_path = dir.join(format!("{MAINTENANCE_GENERATION_FILE}.tmp"));
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(generation.to_string().as_bytes())?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    std::fs::rename(&tmp_path, dir.join(MAINTENANCE_GENERATION_FILE))?;
+    Ok(())
+}
+
+/// Before a maintenance pass mutates vectors: raise the maintenance generation
+/// past every epoch published so far and remove the manifest, both under
+/// `index.lock`, so no engine loaded before the pass can publish its graph
+/// again, and an interrupted pass leaves no manifest to trust. Returns the new
+/// generation. When the lock file cannot be opened or locked, no publisher can
+/// take it either, and the two writes go ahead without it.
+pub fn invalidate_for_maintenance(dir: &Path) -> Result<u64> {
+    std::fs::create_dir_all(dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("index.lock"))
+        .and_then(|file| file.lock_exclusive().map(|()| file));
+    if let Err(error) = &lock {
+        tracing::warn!(%error, path = %dir.display(), "index lock unavailable; invalidating without it");
+    }
+    let published = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
+        .map_or(0, |manifest| manifest.epoch);
+    let generation = read_maintenance_generation(dir).max(published) + 1;
+    write_maintenance_generation(dir, generation)?;
+    match std::fs::remove_file(dir.join("manifest.json")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    drop(lock);
+    Ok(generation)
 }
 
 fn write_manifest_atomically(dir: &Path, manifest: &IndexManifest) -> Result<()> {
@@ -2289,7 +2387,9 @@ mod tests {
             active_reflection_count: 0,
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
-            epoch: 0,
+            // The epoch the seeding dump published: a manifest below the
+            // maintenance generation would be rejected for that reason instead.
+            epoch: seeded_manifest.epoch,
         };
         std::fs::write(
             dir.join("manifest.json"),

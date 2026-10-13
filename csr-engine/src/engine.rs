@@ -281,7 +281,7 @@ impl Engine {
             // and no stale age to report.
             tracing::info!("building search index from stored vectors");
 
-            let (mut search, chunk_total, reflection_total) =
+            let (mut search, chunk_total, reflection_total, _) =
                 rebuild_search_index_streaming(&storage, RECONCILE_BATCH)?;
             let t_hnsw = t0.elapsed();
 
@@ -776,13 +776,14 @@ impl Engine {
     /// the "no dead id is ever returned" contract).
     pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
         let storage = self.storage.clone();
-        let (mut fresh, chunk_count, reflection_count) = tokio::task::spawn_blocking(move || {
-            rebuild_search_index_streaming(&storage, RECONCILE_BATCH)
-        })
-        .await
-        .context("rebuild_search_index_streaming task panicked")??;
+        let (mut fresh, chunk_count, reflection_count, streamed) =
+            tokio::task::spawn_blocking(move || {
+                rebuild_search_index_streaming(&storage, RECONCILE_BATCH)
+            })
+            .await
+            .context("rebuild_search_index_streaming task panicked")??;
 
-        reconcile_fresh_against_db(&self.storage, &mut fresh);
+        reconcile_fresh_against_db(&self.storage, &mut fresh, &streamed);
 
         *self.search.write().await = fresh;
         self.flush_index_checked().await?;
@@ -796,14 +797,20 @@ impl Engine {
     /// vectors. If the operation is interrupted or its final dump fails, the
     /// next process must rebuild from SQLite instead of accepting stale files
     /// whose row counts happen to match.
+    ///
+    /// It also raises the index's maintenance generation (under `index.lock`),
+    /// which outlives the manifest: every engine loaded before this call stays
+    /// fenced out of publishing its pre-maintenance graph, even once the pass's
+    /// own rebuild has published (see `search::invalidate_for_maintenance`).
     pub fn invalidate_index_manifest(&self) -> Result<()> {
-        let path = self.index_dir.join("manifest.json");
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("invalidating HNSW manifest at {}", path.display())),
-        }
+        crate::search::invalidate_for_maintenance(&self.index_dir)
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "invalidating HNSW manifest at {}",
+                    self.index_dir.join("manifest.json").display()
+                )
+            })
     }
 
     /// Start the file system watcher as a background task.
@@ -988,7 +995,22 @@ fn backfill_missing_reflections(
 /// inline — a test that copies this reconciliation rather than calling it
 /// keeps passing even after the real blanking/backfill calls in
 /// `rebuild_search_index` are deleted (WP-D low #7).
-fn reconcile_fresh_against_db(storage: &Storage, fresh: &mut SearchEngine) {
+fn reconcile_fresh_against_db(
+    storage: &Storage,
+    fresh: &mut SearchEngine,
+    streamed: &StreamedVectors,
+) {
+    match replace_vectors_changed_while_streaming(storage, fresh, streamed) {
+        Ok((0, 0)) => {}
+        Ok((chunks, reflections)) => tracing::info!(
+            chunks,
+            reflections,
+            "replaced vectors re-embedded while the rebuild was streaming"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not re-check vectors changed while the rebuild streamed")
+        }
+    }
     if let Ok(db_ids) = storage.load_all_reflection_ids() {
         let db_id_set: std::collections::HashSet<&str> =
             db_ids.iter().map(|s| s.as_str()).collect();
@@ -1047,32 +1069,133 @@ fn reconcile_fresh_against_db(storage: &Storage, fresh: &mut SearchEngine) {
 fn rebuild_search_index_streaming(
     storage: &Storage,
     batch_size: usize,
-) -> Result<(SearchEngine, usize, usize)> {
+) -> Result<(SearchEngine, usize, usize, StreamedVectors)> {
     let chunk_ids = storage.load_all_chunk_ids()?;
     let reflection_ids = storage.load_all_reflection_ids()?;
 
     let estimated_size = (chunk_ids.len() + 1000).max(10_000);
     let mut search = SearchEngine::new(estimated_size);
+    let batch_size = batch_size.max(1);
 
+    let mut chunk_prints = vec![0_u64; chunk_ids.len()];
     let mut chunk_total = 0usize;
-    for batch in chunk_ids.chunks(batch_size.max(1)) {
+    for (number, batch) in chunk_ids.chunks(batch_size).enumerate() {
         let vecs = storage.get_chunk_vectors_by_ids(batch)?;
         chunk_total += vecs.len();
+        let at = batch_positions(batch, number * batch_size);
         for (id, vec) in vecs {
+            if let Some(&position) = at.get(id.as_str()) {
+                chunk_prints[position] = vector_fingerprint(&vec);
+            }
             search.insert_chunk(id, vec);
         }
     }
 
+    let mut reflection_prints = vec![0_u64; reflection_ids.len()];
     let mut reflection_total = 0usize;
-    for batch in reflection_ids.chunks(batch_size.max(1)) {
+    for (number, batch) in reflection_ids.chunks(batch_size).enumerate() {
         let vecs = storage.get_reflection_vectors_by_ids(batch)?;
         reflection_total += vecs.len();
+        let at = batch_positions(batch, number * batch_size);
         for (id, vec) in vecs {
+            if let Some(&position) = at.get(id.as_str()) {
+                reflection_prints[position] = vector_fingerprint(&vec);
+            }
             search.insert_reflection(id, vec);
         }
     }
 
-    Ok((search, chunk_total, reflection_total))
+    Ok((
+        search,
+        chunk_total,
+        reflection_total,
+        StreamedVectors {
+            chunk_ids,
+            chunk_prints,
+            reflection_ids,
+            reflection_prints,
+            batch_size,
+        },
+    ))
+}
+
+/// What the streaming rebuild read: every id with a fingerprint of the vector it
+/// inserted (0 when the row was gone by its batch). Reconciliation re-reads the
+/// same ids and replaces any vector whose fingerprint moved, so a row re-embedded
+/// while the rebuild streamed is published at its current revision (astra #7:
+/// the id-only reconciliation kept the old vector because the id still existed).
+struct StreamedVectors {
+    chunk_ids: Vec<String>,
+    chunk_prints: Vec<u64>,
+    reflection_ids: Vec<String>,
+    reflection_prints: Vec<u64>,
+    batch_size: usize,
+}
+
+fn batch_positions(batch: &[String], base: usize) -> std::collections::HashMap<&str, usize> {
+    batch
+        .iter()
+        .enumerate()
+        .map(|(offset, id)| (id.as_str(), base + offset))
+        .collect()
+}
+
+/// FNV-1a over the vector's bits; never 0, which marks "not read".
+fn vector_fingerprint(vector: &[f32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in vector {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash.max(1)
+}
+
+/// Replace in `fresh` every streamed vector whose stored revision changed since
+/// the stream read it. Returns how many chunks and reflections were replaced.
+fn replace_vectors_changed_while_streaming(
+    storage: &Storage,
+    fresh: &mut SearchEngine,
+    streamed: &StreamedVectors,
+) -> Result<(usize, usize)> {
+    let mut chunks = 0;
+    for (number, batch) in streamed.chunk_ids.chunks(streamed.batch_size).enumerate() {
+        let at = batch_positions(batch, number * streamed.batch_size);
+        for (id, vec) in storage.get_chunk_vectors_by_ids(batch)? {
+            let read = at
+                .get(id.as_str())
+                .map(|&position| streamed.chunk_prints[position]);
+            if read.is_some_and(|read| read != 0 && read != vector_fingerprint(&vec))
+                && fresh.has_chunk(&id)
+            {
+                fresh.remove_chunk(&id);
+                fresh.insert_chunk(id, vec);
+                chunks += 1;
+            }
+        }
+    }
+    let mut reflections = 0;
+    for (number, batch) in streamed
+        .reflection_ids
+        .chunks(streamed.batch_size)
+        .enumerate()
+    {
+        let at = batch_positions(batch, number * streamed.batch_size);
+        for (id, vec) in storage.get_reflection_vectors_by_ids(batch)? {
+            let read = at
+                .get(id.as_str())
+                .map(|&position| streamed.reflection_prints[position]);
+            if read.is_some_and(|read| read != 0 && read != vector_fingerprint(&vec))
+                && fresh.has_reflection(&id)
+            {
+                fresh.remove_reflection(&id);
+                fresh.insert_reflection(id, vec);
+                reflections += 1;
+            }
+        }
+    }
+    Ok((chunks, reflections))
 }
 
 #[cfg(test)]
@@ -1099,6 +1222,106 @@ mod tests {
                 &[0.1_f32; 384],
             )
             .unwrap();
+    }
+
+    fn insert_test_chunk_with(storage: &Storage, id: &str, vector: &[f32]) {
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id.into(),
+                    conversation_id: "conv".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-09-08T00:00:00Z".into(),
+                    content: "x".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                vector,
+            )
+            .unwrap();
+    }
+
+    /// A unit vector along axis `axis`: orthogonal to every other axis and far
+    /// from the `[0.1; 384]` filler every test chunk carries.
+    fn axis(axis: usize) -> Vec<f32> {
+        let mut vector = vec![0.0_f32; 384];
+        vector[axis] = 1.0;
+        vector
+    }
+
+    #[test]
+    fn astra_7_rebuild_reconciliation_picks_up_a_vector_replaced_while_streaming() {
+        let storage = Storage::open_memory().unwrap();
+        for i in 0..10 {
+            insert_test_chunk(&storage, &format!("chunk-{i}"));
+        }
+        insert_test_chunk_with(&storage, "x", &axis(0));
+        let (mut fresh, chunks, _, streamed) = rebuild_search_index_streaming(&storage, 4).unwrap();
+        assert_eq!(chunks, 11);
+        // Another writer re-embeds x after the stream read it.
+        insert_test_chunk_with(&storage, "x", &axis(1));
+        reconcile_fresh_against_db(&storage, &mut fresh, &streamed);
+        let hits = fresh.search_chunks(&axis(1), 1, 0.99);
+        assert_eq!(hits.first().map(|hit| hit.id.as_str()), Some("x"));
+        assert!(fresh.search_chunks(&axis(0), 1, 0.99).is_empty());
+    }
+
+    #[tokio::test]
+    async fn astra_6_a_publisher_loaded_before_a_manifest_invalidation_stays_fenced() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+            insert_test_chunk_with(&storage, "x", &axis(0));
+        }
+        // Writes the first cache generation.
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+        // Engine A: a long-lived MCP server or daemon, loaded with x at v_old.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        // Scrub B: invalidates the manifest, rewrites x to v_clean, rebuilds and
+        // publishes. No other publisher runs in between.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        eng_b.invalidate_index_manifest().unwrap();
+        // A flushing mid-pass, manifest gone, publishes nothing at all.
+        insert_test_chunk(eng_a.storage(), "chunk-mid");
+        eng_a
+            .search
+            .write()
+            .await
+            .insert_chunk("chunk-mid".into(), vec![0.1_f32; 384]);
+        eng_a.flush_index_checked().await.unwrap();
+        assert!(!eng_a.index_dir().join("manifest.json").exists());
+        insert_test_chunk_with(eng_b.storage(), "x", &axis(1));
+        eng_b.rebuild_search_index().await.unwrap();
+        // A imports a genuine new chunk and flushes its pre-scrub graph.
+        insert_test_chunk(eng_a.storage(), "chunk-new");
+        eng_a
+            .search
+            .write()
+            .await
+            .insert_chunk("chunk-new".into(), vec![0.1_f32; 384]);
+        eng_a.flush_index_checked().await.unwrap();
+
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        let index = eng_c.search.read().await;
+        let hits = index.search_chunks(&axis(1), 1, 0.99);
+        assert_eq!(
+            hits.first().map(|hit| hit.id.as_str()),
+            Some("x"),
+            "the scrubbed vector must survive a pre-scrub publisher's flush"
+        );
+        assert!(index.has_chunk("chunk-new"));
+        assert!(index.has_chunk("chunk-mid"));
     }
 
     #[test]
@@ -1178,7 +1401,7 @@ mod tests {
         // batch_size=2 forces multiple batches for both chunks (7) and
         // reflections (3) — proves the rebuild path never needs a single
         // corpus-sized fetch to produce a correct index.
-        let (search, chunk_total, reflection_total) =
+        let (search, chunk_total, reflection_total, _) =
             rebuild_search_index_streaming(&storage, 2).unwrap();
 
         assert_eq!(chunk_total, 7);
@@ -1208,7 +1431,7 @@ mod tests {
         }
 
         // Snapshot, exactly as `rebuild_search_index`'s `spawn_blocking` does.
-        let (mut fresh, chunk_total, _reflection_total) =
+        let (mut fresh, chunk_total, _reflection_total, streamed) =
             rebuild_search_index_streaming(&storage, RECONCILE_BATCH).unwrap();
         assert_eq!(chunk_total, 5);
         for i in 0..5 {
@@ -1223,7 +1446,7 @@ mod tests {
         // Call the SAME function `rebuild_search_index` calls — not a
         // reimplementation of its logic — so removing the blanking calls
         // inside `reconcile_fresh_against_db` fails this test (WP-D low #7).
-        reconcile_fresh_against_db(&storage, &mut fresh);
+        reconcile_fresh_against_db(&storage, &mut fresh, &streamed);
 
         assert!(!fresh.has_chunk("chunk-1"));
         assert!(!fresh.has_chunk("chunk-3"));
