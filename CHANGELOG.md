@@ -284,6 +284,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - **Compaction coach:** `suggest` (default) offers to compact at a quiet turn end between 181k and 269k tokens,
   `auto` compacts on its own, `off` never does.
 - **Git guard** is off unless a `csr-guard.json` exists (`README.md` in the plugin).
+- **Private by default:** the plugin's folder `~/.claude-self-reflect/csr-companion/` is `0700` and its files `0600`
+  under any umask (looser ones are tightened on first write), and API keys, bearer tokens, `password=`/`token=`
+  values and PEM blocks are redacted from the transcript text it keeps (`bin/private.py`).
 
 ### Installer
 

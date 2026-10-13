@@ -3,6 +3,7 @@ fails to load. A pane.py that does not compile, dies as it loads, or asks to sta
 kept failing) gets a one-screen error naming file:line, logged to pane-errors.log; the guard then waits until
 pane.py changes (checked each second) or 30 s pass, and runs it again. A clean exit (q) ends it. Stdlib only.
 usage: python3 -I pane_guard.py <pane.py's arguments>"""
+import importlib.util
 import os
 import re
 import select
@@ -30,15 +31,16 @@ def log(text, path=None):
     """Append to the error log, moving it aside to .1 first once it passes LOG_MAX. Never raises."""
     path = path or LOG
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.getsize(path) >= LOG_MAX:
             os.replace(path, path + '.1')
     except OSError:
         pass
-    try:
-        with open(path, 'a', encoding='utf-8') as handle:
-            handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} guard: {text.rstrip()}\n")
-    except OSError:
+    try:  # the folder 0700, the log 0600, a key in a traceback redacted; with no helper to do that, nothing is logged
+        spec = importlib.util.spec_from_file_location('private', os.path.join(HERE, 'private.py'))
+        private = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(private)
+        private.append(path, private.redact(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} guard: {text.rstrip()}\n"))
+    except Exception:
         pass
 
 

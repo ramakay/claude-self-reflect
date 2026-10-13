@@ -146,10 +146,11 @@ function world() {
       if (fork) await fork.promise
       return { isAnswered: true, text: 'dream: What if the notes read side branches before main?\nexplain:\n**Follow side branches**\n* A separate branch can carry today\'s work.' }
     } },
-    process: { run: async argv => {
+    process: { run: async (argv, init) => {
       runs.push(argv)
       let stdout = '{}'
-      if (argv.some(arg => arg.endsWith('/lease.py'))) stdout = JSON.stringify({ held: leaseHeld })
+      if (argv.some(arg => arg.endsWith('/private.py'))) await $.fs.write(argv[4], init.stdin) // bin/private.py write PATH, text on stdin
+      else if (argv.some(arg => arg.endsWith('/lease.py'))) stdout = JSON.stringify({ held: leaseHeld })
       else if (argv.includes('--brief')) stdout = '* The current work has a side branch.'
       else if (argv.includes('--keep')) records.push(JSON.parse(argv[argv.indexOf('--keep') + 1]))
       else if (argv[0] === 'git') return { exitCode: 1, stdout: '' }
@@ -206,13 +207,13 @@ async function leaseTest() {
     const mod = modules().register(), w = world(), gate = w.holdFork()
     const original = w.$.process.run
     let failed = false
-    w.$.process.run = async argv => {
+    w.$.process.run = async (argv, init) => {
       if (failed && argv.includes('renew')) {
         if (failure === 'throw') throw new Error('The lease helper timed out')
         if (failure === 'missing') throw new Error('spawn python3 ENOENT')
         return { exitCode: failure === 'exit' ? 1 : 0, stdout: failure === 'exit' ? '{"held":true}' : 'not JSON' }
       }
-      return original(argv)
+      return original(argv, init)
     }
     const job = mod.probe.dream(w.$, 100, 6)
     await settle(() => w.forkCalls() === 1)
@@ -233,13 +234,13 @@ async function leaseTest() {
   p.$.model.fork = async () => ({ isAnswered: true, text: 'dream: What if notes followed side branches?\nexplain:\n**Read the branch**\n* The branch changed in [commit abc1234].' })
   const processRun = p.$.process.run
   let receiptChecked = false
-  p.$.process.run = async argv => {
+  p.$.process.run = async (argv, init) => {
     if (argv.includes('cat-file')) {
       receiptChecked = true
       p.loseLease()
       return { exitCode: 0, stdout: '' }
     }
-    return processRun(argv)
+    return processRun(argv, init)
   }
   await publication.probe.dream(p.$, 100, 6)
   assert.ok(receiptChecked)
@@ -300,8 +301,8 @@ async function leaseTest() {
     const original = w.$.process.run
     let latest = null
     w.$.env.get = async () => folder
-    w.$.process.run = async argv => {
-      if (!argv.some(arg => arg.endsWith('/lease.py'))) return original(argv)
+    w.$.process.run = async (argv, init) => {
+      if (!argv.some(arg => arg.endsWith('/lease.py'))) return original(argv, init)
       latest = argv
       const ran = childProcess.spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' })
       return { exitCode: ran.status, stdout: ran.stdout }

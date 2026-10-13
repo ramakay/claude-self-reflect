@@ -31,6 +31,16 @@ import { CHOICES, dueSteps, heading, LINES, refusedText, STEPS } from './setup'
 // The pane: this session live, the dreams by date, and code that changed since
 // your past sessions, in a herdr split beside Claude.
 const script = ($: EngineInterface) => `${$.plugin.root}/bin/pane.py`
+
+// Everything written into the companion's folder (~/.claude-self-reflect/csr-companion) goes through bin/private.py:
+// $.fs.write has no mode to ask for, and a file it makes is 0644 in a 0755 folder, readable by every local user, where
+// the folder holds text from your transcripts. private.py makes the folders 0700 and the file 0600, and with `redact`
+// removes keys, bearer tokens, password=/token= values and PEM blocks from the text first. Rejects when it could not.
+// Files that are the person's own (settings.json, CLAUDE.md) are not the companion's and keep $.fs.write.
+async function keepWrite($: EngineInterface, path: string, text: string, redact = false): Promise<void> {
+  const ran = await $.process.run(['python3', '-I', `${$.plugin.root}/bin/private.py`, 'write', path, ...(redact ? ['--redact'] : [])], { stdin: text, timeoutMs: 10_000 })
+  if (ran.exitCode !== 0) throw new Error(`private write failed: ${ran.stderr.trim()}`)
+}
 const guard = ($: EngineInterface) => `${$.plugin.root}/bin/pane_guard.py` // runs pane.py, and outlives an edit that breaks it
 const PANE = 'csr'
 const LABEL = 'CSR'
@@ -185,7 +195,7 @@ async function guardOf($: EngineInterface, cwd: string): Promise<Guard | null> {
       const log = `${home}/${PANE_ERRORS}`
       const was = await $.fs.read(log).catch(() => '')
       const at = new Date(await $.clock.now()).toISOString()
-      await $.fs.write(log, `${was}${was && !was.endsWith('\n') ? '\n' : ''}${at} csr guard: ${path} is no guard (not JSON, or a key of the wrong kind); it counts for nothing\n`).catch(() => undefined)
+      await keepWrite($, log, `${was}${was && !was.endsWith('\n') ? '\n' : ''}${at} csr guard: ${path} is no guard (not JSON, or a key of the wrong kind); it counts for nothing\n`, true).catch(() => undefined)
     }
   }
   return mergeGuards(guards)
@@ -709,7 +719,7 @@ async function addToClaudeMd($: EngineInterface, line: string): Promise<boolean>
   // Read it first: a file that is there but could not be read is left alone, never written over.
   const text = (await $.fs.exists(file).catch(() => null)) === false ? '' : await $.fs.read(file).catch(() => null)
   if (text === null) return false
-  return $.fs.write(file, addTerm(text, line)).then(() => true, () => false)
+  return $.fs.write(file, addTerm(text, line)).then(() => true, () => false) // user file: the person's own CLAUDE.md
 }
 
 async function dreamsText($: EngineInterface, on: boolean): Promise<string> {
@@ -978,7 +988,7 @@ async function showPlan($: EngineInterface, state: string, text: string | null, 
   const done = planQueue.then(async () => {
     if (!currentPlan(op)) return
     await update($, infinite, current => (currentPlan(op) ? { plan: text, story: current?.story ?? null } : current))
-    if (path && currentPlan(op)) await $.fs.write(path, JSON.stringify({ at, state, text, ...extra })).catch(() => undefined)
+    if (path && currentPlan(op)) await keepWrite($, path, JSON.stringify({ at, state, text, ...extra }), true).catch(() => undefined)
   })
   planQueue = done.catch(() => undefined)
   await done
@@ -2236,7 +2246,7 @@ function commandOf(settings: Settings): string | undefined {
 async function writeCommand($: EngineInterface, path: string, settings: UserSettings, command: string): Promise<void> {
   const statusLine = { ...(settings.json.statusLine as Record<string, unknown>), command }
   const text = JSON.stringify({ ...settings.json, statusLine }, null, 2)
-  await $.fs.write(path, settings.raw.endsWith('\n') ? `${text}\n` : text)
+  await $.fs.write(path, settings.raw.endsWith('\n') ? `${text}\n` : text) // user file: settings.json
 }
 
 // Claude Code runs a statusLine command through a shell: the original rides as one single-quoted word.
@@ -2317,8 +2327,8 @@ async function statusline($: EngineInterface, choice: string | undefined): Promi
   if (!node || node.exitCode !== 0) {
     return `"/csr statusline on" runs your status line through a small node script, and node didn't run here. Nothing changed.`
   }
-  await $.fs.write(where.wrapper, await $.fs.read(shippedWrapper($)))
-  await $.fs.write(where.backup, settings.raw)
+  await keepWrite($, where.wrapper, await $.fs.read(shippedWrapper($)))
+  await keepWrite($, where.backup, settings.raw) // settings.json can hold tokens: kept 0600, and as it was
   await writeCommand($, where.settings, settings, wrapped)
   await $.store.set(WRAPPING, { original: command, wrapped } satisfies Wrapping)
   return [
@@ -2347,7 +2357,7 @@ async function refreshWrapper($: EngineInterface): Promise<void> {
   const where = await places($)
   if (!where || !(await $.fs.exists(where.wrapper))) return
   const shipped = await $.fs.read(shippedWrapper($))
-  if (shipped !== (await $.fs.read(where.wrapper))) await $.fs.write(where.wrapper, shipped)
+  if (shipped !== (await $.fs.read(where.wrapper))) await keepWrite($, where.wrapper, shipped)
 }
 
 // ---------------------------------------------------------------- compaction marker
@@ -2358,7 +2368,7 @@ async function markCompacting($: EngineInterface, trigger: string): Promise<stri
     const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
     if (!home) return null
     const path = `${home}/.claude-self-reflect/csr-companion/compacting/${await $.session.id()}.json`
-    await $.fs.write(path, JSON.stringify({ at: (await $.clock.now()) / 1000, trigger }))
+    await keepWrite($, path, JSON.stringify({ at: (await $.clock.now()) / 1000, trigger }))
     return path
   } catch {
     return null
@@ -2369,7 +2379,7 @@ async function markCompacting($: EngineInterface, trigger: string): Promise<stri
 async function unmarkCompacting($: EngineInterface, path: string): Promise<void> {
   try {
     await $.process.run(['rm', '-f', path], { timeoutMs: 5_000 })
-    if (await $.fs.exists(path)) await $.fs.write(path, JSON.stringify({ ended: true }))
+    if (await $.fs.exists(path)) await keepWrite($, path, JSON.stringify({ ended: true }))
   } catch {}
 }
 

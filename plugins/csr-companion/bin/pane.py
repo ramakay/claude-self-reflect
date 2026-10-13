@@ -26,6 +26,7 @@ import base64
 import bisect
 import fcntl
 import glob
+import importlib.util
 import io
 import json
 import math
@@ -48,6 +49,17 @@ from collections import Counter, namedtuple
 from datetime import datetime, timezone
 
 HOME = os.environ.get('HOME', '')
+
+
+def sibling(name):
+    """A module that ships beside this script, loaded by its path: python3 -I keeps the script's folder off sys.path."""
+    spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(os.path.realpath(__file__)), f'{name}.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+private = sibling('private')  # every write below goes through it: folders 0700, files 0600, credentials redacted
 DB = os.path.join(HOME, '.claude-self-reflect', 'csr-engine.db')
 VERB = {'superseded_by': 'changed', 'anchor_obsolete': 'removed', 'anchor_reinstated': 'came back'}
 NESTED = ('/.claude/worktrees/', '/.worktrees/')
@@ -887,9 +899,7 @@ def public(data):
 
 def keep(record):
     """One line in the dream log: a dream the mod showed, or what the person answered to it."""
-    os.makedirs(KEEP, exist_ok=True)
-    with open(DREAM_LOG, 'a', encoding='utf-8') as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+    private.append(DREAM_LOG, private.dumps(record, ensure_ascii=False) + '\n', root=KEEP)
 
 
 SETTLED = ('helpful', 'not_relevant', 'ask_claude', 'thought_of_it', 'got_it', 'dismiss', 'ignored', 'turn_off',
@@ -3517,9 +3527,7 @@ def coach_terms(now=None, newest=COACH_SESSIONS):
         for term, said in kept[path][1].items():
             sessions.setdefault(term, []).append(said)
     try:
-        os.makedirs(KEEP, exist_ok=True)
-        with open(COACH_KEPT, 'w') as handle:
-            json.dump({p: v for p, v in kept.items() if p in paths}, handle)
+        private.write_atomic(COACH_KEPT, json.dumps({p: v for p, v in kept.items() if p in paths}), root=KEEP)
     except OSError:
         pass
     try:
@@ -4492,10 +4500,8 @@ def read_likes():
 
 
 def keep_like(key, source, title, liked, at):
-    os.makedirs(os.path.dirname(LIKES), exist_ok=True)
-    with open(LIKES, 'a', encoding='utf-8') as handle:
-        handle.write(json.dumps(dict(key=key, source=source, title=one_line(title or '', 200), at=at, liked=liked),
-                                ensure_ascii=False) + '\n')
+    private.append(LIKES, private.dumps(dict(key=key, source=source, title=one_line(title or '', 200), at=at, liked=liked),
+                                        ensure_ascii=False) + '\n', root=KEEP)
 
 
 def likes_since(likes, start):
@@ -4675,11 +4681,7 @@ class Spend:
         if not self.dirty or (not force and now - self.saved < SPEND_EVERY):
             return
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            temp = f'{self.path}.{os.getpid()}.tmp'
-            with open(temp, 'w', encoding='utf-8') as handle:
-                json.dump(dict(start=self.start, files=self.files), handle)
-            os.replace(temp, self.path)
+            private.write_atomic(self.path, json.dumps(dict(start=self.start, files=self.files)), root=KEEP)
         except OSError:
             return  # a pane that cannot write still counts; it only reads again after a restart
         self.saved, self.dirty = now, False
@@ -4897,10 +4899,7 @@ def compaction_seconds(projects=None, cache=None, newest=NEWEST):
         seconds += entry[1]
     if current != kept:
         try:
-            os.makedirs(os.path.dirname(cache), exist_ok=True)
-            with open(cache + '.tmp', 'w', encoding='utf-8') as handle:
-                json.dump(current, handle)
-            os.replace(cache + '.tmp', cache)
+            private.write_atomic(cache, json.dumps(current), root=KEEP)
         except OSError:
             pass
     return sorted(seconds)
@@ -4987,10 +4986,7 @@ def keep_compact_usual(now, projects=None, path=None, logs=None):
     kept = dict(at=now, median=percentile(seconds, 0.5) if len(seconds) >= 3 else None, n=len(seconds), excluded=len(csr))
     path = path or COMPACT_USUAL
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path + '.tmp', 'w', encoding='utf-8') as handle:
-            json.dump(kept, handle)
-        os.replace(path + '.tmp', path)
+        private.write_atomic(path, json.dumps(kept), root=KEEP)
     except OSError:
         pass
     return kept
@@ -6838,9 +6834,7 @@ def lost_log(project=None):
 
 
 def keep_lost(key, answer, at, project=None, **more):
-    os.makedirs(os.path.dirname(LOST_LOG), exist_ok=True)
-    with open(LOST_LOG, 'a', encoding='utf-8') as handle:
-        handle.write(json.dumps(dict(key=key, answer=answer, at=at, project=project, **more)) + '\n')
+    private.append(LOST_LOG, private.dumps(dict(key=key, answer=answer, at=at, project=project, **more)) + '\n', root=KEEP)
 
 
 def lost_found(summaries, typed=(), carried=(), project=None):
@@ -7085,11 +7079,7 @@ def read_previous(session_id):
 
 
 def keep_json(folder, name, record):
-    os.makedirs(os.path.join(KEEP, folder), exist_ok=True)
-    temp = os.path.join(KEEP, folder, f'{name}.json.{os.getpid()}.tmp')
-    with open(temp, 'w', encoding='utf-8') as handle:
-        json.dump(record, handle)
-    os.replace(temp, os.path.join(KEEP, folder, f'{name}.json'))
+    private.write_atomic(os.path.join(KEEP, folder, f'{name}.json'), private.dumps(record), root=KEEP)
 
 
 def carry_into(session):
@@ -7245,14 +7235,12 @@ def log_error(text, path=None):
     """Append one failure to the error log, which first moves aside to .1 once it passes LOG_MAX. Never raises."""
     path = path or ERROR_LOG
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.getsize(path) >= LOG_MAX:
             os.replace(path, path + '.1')
     except OSError:
         pass  # no log yet, or nowhere to write one
     try:
-        with open(path, 'a', encoding='utf-8') as handle:
-            handle.write(text if text.endswith('\n') else text + '\n')
+        private.append(path, private.redact(text if text.endswith('\n') else text + '\n'), root=KEEP)
     except OSError:
         pass
 
@@ -7377,9 +7365,7 @@ def watch(root, limit, session_id, agent=None):
         signal.signal(ending, lambda *_: sys.exit(0))
     mine = kept_file(PANES, session_id)
     if mine:  # while this file names a live pid, Claude's status lines draw here, not under its prompt
-        os.makedirs(PANES, exist_ok=True)
-        with open(mine, 'w', encoding='utf-8') as handle:
-            json.dump(dict(pid=os.getpid()), handle)
+        private.write_atomic(mine, json.dumps(dict(pid=os.getpid())), root=KEEP)
     beat = Heartbeat(mine).start()  # a pid file older than HEARTBEAT_S (statusline.cjs) names a pane that is gone
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd) if os.isatty(fd) else None

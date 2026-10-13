@@ -77,9 +77,14 @@ process.stdin.on('data', chunk => chunks.push(chunk)).on('end', () => {
   if (keep) {
     try {
       const dir = path.join(keep, 'statusline')
-      fs.mkdirSync(dir, { recursive: true })
+      // Private to the person, as everything the companion keeps (bin/private.py): 0700 folders, 0600 files. A mode
+      // given to mkdir or writeFile counts only for what they create and the umask can narrow it, so each is set after.
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      fs.chmodSync(keep, 0o700)
+      fs.chmodSync(dir, 0o700)
       const file = path.join(dir, `${session}.json`)
-      fs.writeFileSync(`${file}.tmp`, JSON.stringify({ at: Date.now() / 1000, line, fields }))
+      fs.writeFileSync(`${file}.tmp`, JSON.stringify({ at: Date.now() / 1000, line, fields }), { mode: 0o600 })
+      fs.chmodSync(`${file}.tmp`, 0o600)
       fs.renameSync(`${file}.tmp`, file)
       return // drawn in the pane
     } catch {}

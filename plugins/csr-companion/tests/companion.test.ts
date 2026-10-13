@@ -231,6 +231,11 @@ function host(on: On, world: World) {
       return said === undefined ? { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : ok(said)
     }
     if (e.argv[0] === 'node' && world.noNode) return { value: { exitCode: 127, stdout: '', stderr: 'node: not found', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/private.py')) { // `private.py write PATH [--redact]`: text on stdin, kept 0600
+      files.set(e.argv[4] as string, e.init?.stdin ?? '')
+      writes.push(e.argv[4] as string)
+      return ok('')
+    }
     if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/lease.py')) { // a stand-in: lease.py's decide, on these files
       const arg = (name: string) => e.argv[e.argv.indexOf(name) + 1] as string
       const path = `${arg('--folder')}/${arg('--session')}.json`
@@ -1322,6 +1327,9 @@ test('/csr statusline on copies the wrapper out of the plugin, backs up the file
   expect(Object.keys(JSON.parse(seen.files.get(USER) ?? '{}'))).toEqual(['model', 'statusLine', 'hooks', 'theme'])
   expect(seen.writes).toEqual([STABLE, BACKUP, USER])
   expect(seen.writes.some(path => path.includes('/csr-companion/bin/'))).toBe(false) // never into the plugin's folder
+  // The companion's own files go through bin/private.py (0700 folders, 0600 files); the person's settings.json does not.
+  const private_ = seen.runs.filter(argv => (argv[2] ?? '').endsWith('/bin/private.py')).map(argv => argv[4])
+  expect(private_).toEqual([STABLE, BACKUP])
   expect(seen.store.get('statusline')).toEqual({ original: ORIGINAL, wrapped: WRAPPED })
 })
 

@@ -17,10 +17,22 @@ once ([true,true], then [true,false,true]): two paid looks.
 Prints {"held": true|false, "lease": <the lease now>}.
 """
 import fcntl
+import importlib.util
 import json
 import os
 import sys
 import time
+
+
+def sibling(name):
+    """A module that ships beside this script, loaded by its path: python3 -I keeps the script's folder off sys.path."""
+    spec = importlib.util.spec_from_file_location(name, os.path.join(os.path.dirname(os.path.realpath(__file__)), f'{name}.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+private = sibling('private')  # the lease folder is 0700 and its files 0600
 
 LEASE_MS = 15 * 60 * 1000  # dreamer.ts LEASE_MS
 
@@ -53,15 +65,13 @@ def read(path):
 
 
 def write(path, lease):
-    with open(path + '.writing', 'w', encoding='utf-8') as handle:
-        json.dump(lease, handle)
-    os.replace(path + '.writing', path)  # one rename: a reader never sees half a lease
+    private.write_atomic(path, json.dumps(lease))  # one rename: a reader never sees half a lease
 
 
 def step_under_lock(step, folder, session, root, rank, now, busy=False):
-    os.makedirs(folder, exist_ok=True)
+    private.ensure_dir(folder)
     path = os.path.join(folder, f'{session}.json')
-    with open(os.path.join(folder, f'{session}.lease.lock'), 'a') as lock:
+    with private.open_private(os.path.join(folder, f'{session}.lease.lock'), 'a') as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)  # released when this process ends, however it ends
         held = read(path)
         pause = os.environ.get('CSR_LEASE_PAUSE_MS')  # tests only: hold the lock between the read and the write

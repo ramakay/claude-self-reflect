@@ -54,12 +54,12 @@ function multilineTest() {
 async function refreshRejectionTest() {
   const mod = modules().register(), w = world(), original = w.$.process.run
   let rejected = false
-  w.$.process.run = async argv => {
+  w.$.process.run = async (argv, init) => {
     if (argv.includes('--json')) {
       rejected = true
       throw new Error('The pane refresh timed out')
     }
-    return original(argv)
+    return original(argv, init)
   }
   await mod.probe.dream(w.$, 100, 6)
   await settle(() => rejected)
@@ -81,7 +81,7 @@ async function buttonRejectionTest() {
   const button = find(tree)
   assert.ok(button, 'A shown dream has a Dismiss button')
   let rejected = false
-  w.$.process.run = async argv => {
+  w.$.process.run = async (argv, init) => {
     assert.ok(argv.some(arg => /\/(pane|shifts)\.py$/.test(arg))) // the dev mod's copy is shifts.py
     rejected = true
     throw new Error('The pane answer timed out')
@@ -96,9 +96,9 @@ async function supersededPreparationTest() {
   mod.register(on, { autoCompact: 'auto' })
   let preparing = false, compactions = 0
   const original = w.$.process.run
-  w.$.process.run = async argv => {
+  w.$.process.run = async (argv, init) => {
     if (argv[0] === 'git') { preparing = true; await gate.promise }
-    return original(argv)
+    return original(argv, init)
   }
   w.$.session.compact = async () => { compactions++; return { tokensAfter: 10000 } }
   const preparation = mod.probe.compactNow(w.$, armed('done'), 'unattended', mod.probe.CS.settingStamp)
@@ -124,7 +124,7 @@ async function lostTimerTest() {
   const mod = modules().register(), w = world(), gate = w.holdFork()
   const original = w.$.process.run
   let fail = false, renewals = 0
-  w.$.process.run = async argv => {
+  w.$.process.run = async (argv, init) => {
     if (argv.includes('renew')) {
       renewals++
       if (fail) {
@@ -132,7 +132,7 @@ async function lostTimerTest() {
         return { exitCode: which === 'exit' ? 1 : 0, stdout: which === 'malformed' ? 'bad JSON' : '{"held":false}' }
       }
     }
-    return original(argv)
+    return original(argv, init)
   }
   const job = mod.probe.dream(w.$, 100, 6)
   await settle(() => w.forkCalls() === 1)

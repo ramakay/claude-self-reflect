@@ -68,6 +68,10 @@ function world(on: On, w: World) {
       const said = w.git?.[e.argv.slice(3).join(' ')]
       return said === undefined ? fail : ok(said)
     }
+    if ((e.argv[2] ?? '').endsWith('/bin/private.py')) { // `private.py write PATH [--redact]`: text on stdin, kept 0600
+      files.set(e.argv[4] as string, e.init?.stdin ?? '')
+      return ok('')
+    }
     if (e.argv.includes('--compact-plan')) return ok(JSON.stringify(w.plan === undefined ? { ...PLAN, ctx: w.ctx } : w.plan))
     if (e.argv.includes('--keep')) {
       kept.push(JSON.parse(e.argv[e.argv.indexOf('--keep') + 1] ?? '{}'))
