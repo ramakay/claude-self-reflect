@@ -21,6 +21,12 @@ cd "$top"
 staged=$(git diff --cached --name-only --diff-filter=ACMRD)
 [ -n "$staged" ] || exit 0
 
+# git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks. Tests that run git in their own temp repos
+# would act on this repository's index instead, so nothing below inherits them.
+for var in $(env | sed -n 's/^\(GIT_[A-Z_]*\)=.*/\1/p'); do
+  unset "$var"
+done
+
 cpus=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 jobs=$((cpus / 2))
 [ "$jobs" -ge 1 ] || jobs=1
