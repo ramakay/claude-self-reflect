@@ -1770,6 +1770,48 @@ mod tests {
         v
     }
 
+    /// `tests/fixtures/hnsw-0.3.4` is a 300-point graph dumped by hnsw_rs
+    /// 0.3.4 (the format every installed index is in), with the answers that
+    /// version gave for 20 queries. Upgrading must keep reading it and give
+    /// the same answers — the format is MAGICDESCR_4 in 0.3.4 and 0.3.5.
+    #[test]
+    fn an_hnsw_rs_0_3_4_dump_reloads_with_the_same_answers() {
+        fn vector(seed: u64) -> Vec<f32> {
+            let mut state = (seed + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (0..32)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % 2001) as f32 / 1000.0 - 1.0
+                })
+                .collect()
+        }
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hnsw-0.3.4");
+        let expected: Vec<Vec<(usize, f32)>> =
+            serde_json::from_slice(&std::fs::read(dir.join("hnsw-0.3.4.expected.json")).unwrap())
+                .unwrap();
+        for mapped in [false, true] {
+            let mut io = HnswIo::new_with_options(&dir, "hnsw-0.3.4", ReloadOptions::new(mapped));
+            let hnsw: Hnsw<f32, DistCosine> = io.load_hnsw().unwrap();
+            for (q, want) in expected.iter().enumerate() {
+                let got: Vec<(usize, f32)> = hnsw
+                    .search(&vector(10_000 + q as u64), 10, EF_SEARCH)
+                    .into_iter()
+                    .map(|n| (n.d_id, n.distance))
+                    .collect();
+                assert_eq!(
+                    got.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    want.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    "query {q}, mapped {mapped}"
+                );
+                for ((_, a), (_, b)) in got.iter().zip(want) {
+                    assert!((a - b).abs() < 1e-6, "query {q}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_dropped_engine_releases_the_generation_it_mapped() {
         let tmp = tempfile::TempDir::new().unwrap();
