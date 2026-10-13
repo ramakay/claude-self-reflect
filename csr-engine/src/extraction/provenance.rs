@@ -722,6 +722,35 @@ mod tests {
     }
 
     #[test]
+    fn dreamer_prompt_in_any_language_is_held_past_the_header_window() {
+        // The dreamer writes in the person's language. Devanagari is 3 bytes a character, so a long Hindi question
+        // pushes the attribution past HEADER_WINDOW; the whole-message grammar must still hold it as CSR's own.
+        let hindi = "क्या होगा अगर पैन अपने रंग पिगमेंट की स्याही से ले, ताकि दोनों सतहें एक ही रंग पढ़ें और हर बार नया रंग चुनने की ज़रूरत न पड़े, और पुराने सत्रों में जो रंग तय हुए थे वे भी वहीं से आएँ?";
+        let japanese = "ペインの色をピグメントのインクから取ったら、二つの画面が同じ色を読み、毎回新しい色を選ぶ必要がなくなり、過去のセッションで決めた色もそこから来て、ステータス行や情報ページの図も同じインクで描かれ、利用者が以前に一度だけ選んだ配色がすべての画面で保たれるのではないでしょうか？";
+        let mixed = "क्या होगा अगर pane अपने colours pigment की nyt inks से ले, ताकि दोनों surfaces एक ही palette पढ़ें?";
+        for question in [hindi, japanese, mixed] {
+            let sent = format!(
+                "{question}\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> **रंग साझा करें**\n>\n> दो सतहें पहले से वही स्याही पढ़ती हैं।"
+            );
+            assert!(
+                question.len() > HEADER_WINDOW || question == mixed,
+                "{}",
+                question.len()
+            );
+            assert!(is_dreamer_prompt(&sent), "{question}");
+            assert!(is_csr_emission(&sent), "{question}");
+            assert_eq!(
+                crate::import::scrub_contaminated_text(&sent),
+                None,
+                "{question}"
+            );
+        }
+        // The person's own non-English question is still theirs.
+        assert!(!is_csr_emission(hindi));
+        assert!(!is_dreamer_prompt(japanese));
+    }
+
+    #[test]
     fn emission_detects_the_companions_compaction_keep_list_and_notice() {
         assert!(is_csr_emission(
             "CSR COMPACT KEEP — in the summary, keep these, in this order, ids and SHAs word for word:\n\
