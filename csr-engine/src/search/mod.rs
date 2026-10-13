@@ -147,7 +147,7 @@ pub struct SearchEngine {
     /// Whether the loaded vectors live in a memory map (see `is_mapped`).
     vectors_mapped: bool,
     /// Set on an MCP server's engine while the daemon is live: searches go
-    /// to the daemon (falling back to an index the proxy loads itself), and
+    /// to the daemon (falling back to keyword-only results), and
     /// this engine's own indexes stay empty and never dirty — see
     /// [`vector_ipc`].
     proxy: Option<std::sync::Arc<vector_ipc::VectorProxy>>,
@@ -157,6 +157,11 @@ pub struct SearchEngine {
     /// for the process lifetime, which kept every unlinked generation's
     /// ~1.2 GB on disk until the process exited and made a reload a leak.
     _mapped: Vec<MappedGeneration>,
+    /// The maintenance generation a full rebuild read before it streamed the
+    /// stored vectors ([`Self::mark_rebuilt_at`]). A rebuild that a maintenance
+    /// pass overtook read rows the pass has since rewritten: its publish is
+    /// refused ([`CrossedMaintenance`]) instead of restoring them (astra r2 #4).
+    rebuilt_at_generation: Option<u64>,
 }
 
 /// Owns an `HnswIo` whose memory map a loaded `Hnsw` borrows. Never touched
@@ -184,6 +189,33 @@ impl Drop for MappedGeneration {
 #[cfg(test)]
 thread_local! {
     static LIVE_MAPPED_GENERATIONS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// A full rebuild tried to publish after a maintenance pass began: it read the
+/// stored vectors before the pass rewrote them. Rebuild again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossedMaintenance {
+    pub rebuilt_at: u64,
+    pub now: u64,
+}
+
+impl std::fmt::Display for CrossedMaintenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "index rebuild read at maintenance generation {} but the index is now at {}: rebuild again",
+            self.rebuilt_at, self.now
+        )
+    }
+}
+
+impl std::error::Error for CrossedMaintenance {}
+
+/// True when `error` is (or wraps) a [`CrossedMaintenance`].
+pub fn crossed_maintenance(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<CrossedMaintenance>().is_some())
 }
 
 // HNSW parameters
@@ -394,6 +426,7 @@ impl SearchEngine {
             vectors_mapped: false,
             proxy: None,
             _mapped: Vec::new(),
+            rebuilt_at_generation: None,
         }
     }
 
@@ -422,6 +455,12 @@ impl SearchEngine {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Record the maintenance generation read before this engine was rebuilt
+    /// from the stored vectors. Call it BEFORE the stream starts.
+    pub fn mark_rebuilt_at(&mut self, maintenance_generation: u64) {
+        self.rebuilt_at_generation = Some(maintenance_generation);
     }
 
     fn mark_chunk_dirty(&mut self) {
@@ -1068,12 +1107,26 @@ impl SearchEngine {
         // from memory now, so whatever this call publishes is guaranteed to
         // match what's actually on disk" rather than risking the same
         // id-map/graph mismatch this whole fix exists to prevent.
+        // A manifest below the maintenance generation was published from a graph
+        // loaded before the last maintenance pass (an older binary's): it is no
+        // more trustworthy than none, and carrying its fields forward would
+        // relabel it current (astra r2 #5).
+        let floor = read_maintenance_generation(dir);
         let existing_manifest: Option<IndexManifest> =
             std::fs::read_to_string(dir.join("manifest.json"))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
-                .filter(|m| m.version == MANIFEST_VERSION);
+                .filter(|m| m.version == MANIFEST_VERSION && m.epoch >= floor);
         let force_full = existing_manifest.is_none();
+        if let (false, Some(rebuilt_at)) = (self.manifest_backed, self.rebuilt_at_generation) {
+            if floor > rebuilt_at {
+                return Err(CrossedMaintenance {
+                    rebuilt_at,
+                    now: floor,
+                }
+                .into());
+            }
+        }
 
         // WP-D medium (compaction epoch guard): `manifest_backed` plus the
         // per-side dirty flags stop a long-lived engine from republishing a
@@ -1094,9 +1147,15 @@ impl SearchEngine {
         // both sides — a compaction is a single atomic swap of the whole
         // manifest, so a stale engine must not publish EITHER side from
         // memory, not just the one whose dirty flag happens to be set.
-        let on_disk_epoch = existing_manifest.as_ref().map(|m| m.epoch).unwrap_or(0);
-        let stale_generation =
-            self.manifest_backed && existing_manifest.is_some() && on_disk_epoch > self.epoch;
+        // The maintenance generation counts too: a maintenance pass removes the
+        // manifest but leaves the generation it raised, so an engine loaded
+        // before the pass stays stale whether or not a manifest is on disk.
+        let on_disk_epoch = existing_manifest
+            .as_ref()
+            .map(|m| m.epoch)
+            .unwrap_or(0)
+            .max(floor);
+        let stale_generation = self.manifest_backed && on_disk_epoch > self.epoch;
         if stale_generation {
             tracing::warn!(
                 on_disk_epoch,
@@ -1106,6 +1165,22 @@ impl SearchEngine {
                  Any genuine new content already in SQLite is picked up by the next load's \
                  additive backfill."
             );
+        }
+
+        // Stale, and no manifest to carry forward (a maintenance pass removed it
+        // and has not published yet): there is nothing true this engine can
+        // publish. Write nothing; the next load rebuilds or loads the pass's.
+        if stale_generation && existing_manifest.is_none() {
+            return Ok(Published {
+                generation: self.generation,
+                chunk_changes: self.chunk_changes,
+                reflection_changes: self.reflection_changes,
+                stale_generation,
+                new_epoch: on_disk_epoch,
+                // No new publication; settle_publish ignores these basenames
+                // for a stale generation and keeps the mapped owner's names.
+                basenames: self.published_basenames.clone().unwrap_or_default(),
+            });
         }
 
         // Dump a side to a NEW generation only when it actually changed (skip empty
@@ -1257,6 +1332,11 @@ impl SearchEngine {
         };
 
         write_manifest_atomically(dir, &manifest)?;
+        if !self.manifest_backed {
+            // A full rebuild: keep the maintenance generation level with the
+            // epoch it published, so it never depends on the manifest surviving.
+            write_maintenance_generation(dir, new_epoch)?;
+        }
 
         // Clean numbered generations not referenced by the newly committed manifest.
         cleanup_stale_index_files(dir);
@@ -1372,6 +1452,17 @@ impl SearchEngine {
                 expected = "1 or 2",
                 found = manifest.version,
                 "index cache version mismatch"
+            );
+            return None;
+        }
+        // Published from a graph loaded before the last maintenance pass (an
+        // older binary that does not read the generation): not to be trusted.
+        let floor = read_maintenance_generation(dir);
+        if manifest.epoch < floor {
+            tracing::info!(
+                manifest_epoch = manifest.epoch,
+                maintenance_generation = floor,
+                "index cache predates the last maintenance pass"
             );
             return None;
         }
@@ -1556,6 +1647,7 @@ impl SearchEngine {
             vectors_mapped,
             proxy: None,
             _mapped: mapped,
+            rebuilt_at_generation: None,
         })
     }
 }
@@ -1640,6 +1732,69 @@ fn sync_index_pair(dir: &Path, basename: &str) -> Result<()> {
         std::fs::File::open(dir.join(format!("{basename}{extension}")))?.sync_all()?;
     }
     Ok(())
+}
+
+/// Index-dir file holding the maintenance generation: a counter that only
+/// grows and, unlike the manifest's `epoch`, survives manifest invalidation.
+/// Every publisher reads it under `index.lock`; an engine whose epoch is below
+/// it loaded its graph before a maintenance pass and must never publish from
+/// memory again (astra #6: invalidation used to delete the only epoch record,
+/// so the pass's rebuild republished epoch 1 and a pre-scrub engine still at 1
+/// restored the old vectors).
+const MAINTENANCE_GENERATION_FILE: &str = "generation";
+
+/// The maintenance generation recorded in `dir`; 0 when none is.
+pub fn read_maintenance_generation(dir: &Path) -> u64 {
+    std::fs::read_to_string(dir.join(MAINTENANCE_GENERATION_FILE))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn write_maintenance_generation(dir: &Path, generation: u64) -> Result<()> {
+    let tmp_path = dir.join(format!("{MAINTENANCE_GENERATION_FILE}.tmp"));
+    let mut tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+    tmp_file.write_all(generation.to_string().as_bytes())?;
+    tmp_file.sync_all()?;
+    drop(tmp_file);
+    std::fs::rename(&tmp_path, dir.join(MAINTENANCE_GENERATION_FILE))?;
+    Ok(())
+}
+
+/// Before a maintenance pass mutates vectors: raise the maintenance generation
+/// past every epoch published so far and remove the manifest, both under
+/// `index.lock`, so no engine loaded before the pass can publish its graph
+/// again, and an interrupted pass leaves no manifest to trust. Returns the new
+/// generation. When the lock file cannot be opened or locked, no publisher can
+/// take it either, and the two writes go ahead without it.
+pub fn invalidate_for_maintenance(dir: &Path) -> Result<u64> {
+    std::fs::create_dir_all(dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("index.lock"))
+        .and_then(|file| file.lock_exclusive().map(|()| file));
+    if let Err(error) = &lock {
+        tracing::warn!(%error, path = %dir.display(), "index lock unavailable; invalidating without it");
+    }
+    let published = std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
+        .map_or(0, |manifest| manifest.epoch);
+    let generation = read_maintenance_generation(dir).max(published) + 1;
+    write_maintenance_generation(dir, generation)?;
+    match std::fs::remove_file(dir.join("manifest.json")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    drop(lock);
+    Ok(generation)
 }
 
 fn write_manifest_atomically(dir: &Path, manifest: &IndexManifest) -> Result<()> {
@@ -1991,6 +2146,43 @@ mod tests {
         assert_eq!(live(), 2, "dropping an engine frees its maps");
         assert_eq!(loaded.search_chunks(&unit(2), 1, 0.99)[0].id, "c2");
         drop(loaded);
+        assert_eq!(live(), 0);
+    }
+
+    #[test]
+    fn crossed_maintenance_rebuild_keeps_mapped_owner_until_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let mut seed = SearchEngine::new(16);
+        seed.insert_chunk("c".into(), unit(0));
+        seed.insert_reflection("r".into(), unit(1));
+        seed.dump_to_disk(dir, 1, 1).unwrap();
+        let mut serving = SearchEngine::load_from_disk(dir, 1, 1).unwrap();
+        let live = || LIVE_MAPPED_GENERATIONS.with(|live| live.get());
+        assert_eq!(live(), 2);
+        let mut delayed = SearchEngine::new(16);
+        delayed.mark_rebuilt_at(read_maintenance_generation(dir));
+        delayed.insert_chunk("c".into(), unit(0));
+        invalidate_for_maintenance(dir).unwrap();
+        assert!(crossed_maintenance(
+            &delayed.dump_to_disk(dir, 1, 0).unwrap_err()
+        ));
+        drop(delayed);
+        assert_eq!(live(), 2, "refusal retains the serving engine's maps");
+        assert_eq!(serving.search_chunks(&unit(0), 1, 0.99)[0].id, "c");
+
+        let mut fresh = SearchEngine::new(16);
+        fresh.mark_rebuilt_at(read_maintenance_generation(dir));
+        fresh.insert_chunk("c".into(), unit(2));
+        fresh.dump_to_disk(dir, 1, 0).unwrap();
+        serving = fresh;
+        assert_eq!(
+            live(),
+            0,
+            "replacement drops the old indexes before their maps"
+        );
+        assert_eq!(serving.search_chunks(&unit(2), 1, 0.99)[0].id, "c");
+        drop(serving);
         assert_eq!(live(), 0);
     }
 
@@ -2733,7 +2925,9 @@ mod tests {
             active_reflection_count: 0,
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
-            epoch: 0,
+            // The epoch the seeding dump published: a manifest below the
+            // maintenance generation would be rejected for that reason instead.
+            epoch: seeded_manifest.epoch,
             chunk_change_cursor: 0,
             reflection_change_cursor: 0,
         };

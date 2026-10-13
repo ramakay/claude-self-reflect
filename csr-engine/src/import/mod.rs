@@ -54,6 +54,11 @@ pub fn contamination_reason(text: &str) -> Option<&'static str> {
         Some("system_reminder")
     } else if crate::extraction::provenance::is_csr_emission(text) {
         Some("csr_emission")
+    } else if crate::extraction::provenance::strip_csr_forwards(text).is_some() {
+        // A forward anywhere, not only in the leading window is_csr_emission
+        // reads: one past byte 400 was cut by the scrub but never selected for
+        // it (astra #8).
+        Some("csr_forward")
     } else {
         None
     }
@@ -62,13 +67,21 @@ pub fn contamination_reason(text: &str) -> Option<&'static str> {
 /// Remove exact wrapper spans and paragraphs that are themselves CSR output.
 /// `None` means the content was pure contamination and should be dropped.
 pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
-    // The companion dreamer's message is machine-owned from its first word to
-    // its last: drop it whole BEFORE paragraph scrubbing, which would remove
-    // only the attribution paragraph and keep the question and the quoted
-    // reasoning as the person's own words.
-    if crate::extraction::provenance::is_dreamer_prompt(text) {
-        return None;
-    }
+    // The companion dreamer's message is machine-owned from its question to
+    // its reasoning: cut it by shape BEFORE paragraph scrubbing, which would
+    // remove only the attribution paragraph and keep the question and the
+    // quoted reasoning as the person's own words. Every forwarded dream goes,
+    // and the compaction card's draft with them; a reply typed under or
+    // between them is the person's and stays.
+    let dreamt;
+    let text = match crate::extraction::provenance::strip_csr_forwards(text) {
+        Some(own) if own.is_empty() => return None,
+        Some(own) => {
+            dreamt = own;
+            dreamt.as_str()
+        }
+        None => text,
+    };
     // A forwarded side-agent note is the side agent's words, not the person's:
     // cut the opener and its blockquote, keep what the person typed after it.
     let forwarded;
@@ -81,7 +94,11 @@ pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
         None => text,
     };
     let without_wrappers = CSR_SYSTEM_REMINDER_RE.replace_all(text, "");
-    let clean = without_wrappers
+    // Emission lines and spans go before paragraphs are judged: a recap or
+    // sentinel line inside the person's paragraph would otherwise take the
+    // whole paragraph with it (astra #5).
+    let lines = crate::extraction::provenance::strip_emission_lines(&without_wrappers, false);
+    let clean = lines
         .split("\n\n")
         .filter(|paragraph| contamination_reason(paragraph).is_none())
         .collect::<Vec<_>>()
@@ -2217,6 +2234,30 @@ mod tests {
         // the person's own words, and the assistant's, are untouched
         for kept in ["flaky retry test", "bounded backoff", "importer suite"] {
             assert!(everything.contains(kept), "`{kept}` was lost: {everything}");
+        }
+    }
+
+    #[test]
+    fn codex_r2_6_to_8_scrub_keeps_what_extractable_keeps() {
+        use crate::extraction::provenance::{extractable, probes};
+        // #6: a request about the compaction card is the person's.
+        let card = probes::CARD_REQUEST;
+        assert_eq!(scrub_contaminated_text(card).as_deref(), Some(card));
+        // #7: a sentence that opens with the attribution's words is the person's.
+        let talk = probes::attribution_talk();
+        assert_eq!(
+            scrub_contaminated_text(&talk).as_deref(),
+            Some(talk.as_str())
+        );
+        // #8: both forwarded dreams go, the reply between them stays.
+        let f = probes::hindi_forward();
+        let twice = format!("{f}\n\nNo, keep the current palette.\n\n{f}");
+        assert_eq!(
+            scrub_contaminated_text(&twice).as_deref(),
+            Some("No, keep the current palette.")
+        );
+        for text in [card.to_string(), talk, twice] {
+            assert_eq!(scrub_contaminated_text(&text), extractable(&text), "{text}");
         }
     }
 

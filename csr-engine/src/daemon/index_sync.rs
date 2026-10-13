@@ -202,6 +202,52 @@ mod tests {
     use crate::import::ConversationChunk;
 
     #[test]
+    fn scrub_changes_survive_sync_and_a_batch_read_before_the_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index_dir = tmp.path().join("index");
+        let storage = Storage::open_memory().unwrap();
+        storage.insert_chunk(&chunk("keep"), &axis(0)).unwrap();
+        storage.insert_chunk(&chunk("drop"), &axis(1)).unwrap();
+        storage
+            .insert_reflection("drop-r", "x", &[], &axis(2))
+            .unwrap();
+        let search = RwLock::new(SearchEngine::new(100));
+        let shutdown = AtomicBool::new(false);
+        let obsolete = read_batch(&storage, &search, 0, None).unwrap();
+
+        crate::search::invalidate_for_maintenance(&index_dir).unwrap();
+        // The same embedding writes/deletions used by scrub's apply_plan
+        // and agent purge must be visible through the change journal.
+        storage.insert_chunk(&chunk("keep"), &axis(3)).unwrap();
+        storage.delete_chunk("drop").unwrap();
+        storage.purge_reflections(&["drop-r".into()]).unwrap();
+        let (_, _, count) = sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+        assert_eq!(count, 3);
+        {
+            let index = search.blocking_read();
+            assert_eq!(index.search_chunks(&axis(3), 1, 0.99)[0].id, "keep");
+            assert!(!index.has_chunk("drop"));
+            assert!(!index.has_reflection("drop-r"));
+        }
+
+        let generation = crate::search::read_maintenance_generation(&index_dir);
+        let (mut rebuilt, _, _, _) =
+            crate::engine::rebuild_search_index_streaming(&storage, 1, generation).unwrap();
+        rebuilt.dump_to_disk(&index_dir, 1, 0).unwrap();
+        *search.blocking_write() = rebuilt;
+        assert_eq!(apply_batch(&search, &shutdown, obsolete).2, 0);
+        assert_eq!(
+            sync_batch(&storage, &search, &shutdown, 0, None).unwrap().2,
+            0
+        );
+        let index = search.blocking_read();
+        assert_eq!(index.search_chunks(&axis(3), 1, 0.99)[0].id, "keep");
+        assert!(!index.has_chunk("drop"));
+        assert!(!index.has_reflection("drop-r"));
+        assert_eq!(index.chunk_tombstone_count(), 0);
+    }
+
+    #[test]
     fn rebuild_swap_replays_external_updates_already_applied_to_the_old_index() {
         let storage = Storage::open_memory().unwrap();
         let mut old = vec![0.0; 384];
@@ -420,7 +466,8 @@ mod tests {
         storage.insert_chunk(&chunk("a"), &axis(0)).unwrap();
         // An update before the rebuild: retained as an invalidating change.
         storage.insert_chunk(&chunk("a"), &axis(1)).unwrap();
-        let (engine, _, _) = crate::engine::rebuild_search_index_streaming(&storage, 100).unwrap();
+        let (engine, _, _, _) =
+            crate::engine::rebuild_search_index_streaming(&storage, 100, 0).unwrap();
         assert!(engine.change_cursor() > 0);
         let search = RwLock::new(engine);
         let shutdown = AtomicBool::new(false);
@@ -575,7 +622,12 @@ mod tests {
         storage
             .insert_reflection("r", "x", &[], &axis(999))
             .unwrap();
-        let (engine, _, _) = crate::engine::rebuild_search_index_streaming(&storage, 128).unwrap();
+        let (engine, _, _, _) = crate::engine::rebuild_search_index_streaming(
+            &storage,
+            128,
+            crate::search::read_maintenance_generation(&index_dir),
+        )
+        .unwrap();
         let search = RwLock::new(engine);
         let shutdown = AtomicBool::new(false);
         assert!(matches!(

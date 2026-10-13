@@ -377,6 +377,10 @@ impl FileWatcher {
 
             // Process all pending files
             if !pending.is_empty() {
+                // A maintenance run holds the database: the batch waits for it.
+                if let Some(data_dir) = self.index_dir.parent() {
+                    crate::maintenance::sleep_while_active(data_dir).await;
+                }
                 let _heavy_permit = match &self.heavy_work {
                     Some(heavy_work) => Some(acquire_heavy_work_permit(heavy_work.clone()).await),
                     None => None,

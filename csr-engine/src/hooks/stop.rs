@@ -519,6 +519,11 @@ fn forwarded_note_headline(text: &str) -> Option<String> {
     }
     if crate::extraction::provenance::is_dreamer_prompt(text) {
         let question = text.trim().split("\n\n").next()?.trim();
+        // Forward grammar v2 wraps the band's question in curly quotes.
+        let question = question
+            .strip_prefix('\u{201c}')
+            .and_then(|inner| inner.strip_suffix('\u{201d}'))
+            .unwrap_or(question);
         return (!question.starts_with(crate::extraction::provenance::DREAMER_ATTRIBUTION)
             && !question.contains('\n'))
         .then(|| question.to_string());
@@ -2919,6 +2924,20 @@ mod tests {
             typed_line("and check the pane width while you are at it", "queued"),
             typed_line("ok, do it please", "typed"),
         ]);
+        assert_eq!(
+            ep.anchor_request.as_deref(),
+            Some("note: What if Claude opening a memory note also pulled in its session?")
+        );
+    }
+
+    #[test]
+    fn a_v2_dreamer_what_if_is_a_note_without_its_quote_envelope() {
+        let ep = extract(&[typed_line(
+            "\u{201c}What if Claude opening a memory note also pulled in its session?\u{201d}\n\n\
+             CSR's dreamer asked this while you worked, quoted. Its reasoning:\n\n\
+             > Notes are where Claude looks first.",
+            "typed",
+        )]);
         assert_eq!(
             ep.anchor_request.as_deref(),
             Some("note: What if Claude opening a memory note also pulled in its session?")

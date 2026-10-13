@@ -118,6 +118,30 @@ pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Re
     Ok(())
 }
 
+/// Replace the evidence of chunks in one conversation inside a transaction the
+/// caller already holds, then relink once, seeded by that conversation and the
+/// conversations its events name: its family, never the whole corpus. The
+/// corpus-wide relink held a maintenance transaction past every hook's 5 s busy
+/// timeout on the full database (astra r2 #1: 18.4 s for its seed query alone).
+pub(crate) fn replace_conversation_evidence_in(
+    conn: &Connection,
+    conversation_id: &str,
+    evidence: &[ChunkEvidence],
+) -> Result<()> {
+    let mut seeds = vec![conversation_id.to_string()];
+    for row in evidence {
+        replace_chunk_evidence_inner(conn, row)
+            .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
+        for event in &row.events {
+            if !seeds.contains(&event.conversation_id) {
+                seeds.push(event.conversation_id.clone());
+            }
+        }
+    }
+    super::sidechain_provenance::relink_conversations(conn, &seeds)?;
+    Ok(())
+}
+
 fn evidence_needs_relink(conn: &Connection, evidence: &ChunkEvidence) -> Result<bool> {
     for event in &evidence.events {
         if event.parent_event_id.is_some() {
@@ -2747,7 +2771,7 @@ pub fn is_file_imported(conn: &Connection, path: &Path) -> Result<bool> {
 }
 
 /// Get file modification time as a string for comparison.
-fn file_mtime_str(path: &Path) -> String {
+pub(crate) fn file_mtime_str(path: &Path) -> String {
     path.metadata()
         .and_then(|m| m.modified())
         .map(|t| {
@@ -2758,13 +2782,24 @@ fn file_mtime_str(path: &Path) -> String {
 }
 
 pub fn mark_file_imported(conn: &Connection, path: &Path, chunks: usize) -> Result<()> {
+    mark_file_imported_at(conn, path, chunks, &file_mtime_str(path))
+}
+
+/// [`mark_file_imported`] with the revision the caller read the file at, not one
+/// sampled now: a file that grew since must still read as changed
+/// ([`is_file_imported`] compares this against the current mtime).
+pub(crate) fn mark_file_imported_at(
+    conn: &Connection,
+    path: &Path,
+    chunks: usize,
+    mtime: &str,
+) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
     // Extract conversation_id from filename (stem of the JSONL file)
     let conv_id = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mtime = file_mtime_str(path);
     conn.execute(
         "INSERT INTO import_state (
              file_path, conversation_id, chunks_imported, file_mtime,

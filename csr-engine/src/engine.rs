@@ -211,21 +211,41 @@ impl Engine {
             // and no stale age to report.
             tracing::info!("building search index from stored vectors");
 
-            let (mut search, chunk_total, reflection_total) =
-                rebuild_search_index_streaming(&storage, RECONCILE_BATCH)?;
-            let t_hnsw = t0.elapsed();
-
-            // Re-query counts right before dump to minimize staleness window (E-1)
-            let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
-            let reflection_count = storage
-                .count_reflection_embeddings()
-                .unwrap_or(reflection_count);
-            if persist {
-                if let Err(e) = search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
-                    tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
+            // The maintenance generation is read before the stream: a rebuild a
+            // maintenance pass overtakes is refused publication and run again,
+            // so it never restores rows the pass rewrote (astra r2 #4).
+            let mut attempt = 1;
+            let (search, chunk_total, reflection_total, t_hnsw) = loop {
+                let generation = crate::search::read_maintenance_generation(&index_dir);
+                let (mut search, chunk_total, reflection_total, streamed) =
+                    rebuild_search_index_streaming(&storage, RECONCILE_BATCH, generation)?;
+                reconcile_fresh_against_db(&storage, &mut search, &streamed)?;
+                let t_hnsw = t0.elapsed();
+                if !persist {
+                    break (search, chunk_total, reflection_total, t_hnsw);
+                }
+                // Re-query counts right before dump to minimize staleness window (E-1)
+                let chunk_count = storage.count_chunk_embeddings().unwrap_or(chunk_count);
+                let reflection_count = storage
+                    .count_reflection_embeddings()
+                    .unwrap_or(reflection_count);
+                match search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
+                    Err(e)
+                        if crate::search::crossed_maintenance(&e) && attempt < REBUILD_ATTEMPTS =>
+                    {
+                        tracing::warn!(error = %e, attempt, "startup rebuild crossed a maintenance pass; rebuilding");
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(e) if crate::search::crossed_maintenance(&e) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to cache HNSW index (non-fatal)");
+                    }
+                    Ok(()) => {}
                 }
                 crate::search::clear_needs_compaction(&index_dir);
-            }
+                break (search, chunk_total, reflection_total, t_hnsw);
+            };
             index_freshly_rebuilt = true;
             let t_total = t0.elapsed();
 
@@ -402,6 +422,17 @@ impl Engine {
         file_path: &Path,
         attribution: &import::ConversationAttribution,
     ) -> Result<usize> {
+        // A maintenance run (`backfill scrub`) holds the database: write
+        // nothing and leave the file's import state alone, so the watcher or
+        // the next hook imports it once the run ends.
+        if let Some(holder) = crate::maintenance::active(self.data_dir()) {
+            tracing::info!(
+                pid = holder.pid,
+                file = %file_path.display(),
+                "maintenance in progress; import skipped"
+            );
+            return Ok(0);
+        }
         let conversation_id = file_path
             .file_stem()
             .unwrap_or_default()
@@ -668,6 +699,12 @@ impl Engine {
         &self.index_dir
     }
 
+    /// The data directory: the database's own, where the index directory and
+    /// the maintenance lock live.
+    pub fn data_dir(&self) -> &Path {
+        self.index_dir.parent().unwrap_or(&self.index_dir)
+    }
+
     /// True when this `Engine::new` call took the cache-miss path and built
     /// a fresh, compact index from SQLite from scratch (first-ever run, or
     /// `load_from_disk` rejecting a missing/corrupt manifest — interface 4,
@@ -755,22 +792,65 @@ impl Engine {
     /// #6: without this, a swapped-in "fresh" index could still hand back a
     /// dead id until the next `Engine::new` reconciliation, contradicting
     /// the "no dead id is ever returned" contract).
+    ///
+    /// The maintenance generation is read before the stream starts; a rebuild
+    /// a maintenance pass overtook is refused publication and run again (up to
+    /// [`REBUILD_ATTEMPTS`] times), so it never restores rows the pass rewrote.
     pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
-        let storage = self.storage.clone();
-        let (mut fresh, chunk_count, reflection_count) = tokio::task::spawn_blocking(move || {
-            rebuild_search_index_streaming(&storage, RECONCILE_BATCH)
-        })
-        .await
-        .context("rebuild_search_index_streaming task panicked")??;
+        let mut attempt = 1;
+        loop {
+            let generation = crate::search::read_maintenance_generation(&self.index_dir);
+            let storage = self.storage.clone();
+            let (mut fresh, chunk_count, reflection_count) =
+                tokio::task::spawn_blocking(move || {
+                    let (mut fresh, chunk_count, reflection_count, streamed) =
+                        rebuild_search_index_streaming(&storage, RECONCILE_BATCH, generation)?;
+                    reconcile_fresh_against_db(&storage, &mut fresh, &streamed)?;
+                    Ok::<_, anyhow::Error>((fresh, chunk_count, reflection_count))
+                })
+                .await
+                .context("rebuild_search_index_streaming task panicked")??;
 
-        reconcile_fresh_against_db(&self.storage, &mut fresh);
+            // Keep publication separate from the streaming worker: if the
+            // daemon cancels while that worker runs, its detached result is
+            // dropped without ever publishing or swapping the index.
+            let storage = self.storage.clone();
+            let index_dir = self.index_dir.clone();
+            let persist = !self.skip_index_persistence;
+            let rebuilt = tokio::task::spawn_blocking(move || {
+                // Refuse a crossed rebuild before installing it. The serving
+                // engine (and its maps) stays owned until a publish succeeds.
+                if persist {
+                    fresh.dump_to_disk(
+                        &index_dir,
+                        storage.count_chunk_embeddings()?,
+                        storage.count_reflection_embeddings()?,
+                    )?;
+                }
+                Ok::<_, anyhow::Error>((fresh, chunk_count, reflection_count))
+            })
+            .await
+            .context("rebuild publication task panicked")?
+            .with_context(|| format!("persisting HNSW index to {}", self.index_dir.display()));
 
-        *self.search.write().await = fresh;
-        self.flush_index_checked().await?;
-        // Compact by construction — clears any pending compaction request
-        // (`needs_compaction` marker) a foreground process may have left.
-        crate::search::clear_needs_compaction(&self.index_dir);
-        Ok((chunk_count, reflection_count))
+            match rebuilt {
+                Err(error)
+                    if crate::search::crossed_maintenance(&error) && attempt < REBUILD_ATTEMPTS =>
+                {
+                    tracing::warn!(%error, attempt, "index rebuild crossed a maintenance pass; rebuilding");
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+                Ok((fresh, chunk_count, reflection_count)) => {
+                    *self.search.write().await = fresh;
+                    // Compact by construction — clears any pending compaction
+                    // request (`needs_compaction` marker) a foreground process
+                    // may have left.
+                    crate::search::clear_needs_compaction(&self.index_dir);
+                    return Ok((chunk_count, reflection_count));
+                }
+            }
+        }
     }
 
     /// Daemon only: [`remap_published_generation`] on the blocking pool.
@@ -789,14 +869,20 @@ impl Engine {
     /// vectors. If the operation is interrupted or its final dump fails, the
     /// next process must rebuild from SQLite instead of accepting stale files
     /// whose row counts happen to match.
+    ///
+    /// It also raises the index's maintenance generation (under `index.lock`),
+    /// which outlives the manifest: every engine loaded before this call stays
+    /// fenced out of publishing its pre-maintenance graph, even once the pass's
+    /// own rebuild has published (see `search::invalidate_for_maintenance`).
     pub fn invalidate_index_manifest(&self) -> Result<()> {
-        let path = self.index_dir.join("manifest.json");
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("invalidating HNSW manifest at {}", path.display())),
-        }
+        crate::search::invalidate_for_maintenance(&self.index_dir)
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "invalidating HNSW manifest at {}",
+                    self.index_dir.join("manifest.json").display()
+                )
+            })
     }
 
     /// Start the file system watcher as a background task.
@@ -1147,6 +1233,10 @@ const ORPHAN_REBUILD_DIVISOR: usize = 20;
 /// is O(batch) instead of O(corpus). See src/engine.rs:126-165 history.
 const RECONCILE_BATCH: usize = 2_000;
 
+/// How many times a full rebuild runs when a maintenance pass keeps overtaking
+/// it before it can publish.
+const REBUILD_ATTEMPTS: usize = 3;
+
 /// Fetch and insert only the given missing chunk ids, in bounded batches.
 /// Never materializes more than `batch_size` vectors at once. Returns the
 /// number of points actually inserted.
@@ -1219,53 +1309,63 @@ fn backfill_missing_reflections(
 /// inline — a test that copies this reconciliation rather than calling it
 /// keeps passing even after the real blanking/backfill calls in
 /// `rebuild_search_index` are deleted (WP-D low #7).
-fn reconcile_fresh_against_db(storage: &Storage, fresh: &mut SearchEngine) {
-    if let Ok(db_ids) = storage.load_all_reflection_ids() {
-        let db_id_set: std::collections::HashSet<&str> =
-            db_ids.iter().map(|s| s.as_str()).collect();
-        let blanked = fresh.blank_orphan_reflections(&db_id_set);
-        if blanked > 0 {
-            tracing::info!(
-                blanked,
-                "blanked reflections deleted while the rebuild was streaming"
-            );
-        }
-        let missing: Vec<String> = db_id_set
-            .iter()
-            .filter(|id| !fresh.has_reflection(id))
-            .map(|s| s.to_string())
-            .collect();
-        if !missing.is_empty() {
-            if let Ok(added) = backfill_missing_reflections(storage, fresh, &missing) {
-                if added > 0 {
-                    tracing::info!(added, "backfilled reflections that landed mid-rebuild");
-                }
-            }
+fn reconcile_fresh_against_db(
+    storage: &Storage,
+    fresh: &mut SearchEngine,
+    streamed: &StreamedVectors,
+) -> Result<()> {
+    let (chunks, reflections) =
+        replace_vectors_changed_while_streaming(storage, fresh, streamed)
+            .context("re-checking vectors changed while the rebuild streamed")?;
+    if chunks + reflections > 0 {
+        tracing::info!(
+            chunks,
+            reflections,
+            "replaced vectors re-embedded while the rebuild was streaming"
+        );
+    }
+    let db_ids = storage.load_all_reflection_ids()?;
+    let db_id_set: std::collections::HashSet<&str> = db_ids.iter().map(|s| s.as_str()).collect();
+    let blanked = fresh.blank_orphan_reflections(&db_id_set);
+    if blanked > 0 {
+        tracing::info!(
+            blanked,
+            "blanked reflections deleted while the rebuild was streaming"
+        );
+    }
+    let missing: Vec<String> = db_id_set
+        .iter()
+        .filter(|id| !fresh.has_reflection(id))
+        .map(|s| s.to_string())
+        .collect();
+    if !missing.is_empty() {
+        let added = backfill_missing_reflections(storage, fresh, &missing)?;
+        if added > 0 {
+            tracing::info!(added, "backfilled reflections that landed mid-rebuild");
         }
     }
-    if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
-        let db_id_set: std::collections::HashSet<&str> =
-            db_chunk_ids.iter().map(|s| s.as_str()).collect();
-        let blanked = fresh.blank_orphan_chunks(&db_id_set);
-        if blanked > 0 {
-            tracing::info!(
-                blanked,
-                "blanked chunks deleted while the rebuild was streaming"
-            );
-        }
-        let missing: Vec<String> = db_id_set
-            .iter()
-            .filter(|id| !fresh.has_chunk(id))
-            .map(|s| s.to_string())
-            .collect();
-        if !missing.is_empty() {
-            if let Ok(added) = backfill_missing_chunks(storage, fresh, &missing) {
-                if added > 0 {
-                    tracing::info!(added, "backfilled chunks that landed mid-rebuild");
-                }
-            }
+    let db_chunk_ids = storage.load_all_chunk_ids()?;
+    let db_id_set: std::collections::HashSet<&str> =
+        db_chunk_ids.iter().map(|s| s.as_str()).collect();
+    let blanked = fresh.blank_orphan_chunks(&db_id_set);
+    if blanked > 0 {
+        tracing::info!(
+            blanked,
+            "blanked chunks deleted while the rebuild was streaming"
+        );
+    }
+    let missing: Vec<String> = db_id_set
+        .iter()
+        .filter(|id| !fresh.has_chunk(id))
+        .map(|s| s.to_string())
+        .collect();
+    if !missing.is_empty() {
+        let added = backfill_missing_chunks(storage, fresh, &missing)?;
+        if added > 0 {
+            tracing::info!(added, "backfilled chunks that landed mid-rebuild");
         }
     }
+    Ok(())
 }
 
 /// Rebuild the HNSW index from SQLite, streaming vectors in bounded batches
@@ -1274,11 +1374,13 @@ fn reconcile_fresh_against_db(storage: &Storage, fresh: &mut SearchEngine) {
 /// (`load_all_chunk_ids` / `load_all_reflection_ids`) drive the batching;
 /// each batch's vectors are moved (not cloned) into the index and dropped
 /// before the next batch is fetched. Returns the built index plus the
-/// (chunks, reflections) counts actually inserted.
+/// (chunks, reflections) counts actually inserted and stream fingerprints.
+/// `maintenance_generation` must be captured before starting the stream.
 pub(crate) fn rebuild_search_index_streaming(
     storage: &Storage,
     batch_size: usize,
-) -> Result<(SearchEngine, usize, usize)> {
+    maintenance_generation: u64,
+) -> Result<(SearchEngine, usize, usize, StreamedVectors)> {
     // Every change up to here is visible to the reads below, so the index
     // sync may resume after it once this engine is swapped in.
     let change_cursor = storage.latest_embedding_change_seq()?;
@@ -1288,26 +1390,128 @@ pub(crate) fn rebuild_search_index_streaming(
     let estimated_size = (chunk_ids.len() + 1000).max(10_000);
     let mut search = SearchEngine::new(estimated_size);
     search.set_change_cursor(change_cursor);
+    search.mark_rebuilt_at(maintenance_generation);
+    let batch_size = batch_size.max(1);
 
+    let mut chunk_prints = vec![0_u64; chunk_ids.len()];
     let mut chunk_total = 0usize;
-    for batch in chunk_ids.chunks(batch_size.max(1)) {
+    for (number, batch) in chunk_ids.chunks(batch_size).enumerate() {
         let vecs = storage.get_chunk_vectors_by_ids(batch)?;
         chunk_total += vecs.len();
+        let at = batch_positions(batch, number * batch_size);
         for (id, vec) in vecs {
+            if let Some(&position) = at.get(id.as_str()) {
+                chunk_prints[position] = vector_fingerprint(&vec);
+            }
             search.insert_chunk(id, vec);
         }
     }
 
+    let mut reflection_prints = vec![0_u64; reflection_ids.len()];
     let mut reflection_total = 0usize;
-    for batch in reflection_ids.chunks(batch_size.max(1)) {
+    for (number, batch) in reflection_ids.chunks(batch_size).enumerate() {
         let vecs = storage.get_reflection_vectors_by_ids(batch)?;
         reflection_total += vecs.len();
+        let at = batch_positions(batch, number * batch_size);
         for (id, vec) in vecs {
+            if let Some(&position) = at.get(id.as_str()) {
+                reflection_prints[position] = vector_fingerprint(&vec);
+            }
             search.insert_reflection(id, vec);
         }
     }
 
-    Ok((search, chunk_total, reflection_total))
+    Ok((
+        search,
+        chunk_total,
+        reflection_total,
+        StreamedVectors {
+            chunk_ids,
+            chunk_prints,
+            reflection_ids,
+            reflection_prints,
+            batch_size,
+        },
+    ))
+}
+
+/// What the streaming rebuild read: every id with a fingerprint of the vector it
+/// inserted (0 when the row was gone by its batch). Reconciliation re-reads the
+/// same ids and replaces any vector whose fingerprint moved, so a row re-embedded
+/// while the rebuild streamed is published at its current revision (astra #7:
+/// the id-only reconciliation kept the old vector because the id still existed).
+pub(crate) struct StreamedVectors {
+    chunk_ids: Vec<String>,
+    chunk_prints: Vec<u64>,
+    reflection_ids: Vec<String>,
+    reflection_prints: Vec<u64>,
+    batch_size: usize,
+}
+
+fn batch_positions(batch: &[String], base: usize) -> std::collections::HashMap<&str, usize> {
+    batch
+        .iter()
+        .enumerate()
+        .map(|(offset, id)| (id.as_str(), base + offset))
+        .collect()
+}
+
+/// FNV-1a over the vector's bits; never 0, which marks "not read".
+fn vector_fingerprint(vector: &[f32]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for value in vector {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash.max(1)
+}
+
+/// Replace in `fresh` every streamed vector whose stored revision changed since
+/// the stream read it. Returns how many chunks and reflections were replaced.
+fn replace_vectors_changed_while_streaming(
+    storage: &Storage,
+    fresh: &mut SearchEngine,
+    streamed: &StreamedVectors,
+) -> Result<(usize, usize)> {
+    let mut chunks = 0;
+    for (number, batch) in streamed.chunk_ids.chunks(streamed.batch_size).enumerate() {
+        let at = batch_positions(batch, number * streamed.batch_size);
+        for (id, vec) in storage.get_chunk_vectors_by_ids(batch)? {
+            let read = at
+                .get(id.as_str())
+                .map(|&position| streamed.chunk_prints[position]);
+            if read.is_some_and(|read| read != 0 && read != vector_fingerprint(&vec))
+                && fresh.has_chunk(&id)
+            {
+                fresh.remove_chunk(&id);
+                fresh.insert_chunk(id, vec);
+                chunks += 1;
+            }
+        }
+    }
+    let mut reflections = 0;
+    for (number, batch) in streamed
+        .reflection_ids
+        .chunks(streamed.batch_size)
+        .enumerate()
+    {
+        let at = batch_positions(batch, number * streamed.batch_size);
+        for (id, vec) in storage.get_reflection_vectors_by_ids(batch)? {
+            let read = at
+                .get(id.as_str())
+                .map(|&position| streamed.reflection_prints[position]);
+            if read.is_some_and(|read| read != 0 && read != vector_fingerprint(&vec))
+                && fresh.has_reflection(&id)
+            {
+                fresh.remove_reflection(&id);
+                fresh.insert_reflection(id, vec);
+                reflections += 1;
+            }
+        }
+    }
+    Ok((chunks, reflections))
 }
 
 #[cfg(test)]
@@ -1334,6 +1538,162 @@ mod tests {
                 &[0.1_f32; 384],
             )
             .unwrap();
+    }
+
+    fn insert_test_chunk_with(storage: &Storage, id: &str, vector: &[f32]) {
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id.into(),
+                    conversation_id: "conv".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-09-08T00:00:00Z".into(),
+                    content: "x".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                vector,
+            )
+            .unwrap();
+    }
+
+    /// A unit vector along axis `axis`: orthogonal to every other axis and far
+    /// from the `[0.1; 384]` filler every test chunk carries.
+    fn axis(axis: usize) -> Vec<f32> {
+        let mut vector = vec![0.0_f32; 384];
+        vector[axis] = 1.0;
+        vector
+    }
+
+    #[test]
+    fn astra_7_rebuild_reconciliation_picks_up_a_vector_replaced_while_streaming() {
+        let storage = Storage::open_memory().unwrap();
+        for i in 0..10 {
+            insert_test_chunk(&storage, &format!("chunk-{i}"));
+        }
+        insert_test_chunk_with(&storage, "x", &axis(0));
+        let (mut fresh, chunks, _, streamed) =
+            rebuild_search_index_streaming(&storage, 4, 0).unwrap();
+        assert_eq!(chunks, 11);
+        // Another writer re-embeds x after the stream read it.
+        insert_test_chunk_with(&storage, "x", &axis(1));
+        reconcile_fresh_against_db(&storage, &mut fresh, &streamed).unwrap();
+        let hits = fresh.search_chunks(&axis(1), 1, 0.99);
+        assert_eq!(hits.first().map(|hit| hit.id.as_str()), Some("x"));
+        assert!(fresh.search_chunks(&axis(0), 1, 0.99).is_empty());
+    }
+
+    /// 40 filler chunks and `x` along `axis(n)`.
+    fn graph_with_x(n: usize) -> SearchEngine {
+        let mut graph = SearchEngine::new(100);
+        for i in 0..40 {
+            graph.insert_chunk(format!("filler-{i}"), vec![0.1; 384]);
+        }
+        graph.insert_chunk("x".into(), axis(n));
+        graph
+    }
+
+    #[test]
+    fn astra_r2_5_a_below_floor_manifest_is_never_carried_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        graph_with_x(0).dump_to_disk(dir, 41, 0).unwrap();
+        let old_manifest = std::fs::read(dir.join("manifest.json")).unwrap();
+        let mut peer = SearchEngine::load_from_disk(dir, 41, 0).unwrap();
+        crate::search::invalidate_for_maintenance(dir).unwrap();
+        // An older binary, blind to the generation, puts the pre-pass manifest back.
+        std::fs::write(dir.join("manifest.json"), old_manifest).unwrap();
+        assert!(SearchEngine::load_from_disk(dir, 41, 0).is_none());
+        // A peer of this binary loaded before the pass flushes: it must not
+        // relabel those files current.
+        peer.insert_chunk("y".into(), axis(2));
+        peer.dump_to_disk(dir, 42, 0).unwrap();
+        assert!(SearchEngine::load_from_disk(dir, 42, 0).is_none());
+    }
+
+    #[test]
+    fn astra_r2_4_a_rebuild_a_maintenance_pass_overtook_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        graph_with_x(0).dump_to_disk(dir, 41, 0).unwrap();
+        // Another process starts a cache-miss rebuild and reads x at v_old.
+        let mut delayed = graph_with_x(0);
+        delayed.mark_rebuilt_at(crate::search::read_maintenance_generation(dir));
+        // The scrub invalidates, rewrites x and publishes its own rebuild.
+        crate::search::invalidate_for_maintenance(dir).unwrap();
+        let mut scrubbed = graph_with_x(1);
+        scrubbed.mark_rebuilt_at(crate::search::read_maintenance_generation(dir));
+        scrubbed.dump_to_disk(dir, 41, 0).unwrap();
+        // The delayed rebuild finishes: refused, nothing written.
+        let error = delayed.dump_to_disk(dir, 41, 0).unwrap_err();
+        assert!(crate::search::crossed_maintenance(&error), "{error:#}");
+        let loaded = SearchEngine::load_from_disk(dir, 41, 0).unwrap();
+        assert_eq!(
+            loaded
+                .search_chunks(&axis(1), 1, 0.99)
+                .first()
+                .map(|hit| hit.id.as_str()),
+            Some("x")
+        );
+        assert!(loaded.search_chunks(&axis(0), 1, 0.99).is_empty());
+    }
+
+    #[tokio::test]
+    async fn astra_6_a_publisher_loaded_before_a_manifest_invalidation_stays_fenced() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let projects_dir = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        {
+            let storage = Storage::open(&db_path).unwrap();
+            for i in 0..40 {
+                insert_test_chunk(&storage, &format!("chunk-{i}"));
+            }
+            insert_test_chunk_with(&storage, "x", &axis(0));
+        }
+        // Writes the first cache generation.
+        {
+            Engine::new(&db_path, &projects_dir).unwrap();
+        }
+        // Engine A: a long-lived MCP server or daemon, loaded with x at v_old.
+        let eng_a = Engine::new(&db_path, &projects_dir).unwrap();
+        // Scrub B: invalidates the manifest, rewrites x to v_clean, rebuilds and
+        // publishes. No other publisher runs in between.
+        let eng_b = Engine::new(&db_path, &projects_dir).unwrap();
+        eng_b.invalidate_index_manifest().unwrap();
+        // A flushing mid-pass, manifest gone, publishes nothing at all.
+        insert_test_chunk(eng_a.storage(), "chunk-mid");
+        eng_a
+            .search
+            .write()
+            .await
+            .insert_chunk("chunk-mid".into(), vec![0.1_f32; 384]);
+        eng_a.flush_index_checked().await.unwrap();
+        assert!(!eng_a.index_dir().join("manifest.json").exists());
+        insert_test_chunk_with(eng_b.storage(), "x", &axis(1));
+        eng_b.rebuild_search_index().await.unwrap();
+        // A imports a genuine new chunk and flushes its pre-scrub graph.
+        insert_test_chunk(eng_a.storage(), "chunk-new");
+        eng_a
+            .search
+            .write()
+            .await
+            .insert_chunk("chunk-new".into(), vec![0.1_f32; 384]);
+        eng_a.flush_index_checked().await.unwrap();
+
+        let eng_c = Engine::new(&db_path, &projects_dir).unwrap();
+        let index = eng_c.search.read().await;
+        let hits = index.search_chunks(&axis(1), 1, 0.99);
+        assert_eq!(
+            hits.first().map(|hit| hit.id.as_str()),
+            Some("x"),
+            "the scrubbed vector must survive a pre-scrub publisher's flush"
+        );
+        assert!(index.has_chunk("chunk-new"));
+        assert!(index.has_chunk("chunk-mid"));
     }
 
     #[test]
@@ -1413,8 +1773,8 @@ mod tests {
         // batch_size=2 forces multiple batches for both chunks (7) and
         // reflections (3) — proves the rebuild path never needs a single
         // corpus-sized fetch to produce a correct index.
-        let (search, chunk_total, reflection_total) =
-            rebuild_search_index_streaming(&storage, 2).unwrap();
+        let (search, chunk_total, reflection_total, _) =
+            rebuild_search_index_streaming(&storage, 2, 0).unwrap();
 
         assert_eq!(chunk_total, 7);
         assert_eq!(reflection_total, 3);
@@ -1443,8 +1803,8 @@ mod tests {
         }
 
         // Snapshot, exactly as `rebuild_search_index`'s `spawn_blocking` does.
-        let (mut fresh, chunk_total, _reflection_total) =
-            rebuild_search_index_streaming(&storage, RECONCILE_BATCH).unwrap();
+        let (mut fresh, chunk_total, _reflection_total, streamed) =
+            rebuild_search_index_streaming(&storage, RECONCILE_BATCH, 0).unwrap();
         assert_eq!(chunk_total, 5);
         for i in 0..5 {
             assert!(fresh.has_chunk(&format!("chunk-{i}")));
@@ -1458,7 +1818,7 @@ mod tests {
         // Call the SAME function `rebuild_search_index` calls — not a
         // reimplementation of its logic — so removing the blanking calls
         // inside `reconcile_fresh_against_db` fails this test (WP-D low #7).
-        reconcile_fresh_against_db(&storage, &mut fresh);
+        reconcile_fresh_against_db(&storage, &mut fresh, &streamed).unwrap();
 
         assert!(!fresh.has_chunk("chunk-1"));
         assert!(!fresh.has_chunk("chunk-3"));
@@ -1527,7 +1887,12 @@ mod tests {
         for i in 0..400 {
             insert_direction(&storage, &format!("c{i}"), i);
         }
-        let (rebuilt, _, _) = rebuild_search_index_streaming(&storage, 128).unwrap();
+        let (rebuilt, _, _, _) = rebuild_search_index_streaming(
+            &storage,
+            128,
+            crate::search::read_maintenance_generation(&index_dir),
+        )
+        .unwrap();
         assert!(!rebuilt.is_mapped());
         let search = RwLock::new(rebuilt);
         assert!(matches!(
@@ -1600,14 +1965,24 @@ mod tests {
         for i in 0..300 {
             insert_direction(&storage, &format!("c{i}"), i);
         }
-        let (rebuilt, _, _) = rebuild_search_index_streaming(&storage, 128).unwrap();
+        let (rebuilt, _, _, _) = rebuild_search_index_streaming(
+            &storage,
+            128,
+            crate::search::read_maintenance_generation(&index_dir),
+        )
+        .unwrap();
         let search = RwLock::new(rebuilt);
         assert!(matches!(
             crate::import::watcher::flush_index_blocking(&storage, &search, &index_dir, true),
             Some(Ok(()))
         ));
         // Another process publishes over it before the remap loads.
-        let (mut other, _, _) = rebuild_search_index_streaming(&storage, 128).unwrap();
+        let (mut other, _, _, _) = rebuild_search_index_streaming(
+            &storage,
+            128,
+            crate::search::read_maintenance_generation(&index_dir),
+        )
+        .unwrap();
         other.dump_to_disk(&index_dir, 300, 0).unwrap();
         let generation = search.blocking_read().generation();
         assert!(!remap_published_generation(&storage, &search, &index_dir).unwrap());
