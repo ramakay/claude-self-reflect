@@ -488,15 +488,18 @@ fn source_forward_cuts(
             })
             .collect();
     }
+    // A chunk matched on its own still keeps the whitespace it stored before
+    // the next chunk; trimming it would glue the two slices together.
     chunks
         .iter()
-        .filter_map(|chunk| {
+        .enumerate()
+        .filter_map(|(i, chunk)| {
             index.without_forwards(&chunk.content).map(|own| {
                 (
                     chunk.id.clone(),
                     SourceCut {
                         text: own,
-                        continues_after: false,
+                        continues_after: i + 1 < chunks.len(),
                     },
                 )
             })
@@ -1725,6 +1728,52 @@ mod tests {
                 );
                 assert!(persisted.contains(&format!("4{space}2")), "{persisted}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn r9_chunk_matched_source_cut_keeps_trailing_join() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let forward = "CSR's story of this session, rev 1, quoted: “One.”";
+        for space in [" ", "  "] {
+            let raw = format!("The code is {forward}4{space}2{forward} Keep it.");
+            let split = raw.find(&format!("2{forward}")).unwrap();
+            let conversation = format!("codex:r9-{}", space.len());
+            // The third chunk is absent from the source, so the stored sequence
+            // cannot match as a whole and each chunk is matched on its own.
+            let ids = seed_message_chunks(
+                &storage,
+                &embeddings,
+                &conversation,
+                vec![
+                    chunk_at(&conversation, 0, &raw[..split]),
+                    chunk_at(&conversation, 1, &raw[split..]),
+                    chunk_at(&conversation, 2, "Later note."),
+                ],
+                false,
+            );
+            let path = temp.path().join(format!("r9-{}.jsonl", space.len()));
+            std::fs::write(&path, serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":raw}]}}).to_string()).unwrap();
+            storage
+                .upsert_import_state_explicit(path.to_str().unwrap(), &conversation, 3, "fixture")
+                .unwrap();
+            super::run_scrub(&engine, false, Some(&conversation), false, true)
+                .await
+                .unwrap();
+            let persisted = ids
+                .iter()
+                .filter_map(|id| storage.get_chunk_content(id).unwrap())
+                .collect::<String>();
+            assert!(persisted.contains(&format!("4{space}2")), "{persisted:?}");
+            assert!(!persisted.contains("CSR's"), "{persisted:?}");
         }
     }
 
