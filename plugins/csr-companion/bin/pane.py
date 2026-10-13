@@ -2983,12 +2983,13 @@ ANSWER_WORD = dict(helpful='helpful', ask_claude='asked Claude', thought_of_it="
                    rejected='you said no')
 
 
-def send_draft(agent, text):
+def send_draft(agent, text, named=None):
     """Words into Claude's prompt, unsent, over more than one line: each line is typed with send-text and a Ctrl+J, Claude Code's
     own new line, between them; an Enter is never sent, so nothing submits. False as soon as one step fails (the pane's herdr
-    refusing a key stops it with the lines so far typed, none sent)."""
+    refusing a key stops it with the lines so far typed, none sent). Fails closed unless `agent` is the pane the mod named
+    (`named`): the left neighbour agent_pane() falls back to may be a shell, and there a Ctrl+J runs the first line."""
     lines = [CONTROL.sub('', line) for line in str(text).split('\n')]
-    if not agent or not lines or any(len(line) > 4000 for line in lines):
+    if not agent or agent != named or not lines or any(len(line) > 4000 for line in lines):
         return False
     for number, line in enumerate(lines):
         if number and herdr('pane', 'send-keys', agent, 'ctrl+j') is None:
@@ -7406,7 +7407,7 @@ def lost_click(pane, act, col):
         agent = agent_pane(pane.agent)
         request, envelope = new_handoff(getattr(getattr(pane, 'session', None), 'id', None), act['lost']) if pick == 'sub' else (None, None)
         # The subagent ask carries its request: the ask, then the envelope on lines of its own, both unsent.
-        went = send_draft(agent, act['asks'][pick] + '\n' + envelope) if envelope else send_text(agent, act['asks'][pick])
+        went = send_draft(agent, act['asks'][pick] + '\n' + envelope, pane.agent) if envelope else send_text(agent, act['asks'][pick])
         pane.sent = (act['item'], went, time.time())
         if went:
             keep_lost(act['lost'], 'sent', time.time(), project, how=pick, **({'request': request} if request else {}))

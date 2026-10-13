@@ -869,3 +869,36 @@ class HandedThreads(Folder):
         finally:
             pane.herdr, pane.agent_pane, pane.focus_back = saved
         self.assertTrue(all(argv[1] == 'send-text' for argv in typed))
+
+    def test_the_multi_line_draft_is_never_typed_into_a_pane_the_mod_did_not_name(self):
+        """With no named pane the left neighbour is a guess: if it is a shell, Ctrl+J would run the ask as a command."""
+        key = the_thread(threads())['key']
+        (section,) = pane.lost_sections(dict(lost=threads()), T1 + 9100)
+        item = next(i for i in section['items'] if i['lost'] == key)
+        act = next(act for _, act in pane.lost_rows(dict(item, top=True), 46, {}, False)
+                   if any(answer == 'sub' for _, _, answer in act['spans']))
+        sub_at = next(start for start, _, answer in act['spans'] if answer == 'sub')
+        typed = []
+
+        def herdr(*argv):
+            typed.append(argv)
+            return json.dumps(dict(result=dict(pane=dict(pane_id='w1:shell')))) if argv[1] == 'neighbor' else ''
+
+        saved = pane.herdr, pane.focus_back
+        pane.herdr, pane.focus_back = herdr, lambda: None
+        unnamed = types.SimpleNamespace(session=types.SimpleNamespace(id=SESSION, path=None), agent=None, sent=None)
+        try:
+            unittest.mock.patch.dict(os.environ, HERDR_PANE_ID='w1:mine').start()
+            self.addCleanup(unittest.mock.patch.stopall)
+            self.assertEqual(pane.agent_pane(None), 'w1:shell')  # the fallback finds the shell
+            self.assertFalse(pane.send_draft('w1:shell', 'ask\nline two'))
+            pane.lost_click(unnamed, act, sub_at)
+            named = types.SimpleNamespace(session=unnamed.session, agent='w1:claude', sent=None)
+            typed.clear()
+            pane.lost_click(named, act, sub_at)  # the named pane still gets the whole draft
+        finally:
+            pane.herdr, pane.focus_back = saved
+        self.assertFalse(unnamed.sent[1])
+        self.assertTrue(named.sent[1])
+        self.assertEqual({argv[3] for argv in typed if argv[1] == 'send-keys'}, {'ctrl+j'})
+        self.assertTrue(all(argv[2] == 'w1:claude' for argv in typed if argv[1] in ('send-keys', 'send-text')))
