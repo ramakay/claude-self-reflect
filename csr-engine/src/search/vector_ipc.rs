@@ -171,6 +171,19 @@ struct Response {
     reply: Reply,
 }
 
+/// Run blocking socket work without stalling the async runtime: on a
+/// multi-threaded runtime worker the worker hands its other tasks (MCP stdio
+/// and cancellation included) to a replacement first. Elsewhere (a blocking
+/// thread, no runtime, a current-thread runtime) it just runs.
+fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
 /// Blocking client for the daemon's vector socket. Every call has an
 /// absolute deadline covering connect, write and read.
 pub struct VectorClient {
@@ -205,7 +218,7 @@ impl VectorClient {
 
     #[cfg(unix)]
     fn send(&self, request: &[u8], deadline: Instant) -> Result<Reply> {
-        let mut stream = std::os::unix::net::UnixStream::connect(&self.socket)
+        let mut stream = connect_by(&self.socket, deadline)
             .with_context(|| format!("connecting {}", self.socket.display()))?;
         let mut frame = Vec::with_capacity(4 + request.len());
         frame.extend_from_slice(&(request.len() as u32).to_be_bytes());
@@ -240,6 +253,89 @@ impl VectorClient {
     }
 }
 
+/// Connect without blocking past `deadline` (a listener whose backlog is
+/// full would otherwise hold a blocking connect).
+#[cfg(unix)]
+fn connect_by(path: &Path, deadline: Instant) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: plain socket calls on a descriptor this function owns; it is
+    // closed on every error path and handed to UnixStream on success.
+    unsafe {
+        let mut addr: libc::sockaddr_un = std::mem::zeroed();
+        if bytes.len() >= addr.sun_path.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path too long",
+            ));
+        }
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let close_with = |error: std::io::Error| {
+            libc::close(fd);
+            Err(error)
+        };
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return close_with(std::io::Error::last_os_error());
+        }
+        let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        if libc::connect(fd, &addr as *const _ as *const libc::sockaddr, len) < 0 {
+            let error = std::io::Error::last_os_error();
+            let pending = matches!(
+                error.raw_os_error(),
+                Some(libc::EINPROGRESS) | Some(libc::EAGAIN)
+            );
+            if !pending {
+                return close_with(error);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+            if libc::poll(&mut poll, 1, millis) <= 0 {
+                return close_with(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect timed out",
+                ));
+            }
+            let mut so_error: libc::c_int = 0;
+            let mut so_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_error as *mut _ as *mut libc::c_void,
+                &mut so_len,
+            );
+            if so_error != 0 {
+                return close_with(std::io::Error::from_raw_os_error(so_error));
+            }
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags) < 0 {
+            return close_with(std::io::Error::last_os_error());
+        }
+        let stream = std::os::unix::net::UnixStream::from_raw_fd(fd);
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        stream.set_read_timeout(Some(remaining))?;
+        stream.set_write_timeout(Some(remaining))?;
+        Ok(stream)
+    }
+}
+
 /// Run one blocking stream operation with the time left until `deadline`
 /// as its socket timeout, failing once the deadline has passed.
 #[cfg(unix)]
@@ -256,7 +352,8 @@ fn io_by(
         ));
     }
     // macOS refuses SO_RCVTIMEO/SO_SNDTIMEO (EINVAL) once the peer has
-    // closed — i.e. after a fast reply; keep the timeouts already set then.
+    // closed — i.e. after a fast reply. The timeouts set right after connect
+    // still bound the operation then, so a refused tightening is ignored.
     let _ = stream.set_read_timeout(Some(remaining));
     let _ = stream.set_write_timeout(Some(remaining));
     op(stream)
@@ -425,7 +522,7 @@ impl VectorProxy {
     }
 
     fn remote(&self, op: Op, timeout: Duration) -> Option<Reply> {
-        (|| {
+        off_worker(|| {
             let request = self.client.encode(op).ok()?;
             let error = match self.client.send(&request, Instant::now() + timeout) {
                 Ok(reply) => {
@@ -444,7 +541,7 @@ impl VectorProxy {
             }
             self.mark_down(&error);
             None
-        })()
+        })
     }
 
     fn hits(reply: Option<Reply>) -> Vec<SearchResult> {

@@ -2934,3 +2934,128 @@ fn test_version_flag_is_side_effect_free() {
         );
     }
 }
+
+/// Review finding #5: a proxied MCP server's vector IPC must not freeze its
+/// runtime. With one Tokio worker and a daemon that answers pings and
+/// embeddings but stalls every search, an MCP `ping` sent while a search is
+/// stuck — and again after cancelling it — is answered at once.
+#[cfg(unix)]
+mod proxied_server_stays_responsive {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn fake_daemon(dir: &std::path::Path) -> std::thread::JoinHandle<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        let ipc = dir.join("hook-ipc-v1");
+        std::fs::DirBuilder::new().mode(0o700).create(&ipc).unwrap();
+        std::fs::write(ipc.join("daemon.alive"), "1 now\n").unwrap();
+        let listener = UnixListener::bind(ipc.join("vector.sock")).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut header = [0u8; 4];
+                    if stream.read_exact(&mut header).is_err() {
+                        return;
+                    }
+                    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                    if stream.read_exact(&mut body).is_err() {
+                        return;
+                    }
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let reply = match request["op"]["op"].as_str().unwrap_or_default() {
+                        "ping" => serde_json::json!({"reply": "pong"}),
+                        "embed" => {
+                            let n = request["op"]["texts"].as_array().map_or(0, Vec::len);
+                            serde_json::json!({"reply": "vectors", "vectors": vec![vec![0.1f32; 384]; n]})
+                        }
+                        // Searches hang: the server must stay responsive anyway.
+                        _ => {
+                            std::thread::sleep(Duration::from_secs(60));
+                            return;
+                        }
+                    };
+                    let bytes =
+                        serde_json::to_vec(&serde_json::json!({"version": 1, "reply": reply}))
+                            .unwrap();
+                    let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
+                    let _ = stream.write_all(&bytes);
+                });
+            }
+        })
+    }
+
+    #[test]
+    fn mcp_ping_and_cancel_stay_responsive_while_a_daemon_search_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let _daemon = fake_daemon(dir.path());
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("CSR_TOKIO_WORKERS", "1")
+            .env("CSR_ENRICH_INITIAL_DELAY_SECS", "3600")
+            .env_remove("CSR_NO_DAEMON_PROXY")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+        let stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                // Every stdout line is a JSON-RPC message.
+                let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut send = |message: serde_json::Value| {
+            writeln!(stdin, "{message}").unwrap();
+            stdin.flush().unwrap();
+        };
+        let wait_for = |id: i64, within: Duration| -> Option<Duration> {
+            let started = Instant::now();
+            while started.elapsed() < within {
+                if let Ok(message) = rx.recv_timeout(Duration::from_millis(50)) {
+                    if message["id"] == id {
+                        return Some(started.elapsed());
+                    }
+                }
+            }
+            None
+        };
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}}),
+        );
+        assert!(wait_for(1, Duration::from_secs(30)).is_some(), "initialize");
+        send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "csr_reflect_on_past", "arguments": {"query": "anything", "project": "all"}}}),
+        );
+        // Give the call time to reach the stalled search.
+        std::thread::sleep(Duration::from_millis(1500));
+        send(serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}));
+        let pinged = wait_for(3, Duration::from_secs(5));
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": 2, "reason": "test"}}),
+        );
+        send(serde_json::json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}));
+        let pinged_again = wait_for(4, Duration::from_secs(5));
+        let _ = child.kill();
+        let _ = child.wait();
+        let ping = pinged.expect("ping answered while the search stalls");
+        assert!(ping < Duration::from_secs(1), "ping took {ping:?}");
+        let ping = pinged_again.expect("ping answered after cancelling");
+        assert!(ping < Duration::from_secs(1), "ping took {ping:?}");
+    }
+}
