@@ -201,6 +201,7 @@ pub async fn run_full(
 
     // Contamination: every emitter output removed, every mention kept (no DB).
     results.push(contamination::emitter_canary());
+    results.push(contamination::census_result(storage));
 
     EvalReport {
         results,

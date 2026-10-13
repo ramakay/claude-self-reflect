@@ -149,7 +149,7 @@ fn a_drifted_output_turns_the_canary_red() {
         reason: ContaminationReason::DegradedStatus,
         text: "CSR engine ready (degraded mode)!".into(),
         assistant_relay: true,
-        standalone_span: true,
+        mixed: Mixed::Removed,
     };
     let removal = remove_csr_emissions(OwnedText {
         source: SourceKind::Conversation,
@@ -188,4 +188,70 @@ fn matrix_covers_every_engine_branch() {
     ] {
         assert!(ids.iter().any(|id| id == needed), "{needed}");
     }
+}
+
+#[test]
+fn the_census_result_reports_proven_unjudged_and_clean_over_one_population() {
+    let storage = crate::storage::Storage::open_memory().unwrap();
+    let seed = |id: &str, conversation: &str, content: &str, owned: bool| {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, source)
+                     VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1, 'conversation')",
+                    rusqlite::params![id, conversation, content],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        if owned {
+            let event = crate::provenance::ProvenanceEvent {
+                event_id: format!("event:{id}"),
+                conversation_id: conversation.to_string(),
+                message_key: id.to_string(),
+                seq: 0,
+                channel: "user_message".to_string(),
+                trust_tier: crate::provenance::TrustTier::UserHistory,
+                parent_event_id: None,
+                receipt_kind: "jsonl".to_string(),
+                receipt_ref: None,
+                observed_at: "2026-09-01T00:00:00Z".to_string(),
+            };
+            storage
+                .replace_chunk_evidence(&crate::provenance::ChunkEvidence {
+                    chunk_id: id.to_string(),
+                    min_trust: event.trust_tier,
+                    tool_result_share: Some(0.0),
+                    spans: vec![crate::provenance::ChunkSpan {
+                        chunk_id: id.to_string(),
+                        event_id: event.event_id.clone(),
+                        start_char: 0,
+                        end_char: content.chars().count(),
+                        content_hash: crate::provenance::content_hash(content),
+                    }],
+                    events: vec![event],
+                })
+                .unwrap();
+        }
+    };
+    let degraded = "CSR engine ready (degraded mode).";
+    seed("p", "proven", degraded, true);
+    seed("u", "unjudged", degraded, false);
+    seed("c1", "clean-1", "ordinary work", false);
+    seed("c2", "clean-2", "more ordinary work", true);
+    let result = census_result(&storage);
+    assert_eq!(result.name, "Contamination Census");
+    assert!(result.passed, "{}", result.detail);
+    assert!(
+        result.detail.contains("proven 1")
+            && result.detail.contains("unjudged 1")
+            && result.detail.contains("clean 2"),
+        "{}",
+        result.detail
+    );
+    assert!(
+        result.detail.contains("of 4 conversations"),
+        "{}",
+        result.detail
+    );
 }

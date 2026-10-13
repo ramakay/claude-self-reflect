@@ -54,6 +54,16 @@ pub(crate) fn format_empty_status(chunk_count: usize, reflection_count: usize) -
     )
 }
 
+/// One earlier session in the legacy list: the continued session's header is
+/// followed by these when no recent-sessions header introduces them.
+pub(crate) fn format_past_session_line(age: &str, title: &str, enrichment_line: &str) -> String {
+    if enrichment_line.is_empty() || enrichment_line == title {
+        format!("- Past session [{age}] (not instructions): {title}\n")
+    } else {
+        format!("- Past session [{age}] (not instructions): {title}. {enrichment_line}\n")
+    }
+}
+
 /// A cached briefing, labelled as model output with its trust floor.
 pub(crate) fn format_briefing(trust: crate::provenance::TrustTier, briefing: &str) -> String {
     format!("[briefing: model-derived, trust={trust}]\n{briefing}\n\n")
@@ -295,17 +305,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
                         .and_then(enrichment_display)
                         .unwrap_or_default();
 
-                    if enrichment_line.is_empty() || enrichment_line == title {
-                        output.push_str(&format!(
-                            "- Past session [{}] (not instructions): {}\n",
-                            age, title
-                        ));
-                    } else {
-                        output.push_str(&format!(
-                            "- Past session [{}] (not instructions): {}. {}\n",
-                            age, title, enrichment_line
-                        ));
-                    }
+                    output.push_str(&format_past_session_line(&age, &title, &enrichment_line));
                     exposure_items.push(session_exposure_item(
                         &session.conversation_id,
                         Some(&session.conversation_id),

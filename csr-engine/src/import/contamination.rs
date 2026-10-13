@@ -8,9 +8,11 @@
 //! a registered formatter grammar accounts for, and only from channels CSR can
 //! write into:
 //!
-//! - **Eligible**: Claude user text (every grammar) and assistant text (engine
-//!   grammars, complete blocks only). Structural channels (CSR tool blocks,
-//!   harness rows) are removed whole by the importer's own identity checks.
+//! - **Eligible**: Claude user text (every grammar) and assistant text
+//!   (complete blocks that stand alone: set off by blank lines or the
+//!   component's edges, whole lines of their own). Structural channels (CSR
+//!   tool blocks, harness rows) are removed whole by the importer's own
+//!   identity checks.
 //! - **Never touched**: non-CSR tool output, Codex prose, plans, unknown
 //!   sources. Those are mentions by construction.
 //! - **Protected**: fenced blocks, inline code, blockquote lines, indented
@@ -336,6 +338,13 @@ pub fn prove_stored_ownership(evidence: StoredChunkEvidence<'_>) -> StoredOwners
         "assistant_message" => ContentChannel::AssistantText,
         _ => return StoredOwnership::Unproven("event channel is not user or assistant text"),
     };
+    // The chunker trims a chunk's edges, and a long component is split. A
+    // slice that starts past its component's first byte has lost the context
+    // that decides whether it was code, a quote or a fence: its hash proves
+    // the bytes are the event's, not that they were an emission.
+    if span.start_char != 0 {
+        return StoredOwnership::Unproven("chunk does not start at its component's first byte");
+    }
     if span.end_char < span.start_char
         || span.end_char - span.start_char != evidence.content.chars().count()
     {
@@ -404,6 +413,28 @@ pub struct Formatter {
 }
 
 impl Formatter {
+    /// Blank lines after the block that belong to it. The engine writes one
+    /// after the manifest, the briefing and each injection section; the
+    /// companion's sends leave the person's reply one blank line below.
+    /// Everything else ends with its own line ending and nothing more.
+    fn trailing_blank(&self) -> usize {
+        use ContaminationReason as R;
+        match self.reason {
+            R::MemoryManifest | R::Briefing | R::InjectionSection => 1,
+            _ if self.emitter == Emitter::Plugin => 1,
+            _ => 0,
+        }
+    }
+
+    /// Whether the lines a block spans may hold quotes, code and fences of
+    /// their own: a briefing is model prose, a side note is a quotation.
+    fn owns_quoted_body(&self) -> bool {
+        matches!(
+            self.reason,
+            ContaminationReason::Briefing | ContaminationReason::PluginSideNote
+        )
+    }
+
     /// Whether this formatter is recognised inside a component, as opposed to
     /// on a whole transcript's opening prompt.
     pub fn is_component_formatter(&self) -> bool {
@@ -610,6 +641,10 @@ re!(
     FULL_STATE_RE,
     r#"^Full state: csr_reflect_on_past\("conv_[^"\n]*"\)$"#
 );
+re!(
+    PAST_SESSION_RE,
+    r"^- Past session \[[^\]\n]*\] \(not instructions\):"
+);
 re!(CONTINUUM_HEAD_RE, r"^CSR CONTINUUM \[[^\]\n]{1,24}\]: .*$");
 re!(
     CONTINUUM_LAST_RE,
@@ -659,22 +694,26 @@ re!(
     READING_RE,
     r"^Earlier you read (?:my “.+” as (?:“.+”|unclear)|me this way: “.+”)\. Check .+$"
 );
-re!(RULE_RE, r"^A standing rule from \d{4}-\d{2}-\d{2}: “.+”$");
+// short_date() writes MM-DD; when the time does not parse, the pane sends the
+// first ten characters of whatever it was given.
+re!(RULE_RE, r"^A standing rule from [^“\n]{1,10}: “.+”$");
+// The pane strips the recap's sentinel before it sends (told_lines), and when
+// there is no recap line it sends the first line that is not CSR's preamble.
 re!(
     RECAP_FORWARD_RE,
-    r"^CSR's recap at the start of this session: recap \[[^\]\n]{1,24}\]: .+ \[\[CSR:RECAP\]\](?: The rest: .+)?$"
+    r"^CSR's recap at the start of this session: \S.*$"
 );
 re!(
     LAST_SESSION_RE,
-    r#"^Last session \S{8} \(“.*”\): .+ active, \d+ prompts, \d+ compactions, last row .+\. The rest of it: csr_reflect_on_past\("conv_[^"\n]*"\)$"#
+    r#"^Last session \S* \(“.*”\): .+ active, \d+ prompts, \d+ compactions, last row .*\. The rest of it: csr_reflect_on_past\("conv_[^"\n]*"\)$"#
 );
 re!(
     LEFTOVER_RE,
-    r"^Left over from session \S{8}: “.+” \([^)\n]+\)\.$"
+    r"^Left over from session [^\s:]*: “.+” \(.+\)\.$"
 );
 re!(
     CODE_SHIFT_RE,
-    r"^Since our past sessions, commit [0-9a-f]{7,40} “.+” \(\d{4}-\d{2}-\d{2}\) changed code we worked on: .+\.$"
+    r"^Since our past sessions, commit \S{1,40} “.+” \([^)\n]+\) changed code we worked on: .*\.$"
 );
 re!(
     LOST_RE,
@@ -684,6 +723,19 @@ re!(
     HOOK_LABEL_RE,
     r"^[A-Za-z]+(?::[A-Za-z_-]+)? hook (?:success|additional context): "
 );
+// A send `one_line` cut at its 700-character limit ends in `…` with no
+// closing quote or period. Only the openings of the sends it can cut count, and
+// each send keeps its own opening.
+re!(CUT_RECALL_RE, r"^CSR remembered(?: a past session)?: “");
+re!(CUT_READING_RE, r"^Earlier you read (?:my “|me this way: “)");
+re!(CUT_RULE_RE, r"^A standing rule from [^“\n]{1,10}: “");
+re!(
+    CUT_CODE_SHIFT_RE,
+    r"^Since our past sessions, commit \S{1,40} “"
+);
+re!(CUT_LAST_SESSION_RE, r"^Last session \S* \(“");
+re!(CUT_LEFTOVER_RE, r"^Left over from session [^\s:]*: “");
+const ONE_LINE_LIMIT: usize = 700;
 re!(HANDED_RE, r"^CSR handed you these this session: .+ · .+$");
 re!(
     SEMANTIC_PICKUP_RE,
@@ -753,8 +805,12 @@ impl<'a> Doc<'a> {
     }
 
     /// The line's content, with a byte-zero BOM ignored on line 0.
+    /// Past the last line there is nothing: an empty line, never a panic. A
+    /// header cut off at the end of a document must not index beyond it.
     fn line(&self, index: usize) -> &'a str {
-        let line = self.lines[index];
+        let Some(line) = self.lines.get(index) else {
+            return "";
+        };
         let skip = if index == 0 { self.bom } else { 0 };
         &self.text[(line.start + skip).min(line.end)..line.end]
     }
@@ -763,17 +819,20 @@ impl<'a> Doc<'a> {
         self.line(index).trim().is_empty()
     }
 
+    /// `index` moved past at most `most` blank lines.
+    fn skip_blank_up_to(&self, mut index: usize, most: usize) -> usize {
+        let mut skipped = 0;
+        while skipped < most && index < self.len() && self.is_blank(index) {
+            index += 1;
+            skipped += 1;
+        }
+        index
+    }
+
     fn line_of(&self, byte: usize) -> usize {
         self.lines
             .partition_point(|line| line.next <= byte)
             .min(self.lines.len().saturating_sub(1))
-    }
-
-    fn skip_blank(&self, mut index: usize) -> usize {
-        while index < self.len() && self.is_blank(index) {
-            index += 1;
-        }
-        index
     }
 
     /// Byte offset where line `index` starts (the text length past the end).
@@ -898,9 +957,13 @@ fn m_briefing(doc: &Doc<'_>, at: usize) -> Option<usize> {
     if !BRIEFING_HEAD_RE.is_match(doc.line(at)) {
         return None;
     }
-    // The body is the briefing text: its first paragraph. A raw copy carries no
-    // envelope to say where a longer body ends, so what follows the first
-    // blank line is left to its own grammar.
+    // The body is the briefing's text: model prose, paragraphs, lists, even
+    // fences, and the SessionStart envelope puts the next block right under it.
+    // So it runs to that block. With nothing after it the body cannot be told
+    // from the person's words, and only its first paragraph is the briefing's.
+    if let Some(next) = briefing_next_block(doc, at) {
+        return Some(next);
+    }
     let mut end = at + 1;
     while end < doc.len() && !doc.is_blank(end) {
         end += 1;
@@ -908,18 +971,43 @@ fn m_briefing(doc: &Doc<'_>, at: usize) -> Option<usize> {
     (end > at + 1).then_some(end)
 }
 
+/// The first line under a briefing that starts another registered block.
+fn briefing_next_block(doc: &Doc<'_>, at: usize) -> Option<usize> {
+    (at + 1..doc.len()).find(|&line| {
+        line_kind(doc.line(line)) == LineKind::Normal && block_at(doc, line, false).is_some()
+    })
+}
+
 fn m_continuity(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    if doc.line(at) != CONTINUITY_HEADER || at + 1 >= doc.len() {
-        return None;
-    }
-    if !CONTINUED_FROM_RE.is_match(doc.line(at + 1)) {
+    if doc.line(at) != CONTINUITY_HEADER || !CONTINUED_FROM_RE.is_match(doc.line(at + 1)) {
         return None;
     }
     let mut end = at + 2;
     // Enrichment, `Last working on:` and `Pitfall (N%):` lines: exactly two
     // spaces, then text. Four spaces is code.
-    while end < doc.len() && is_two_space_line(doc.line(end)) {
+    while is_two_space_line(doc.line(end)) {
         end += 1;
+    }
+    // With no episodes to index, the other past sessions follow as bare rows
+    // (no RECENT SESSIONS header), then the cross-project pulse, then the
+    // footer. A pulse row is the engine's only when the footer closes the run.
+    let mut rows = 0;
+    while PAST_SESSION_RE.is_match(doc.line(end)) {
+        end += 1;
+        rows += 1;
+        while is_two_space_line(doc.line(end)) {
+            end += 1;
+        }
+    }
+    if rows > 0 {
+        let mut pulse = end;
+        while doc.line(pulse).starts_with("- ") {
+            pulse += 1;
+        }
+        if pulse > end && m_deeper_context(doc, pulse).is_none() {
+            pulse = end;
+        }
+        end = pulse;
     }
     Some(end)
 }
@@ -1035,7 +1123,13 @@ fn m_injection_section(doc: &Doc<'_>, at: usize) -> Option<usize> {
     let free_form = title == crate::injection::formatter::STUCK_WARNING_TITLE;
     let mut end = at + 1;
     while end < doc.len() && !doc.is_blank(end) {
-        if !free_form && !INJECTION_ROW_RE.is_match(doc.line(end)) {
+        let line = doc.line(end);
+        // A warning's words are free, but a quote, code or a fence under the
+        // heading is somebody's markdown, not the warning.
+        if free_form && (line_kind(line) != LineKind::Normal || fence_open(line).is_some()) {
+            break;
+        }
+        if !free_form && !INJECTION_ROW_RE.is_match(line) {
             break;
         }
         end += 1;
@@ -1066,17 +1160,17 @@ fn m_side_note(doc: &Doc<'_>, at: usize) -> Option<usize> {
         return None;
     }
     let mut end = at + 1;
-    let mut quoted = false;
+    let mut last_quote = None;
     while end < doc.len() {
         let line = doc.line(end);
         if line.trim_start().starts_with('>') {
-            quoted = true;
+            last_quote = Some(end + 1);
         } else if !line.trim().is_empty() {
             break;
         }
         end += 1;
     }
-    quoted.then_some(end)
+    last_quote
 }
 
 fn m_keep_list(doc: &Doc<'_>, at: usize) -> Option<usize> {
@@ -1098,6 +1192,15 @@ fn one_line(doc: &Doc<'_>, at: usize, re: &Regex) -> Option<usize> {
     re.is_match(doc.line(at)).then_some(at + 1)
 }
 
+/// A whole send, or the send `one_line` cut at its limit (its end is gone, its
+/// opening and length are not).
+fn one_send(doc: &Doc<'_>, at: usize, re: &Regex, opening: &Regex) -> Option<usize> {
+    let line = doc.line(at);
+    let cut =
+        line.ends_with('…') && line.chars().count() == ONE_LINE_LIMIT && opening.is_match(line);
+    (re.is_match(line) || cut).then_some(at + 1)
+}
+
 fn m_compact_notice(doc: &Doc<'_>, at: usize) -> Option<usize> {
     one_line(doc, at, &COMPACT_NOTICE_RE)
 }
@@ -1114,16 +1217,16 @@ fn m_carry(doc: &Doc<'_>, at: usize) -> Option<usize> {
 }
 
 fn m_recall(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    let line = doc.line(at);
-    (RECALL_RE.is_match(line) || RECALL_SESSION_RE.is_match(line)).then_some(at + 1)
+    one_send(doc, at, &RECALL_RE, &CUT_RECALL_RE)
+        .or_else(|| one_send(doc, at, &RECALL_SESSION_RE, &CUT_RECALL_RE))
 }
 
 fn m_reading(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    one_line(doc, at, &READING_RE)
+    one_send(doc, at, &READING_RE, &CUT_READING_RE)
 }
 
 fn m_rule(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    one_line(doc, at, &RULE_RE)
+    one_send(doc, at, &RULE_RE, &CUT_RULE_RE)
 }
 
 fn m_recap_forward(doc: &Doc<'_>, at: usize) -> Option<usize> {
@@ -1131,15 +1234,15 @@ fn m_recap_forward(doc: &Doc<'_>, at: usize) -> Option<usize> {
 }
 
 fn m_last_session(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    one_line(doc, at, &LAST_SESSION_RE)
+    one_send(doc, at, &LAST_SESSION_RE, &CUT_LAST_SESSION_RE)
 }
 
 fn m_leftover(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    one_line(doc, at, &LEFTOVER_RE)
+    one_send(doc, at, &LEFTOVER_RE, &CUT_LEFTOVER_RE)
 }
 
 fn m_code_shift(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    one_line(doc, at, &CODE_SHIFT_RE)
+    one_send(doc, at, &CODE_SHIFT_RE, &CUT_CODE_SHIFT_RE)
 }
 
 fn m_lost_and_found(doc: &Doc<'_>, at: usize) -> Option<usize> {
@@ -1344,7 +1447,26 @@ fn inline_candidate_allowed(line: &str, kind: LineKind, rel: usize, span: &str) 
         LineKind::Quote if !QUOTED_HOTKEY_RE.is_match(span) => return false,
         _ => {}
     }
-    !in_inline_code(line, rel) && standalone_start(line, rel)
+    !in_inline_code(line, rel) && !in_string_literal(line, rel) && standalone_start(line, rel)
+}
+
+/// Whether byte `at` of `line` sits inside a double-quoted string: an odd
+/// number of unescaped quotes before it. A JSON value or a code literal that
+/// holds a send is quoting it, wherever in the string it sits.
+fn in_string_literal(line: &str, at: usize) -> bool {
+    let mut open = false;
+    let mut escaped = false;
+    for c in line[..at].chars() {
+        match c {
+            '\\' if !escaped => escaped = true,
+            '"' if !escaped => open = !open,
+            _ => escaped = false,
+        }
+        if c != '\\' {
+            escaped = false;
+        }
+    }
+    open
 }
 
 struct Candidate {
@@ -1355,11 +1477,8 @@ struct Candidate {
 
 fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
     let doc = Doc::new(text);
-    let forwards = if user {
-        forward_candidates(text)
-    } else {
-        Vec::new()
-    };
+    let forwards = forward_candidates(text);
+    let mut close = CloseCursor::default();
     let mut spans: Vec<RemovedSpan> = Vec::new();
     let mut fence: Option<Fence> = None;
     let mut pos = 0usize;
@@ -1389,21 +1508,40 @@ fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
         let kind = line_kind(content);
 
         if at_line_start && kind == LineKind::Normal {
+            let follows_removal = spans.last().is_some_and(|span| span.end_byte == line.start);
             for formatter in REGISTRY {
-                if !user && formatter.emitter == Emitter::Plugin {
-                    continue;
-                }
                 let Matcher::Block(block) = formatter.matcher else {
                     continue;
                 };
-                let Some(end_line) = block(&doc, index) else {
+                let Some(mut end_line) = block(&doc, index) else {
                     continue;
                 };
-                let follows_removal = spans.last().is_some_and(|span| span.end_byte == line.start);
+                // A briefing that is all there is of a component (it opens the
+                // component, or follows the rest of a SessionStart emission)
+                // runs to its end: nothing else can be the briefing's.
+                if formatter.reason == ContaminationReason::Briefing
+                    && (index == 0 || follows_removal)
+                    && briefing_next_block(&doc, index).is_none()
+                {
+                    end_line = doc.len();
+                }
+                // Protected ranges come first: a block whose lines hold a
+                // fence, a quote or code that its formatter does not write
+                // has run into somebody's markdown.
+                if !formatter.owns_quoted_body() && body_is_protected(&doc, index, end_line) {
+                    continue;
+                }
                 if !user && !assistant_boundaries_ok(&doc, index, end_line, follows_removal) {
                     continue;
                 }
-                let end_line = doc.skip_blank(end_line);
+                // The footer that closes a SessionStart emission carries the
+                // blank line above it.
+                let end_line =
+                    if doc.is_blank(end_line) && doc.line(end_line + 1) == DEEPER_CONTEXT_FIRST {
+                        end_line + 1
+                    } else {
+                        doc.skip_blank_up_to(end_line, formatter.trailing_blank())
+                    };
                 let end = doc.byte_of(end_line);
                 spans.push(RemovedSpan {
                     start_byte: line.start,
@@ -1415,42 +1553,52 @@ fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
             }
         }
 
-        if user {
-            // Inline candidates that start in this line, earliest first. One
-            // that is protected, or that would swallow a fence line, is passed
-            // over and the rest of the line is searched.
-            let mut from = pos_in_line.max(content_start);
-            while from < line.next {
-                let wrapper = find_wrapper(text, from, line.end);
-                let forward = forwards
-                    .get(forwards.partition_point(|forward| forward.start < from))
-                    .filter(|forward| forward.start < line.next)
-                    .map(Candidate::from);
-                let found = match (wrapper, forward) {
-                    (Some(w), Some(f)) => Some(if f.start < w.start { f } else { w }),
-                    (w, f) => w.or(f),
-                };
-                let Some(found) = found else { break };
-                // Judge where the formatter's own bytes begin: a forward's span
-                // can open on the separator that followed the person's words.
-                let raw = &text[found.start..found.end];
-                let begins = found.start + raw.len() - raw.trim_start().len();
-                let rel = begins.saturating_sub(content_start).min(content.len());
-                if inline_candidate_allowed(content, kind, rel, &text[begins..found.end])
-                    && (found.reason == ContaminationReason::SystemReminder
-                        || !spans_a_fence(&text[found.start..found.end]))
-                {
-                    let (start, end) = settle_span(&doc, &found);
-                    spans.push(RemovedSpan {
-                        start_byte: start,
-                        end_byte: end,
-                        reason: found.reason,
-                    });
-                    pos = end;
-                    continue 'scan;
-                }
-                from = found.start + text[found.start..].chars().next().map_or(1, char::len_utf8);
+        // Inline candidates that start in this line, earliest first. One that
+        // is protected, or that would swallow a fence line, is passed over and
+        // the rest of the line is searched. The harness's hook wrappers are
+        // only ever in the person's turn.
+        let mut from = pos_in_line.max(content_start);
+        while from < line.next {
+            let wrapper = if user {
+                find_wrapper(text, from, line.end, &mut close)
+            } else {
+                None
+            };
+            let forward = forwards
+                .get(forwards.partition_point(|forward| forward.start < from))
+                .filter(|forward| forward.start < line.next)
+                .map(Candidate::from);
+            let found = match (wrapper, forward) {
+                (Some(w), Some(f)) => Some(if f.start < w.start { f } else { w }),
+                (w, f) => w.or(f),
+            };
+            let Some(found) = found else { break };
+            // Judge where the formatter's own bytes begin: a forward's span
+            // can open on the separator that followed the person's words.
+            let raw = &text[found.start..found.end];
+            let begins = found.start + raw.len() - raw.trim_start().len();
+            let rel = begins.saturating_sub(content_start).min(content.len());
+            let structural = found.reason == ContaminationReason::SystemReminder;
+            let allowed = inline_candidate_allowed(content, kind, rel, &text[begins..found.end])
+                && (structural || !spans_a_fence(&text[found.start..found.end]))
+                && (user || {
+                    let follows_removal = spans
+                        .last()
+                        .is_some_and(|span| span.end_byte == doc.lines[doc.line_of(begins)].start);
+                    standalone_relay(&doc, &found, follows_removal)
+                });
+            if allowed {
+                let blank_after = usize::from(!structural);
+                let (start, end) = settle_span(&doc, &found, blank_after);
+                spans.push(RemovedSpan {
+                    start_byte: start,
+                    end_byte: end,
+                    reason: found.reason,
+                });
+                pos = end;
+                continue 'scan;
             }
+            from = found.start + text[found.start..].chars().next().map_or(1, char::len_utf8);
         }
         pos = line.next;
     }
@@ -1460,20 +1608,51 @@ fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
 /// An assistant relay is a complete block standing alone: set off from the
 /// text around it by blank lines or the component's edges. Blocks the engine
 /// writes back to back (a whole SessionStart emission) stand alone together,
-/// so a neighbouring engine block counts as a boundary too.
+/// so a neighbouring registered block counts as a boundary too.
 fn assistant_boundaries_ok(doc: &Doc<'_>, start: usize, end: usize, follows_removal: bool) -> bool {
     let before = follows_removal || start == 0 || doc.is_blank(start - 1);
-    let after = end >= doc.len() || doc.is_blank(end) || engine_block_at(doc, end).is_some();
+    let after = end >= doc.len() || doc.is_blank(end) || block_at(doc, end, true).is_some();
     before && after
 }
 
-/// The end of the engine block that starts at line `at`, if one does.
-fn engine_block_at(doc: &Doc<'_>, at: usize) -> Option<usize> {
+/// A forward the assistant relays is removable only as a whole line (or lines)
+/// of its own: nothing but whitespace shares them, and blank lines or the
+/// component's edges set it off.
+fn standalone_relay(doc: &Doc<'_>, found: &Candidate, follows_removal: bool) -> bool {
+    let text = doc.text;
+    let raw = &text[found.start..found.end];
+    let begins = found.start + raw.len() - raw.trim_start().len();
+    let ends = found.start + raw.trim_end().len();
+    if ends <= begins {
+        return false;
+    }
+    let first = doc.line_of(begins);
+    let last = doc.line_of(ends - 1);
+    let whole_lines = text[doc.lines[first].start..begins].trim().is_empty()
+        && text[ends..doc.lines[last].end].trim().is_empty();
+    whole_lines && assistant_boundaries_ok(doc, first, last + 1, follows_removal)
+}
+
+/// Whether the lines under a block's first line hold something its formatter
+/// never writes: a fence opener, a quote line, or code.
+fn body_is_protected(doc: &Doc<'_>, start: usize, end: usize) -> bool {
+    (start + 1..end.min(doc.len())).any(|line| {
+        let text = doc.line(line);
+        fence_open(text).is_some() || line_kind(text) != LineKind::Normal
+    })
+}
+
+/// The end of the registered block that starts at line `at`, if one does. The
+/// briefing is left out when asked: its own end is what is being looked for.
+fn block_at(doc: &Doc<'_>, at: usize, with_briefing: bool) -> Option<usize> {
     REGISTRY
         .iter()
-        .filter(|formatter| formatter.emitter == Emitter::Engine)
         .find_map(|formatter| match formatter.matcher {
-            Matcher::Block(block) => block(doc, at),
+            Matcher::Block(block)
+                if with_briefing || formatter.reason != ContaminationReason::Briefing =>
+            {
+                block(doc, at)
+            }
             _ => None,
         })
 }
@@ -1483,10 +1662,10 @@ fn spans_a_fence(span: &str) -> bool {
 }
 
 /// Trim a candidate to the formatter's own bytes. A span that begins its line
-/// also takes the line break and the blank lines under it, so the person's
-/// next paragraph starts the retained text; mid-line spans leave their
-/// neighbours exactly as typed.
-fn settle_span(doc: &Doc<'_>, candidate: &Candidate) -> (usize, usize) {
+/// also takes its own line ending, and up to `blank_after` blank lines the
+/// formatter leaves under it; mid-line spans leave their neighbours exactly as
+/// typed.
+fn settle_span(doc: &Doc<'_>, candidate: &Candidate, blank_after: usize) -> (usize, usize) {
     let text = doc.text;
     let raw = &text[candidate.start..candidate.end];
     let lead = raw.len() - raw.trim_start().len();
@@ -1505,7 +1684,7 @@ fn settle_span(doc: &Doc<'_>, candidate: &Candidate) -> (usize, usize) {
     let last = doc.line_of(end.saturating_sub(1));
     let suffix_blank = text[end..doc.lines[last].end].trim().is_empty();
     if prefix_blank && suffix_blank {
-        end = doc.byte_of(doc.skip_blank(last + 1));
+        end = doc.byte_of(doc.skip_blank_up_to(last + 1, blank_after));
     }
     (start, end)
 }
@@ -1527,16 +1706,47 @@ fn merge_overlaps(mut spans: Vec<RemovedSpan>) -> Vec<RemovedSpan> {
 const WRAPPER_OPEN: &str = "<system-reminder>";
 const WRAPPER_CLOSE: &str = "</system-reminder>";
 
+/// Where the next closing tag is. An opener asks; the answer for one opener
+/// holds for every later opener before that tag, and "nowhere" holds for all
+/// later ones, so a component of unclosed openers is read once, not once each.
+#[derive(Default)]
+struct CloseCursor {
+    asked_from: usize,
+    answer: Option<Option<usize>>,
+}
+
+impl CloseCursor {
+    fn next_close(&mut self, text: &str, from: usize) -> Option<usize> {
+        if let Some(answer) = self.answer {
+            if from >= self.asked_from {
+                match answer {
+                    None => return None,
+                    Some(at) if at >= from => return Some(at),
+                    Some(_) => {}
+                }
+            }
+        }
+        let found = text[from..].find(WRAPPER_CLOSE).map(|at| from + at);
+        self.asked_from = from;
+        self.answer = Some(found);
+        found
+    }
+}
+
 /// The first `<system-reminder>` at or after `from` (within the line) whose
 /// first nonblank payload is a registered engine emission, through its close.
-fn find_wrapper(text: &str, from: usize, line_end: usize) -> Option<Candidate> {
+fn find_wrapper(
+    text: &str,
+    from: usize,
+    line_end: usize,
+    close: &mut CloseCursor,
+) -> Option<Candidate> {
     let mut search = from;
     while search < line_end {
         let open = search + text[search..line_end].find(WRAPPER_OPEN)?;
         let payload_start = open + WRAPPER_OPEN.len();
-        let close = text[payload_start..].find(WRAPPER_CLOSE);
-        if let Some(close) = close {
-            let payload = text[payload_start..payload_start + close].trim_start();
+        if let Some(close_at) = close.next_close(text, payload_start) {
+            let payload = text[payload_start..close_at].trim_start();
             // The harness labels hook output it wraps: `SessionStart:startup
             // hook success: <the hook's stdout>`. The label is not CSR's; what
             // follows it decides.
@@ -1546,7 +1756,7 @@ fn find_wrapper(text: &str, from: usize, line_end: usize) -> Option<Candidate> {
             if starts_registered_emission(payload) {
                 return Some(Candidate {
                     start: open,
-                    end: payload_start + close + WRAPPER_CLOSE.len(),
+                    end: close_at + WRAPPER_CLOSE.len(),
                     reason: ContaminationReason::SystemReminder,
                 });
             }

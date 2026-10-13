@@ -27,6 +27,11 @@ use crate::import::contamination::{
 
 const CASES_JSONL: &str = include_str!("../../tests/fixtures/contamination/cases.jsonl");
 
+/// What the companion's pane types into the prompt, written by the pane's own
+/// formatters (`plugins/csr-companion/tests/export-emissions.py`). The plugin
+/// keeps an identical copy; this one keeps the crate self-contained.
+const PANE_JSON: &str = include_str!("../../tests/fixtures/contamination/pane-v1.json");
+
 /// Prefix of the generated rows in `cases.jsonl`.
 pub const MATRIX_PREFIX: &str = "matrix-";
 
@@ -116,10 +121,20 @@ pub struct Output {
     pub text: String,
     /// Whether an assistant relaying the whole output is removable too.
     pub assistant_relay: bool,
-    /// Whether prose around the output leaves it removable on its own. A
-    /// whole-component formatter (the memory-feedback report) owns the
-    /// component only from its first bytes.
-    pub standalone_span: bool,
+    /// What prose in front of the output does to it.
+    pub mixed: Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mixed {
+    /// The output is cut out; the words around it stay.
+    Removed,
+    /// The formatter owns a component only from its first bytes (the
+    /// memory-feedback report): behind prose it is a mention.
+    Kept,
+    /// The output has no end of its own to cut at (a briefing's last paragraph
+    /// ends where the component does), so there is no mixed form to state.
+    Skipped,
 }
 
 fn output(id: &str, formatter: &'static str, reason: ContaminationReason, text: String) -> Output {
@@ -129,7 +144,7 @@ fn output(id: &str, formatter: &'static str, reason: ContaminationReason, text: 
         reason,
         text,
         assistant_relay: true,
-        standalone_span: true,
+        mixed: Mixed::Removed,
     }
 }
 
@@ -372,6 +387,36 @@ pub fn engine_outputs() -> Vec<Output> {
         R::Continuity,
         continuity("", None),
     ));
+    // No episodes: the continued session's block, the other past sessions as
+    // bare rows (no RECENT SESSIONS header), the cross-project pulse, the footer.
+    out.push(output(
+        "continuity-legacy-tail",
+        "continuity",
+        R::Continuity,
+        [
+            continuity("Edited 3 files", Some("span ownership")),
+            session_start::format_past_session_line("2h ago", "Fix parser", ""),
+            session_start::format_past_session_line("1d ago", "Tidy docs", "Edited 2 files"),
+            "- Related work in csr-companion: the pane sends\n".to_string(),
+            session_start::DEEPER_CONTEXT_FOOTER
+                .trim_start_matches('\n')
+                .to_string(),
+        ]
+        .concat(),
+    ));
+    // A briefing is model prose: paragraphs, lists, even fences. Its last
+    // paragraph ends where the component does.
+    let mut paragraphs = output(
+        "briefing-paragraphs",
+        "briefing",
+        R::Briefing,
+        session_start::format_briefing(
+            crate::provenance::TrustTier::External,
+            "## Session Intelligence (CSR v9.2)\n\n**Recent work**\n- **1w ago:** Hook-latency fix.\n\nFixed parser.",
+        ),
+    );
+    paragraphs.mixed = Mixed::Skipped;
+    out.push(paragraphs);
     let recent = |body: &str| {
         format!(
             "{}{}{}",
@@ -531,7 +576,7 @@ pub fn engine_outputs() -> Vec<Output> {
             crate::import::contamination::MEMORY_FEEDBACK_REPORT_HEADER
         ),
     );
-    report.standalone_span = false;
+    report.mixed = Mixed::Kept;
     out.push(report);
     let mut probe = output(
         "memory-feedback-probe",
@@ -543,7 +588,7 @@ pub fn engine_outputs() -> Vec<Output> {
             crate::import::contamination::MEMORY_FEEDBACK_PROBE_BODY
         ),
     );
-    probe.standalone_span = false;
+    probe.mixed = Mixed::Kept;
     out.push(probe);
 
     // A whole SessionStart emission, in the order the hook writes it, and the
@@ -593,6 +638,70 @@ pub fn engine_outputs() -> Vec<Output> {
         out.push(wrapped);
     }
     out
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaneCase {
+    pub id: String,
+    pub producer: String,
+    pub reason: ContaminationReason,
+    pub text: String,
+    pub chars: usize,
+    /// Cut by the pane's `one_line` at its limit: no closing quote or period.
+    pub cut: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaneDocument {
+    pub schema: String,
+    pub source: PaneSource,
+    pub cases: Vec<PaneCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaneSource {
+    pub file: String,
+    pub sha256: String,
+}
+
+pub fn pane_document() -> PaneDocument {
+    serde_json::from_str(PANE_JSON).expect("pane-v1.json")
+}
+
+/// The registry formatter a pane send belongs to.
+fn pane_formatter(reason: ContaminationReason) -> &'static str {
+    use ContaminationReason as R;
+    match reason {
+        R::PluginPaneRecall => "plugin_recall",
+        R::PluginPaneReading => "plugin_reading",
+        R::PluginStandingRule => "plugin_rule",
+        R::PluginDreamForward => "plugin_dream_forward",
+        R::PluginSessionStory => "plugin_session_story",
+        R::PluginCompactionCard => "plugin_compaction_card",
+        R::PluginRecapForward => "plugin_recap_forward",
+        R::PluginLastSession => "plugin_last_session",
+        R::PluginLeftover => "plugin_leftover",
+        R::PluginCodeShift => "plugin_code_shift",
+        R::PluginLostAndFound => "plugin_lost_and_found",
+        other => panic!("pane send with reason {other:?}"),
+    }
+}
+
+/// Every send the pane's real formatters produced for the fixture's invented
+/// inputs, as canary outputs.
+pub fn pane_outputs() -> Vec<Output> {
+    pane_document()
+        .cases
+        .into_iter()
+        .map(|case| Output {
+            id: format!("pane-{}", case.id),
+            formatter: pane_formatter(case.reason),
+            reason: case.reason,
+            text: case.text,
+            assistant_relay: true,
+            mixed: Mixed::Removed,
+        })
+        .collect()
 }
 
 /// Plugin grammars as synthetic strings: one per branch of Appendix B. These
@@ -685,9 +794,9 @@ pub fn plugin_synthetic() -> Vec<Output> {
         .map(|&(id, formatter, reason, text)| {
             let mut synthetic =
                 output(&format!("plugin-{id}"), formatter, reason, text.to_string());
-            // The companion writes into the user's prompt; an assistant
-            // relaying it word for word is not an engine emission.
-            synthetic.assistant_relay = false;
+            // An assistant relaying a complete send word for word is the same
+            // loop as the send itself.
+            synthetic.assistant_relay = true;
             synthetic
         })
         .collect()
@@ -782,27 +891,28 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
                 None,
             ));
         }
-        let mixed = format!("Please look at this.\n\n{text}\nNow answer.");
-        rows.push(if output.standalone_span {
-            row(
+        // The text's own line ending closes it; a text that has none gets one.
+        let line_end = if text.ends_with('\n') { "" } else { "\n" };
+        let mixed = format!("Please look at this.\n\n{text}{line_end}Now answer.");
+        match output.mixed {
+            Mixed::Removed => rows.push(row(
                 format!("{id}-mixed"),
                 "conversation",
                 "user_text",
                 mixed,
                 "Please look at this.\n\nNow answer.".to_string(),
                 Some(output.reason),
-            )
-        } else {
-            // Owned only from its first bytes: behind prose it is a mention.
-            row(
+            )),
+            Mixed::Kept => rows.push(row(
                 format!("{id}-mixed"),
                 "conversation",
                 "user_text",
                 mixed.clone(),
                 mixed,
                 None,
-            )
-        });
+            )),
+            Mixed::Skipped => {}
+        }
         if output.assistant_relay {
             rows.push(row(
                 format!("{id}-assistant-relay"),
@@ -841,6 +951,7 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
 /// Every matrix row the current formatters produce.
 pub fn expected_matrix() -> Vec<Case> {
     let mut outputs = engine_outputs();
+    outputs.extend(pane_outputs());
     outputs.extend(plugin_synthetic());
     matrix_rows(&outputs)
 }
@@ -890,7 +1001,7 @@ pub fn run_canary() -> CanaryReport {
             .then(|| removal.removed.first().map(|span| span.reason))
             .flatten()
     };
-    for output in engine_outputs() {
+    for output in engine_outputs().into_iter().chain(pane_outputs()) {
         report.generated += 1;
         match removes(&output.text, ContentChannel::UserText) {
             Some(reason) if reason == output.reason => report.correctly_removed += 1,
@@ -920,6 +1031,7 @@ pub fn run_canary() -> CanaryReport {
     // output here is a formatter nobody watches.
     let produced: std::collections::HashSet<&str> = engine_outputs()
         .iter()
+        .chain(pane_outputs().iter())
         .map(|output| output.formatter)
         .chain(plugin_synthetic().iter().map(|output| output.formatter))
         .collect();
@@ -958,6 +1070,36 @@ pub fn require_green() -> Result<()> {
         report.failures.len(),
         report.failures[0]
     )
+}
+
+/// The ownership census over the database being evaluated: the three bins of
+/// one population, the same classifier the status badge and scrub use. It
+/// reports; it never fails the run (unjudged text is kept, not an error).
+pub fn census_result(storage: &crate::storage::Storage) -> EvalResult {
+    let start = Instant::now();
+    let duration = |start: Instant| start.elapsed().as_secs_f64() * 1000.0;
+    match storage.contamination_census() {
+        Ok(census) => {
+            let proven = census.proven.len();
+            let unjudged = census.unjudged.len();
+            let total = census.total_conversations;
+            EvalResult::pass(
+                "Contamination Census",
+                "contamination",
+                duration(start),
+                format!(
+                    "proven {proven} / unjudged {unjudged} / clean {} of {total} conversations",
+                    total.saturating_sub(proven + unjudged)
+                ),
+            )
+        }
+        Err(error) => EvalResult::fail(
+            "Contamination Census",
+            "contamination",
+            duration(start),
+            format!("census failed: {error}"),
+        ),
+    }
 }
 
 pub fn emitter_canary() -> EvalResult {

@@ -3091,6 +3091,40 @@ mod tests {
         assert_eq!(storage.cached_contamination().unwrap(), Some(measured));
     }
 
+    /// The chunker trims a chunk's edges, which strips the indentation that
+    /// made `    CSR engine ready (degraded mode).` code. A hash of the trimmed
+    /// slice cannot prove the bytes were an emission: the chunk is unjudged.
+    #[test]
+    fn a_chunk_trimmed_out_of_an_indented_mention_is_never_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indented.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u1",
+                "timestamp": "2026-10-13T00:00:00Z",
+                "message": {"content": format!("    {DEGRADED}")}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "project").unwrap();
+        let chunk = &parsed.chunks[0];
+        assert_eq!(
+            chunk.content, DEGRADED,
+            "the mention is kept, trimmed at the edge"
+        );
+        let storage = Storage::open_memory().unwrap();
+        storage.insert_chunk(chunk, &[0.0; 4]).unwrap();
+        storage
+            .replace_chunk_evidence(&parsed.evidence[&chunk.id])
+            .unwrap();
+        let census = storage.contamination_census().unwrap();
+        assert!(census.proven.is_empty(), "{:?}", census.proven);
+        assert_eq!(census.unjudged.len(), 1);
+    }
+
     /// An unproven chunk is never mutated by being measured, and never counted
     /// toward the warning: unjudged alone leaves `conversations` at zero.
     #[test]

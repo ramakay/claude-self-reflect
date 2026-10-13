@@ -2791,8 +2791,8 @@ mod tests {
         assert_eq!(parsed.suppression.csr_hook_wrappers_scrubbed, 1);
         assert_eq!(parsed.chunks.len(), 1);
         let chunk = &parsed.chunks[0];
-        // Every byte outside the wrapper, and nothing else.
-        assert_eq!(chunk.content, "alpha line\n\nbeta line");
+        // Every byte outside the wrapper and its own line ending.
+        assert_eq!(chunk.content, "alpha line\n\n\nbeta line");
         let evidence = &parsed.evidence[&chunk.id];
         let [span] = evidence.spans.as_slice() else {
             panic!("one retained component, one span: {:?}", evidence.spans);

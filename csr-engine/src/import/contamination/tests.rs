@@ -167,12 +167,12 @@ fn quoting_a_marker_is_not_emitting_it() {
 fn retained_bytes_are_never_trimmed_joined_or_normalised() {
     let text = format!("  lead\t \n\n{DEGRADED}\n\n\ttrail \r\n  ");
     let cut = user(&text);
-    assert_eq!(cut.kept, "  lead\t \n\n\ttrail \r\n  ");
+    assert_eq!(cut.kept, "  lead\t \n\n\n\ttrail \r\n  ");
     assert_eq!(cut.removed.len(), 1);
     assert_eq!(cut.removed[0].reason, ContaminationReason::DegradedStatus);
     assert_eq!(
         &text[cut.removed[0].start_byte..cut.removed[0].end_byte],
-        format!("{DEGRADED}\n\n")
+        format!("{DEGRADED}\n")
     );
     // multi-byte text around the cut survives untouched
     let text = format!("é–✓ keep\n{DEGRADED}\nα β");
@@ -194,8 +194,9 @@ fn a_bom_counts_only_at_byte_zero() {
 fn crlf_and_lf_blocks_are_cut_alike() {
     let lf = format!("before\n\n{RECAP}\nSettled: x (abc1234).\nNext: y.\n\nafter");
     let crlf = lf.replace('\n', "\r\n");
-    assert_eq!(user(&lf).kept, "before\n\nafter");
-    assert_eq!(user(&crlf).kept, "before\r\n\r\nafter");
+    // the recap block and its own line endings go; the person's blank line stays
+    assert_eq!(user(&lf).kept, "before\n\n\nafter");
+    assert_eq!(user(&crlf).kept, "before\r\n\r\n\r\nafter");
 }
 
 #[test]
@@ -283,16 +284,15 @@ fn assistant_relays_are_removed_only_as_complete_standalone_blocks() {
             "Here is what the hook said:\n\n{DEGRADED}\n\nThat is all."
         ))
         .kept,
-        "Here is what the hook said:\n\nThat is all."
+        "Here is what the hook said:\n\n\nThat is all."
     );
-    // discussion, quotation, a block glued to prose, and plugin text stay
+    // discussion, quotation and a block glued to prose stay
     for text in [
         format!("The prior line was “{DEGRADED}” and it matched."),
         format!("Hook said:\n{DEGRADED}\nand then I carried on."),
         format!("`{DEGRADED}`"),
         format!("> {DEGRADED}"),
-        "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “R.”".to_string(),
-        "Here is a note offered by a side agent:\n\n> quoted".to_string(),
+        "A standing rule from last month: she said “never lie”".to_string(),
         "<system-reminder>CSR PICKUP — relayed</system-reminder>".to_string(),
     ] {
         let cut = assistant(&text);
@@ -575,8 +575,8 @@ fn stored_ownership_needs_every_condition() {
     let mut shifted = s.clone();
     shifted.start_char = 1;
     shifted.end_char += 1;
-    // a span in the event's coordinates may start past zero; only its length counts
-    assert!(!unproven(proven(
+    // a span past the component's first byte lost its context to the trim
+    assert!(unproven(proven(
         Some("conversation"),
         None,
         &[shifted],
@@ -743,4 +743,327 @@ fn classification_p95_stays_inside_the_budget() {
             "{label} p95 {p95:?} over the 100 µs budget"
         );
     }
+}
+
+// --- phase A fix round 1: what the review found ---
+
+use crate::eval::contamination::{
+    cases, engine_outputs, pane_document, pane_outputs, plugin_synthetic,
+};
+
+/// `prefix`, filler, then the `…` that ends a send `one_line` cut at 700.
+fn cut_at_700(prefix: &str) -> String {
+    let filler = 700 - 1 - prefix.chars().count();
+    format!("{prefix}{}…", "x".repeat(filler))
+}
+
+#[test]
+fn every_send_the_panes_own_formatters_write_is_removed_whole() {
+    let document = pane_document();
+    assert_eq!(document.schema, "pane-emissions-v1");
+    assert!(document.cases.len() >= 50, "{}", document.cases.len());
+    assert!(
+        document.cases.iter().any(|case| case.cut),
+        "the fixture carries sends cut at the one_line boundary"
+    );
+    for case in &document.cases {
+        let cut = user(&case.text);
+        assert_eq!(
+            (cut.kept.as_str(), cut.removed.first().map(|s| s.reason)),
+            ("", Some(case.reason)),
+            "{} ({} chars, cut: {}): {}",
+            case.id,
+            case.chars,
+            case.cut,
+            case.text
+        );
+    }
+}
+
+#[test]
+fn the_pane_fixture_is_the_one_pane_py_would_write_now() {
+    let document = pane_document();
+    let pane = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../plugins/csr-companion/bin/pane.py");
+    let Ok(bytes) = std::fs::read(&pane) else {
+        return; // packaged without the plugin beside it
+    };
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        document.source.sha256, digest,
+        "pane.py changed: run `python3 -I plugins/csr-companion/tests/export-emissions.py --write` and review the grammar"
+    );
+    let plugin_copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../plugins/csr-companion/tests/fixtures/emissions/pane-v1.json");
+    if let Ok(copy) = std::fs::read_to_string(plugin_copy) {
+        assert_eq!(
+            copy,
+            include_str!("../../../tests/fixtures/contamination/pane-v1.json")
+        );
+    }
+}
+
+#[test]
+fn a_standing_rule_is_dated_month_day_or_by_its_first_ten_characters() {
+    // short_date() writes %m-%d; when the time does not parse, when[:10]
+    for text in [
+        "A standing rule from 10-13: “Keep receipts”",
+        "A standing rule from sometime i: “Keep receipts”",
+        "A standing rule from 2026-10-13: “Keep receipts”",
+    ] {
+        let cut = user(text);
+        assert_eq!(cut.kept, "", "{text}");
+        assert_eq!(
+            cut.removed[0].reason,
+            ContaminationReason::PluginStandingRule
+        );
+    }
+    assert_kept("A standing rule from my grandmother: “never lie”, she said");
+}
+
+#[test]
+fn a_recap_forward_carries_no_sentinel_because_the_pane_strips_it() {
+    for text in [
+        "CSR's recap at the start of this session: recap [2m ago]: Fixed parser.",
+        "CSR's recap at the start of this session: recap [2m ago]: Fixed parser. The rest: csr_reflect_on_past(\"conv_abc123\")",
+        "CSR's recap at the start of this session: Welcome back. Nothing is pending.",
+    ] {
+        let cut = user(text);
+        assert_eq!(cut.kept, "", "{text}");
+        assert_eq!(cut.removed[0].reason, ContaminationReason::PluginRecapForward);
+    }
+}
+
+#[test]
+fn sends_cut_at_the_one_line_boundary_lose_their_closing_but_not_their_ownership() {
+    for (prefix, reason) in [
+        ("CSR remembered: “", ContaminationReason::PluginPaneRecall),
+        ("CSR remembered a past session: “", ContaminationReason::PluginPaneRecall),
+        ("Earlier you read my “keep it” as “", ContaminationReason::PluginPaneReading),
+        ("Earlier you read me this way: “", ContaminationReason::PluginPaneReading),
+        ("A standing rule from 10-12: “", ContaminationReason::PluginStandingRule),
+        (
+            "Since our past sessions, commit abc1234 “fix importer” (2026-10-13) changed code we worked on: ",
+            ContaminationReason::PluginCodeShift,
+        ),
+        ("Last session abc12345 (“Fix scrub”): 12m active, ", ContaminationReason::PluginLastSession),
+    ] {
+        let send = cut_at_700(prefix);
+        assert_eq!(send.chars().count(), 700);
+        let cut = user(&send);
+        assert_eq!((cut.kept.as_str(), cut.removed.first().map(|s| s.reason)), ("", Some(reason)), "{prefix}");
+        // a 700-character line that is merely prose is not a send
+        assert_kept(&cut_at_700("I was reading about "));
+    }
+    // 699 characters ending in … is not the cut: one_line cuts at exactly 700
+    let short = format!("CSR remembered: “{}…", "x".repeat(10));
+    assert_kept(&short);
+}
+
+#[test]
+fn an_assistant_relay_of_a_dreamer_send_is_removed_when_it_stands_alone() {
+    let pane = "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “R.”";
+    assert_eq!(assistant(pane).kept, "");
+    assert_eq!(
+        assistant(&format!("Here it is:\n\n{pane}\n\nThanks")).kept,
+        "Here it is:\n\nThanks"
+    );
+    let band = "“Q?”\n\nCSR's dreamer asked this while you worked, quoted. Its reasoning:\n\n> **T**\n> reason";
+    assert_eq!(assistant(band).kept, "");
+    // quotation, discussion and a send glued to prose stay
+    for text in [
+        format!("The send read “{pane}” and nothing more."),
+        format!("Look: {pane} was typed."),
+        format!("\"{pane}\""),
+        format!("> {pane}"),
+        format!("```\n{pane}\n```"),
+    ] {
+        assert_eq!(assistant(&text).kept, text);
+    }
+    // every pane and synthetic plugin send is removable as a relay
+    for output in pane_outputs().into_iter().chain(plugin_synthetic()) {
+        assert!(output.assistant_relay, "{}", output.id);
+        assert_eq!(assistant(&output.text).kept, "", "{}", output.id);
+    }
+}
+
+#[test]
+fn a_briefing_with_paragraphs_leaves_nothing_behind() {
+    use crate::hooks::session_start::{format_briefing, MEMORY_MANIFEST};
+    use crate::provenance::TrustTier;
+    let briefing = format_briefing(
+        TrustTier::External,
+        "## Session Intelligence (CSR v9.2)\n\nFixed parser.",
+    );
+    assert_eq!(user(&briefing).kept, "");
+    // inside the SessionStart blob: the briefing runs to the next block
+    let multi = format_briefing(
+        TrustTier::External,
+        "## Session Intelligence (CSR v9.2)\n\n**Recent work**\n- **1w ago:** Hook-latency fix.\n\n```\ncode in a briefing\n```\n\n> a quote in a briefing\n\nLast paragraph.",
+    );
+    let tail = "recap [5h ago]: Fix the importer. [[CSR:RECAP]]\nFull state: csr_reflect_on_past(\"conv_abc\")\n";
+    assert_eq!(user(&format!("{MEMORY_MANIFEST}{multi}{tail}")).kept, "");
+    // with the person's words after the blocks
+    assert_eq!(
+        user(&format!("{MEMORY_MANIFEST}{multi}{tail}\nmy question")).kept,
+        "\nmy question"
+    );
+    // prose after a lone briefing that opened mid-text is the person's
+    assert_eq!(
+        user("Pasted this:\n\n[briefing: model-derived, trust=external]\nbody\n\nwhy is it wrong?")
+            .kept,
+        "Pasted this:\n\nwhy is it wrong?"
+    );
+}
+
+#[test]
+fn the_legacy_session_start_tail_is_removed_with_its_continuity_block() {
+    use crate::hooks::session_start::{
+        format_continuity_header, format_past_session_line, DEEPER_CONTEXT_FOOTER,
+    };
+    let text = format!(
+        "{}{}{}{}",
+        format_continuity_header(
+            "4m ago",
+            "Fix the importer",
+            "Edited 3 files",
+            Some("span ownership")
+        ),
+        format_past_session_line("2h ago", "Fix parser", ""),
+        format_past_session_line("1d ago", "Tidy docs", "Edited 2 files"),
+        DEEPER_CONTEXT_FOOTER.trim_start_matches('\n'),
+    );
+    assert_eq!(user(&text).kept, "", "{text}");
+    // a person's own list line after the block is theirs
+    let with_own = format!(
+        "{}{}\n- my own bullet",
+        format_continuity_header("4m ago", "Fix the importer", "", None),
+        format_past_session_line("2h ago", "Fix parser", ""),
+    );
+    assert_eq!(user(&with_own).kept, "\n- my own bullet");
+}
+
+#[test]
+fn a_truncated_pickup_header_never_indexes_past_the_document() {
+    for text in [
+        "CSR PICKUP — continue",
+        "CSR PICKUP — continue\n",
+        "CSR PICKUP — this prompt matches a past episode (similarity 0.87); the work may already exist — verify against it before re-deriving.",
+        "CSR PICKUP — x\nCSR CONTINUUM [4m ago]: x",
+        "CSR PICKUP — x\nCSR CONTINUUM [4m ago]: x\nLAST: y (outcome=success, trust=unknown)",
+    ] {
+        assert_kept(text);
+    }
+}
+
+#[test]
+fn every_prefix_of_every_canary_case_classifies_without_panic() {
+    let mut inputs: Vec<String> = engine_outputs()
+        .into_iter()
+        .chain(pane_outputs())
+        .chain(plugin_synthetic())
+        .map(|output| output.text)
+        .collect();
+    inputs.extend(cases().into_iter().map(|case| case.input));
+    inputs.sort();
+    inputs.dedup();
+    for input in &inputs {
+        for end in (0..=input.len()).filter(|&end| input.is_char_boundary(end)) {
+            let prefix = &input[..end];
+            for channel in [ContentChannel::UserText, ContentChannel::AssistantText] {
+                let cut = remove_csr_emissions(OwnedText {
+                    source: SourceKind::Conversation,
+                    channel,
+                    text: prefix,
+                });
+                assert!(cut.kept.len() <= prefix.len());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mention_inside_a_string_or_beside_a_quote_keeps_every_byte() {
+    for text in [
+        "{\"sample\":\"prefix CSR's compaction card (compacting), quoted: “One.” suffix\"}",
+        "{\"a\": \"see CSR's story of this session, rev 3, quoted: “Story.” for details\"}",
+        "## STUCK WARNING\n> Keep this quoted requirement",
+        "## STUCK WARNING\n    indented code line",
+        "## STUCK WARNING\n```\nfenced\n```",
+        "## DON'T RETRY\n> - [episode] quoted row",
+    ] {
+        assert_kept(text);
+    }
+    // a card outside any string is still the companion's
+    assert_eq!(
+        user("see CSR's compaction card (compacting), quoted: “One.” for details").kept,
+        "see  for details"
+    );
+}
+
+#[test]
+fn removal_consumes_only_the_emitters_own_line_ending() {
+    let text = format!("before\n{DEGRADED}\n\t\n\nafter");
+    assert_eq!(user(&text).kept, "before\n\t\n\nafter");
+    // CRLF: the emitter's own ending only
+    let crlf = format!("before\r\n{RECAP}\r\n\r\nafter");
+    assert_eq!(user(&crlf).kept, "before\r\n\r\nafter");
+    // blocks the engine writes with a trailing blank line take exactly that line
+    let manifest = format!("{}\nafter", crate::hooks::session_start::MEMORY_MANIFEST);
+    assert_eq!(user(&manifest).kept, "\nafter");
+}
+
+#[test]
+fn ten_thousand_unclosed_wrapper_openers_scan_in_one_pass() {
+    let text = "<system-reminder>\n".repeat(10_000) + "tail";
+    let start = std::time::Instant::now();
+    let cut = user(&text);
+    let elapsed = start.elapsed();
+    assert_eq!(cut.kept, text, "an unclosed opener is no wrapper");
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "10,000 unclosed openers took {elapsed:?}"
+    );
+    let registered = "<system-reminder>CSR PICKUP — x\n".repeat(10_000);
+    let start = std::time::Instant::now();
+    assert_eq!(user(&registered).kept, registered);
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn a_chunk_that_starts_after_its_components_first_byte_is_unproven() {
+    let content = "CSR engine ready (degraded mode).";
+    let e = event("e1", "conv", "user_message");
+    let mut trimmed = span("c1", "e1", content);
+    trimmed.start_char = 4; // "    " was trimmed off the front of the component
+    trimmed.end_char = 4 + content.chars().count();
+    assert!(matches!(
+        proof(
+            Some("conversation"),
+            None,
+            std::slice::from_ref(&trimmed),
+            std::slice::from_ref(&e),
+            content
+        ),
+        StoredOwnership::Unproven(_)
+    ));
+    let whole = span("c1", "e1", content);
+    assert_eq!(
+        proof(
+            Some("conversation"),
+            None,
+            std::slice::from_ref(&whole),
+            std::slice::from_ref(&e),
+            content
+        ),
+        StoredOwnership::Proven(ContentChannel::UserText)
+    );
 }
