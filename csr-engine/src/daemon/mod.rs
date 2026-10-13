@@ -1492,11 +1492,18 @@ async fn compact_if_marked(
     tokio::select! {
         result = engine.rebuild_search_index() => {
             match result {
-                Ok((chunks, reflections)) => tracing::info!(
-                    chunks,
-                    reflections,
-                    "compaction rebuild complete, needs_compaction cleared"
-                ),
+                Ok((chunks, reflections)) => {
+                    tracing::info!(
+                        chunks,
+                        reflections,
+                        "compaction rebuild complete, needs_compaction cleared"
+                    );
+                    // The rebuild streamed every vector into the heap and
+                    // has just published them: serve them from the map.
+                    if let Err(e) = engine.remap_published().await {
+                        tracing::warn!(error = %e, "index remap after compaction failed");
+                    }
+                }
                 Err(e) => tracing::warn!(error = %e, "compaction rebuild failed"),
             }
         }

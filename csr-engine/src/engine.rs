@@ -697,6 +697,18 @@ impl Engine {
         Ok((chunk_count, reflection_count))
     }
 
+    /// Daemon only: [`remap_published_generation`] on the blocking pool.
+    pub async fn remap_published(&self) -> Result<bool> {
+        let storage = self.storage.clone();
+        let search = self.search.clone();
+        let index_dir = self.index_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            remap_published_generation(&storage, &search, &index_dir)
+        })
+        .await
+        .context("index remap task failed")?
+    }
+
     /// Remove the persisted manifest before a maintenance operation mutates
     /// vectors. If the operation is interrupted or its final dump fails, the
     /// next process must rebuild from SQLite instead of accepting stale files
@@ -832,7 +844,30 @@ pub(crate) fn load_reconciled(
     reflection_count: usize,
     persist: bool,
 ) -> Option<LoadedIndex> {
+    load_reconciled_expecting(
+        storage,
+        index_dir,
+        chunk_count,
+        reflection_count,
+        persist,
+        None,
+    )
+}
+
+/// [`load_reconciled`], refusing (`None`) a manifest that no longer names
+/// the `expected` generation basenames.
+fn load_reconciled_expecting(
+    storage: &Storage,
+    index_dir: &Path,
+    chunk_count: usize,
+    reflection_count: usize,
+    persist: bool,
+    expected: Option<&(String, String)>,
+) -> Option<LoadedIndex> {
     let mut search = SearchEngine::load_from_disk(index_dir, chunk_count, reflection_count)?;
+    if expected.is_some_and(|expected| search.published_basenames() != Some(expected)) {
+        return None;
+    }
     let mut chunks_added = 0usize;
     let mut reflections_added = 0usize;
     // Reconcile HNSW cache with DB:
@@ -939,6 +974,74 @@ pub(crate) fn load_reconciled(
         chunks_added,
         reflections_added,
     })
+}
+
+/// Daemon only: replace the in-memory index with the generation it just
+/// published, loaded mapped from disk and reconciled with SQLite.
+///
+/// A compaction rebuild, and every point the daemon inserts, lives on the
+/// heap: at the live size that was 773k vectors x 1.5 KB = 1.1 GB of heap
+/// copies while the same vectors sat in the generation file every MCP
+/// server maps (sampled live: 0 KB of the daemon's mapped file resident).
+/// After the daemon's own publish those vectors are on disk, so the heap
+/// copies can go; dropping the old engine also releases the map of the
+/// generation it was loaded from, which the publish has already unlinked.
+///
+/// Returns `false` (and keeps the current engine) when the manifest no
+/// longer names this engine's publish, the load fails or is not mapped, or
+/// the engine was swapped meanwhile. Nothing is lost by the swap: what the
+/// old engine gained after its publish is in SQLite, and the index sync
+/// replays it after the loaded generation's change cursor.
+pub(crate) fn remap_published_generation(
+    storage: &Storage,
+    search: &RwLock<SearchEngine>,
+    index_dir: &Path,
+) -> Result<bool> {
+    let (expected, generation) = {
+        let index = search.blocking_read();
+        (index.published_basenames().cloned(), index.generation())
+    };
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    let started = std::time::Instant::now();
+    let chunk_count = storage.count_chunk_embeddings()?;
+    let reflection_count = storage.count_reflection_embeddings()?;
+    let Some(loaded) = load_reconciled_expecting(
+        storage,
+        index_dir,
+        chunk_count,
+        reflection_count,
+        true,
+        Some(&expected),
+    ) else {
+        return Ok(false);
+    };
+    if !loaded.search.is_mapped() {
+        return Ok(false);
+    }
+    let LoadedIndex {
+        search: mut fresh,
+        chunks_added,
+        reflections_added,
+    } = loaded;
+    fresh.note_unpublished(chunks_added, reflections_added);
+    let mut index = search.blocking_write();
+    if index.generation() != generation {
+        return Ok(false);
+    }
+    let previous = std::mem::replace(&mut *index, fresh);
+    drop(index);
+    // Freeing ~700k points takes a moment; never under the lock.
+    drop(previous);
+    crate::runtime::release_freed_pages();
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        chunks_added,
+        reflections_added,
+        "index remapped from the published generation"
+    );
+    Ok(true)
 }
 
 /// A loaded cache is rebuilt when orphan slots in either index exceed 1/N of
@@ -1279,6 +1382,121 @@ mod tests {
 
     // --- WP-D: foreground `Engine::new` must not inline-rebuild on material
     // orphans; it defers to the `needs_compaction` marker instead. ---
+
+    /// A deterministic pseudo-random 384-dim direction per seed.
+    fn direction(seed: usize) -> Vec<f32> {
+        let mut state = (seed as u64 + 7).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..384)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 2001) as f32 / 1000.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn insert_direction(storage: &Storage, id: &str, seed: usize) {
+        storage
+            .insert_chunk(
+                &ConversationChunk {
+                    id: id.into(),
+                    conversation_id: "conv".into(),
+                    project_name: "proj".into(),
+                    timestamp: "2026-10-12T00:00:00Z".into(),
+                    content: id.into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &direction(seed),
+            )
+            .unwrap();
+    }
+
+    fn hits(search: &SearchEngine, seed: usize) -> Vec<(String, f32)> {
+        search
+            .search_chunks(&direction(seed), 10, -1.0)
+            .into_iter()
+            .map(|hit| (hit.id, hit.score))
+            .collect()
+    }
+
+    /// The daemon's remap swaps its heap copies for the generation it just
+    /// published, mapped: same answers, plus what SQLite gained since.
+    #[test]
+    fn remap_serves_the_published_generation_from_the_map() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let storage = Storage::open(&tmp.path().join("csr-engine.db")).unwrap();
+        for i in 0..400 {
+            insert_direction(&storage, &format!("c{i}"), i);
+        }
+        let (rebuilt, _, _) = rebuild_search_index_streaming(&storage, 128).unwrap();
+        assert!(!rebuilt.is_mapped());
+        let search = RwLock::new(rebuilt);
+        assert!(matches!(
+            crate::import::watcher::flush_index_blocking(&storage, &search, &index_dir, true),
+            Some(Ok(()))
+        ));
+        let before: Vec<_> = (0..20)
+            .map(|q| hits(&search.blocking_read(), 1000 + q))
+            .collect();
+        let generation = search.blocking_read().generation();
+        // Landed in SQLite after the publish (an extraction-loop write).
+        for i in 400..405 {
+            insert_direction(&storage, &format!("c{i}"), i);
+        }
+
+        assert!(remap_published_generation(&storage, &search, &index_dir).unwrap());
+        let index = search.blocking_read();
+        assert!(index.is_mapped());
+        assert_ne!(index.generation(), generation);
+        for i in 0..405 {
+            assert!(index.has_chunk(&format!("c{i}")), "c{i}");
+        }
+        assert_eq!(
+            index.unpublished_changes(),
+            5,
+            "the backfill is the daemon's to publish"
+        );
+        // The first 400 points are the published graph, untouched by the
+        // backfill only where the five new points do not rank.
+        for (q, expected) in before.iter().enumerate() {
+            let got = hits(&index, 1000 + q);
+            let unchanged: Vec<_> = got
+                .iter()
+                .filter(|(id, _)| id.trim_start_matches('c').parse::<usize>().unwrap() < 400)
+                .cloned()
+                .collect();
+            assert_eq!(unchanged, expected[..unchanged.len()].to_vec(), "query {q}");
+        }
+    }
+
+    #[test]
+    fn remap_refuses_a_generation_another_writer_published() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tmp.path().join("index");
+        let storage = Storage::open(&tmp.path().join("csr-engine.db")).unwrap();
+        for i in 0..300 {
+            insert_direction(&storage, &format!("c{i}"), i);
+        }
+        let (rebuilt, _, _) = rebuild_search_index_streaming(&storage, 128).unwrap();
+        let search = RwLock::new(rebuilt);
+        assert!(matches!(
+            crate::import::watcher::flush_index_blocking(&storage, &search, &index_dir, true),
+            Some(Ok(()))
+        ));
+        // Another process publishes over it before the remap loads.
+        let (mut other, _, _) = rebuild_search_index_streaming(&storage, 128).unwrap();
+        other.dump_to_disk(&index_dir, 300, 0).unwrap();
+        let generation = search.blocking_read().generation();
+        assert!(!remap_published_generation(&storage, &search, &index_dir).unwrap());
+        assert_eq!(search.blocking_read().generation(), generation);
+        assert!(!search.blocking_read().is_mapped());
+    }
 
     #[tokio::test]
     async fn orphans_material_in_foreground_marks_compaction_instead_of_rebuilding() {

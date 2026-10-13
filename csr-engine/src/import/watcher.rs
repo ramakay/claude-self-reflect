@@ -449,12 +449,25 @@ impl FileWatcher {
     }
 
     /// [`flush_index_blocking`] on the blocking pool. `None`: nothing was dirty.
+    /// Under the daemon's budget a successful dump is followed by
+    /// [`crate::engine::remap_published_generation`], still inside the
+    /// caller's heavy-work permit: the daemon then serves the vectors it
+    /// just wrote from the mapped file instead of keeping heap copies.
     async fn flush_index(&self) -> Option<Result<()>> {
         let storage = Arc::clone(&self.storage);
         let search = Arc::clone(&self.search);
         let index_dir = self.index_dir.clone();
+        let remap = self.flush_policy == FlushPolicy::Budget;
         tokio::task::spawn_blocking(move || {
-            flush_index_blocking(&storage, &search, &index_dir, false)
+            let flushed = flush_index_blocking(&storage, &search, &index_dir, false);
+            if remap && matches!(flushed, Some(Ok(()))) {
+                if let Err(e) =
+                    crate::engine::remap_published_generation(&storage, &search, &index_dir)
+                {
+                    tracing::warn!(error = %e, "index remap after dump failed (non-fatal)");
+                }
+            }
+            flushed
         })
         .await
         .unwrap_or_else(|e| Some(Err(anyhow::anyhow!("index flush task failed: {e}"))))

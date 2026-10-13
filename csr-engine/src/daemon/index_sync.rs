@@ -396,7 +396,7 @@ mod tests {
                 .unwrap();
         }
         // An update that predates the dump: replaying it would mint a tombstone.
-        storage.insert_chunk(&chunk("c1"), &axis(301)).unwrap();
+        storage.insert_chunk(&chunk("c1"), &axis(1001)).unwrap();
         // First start: no cache, so the engine rebuilds and dumps.
         drop(Engine::new(&db, &projects).unwrap());
 
@@ -407,7 +407,7 @@ mod tests {
                 .insert_chunk(&chunk(&format!("c{i}")), &axis(i))
                 .unwrap();
         }
-        storage.insert_chunk(&chunk("c5"), &axis(350)).unwrap();
+        storage.insert_chunk(&chunk("c5"), &axis(1050)).unwrap();
 
         let restarted = Engine::new(&db, &projects).unwrap();
         assert_eq!(restarted.startup_backfill(), (20, 0));
@@ -420,8 +420,8 @@ mod tests {
         for i in 0..320 {
             assert!(index.has_chunk(&format!("c{i}")), "c{i}");
         }
-        assert_eq!(index.search_chunks(&axis(350), 1, 0.99)[0].id, "c5");
-        assert_eq!(index.search_chunks(&axis(301), 1, 0.99)[0].id, "c1");
+        assert_eq!(index.search_chunks(&axis(1050), 1, 0.99)[0].id, "c5");
+        assert_eq!(index.search_chunks(&axis(1001), 1, 0.99)[0].id, "c1");
         assert_eq!(
             index.chunk_tombstone_count(),
             1,

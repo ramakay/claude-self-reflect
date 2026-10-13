@@ -36,9 +36,26 @@ static MODEL_INIT_LOCK: Mutex<()> = Mutex::new(());
 /// (`daemon::trained_rerank`, `import::plans`, `import::scrub` all pass their
 /// whole text list), so one large pass permanently parked ~17GB of arena in the
 /// long-lived daemon process while short-lived MCP servers stayed at ~670MB.
-/// Capping here fixes every call site at once; 16 keeps the worst-case tensor
-/// near 200MB.
-const EMBED_BATCH_SIZE: usize = 16;
+/// Capping here fixes every call site at once.
+///
+/// One text per run: a batch is padded to its longest member and attention
+/// is quadratic in that length, so the arena sized itself to the longest
+/// text times the batch. Measured on 2,000 real chunk texts (mean 771
+/// chars) in the importer's calls of 10, arena on, 4 threads:
+///
+/// | per run | vectors/s | footprint after |
+/// |---------|-----------|-----------------|
+/// | 16      | 82.4      | 1,382 MB        |
+/// | 4       | 93.5      | 508 MB          |
+/// | 2       | 98.6      | 349 MB          |
+/// | 1       | 106.6     | 261 MB          |
+///
+/// Vectors differ from the 16-text runs by at most 1.9e-7 per component
+/// (min cosine 0.9999999999994), the same order as the padding-dependent
+/// noise between any two batch compositions. Disabling ORT's CPU arena
+/// instead was worse on macOS: same throughput, 2,270 MB after, because the
+/// system allocator kept the freed tensors.
+const EMBED_BATCH_SIZE: usize = 1;
 
 /// Resolve the ONNX intra-op thread cap: `CSR_EMBED_THREADS` if it parses
 /// as `1..=runtime::MAX_THREAD_OVERRIDE`, else `min(4, available_parallelism)`.

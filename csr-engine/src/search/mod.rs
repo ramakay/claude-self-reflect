@@ -30,7 +30,7 @@ pub struct SearchResult {
 
 /// What [`SearchEngine::publish_to_disk`] published, for
 /// [`SearchEngine::settle_publish`] to record on the same engine.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[must_use = "settle the publish, or the published sides stay dirty"]
 pub struct Published {
     /// Which engine published (see `SearchEngine::generation`).
@@ -39,6 +39,8 @@ pub struct Published {
     reflection_changes: u64,
     stale_generation: bool,
     new_epoch: u64,
+    /// The generation files the committed manifest names.
+    basenames: (String, String),
 }
 
 /// HNSW-backed search engine for chunks and reflections.
@@ -132,6 +134,45 @@ pub struct SearchEngine {
     /// side from memory (dirty or not) when the on-disk manifest's epoch is
     /// newer than this value — see `dump_to_disk`'s stale-generation guard.
     epoch: u64,
+    /// The `(chunk, reflection)` generation basenames of the manifest this
+    /// engine last loaded or published with its own content. The daemon
+    /// remaps from disk only when the manifest still names them.
+    published_basenames: Option<(String, String)>,
+    /// Whether the loaded vectors live in a memory map (see `is_mapped`).
+    vectors_mapped: bool,
+    /// The `HnswIo`s a loaded engine's indexes borrow from (their memory
+    /// maps, when mapped). Declared after the indexes, so those drop first
+    /// and the maps are released with the engine. They used to be leaked
+    /// for the process lifetime, which kept every unlinked generation's
+    /// ~1.2 GB on disk until the process exited and made a reload a leak.
+    _mapped: Vec<MappedGeneration>,
+}
+
+/// Owns an `HnswIo` whose memory map a loaded `Hnsw` borrows. Never touched
+/// after the load except to free it, after that `Hnsw` has been dropped.
+struct MappedGeneration(NonNull<HnswIo>);
+
+// SAFETY: the `HnswIo` is only dereferenced during the single-threaded load;
+// afterwards this handle only frees it. Its mapping is read-only shared memory.
+unsafe impl Send for MappedGeneration {}
+// SAFETY: as above — no `&self` method dereferences the pointer.
+unsafe impl Sync for MappedGeneration {}
+
+impl Drop for MappedGeneration {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_MAPPED_GENERATIONS.with(|live| live.set(live.get() - 1));
+        // SAFETY: allocated by `Box::into_raw` in `PendingHnswIo::new` and
+        // owned uniquely here; the borrowing `Hnsw` was dropped first.
+        unsafe { drop(Box::from_raw(self.0.as_ptr())) }
+    }
+}
+
+// `MappedGeneration`s created minus dropped on this test thread (each test
+// runs on its own thread, so concurrent tests cannot disturb the count).
+#[cfg(test)]
+thread_local! {
+    static LIVE_MAPPED_GENERATIONS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
 // HNSW parameters
@@ -335,7 +376,21 @@ impl SearchEngine {
             change_cursor: 0,
             manifest_backed: false,
             epoch: 0,
+            published_basenames: None,
+            vectors_mapped: false,
+            _mapped: Vec::new(),
         }
+    }
+
+    /// Whether an index reads its loaded vectors from a memory-mapped
+    /// generation rather than heap copies.
+    pub fn is_mapped(&self) -> bool {
+        self.vectors_mapped
+    }
+
+    /// See the `published_basenames` field.
+    pub(crate) fn published_basenames(&self) -> Option<&(String, String)> {
+        self.published_basenames.as_ref()
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -759,6 +814,10 @@ impl SearchEngine {
     pub fn clear_reconciliation_dirty(&mut self) {
         self.chunk_dirty = false;
         self.reflection_dirty = false;
+        // Nor does it count toward a dump budget; an owner that does want
+        // it published says so with `note_unpublished`.
+        self.settled_chunk_changes = self.chunk_changes;
+        self.settled_reflection_changes = self.reflection_changes;
     }
 
     /// Search chunk index but only return results whose IDs are in `allowed_ids`.
@@ -1123,6 +1182,7 @@ impl SearchEngine {
             reflection_changes: self.reflection_changes,
             stale_generation,
             new_epoch,
+            basenames: (manifest.chunk_basename, manifest.reflection_basename),
         })
     }
 
@@ -1145,6 +1205,7 @@ impl SearchEngine {
         if !published.stale_generation {
             self.settled_chunk_changes = published.chunk_changes;
             self.settled_reflection_changes = published.reflection_changes;
+            self.published_basenames = Some(published.basenames.clone());
         }
         let stale_generation = published.stale_generation;
         let new_epoch = published.new_epoch;
@@ -1197,10 +1258,9 @@ impl SearchEngine {
     /// - Chunk/reflection counts match current DB state (staleness detection)
     /// - All required files exist and load successfully
     ///
-    /// **WARNING**: On full success the `HnswIo` objects are leaked to satisfy
-    /// the `'static` lifetime requirement (their mmaps must outlive the returned
-    /// indices). Failed or partially failed loads reclaim them instead. Only
-    /// call this once per process (at startup).
+    /// On full success the engine owns the `HnswIo` objects whose maps its
+    /// indexes borrow (see the `mapped` field) and frees them when dropped.
+    /// Failed or partially failed loads reclaim them at once.
     pub fn load_from_disk(
         dir: &Path,
         expected_chunks: usize,
@@ -1339,14 +1399,15 @@ impl SearchEngine {
             )
         };
 
-        // These allocations own mmaps referenced by the returned Hnsw values and
-        // therefore intentionally live for the process lifetime after full success.
-        if let Some(io) = chunk_io.take() {
-            io.leak();
-        }
-        if let Some(io) = refl_io.take() {
-            io.leak();
-        }
+        // These allocations own mmaps referenced by the returned Hnsw values:
+        // the engine keeps them, after its indexes, until it is dropped.
+        let vectors_mapped =
+            chunk_io.is_some() && chunk_use_mmap || refl_io.is_some() && refl_use_mmap;
+        let mapped: Vec<MappedGeneration> = [chunk_io.take(), refl_io.take()]
+            .into_iter()
+            .flatten()
+            .map(PendingHnswIo::into_mapped)
+            .collect();
 
         // Rebuild live reverse positions without changing the on-disk manifest layout.
         let chunk_positions: HashMap<String, usize> = manifest
@@ -1385,6 +1446,9 @@ impl SearchEngine {
             change_cursor: manifest.change_cursor,
             manifest_backed: true,
             epoch: manifest.epoch,
+            published_basenames: Some((manifest.chunk_basename, manifest.reflection_basename)),
+            vectors_mapped,
+            _mapped: mapped,
         })
     }
 }
@@ -1572,13 +1636,12 @@ impl PendingHnswIo {
         .map_err(HnswLoadFailure::Error)
     }
 
-    fn leak(self) {
+    /// Hand the allocation to the engine whose `Hnsw` borrows its map.
+    fn into_mapped(self) -> MappedGeneration {
         let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: the allocation is still uniquely owned here. Both Hnsw loads have
-        // succeeded, so converting it to a process-lifetime leak preserves their mmaps.
-        unsafe {
-            Box::leak(Box::from_raw(this.io.as_ptr()));
-        }
+        #[cfg(test)]
+        LIVE_MAPPED_GENERATIONS.with(|live| live.set(live.get() + 1));
+        MappedGeneration(this.io)
     }
 }
 
@@ -1705,6 +1768,29 @@ mod tests {
         let mut v = vec![0.0; 4];
         v[i % 4] = 1.0;
         v
+    }
+
+    #[test]
+    fn a_dropped_engine_releases_the_generation_it_mapped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut engine = SearchEngine::new(16);
+        for i in 0..4 {
+            engine.insert_chunk(format!("c{i}"), unit(i));
+            engine.insert_reflection(format!("r{i}"), unit(i));
+        }
+        engine.dump_to_disk(tmp.path(), 4, 4).unwrap();
+        let live = || LIVE_MAPPED_GENERATIONS.with(|live| live.get());
+        let loaded = SearchEngine::load_from_disk(tmp.path(), 4, 4).unwrap();
+        assert!(loaded.is_mapped());
+        assert_eq!(live(), 2, "one per index");
+        let again = SearchEngine::load_from_disk(tmp.path(), 4, 4).unwrap();
+        assert_eq!(live(), 4);
+        assert_eq!(again.search_chunks(&unit(1), 1, 0.99)[0].id, "c1");
+        drop(again);
+        assert_eq!(live(), 2, "dropping an engine frees its maps");
+        assert_eq!(loaded.search_chunks(&unit(2), 1, 0.99)[0].id, "c2");
+        drop(loaded);
+        assert_eq!(live(), 0);
     }
 
     #[test]
