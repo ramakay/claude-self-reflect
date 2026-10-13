@@ -100,6 +100,7 @@ const parseOf = (command: string) => gitParse(command, GUARD)
 const MARKER = `${HOME}/.claude-self-reflect/csr-companion/compacting/sess-1.json`
 
 function host(on: On, world: World) {
+  mainNext = 0
   const runs: string[][] = []
   const statuses: Array<string | undefined> = []
   const opened: string[] = []
@@ -312,8 +313,12 @@ async function settle(done: () => boolean | Promise<boolean>) {
 }
 
 // Steps of Claude's main loop (or a subagent's, with agentId).
-async function steps($: Engine, n: number, agentId?: string) {
-  for (let index = 0; index < n; index++) {
+// n steps of a turn. The main session's continue the turn's index where the last call stopped (a step is one index of one
+// turn, so a second call is new work); `from` replays the indexes from there. A subagent's start at 0, as they always did.
+let mainNext = 0
+async function steps($: Engine, n: number, agentId?: string, from?: number) {
+  for (let k = 0; k < n; k++) {
+    const index = from !== undefined ? from + k : agentId === undefined ? mainNext++ : k
     const stream = $.turn.step({ turnId: 'turn-1', index, model: 'opus', messageCount: 4, agentId } as never)
     for await (const _ of stream) void _
   }
@@ -2421,6 +2426,38 @@ test('agent_usage_never_counts_towards_the_share_or_the_chapter', ON, async ($, 
   expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ steps: 2 })) // only Claude's own steps are the chapter's
   expect(seen.forks).toEqual([])
   expect(seen.kept.filter(record => record.kind === 'look')).toEqual([])
+})
+
+test('a replayed main step adds no usage and no chapter step; a new step still does', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  await steps($, 3)
+  await steps($, 3, undefined, 0) // the same three steps of the same turn again: a replay
+  await settle(() => false)
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 3 * LOOK, step: LOOK }))
+  expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ steps: 3 }))
+  await steps($, 1) // the next index of the turn: new work
+  await settle(() => false)
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 4 * LOOK }))
+  expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ steps: 4 }))
+})
+
+test('main step receipts: an open turn is never forgotten, a closed one is trimmed, and the same index of a new turn counts', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
+  const step = async (turnId: string, index: number) => {
+    for await (const _ of $.turn.step({ turnId, index, model: 'opus', messageCount: 4 } as never)) void _
+  }
+  await step('open-0', 0) // a turn left open (no turn.complete) ...
+  for (let n = 0; n < 70; n++) {
+    await step(`done-${n}`, 0)
+    await $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: `done-${n}`, reason: 'answer' } as never)
+  }
+  await step('open-0', 0) // ... is still known after 70 closed turns went by
+  await settle(() => false)
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 71 * LOOK }))
+  expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ steps: 71 }))
+  const turns = (seen.store.get(`pace:${SID}`) as { turns: Record<string, { closed?: boolean }> }).turns
+  expect(Object.values(turns).filter(receipt => receipt.closed).length).toBeLessThanOrEqual(60)
+  expect(Object.keys(turns)).toContain(JSON.stringify([SID, 'open-0']))
 })
 
 test('completion_usage_never_counts_towards_the_share', ON, async ($, on) => {

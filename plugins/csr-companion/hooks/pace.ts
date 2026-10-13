@@ -32,6 +32,44 @@ export type Pace = {
   dreams: number
   lastLook: number // tokens the last look cost: the estimate for the next
   step?: number // tokens the main session's last step spent: the estimate for a look no step of its own started
+  turns?: Record<string, Receipt> // the main session's steps already counted, by [session, turn], so a replay or a reload never counts twice
+}
+
+// The step indexes of one main-session turn already counted, and whether the turn has ended.
+export type Receipt = { steps: number[]; closed?: boolean }
+export const TURNS_KEPT = 60 // ended turns remembered (oldest go first): they only guard a replay of a step
+export const OPEN_KEPT = 1000 // a safety bound on turns that never ended; far above any real run
+
+export const turnKey = (session: string, turn: string) => JSON.stringify([session, turn])
+
+// A step, counted once: its tokens are Claude's spend and it is one step of the chapter (the caller advances that when
+// this returns a new pace). A step already counted (same session, turn and index) returns the pace itself, unchanged.
+export function countStep(pace: Pace, turn: string, index: number, tokens: number): Pace {
+  const key = turnKey(pace.session, turn)
+  const seen = pace.turns?.[key]
+  if (seen?.steps.includes(index)) return pace
+  const { [key]: _old, ...others } = pace.turns ?? {}
+  const turns = { ...others, [key]: { ...seen, steps: [...(seen?.steps ?? []), index] } }
+  return { ...pace, claude: pace.claude + tokens, ...(tokens ? { step: tokens } : {}), turns: keepTurns(turns) }
+}
+
+// The turn ended: its receipt may now be trimmed. Nothing else about it changes.
+export function closeTurn(pace: Pace, turn: string): Pace {
+  const key = turnKey(pace.session, turn)
+  const seen = pace.turns?.[key]
+  if (!seen || seen.closed) return pace
+  return { ...pace, turns: keepTurns({ ...pace.turns, [key]: { ...seen, closed: true } }) }
+}
+
+// An open receipt is what stops a replayed step counting again, so none is evicted while its turn can still step: only
+// ended turns are trimmed, oldest first (OPEN_KEPT bounds the turns that never ended).
+const keepTurns = (turns: Record<string, Receipt>) => {
+  const entries = Object.entries(turns)
+  const closed = entries.filter(([, receipt]) => receipt.closed)
+  const open = entries.filter(([, receipt]) => !receipt.closed).slice(-OPEN_KEPT)
+  const drop = new Set(closed.slice(0, Math.max(0, closed.length - TURNS_KEPT)).map(([key]) => key))
+  const keep = new Set([...open.map(([key]) => key), ...closed.map(([key]) => key)].filter(key => !drop.has(key)))
+  return Object.fromEntries(entries.filter(([key]) => keep.has(key)))
 }
 
 export const freshPace = (session: string): Pace => ({

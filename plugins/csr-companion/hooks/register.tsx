@@ -7,7 +7,7 @@ import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
-import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
+import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, closeTurn, countStep, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
 import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, mergeGuards, parseGuard, protectedFromGit, reasonFor, UNRESOLVED } from './coach'
 import type { LeaseStep } from './dreamer'
@@ -1805,6 +1805,7 @@ export const register: Register = (on, options) => {
       return result
     }
     fleet.active = false
+    if (dreamsOn && (await isPerson($).catch(() => false))) await changePace($, pace => closeTurn(pace, e.turnId)).catch(() => undefined)
     if (await isPerson($).catch(() => false)) {
       void pollAgents($)
       void armCompletions($, fleet).catch(() => undefined) // reports that came in mid-turn are looked at once the person has the floor
@@ -1873,8 +1874,17 @@ export const register: Register = (on, options) => {
     fleet.stepAt = await $.clock.now()
     if (!dreamsOn || !person) return result
     fleet.spent = spent || fleet.spent
-    // Count what Claude spends: the dreamer's share is measured against it.
-    if (spent) await changePace($, pace => ({ ...pace, claude: pace.claude + spent, step: spent }))
+    // Count what Claude spends: the dreamer's share is measured against it. A step is one index of one turn, counted once
+    // in the pace's receipts: a replay of it adds no usage and is no step of the chapter.
+    const turn = result?.turnId ?? e.turnId
+    const index = result?.index ?? e.index
+    let fresh = true
+    await changePace($, pace => {
+      const counted = countStep(pace, turn, index, spent)
+      fresh = counted !== pace
+      return counted
+    })
+    if (!fresh) return result
     // Steps counted in the store, so a reload of this module does not start the count over.
     const chapter = await changeChapter($, current => ({ ...current, steps: current.steps + 1 }))
     if (chapter.steps >= chapter.due && !fleet.dreaming) {
