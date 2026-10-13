@@ -61,6 +61,7 @@ def sibling(name):
 
 private = sibling('private')  # every write below goes through it: folders 0700, files 0600, credentials redacted
 agents_lib = sibling('agents')  # the agents of a session, as the hooks keep them (hooks/agents.ts writes, this reads)
+codex_lib = sibling('codex_runs')  # Codex runs and its week, read from its rollout files; starts no process
 DB = os.path.join(HOME, '.claude-self-reflect', 'csr-engine.db')
 VERB = {'superseded_by': 'changed', 'anchor_obsolete': 'removed', 'anchor_reinstated': 'came back'}
 NESTED = ('/.claude/worktrees/', '/.worktrees/')
@@ -3671,7 +3672,7 @@ def page_main(data, s, now, ui=None):
     names = [section['name'] for section in sections]
     after_dreams = names.index('dreams') + 1  # by name: the sections above it are not counted by position
     sections[after_dreams:after_dreams] = lost_sections(s, now, 3 * more)
-    flight = flight_section(data.get('agents'), now, ui)
+    flight = flight_section(data.get('agents'), now, ui, data.get('codex'))
     if flight:  # after the story, before What if…
         sections.insert(names.index('story') + 1, flight)
     card = compact_section((data.get('infinite') or {}).get('card'), data.get('compacting'), lost_waiting(s.get('lost')))
@@ -3739,11 +3740,34 @@ def flight_item(row, depth, unknown, now):
                 whole_detail=True, send='', nosend=True, hint=FLIGHT_HINT, unrated=True)
 
 
-def flight_section(agents, now, ui=None):
-    """In flight: the session's agents depth-first, four by default and "and N more" after them. Open while any agent is
-    pending, running or waiting, or a report came in the last 30 minutes; else one folded row. None without agents."""
+def codex_items(codex, now):
+    """The Codex part of In flight: the week's line (amber from 75%, red from 90%), then a row per live run. Hidden
+    (nothing) when there is no ~/.codex, which codex_snapshot reports as None."""
+    if codex is None:
+        return []
+    week = codex.get('week')
+    line = codex_lib.week_line(week, codex.get('live') or 0)
+    items = [dict(key='codex:week', title=line, lines=1, tone=(week or {}).get('level'), quiet=not (week or {}).get('level'),
+                  detail=[], send='', nosend=True, unrated=True)]
+    for row in codex.get('rows') or []:
+        model, effort = row.get('model'), row.get('effort')
+        minutes = row.get('minutes')
+        body = ' · '.join((f'{minutes}m' if minutes is not None else 'time unknown',
+                           short_path(row['cwd'], 2) if row.get('cwd') else 'folder unknown',
+                           f"{short(row['tokens'])} tokens" if row.get('tokens') is not None else 'tokens unknown'))
+        items.append(dict(key='codex:' + str(row.get('identity') or row.get('started')),
+                          title=' · '.join(('Codex', one_line(model, 40) if model else 'model unknown', one_line(effort, 12) if effort else 'effort unknown')),
+                          lines=1, body=[body], fit_body=True, detail=[], send='', nosend=True, unrated=True))
+    return items
+
+
+def flight_section(agents, now, ui=None, codex=None):
+    """In flight: the session's agents depth-first, four by default and "and N more" after them, then Codex (its week and
+    its live runs). Open while any agent is pending, running or waiting, or a report came in the last 30 minutes; else one
+    folded row. None without agents and without a ~/.codex."""
     rows = (agents or {}).get('agents') or []
-    if not rows:
+    elsewhere = codex_items(codex, now)
+    if not rows and not elsewhere:
         return None
     folds = (ui or {}).get('folds') or ()
     tree = agents_lib.tree(rows)
@@ -3752,17 +3776,19 @@ def flight_section(agents, now, ui=None):
     is_open = bool(live or recent is not None)
     times = [row['last_at'] / 1000 for row in rows]
     left = (agents or {}).get('omitted_agents') or 0
-    if is_open:
+    if not rows:
+        right = ''
+    elif is_open:
         right = ' · '.join(x for x in (f'{live} running' if live else 'all finished', f'+{left} not shown' if left else '') if x)
     else:
         right = f'{len(rows)} finished'
     items = []
     unfolded = 'flight' in folds
-    if not is_open and not unfolded:
+    if rows and not is_open and not unfolded:
         ago_text = age_of(now - max(times))
         items.append(dict(key='fold:flight', quiet=True, lines=1, title=f"› {counted(len(rows), 'agent')} finished · {ago_text} ago",
                           detail=[], send=''))
-    else:
+    elif rows:
         if not is_open:
             items.append(dict(key='fold:flight', quiet=True, lines=1, title='⌄ ' + f"{counted(len(rows), 'agent')} finished", detail=[], send=''))
         more = 'flight-more' in folds or not is_open
@@ -3772,8 +3798,13 @@ def flight_section(agents, now, ui=None):
             hidden = len(tree) - FLIGHT_SHOWN
             items.append(dict(key='fold:flight-more', quiet=True, lines=1, detail=[], send='',
                               title=('⌄ fewer' if more else f'› and {hidden} more'), unsigned=True))
-    return dict(name='flight', title='In flight', right=right, items=items, empty='', count=live or len(rows), live=True,
-                active=is_open, at=max(times), brief=f"{live} running" if live else counted(len(rows), 'agent'))
+    items += elsewhere
+    running = (codex or {}).get('live') or 0
+    if codex is not None and not rows:
+        right = f'{running} live' if running else ''
+    return dict(name='flight', title='In flight', right=right, items=items, empty='', count=live + running or len(rows), live=True,
+                active=is_open or bool(running), at=max(times) if times else None,
+                brief=f"{live} running" if live else counted(len(rows), 'agent') or f'{running} live')
 
 
 # ---------------------------------------------------------------- the default view
@@ -3976,6 +4007,8 @@ def item_rows(item, name, width, is_open, at=ITEM, heart=None):
     title = wrap(title.replace('`', ''), room - (0 if flag or meta else spare),
                  item.get('open_lines', 6) if is_open else item.get('lines', 2))
     voice = ink('quiet') if item.get('quiet') else ink('you')  # lamp black: the page's own type
+    if item.get('tone') in ('amber', 'red'):  # a figure that nears its limit: ochre, then vermilion
+        voice = ink('dream' if item['tone'] == 'amber' else 'turn') + BOLD
     rows = [' ' * at + voice + line + OFF for line in title]
     rows += [' ' * at + voice + fit(line, room) + OFF for line in item.get('lede') or ()]  # whole rows, before a picture
     picture = item.get('picture')
@@ -6493,6 +6526,7 @@ class Pane:
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
             self.data['agents'] = fail_open(agents_of, agents_lib.empty(), self.session and self.session.id)
+            self.data['codex'] = fail_open(codex_lib.codex_snapshot, None, HOME, now)  # None: no ~/.codex, no section
             # each of these reads a file of someone else's: one that fails is empty, it never blanks the pane
             self.data['claude_fields'], self.data['claude_at'] = fail_open(
                 kept_status, ({}, None), self.session and self.session.id, now)
@@ -6542,7 +6576,7 @@ class Pane:
                           [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held, self.data.get('agents'),
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held, self.data.get('agents'), self.data.get('codex'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
                           value_pieces(self.data.get('value')),  # what it says: the dollars under it move each step
