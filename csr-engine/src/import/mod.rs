@@ -54,6 +54,11 @@ pub fn contamination_reason(text: &str) -> Option<&'static str> {
         Some("system_reminder")
     } else if crate::extraction::provenance::is_csr_emission(text) {
         Some("csr_emission")
+    } else if crate::extraction::provenance::strip_csr_forwards(text).is_some() {
+        // A forward anywhere, not only in the leading window is_csr_emission
+        // reads: one past byte 400 was cut by the scrub but never selected for
+        // it (astra #8).
+        Some("csr_forward")
     } else {
         None
     }
@@ -89,7 +94,11 @@ pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
         None => text,
     };
     let without_wrappers = CSR_SYSTEM_REMINDER_RE.replace_all(text, "");
-    let clean = without_wrappers
+    // Emission lines and spans go before paragraphs are judged: a recap or
+    // sentinel line inside the person's paragraph would otherwise take the
+    // whole paragraph with it (astra #5).
+    let lines = crate::extraction::provenance::strip_emission_lines(&without_wrappers, false);
+    let clean = lines
         .split("\n\n")
         .filter(|paragraph| contamination_reason(paragraph).is_none())
         .collect::<Vec<_>>()

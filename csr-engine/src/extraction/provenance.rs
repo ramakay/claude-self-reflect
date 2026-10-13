@@ -302,24 +302,42 @@ pub fn is_csr_emission(text: &str) -> bool {
 /// The attribution sentence the companion dreamer's "ask Claude" message carries.
 pub(crate) const DREAMER_ATTRIBUTION: &str = "CSR's dreamer asked this while you worked";
 
-/// The band's attribution paragraph, word for word. `askClaude` (plugins/csr-companion/hooks/dreamer.ts) writes the
-/// first; the recap fixtures in hooks/stop.rs (1d23d675) carry the second. A paragraph that only opens with the
-/// attribution's words is the person's: "... while you worked yesterday, but I wrote today's question myself."
-/// (Codex review r2, #7).
-const DREAMER_BAND_LINES: [&str; 2] = [
+/// The band's attribution paragraph, word for word. Forward grammar v2 (`.plans/release-10.1/forward-grammar.md`)
+/// marks its own with `quoted`: [`DREAMER_BAND_QUOTED`]. Legacy (v1) forms already sit in transcripts:
+/// `askClaude` (plugins/csr-companion/hooks/dreamer.ts) wrote the first, the recap fixtures in hooks/stop.rs
+/// (1d23d675) carry the second. A paragraph that only opens with the attribution's words is the person's: "...
+/// while you worked yesterday, but I wrote today's question myself." (Codex review r2, #7).
+const DREAMER_BAND_QUOTED: &str =
+    "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
+const DREAMER_BAND_LEGACY: [&str; 2] = [
     "CSR's dreamer asked this while you worked. Its reasoning:",
     "CSR's dreamer asked this while you worked. It is a question, not a task.",
 ];
 
-/// The pane's one-line send of a dream (plugins/csr-companion/bin/pane.py `dream_send`):
-/// `CSR's dreamer asked this while you worked: “<question>” Its reasoning: <title>. <reasons>`.
-/// `one_line` puts it on one line, so it runs to the end of its line. A question is at most 240 characters
-/// (dreamer.ts `parseDream`), so the 700-character cut never falls before "Its reasoning:".
-const DREAMER_PANE_OPEN: &str = "CSR's dreamer asked this while you worked: \u{201c}";
-const DREAMER_PANE_REASONING: &str = "\u{201d} Its reasoning:";
+fn is_band_attribution(line: &str) -> bool {
+    let line = line.trim();
+    line == DREAMER_BAND_QUOTED || DREAMER_BAND_LEGACY.contains(&line)
+}
 
-/// The companion's compaction card draft a click puts in the prompt (pane.py `compact_section`):
-/// `CSR's compaction card (<stage>): <title>. <rows>.` on one line, the stage its heading lowercased.
+/// What marks a v2 one-line forward right after its header: its body follows, wrapped in curly quotes. The
+/// emitter makes every ” inside a body a straight quote, so the first ” after the opening “ closes it.
+const QUOTED_OPEN: &str = ", quoted: \u{201c}";
+
+/// The pane's one-line send of a dream (plugins/csr-companion/bin/pane.py `dream_send`), at most 700 characters:
+/// - v2: `CSR's dreamer asked this while you worked, quoted: “<question>” Its reasoning: “<reasoning>”`, ending at
+///   the reasoning's closing ”.
+/// - v1: `CSR's dreamer asked this while you worked: “<question>” Its reasoning: <title>. <reasons>`. Never
+///   searched for a closing quote: it ends at `one_line`'s cut (`…` as its 700th character), else at the end of
+///   its line. A question is at most 240 characters (dreamer.ts `parseDream`), so a cut never falls before "Its
+///   reasoning:".
+const DREAMER_PANE_LEGACY_OPEN: &str = ": \u{201c}";
+const DREAMER_PANE_LEGACY_REASONING: &str = "\u{201d} Its reasoning:";
+const DREAMER_PANE_QUOTED_REASONING: &str = " Its reasoning: \u{201c}";
+const DREAMER_PANE_SEND_CHARS: usize = 700;
+
+/// The companion's compaction card draft a click puts in the prompt (pane.py `compact_section`), the stage its
+/// heading lowercased, at most 1,200 characters. v2: `CSR's compaction card (<stage>), quoted: “<body>”`. v1:
+/// `CSR's compaction card (<stage>): <title>. <rows>.`, ending at its cut or the end of its line.
 const COMPACTION_CARD_OPEN: &str = "CSR's compaction card (";
 const COMPACTION_CARD_STAGES: [&str; 4] = [
     "compacting soon",
@@ -327,23 +345,26 @@ const COMPACTION_CARD_STAGES: [&str; 4] = [
     "compaction skipped",
     "compacted by csr",
 ];
+const COMPACTION_CARD_SEND_CHARS: usize = 1200;
+
+/// The session story's draft (pane.py), at most 700 characters. v2: `CSR's story of this session, rev <n>, quoted:
+/// “<body>”`. v1: `CSR's story of this session, rev <n>: <body>`, ending at its cut or the end of its line.
+const STORY_OPEN: &str = "CSR's story of this session, rev ";
+const STORY_SEND_CHARS: usize = 700;
 
 /// True when the WHOLE of `text` is the companion dreamer's "ask Claude"
 /// message, in the exact grammar `askClaude` (plugins/csr-companion/hooks/
 /// dreamer.ts) writes: an optional one-line question, a blank line, the
-/// attribution paragraph ([`DREAMER_BAND_LINES`]), a blank line, then the
-/// dreamer's reasoning as a blockquote. Every word of it is the dreamer's, not
-/// the person's, so a caller must drop the message as a whole: paragraph
-/// scrubbing alone would remove only the attribution and keep the question and
-/// the reasoning as the person's own words. Prose that merely mentions the
-/// marker, or opens with its words, does not match.
+/// attribution paragraph (v2 or legacy), a blank line, then the dreamer's
+/// reasoning as a blockquote. Every word of it is the dreamer's, not the
+/// person's, so a caller must drop the message as a whole: paragraph scrubbing
+/// alone would remove only the attribution and keep the question and the
+/// reasoning as the person's own words. Prose that merely mentions the marker,
+/// or opens with its words, does not match.
 pub fn is_dreamer_prompt(text: &str) -> bool {
     let normalized = text.replace("\r\n", "\n");
     let paragraphs: Vec<&str> = normalized.trim().split("\n\n").collect();
-    let Some(at) = paragraphs
-        .iter()
-        .position(|p| DREAMER_BAND_LINES.contains(&p.trim()))
-    else {
+    let Some(at) = paragraphs.iter().position(|p| is_band_attribution(p)) else {
         return false;
     };
     let one_line = |p: &str| !p.trim().is_empty() && !p.trim().contains('\n');
@@ -361,25 +382,28 @@ pub fn is_dreamer_prompt(text: &str) -> bool {
 
 /// If `text` carries the companion dreamer's "ask Claude" message, the person's own words around it (empty when
 /// there are none); `None` when it carries none. See [`strip_csr_forwards`] for the grammar; this reads dreams
-/// only, never the compaction card.
+/// only, never the compaction card or the story.
 pub fn strip_dreamer_prompt(text: &str) -> Option<String> {
     scan_forwards(text, false).map(|found| found.own)
 }
 
 /// If `text` carries words the companion forwards into the prompt for the person, the person's own words around
-/// them (empty when there are none); `None` when it carries none. Every forward is cut, wherever it sits (Codex
-/// review r2, #8: only the first dream was), and each is read by its emitted grammar, never by a substring or a
-/// byte window:
-/// - the band's dream (dreamer.ts `askClaude`): the attribution paragraph exactly ([`DREAMER_BAND_LINES`]) with
-///   the question paragraph just above it (one line, ending on a question mark) and/or the blockquote paragraphs
-///   right after it. All of them go. The attribution's words alone are not enough (#7).
-/// - the pane's dream (pane.py `dream_send`): from [`DREAMER_PANE_OPEN`] to the end of its line, when
-///   [`DREAMER_PANE_REASONING`] follows. Words typed before it on the line stay.
-/// - the compaction card draft (pane.py `compact_section`): a line that opens with
-///   `CSR's compaction card (<stage>):` for a stage the card has (#6). The whole line goes.
+/// them (empty when there are none); `None` when it carries none. Forward grammar v2
+/// (`.plans/release-10.1/forward-grammar.md`). Every forward is cut, wherever it sits (Codex review r2, #8), as a
+/// bounded span read by its emitted grammar, never by a substring or a byte window; the person's words before and
+/// after a span, on its lines too, stay:
+/// - one-line forwards (the pane's dream, the compaction card, the session story): v2, marked `quoted` in its
+///   header, ends at the closing ” of its quoted body (for the dream, its reasoning's), searched only inside the
+///   send's character limit; v1 (the header followed directly by `:`) is never searched for a closing quote and
+///   ends at its known cut (`…` exactly at the limit: 700 for the dream and the story, 1,200 for the card), else at
+///   the end of its line (astra #4, #9). A card needs a stage the card has (#6).
+/// - the band's dream, read by line: the attribution line exactly, with the question above it (past a blank line)
+///   and/or the run of `>` lines under it (past a blank line); the first line without `>` is the person's (astra
+///   #10). v2's question is the `“…”` span that ends the line above, from its last `“`, so words before it on that
+///   line stay; v1's question line ends in a question mark and goes whole (it cannot be split, legacy only). The
+///   attribution's words alone are never enough (#7).
 ///
-/// One-line forwards may follow a band hotkey that landed in the box ("2CSR's dreamer…", 10-11) or a quote
-/// marker; neither is the person's. Every other paragraph and line is.
+/// A band hotkey digit or a `>` directly before a one-line forward goes with it.
 pub fn strip_csr_forwards(text: &str) -> Option<String> {
     scan_forwards(text, true).map(|found| found.own)
 }
@@ -392,104 +416,249 @@ struct Forwards {
     first: usize,
 }
 
-/// A line that ends in a one-line forward: where the forward starts.
-fn one_line_forward(line: &str, cards: bool) -> Option<usize> {
-    let pane = line
-        .match_indices(DREAMER_PANE_OPEN)
-        .find_map(|(at, open)| {
-            line[at + open.len()..]
-                .contains(DREAMER_PANE_REASONING)
-                .then_some(at)
-        });
-    if pane.is_some() || !cards {
-        return pane;
-    }
-    let rest =
-        line.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace() || c == '>');
-    let stage = rest.strip_prefix(COMPACTION_CARD_OPEN)?;
-    COMPACTION_CARD_STAGES
-        .iter()
-        .any(|known| {
-            stage
-                .strip_prefix(known)
-                .is_some_and(|after| after.starts_with("):"))
-        })
-        .then(|| line.len() - rest.len())
+/// Byte offset just past the `…` pane.py's `one_line(text, chars)` appends when it cut a send that starts at
+/// `start` (it keeps `chars - 1` characters), if it did.
+fn send_truncation_end(line: &str, start: usize, chars: usize) -> Option<usize> {
+    let (offset, c) = line[start..].char_indices().nth(chars - 1)?;
+    (c == '\u{2026}').then(|| start + offset + c.len_utf8())
 }
 
-/// Read `text` by paragraph and line for the forwards [`strip_csr_forwards`] names (the compaction card only when
-/// `cards`). `None` when there are none.
-fn scan_forwards(text: &str, cards: bool) -> Option<Forwards> {
-    if !text.contains(DREAMER_ATTRIBUTION) && !(cards && text.contains(COMPACTION_CARD_OPEN)) {
+/// Byte offset of the character `chars` past `start`, or the end of the line: where a send of at most `chars`
+/// characters must have ended.
+fn send_limit(line: &str, start: usize, chars: usize) -> usize {
+    line[start..]
+        .char_indices()
+        .nth(chars)
+        .map_or(line.len(), |(offset, _)| start + offset)
+}
+
+/// Just past the first ” at or after `from`, if one falls before `limit`.
+fn closing_quote(line: &str, from: usize, limit: usize) -> Option<usize> {
+    line[from..limit.max(from)]
+        .find('\u{201d}')
+        .map(|at| from + at + '\u{201d}'.len_utf8())
+}
+
+/// End of a v1 (legacy) one-line send that starts at `start`: its cut, else the end of its line.
+fn legacy_end(line: &str, start: usize, chars: usize) -> usize {
+    send_truncation_end(line, start, chars).unwrap_or(line.len())
+}
+
+/// A one-line forward whose header ends at `header` (the stage, or the story's number): its end, v2 or v1, or
+/// `None` when what follows is neither form.
+fn body_forward_end(line: &str, start: usize, header: usize, chars: usize) -> Option<usize> {
+    let rest = &line[header..];
+    if rest.starts_with(QUOTED_OPEN) {
+        let limit = send_limit(line, start, chars);
+        return Some(closing_quote(line, header + QUOTED_OPEN.len(), limit).unwrap_or(line.len()));
+    }
+    rest.starts_with(':')
+        .then(|| legacy_end(line, start, chars))
+}
+
+/// The pane's dream starting at `start` (where the attribution sentence is): its end, or `None`.
+fn pane_dream_end(line: &str, start: usize) -> Option<usize> {
+    let after = start + DREAMER_ATTRIBUTION.len();
+    let rest = &line[after..];
+    if rest.starts_with(QUOTED_OPEN) {
+        let limit = send_limit(line, start, DREAMER_PANE_SEND_CHARS);
+        let question = closing_quote(line, after + QUOTED_OPEN.len(), limit);
+        let reasoning = question
+            .filter(|&end| line[end..].starts_with(DREAMER_PANE_QUOTED_REASONING))
+            .and_then(|end| closing_quote(line, end + DREAMER_PANE_QUOTED_REASONING.len(), limit));
+        return Some(reasoning.unwrap_or(line.len()));
+    }
+    let question = rest.strip_prefix(DREAMER_PANE_LEGACY_OPEN)?;
+    question
+        .contains(DREAMER_PANE_LEGACY_REASONING)
+        .then(|| legacy_end(line, start, DREAMER_PANE_SEND_CHARS))
+}
+
+/// The first one-line forward in `line` at or after byte `from`: its `(start, end)`. The card and the story count
+/// only when `others`.
+fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize, usize)> {
+    let dream = line[from..]
+        .match_indices(DREAMER_ATTRIBUTION)
+        .find_map(|(at, _)| pane_dream_end(line, from + at).map(|end| (from + at, end)));
+    let card = || {
+        line[from..]
+            .match_indices(COMPACTION_CARD_OPEN)
+            .find_map(|(at, open)| {
+                let start = from + at;
+                let stage = start + open.len();
+                COMPACTION_CARD_STAGES.iter().find_map(|known| {
+                    line[stage..]
+                        .strip_prefix(known)
+                        .filter(|after| after.starts_with(')'))
+                        .and_then(|_| {
+                            let header = stage + known.len() + ")".len();
+                            body_forward_end(line, start, header, COMPACTION_CARD_SEND_CHARS)
+                        })
+                        .map(|end| (start, end))
+                })
+            })
+    };
+    let story = || {
+        line[from..]
+            .match_indices(STORY_OPEN)
+            .find_map(|(at, open)| {
+                let start = from + at;
+                let number = start + open.len();
+                let digits = line[number..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(line.len() - number);
+                (digits > 0)
+                    .then(|| body_forward_end(line, start, number + digits, STORY_SEND_CHARS))
+                    .flatten()
+                    .map(|end| (start, end))
+            })
+    };
+    [
+        dream,
+        others.then(card).flatten(),
+        others.then(story).flatten(),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|&(start, _)| start)
+}
+
+/// Cut every one-line forward out of `line`. `None` when it has none; otherwise the person's words left on it
+/// (pieces joined by a space) and the offset of its first forward. A piece of digits, spaces or `>` alone right
+/// before a forward is a band hotkey or quote marker, not the person's.
+fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> {
+    let mut pieces: Vec<&str> = Vec::new();
+    let mut cursor = 0;
+    let mut first = None;
+    while let Some((start, end)) = next_one_line_forward(line, cursor, others) {
+        first.get_or_insert(start);
+        let before = &line[cursor..start];
+        if before
+            .chars()
+            .any(|c| !(c.is_ascii_digit() || c.is_whitespace() || c == '>'))
+        {
+            pieces.push(before.trim());
+        }
+        cursor = end.max(start + 1);
+    }
+    let first = first?;
+    pieces.push(line[cursor..].trim());
+    let kept = pieces
+        .into_iter()
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some((kept, first))
+}
+
+/// Read `text` by line for the forwards [`strip_csr_forwards`] names (the card and the story only when `others`).
+/// `None` when there are none.
+fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
+    if !text.contains(DREAMER_ATTRIBUTION)
+        && !(others && (text.contains(COMPACTION_CARD_OPEN) || text.contains(STORY_OPEN)))
+    {
         return None;
     }
     let normalized = text.replace("\r\n", "\n");
     let body = normalized.trim();
-    let paragraphs: Vec<&str> = body.split("\n\n").collect();
-    let mut starts = Vec::with_capacity(paragraphs.len());
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut starts = Vec::with_capacity(lines.len());
     let mut offset = 0;
-    for paragraph in &paragraphs {
+    for line in &lines {
         starts.push(offset);
-        offset += paragraph.len() + 2;
+        offset += line.len() + 1;
     }
-    let asks = |p: &str| {
-        let line = p.trim();
-        !line.is_empty() && !line.contains('\n') && line.ends_with(['?', '\u{ff1f}', '\u{61f}'])
-    };
-    let quoted = |p: &str| {
-        !p.trim().is_empty()
-            && p.lines()
-                .all(|line| line.trim_start().starts_with('>') || line.trim().is_empty())
-    };
-    let mut cut = vec![false; paragraphs.len()];
+    let blank = |line: &str| line.trim().is_empty();
+    let asks = |line: &str| line.trim().ends_with(['?', '\u{ff1f}', '\u{61f}']);
+    let quoted = |line: &str| line.trim_start().starts_with('>');
+    // `None`: the line is cut whole; `Some(text)`: what is left of it.
+    let mut kept: Vec<Option<&str>> = lines.iter().map(|line| Some(*line)).collect();
     let mut first: Option<usize> = None;
-    for at in 0..paragraphs.len() {
-        if !DREAMER_BAND_LINES.contains(&paragraphs[at].trim()) {
+    let mark = |at: usize, first: &mut Option<usize>| {
+        *first = Some(first.map_or(at, |seen| seen.min(at)));
+    };
+    for at in 0..lines.len() {
+        if kept[at].is_none() || !is_band_attribution(lines[at]) {
             continue;
         }
-        let question = at > 0 && !cut[at - 1] && asks(paragraphs[at - 1]);
-        let mut end = at + 1;
-        while end < paragraphs.len() && quoted(paragraphs[end]) {
-            end += 1;
+        let v2 = lines[at].trim() == DREAMER_BAND_QUOTED;
+        // The question: the line above, past at least one blank line.
+        let mut above = at;
+        while above > 0 && blank(lines[above - 1]) {
+            above -= 1;
         }
-        if !question && end == at + 1 {
-            continue;
-        }
-        let from = if question { at - 1 } else { at };
-        cut[from..end].fill(true);
-        first = Some(first.map_or(starts[from], |seen| seen.min(starts[from])));
-    }
-    let mut own: Vec<String> = Vec::new();
-    for (index, paragraph) in paragraphs.iter().enumerate() {
-        if cut[index] {
-            continue;
-        }
-        let mut lines: Vec<&str> = Vec::new();
-        let mut line_start = starts[index];
-        for line in paragraph.split('\n') {
-            match one_line_forward(line, cards) {
-                Some(at) => {
-                    let start = line_start + at;
-                    first = Some(first.map_or(start, |seen| seen.min(start)));
-                    let before = &line[..at];
-                    if before
-                        .chars()
-                        .any(|c| !(c.is_ascii_digit() || c.is_whitespace() || c == '>'))
-                    {
-                        lines.push(before.trim_end());
-                    }
+        let question = (above < at && above > 0 && kept[above - 1] == Some(lines[above - 1]))
+            .then(|| above - 1)
+            .and_then(|line| {
+                let text = lines[line].trim_end();
+                if v2 {
+                    // The `“…”` span that ends the line, from its last “: what is before it stays.
+                    let open = text
+                        .ends_with('\u{201d}')
+                        .then(|| text.rfind('\u{201c}'))
+                        .flatten()?;
+                    Some((line, open))
+                } else {
+                    asks(text).then_some((line, 0))
                 }
-                None => lines.push(line),
-            }
-            line_start += line.len() + 1;
+            });
+        // The reasoning: the run of `>` lines below, past at least one blank line.
+        let mut below = at + 1;
+        while below < lines.len() && blank(lines[below]) {
+            below += 1;
         }
-        let kept = lines.join("\n");
-        if !kept.trim().is_empty() {
-            own.push(kept.trim().to_string());
+        let mut end = below;
+        if below > at + 1 {
+            while end < lines.len() && quoted(lines[end]) {
+                end += 1;
+            }
+        }
+        let reasoning = end > below;
+        if question.is_none() && !reasoning {
+            continue;
+        }
+        let to = if reasoning { end } else { at + 1 };
+        let from = match question {
+            Some((line, open)) => {
+                let before = lines[line][..open].trim_end();
+                kept[line] = (!before.is_empty()).then_some(before);
+                mark(starts[line] + open, &mut first);
+                line + 1
+            }
+            None => {
+                mark(starts[at], &mut first);
+                at
+            }
+        };
+        kept[from..to].fill(None);
+    }
+    let mut left: Vec<String> = Vec::with_capacity(lines.len());
+    for (index, line) in kept.iter().enumerate() {
+        let Some(line) = line else { continue };
+        match strip_one_line_forwards(line, others) {
+            Some((own, at)) => {
+                mark(starts[index] + at, &mut first);
+                if !own.is_empty() {
+                    left.push(own);
+                }
+            }
+            None => left.push((*line).to_string()),
         }
     }
-    first.map(|first| Forwards {
-        own: own.join("\n\n"),
+    let first = first?;
+    // Paragraphs of what is left: a cut line vanishes, a blank line still parts two paragraphs.
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for line in left.into_iter().chain([String::new()]) {
+        if !blank(&line) {
+            current.push(line);
+        } else if !current.is_empty() {
+            paragraphs.push(current.join("\n").trim().to_string());
+            current.clear();
+        }
+    }
+    Some(Forwards {
+        own: paragraphs.join("\n\n"),
         first,
     })
 }
@@ -604,8 +773,7 @@ static INJECTED_ITEM_LINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
 /// Byte offset just past the ellipsis `one_line` appends when it cut a send
 /// text that starts at `start`, if it did.
 fn pane_truncation_end(line: &str, start: usize) -> Option<usize> {
-    let (offset, c) = line[start..].char_indices().nth(PANE_SEND_WIDTH)?;
-    (c == '…').then(|| start + offset + c.len_utf8())
+    send_truncation_end(line, start, PANE_SEND_WIDTH + 1)
 }
 
 /// End (byte offset in `line`) of a pane send text that starts at `start`
@@ -711,6 +879,14 @@ pub fn strip_csr_emissions(text: &str) -> String {
         }
         None => text,
     };
+    strip_emission_lines(text, true)
+}
+
+/// The line pass of [`strip_csr_emissions`]: injected block lines, item lines, recap spans, pane send texts and
+/// sentinel lines go; every other line stays as typed. `reminder_tags` also drops bare `<system-reminder>` tag
+/// lines (the query side); the import scrub keeps them, since it removes CSR's own reminders whole and a reminder
+/// Claude Code wrote is not CSR's to edit. Returns `text` unchanged when nothing on it is CSR's.
+pub(crate) fn strip_emission_lines(text: &str, reminder_tags: bool) -> String {
     let mut kept: Vec<String> = Vec::new();
     let mut changed = false;
     let mut in_block = false;
@@ -721,11 +897,15 @@ pub fn strip_csr_emissions(text: &str) -> String {
             kept.push(raw.to_string());
             continue;
         }
-        if line == "<system-reminder>" || line == "</system-reminder>" {
+        if reminder_tags && (line == "<system-reminder>" || line == "</system-reminder>") {
             changed = true;
             continue;
         }
-        let line = line.strip_prefix("<system-reminder>").unwrap_or(line);
+        let line = if reminder_tags {
+            line.strip_prefix("<system-reminder>").unwrap_or(line)
+        } else {
+            line
+        };
         if INJECTED_BLOCK_OPENINGS.iter().any(|h| line.starts_with(h)) {
             in_block = true;
             changed = true;
@@ -893,6 +1073,285 @@ mod tests {
             extractable(&format!("Look at this: {pane}")).as_deref(),
             Some("Look at this:")
         );
+    }
+
+    /// Every reader of the person's words agrees on `input`: extraction, the
+    /// import scrub, and the query-side emission stripper.
+    fn own_words_agree(input: &str, mine: Option<&str>) {
+        assert_eq!(extractable(input).as_deref(), mine, "extractable: {input}");
+        assert_eq!(
+            crate::import::scrub_contaminated_text(input).as_deref(),
+            mine,
+            "scrub: {input}"
+        );
+        assert_eq!(
+            strip_csr_emissions(input),
+            mine.unwrap_or(""),
+            "strip_csr_emissions: {input}"
+        );
+    }
+
+    /// The band's forward as `askClaude` writes it.
+    const BAND: &str = "What if we reuse the palette?\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> **Reuse**\n> Shared colours.";
+
+    #[test]
+    fn astra_4_words_after_a_truncated_legacy_send_are_the_persons() {
+        // pane.py one_line(.., 700) cut the send at 699 characters and added an ellipsis: the send ended there.
+        let head =
+            "CSR's dreamer asked this while you worked: \u{201c}What if?\u{201d} Its reasoning: ";
+        let sent = format!("{head}{}\u{2026}", "x".repeat(699 - head.chars().count()));
+        assert_eq!(sent.chars().count(), 700);
+        own_words_agree(
+            &format!("{sent} Keep the deployment frozen."),
+            Some("Keep the deployment frozen."),
+        );
+        own_words_agree(
+            &format!("Look: {sent} Keep the deployment frozen."),
+            Some("Look: Keep the deployment frozen."),
+        );
+        // The card's send is cut at 1,199 characters the same way.
+        let card = "CSR's compaction card (compacted by csr): ";
+        let sent = format!("{card}{}\u{2026}", "y".repeat(1199 - card.chars().count()));
+        own_words_agree(
+            &format!("{sent} Keep the deployment frozen."),
+            Some("Keep the deployment frozen."),
+        );
+        // Untruncated legacy sends still run to the end of their line.
+        own_words_agree(
+            "CSR's compaction card (compacting): Summarizing 278k. ok\nKeep it.",
+            Some("Keep it."),
+        );
+    }
+
+    #[test]
+    fn astra_9_a_card_after_the_persons_words_on_its_line_is_cut() {
+        own_words_agree(
+            "Please check this: CSR's compaction card (compacting): Summarizing 278k.",
+            Some("Please check this:"),
+        );
+    }
+
+    #[test]
+    fn astra_10_the_band_forward_is_cut_by_line_inside_the_persons_paragraph() {
+        // A: the person's line directly above the question.
+        let above = format!("Keep the deployment frozen.\n{BAND}");
+        own_words_agree(&above, Some("Keep the deployment frozen."));
+        assert_eq!(
+            strip_dreamer_prompt(&above).as_deref(),
+            Some("Keep the deployment frozen.")
+        );
+        // B: the person's reply directly under the reasoning.
+        let below = format!("{BAND}\nNo, keep the current palette.");
+        own_words_agree(&below, Some("No, keep the current palette."));
+        assert_eq!(
+            strip_dreamer_prompt(&below).as_deref(),
+            Some("No, keep the current palette.")
+        );
+    }
+
+    /// The v2 emitters' normalization: an inner ” becomes a straight quote.
+    fn straight(text: &str) -> String {
+        text.replace('\u{201d}', "\"")
+    }
+
+    /// `<head>“<body>”` within `most` characters, the body cut with `…` (still closed) when it does not fit.
+    fn envelope(head: &str, body: &str, most: usize) -> String {
+        let body = straight(body);
+        let room = most - head.chars().count() - 2;
+        let body = if body.chars().count() > room {
+            format!(
+                "{}\u{2026}",
+                body.chars().take(room - 1).collect::<String>()
+            )
+        } else {
+            body
+        };
+        format!("{head}\u{201c}{body}\u{201d}")
+    }
+
+    fn v2_pane(question: &str, reasoning: &str) -> String {
+        let head = format!(
+            "CSR's dreamer asked this while you worked, quoted: \u{201c}{}\u{201d} Its reasoning: ",
+            straight(question)
+        );
+        envelope(&head, reasoning, 700)
+    }
+
+    fn v2_card(stage: &str, body: &str) -> String {
+        envelope(
+            &format!("CSR's compaction card ({stage}), quoted: "),
+            body,
+            1200,
+        )
+    }
+
+    fn v2_story(rev: usize, body: &str) -> String {
+        envelope(
+            &format!("CSR's story of this session, rev {rev}, quoted: "),
+            body,
+            700,
+        )
+    }
+
+    fn v2_band(question: &str, title: &str, reasoning: &str) -> String {
+        format!(
+            "\u{201c}{}\u{201d}\n\nCSR's dreamer asked this while you worked, quoted. Its reasoning:\n\n> **{title}**\n> {reasoning}",
+            straight(question)
+        )
+    }
+
+    #[test]
+    fn v2_forwards_round_trip_to_exactly_the_typed_reply() {
+        let long =
+            "Two surfaces already read the same inks, and the \u{201c}deck\u{201d} does too. "
+                .repeat(30);
+        let sends = [
+            v2_pane("What if we cache it?", "Two callers read the same file."),
+            v2_pane("What if we cache it?", &long),
+            v2_card(
+                "compacted by csr",
+                "Context: 274k \u{2192} 70k tokens. Learnt: \u{201c}Never\u{201d} skip validation.",
+            ),
+            v2_card("compacting", &long),
+            v2_story(3, "The session covered iOS fixes for Bold."),
+            v2_story(3, &long),
+        ];
+        for send in &sends {
+            own_words_agree(send, None);
+            own_words_agree(
+                &format!("Before I send this: {send} and after it, my reply."),
+                Some("Before I send this: and after it, my reply."),
+            );
+            own_words_agree(&format!("2{send}\nmy reply"), Some("my reply"));
+            own_words_agree(&format!("> {send} Keep it."), Some("Keep it."));
+        }
+        // The cut ones end on `…”` inside their limit.
+        assert_eq!(sends[1].chars().count(), 700);
+        assert!(sends[1].ends_with("\u{2026}\u{201d}"));
+        assert_eq!(sends[3].chars().count(), 1200);
+        // Two forwards on one line, the person's words between them.
+        own_words_agree(&format!("{} then {}", sends[0], sends[2]), Some("then"));
+
+        let band = v2_band("What if we reuse the palette?", "Reuse", "Shared colours.");
+        own_words_agree(&band, None);
+        own_words_agree(
+            &format!("Earlier note.\n\n{band}\n\nNo, keep the current palette."),
+            Some("Earlier note.\n\nNo, keep the current palette."),
+        );
+    }
+
+    #[test]
+    fn v2_band_keeps_the_persons_words_before_the_question_on_its_line() {
+        let band = v2_band("What if we reuse the palette?", "Reuse", "Shared colours.");
+        let typed = format!("Keep the deployment frozen. {band}\nNo, keep the current palette.");
+        own_words_agree(
+            &typed,
+            Some("Keep the deployment frozen.\nNo, keep the current palette."),
+        );
+        assert_eq!(
+            strip_dreamer_prompt(&typed).as_deref(),
+            Some("Keep the deployment frozen.\nNo, keep the current palette.")
+        );
+        // The whole v2 message is still the dreamer's prompt.
+        assert!(is_dreamer_prompt(&band));
+        assert!(is_csr_emission(&band));
+    }
+
+    #[test]
+    fn v1_legacy_forwards_never_look_for_a_closing_quote() {
+        // A legacy body that opens with a quoted phrase goes whole (astra r3 #6).
+        for legacy in [
+            "CSR's compaction card (compacted by csr): \u{201c}Queue\u{201d} was moved. Never skip validation.",
+            "CSR's dreamer asked this while you worked: \u{201c}What if?\u{201d} Its reasoning: \u{201c}Queue\u{201d} was moved. Never skip validation.",
+            "CSR's story of this session, rev 2: \u{201c}Queue\u{201d} was moved. Never skip validation.",
+        ] {
+            own_words_agree(legacy, None);
+            own_words_agree(&format!("{legacy}\nKeep it."), Some("Keep it."));
+            own_words_agree(&format!("Look: {legacy}"), Some("Look:"));
+        }
+        // A 700-character legacy send ends at its cut; the reply after it, curly quotes and all, is the person's
+        // (astra r3 #5: a quote search crossed the cut).
+        let head =
+            "CSR's dreamer asked this while you worked: \u{201c}What if?\u{201d} Its reasoning: ";
+        let sent = format!("{head}{}\u{2026}", "x".repeat(699 - head.chars().count()));
+        own_words_agree(
+            &format!("{sent} Keep \u{201c}my words\u{201d} exactly."),
+            Some("Keep \u{201c}my words\u{201d} exactly."),
+        );
+        // The legacy band, line by line; personal words before its question on that line cannot be told apart
+        // and go with it (a documented legacy-only limit).
+        own_words_agree(BAND, None);
+        own_words_agree(&format!("Keep it. {BAND}"), None);
+    }
+
+    #[test]
+    fn a_question_with_curly_quotes_of_its_own_is_cut_whole() {
+        let send = v2_pane(
+            "What if the \u{201c}Queue\u{201d} view moved?",
+            "It sits beside \u{201c}Lost and found\u{201d}.",
+        );
+        assert!(send.contains("\u{201c}Queue\" view"));
+        own_words_agree(&format!("{send} No."), Some("No."));
+    }
+
+    #[test]
+    fn cjk_forwards_are_cut_by_the_same_grammar() {
+        let card = v2_card(
+            "compacted by csr",
+            "\u{30b3}\u{30f3}\u{30c6}\u{30ad}\u{30b9}\u{30c8}\u{ff1a}274k \u{2192} 70k\u{3002}\u{691c}\u{8a3c}\u{3092}\u{98db}\u{3070}\u{3055}\u{306a}\u{3044}\u{3002}",
+        );
+        own_words_agree(&card, None);
+        own_words_agree(
+            &format!("\u{898b}\u{3066}\u{ff1a}{card}\u{8fd4}\u{4e8b}\u{3067}\u{3059}\u{3002}"),
+            Some("\u{898b}\u{3066}\u{ff1a} \u{8fd4}\u{4e8b}\u{3067}\u{3059}\u{3002}"),
+        );
+        let question = "\u{30ad}\u{30e3}\u{30c3}\u{30b7}\u{30e5}\u{3092}\u{5171}\u{6709}\u{3057}\u{305f}\u{3089}\u{3069}\u{3046}\u{3067}\u{3057}\u{3087}\u{3046}\u{304b}\u{ff1f}";
+        let dream = v2_pane(question, &"\u{4e8c}\u{3064}\u{306e}\u{753b}\u{9762}\u{304c}\u{540c}\u{3058}\u{8272}\u{3092}\u{8aad}\u{3080}\u{3002}".repeat(80));
+        assert_eq!(dream.chars().count(), 700);
+        own_words_agree(
+            &format!("{dream}\u{3044}\u{3044}\u{3048}\u{3002}"),
+            Some("\u{3044}\u{3044}\u{3048}\u{3002}"),
+        );
+        own_words_agree(
+            &v2_band(question, "\u{8272}", "\u{540c}\u{3058}\u{8272}\u{3002}"),
+            None,
+        );
+        // A legacy card cut at 1,200 CJK characters, then the person's reply.
+        let head = "CSR's compaction card (compacting): ";
+        let legacy = format!(
+            "{head}{}\u{2026}",
+            "\u{8981}".repeat(1199 - head.chars().count())
+        );
+        own_words_agree(
+            &format!("{legacy}\u{3044}\u{3044}\u{3048}"),
+            Some("\u{3044}\u{3044}\u{3048}"),
+        );
+    }
+
+    #[test]
+    fn astra_5_a_sentinel_line_goes_and_the_line_beside_it_stays() {
+        let input = "Keep the deployment frozen.\n[[CSR:RECAP]] generated recap";
+        assert_eq!(
+            crate::import::scrub_contaminated_text(input).as_deref(),
+            Some("Keep the deployment frozen.")
+        );
+        assert_eq!(strip_csr_emissions(input), "Keep the deployment frozen.");
+        // A recap line inside the person's paragraph, without its sentinel.
+        let recap = "Keep the deployment frozen.\nrecap [2h ago]: shipped the cap. Next: tag it.";
+        assert_eq!(
+            crate::import::scrub_contaminated_text(recap).as_deref(),
+            Some("Keep the deployment frozen.")
+        );
+    }
+
+    #[test]
+    fn astra_8_a_forward_past_the_header_window_marks_the_text_contaminated() {
+        let input = format!(
+            "{}\n\nCSR's compaction card (compacting): Summarizing 278k.",
+            "Keep this user requirement. ".repeat(16)
+        );
+        assert!(input.find("CSR's compaction card").unwrap() > HEADER_WINDOW);
+        assert!(crate::import::contamination_reason(&input).is_some());
     }
 
     #[test]
