@@ -796,6 +796,7 @@ mod tests {
                 receipt: "abc1234".into(),
             }],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         }
     }
