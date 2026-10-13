@@ -1698,13 +1698,19 @@ async function completions($: EngineInterface, fleet: Fleet): Promise<void> {
   }
 }
 
-async function armCompletions($: EngineInterface, fleet: Fleet): Promise<void> {
+// `wait` is how long the timer runs. A timer that fires with the main session mid-turn leaves the reports to its next step
+// (the turn's end arms the timer again). One that fires just after a step waits out the idle time it lacked, and one that
+// finds a look running tries once more after the wait: otherwise the reports would sit until the next prompt.
+async function armCompletions($: EngineInterface, fleet: Fleet, wait = COMPLETION_WAIT_MS, retried = false): Promise<void> {
   if (!fleet.dreamsOn || fleet.timer || !(await hasPending($).catch(() => false))) return
   fleet.timer = true
-  $.clock.after(COMPLETION_WAIT_MS, () => {
+  $.clock.after(wait, () => {
     fleet.timer = false
     void (async () => {
-      if (fleet.active || (await $.clock.now()) - fleet.stepAt < COMPLETION_WAIT_MS) return // mid-work: its next step takes them
+      if (fleet.active) return // mid-work: its next step takes them
+      const idle = (await $.clock.now()) - fleet.stepAt
+      if (idle < COMPLETION_WAIT_MS) return armCompletions($, fleet, COMPLETION_WAIT_MS - idle, retried)
+      if (fleet.dreaming) return retried ? undefined : armCompletions($, fleet, COMPLETION_WAIT_MS, true)
       await completions($, fleet)
     })().catch(() => undefined)
   })

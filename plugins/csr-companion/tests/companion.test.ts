@@ -312,8 +312,7 @@ async function settle(done: () => boolean | Promise<boolean>) {
   for (let i = 0; i < 200 && !(await done()); i++) await new Promise<void>(resolve => setTimeout(() => resolve(), 5))
 }
 
-// Steps of Claude's main loop (or a subagent's, with agentId).
-// n steps of a turn. The main session's continue the turn's index where the last call stopped (a step is one index of one
+// Steps of Claude's main loop (or a subagent's, with agentId): n steps of a turn. The main session's continue the turn's index where the last call stopped (a step is one index of one
 // turn, so a second call is new work); `from` replays the indexes from there. A subagent's start at 0, as they always did.
 let mainNext = 0
 async function steps($: Engine, n: number, agentId?: string, from?: number) {
@@ -2514,6 +2513,47 @@ test('a timer finding the main session at work leaves the report for its next st
   await steps($, 1)
   await settle(() => seen.forks.length >= 1)
   expect(seen.forks.length).toBe(1)
+})
+
+test('a timer that finds the main session just stepped tries again once the idle time it lacked is up', { options: { dreams: true } }, async ($, on) => {
+  let open!: () => void
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, replies: ['dream: none', DREAM_REPLY], forkGate: new Promise<void>(done => (open = done)),
+    brief: briefWith({ id: 'a1', answer: REPORT }) })
+  roomy(seen)
+  seen.store.set(`chapter:${SID}`, { ...freshChapter(SID, NOW), due: 1, gen: 1 }) // the main schedule's look is due at the next step
+  await reported($, 'a1', 'turn-1') // the 20 s timer starts now
+  await seen.clock!.advance(10_000)
+  void steps($, 1) // the main session steps at 10 s: its own look starts (the fork waits on the gate), so the report is not taken
+  await settle(() => seen.forks.length >= 1)
+  await seen.clock!.advance(10_000) // the timer fires at 20 s: the last step was 10 s ago, a look is running
+  open()
+  await settle(() => seen.kept.some(record => record.kind === 'look' || record.kind === 'dream'))
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('pending')
+  await seen.clock!.advance(10_000) // the idle time it still lacked is up: it looks without waiting for a prompt
+  await settle(() => seen.forks.length >= 2)
+  await settle(() => ledgerOf(seen)[keyOfRun('a1', 'turn-1')] === 'looked')
+  expect(seen.forks.length).toBe(2)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('looked')
+})
+
+test('a timer that finds a look already running tries once more after it', { options: { dreams: true } }, async ($, on) => {
+  let open!: () => void
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, replies: ['dream: none', DREAM_REPLY], forkGate: new Promise<void>(done => (open = done)),
+    brief: briefWith({ id: 'a1', answer: REPORT }) })
+  roomy(seen)
+  seen.store.set(`chapter:${SID}`, { ...freshChapter(SID, NOW), due: 1, gen: 1 }) // the main schedule's look is due at the next step
+  void steps($, 1) // the main session's own look starts, and its fork waits on the gate
+  await settle(() => seen.forks.length >= 1)
+  await reported($, 'a1', 'turn-1') // the report comes in while that look runs
+  await seen.clock!.advance(25_000) // its timer finds the look still running
+  expect(seen.forks.length).toBe(1)
+  open()
+  await settle(() => seen.kept.some(record => record.kind === 'look' || record.kind === 'dream'))
+  await seen.clock!.advance(25_000) // and tries again, once, after
+  await settle(() => seen.forks.length >= 2)
+  await settle(() => ledgerOf(seen)[keyOfRun('a1', 'turn-1')] === 'looked')
+  expect(seen.forks.length).toBe(2)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('looked')
 })
 
 test('completion_claim_survives_reload_and_fork_failure', { options: { dreams: true } }, async ($, on) => {
