@@ -2215,11 +2215,20 @@ async fn narrator_loop_inner(
 
         // Store prompt hash for re-enrichment detection (D-11)
         let hash = prompt_hash(&skill_prompt);
-        for (conv_id, _) in &unenriched {
-            if submitted_ids.contains(conv_id) {
-                let _ = storage.set_batch_id(conv_id, &batch_id, &hash);
+        // Keep the returned identity in this iteration until every row is
+        // durable. Returning on a write error would allow the next iteration
+        // to submit the same conversations again. Even shutdown waits here:
+        // dropping an accepted provider id would make it unrecoverable.
+        for conv_id in &submitted_ids {
+            while let Err(error) = storage.set_batch_id(conv_id, &batch_id, &hash) {
+                tracing::warn!(%batch_id, %conv_id, %error, "batch id persistence deferred; retrying before new submissions");
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         }
+        let submitted = unenriched
+            .into_iter()
+            .filter(|(id, _)| submitted_ids.contains(id))
+            .collect();
 
         spawn_batch_poll(
             storage.clone(),
@@ -2227,7 +2236,7 @@ async fn narrator_loop_inner(
             search.clone(),
             client.clone(),
             batch_id,
-            unenriched,
+            submitted,
             poll_interval_secs,
             shutdown.clone(),
         );
@@ -2339,10 +2348,22 @@ async fn poll_batch_results(
                 if crate::api::permanent_batch_error(&error) {
                     failure = Some(error.to_string());
                 } else {
-                    tracing::warn!(batch_id, %error, ?retry_delay, "batch provider error; retrying");
-                    delay = retry_delay;
-                    retry_delay = (retry_delay * 2).min(tokio::time::Duration::from_secs(300));
-                    continue;
+                    match storage.record_narrative_batch_transient_failure(batch_id) {
+                        Ok(true) => {
+                            failure =
+                                Some(format!("batch transient failure budget exhausted: {error}"))
+                        }
+                        outcome => {
+                            if let Err(write_error) = outcome {
+                                tracing::warn!(batch_id, %write_error, "batch transient budget write deferred");
+                            }
+                            tracing::warn!(batch_id, %error, ?retry_delay, "batch provider error; retrying");
+                            delay = retry_delay;
+                            retry_delay =
+                                (retry_delay * 2).min(tokio::time::Duration::from_secs(300));
+                            continue;
+                        }
+                    }
                 }
             } else {
                 retry_delay = base_delay;
@@ -4333,5 +4354,347 @@ mod r6_batch_recovery_tests {
             }
         }
         assert!(storage.recover_narrative_batches().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod r8_batch_regressions {
+    use super::*;
+    use crate::api::types::{BatchResponse, BatchResultItem};
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    fn fixture(
+        id: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Storage>,
+        Arc<EmbeddingEngine>,
+        Arc<RwLock<SearchEngine>>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Storage::open(&dir.path().join("db")).unwrap());
+        s.insert_chunk(
+            &crate::import::ConversationChunk {
+                id: format!("chunk-{id}"),
+                conversation_id: id.into(),
+                project_name: "fixture".into(),
+                timestamp: "2026-10-13T00:00:00Z".into(),
+                content: "Keep deployment frozen.".into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            },
+            &vec![0.1; 384],
+        )
+        .unwrap();
+        s.upsert_import_state_explicit(
+            dir.path().join(format!("{id}.jsonl")).to_str().unwrap(),
+            id,
+            1,
+            "fixture",
+        )
+        .unwrap();
+        s.set_batch_id(id, "batch-r7", "hash").unwrap();
+        (
+            dir,
+            s,
+            Arc::new(EmbeddingEngine::new().unwrap()),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+        )
+    }
+    fn state(s: &Storage, id: &str) -> (String, i64, String) {
+        s.with_connection(|c|Ok(c.query_row("SELECT status,batch_failures,COALESCE(batch_id,'') FROM enrichment_state WHERE conversation_id=? AND enrichment_type='ai_narrative'",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)).unwrap()
+    }
+    struct TransientProvider {
+        remaining: usize,
+        polls: AtomicUsize,
+        fetches: AtomicUsize,
+        at_results: bool,
+    }
+    #[async_trait::async_trait]
+    impl BatchClient for TransientProvider {
+        async fn create_batch(&self, _: Vec<BatchRequest>) -> Result<String> {
+            anyhow::bail!("unexpected submission")
+        }
+        async fn get_batch_status(&self, id: &str) -> Result<BatchResponse> {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst);
+            if !self.at_results && n < self.remaining {
+                anyhow::bail!("503 Service Unavailable")
+            }
+            Ok(BatchResponse {
+                id: id.into(),
+                processing_status: "ended".into(),
+            })
+        }
+        async fn get_batch_results(&self, _: &str) -> Result<Vec<BatchResultItem>> {
+            let n = self.fetches.fetch_add(1, Ordering::SeqCst);
+            if self.at_results && n < self.remaining {
+                anyhow::bail!("503 Service Unavailable")
+            }
+            Ok(vec![])
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn r8_transient_multiple_retries_then_reconciles_without_restart() {
+        for at_results in [false, true] {
+            let (_dir, s, e, i) = fixture(if at_results {
+                "multiple-results"
+            } else {
+                "multiple-polls"
+            });
+            let id = if at_results {
+                "multiple-results"
+            } else {
+                "multiple-polls"
+            };
+            let p = Arc::new(TransientProvider {
+                remaining: 4,
+                polls: AtomicUsize::new(0),
+                fetches: AtomicUsize::new(0),
+                at_results,
+            });
+            let c: Arc<dyn BatchClient> = p.clone();
+            poll_batch_results(
+                &s,
+                &e,
+                &i,
+                &c,
+                "batch-r7",
+                &[(id.into(), "source.jsonl".into())],
+                0,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+            println!(
+                "four transient failures at_results={at_results} polls={} fetches={} state={:?}",
+                p.polls.load(Ordering::SeqCst),
+                p.fetches.load(Ordering::SeqCst),
+                state(&s, id)
+            );
+            assert_eq!(state(&s, id), ("pending".into(), 1, "".into()));
+            assert!(p.polls.load(Ordering::SeqCst) >= 5);
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn r8_persistent_transient_errors_settle_with_durable_budget() {
+        for at_results in [false, true] {
+            let id = if at_results {
+                "persistent-results"
+            } else {
+                "persistent-polls"
+            };
+            let (dir, mut storage, embeddings, search) = fixture(id);
+            let provider = Arc::new(TransientProvider {
+                remaining: usize::MAX,
+                polls: AtomicUsize::new(0),
+                fetches: AtomicUsize::new(0),
+                at_results,
+            });
+            let client: Arc<dyn BatchClient> = provider.clone();
+            let conversations = vec![(id.into(), "source.jsonl".into())];
+            let shutdown = Arc::new(AtomicBool::new(false));
+            for attempt in 1..=3 {
+                let batch = format!("persistent-{attempt}");
+                storage.set_batch_id(id, &batch, "hash").unwrap();
+                let before = provider.polls.load(Ordering::SeqCst);
+                // Interrupt a poll after several errors, then reopen the DB.
+                assert!(tokio::time::timeout(
+                    Duration::from_secs(120),
+                    poll_batch_results(
+                        &storage,
+                        &embeddings,
+                        &search,
+                        &client,
+                        &batch,
+                        &conversations,
+                        0,
+                        &shutdown,
+                    )
+                )
+                .await
+                .is_err());
+                assert_eq!(
+                    state(&storage, id),
+                    ("processing".into(), attempt - 1, batch.clone())
+                );
+                drop(storage);
+                storage = Arc::new(Storage::open(&dir.path().join("db")).unwrap());
+                let recovered = storage
+                    .recover_narrative_batches()
+                    .unwrap()
+                    .remove(&batch)
+                    .unwrap();
+                // Repeating persistence of the SAME id also cannot reset it.
+                storage.set_batch_id(id, &batch, "hash").unwrap();
+                tokio::time::timeout(
+                    Duration::from_secs(86400),
+                    poll_batch_results(
+                        &storage,
+                        &embeddings,
+                        &search,
+                        &client,
+                        &batch,
+                        &recovered,
+                        0,
+                        &shutdown,
+                    ),
+                )
+                .await
+                .expect("transient failures must settle")
+                .unwrap();
+                assert_eq!(provider.polls.load(Ordering::SeqCst) - before, 20);
+                let status = if attempt == 3 { "failed" } else { "pending" };
+                assert_eq!(state(&storage, id), (status.into(), attempt, "".into()));
+                assert_eq!(
+                    storage
+                        .get_unenriched_conversations("ai_narrative", 10)
+                        .unwrap()
+                        .len(),
+                    usize::from(attempt < 3)
+                );
+            }
+            assert!(storage.recover_narrative_batches().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn r8_database_refusal_does_not_consume_retry_budget() {
+        let (_dir, s, e, i) = fixture("write-refused");
+        s.with_connection(|c|{c.execute_batch("CREATE TRIGGER reject_settlement BEFORE UPDATE ON enrichment_state WHEN NEW.status!='processing' BEGIN SELECT RAISE(FAIL,'temporary write refusal'); END;")?;Ok(())}).unwrap();
+        let c: Arc<dyn BatchClient> = Arc::new(crate::api::MockBatchClient {
+            batch_id: "batch-r7".into(),
+            results: vec![],
+        });
+        let ids = vec![("write-refused".into(), "source.jsonl".into())];
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut poll = Box::pin(poll_batch_results(
+            &s, &e, &i, &c, "batch-r7", &ids, 0, &stop,
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(1200), &mut poll)
+            .await
+            .is_err());
+        assert_eq!(
+            state(&s, "write-refused"),
+            ("processing".into(), 0, "batch-r7".into())
+        );
+        s.with_connection(|c| {
+            c.execute_batch("DROP TRIGGER reject_settlement")?;
+            Ok(())
+        })
+        .unwrap();
+        poll.await.unwrap();
+        println!(
+            "temporary settlement refusal eventually recovered {:?}",
+            state(&s, "write-refused")
+        );
+        assert_eq!(state(&s, "write-refused"), ("pending".into(), 1, "".into()));
+    }
+    struct CaptureProvider {
+        requests: std::sync::Mutex<Vec<Vec<String>>>,
+        reject: bool,
+    }
+    #[async_trait::async_trait]
+    impl BatchClient for CaptureProvider {
+        async fn create_batch(&self, requests: Vec<BatchRequest>) -> Result<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(requests.into_iter().map(|r| r.custom_id).collect());
+            if self.reject {
+                anyhow::bail!("stop after capture")
+            }
+            Ok("batch-submitted".into())
+        }
+        async fn get_batch_status(&self, id: &str) -> Result<BatchResponse> {
+            Ok(BatchResponse {
+                id: id.into(),
+                processing_status: "ended".into(),
+            })
+        }
+        async fn get_batch_results(&self, _: &str) -> Result<Vec<BatchResultItem>> {
+            Ok(vec![])
+        }
+    }
+    fn real_source(s: &Storage, dir: &std::path::Path, id: &str, name: &str) {
+        let file = dir.join(name);
+        let row = serde_json::json!({"type":"user","sessionId":id,"timestamp":"2026-10-13T00:00:00Z","message":{"role":"user","content":format!("Please review deployment. {}","x".repeat(51000))}});
+        std::fs::write(&file, format!("{row}\n")).unwrap();
+        s.upsert_import_state_explicit(file.to_str().unwrap(), id, 1, "fixture")
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn r8_duplicate_import_paths_submit_one_custom_id() {
+        let (dir, s, e, i) = fixture("dup-path");
+        s.reset_enrichment("dup-path", "ai_narrative").unwrap();
+        s.with_connection(|c| {
+            c.execute("DELETE FROM import_state", [])?;
+            Ok(())
+        })
+        .unwrap();
+        real_source(&s, dir.path(), "dup-path", "source1.jsonl");
+        real_source(&s, dir.path(), "dup-path", "source2.jsonl");
+        let p = Arc::new(CaptureProvider {
+            requests: Default::default(),
+            reject: true,
+        });
+        let c: Arc<dyn BatchClient> = p.clone();
+        let result = narrator_loop_inner(
+            &s,
+            &e,
+            &i,
+            &c,
+            100,
+            0,
+            0,
+            &mut tokio::time::Instant::now(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        let batches = p.requests.lock().unwrap();
+        println!(
+            "duplicate source paths result_error={} submitted={:?}",
+            result.is_err(),
+            *batches
+        );
+        assert_eq!(batches[0], vec!["dup-path"]);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn r8_batch_id_persistence_retries_before_reselection() {
+        let (dir, s, e, i) = fixture("submit-write-fail");
+        s.reset_enrichment("submit-write-fail", "ai_narrative")
+            .unwrap();
+        s.with_connection(|c|{c.execute("DELETE FROM import_state",[])?;c.execute_batch("CREATE TRIGGER reject_batch_id BEFORE INSERT ON enrichment_state WHEN NEW.status='processing' BEGIN SELECT RAISE(FAIL,'batch ID persistence refused'); END;")?;Ok(())}).unwrap();
+        real_source(&s, dir.path(), "submit-write-fail", "source.jsonl");
+        let p = Arc::new(CaptureProvider {
+            requests: Default::default(),
+            reject: false,
+        });
+        let c: Arc<dyn BatchClient> = p.clone();
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut last = tokio::time::Instant::now();
+        let mut submit = Box::pin(narrator_loop_inner(
+            &s, &e, &i, &c, 100, 0, 0, &mut last, &stop,
+        ));
+        assert!(tokio::time::timeout(Duration::from_secs(3), &mut submit)
+            .await
+            .is_err());
+        assert_eq!(p.requests.lock().unwrap().len(), 1);
+        s.with_connection(|c| {
+            c.execute_batch("DROP TRIGGER reject_batch_id")?;
+            Ok(())
+        })
+        .unwrap();
+        submit.await.unwrap();
+        assert_eq!(
+            s.recover_narrative_batches().unwrap()["batch-submitted"].len(),
+            1
+        );
+        narrator_loop_inner(&s, &e, &i, &c, 100, 0, 0, &mut last, &stop)
+            .await
+            .unwrap();
+        assert_eq!(p.requests.lock().unwrap().len(), 1);
     }
 }

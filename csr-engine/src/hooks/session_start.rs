@@ -883,7 +883,7 @@ fn recap_disabled() -> bool {
         .unwrap_or(false)
 }
 
-fn format_session_start_tier0_for_session(
+pub(crate) fn format_session_start_tier0_for_session(
     storage: &crate::storage::Storage,
     project: &str,
     ep: &Episode,
@@ -946,7 +946,25 @@ fn format_session_start_tier0_for_session(
             open_proposals,
             top_dream,
         };
-        let recap_ep = recap_episode(ep, source, target_session_id);
+        let mut refreshed = None;
+        if source == Some("compact") && target_session_id == Some(ep.session_id.as_str()) {
+            if let Some(snapshot) = storage
+                .get_meta(&format!("compact_anchor:{}", ep.session_id))
+                .ok()
+                .flatten()
+                .and_then(|json| {
+                    serde_json::from_str::<super::precompact::CompactSnapshot>(&json).ok()
+                })
+            {
+                let mut current = ep.clone();
+                current.compact_anchor = snapshot.anchor;
+                current.completions = snapshot.completions;
+                current.completions_untied = snapshot.completions_untied;
+                current.recap_evidence_version = Some(super::stop::RECAP_EVIDENCE_VERSION);
+                refreshed = Some(current);
+            }
+        }
+        let recap_ep = recap_episode(refreshed.as_ref().unwrap_or(ep), source, target_session_id);
         let composed = crate::hooks::recap::compose_recap_with_deliveries(&recap_ep, &feeds, age);
         if let (Some(composed), Some(id)) = (composed.as_ref(), dream_id) {
             let text = &composed.text;

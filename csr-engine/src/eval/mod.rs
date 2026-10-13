@@ -324,7 +324,7 @@ async fn test_performance(
 
 fn test_cache_status(index_dir: &Path) -> EvalResult {
     let t = Instant::now();
-    let manifest_path = index_dir.join("index_manifest.json");
+    let manifest_path = index_dir.join("manifest.json");
 
     if manifest_path.exists() {
         let metadata = std::fs::metadata(&manifest_path);

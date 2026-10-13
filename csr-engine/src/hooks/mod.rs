@@ -231,6 +231,15 @@ fn resolve_hook_cwd(input_cwd: Option<&str>) -> PathBuf {
 /// Shared helper: import the current transcript incrementally.
 /// Used by stop, precompact, prompt_submit, and session_end hooks.
 pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: &Path) {
+    import_current_transcript_observing(input, engine, cwd, None).await;
+}
+
+pub(crate) async fn import_current_transcript_observing(
+    input: &HookInput,
+    engine: &Engine,
+    cwd: &Path,
+    observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+) {
     let Some(ref transcript) = input.transcript_path else {
         return;
     };
@@ -256,7 +265,10 @@ pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: 
     let cwd_str = cwd.to_string_lossy();
     let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
 
-    match engine.import_file(&canonical, &project).await {
+    match engine
+        .import_file_observing(&canonical, &project, observer)
+        .await
+    {
         Ok(0) => {} // no new content, silent
         Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
         Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),

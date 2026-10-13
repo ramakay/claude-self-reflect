@@ -656,6 +656,22 @@ fn ends_turn(val: &serde_json::Value, msg_type: &str) -> bool {
             val.get("subtype").and_then(|v| v.as_str()),
             Some("turn_duration" | "stop_hook_summary")
         ),
+        "user" | "human" => val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .is_some_and(|content| {
+                // A tool result quoting this notice does not interrupt the
+                // main turn. Only a harness text row is a boundary.
+                if content.as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+                    })
+                }) {
+                    return false;
+                }
+                let text = extract_text_from_content(content);
+                text.trim_start().starts_with("[Request interrupted")
+            }),
         "assistant" => match val.get("message").and_then(|m| m.get("stop_reason")) {
             Some(reason) => reason.as_str() == Some("end_turn"),
             None => true,
@@ -687,7 +703,7 @@ pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episo
 /// `messages` are sanitized for search; `raw` are the same rows untouched
 /// (index-aligned), read only to recognise forwarded notes and dreamer
 /// what-ifs, which the sanitizer blanks as CSR's own words.
-fn extract_episode_from_messages(
+pub(crate) fn extract_episode_from_messages(
     messages: &[serde_json::Value],
     raw: &[serde_json::Value],
     session_id: &str,
@@ -2921,6 +2937,46 @@ mod tests {
     fn extract(lines: &[String]) -> Episode {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         extract_episode(&refs, "6ca2a4d5", "claude-self-reflect")
+    }
+
+    #[test]
+    fn r8_interruption_closes_main_turn_without_becoming_anchor() {
+        for notice in [
+            "[Request interrupted by user]",
+            "[Request interrupted by user for tool use]",
+            "[Request interrupted]",
+        ] {
+            assert!(ends_turn(
+                &serde_json::json!({"message":{"content":notice}}),
+                "user"
+            ));
+            assert!(!ends_turn(
+                &serde_json::json!({"message":{"content":[{"type":"tool_result","content":notice}]}}),
+                "user"
+            ));
+            for sidechain in [false, true] {
+                let rows = [
+                    serde_json::json!({"type":"user", "timestamp":"2026-10-13T00:00:00Z", "message":{"content":"Design the discussion side pane for users."}}),
+                    serde_json::json!({"type":"assistant", "message":{"content":[], "stop_reason":"tool_use"}}),
+                    serde_json::json!({"type":"user", "isSidechain":sidechain, "message":{"content":[{"type":"text","text":notice}]}}),
+                    serde_json::json!({"type":"user", "timestamp":"2026-10-13T01:00:00Z", "message":{"content":"Fix the database durability regression before release."}}),
+                    serde_json::json!({"type":"assistant", "message":{"content":"Done.","stop_reason":"end_turn"}}),
+                ];
+                let ep = extract(&rows.iter().map(ToString::to_string).collect::<Vec<_>>());
+                if sidechain {
+                    assert!(ep.compact_anchor.is_none());
+                } else {
+                    assert_eq!(
+                        ep.compact_anchor.as_ref().map(|a| a.request.as_str()),
+                        Some("Fix the database durability regression before release.")
+                    );
+                }
+                assert!(!ep
+                    .anchor_request
+                    .unwrap_or_default()
+                    .contains("interrupted"));
+            }
+        }
     }
 
     #[test]

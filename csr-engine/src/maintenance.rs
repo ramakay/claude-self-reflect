@@ -581,6 +581,12 @@ mod tests {
         assert!(try_shared(dir.path()).unwrap().is_none());
         drop(lock);
         assert!(path.exists());
+        // A child another test is spawning can hold an inherited copy of the
+        // lock descriptor until its exec; wait that window out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while active(dir.path()).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(active(dir.path()).is_none());
         assert!(try_shared(dir.path()).unwrap().is_some());
     }

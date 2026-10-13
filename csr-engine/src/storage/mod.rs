@@ -209,8 +209,11 @@ impl Storage {
         // 10.4M orphan rows, and one that `integrity-check` does not report. The
         // production write path is an upsert and no longer does that; this pragma is
         // the guard against the next writer that reaches for REPLACE.
+        // busy_timeout first: switching a rollback-journal database to WAL takes
+        // an exclusive lock, and without a busy wait a concurrent first open
+        // fails at once with "database is locked".
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
+            "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
         )?;
         conn.execute_batch(READ_PATH_PRAGMAS)?;
         migrations::run(&conn)?;
@@ -780,6 +783,26 @@ impl Storage {
             }
             tx.commit()?;
             Ok(batches)
+        })
+    }
+
+    /// Bound provider failures across daemon restarts. The budget belongs to a
+    /// submitted batch, so persisting the same id again must not reset it.
+    pub(crate) fn record_narrative_batch_transient_failure(&self, batch_id: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE enrichment_state SET batch_transient_failures = batch_transient_failures + 1
+                 WHERE enrichment_type = 'ai_narrative' AND status = 'processing' AND batch_id = ?1",
+                [batch_id],
+            )?;
+            let exhausted = tx.query_row(
+                "SELECT COALESCE(MAX(batch_transient_failures), 0) >= 20 FROM enrichment_state
+                 WHERE enrichment_type = 'ai_narrative' AND status = 'processing' AND batch_id = ?1",
+                [batch_id], |row| row.get(0),
+            )?;
+            tx.commit()?;
+            Ok(exhausted)
         })
     }
 

@@ -451,12 +451,22 @@ impl Engine {
     /// only new chunks are embedded (chunks beyond prev_count are new).
     /// Returns the number of NEW chunks imported (0 if nothing new).
     pub async fn import_file(&self, file_path: &Path, project_name: &str) -> Result<usize> {
+        self.import_file_observing(file_path, project_name, None)
+            .await
+    }
+
+    pub(crate) async fn import_file_observing(
+        &self,
+        file_path: &Path,
+        project_name: &str,
+        observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+    ) -> Result<usize> {
         let mut attribution =
             import::derive_conversation_attribution(&self.projects_dir, file_path);
         if attribution.parent_conversation_id.is_none() {
             attribution.project_name = project_name.into();
         }
-        self.import_file_with_attribution(file_path, &attribution)
+        self.import_file_with_observer(file_path, &attribution, observer)
             .await
     }
 
@@ -464,6 +474,16 @@ impl Engine {
         &self,
         file_path: &Path,
         attribution: &import::ConversationAttribution,
+    ) -> Result<usize> {
+        self.import_file_with_observer(file_path, attribution, None)
+            .await
+    }
+
+    async fn import_file_with_observer(
+        &self,
+        file_path: &Path,
+        attribution: &import::ConversationAttribution,
+        observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
     ) -> Result<usize> {
         let _operation = self.storage.operation_lock()?;
         let conversation_id = file_path
@@ -479,7 +499,7 @@ impl Engine {
             )?;
         }
         // Check if file is unchanged (mtime match = fully imported, nothing new)
-        if self.storage.is_file_imported(file_path)? {
+        if observer.is_none() && self.storage.is_file_imported(file_path)? {
             return Ok(0);
         }
 
@@ -492,10 +512,11 @@ impl Engine {
                     .parent_provenance_context(parent_id, message_key.as_deref())
             })
             .transpose()?;
-        let parsed = import::parse_jsonl_file_with_stats_and_parent(
+        let parsed = import::parse_jsonl_file_observing(
             file_path,
             &attribution.project_name,
             parent_context.as_ref(),
+            observer,
         )?;
         let import::ParsedConversation {
             chunks,

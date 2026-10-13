@@ -172,7 +172,7 @@ fn reparse_lacks_stored_text(
     old_chunks: &[ConversationChunk],
     new_chunks: &[ConversationChunk],
     continues: &[bool],
-    source_cuts: &HashMap<String, String>,
+    source_cuts: &HashMap<String, SourceCut>,
 ) -> bool {
     let squash = |text: &str| {
         text.chars()
@@ -435,13 +435,18 @@ fn cut_forwards_across_chunks(
     (out, ambiguous)
 }
 
+struct SourceCut {
+    text: String,
+    continues_after: bool,
+}
+
 /// Source adapters can prove cuts even when historical chunks lack spans.
 fn source_forward_cuts(
     path: &Path,
     conversation_id: &str,
     chunks: &[ConversationChunk],
     sources: &HashMap<String, String>,
-) -> HashMap<String, String> {
+) -> HashMap<String, SourceCut> {
     let codex = conversation_id.starts_with("codex:")
         || sources.values().any(|source| source == "codex_rollout");
     let plan =
@@ -471,15 +476,30 @@ fn source_forward_cuts(
         return chunks
             .iter()
             .zip(own)
-            .map(|(chunk, own)| (chunk.id.clone(), own))
+            .enumerate()
+            .map(|(i, (chunk, own))| {
+                (
+                    chunk.id.clone(),
+                    SourceCut {
+                        text: own,
+                        continues_after: i + 1 < chunks.len(),
+                    },
+                )
+            })
             .collect();
     }
     chunks
         .iter()
         .filter_map(|chunk| {
-            index
-                .without_forwards(&chunk.content)
-                .map(|own| (chunk.id.clone(), own))
+            index.without_forwards(&chunk.content).map(|own| {
+                (
+                    chunk.id.clone(),
+                    SourceCut {
+                        text: own,
+                        continues_after: false,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -487,12 +507,12 @@ fn source_forward_cuts(
 fn cuts_with_source(
     chunks: &[ConversationChunk],
     continues: &[bool],
-    source_cuts: &HashMap<String, String>,
+    source_cuts: &HashMap<String, SourceCut>,
 ) -> (Vec<String>, Vec<bool>) {
     let (mut own, mut ambiguous) = cut_forwards_across_chunks(chunks, continues);
     for (index, chunk) in chunks.iter().enumerate() {
         if let Some(proven) = source_cuts.get(&chunk.id) {
-            own[index] = proven.clone();
+            own[index] = proven.text.clone();
             ambiguous[index] = false;
         }
     }
@@ -502,7 +522,7 @@ fn cuts_with_source(
 fn in_place(
     old_chunks: &[ConversationChunk],
     continues: &[bool],
-    source_cuts: &HashMap<String, String>,
+    source_cuts: &HashMap<String, SourceCut>,
     reason: String,
 ) -> ScrubPlanKind {
     let (carried, ambiguous) = cuts_with_source(old_chunks, continues, source_cuts);
@@ -516,7 +536,12 @@ fn in_place(
             // Preserve whitespace at proven slice boundaries, including the
             // separator carried by the chunk containing the next kept text.
             // Source-mapped cuts prove their joins even without stored spans.
-            if continues.get(index + 1) == Some(&true) && carried.ends_with(char::is_whitespace) {
+            if (continues.get(index + 1) == Some(&true)
+                || source_cuts
+                    .get(&chunk.id)
+                    .is_some_and(|cut| cut.continues_after))
+                && carried.ends_with(char::is_whitespace)
+            {
                 content.push_str(&carried[carried.trim_end().len()..]);
             }
             if (continues[index] || source_cuts.contains_key(&chunk.id))
@@ -1497,6 +1522,208 @@ mod tests {
                     "case {case}, source {source}"
                 );
                 assert_eq!(persisted, "The code is 4 2.");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn r8_persisted_forward_variants_preserve_source_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            Arc::new(RwLock::new(SearchEngine::new(512))),
+            temp.path().to_path_buf(),
+        );
+        let forwards = [
+            "CSR's compaction card (compacting), quoted: “One.”",
+            "CSR's story of this session, rev 1, quoted: “One.”",
+            "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “One.”",
+        ];
+        let mut seeded = Vec::new();
+        for (fi, f) in forwards.iter().enumerate() {
+            let g = forwards[(fi + 1) % 3];
+            let cases = [
+                (
+                    format!("I vote {f} 2{g} Keep the deployment frozen."),
+                    "I vote 2 Keep the deployment frozen.",
+                ),
+                (
+                    format!("I vote {f}{g} 2{f} Keep the deployment frozen."),
+                    "I vote 2 Keep the deployment frozen.",
+                ),
+                (
+                    format!("I vote {f} > 2{g} 3{f} Keep the deployment frozen."),
+                    "I vote > 2 3 Keep the deployment frozen.",
+                ),
+                (format!("The code is 4 {f}2."), "The code is 4 2."),
+                (format!("The code is 4 {f} {g}2."), "The code is 4 2."),
+                (format!("The code is 4 {f}\t\t2."), "The code is 4 2."),
+            ];
+            for (ci, (raw, expected)) in cases.iter().enumerate() {
+                assert_eq!(
+                    crate::extraction::provenance::extractable(raw).as_deref(),
+                    Some(*expected)
+                );
+                assert_eq!(
+                    super::scrub_contaminated_text(raw).as_deref(),
+                    Some(*expected)
+                );
+                let mut positions = vec![
+                    0,
+                    raw.len(),
+                    1,
+                    raw.find("CSR").unwrap(),
+                    raw.find('”').unwrap() + 3,
+                    raw.len() - 2,
+                ];
+                positions.extend(raw.match_indices("2").map(|(at, _)| at));
+                positions.sort();
+                positions.dedup();
+                let mut splits: Vec<Vec<usize>> = positions
+                    .iter()
+                    .copied()
+                    .filter(|&p| p > 0 && p < raw.len())
+                    .map(|p| vec![0, p, raw.len()])
+                    .collect();
+                splits.push(positions.clone());
+                for (si, cuts) in splits.iter().enumerate() {
+                    for source in [false, true] {
+                        let conv = format!("codex:r8-prefix-{fi}-{ci}-{si}-{source}");
+                        let event = format!("{conv}-message");
+                        let mut chunkids = Vec::new();
+                        let mut start_char = 0_i64;
+                        if !source {
+                            storage
+                                .with_connection(|conn| {
+                                    crate::storage::queries::insert_provenance_event(
+                                        conn,
+                                        &crate::provenance::ProvenanceEvent {
+                                            event_id: event.clone(),
+                                            conversation_id: conv.clone(),
+                                            message_key: "m0".into(),
+                                            seq: 0,
+                                            channel: "user_message".into(),
+                                            trust_tier: crate::provenance::TrustTier::UserHistory,
+                                            parent_event_id: None,
+                                            receipt_kind: "jsonl".into(),
+                                            receipt_ref: None,
+                                            observed_at: "2026-09-01T00:00:00Z".into(),
+                                        },
+                                    )
+                                })
+                                .unwrap();
+                        }
+                        for (n, pair) in cuts.windows(2).enumerate() {
+                            let chunk = chunk_at(&conv, n, &raw[pair[0]..pair[1]]);
+                            storage
+                                .insert_chunk_with_source(&chunk, &vec![0.1; 384], "conversation")
+                                .unwrap();
+                            if !source {
+                                let end_char = start_char + chunk.content.chars().count() as i64;
+                                storage.with_connection(|conn|{conn.execute("INSERT INTO chunk_spans (chunk_id,event_id,start_char,end_char,content_hash) VALUES (?1,?2,?3,?4,?5)",rusqlite::params![chunk.id,event,start_char,end_char,crate::provenance::content_hash(&chunk.content)])?;Ok(())}).unwrap();
+                                start_char = end_char;
+                            }
+                            chunkids.push(chunk.id);
+                        }
+                        if source {
+                            let path = temp.path().join(format!("{conv}.jsonl"));
+                            std::fs::write(&path,serde_json::json!({"timestamp":"2026-09-01T00:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":raw}]}}).to_string()).unwrap();
+                            storage
+                                .upsert_import_state_explicit(
+                                    path.to_str().unwrap(),
+                                    &conv,
+                                    chunkids.len(),
+                                    "fixture",
+                                )
+                                .unwrap();
+                        }
+                        seeded.push((conv, chunkids, expected.to_string()));
+                    }
+                }
+            }
+        }
+        let report = super::run_scrub(&engine, false, None, false, true)
+            .await
+            .unwrap();
+        println!(
+            "R8 prefix {} production persisted variants; ambiguity={}",
+            seeded.len(),
+            report.unresolved_ambiguous_source
+        );
+        let mut failed = 0;
+        for (conv, ids, expected) in &seeded {
+            let actual = ids
+                .iter()
+                .filter_map(|id| storage.get_chunk_content(id).unwrap())
+                .collect::<String>();
+            if actual != *expected {
+                failed += 1;
+                println!("MISMATCH {conv}: expected={expected:?} actual={actual:?}");
+            }
+        }
+        assert_eq!(failed, 0);
+        assert_eq!(report.unresolved_ambiguous_source, 0);
+    }
+
+    #[tokio::test]
+    async fn r8_source_backed_boundary_whitespace_survives_persisted_scrub() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let forwards = [
+            "CSR's compaction card (compacting), quoted: “One.”",
+            "CSR's story of this session, rev 1, quoted: “One.”",
+        ];
+        for (case, (first, second)) in [(0, 0), (0, 1), (1, 0)].into_iter().enumerate() {
+            for space in [" ", "  "] {
+                let raw = format!(
+                    "The code is {}4{space}2{} Keep the deployment frozen.",
+                    forwards[first], forwards[second]
+                );
+                let split = raw.find(&format!("2{}", forwards[second])).unwrap();
+                let conversation = format!("codex:r8-{case}-{}", space.len());
+                let ids = seed_message_chunks(
+                    &storage,
+                    &embeddings,
+                    &conversation,
+                    vec![
+                        chunk_at(&conversation, 0, &raw[..split]),
+                        chunk_at(&conversation, 1, &raw[split..]),
+                    ],
+                    false,
+                );
+                let path = temp.path().join(format!("{case}-{}.jsonl", space.len()));
+                std::fs::write(&path, serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":raw}]}}).to_string()).unwrap();
+                storage
+                    .upsert_import_state_explicit(
+                        path.to_str().unwrap(),
+                        &conversation,
+                        2,
+                        "fixture",
+                    )
+                    .unwrap();
+                let report = super::run_scrub(&engine, false, Some(&conversation), false, true)
+                    .await
+                    .unwrap();
+                assert_eq!(report.unresolved_ambiguous_source, 0);
+                let persisted = ids
+                    .iter()
+                    .filter_map(|id| storage.get_chunk_content(id).unwrap())
+                    .collect::<String>();
+                assert_eq!(
+                    persisted,
+                    crate::extraction::provenance::extractable(&raw).unwrap()
+                );
+                assert!(persisted.contains(&format!("4{space}2")), "{persisted}");
             }
         }
     }

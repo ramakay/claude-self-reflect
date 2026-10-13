@@ -600,6 +600,16 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
     project_name: &str,
     parent: Option<&ParentContext>,
 ) -> Result<ParsedConversation> {
+    parse_jsonl_file_observing(path, project_name, parent, None)
+}
+
+/// Let a hook reuse the importer's parsed rows without another transcript pass.
+pub(crate) fn parse_jsonl_file_observing(
+    path: &Path,
+    project_name: &str,
+    parent: Option<&ParentContext>,
+    mut observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+) -> Result<ParsedConversation> {
     let conversation_id = path
         .file_stem()
         .unwrap_or_default()
@@ -645,6 +655,10 @@ pub(crate) fn parse_jsonl_file_with_stats_and_parent(
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        if let Some(observe) = observer.as_mut() {
+            observe(&parsed);
+        }
 
         // The harness stamps `"entrypoint"` on most record types (user,
         // assistant, system, attachment, ...), not only the ones this loop

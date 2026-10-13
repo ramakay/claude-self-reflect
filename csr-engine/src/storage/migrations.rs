@@ -380,7 +380,12 @@ fn ensure_witness_verdicts_v2_floor(conn: &Connection) -> Result<()> {
 /// read and NO write (see `ensure_witness_verdicts_v2_floor`).
 fn ensure_witness_verdicts_receipt_committed_at(conn: &Connection) -> Result<()> {
     if !has_column(conn, "witness_verdicts", "receipt_committed_at")? {
-        conn.execute_batch("ALTER TABLE witness_verdicts ADD COLUMN receipt_committed_at TEXT;")?;
+        add_column(
+            conn,
+            "witness_verdicts",
+            "receipt_committed_at",
+            "ALTER TABLE witness_verdicts ADD COLUMN receipt_committed_at TEXT;",
+        )?;
     }
     Ok(())
 }
@@ -469,9 +474,17 @@ pub fn run(conn: &Connection) -> Result<()> {
     )?;
 
     if !has_column(conn, "enrichment_state", "batch_failures")? {
-        conn.execute_batch(
+        add_column(
+            conn,
+            "enrichment_state",
+            "batch_failures",
             "ALTER TABLE enrichment_state ADD COLUMN batch_failures INTEGER NOT NULL DEFAULT 0;",
         )?;
+    }
+
+    if !has_column(conn, "enrichment_state", "batch_transient_failures")? {
+        add_column(conn, "enrichment_state", "batch_transient_failures",
+            "ALTER TABLE enrichment_state ADD COLUMN batch_transient_failures INTEGER NOT NULL DEFAULT 0")?;
     }
 
     // TAD: retrieval events — tracks which memories were surfaced and session outcomes
@@ -657,9 +670,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT src_file FROM code_edges LIMIT 0")
             .is_ok();
         if !has_src_file {
-            let _ = conn.execute_batch(
+            add_column(
+                conn,
+                "code_edges",
+                "src_file",
                 "ALTER TABLE code_edges ADD COLUMN src_file TEXT NOT NULL DEFAULT '';",
-            );
+            )?;
         }
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_code_edges_file ON code_edges(src_file);",
@@ -675,22 +691,34 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT callee_kind FROM code_edges LIMIT 0")
             .is_ok();
         if !has_callee_kind {
-            let _ = conn
-                .execute_batch("ALTER TABLE code_edges ADD COLUMN callee_kind TEXT DEFAULT '';");
+            add_column(
+                conn,
+                "code_edges",
+                "callee_kind",
+                "ALTER TABLE code_edges ADD COLUMN callee_kind TEXT DEFAULT '';",
+            )?;
         }
         let has_boundary: bool = conn
             .prepare("SELECT boundary FROM code_edges LIMIT 0")
             .is_ok();
         if !has_boundary {
-            let _ =
-                conn.execute_batch("ALTER TABLE code_edges ADD COLUMN boundary TEXT DEFAULT '';");
+            add_column(
+                conn,
+                "code_edges",
+                "boundary",
+                "ALTER TABLE code_edges ADD COLUMN boundary TEXT DEFAULT '';",
+            )?;
         }
         let has_evidence: bool = conn
             .prepare("SELECT evidence FROM code_edges LIMIT 0")
             .is_ok();
         if !has_evidence {
-            let _ =
-                conn.execute_batch("ALTER TABLE code_edges ADD COLUMN evidence TEXT DEFAULT '';");
+            add_column(
+                conn,
+                "code_edges",
+                "evidence",
+                "ALTER TABLE code_edges ADD COLUMN evidence TEXT DEFAULT '';",
+            )?;
         }
     }
 
@@ -713,9 +741,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT src_content_hash FROM code_edges LIMIT 0")
             .is_ok();
         if !has_src_content_hash {
-            let _ = conn.execute_batch(
+            add_column(
+                conn,
+                "code_edges",
+                "src_content_hash",
                 "ALTER TABLE code_edges ADD COLUMN src_content_hash TEXT DEFAULT '';",
-            );
+            )?;
         }
     }
 
@@ -749,13 +780,23 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT repo_root FROM code_nodes LIMIT 0")
             .is_ok();
         if !has_repo_root_nodes {
-            let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN repo_root TEXT;");
+            add_column(
+                conn,
+                "code_nodes",
+                "repo_root",
+                "ALTER TABLE code_nodes ADD COLUMN repo_root TEXT;",
+            )?;
         }
         let has_last_chunk_id: bool = conn
             .prepare("SELECT last_chunk_id FROM code_nodes LIMIT 0")
             .is_ok();
         if !has_last_chunk_id {
-            let _ = conn.execute_batch("ALTER TABLE code_nodes ADD COLUMN last_chunk_id TEXT;");
+            add_column(
+                conn,
+                "code_nodes",
+                "last_chunk_id",
+                "ALTER TABLE code_nodes ADD COLUMN last_chunk_id TEXT;",
+            )?;
         }
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_code_nodes_repo_root ON code_nodes(repo_root);",
@@ -765,7 +806,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT repo_root FROM code_evolution LIMIT 0")
             .is_ok();
         if !has_repo_root_evolution {
-            let _ = conn.execute_batch("ALTER TABLE code_evolution ADD COLUMN repo_root TEXT;");
+            add_column(
+                conn,
+                "code_evolution",
+                "repo_root",
+                "ALTER TABLE code_evolution ADD COLUMN repo_root TEXT;",
+            )?;
         }
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_code_evolution_repo_root ON code_evolution(repo_root);",
@@ -842,9 +888,7 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT ast_status FROM code_graph_file_state LIMIT 0")
             .is_ok();
         if !has_ast_status {
-            let _ = conn.execute_batch(
-                "ALTER TABLE code_graph_file_state ADD COLUMN ast_status TEXT NOT NULL DEFAULT 'supported';",
-            );
+            add_column(conn, "code_graph_file_state", "ast_status", "ALTER TABLE code_graph_file_state ADD COLUMN ast_status TEXT NOT NULL DEFAULT 'supported';")?;
         }
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_code_graph_file_state_ast_status ON code_graph_file_state(ast_status);",
@@ -857,9 +901,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT project_name FROM code_evolution LIMIT 0")
             .is_ok();
         if !has_project_col {
-            let _ = conn.execute_batch(
+            add_column(
+                conn,
+                "code_evolution",
+                "project_name",
                 "ALTER TABLE code_evolution ADD COLUMN project_name TEXT DEFAULT '';",
-            );
+            )?;
         }
         // Always try to create the index (safe with IF NOT EXISTS)
         let _ = conn.execute_batch(
@@ -872,10 +919,13 @@ pub fn run(conn: &Connection) -> Result<()> {
         .prepare("SELECT conversation_id FROM import_state LIMIT 0")
         .is_ok();
     if !has_conv_col {
-        let _ = conn.execute_batch(
-            "ALTER TABLE import_state ADD COLUMN conversation_id TEXT;
-             CREATE INDEX IF NOT EXISTS idx_import_conversation_id ON import_state(conversation_id);",
-        );
+        add_column(
+            conn,
+            "import_state",
+            "conversation_id",
+            "ALTER TABLE import_state ADD COLUMN conversation_id TEXT",
+        )?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_import_conversation_id ON import_state(conversation_id);")?;
     }
 
     // Per-file cumulative suppression totals make the global counters idempotent
@@ -886,7 +936,10 @@ pub fn run(conn: &Connection) -> Result<()> {
         .prepare("SELECT csr_tool_blocks_suppressed FROM import_state LIMIT 0")
         .is_ok();
     if !has_tool_suppression_col {
-        conn.execute_batch(
+        add_column(
+            conn,
+            "import_state",
+            "csr_tool_blocks_suppressed",
             "ALTER TABLE import_state ADD COLUMN csr_tool_blocks_suppressed INTEGER;",
         )?;
     }
@@ -894,7 +947,10 @@ pub fn run(conn: &Connection) -> Result<()> {
         .prepare("SELECT csr_hook_wrappers_scrubbed FROM import_state LIMIT 0")
         .is_ok();
     if !has_wrapper_suppression_col {
-        conn.execute_batch(
+        add_column(
+            conn,
+            "import_state",
+            "csr_hook_wrappers_scrubbed",
             "ALTER TABLE import_state ADD COLUMN csr_hook_wrappers_scrubbed INTEGER;",
         )?;
     }
@@ -902,7 +958,12 @@ pub fn run(conn: &Connection) -> Result<()> {
     // Migration: add summary column to chunks table if missing (for timeline display)
     let has_summary_col: bool = conn.prepare("SELECT summary FROM chunks LIMIT 0").is_ok();
     if !has_summary_col {
-        let _ = conn.execute_batch("ALTER TABLE chunks ADD COLUMN summary TEXT;");
+        add_column(
+            conn,
+            "chunks",
+            "summary",
+            "ALTER TABLE chunks ADD COLUMN summary TEXT;",
+        )?;
     }
 
     // Migration: add seq + is_sidechain columns to chunks table (Saga Phase 1 WS1).
@@ -910,15 +971,23 @@ pub fn run(conn: &Connection) -> Result<()> {
     // (never sidechain) until backfilled. Both additive, no table rebuild.
     let has_seq_col: bool = conn.prepare("SELECT seq FROM chunks LIMIT 0").is_ok();
     if !has_seq_col {
-        let _ = conn.execute_batch("ALTER TABLE chunks ADD COLUMN seq INTEGER;");
+        add_column(
+            conn,
+            "chunks",
+            "seq",
+            "ALTER TABLE chunks ADD COLUMN seq INTEGER;",
+        )?;
     }
     let has_sidechain_col: bool = conn
         .prepare("SELECT is_sidechain FROM chunks LIMIT 0")
         .is_ok();
     if !has_sidechain_col {
-        let _ = conn.execute_batch(
+        add_column(
+            conn,
+            "chunks",
+            "is_sidechain",
             "ALTER TABLE chunks ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0;",
-        );
+        )?;
     }
 
     // Migration: chunk source dimension (v9.4 multi-source corpus). Pure additive
@@ -927,9 +996,12 @@ pub fn run(conn: &Connection) -> Result<()> {
     // the full chunks table during Storage::open on production DBs).
     let has_source_col: bool = conn.prepare("SELECT source FROM chunks LIMIT 0").is_ok();
     if !has_source_col {
-        let _ = conn.execute_batch(
+        add_column(
+            conn,
+            "chunks",
+            "source",
             "ALTER TABLE chunks ADD COLUMN source TEXT NOT NULL DEFAULT 'conversation';",
-        );
+        )?;
     }
 
     migrate_provenance_substrate(conn)?;
@@ -1041,9 +1113,12 @@ pub fn run(conn: &Connection) -> Result<()> {
             .prepare("SELECT description FROM journal_headlines LIMIT 0")
             .is_ok();
         if !has_description {
-            let _ = conn.execute_batch(
+            add_column(
+                conn,
+                "journal_headlines",
+                "description",
                 "ALTER TABLE journal_headlines ADD COLUMN description TEXT NOT NULL DEFAULT '';",
-            );
+            )?;
         }
     }
 
@@ -1679,7 +1754,12 @@ pub fn run(conn: &Connection) -> Result<()> {
     // dreams remain valid historical rows; only newly composed backfill
     // dreams carry the deterministic transcript receipts.
     if !has_column(conn, "dreams_v1", "evidence_provenance")? {
-        conn.execute_batch("ALTER TABLE dreams_v1 ADD COLUMN evidence_provenance TEXT")?;
+        add_column(
+            conn,
+            "dreams_v1",
+            "evidence_provenance",
+            "ALTER TABLE dreams_v1 ADD COLUMN evidence_provenance TEXT",
+        )?;
     }
 
     // Memory registry (harness file-based memory spine — never embedded, never
@@ -1842,21 +1922,42 @@ pub fn run(conn: &Connection) -> Result<()> {
     // trained-reranker implementation was reviewable, so prerelease databases
     // may already carry rerank_models without them.
     if !has_column(conn, "rerank_models", "curated_baseline_score")? {
-        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_baseline_score REAL;")?;
+        add_column(
+            conn,
+            "rerank_models",
+            "curated_baseline_score",
+            "ALTER TABLE rerank_models ADD COLUMN curated_baseline_score REAL;",
+        )?;
     }
     if !has_column(conn, "rerank_models", "curated_trained_score")? {
-        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_trained_score REAL;")?;
+        add_column(
+            conn,
+            "rerank_models",
+            "curated_trained_score",
+            "ALTER TABLE rerank_models ADD COLUMN curated_trained_score REAL;",
+        )?;
     }
     if !has_column(conn, "rerank_models", "curated_veto_epsilon")? {
-        conn.execute_batch("ALTER TABLE rerank_models ADD COLUMN curated_veto_epsilon REAL;")?;
+        add_column(
+            conn,
+            "rerank_models",
+            "curated_veto_epsilon",
+            "ALTER TABLE rerank_models ADD COLUMN curated_veto_epsilon REAL;",
+        )?;
     }
     if !has_column(conn, "rerank_models", "curated_case_count")? {
-        conn.execute_batch(
+        add_column(
+            conn,
+            "rerank_models",
+            "curated_case_count",
             "ALTER TABLE rerank_models ADD COLUMN curated_case_count INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     if !has_column(conn, "rerank_gate_clusters", "distinct_session_count")? {
-        conn.execute_batch(
+        add_column(
+            conn,
+            "rerank_gate_clusters",
+            "distinct_session_count",
             "ALTER TABLE rerank_gate_clusters
              ADD COLUMN distinct_session_count INTEGER NOT NULL DEFAULT 0;",
         )?;
@@ -2159,16 +2260,28 @@ fn migrate_intent_events_identity_v2(conn: &Connection) -> Result<()> {
 /// repaired one missing column at a time without rebuilding immutable rows.
 fn migrate_intent_events_detector_v3(conn: &Connection) -> Result<()> {
     if !has_column(conn, "intent_events", "detector")? {
-        conn.execute("ALTER TABLE intent_events ADD COLUMN detector TEXT", [])?;
+        add_column(
+            conn,
+            "intent_events",
+            "detector",
+            "ALTER TABLE intent_events ADD COLUMN detector TEXT",
+        )?;
     }
     if !has_column(conn, "intent_events", "classifier_score")? {
-        conn.execute(
+        add_column(
+            conn,
+            "intent_events",
+            "classifier_score",
             "ALTER TABLE intent_events ADD COLUMN classifier_score TEXT",
-            [],
         )?;
     }
     if !has_column(conn, "intent_events", "marker")? {
-        conn.execute("ALTER TABLE intent_events ADD COLUMN marker TEXT", [])?;
+        add_column(
+            conn,
+            "intent_events",
+            "marker",
+            "ALTER TABLE intent_events ADD COLUMN marker TEXT",
+        )?;
     }
     Ok(())
 }
@@ -2203,23 +2316,38 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Another opener may add the column after our absence check. Accept only
+/// a schema that now contains it; unrelated ALTER failures still propagate.
+fn add_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Result<()> {
+    if let Err(error) = conn.execute_batch(sql) {
+        if !has_column(conn, table, column)? {
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
 /// Expand the schema with message-bound provenance coordinates. Existing
 /// chunks retain an Unknown floor until a structural import or backfill can
 /// attach evidence; the migration never infers trust from legacy authorship.
 fn migrate_provenance_substrate(conn: &Connection) -> Result<()> {
     if !has_column(conn, "chunks", "min_trust")? {
-        conn.execute(
+        add_column(
+            conn,
+            "chunks",
+            "min_trust",
             "ALTER TABLE chunks ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0
                  CHECK (min_trust BETWEEN 0 AND 5)",
-            [],
         )?;
     }
     if !has_column(conn, "chunks", "tool_result_share")? {
-        conn.execute(
+        add_column(
+            conn,
+            "chunks",
+            "tool_result_share",
             "ALTER TABLE chunks ADD COLUMN tool_result_share REAL
                  CHECK (tool_result_share IS NULL OR
                         (tool_result_share >= 0.0 AND tool_result_share <= 1.0))",
-            [],
         )?;
     }
     conn.execute_batch(
@@ -2274,11 +2402,11 @@ fn migrate_artifact_provenance(conn: &Connection) -> Result<()> {
         "ratification_scores",
     ] {
         if !has_column(conn, table, "min_trust")? {
-            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0 CHECK(min_trust BETWEEN 0 AND 5)"), [])?;
+            add_column(conn, table, "min_trust", &format!("ALTER TABLE {table} ADD COLUMN min_trust INTEGER NOT NULL DEFAULT 0 CHECK(min_trust BETWEEN 0 AND 5)"))?;
         }
     }
     if !has_column(conn, "resolution_ledger", "event_id")? {
-        conn.execute("ALTER TABLE resolution_ledger ADD COLUMN event_id TEXT REFERENCES provenance_events(event_id)", [])?;
+        add_column(conn, "resolution_ledger", "event_id", "ALTER TABLE resolution_ledger ADD COLUMN event_id TEXT REFERENCES provenance_events(event_id)")?;
     }
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_provenance_events_parent ON provenance_events(parent_event_id);
@@ -2488,11 +2616,12 @@ fn migrate_narrative_usage_ref_id(conn: &Connection) -> Result<()> {
     conn.execute_batch("SAVEPOINT csr_narrative_usage_ref_id")?;
     let applied = (|| -> Result<()> {
         if !column_present {
-            // Deliberately NOT `IF NOT EXISTS` (SQLite has no such form for
-            // ADD COLUMN): the pragma above already established absence, and
-            // a duplicate-column error here means the schema moved under us
-            // and must surface.
-            conn.execute_batch("ALTER TABLE narrative_usage ADD COLUMN ref_id TEXT")?;
+            add_column(
+                conn,
+                "narrative_usage",
+                "ref_id",
+                "ALTER TABLE narrative_usage ADD COLUMN ref_id TEXT",
+            )?;
         }
         if !index_present {
             conn.execute_batch(
@@ -3177,6 +3306,73 @@ mod tests {
         opener.busy_timeout(std::time::Duration::ZERO).unwrap();
         run(&opener).expect("an up-to-date database must migrate without the write lock");
         writer.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn r8_add_column_rechecks_schema_and_propagates_real_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE probe(id INTEGER)")
+            .unwrap();
+        let ddl = "ALTER TABLE probe ADD COLUMN value TEXT";
+        add_column(&conn, "probe", "value", ddl).unwrap();
+        // Simulate an opener that checked before the other one added it.
+        add_column(&conn, "probe", "value", ddl).unwrap();
+        assert!(add_column(
+            &conn,
+            "missing",
+            "value",
+            "ALTER TABLE missing ADD COLUMN value TEXT"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn r8_eight_concurrent_old_schema_openers_succeed_repeatedly() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old.db");
+        {
+            // Every deployed database is WAL (Storage::open sets it on creation).
+            let conn = Connection::open(&old).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+            run(&conn).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE enrichment_state DROP COLUMN batch_failures;
+                ALTER TABLE import_state DROP COLUMN csr_tool_blocks_suppressed;
+                ALTER TABLE import_state DROP COLUMN csr_hook_wrappers_scrubbed;
+                ALTER TABLE witness_verdicts DROP COLUMN receipt_committed_at;
+                ALTER TABLE rerank_models DROP COLUMN curated_baseline_score;
+                ALTER TABLE rerank_models DROP COLUMN curated_trained_score;
+                ALTER TABLE rerank_models DROP COLUMN curated_veto_epsilon;
+                ALTER TABLE rerank_models DROP COLUMN curated_case_count;
+                ALTER TABLE dreams_v1 DROP COLUMN evidence_provenance;",
+            )
+            .unwrap();
+        }
+        for repeat in 0..10 {
+            let path = temp.path().join(format!("copy-{repeat}.db"));
+            std::fs::copy(&old, &path).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        crate::storage::Storage::open(&path)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .collect::<Vec<_>>();
+            let outcomes = handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                outcomes.iter().all(Result::is_ok),
+                "repeat {repeat}: {outcomes:?}"
+            );
+        }
     }
 
     #[test]

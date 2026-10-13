@@ -2473,7 +2473,7 @@ pub fn get_unenriched_conversations(
     // the daemon, 60 s in each MCP server) — ~3.9 GB/h per server. Same rows,
     // same order; the outer sort only sees one row per conversation.
     let mut stmt = conn.prepare(
-        "SELECT g.conversation_id, i.file_path
+        "SELECT g.conversation_id, MIN(i.file_path)
          FROM (SELECT conversation_id, MAX(timestamp) AS latest
                FROM chunks GROUP BY conversation_id) g
          JOIN import_state i ON i.conversation_id = g.conversation_id
@@ -2481,6 +2481,7 @@ pub fn get_unenriched_conversations(
              ON e.conversation_id = g.conversation_id AND e.enrichment_type = ?1
          WHERE (e.status IS NULL OR e.status IN ('failed', 'pending'))
            AND NOT (?1 = 'ai_narrative' AND COALESCE(e.batch_failures, 0) >= 3)
+         GROUP BY g.conversation_id
          ORDER BY g.latest DESC
          LIMIT ?2",
     )?;
@@ -2505,7 +2506,9 @@ pub fn set_batch_id(
         "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, batch_id, prompt_hash, updated_at)
          VALUES (?1, 'ai_narrative', 'processing', ?2, ?3, datetime('now'))
          ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
-             status = 'processing', batch_id = ?2, prompt_hash = ?3, updated_at = datetime('now')",
+             status = 'processing', batch_id = ?2, prompt_hash = ?3,
+             batch_transient_failures = CASE WHEN batch_id = ?2 THEN batch_transient_failures ELSE 0 END,
+             updated_at = datetime('now')",
         params![conversation_id, batch_id, prompt_hash],
     )?;
     Ok(())
@@ -5172,15 +5175,15 @@ mod tests {
         }
     }
 
-    /// The pre-rewrite statement, kept verbatim as the oracle for
-    /// `get_unenriched_conversations`'s streaming-aggregate form.
-    const UNENRICHED_ORACLE: &str = "SELECT c.conversation_id, i.file_path
+    /// The original grouped join, with one deterministic path per conversation,
+    /// is the oracle for the streaming-aggregate form.
+    const UNENRICHED_ORACLE: &str = "SELECT c.conversation_id, MIN(i.file_path)
          FROM chunks c
          JOIN import_state i ON i.conversation_id = c.conversation_id
          LEFT JOIN enrichment_state e
              ON e.conversation_id = c.conversation_id AND e.enrichment_type = ?1
          WHERE e.status IS NULL OR e.status IN ('failed', 'pending')
-         GROUP BY c.conversation_id, i.file_path
+         GROUP BY c.conversation_id
          ORDER BY MAX(c.timestamp) DESC
          LIMIT ?2";
 
@@ -5231,8 +5234,8 @@ mod tests {
                     .collect::<rusqlite::Result<_>>()
                     .unwrap();
                 let rewritten = get_unenriched_conversations(&conn, kind, limit).unwrap();
-                // Same conversations in the same order; the two files of one
-                // conversation tie on its timestamp, so compare those as a set.
+                // Dedupe before LIMIT so duplicate paths cannot displace a
+                // different conversation from the requested batch size.
                 let order = |rows: &[(String, String)]| -> Vec<String> {
                     rows.iter().map(|(conv, _)| conv.clone()).collect()
                 };
@@ -5253,7 +5256,7 @@ mod tests {
             "failed retries"
         );
         assert!(all.iter().all(|(conv, _)| conv != "empty"), "needs chunks");
-        assert_eq!(all.iter().filter(|(conv, _)| conv == "conv-4").count(), 2);
+        assert_eq!(all.iter().filter(|(conv, _)| conv == "conv-4").count(), 1);
     }
 
     #[test]
