@@ -523,9 +523,17 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
     .min_by_key(|&(start, _)| start)
 }
 
+/// True for what a band hotkey or a quote marker leaves right before a forward: one digit, or `>` marks.
+fn hotkey_or_marker(piece: &str) -> bool {
+    let piece = piece.trim();
+    let mut chars = piece.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_digit())
+        || piece.chars().all(|c| c == '>' || c.is_whitespace())
+}
+
 /// Cut every one-line forward out of `line`. `None` when it has none; otherwise the person's words left on it
-/// (pieces joined by a space) and the offset of its first forward. A piece of digits, spaces or `>` alone right
-/// before a forward is a band hotkey or quote marker, not the person's.
+/// (pieces joined by a space) and the offset of its first forward. A single digit (a band hotkey) or `>` alone
+/// right before a forward goes with it; any other piece, `42` included, is the person's (astra r2 #8).
 fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> {
     let mut pieces: Vec<&str> = Vec::new();
     let mut cursor = 0;
@@ -533,10 +541,7 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> 
     while let Some((start, end)) = next_one_line_forward(line, cursor, others) {
         first.get_or_insert(start);
         let before = &line[cursor..start];
-        if before
-            .chars()
-            .any(|c| !(c.is_ascii_digit() || c.is_whitespace() || c == '>'))
-        {
+        if !hotkey_or_marker(before) {
             pieces.push(before.trim());
         }
         cursor = end.max(start + 1);
@@ -716,7 +721,6 @@ pub fn is_substantive(text: &str) -> bool {
 /// 2026-10-10: a pasted hand-off list drew back its own "When claude is killed"
 /// note at cosine 0.855, plus a duplicate of it, as fresh PAST CONTEXT.
 const PANE_HANDED: &str = "CSR handed you these this session: ";
-const PANE_STORY: &str = "CSR's story of this session, rev ";
 /// pane.py `lost_asks`: `Lost and found: “<thread>” went quiet after HH:MM.`
 /// then one of two fixed asks, all CSR's words.
 const PANE_LOST: &str = "Lost and found: “";
@@ -820,8 +824,8 @@ fn pane_send_end(line: &str, start: usize, header: &str) -> usize {
             }
             None => line.len(),
         },
-        // A story is free prose with no grammar of its own: it runs to the
-        // end of its line (one_line collapsed it to one).
+        // Any other send text runs to the end of its line (one_line
+        // collapsed it to one).
         _ => line.len(),
     }
 }
@@ -846,9 +850,11 @@ fn strip_line_emissions(line: &str) -> String {
         out.replace_range(lead..end, " ");
         from = lead;
     }
+    // The session story is a forward: `strip_csr_forwards` cuts it by its
+    // grammar (its revision number, then `:` or `, quoted: “`). Cut here by its
+    // opening words alone, it took the person's sentence about a story with it.
     for header in [
         PANE_HANDED,
-        PANE_STORY,
         PANE_LOST,
         PANE_REMEMBERED_SESSION,
         PANE_REMEMBERED,
@@ -1326,6 +1332,29 @@ mod tests {
             &format!("{legacy}\u{3044}\u{3044}\u{3048}"),
             Some("\u{3044}\u{3044}\u{3048}"),
         );
+    }
+
+    #[test]
+    fn astra_r2_2_feedback_about_a_story_is_the_persons() {
+        // The broad line pass cut from the story's opening words to the end of the line, without its
+        // revision delimiter, and took the person's sentence with it.
+        let own = "CSR's story of this session, rev 3 is wrong; keep my rollback plan.";
+        let input = format!(
+            "{own}\n\nCSR's compaction card (compacting), quoted: \u{201c}Summarizing.\u{201d}"
+        );
+        own_words_agree(&input, Some(own));
+        own_words_agree(own, Some(own));
+    }
+
+    #[test]
+    fn astra_r2_8_a_number_between_two_forwards_is_the_persons() {
+        let card = |body: &str| {
+            format!("CSR's compaction card (compacting), quoted: \u{201c}{body}\u{201d}")
+        };
+        own_words_agree(&format!("{} 42 {}", card("One."), card("Two.")), Some("42"));
+        // The single hotkey digit the band leaves before a send still goes with it.
+        own_words_agree(&format!("2{}\nmy reply", card("One.")), Some("my reply"));
+        own_words_agree(&format!("42{}", card("One.")), Some("42"));
     }
 
     #[test]
