@@ -163,6 +163,13 @@ impl EmbeddingEngine {
     /// Loads the model on first call if it hasn't been `warm()`ed already.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if let Some(vectors) = self.remote.as_ref().and_then(|proxy| proxy.embed(texts)) {
+            // The daemon answers again after a fallback: free the model.
+            let dropped = self.model.lock().ok().and_then(|mut model| model.take());
+            if dropped.is_some() {
+                drop(dropped);
+                crate::runtime::release_freed_pages();
+                tracing::info!("daemon answers again: dropped the in-process embedding model");
+            }
             return Ok(vectors);
         }
         self.ensure_loaded()?;

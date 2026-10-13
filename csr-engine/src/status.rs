@@ -50,6 +50,10 @@ pub struct StatusReport {
     /// now — i.e. still running a build an install has since superseded.
     /// See `binary_identity::stale_processes`.
     pub stale_processes: Vec<crate::binary_identity::StaleProcess>,
+    /// Every live MCP server and what answers its vector calls: `daemon`,
+    /// `in-process`, or `in-process (daemon unavailable)`; `null` for a
+    /// server whose binary predates the field. See `search::vector_ipc`.
+    pub mcp_servers: Vec<crate::binary_identity::McpServerPath>,
     /// Aux corpus coverage (session_registry vs chunks) — never injected into search.
     pub aux: AuxStatus,
     /// Native memory-file spine (`~/.claude/projects/*/memory/*.md`) — metadata
@@ -784,12 +788,16 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let total_jsonl = count_jsonl_files(projects_dir);
     let stale_processes = gather_stale_processes();
     let mcp_binary_stale = mcp_binary_stale_from(&stale_processes);
+    let mcp_servers = crate::binary_identity::default_run_dir()
+        .map(|run_dir| crate::binary_identity::live_mcp_servers(&run_dir))
+        .unwrap_or_default();
 
     // If DB doesn't exist yet, return empty report
     if !db_path.exists() {
         return Ok(StatusReport {
             mcp_binary_stale,
             stale_processes,
+            mcp_servers: mcp_servers.clone(),
             conversations: 0,
             projects: 0,
             chunks: 0,
@@ -925,6 +933,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     Ok(StatusReport {
         mcp_binary_stale,
         stale_processes,
+        mcp_servers,
         conversations,
         projects,
         chunks,
@@ -2030,6 +2039,7 @@ mod tests {
         StatusReport {
             mcp_binary_stale: false,
             stale_processes: Vec::new(),
+            mcp_servers: Vec::new(),
             conversations: 909,
             projects: 3,
             chunks: 5000,

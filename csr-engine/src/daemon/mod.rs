@@ -1216,7 +1216,10 @@ impl Daemon {
             tracing::info!("journal server started (v10.1 journal v4)");
         }
         // MCP servers started while this daemon is live search through it
-        // instead of loading their own index and model.
+        // instead of loading their own index and model. Its own shutdown
+        // flag: it keeps answering through the whole teardown below, so a
+        // restart's gap is only the new daemon's startup.
+        let vector_shutdown = Arc::new(AtomicBool::new(false));
         let vector_handle = crate::search::vector_ipc::spawn_for_daemon(
             self.embeddings.clone(),
             self.search.clone(),
@@ -1232,7 +1235,7 @@ impl Daemon {
                     })
                     .unwrap_or_else(|_| "csr-engine.db".to_owned()),
             ),
-            shutdown.clone(),
+            vector_shutdown.clone(),
             sync_nudge,
         );
 
@@ -1266,9 +1269,8 @@ impl Daemon {
         // Signal all loops to stop
         shutdown.store(true, Ordering::SeqCst);
 
-        // Stop admitting prompt and vector requests and remove the sockets.
+        // Stop admitting prompt requests and remove the private socket.
         let _ = prompt_handle.await;
-        let _ = vector_handle.await;
         let _ = index_sync_handle.await;
 
         // Give loops time to finish current work (5s timeout)
@@ -1355,6 +1357,10 @@ impl Daemon {
                 tracing::info!("HNSW index flushed to disk on shutdown");
             }
         }
+
+        // Last: MCP servers kept searching through the teardown.
+        vector_shutdown.store(true, Ordering::SeqCst);
+        let _ = vector_handle.await;
 
         if let Some(path) = run_record_path {
             crate::binary_identity::remove_run_record(&path);

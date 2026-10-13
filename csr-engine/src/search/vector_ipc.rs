@@ -40,7 +40,15 @@ const PING_TIMEOUT: Duration = Duration::from_millis(1500);
 /// the whole graph) so a busy daemon is not mistaken for a dead one.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const NUDGE_TIMEOUT: Duration = Duration::from_millis(500);
-/// After a failed call, go straight to the in-process path for this long.
+/// After a failed call, re-ping the daemon this often (doubling) for up to
+/// [`BACKOFF_TOTAL`] before falling back: a restart or a stalled moment must
+/// not cost a 1.3-2.2 GB in-process load. A restart leaves no socket from
+/// the old daemon's exit until the new one has loaded its index (5.7-12.3 s
+/// of cache load in the live daemon's log), so 8 s would still fall back.
+const BACKOFF_FIRST: Duration = Duration::from_millis(250);
+const BACKOFF_TOTAL: Duration = Duration::from_secs(20);
+/// After falling back, try the daemon again on the first call this long
+/// after; when it answers, the in-process index and model are dropped.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// Requests the daemon serves at once; more wait for a slot.
 const SERVER_SLOTS: usize = 8;
@@ -132,8 +140,7 @@ impl VectorClient {
         })
     }
 
-    #[cfg(unix)]
-    fn call(&self, op: Op, timeout: Duration) -> Result<Reply> {
+    fn encode(&self, op: Op) -> Result<Vec<u8>> {
         let request = serde_json::to_vec(&Request {
             version: VERSION,
             database: self.database.clone(),
@@ -142,12 +149,21 @@ impl VectorClient {
         if request.len() > MAX_FRAME {
             bail!("request of {} bytes exceeds the frame cap", request.len());
         }
+        Ok(request)
+    }
+
+    fn call(&self, op: Op, timeout: Duration) -> Result<Reply> {
+        self.send(&self.encode(op)?, timeout)
+    }
+
+    #[cfg(unix)]
+    fn send(&self, request: &[u8], timeout: Duration) -> Result<Reply> {
         let mut stream = std::os::unix::net::UnixStream::connect(&self.socket)
             .with_context(|| format!("connecting {}", self.socket.display()))?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.write_all(&(request.len() as u32).to_be_bytes())?;
-        stream.write_all(&request)?;
+        stream.write_all(request)?;
         let mut header = [0u8; 4];
         stream.read_exact(&mut header).context("reading reply")?;
         let size = u32::from_be_bytes(header) as usize;
@@ -164,13 +180,17 @@ impl VectorClient {
     }
 
     #[cfg(not(unix))]
-    fn call(&self, _op: Op, _timeout: Duration) -> Result<Reply> {
+    fn send(&self, _request: &[u8], _timeout: Duration) -> Result<Reply> {
         bail!("no vector socket on this platform")
     }
 
     /// The daemon answers for this database.
     pub fn ping(&self) -> Result<()> {
-        match self.call(Op::Ping, PING_TIMEOUT)? {
+        self.ping_within(PING_TIMEOUT)
+    }
+
+    fn ping_within(&self, timeout: Duration) -> Result<()> {
+        match self.call(Op::Ping, timeout)? {
             Reply::Pong => Ok(()),
             _ => bail!("unexpected reply to ping"),
         }
@@ -180,8 +200,35 @@ impl VectorClient {
 /// Builds the in-process index when the daemon cannot serve.
 pub type IndexLoader = Box<dyn Fn() -> Result<SearchEngine> + Send + Sync>;
 
+/// Which path answers a server's vector calls; recorded in its run record
+/// (`csr-engine status` lists it) and logged on every change.
+pub const PATH_DAEMON: &str = "daemon";
+/// A proxied server whose daemon stopped answering, on its own index.
+pub const PATH_FALLBACK: &str = "in-process (daemon unavailable)";
+/// A server that found no daemon at startup (or `CSR_NO_DAEMON_PROXY=1`).
+pub const PATH_IN_PROCESS: &str = "in-process";
+
+/// Backoff and retry timing, adjustable so tests need not wait 8 s.
+#[derive(Clone, Copy, Debug)]
+pub struct ProxyTimings {
+    pub backoff_first: Duration,
+    pub backoff_total: Duration,
+    pub retry_after: Duration,
+}
+
+impl Default for ProxyTimings {
+    fn default() -> Self {
+        Self {
+            backoff_first: BACKOFF_FIRST,
+            backoff_total: BACKOFF_TOTAL,
+            retry_after: RETRY_AFTER,
+        }
+    }
+}
+
 /// The vector side of a proxied MCP server: the daemon first, the server's
-/// own lazily loaded index and model when that fails.
+/// own lazily loaded index and model when that fails, dropped again once the
+/// daemon answers.
 pub struct VectorProxy {
     client: VectorClient,
     loader: IndexLoader,
@@ -190,6 +237,9 @@ pub struct VectorProxy {
     remote_down_until: std::sync::Mutex<Option<Instant>>,
     remote_calls: AtomicU64,
     remote_failures: AtomicU64,
+    timings: std::sync::Mutex<ProxyTimings>,
+    /// The server's run record, rewritten with its current path.
+    run_record: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl VectorProxy {
@@ -202,6 +252,45 @@ impl VectorProxy {
             remote_down_until: std::sync::Mutex::new(None),
             remote_calls: AtomicU64::new(0),
             remote_failures: AtomicU64::new(0),
+            timings: std::sync::Mutex::new(ProxyTimings::default()),
+            run_record: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn set_timings(&self, timings: ProxyTimings) {
+        if let Ok(mut current) = self.timings.lock() {
+            *current = timings;
+        }
+    }
+
+    fn timings(&self) -> ProxyTimings {
+        self.timings.lock().map(|t| *t).unwrap_or_default()
+    }
+
+    /// Record this server's path in `record` from now on, starting now.
+    pub fn attach_run_record(&self, record: PathBuf) {
+        crate::binary_identity::set_run_record_search_path(&record, self.path());
+        if let Ok(mut current) = self.run_record.lock() {
+            *current = Some(record);
+        }
+    }
+
+    /// The path answering this server's vector calls right now.
+    pub fn path(&self) -> &'static str {
+        if self.local_loaded() {
+            PATH_FALLBACK
+        } else {
+            PATH_DAEMON
+        }
+    }
+
+    fn report_path(&self) {
+        let path = self.path();
+        tracing::info!(search_path = path, "MCP vector search path changed");
+        if let Ok(record) = self.run_record.lock() {
+            if let Some(record) = record.as_ref() {
+                crate::binary_identity::set_run_record_search_path(record, path);
+            }
         }
     }
 
@@ -224,23 +313,66 @@ impl VectorProxy {
                 return None;
             }
         }
-        match self.client.call(op, CALL_TIMEOUT) {
-            Ok(reply) => {
-                self.remote_calls.fetch_add(1, Ordering::Relaxed);
-                Some(reply)
-            }
-            Err(error) => {
-                self.remote_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    %error,
-                    "daemon vector search unavailable; using the in-process index"
-                );
-                if let Ok(mut until) = self.remote_down_until.lock() {
-                    *until = Some(Instant::now() + RETRY_AFTER);
-                }
-                None
+        let request = self.client.encode(op).ok()?;
+        let error = match self.client.send(&request, CALL_TIMEOUT) {
+            Ok(reply) => return Some(self.answered(reply)),
+            Err(error) => error,
+        };
+        // A restarting or briefly stalled daemon: wait for it to answer a
+        // ping before paying for an in-process load.
+        if self.await_daemon() {
+            if let Ok(reply) = self.client.send(&request, CALL_TIMEOUT) {
+                return Some(self.answered(reply));
             }
         }
+        self.remote_failures.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            %error,
+            "daemon vector search unavailable; answering in-process"
+        );
+        if let Ok(mut until) = self.remote_down_until.lock() {
+            *until = Some(Instant::now() + self.timings().retry_after);
+        }
+        None
+    }
+
+    /// Re-ping the daemon with doubling backoff; `true` once it answers.
+    fn await_daemon(&self) -> bool {
+        let timings = self.timings();
+        let started = Instant::now();
+        let mut delay = timings.backoff_first;
+        loop {
+            let remaining = timings.backoff_total.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(delay.min(remaining));
+            let remaining = timings.backoff_total.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            if self.client.ping_within(PING_TIMEOUT.min(remaining)).is_ok() {
+                return true;
+            }
+            delay = delay.saturating_mul(2);
+        }
+    }
+
+    /// The daemon answered. A server that fell back drops its in-process
+    /// index now (the model is dropped by `EmbeddingEngine` on its next
+    /// daemon-answered embed), so a daemon restart costs a fleet of servers
+    /// a load only for the outage, not for the rest of their sessions.
+    fn answered(&self, reply: Reply) -> Reply {
+        self.remote_calls.fetch_add(1, Ordering::Relaxed);
+        if self.local_loaded() {
+            let dropped = self.local.write().ok().and_then(|mut local| local.take());
+            // Freeing the graph takes a moment; never under the lock.
+            drop(dropped);
+            crate::runtime::release_freed_pages();
+            tracing::info!("daemon answers again: dropped the in-process index");
+            self.report_path();
+        }
+        reply
     }
 
     fn hits(reply: Option<Reply>) -> Option<Vec<SearchResult>> {
@@ -270,6 +402,7 @@ impl VectorProxy {
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "loaded the index in-process (daemon vector search unavailable)"
                         );
+                        self.report_path();
                     }
                     Err(error) => {
                         tracing::warn!(%error, "in-process index load failed");
@@ -344,7 +477,8 @@ impl VectorProxy {
         })
     }
 
-    /// The daemon's embedding of `texts`, or `None` to embed in-process.
+    /// The daemon's embedding of `texts`, or `None` to embed in-process. The
+    /// caller drops its in-process model when this answers.
     pub(crate) fn embed(&self, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
         let op = Op::Embed {
             texts: texts.iter().map(|text| text.to_string()).collect(),
@@ -793,6 +927,93 @@ mod tests {
             .embed_single("index dump to disk")
             .unwrap();
         assert!(v.iter().zip(&w).all(|(a, b)| (a - b).abs() < 1e-6));
+    }
+
+    fn recorded_path(record: &Path) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_slice(&std::fs::read(record).ok()?).ok()?;
+        json["search_path"].as_str().map(str::to_owned)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_daemon_back_within_the_backoff_costs_no_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let proxied = Engine::new_proxied(&db, &projects).unwrap().unwrap();
+        let proxy = proxied.search().read().await.proxy().unwrap().clone();
+        proxy.set_timings(ProxyTimings {
+            backoff_first: Duration::from_millis(50),
+            backoff_total: Duration::from_secs(5),
+            retry_after: Duration::from_secs(30),
+        });
+        daemon.stop().await;
+        // The daemon restarts while the call is backing off.
+        let restart = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                TestDaemon::start(&db).await
+            })
+        };
+        let hits = proxied
+            .search()
+            .read()
+            .await
+            .search_chunks(&direction(7), 5, -1.0);
+        assert_eq!(hits.len(), 5);
+        assert!(
+            !proxy.local_loaded(),
+            "a restart inside the backoff loads nothing"
+        );
+        assert_eq!(proxy.remote_stats().1, 0);
+        restart.await.unwrap().stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_daemon_answering_again_drops_the_fallback_index_and_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let proxied = Engine::new_proxied(&db, &projects).unwrap().unwrap();
+        let proxy = proxied.search().read().await.proxy().unwrap().clone();
+        proxy.set_timings(ProxyTimings {
+            backoff_first: Duration::from_millis(20),
+            backoff_total: Duration::from_millis(100),
+            retry_after: Duration::from_millis(300),
+        });
+        let run_dir = tmp.path().join("run");
+        let identity = crate::binary_identity::FileIdentity::capture(&db).unwrap();
+        let record =
+            crate::binary_identity::write_run_record(&run_dir, "mcp_stdio", identity).unwrap();
+        proxy.attach_run_record(record.clone());
+        assert_eq!(recorded_path(&record).as_deref(), Some(PATH_DAEMON));
+
+        daemon.stop().await;
+        let query = "daemon lock and socket handshake";
+        let search = |engine: &Engine| {
+            let search = engine.search().clone();
+            async move { search.read().await.search_chunks(&direction(9), 5, -1.0) }
+        };
+        assert_eq!(search(&proxied).await.len(), 5);
+        assert!(proxy.local_loaded(), "the outage outlasted the backoff");
+        proxied.embeddings().embed_single(query).unwrap();
+        assert!(proxied.embeddings().is_loaded());
+        assert_eq!(recorded_path(&record).as_deref(), Some(PATH_FALLBACK));
+
+        let daemon = TestDaemon::start(&db).await;
+        // Inside RETRY_AFTER the server stays on its own index.
+        assert_eq!(search(&proxied).await.len(), 5);
+        assert!(proxy.local_loaded());
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        proxied.embeddings().embed_single(query).unwrap();
+        assert!(!proxied.embeddings().is_loaded(), "model dropped");
+        assert_eq!(search(&proxied).await.len(), 5);
+        assert!(!proxy.local_loaded(), "index dropped");
+        assert_eq!(recorded_path(&record).as_deref(), Some(PATH_DAEMON));
+        let servers = crate::binary_identity::live_mcp_servers(&run_dir);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].search_path.as_deref(), Some(PATH_DAEMON));
+        daemon.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

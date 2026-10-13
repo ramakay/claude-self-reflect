@@ -375,6 +375,11 @@ pub struct RunRecord {
     pub role: String,
     pub started_at: String,
     pub parent_cmd: Option<String>,
+    /// MCP servers: what answers their vector calls — `"daemon"`,
+    /// `"in-process"`, or `"in-process (daemon unavailable)"` (see
+    /// `search::vector_ipc`). Absent from records older binaries wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_path: Option<String>,
 }
 
 /// `~/.claude-self-reflect/run`.
@@ -422,12 +427,62 @@ pub fn write_run_record(run_dir: &Path, role: &str, identity: FileIdentity) -> O
         role: role.to_string(),
         started_at: chrono::Utc::now().to_rfc3339(),
         parent_cmd: parent_command_name(),
+        search_path: None,
     };
     std::fs::create_dir_all(run_dir).ok()?;
     let path = run_dir.join(format!("{pid}.json"));
     let json = serde_json::to_string_pretty(&record).ok()?;
     std::fs::write(&path, json).ok()?;
     Some(path)
+}
+
+/// Best-effort: rewrite a run record's `search_path` (tmp file + rename, so
+/// a reader never sees half a record).
+pub fn set_run_record_search_path(path: &Path, search_path: &str) {
+    let Some(mut record) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+    else {
+        return;
+    };
+    record.search_path = Some(search_path.to_string());
+    let Ok(json) = serde_json::to_string_pretty(&record) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// One live MCP server and the path answering its vector calls.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpServerPath {
+    pub pid: u32,
+    pub started_at: String,
+    /// `None` for a server whose binary predates the field.
+    pub search_path: Option<String>,
+}
+
+/// Every live `mcp_stdio` record in `run_dir`, oldest first.
+pub fn live_mcp_servers(run_dir: &Path) -> Vec<McpServerPath> {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    let mut servers: Vec<McpServerPath> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|entry| std::fs::read(entry.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok())
+        .filter(|record| record.role == "mcp_stdio" && pid_is_alive(record.pid))
+        .map(|record| McpServerPath {
+            pid: record.pid,
+            started_at: record.started_at,
+            search_path: record.search_path,
+        })
+        .collect();
+    servers.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    servers
 }
 
 /// Best-effort removal of a run record written by [`write_run_record`].
@@ -832,6 +887,7 @@ mod tests {
             role: "mcp_stdio".into(),
             started_at: "2026-09-22T10:06:00Z".into(),
             parent_cmd: Some("claude".into()),
+            search_path: None,
         };
         let dead_record = RunRecord {
             pid: dead_pid,
@@ -841,6 +897,7 @@ mod tests {
             role: "mcp_stdio".into(),
             started_at: "2026-09-22T10:06:00Z".into(),
             parent_cmd: Some("claude".into()),
+            search_path: None,
         };
         std::fs::write(
             run_dir.join(format!("{}.json", live_record.pid)),
@@ -883,6 +940,7 @@ mod tests {
             role: "daemon".into(),
             started_at: "2026-09-22T10:06:00Z".into(),
             parent_cmd: None,
+            search_path: None,
         };
         std::fs::write(
             run_dir.join(format!("{}.json", record.pid)),

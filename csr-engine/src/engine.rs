@@ -827,6 +827,7 @@ impl Engine {
         startup_identity: Option<crate::binary_identity::FileIdentity>,
         startup_exe_path: Option<std::path::PathBuf>,
     ) -> Result<()> {
+        let proxy = self.search.read().await.proxy().cloned();
         // Spawn enrichment loops as background tasks (extraction, narrator,
         // consolidation) — unless the daemon is live and already runs them.
         let enrichment_handles = if self.proxied {
@@ -858,6 +859,17 @@ impl Engine {
             .and_then(|(identity, run_dir)| {
                 crate::binary_identity::write_run_record(&run_dir, "mcp_stdio", identity)
             });
+        // Which path answers this server's vector calls, for `status`; a
+        // proxied server keeps it current across fallback and recovery.
+        if let Some(path) = &run_record_path {
+            match &proxy {
+                Some(proxy) => proxy.attach_run_record(path.clone()),
+                None => crate::binary_identity::set_run_record_search_path(
+                    path,
+                    crate::search::vector_ipc::PATH_IN_PROCESS,
+                ),
+            }
+        }
         #[cfg(unix)]
         let service = match stdout {
             Some(claimed) => {
