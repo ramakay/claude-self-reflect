@@ -2,8 +2,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelForkResult, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
 
 import type { AgentState, CompactView, CompletionKey, CompletionDisposition, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
-import { admitCompletion, anyActive, claimCompletions, completionKey, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
-import type { AgentEvent, Ledger, WritePlan } from './agents'
+import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
+import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
@@ -537,9 +537,8 @@ const spread = (base: number, usual: number) => (chapter: Chapter): Chapter => (
 // A chapter left as it is, except that its dreams spent end the look schedule (a completion's look used one).
 const kept = (chapter: Chapter): Chapter => (mayLook(chapter) ? chapter : { ...chapter, due: Number.MAX_SAFE_INTEGER })
 
-// What started a look: the main session's own schedule, or the completion of agents. `reports` is what those agents
-// said, redacted, for the prompt.
-type DreamTrigger = { kind: 'main' } | { kind: 'agent'; completions: CompletionKey[]; reports: string }
+// What started a look: the main session's own schedule, or the completion of agents (their identities).
+type DreamTrigger = { kind: 'main' } | { kind: 'agent'; completions: CompletionKey[] }
 const MAIN: DreamTrigger = { kind: 'main' }
 type Trace = { forked: boolean; threw: boolean }
 
@@ -657,7 +656,12 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   }
   if (await isBusy($)) return void (await ownChapter(soonish(base))) // a note is up: no question would be seen
   if (!canAfford(pace, lastStep)) return lookCameTo($, owns, cwd, session, 'budget', await ownChapter(soonish(base)), base, 0, undefined, await more())
-  const brief = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
+  const full = (await run($, ['--repo', cwd, '--brief', '--sid', session])) ?? ''
+  // The brief carries the agents as a machine envelope (bin/agents.py). It is read for who is running and which of the
+  // claimed runs reported, and kept out of what the dreamer reads as CSR's memory: the prompt gets it as its own section.
+  const envelope = parseAgentEnvelope(full)
+  const brief = stripEnvelopes(full)
+  const reported = agent ? completionNews(envelope, await ledgerOf($, session).catch(() => ({})), trigger.completions) : []
   const now = facts(brief)
   const before = await strings($, await ownKey($, 'briefFacts'))
   // A chapter's first look is always taken: after a compaction the work has moved on even when CSR's notes
@@ -665,7 +669,7 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   // A completion's look gets no such exception: it needs news like any other. The completions it was started for are
   // news in themselves (an agent's report that is not yet in a dream), and nothing else is.
   const fresh = !agent && opening.looks === 0
-  const news = hasNews(now, before) || (agent && trigger.reports.trim() !== '')
+  const news = hasNews(now, before) || reported.length > 0
   if (!fresh && !news) return lookCameTo($, owns, cwd, session, 'quiet', await ownChapter(soonish(base)), base, 0, undefined, await more())
   const seen = await strings($, 'seenDreams')
   const known = await strings($, 'knownDreams')
@@ -679,7 +683,7 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   let reply: ModelForkResult
   try {
     trace.forked = true
-    reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known, asked, agent ? trigger.reports : '') })
+    reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known, asked, agentsText(envelope, reported)) })
   } catch (error) {
     trace.threw = true
     await changePace($, current => ({ ...current, looks: current.looks + 1, dreamer: current.dreamer + guess(current, lastStep) }))
@@ -1097,25 +1101,19 @@ async function admitted($: EngineInterface, key: CompletionKey): Promise<boolean
   }
 }
 
-type Taken = { key: CompletionKey; agent: string; type: string | null; description: string; answer: string }
-
 // Every completion that is pending, claimed in one write and recorded before any gate of the look is checked. [] when
 // there is none, or when the claim could not be kept (then nothing was claimed and no look is started).
-async function takeCompletions($: EngineInterface): Promise<Taken[]> {
+async function takeCompletions($: EngineInterface): Promise<CompletionKey[]> {
   try {
     return await ledgerSerially(async () => {
       const session = await $.session.id()
       const ledger = await ledgerOf($, session)
-      const state = ownAgents(await read($, agentSession), session)
-      const due = pendingCompletions(state, ledger)
+      const due = pendingCompletions(ownAgents(await read($, agentSession), session), ledger)
       if (!due.length) return []
       const claim = claimCompletions(ledger, due.map(entry => entry.key))
       await $.store.set(ledgerKey(session), claim.ledger)
       await agentsChange($, current => markDisposition(current, claim.claimed, 'claimed'))
-      return due.filter(entry => claim.claimed.includes(entry.key)).map(entry => ({
-        key: entry.key, agent: entry.agent, type: state.rows[entry.agent]?.type ?? null,
-        description: state.rows[entry.agent]?.description ?? '', answer: entry.answer,
-      }))
+      return claim.claimed
     })
   } catch {
     return []
@@ -1136,10 +1134,21 @@ const hasPending = async ($: EngineInterface): Promise<boolean> => {
   return pendingCompletions(ownAgents(await read($, agentSession), session), await ledgerOf($, session)).length > 0
 }
 
-// What the claimed agents said, for the dreamer's prompt: their own words, quoted, each under who said it.
-const quoted = (text: string) => text.split('\n').map(line => `  > ${line}`).join('\n')
-const agentReports = (taken: readonly Taken[]): string =>
-  taken.map(entry => `- ${entry.type ?? 'An agent'}${entry.description ? ` “${entry.description}”` : ''} finished, and reported:\n${quoted(entry.answer)}`).join('\n')
+// What the prompt says of the agents (dreamer.ts, AGENT_RULES) from the brief's envelope: the agents still running, as
+// context only, and the reports of the runs this look was started for, each in the agent's own words under its name.
+// Nothing else of the agents is read: a finished run no look claimed, a failed one, an empty one say nothing here.
+function agentsText(envelope: Envelope | null, reported: readonly CompletionKey[]): string {
+  if (!envelope || envelope.payload.kind !== 'context') return ''
+  const { session, agents } = envelope.payload
+  const running = agents.filter(row => row.status === 'running' || row.status === 'waiting' || row.status === 'pending')
+  const lines = running.length ? [`Still at work, for context only (nothing to ask about yet): ${running.map(row => `${row.type ?? 'an agent'} (${row.status})`).join(', ')}.`] : []
+  for (const row of agents) {
+    if (!row.completion || !reported.includes(completionKey(session, row.id, row.completion.turn_id))) continue
+    const quoted = row.completion.answer.split('\n').map(line => `  > ${line}`).join('\n')
+    lines.push(`- ${row.type ?? 'An agent'} finished, and reported:\n${quoted}`)
+  }
+  return lines.join('\n')
+}
 
 async function restoreOwners($: EngineInterface): Promise<void> {
   const owners = await read($, taskOwners)
@@ -1625,12 +1634,13 @@ async function completions($: EngineInterface, fleet: Fleet): Promise<void> {
   try {
     const taken = await takeCompletions($)
     if (!taken.length) return
+    await writeAgents($).catch(() => undefined) // the brief reads the agents file: these reports must be in it
     const chapter = await chapterOf($)
     const pace = await paceOf($)
     // What a look would cost, guessed from the main session's last step (a fork re-reads the same context); with none known,
     // from an average step of a usual chapter.
     const step = Math.max(1, fleet.spent || pace.step || Math.round(pace.claude / USUAL_STEPS))
-    await dream($, step, chapter.steps, undefined, { kind: 'agent', completions: taken.map(entry => entry.key), reports: agentReports(taken) })
+    await dream($, step, chapter.steps, undefined, { kind: 'agent', completions: taken })
   } catch {
   } finally {
     fleet.dreaming = false

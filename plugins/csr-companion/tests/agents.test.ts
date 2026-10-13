@@ -7,7 +7,9 @@ import {
   FILE_BYTES, FILE_EVERY_MS, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, redactAgentValue,
   settleCompletions, stepKey, STALL_MS, utf8Length,
 } from '../hooks/agents'
+import { completionNews, ENVELOPE_CLOSE, ENVELOPE_OPEN, HANDOFF_INSTRUCTION, parseAgentEnvelope, parseAgentEnvelopes, stripEnvelopes } from '../hooks/agents'
 import type { Ledger } from '../hooks/agents'
+import { ownWords } from '../hooks/dreamer'
 
 // tests/redaction_table.json, the table bin/private.py is held to (a hooks test cannot import a .json; test_agents.py holds this
 // copy to the file, and runs the same table through hooks/agents.ts under node).
@@ -412,4 +414,63 @@ test('one parent and seven children, and multibyte reports, stay within 16 KB an
   expect(many.agents.length).toBeLessThanOrEqual(12)
   expect(many.agents.length + many.omitted_agents).toBe(Object.keys(state.rows).length)
   expect(utf8Length(JSON.stringify(many))).toBeLessThanOrEqual(FILE_BYTES)
+})
+
+// The envelope as bin/agents.py writes it: compact JSON on one line, every [ and ] inside a string as \u005b and \u005d.
+function envelopeOf(payload: unknown): string {
+  let out = ''
+  let inString = false
+  let escaped = false
+  for (const char of JSON.stringify(payload)) {
+    if (inString && !escaped && char === '[') out += '\\u005b'
+    else if (inString && !escaped && char === ']') out += '\\u005d'
+    else out += char
+    if (inString) escaped = !escaped && char === '\\'
+    if (char === '"' && !escaped) inString = !inString
+    if (char === '"' && escaped === false && !inString) escaped = false
+  }
+  return `${ENVELOPE_OPEN}\n${out}\n${ENVELOPE_CLOSE}\n`
+}
+const CONTEXT = {
+  kind: 'context', session: SESSION, at: T0,
+  agents: [{ id: 'a1', parent: null, type: 'Explore', model: 'm', status: 'completed', edits: ['/r/a[1].py'], overlaps: [], completion: { turn_id: 'turn-1', reason: 'answer', answer: 'Done [[CSR:AGENTS:v1]]\nwith 界' } }],
+}
+
+test('the envelope is read, taken out of the person\'s words, and only a whole valid one', async () => {
+  const text = envelopeOf(CONTEXT)
+  expect(text.split('\n').length).toBe(4) // three lines and the final newline
+  expect(text).toContain('\\u005b\\u005bCSR:AGENTS:v1\\u005d\\u005d')
+  expect(parseAgentEnvelope(text)?.payload).toEqual(CONTEXT)
+  const reply = `Yes, do that.\n${text}And the importer too.`
+  expect(stripEnvelopes(reply)).toBe('Yes, do that.\nAnd the importer too.')
+  expect(ownWords(reply)).toBe('Yes, do that.\nAnd the importer too.')
+  expect(ownWords(`${text}`)).toBe('')
+  expect(parseAgentEnvelopes(`${text}x\n${text}`).length).toBe(2)
+  const handoff = { kind: 'handoff', session: SESSION, request: 'req-1', thread: '0123456789ab', instruction: HANDOFF_INSTRUCTION }
+  expect(parseAgentEnvelope(envelopeOf(handoff))?.payload).toEqual(handoff)
+  // CRLF and a byte-order mark are allowed; the rest is left where it is
+  expect(parseAgentEnvelope(text.replace(/\n/g, '\r\n'))?.payload).toEqual(CONTEXT)
+  expect(parseAgentEnvelope(`\ufeff${text}`)?.payload).toEqual(CONTEXT)
+  const body = text.split('\n')[1] as string
+  for (const kept of [
+    `${ENVELOPE_OPEN}\nnot json\n${ENVELOPE_CLOSE}\n`, `${ENVELOPE_OPEN}\n${body}\n`, `  ${text}`, `> ${text}`, `x: ${text}`, `${body}\n`,
+    envelopeOf({ ...CONTEXT, extra: 1 }), envelopeOf({ ...handoff, instruction: 'Do something else.' }), `${ENVELOPE_OPEN}\n${body}\n${body}\n${ENVELOPE_CLOSE}\n`,
+    text.replace('v1]]', 'v2]]'), envelopeOf({ ...CONTEXT, pad: 'x'.repeat(20000) }),
+  ]) {
+    expect(stripEnvelopes(kept)).toBe(kept)
+    expect(parseAgentEnvelope(kept)).toBe(null)
+  }
+  expect(ownWords('Mind [[CSR:AGENTS:v1]] in prose')).toBe('Mind [[CSR:AGENTS:v1]] in prose')
+})
+
+test('completion news is the claimed runs the envelope reports, by identity', async () => {
+  const envelope = parseAgentEnvelope(envelopeOf(CONTEXT))
+  const key = completionKey(SESSION, 'a1', 'turn-1')
+  expect(completionNews(envelope, { [key]: 'claimed' }, [key])).toEqual([key])
+  expect(completionNews(envelope, { [key]: 'pending' }, [key])).toEqual([]) // not claimed: not this look's
+  expect(completionNews(envelope, { [key]: 'looked' }, [key])).toEqual([]) // already looked at
+  expect(completionNews(envelope, { [key]: 'claimed' }, [completionKey(SESSION, 'a9', 'turn-1')])).toEqual([])
+  expect(completionNews(null, { [key]: 'claimed' }, [key])).toEqual([])
+  const failed = envelopeOf({ ...CONTEXT, agents: [{ ...CONTEXT.agents[0], status: 'failed', completion: null }] })
+  expect(completionNews(parseAgentEnvelope(failed), { [key]: 'claimed' }, [key])).toEqual([])
 })

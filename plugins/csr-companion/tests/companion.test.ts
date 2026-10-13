@@ -2396,6 +2396,15 @@ const reported = ($: Engine, agentId: string, turnId: string, answer = REPORT, m
   $.turn.complete({ answer, durationMs: 1000, isAborted: false, turnId, reason: 'answer', agentId, ...more } as never)
 const ledgerOf = (seen: ReturnType<typeof host>) => (seen.store.get(`agentLedger:${SID}`) ?? {}) as Record<string, string>
 const keyOfRun = (agent: string, turn: string) => JSON.stringify([SID, agent, turn])
+// The brief pane.py would print once these agents had reported: CSR's lines, then the agents as the machine envelope.
+type Said = { id: string; turn?: string; answer?: string; status?: string; type?: string | null }
+const briefWith = (...agents: Said[]) => {
+  const rows = agents.map(row => ({
+    id: row.id, parent: null, type: row.type === undefined ? 'Explore' : row.type, model: null, status: row.status ?? 'completed', edits: [], overlaps: [],
+    completion: row.answer === undefined ? null : { turn_id: row.turn ?? 'turn-1', reason: 'answer', answer: row.answer },
+  }))
+  return `${BRIEF}\n\n[[CSR:AGENTS:v1]]\n${JSON.stringify({ kind: 'context', session: SID, at: NOW, agents: rows })}\n[[/CSR:AGENTS:v1]]`
+}
 // A session whose own schedule is far off and whose Claude has spent plenty: only a completion can start a look.
 function roomy(seen: ReturnType<typeof host>, pace: Partial<ReturnType<typeof freshPace>> = {}) {
   seen.store.set(`chapter:${SID}`, { ...freshChapter(SID, NOW), due: 10_000, gen: 1 })
@@ -2436,7 +2445,7 @@ test('completion_usage_reconciles_without_double_counting', ON, async ($, on) =>
 
 // A report, the main session's next step and the 20 s timer all reach for it: one claim, one look, whatever the order.
 async function oneClaim($: Engine, on: On, order: 'step first' | 'timer first' | 'together') {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
   roomy(seen)
   await reported($, 'a1', 'turn-1')
   await seen.clock!.settle()
@@ -2466,7 +2475,7 @@ test('completion_step_and_timer_share_one_claim: the timer first', { options: { 
 test('completion_step_and_timer_share_one_claim: both at once', { options: { dreams: true } }, ($, on) => oneClaim($, on, 'together'))
 
 test('a timer finding the main session at work leaves the report for its next step', { options: { dreams: true } }, async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
   roomy(seen)
   await $.turn.start({ text: 'go', turnId: 'main-1' } as never)
   await reported($, 'a1', 'turn-1')
@@ -2480,7 +2489,7 @@ test('a timer finding the main session at work leaves the report for its next st
 })
 
 test('completion_claim_survives_reload_and_fork_failure', { options: { dreams: true } }, async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true, forkFails: true })
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, forkFails: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
   roomy(seen)
   await reported($, 'a1', 'turn-1')
   await steps($, 1)
@@ -2499,7 +2508,7 @@ test('completion_claim_survives_reload_and_fork_failure', { options: { dreams: t
 })
 
 test('a pending completion a reload finds is offered once', { options: { dreams: true } }, async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
   roomy(seen)
   await reported($, 'a1', 'turn-1')
   await $.session.start(START as never) // the module was reloaded before the 20 s were up
@@ -2513,7 +2522,7 @@ test('a pending completion a reload finds is offered once', { options: { dreams:
 })
 
 test('budget_blocked_completion_is_not_rearmed', { options: { dreams: true } }, async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
   roomy(seen, { claude: 100_000 }) // 10 tokens of Claude's for each of the dreamer's: 41,000 does not fit in 10,000
   await reported($, 'a1', 'turn-1')
   await steps($, 1)
@@ -2531,7 +2540,8 @@ test('budget_blocked_completion_is_not_rearmed', { options: { dreams: true } }, 
 })
 
 test('overshoot_debt_blocks_completion_look', { options: { dreams: true } }, async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  const world: World = { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }) }
+  const seen = host(on, world)
   roomy(seen, { claude: 1_000_000, dreamer: 300_000, looks: 3, lastLook: 41_000 }) // 100,000 over its share, owed
   await reported($, 'a1', 'turn-1')
   await steps($, 1)
@@ -2542,6 +2552,7 @@ test('overshoot_debt_blocks_completion_look', { options: { dreams: true } }, asy
   expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('skipped')
   // the debt paid by Claude's spending, a later report gets its look
   roomy(seen, { claude: 20_000_000, dreamer: 300_000, looks: 3, lastLook: 41_000 })
+  world.brief = briefWith({ id: 'a1', answer: REPORT }, { id: 'a2', answer: 'A second report.' }) // the agents file now holds both
   await reported($, 'a2', 'turn-1', 'A second report.')
   await steps($, 1)
   await settle(() => seen.forks.length >= 1)
@@ -2551,7 +2562,10 @@ test('overshoot_debt_blocks_completion_look', { options: { dreams: true } }, asy
 })
 
 test('simultaneous_completions_coalesce', { options: { dreams: true } }, async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, mockClock: true })
+  const seen = host(on, {
+    herdr: false, repo: true, mockClock: true,
+    brief: briefWith({ id: 'a1', answer: 'Report one.' }, { id: 'a2', answer: 'Report two.' }, { id: 'a3', turn: 'turn-4', answer: 'Report three.' }),
+  })
   roomy(seen)
   await Promise.all([reported($, 'a1', 'turn-1', 'Report one.'), reported($, 'a2', 'turn-1', 'Report two.'), reported($, 'a3', 'turn-4', 'Report three.')])
   await steps($, 1)
@@ -2596,4 +2610,29 @@ test('the ledger of an old session is swept with its other per-session keys', ON
   expect(seen.store.has('agentLedger:old-3')).toBe(true) // the newest 20 are kept
   expect(seen.store.has('agentLedger:old-22')).toBe(true)
   expect(seen.store.has(`agentLedger:${SID}`)).toBe(true)
+})
+
+test('a claimed completion the agents file did not carry is no news: the look is spent without a fork', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true }) // the brief is CSR's lines alone: no envelope
+  roomy(seen)
+  seen.store.set(`briefFacts:${SID}`, facts(BRIEF)) // and CSR has nothing new in them
+  await reported($, 'a1', 'turn-1')
+  await steps($, 1)
+  await settle(() => seen.kept.some(record => record.kind === 'look'))
+  expect(seen.forks).toEqual([])
+  expect(seen.kept.filter(record => record.kind === 'look')).toEqual([expect.objectContaining({ outcome: 'quiet', trigger: 'agent', completions: 1 })])
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('skipped')
+})
+
+test('the dreamer reads the claimed reports in the agents\' words, and the running agents as context only', { options: { dreams: true } }, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, brief: briefWith({ id: 'a1', answer: REPORT }, { id: 'a2', status: 'running', type: 'Plan' }) })
+  roomy(seen)
+  await reported($, 'a1', 'turn-1')
+  await steps($, 1)
+  await settle(() => seen.forks.length >= 1)
+  const prompt = seen.forks[0] as string
+  expect(prompt).toContain(`  > ${REPORT}`)
+  expect(prompt).toContain('Still at work, for context only (nothing to ask about yet): Plan (running).')
+  expect(prompt).not.toContain('[[CSR:AGENTS') // the machine envelope is not what the dreamer reads
+  expect(prompt).toContain('Do not dream about an agent that is running, stalled, failed, killed or reported nothing.')
 })

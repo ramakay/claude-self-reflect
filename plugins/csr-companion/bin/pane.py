@@ -1183,7 +1183,15 @@ def brief(con, root, session_id):
             owner = repo_root(folder) if os.path.isdir(folder) else None
             roots[folder] = owner and os.path.realpath(owner)
         return roots[folder]
-    tracked = [path for path in sorted(session.files, key=lambda p: session.last.get(p, 0), reverse=True) if root_of(path)]
+    # The files Claude handled, and those its agents wrote (the agents file, hooks/agents.ts): one union, newest first. An
+    # agent's files count from when it last acted; its notes come from the same CSR memory as Claude's own.
+    agents = agents_of(session_id)
+    heard = {path: session.last.get(path, 0) for path in session.files}
+    for row in agents['agents']:
+        for path in row['edits']:
+            if os.path.isabs(path):
+                heard[path] = max(heard.get(path, 0), row['last_at'] / 1000)
+    tracked = [path for path in sorted(heard, key=lambda p: heard[p], reverse=True) if root_of(path)]
     compacted = [at for at in session.compacts if at]
     before = max(compacted) if compacted else None  # this session's work before it counts as past
     for path in tracked[:6]:
@@ -1220,6 +1228,9 @@ def brief(con, root, session_id):
                 for ts, quote, sid in corrections]
     out += past_rows(voice_and_lines(con, session_id)[1], time.time())
     out += dream_rows(load_dream_log(root)[:8])
+    envelope = agents_lib.context_envelope(agents, session_id)  # the agents, as a machine envelope: context, not a "* " fact
+    if envelope:
+        out += ['', envelope]
     return '\n'.join(out).strip()
 
 
@@ -3236,7 +3247,9 @@ def cut_sends(line):
 
 def strip_forwards(text):
     """The text with every forward cut and your paragraphs kept (trimmed, joined by a blank line); the text as it
-    was when it carries none."""
+    was when it carries none. A complete CSR agents envelope (bin/agents.py) is the plugin's words, never yours: it
+    goes first, with its final newline, and every other character stays."""
+    text = agents_lib.strip_envelopes(text)
     lines = text.replace('\r\n', '\n').strip().split('\n')
     blank = lambda line: not line.strip()
     quoted = lambda line: line.lstrip().startswith('>')

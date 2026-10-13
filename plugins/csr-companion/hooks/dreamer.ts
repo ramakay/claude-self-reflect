@@ -6,6 +6,8 @@
 // keeps asking the agent, "what if...?". What is CSR's own is the brief: what
 // CSR remembers near this session, each fact with its receipt.
 
+import { stripEnvelopes } from './agents'
+
 export type Dream = { line: string; title: string; text: string }
 
 const listed = (lines: readonly string[]) => (lines.length ? lines.map(line => `- ${line}`).join('\n') : '(none)')
@@ -412,7 +414,9 @@ export function cutSends(line: string): string | null {
 
 // The text with every forward cut and the person's paragraphs kept (trimmed, joined by a blank line); the text as
 // it was when it carries none.
-export function stripForwards(text: string): string {
+export function stripForwards(source: string): string {
+  // A complete CSR agents envelope (hooks/agents.ts) is the plugin's words, never the person's: out first, the rest as it was.
+  const text = stripEnvelopes(source)
   const lines = text.replace(/\r\n/g, '\n').trim().split('\n')
   const blank = (line: string) => !line.trim()
   const cut = lines.map(() => false)

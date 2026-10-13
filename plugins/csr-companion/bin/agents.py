@@ -181,3 +181,193 @@ def recent_completion(agents, now):
     """The newest completion time (seconds) of a report within RECENT_SECONDS, else None."""
     times = [row['completion']['at'] / 1000 for row in agents if row['completion'] and now - row['completion']['at'] / 1000 <= RECENT_SECONDS]
     return max(times, default=None)
+
+
+# ---------------------------------------------------------------- the machine envelope
+#
+# What the plugin puts in front of a model or into a prompt box, and nowhere else, so that what it wrote is never read back
+# as the person's words (csr-engine's provenance guard knows the same grammar, registry entry plugin_agents_v1):
+#
+#   [[CSR:AGENTS:v1]]
+#   <one compact JSON object>
+#   [[/CSR:AGENTS:v1]]
+#
+# Exactly three physical lines and a final newline. The JSON escapes every newline and every [ and ] inside a string
+# ([, ]), so a report can never write a delimiter. Two payloads exist: the agents' context (the brief's) and the
+# handoff of a request to a background agent (Lost and found's). This module is the one formatter; hooks/agents.ts parses.
+OPEN = '[[CSR:AGENTS:v1]]'
+CLOSE = '[[/CSR:AGENTS:v1]]'
+MAX_ENVELOPE = 16384  # UTF-8 bytes, the three lines together
+HANDOFF_INSTRUCTION = "Copy this envelope unchanged into the background agent's prompt."
+CONTEXT_KEYS = {'kind', 'session', 'at', 'agents'}
+CONTEXT_AGENT_KEYS = {'id', 'parent', 'type', 'model', 'status', 'edits', 'overlaps', 'completion'}
+COMPLETION_KEYS = {'turn_id', 'reason', 'answer'}
+HANDOFF_KEYS = {'kind', 'session', 'request', 'thread', 'instruction'}
+REQUEST = re.compile(r'[A-Za-z0-9_.:-]{1,128}')
+
+
+def escape_brackets(dumped):
+    """Compact JSON with every [ and ] that sits inside a string written as \\u005b and \\u005d; the brackets of the JSON
+    itself (an array) are left."""
+    out, in_string, escaped = [], False, False
+    for char in dumped:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            elif char == '[':
+                out.append('\\u005b')
+                continue
+            elif char == ']':
+                out.append('\\u005d')
+                continue
+        elif char == '"':
+            in_string = True
+        out.append(char)
+    return ''.join(out)
+
+
+def string_ok(value, most):
+    return isinstance(value, str) and len(value) <= most and not CONTROL.search(value.replace('\n', '').replace('\t', ''))
+
+
+def valid_context(payload):
+    """Whether a parsed object is a context payload within the bounds of the agents file."""
+    if not isinstance(payload, dict) or set(payload) != CONTEXT_KEYS or payload['kind'] != 'context':
+        return False
+    if not (isinstance(payload['session'], str) and SESSION.fullmatch(payload['session'])) or not number(payload['at']):
+        return False
+    agents = payload['agents']
+    if not isinstance(agents, list) or len(agents) > MAX_AGENTS:
+        return False
+    for row in agents:
+        if not isinstance(row, dict) or set(row) != CONTEXT_AGENT_KEYS or not agent_id(row['id']):
+            return False
+        if not (row['parent'] is None or agent_id(row['parent'])) or row['status'] not in STATUSES:
+            return False
+        if not all(row[k] is None or string_ok(row[k], 300) for k in ('type', 'model')):
+            return False
+        for key in ('edits', 'overlaps'):
+            if not isinstance(row[key], list) or len(row[key]) > MAX_PATHS or not all(string_ok(p, 300) for p in row[key]):
+                return False
+        done = row['completion']
+        if done is not None and not (isinstance(done, dict) and set(done) == COMPLETION_KEYS and agent_id(done['turn_id'])
+                                     and done['reason'] in REASONS and string_ok(done['answer'], 700)):
+            return False
+    return True
+
+
+def valid_handoff(payload):
+    """Whether a parsed object is a handoff payload: only its keys, and its instruction word for word."""
+    return (isinstance(payload, dict) and set(payload) == HANDOFF_KEYS and payload['kind'] == 'handoff'
+            and isinstance(payload['session'], str) and bool(SESSION.fullmatch(payload['session']))
+            and isinstance(payload['request'], str) and bool(REQUEST.fullmatch(payload['request']))
+            and isinstance(payload['thread'], str) and bool(re.fullmatch(r'[0-9a-f]{12}', payload['thread']))
+            and payload['instruction'] == HANDOFF_INSTRUCTION)
+
+
+def valid_payload(payload):
+    return valid_context(payload) or valid_handoff(payload)
+
+
+def format_agents_context(payload):
+    """The envelope for a payload, three lines and a final newline. ValueError for a payload that is not a context or a
+    handoff, or that does not fit MAX_ENVELOPE bytes: nothing is cut here (context_envelope fits a context first)."""
+    if not valid_payload(payload):
+        raise ValueError('not an agents context or handoff payload')
+    body = escape_brackets(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+    text = f'{OPEN}\n{body}\n{CLOSE}\n'
+    if len(text.encode('utf-8')) > MAX_ENVELOPE:
+        raise ValueError('the envelope is over 16,384 bytes')
+    return text
+
+
+def parse_envelopes(text):
+    """Every complete valid envelope in `text`: [(start, end, payload)], offsets in characters; `end` is past the closing
+    line and its newline (the end of the text when the text stops there). A delimiter must start its line (a leading
+    byte-order mark is allowed at the very start of the text), the JSON is one line, the closing line follows it, LF and
+    CRLF both end lines, and the payload must be valid and the three lines within MAX_ENVELOPE bytes. Anything less is not
+    an envelope and is left where it is."""
+    if OPEN not in text:
+        return []
+    lines = text.split('\n')
+    starts, at = [], 0
+    for line in lines:
+        starts.append(at)
+        at += len(line) + 1
+    found, i = [], 0
+    while i + 2 < len(lines):
+        head = lines[i][:-1] if lines[i].endswith('\r') else lines[i]
+        if i == 0 and head.startswith('\ufeff'):
+            head = head[1:]
+        middle = lines[i + 1][:-1] if lines[i + 1].endswith('\r') else lines[i + 1]
+        tail = lines[i + 2][:-1] if lines[i + 2].endswith('\r') else lines[i + 2]
+        if head == OPEN and tail == CLOSE and '\r' not in middle:
+            try:
+                payload = json.loads(middle)
+            except (ValueError, RecursionError):
+                payload = None
+            size = len(f'{OPEN}\n{middle}\n{CLOSE}\n'.encode('utf-8', 'surrogatepass'))
+            if payload is not None and size <= MAX_ENVELOPE and valid_payload(payload):
+                last = i + 2 == len(lines) - 1
+                end = len(text) if last else starts[i + 2] + len(lines[i + 2]) + 1
+                found.append((starts[i], end, payload))
+                i += 3
+                continue
+        i += 1
+    return found
+
+
+def strip_envelopes(text):
+    """The text without its complete valid envelopes and their final newline; every other byte as it was."""
+    if not isinstance(text, str) or OPEN not in text:
+        return text
+    out, at = [], 0
+    for start, end, _ in parse_envelopes(text):
+        out.append(text[at:start])
+        at = end
+    out.append(text[at:])
+    return ''.join(out)
+
+
+def context_payload(projection, session):
+    """The context payload for the agents file's projection (read_agents): every agent with its status, files and, when it
+    finished with a report, that report. Failed, killed, interrupted and empty runs carry none: they are context, never
+    news."""
+    rows = []
+    for row in projection['agents'][:MAX_AGENTS]:
+        done = row['completion']
+        report = dict(turn_id=done['turn_id'], reason='answer', answer=done['answer'][:700]) \
+            if done and done['reason'] == 'answer' and done['answer'].strip() else None
+        rows.append(dict(id=row['id'], parent=row['parent'], type=row['type'], model=row['model'], status=row['status'],
+                         edits=list(row['edits']), overlaps=list(row['overlaps']), completion=report))
+    return dict(kind='context', session=session, at=int(projection['at'] or 0), agents=rows)
+
+
+def context_envelope(projection, session):
+    """The context envelope for the brief, fitted: reports shortened and then dropped, then the last agents, until it is
+    within MAX_ENVELOPE bytes. '' when there are no agents."""
+    payload = context_payload(projection, session)
+    if not payload['agents']:
+        return ''
+    for most in (700, 400, 160, 40, 0):
+        for row in payload['agents']:
+            if row['completion'] is not None:
+                row['completion']['answer'] = row['completion']['answer'][:most]
+                if not most:
+                    row['completion'] = None
+        try:
+            return format_agents_context(payload)
+        except ValueError as error:
+            if not str(error).startswith('the envelope'):
+                raise
+    while payload['agents']:
+        payload['agents'].pop()
+        try:
+            return format_agents_context(payload) if payload['agents'] else ''
+        except ValueError:
+            continue
+    return ''

@@ -500,3 +500,117 @@ export function planWrite(state: AgentState, now: number): WritePlan {
   const due = (state.fileAt as number) + FILE_EVERY_MS
   return { act: 'later', wait: due - now, state: { ...state, fileDue: due } }
 }
+
+// ---------------------------------------------------------------- the machine envelope (bin/agents.py formats it)
+
+// [[CSR:AGENTS:v1]] / one compact JSON line / [[/CSR:AGENTS:v1]]: what the brief carries of the agents, and what a
+// handoff carries into a background agent's prompt. Python writes it; this is the reader, and the one thing that takes
+// it out of a prompt before the words that remain are read as the person's. The rules are bin/agents.py's, and the
+// fixtures (tests/fixtures/emissions/agents-v1.json) hold the two to each other.
+export const ENVELOPE_OPEN = '[[CSR:AGENTS:v1]]'
+export const ENVELOPE_CLOSE = '[[/CSR:AGENTS:v1]]'
+export const ENVELOPE_MAX = 16384
+export const HANDOFF_INSTRUCTION = "Copy this envelope unchanged into the background agent's prompt."
+const STATUS_WORDS = new Set(['pending', 'running', 'waiting', 'idle', 'completed', 'failed', 'killed', 'unknown'])
+const REASON_WORDS = new Set(['answer', 'aborted', 'refusal', 'error'])
+
+export type EnvelopeAgent = {
+  id: string; parent: string | null; type: string | null; model: string | null; status: string
+  edits: string[]; overlaps: string[]; completion: { turn_id: string; reason: string; answer: string } | null
+}
+export type ContextPayload = { kind: 'context'; session: string; at: number; agents: EnvelopeAgent[] }
+export type HandoffPayload = { kind: 'handoff'; session: string; request: string; thread: string; instruction: string }
+export type Envelope = { start: number; end: number; payload: ContextPayload | HandoffPayload }
+
+const isObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+const sameKeys = (value: Record<string, unknown>, keys: readonly string[]) => {
+  const have = Object.keys(value)
+  return have.length === keys.length && keys.every(key => key in value)
+}
+const text = (value: unknown, most: number): value is string =>
+  typeof value === 'string' && Array.from(value).length <= most && !/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(value)
+const num = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && Math.abs(value) < 1e18
+const listOf = (value: unknown, most: number, each: (item: unknown) => boolean) => Array.isArray(value) && value.length <= most && value.every(each)
+
+function validContext(payload: Record<string, unknown>): payload is ContextPayload {
+  if (!sameKeys(payload, ['kind', 'session', 'at', 'agents']) || payload.kind !== 'context') return false
+  if (typeof payload.session !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(payload.session) || !num(payload.at)) return false
+  return listOf(payload.agents, 12, row => {
+    if (!isObject(row) || !sameKeys(row, ['id', 'parent', 'type', 'model', 'status', 'edits', 'overlaps', 'completion'])) return false
+    if (typeof row.id !== 'string' || !safeId(row.id) || !(row.parent === null || (typeof row.parent === 'string' && safeId(row.parent)))) return false
+    if (typeof row.status !== 'string' || !STATUS_WORDS.has(row.status)) return false
+    if (!(row.type === null || text(row.type, 300)) || !(row.model === null || text(row.model, 300))) return false
+    if (!listOf(row.edits, 8, path => text(path, 300)) || !listOf(row.overlaps, 8, path => text(path, 300))) return false
+    const done = row.completion
+    if (done === null) return true
+    return isObject(done) && sameKeys(done, ['turn_id', 'reason', 'answer']) && typeof done.turn_id === 'string' && safeId(done.turn_id) &&
+      typeof done.reason === 'string' && REASON_WORDS.has(done.reason) && text(done.answer, ANSWER_MAX)
+  })
+}
+
+function validHandoff(payload: Record<string, unknown>): payload is HandoffPayload {
+  return sameKeys(payload, ['kind', 'session', 'request', 'thread', 'instruction']) && payload.kind === 'handoff' &&
+    typeof payload.session === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(payload.session) &&
+    typeof payload.request === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(payload.request) &&
+    typeof payload.thread === 'string' && /^[0-9a-f]{12}$/.test(payload.thread) && payload.instruction === HANDOFF_INSTRUCTION
+}
+
+// Every complete valid envelope in a text, offsets in UTF-16 code units; `end` is past the closing line and its newline.
+export function parseAgentEnvelopes(source: string): Envelope[] {
+  if (!source.includes(ENVELOPE_OPEN)) return []
+  const lines = source.split('\n')
+  const starts: number[] = []
+  let at = 0
+  for (const line of lines) {
+    starts.push(at)
+    at += line.length + 1
+  }
+  const found: Envelope[] = []
+  const unr = (line: string) => (line.endsWith('\r') ? line.slice(0, -1) : line)
+  for (let i = 0; i + 2 < lines.length; i++) {
+    let head = unr(lines[i] as string)
+    if (i === 0 && head.startsWith('﻿')) head = head.slice(1)
+    const middle = unr(lines[i + 1] as string)
+    const tail = unr(lines[i + 2] as string)
+    if (head !== ENVELOPE_OPEN || tail !== ENVELOPE_CLOSE || middle.includes('\r')) continue
+    if (utf8Length(`${ENVELOPE_OPEN}\n${middle}\n${ENVELOPE_CLOSE}\n`) > ENVELOPE_MAX) continue
+    let payload: unknown
+    try {
+      payload = JSON.parse(middle)
+    } catch {
+      continue
+    }
+    if (!isObject(payload) || !(validContext(payload) || validHandoff(payload))) continue
+    const last = i + 2 === lines.length - 1
+    found.push({ start: starts[i] as number, end: last ? source.length : (starts[i + 2] as number) + (lines[i + 2] as string).length + 1, payload: payload as ContextPayload | HandoffPayload })
+    i += 2
+  }
+  return found
+}
+
+// The first complete valid envelope of a text, or null.
+export const parseAgentEnvelope = (source: string): Envelope | null => parseAgentEnvelopes(source)[0] ?? null
+
+// The text without its complete valid envelopes and their final newline; every other character as it was.
+export function stripEnvelopes(source: string): string {
+  const found = parseAgentEnvelopes(source)
+  if (!found.length) return source
+  let out = ''
+  let from = 0
+  for (const envelope of found) {
+    out += source.slice(from, envelope.start)
+    from = envelope.end
+  }
+  return out + source.slice(from)
+}
+
+// The finished runs a context envelope reports, by identity: each key is [session, agent, turn] as completionKey makes
+// it, here only the ones the ledger has claimed. These, and no elapsed-time text, are what a completion's look is news for.
+export function completionNews(envelope: Envelope | null, ledger: Ledger, wanted: readonly CompletionKey[]): CompletionKey[] {
+  if (!envelope || envelope.payload.kind !== 'context') return []
+  const { session, agents } = envelope.payload
+  return agents.flatMap(row =>
+    row.completion && row.completion.reason === 'answer' && row.completion.answer.trim() !== ''
+      ? [completionKey(session, row.id, row.completion.turn_id)] : [])
+    .filter(key => wanted.includes(key) && ledger[key] === 'claimed')
+}

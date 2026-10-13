@@ -51,6 +51,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 BIN = ROOT / 'bin'
 
@@ -389,3 +390,272 @@ class InFlight(unittest.TestCase):
         names = [x['name'] for x in lines.sections]
         self.assertEqual(names, ['story', 'flight', 'dreams'])
         self.assertEqual([i['key'] for i in lines.sections[1]['items']], ['flight:p1'])  # the held one is replaced by the live one
+
+
+# ---------------------------------------------------------------- the machine envelope
+
+FIXTURE = ROOT / 'tests' / 'fixtures' / 'emissions' / 'agents-v1.json'
+EXPORT = ROOT / 'tests' / 'export-agent-emissions.py'
+
+# the hooks' modules under node, with their relative imports resolved
+LOAD = r'''
+const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm')
+const ts = require(process.argv[1])
+const cache = new Map()
+function load(file) {
+  if (cache.has(file)) return cache.get(file).exports
+  const mod = { exports: {} }
+  cache.set(file, mod)
+  const js = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  const req = name => {
+    if (!name.startsWith('.')) throw new Error('unexpected import ' + name)
+    const base = path.resolve(path.dirname(file), name)
+    return load(['.ts', '.tsx'].map(ext => base + ext).find(f => fs.existsSync(f)))
+  }
+  vm.runInThisContext(`(function(require,module,exports){${js}\n})`)(req, mod, mod.exports)
+  return mod.exports
+}
+const input = JSON.parse(fs.readFileSync(0, 'utf8'))
+const hooks = path.join(process.argv[2], 'hooks')
+const agents = load(path.join(hooks, 'agents.ts')), dreamer = load(path.join(hooks, 'dreamer.ts'))
+const answer = {}
+for (const [name, text] of Object.entries(input.texts)) {
+  const found = agents.parseAgentEnvelopes(text)
+  answer[name] = { parsed: found.map(e => ({ start: e.start, end: e.end, payload: e.payload })), stripped: agents.stripEnvelopes(text), own: dreamer.ownWords(text) }
+}
+process.stdout.write(JSON.stringify(answer))
+'''
+
+
+def under_node(compiler, texts):
+    ran = subprocess.run(['node', '-e', LOAD, compiler, str(ROOT)], input=json.dumps(dict(texts=texts)), capture_output=True, text=True, timeout=60)
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    return json.loads(ran.stdout)
+
+
+def compiler_path():
+    for parent in ROOT.parents:
+        candidate = parent / 'node_modules/typescript/lib/typescript.js'
+        if candidate.is_file():
+            return str(candidate)
+    found = subprocess.run(['npm', 'root', '-g'], capture_output=True, text=True).stdout.strip()
+    for candidate in [Path(found) / 'typescript/lib/typescript.js', *Path(found).glob('*/node_modules/typescript/lib/typescript.js'),
+                      *Path(found).glob('@*/*/node_modules/typescript/lib/typescript.js')]:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+CONTEXT = dict(kind='context', session=SESSION, at=1_800_000_000_000, agents=[
+    dict(id='a1', parent=None, type='Explore', model='m', status='completed', edits=['/r/a[1].py'], overlaps=[],
+         completion=dict(turn_id='t1', reason='answer', answer='Done [[CSR:AGENTS:v1]]\nwith 界 "quotes"')),
+    dict(id='a2', parent='a1', type=None, model=None, status='running', edits=[], overlaps=[], completion=None)])
+
+
+class TheEnvelope(unittest.TestCase):
+    def test_the_context_envelope_is_exactly_three_lines_with_its_brackets_escaped(self):
+        text = agents_lib.format_agents_context(CONTEXT)
+        self.assertTrue(text.endswith('\n'))
+        lines = text.split('\n')
+        self.assertEqual((lines[0], lines[2], lines[3], len(lines)), ('[[CSR:AGENTS:v1]]', '[[/CSR:AGENTS:v1]]', '', 4))
+        self.assertNotIn('\n', lines[1])
+        body = lines[1]
+        self.assertEqual((body.count('['), body.count(']')), (5, 5))  # the JSON's own arrays: agents, and edits and overlaps of two rows
+        self.assertIn('\\u005b\\u005bCSR:AGENTS:v1\\u005d\\u005d', body)
+        self.assertIn('a\\u005b1\\u005d.py', body)
+        self.assertEqual(json.loads(body), CONTEXT)  # and it is the same payload
+
+    def test_only_valid_payloads_are_formatted_and_the_size_is_bounded(self):
+        bad = [dict(CONTEXT, extra=1), dict(CONTEXT, kind='other'), dict(CONTEXT, session='../x'), dict(CONTEXT, agents='x'),
+               dict(CONTEXT, agents=CONTEXT['agents'] * 7),
+               dict(CONTEXT, agents=[dict(CONTEXT['agents'][0], status='done')]),
+               dict(CONTEXT, agents=[dict(CONTEXT['agents'][0], completion=dict(turn_id='t', reason='answer', answer='x' * 701))]),
+               dict(CONTEXT, agents=[dict(CONTEXT['agents'][0], edits=['x'] * 9)]),
+               dict(kind='handoff', session=SESSION, request='r', thread='0123456789ab', instruction='Do something else.'),
+               dict(kind='handoff', session=SESSION, request='r', thread='not-hex', instruction=agents_lib.HANDOFF_INSTRUCTION),
+               dict(kind='handoff', session=SESSION, request='r', thread='0123456789ab', instruction=agents_lib.HANDOFF_INSTRUCTION, more=1)]
+        for payload in bad:
+            with self.subTest(payload=str(payload)[:80]):
+                with self.assertRaises(ValueError):
+                    agents_lib.format_agents_context(payload)
+        wide = dict(CONTEXT, agents=[dict(CONTEXT['agents'][0], id=f'a{n}', edits=['é' * 300] * 8, overlaps=['é' * 300] * 8,
+                                           completion=dict(turn_id='t', reason='answer', answer='界' * 700)) for n in range(12)])
+        with self.assertRaises(ValueError):  # a payload past 16,384 bytes is refused, not cut
+            agents_lib.format_agents_context(wide)
+        fitted = agents_lib.context_envelope(dict(agents=wide['agents'], omitted_agents=0, at=1.0), SESSION) if False else None
+        self.assertIsNone(fitted)
+
+    def test_a_handoff_envelope_carries_its_instruction_word_for_word(self):
+        payload = dict(kind='handoff', session=SESSION, request='req-1', thread='0123456789ab', instruction=agents_lib.HANDOFF_INSTRUCTION)
+        text = agents_lib.format_agents_context(payload)
+        self.assertEqual([(s, e, p) for s, e, p in agents_lib.parse_envelopes(text)], [(0, len(text), payload)])
+
+    def test_brief_agent_envelope_round_trip(self):
+        """What bin/agents.py writes into the brief is what hooks/agents.ts reads out of it."""
+        ours = agents_lib.format_agents_context(CONTEXT)
+        around = f'Facts about the work.\n* a line\n\n{ours}'.rstrip('\n')  # as pane.py's brief ends: the final newline stripped
+        self.assertEqual([p for _, _, p in agents_lib.parse_envelopes(around)], [CONTEXT])
+        self.assertEqual(agents_lib.strip_envelopes(around), 'Facts about the work.\n* a line\n\n')
+        compiler = compiler_path()
+        if not compiler:
+            if os.environ.get('CI'):
+                self.fail('CI installs a pinned typescript before pytest')
+            self.skipTest('An installed TypeScript compiler is unavailable')
+        got = under_node(compiler, dict(brief=around, context=ours))
+        self.assertEqual([e['payload'] for e in got['brief']['parsed']], [CONTEXT])
+        self.assertEqual(got['brief']['stripped'], 'Facts about the work.\n* a line\n\n')
+        self.assertEqual((got['context']['stripped'], got['context']['own']), ('', ''))
+        self.assertEqual(got['brief']['own'], 'Facts about the work.\n* a line\n\n')
+
+    def test_agent_envelope_preserves_surrounding_user_reply(self):
+        ours = agents_lib.format_agents_context(CONTEXT)
+        reply = f'Yes, please do that.\n{ours}And check the importer too.'
+        self.assertEqual(agents_lib.strip_envelopes(reply), 'Yes, please do that.\nAnd check the importer too.')
+        self.assertEqual(pane.strip_forwards(reply), 'Yes, please do that.\nAnd check the importer too.')
+        self.assertEqual(pane.own_words(reply), 'Yes, please do that.\nAnd check the importer too.')
+        # the person's own words are untouched, byte for byte, when nothing is an envelope
+        words = 'Mind [[CSR:AGENTS:v1]] in prose\n  indented\n'
+        self.assertEqual(agents_lib.strip_envelopes(words), words)
+        self.assertEqual(pane.strip_forwards('Plain words.'), 'Plain words.')
+        compiler = compiler_path()
+        if compiler:
+            got = under_node(compiler, dict(reply=reply, plain=words))
+            self.assertEqual(got['reply']['own'], 'Yes, please do that.\nAnd check the importer too.')
+            self.assertEqual(got['plain']['stripped'], words)
+
+    def test_only_complete_valid_envelopes_at_the_start_of_a_line_are_removed(self):
+        good = agents_lib.format_agents_context(CONTEXT)
+        body = good.split('\n')[1]
+        keep = {
+            'bare markers': '[[CSR:AGENTS:v1]]\nnot json\n[[/CSR:AGENTS:v1]]\n',
+            'open only': '[[CSR:AGENTS:v1]]\n' + body + '\n',
+            'no close': '[[CSR:AGENTS:v1]]\n' + body + '\nsomething else\n',
+            'indented': '  ' + good,
+            'quoted': '> ' + good.replace('\n', '\n> '),
+            'grep prefix': ''.join(f'file.txt:{n}:{line}\n' for n, line in enumerate(good.splitlines(), 1)),
+            'extra key': '[[CSR:AGENTS:v1]]\n' + json.dumps(dict(CONTEXT, extra=1), separators=(',', ':')) + '\n[[/CSR:AGENTS:v1]]\n',
+            'two json lines': '[[CSR:AGENTS:v1]]\n' + body + '\n' + body + '\n[[/CSR:AGENTS:v1]]\n',
+            'over the size': '[[CSR:AGENTS:v1]]\n' + json.dumps(dict(CONTEXT, pad='x' * 20000)) + '\n[[/CSR:AGENTS:v1]]\n',
+            'wrong version': good.replace('v1]]', 'v2]]'),
+            'raw agents json': body + '\n',
+        }
+        for name, text in keep.items():
+            with self.subTest(name):
+                self.assertEqual(agents_lib.strip_envelopes(text), text)
+                self.assertEqual(agents_lib.parse_envelopes(text), [])
+        for name, text in {'CRLF': good.replace('\n', '\r\n'), 'BOM': '﻿' + good, 'no final newline': good.rstrip('\n'),
+                           'twice': good + 'between\n' + good}.items():
+            with self.subTest(name):
+                self.assertGreaterEqual(len(agents_lib.parse_envelopes(text)), 1)
+                self.assertNotIn('[[CSR:AGENTS:v1]]', agents_lib.strip_envelopes(text))
+        self.assertEqual(agents_lib.strip_envelopes(good + 'between\n' + good), 'between\n')
+        self.assertEqual(agents_lib.strip_envelopes('a\r\n' + good.replace('\n', '\r\n') + 'b'), 'a\r\nb')
+
+    def test_the_fixture_is_what_the_formatter_writes_and_never_rewritten_by_check(self):
+        before = FIXTURE.read_bytes()
+        ran = subprocess.run([sys.executable, '-B', str(EXPORT), '--check'], capture_output=True, text=True, timeout=60)
+        self.assertEqual((ran.returncode, ran.stderr), (0, ''))
+        self.assertEqual(FIXTURE.read_bytes(), before)
+        doc = json.loads(before)
+        self.assertEqual((doc['formatter'], sorted(doc['fixtures'])), ('plugin_agents_v1', ['context', 'handoff']))
+        import hashlib
+        for name, entry in doc['fixtures'].items():
+            self.assertEqual(hashlib.sha256(entry['text'].encode('utf-8')).hexdigest(), entry['sha256'])
+            self.assertEqual(agents_lib.format_agents_context(entry['payload']), entry['text'])
+            self.assertEqual([p for _, _, p in agents_lib.parse_envelopes(entry['text'])], [entry['payload']])
+        # a fixture that is not what the formatter writes fails the check, and the check leaves it as it found it
+        folder = tempfile.mkdtemp(prefix='csr-fixture-')
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        stale = Path(folder) / 'agents-v1.json'
+        stale.write_bytes(before.replace(b'synthetic-session', b'another-session', 1))
+        ran = subprocess.run([sys.executable, '-B', str(EXPORT), '--check'], capture_output=True, text=True, timeout=60,
+                             env=dict(os.environ, CSR_AGENT_EMISSIONS_FIXTURE=str(stale)))
+        self.assertEqual(ran.returncode, 1)
+        self.assertIn('is not what bin/agents.py writes', ran.stderr)
+        self.assertEqual(stale.read_bytes(), before.replace(b'synthetic-session', b'another-session', 1))
+        self.assertEqual(subprocess.run([sys.executable, '-B', str(EXPORT)], capture_output=True, text=True).returncode, 2)
+
+    def test_the_hooks_read_the_fixture_the_same_way(self):
+        compiler = compiler_path()
+        if not compiler:
+            if os.environ.get('CI'):
+                self.fail('CI installs a pinned typescript before pytest')
+            self.skipTest('An installed TypeScript compiler is unavailable')
+        doc = json.loads(FIXTURE.read_text(encoding='utf-8'))
+        got = under_node(compiler, {name: entry['text'] for name, entry in doc['fixtures'].items()})
+        for name, entry in doc['fixtures'].items():
+            with self.subTest(name):
+                self.assertEqual([e['payload'] for e in got[name]['parsed']], [entry['payload']])
+                self.assertEqual((got[name]['stripped'], got[name]['own']), ('', ''))
+
+
+class TheBrief(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='csr-brief-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = os.path.realpath(os.path.join(self.tmp, 'repo'))
+        os.makedirs(self.repo)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        subprocess.run(['git', '-C', self.repo, 'init', '-q'], check=True, env=env)
+        self.main_file, self.agent_file = os.path.join(self.repo, 'main.py'), os.path.join(self.repo, 'agent.py')
+        for path in (self.main_file, self.agent_file):
+            open(path, 'w').close()
+        self.asked = []
+        agents_dir = os.path.join(self.tmp, 'agents')
+        os.makedirs(agents_dir)
+        self.doc = dict(version=1, session=SESSION, at=MS, agents=[], omitted_agents=0)
+        self.agents_dir = agents_dir
+
+        class Fake:
+            files, last, compacts, talk = {self.main_file: 2}, {self.main_file: NOW - 500}, [], []
+
+            def __init__(me, session_id):
+                pass
+
+            def read_transcript(me):
+                pass
+
+        patches = [unittest.mock.patch.object(pane, name, value) for name, value in (
+            ('Session', Fake), ('built_near', lambda *a, **k: []), ('voice_and_lines', lambda *a, **k: (None, [])),
+            ('load_dream_log', lambda *a, **k: []), ('typed_by_you', lambda *a, **k: True),
+            ('notes_for', lambda con, root, path, session_id=None, before=None: self.asked.append(path) or []),
+            ('agents_of', lambda session_id, folder=None: self.read()))]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        con = sqlite3.connect(':memory:')
+        con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, byte_start int, project text, kind text)')
+        self.addCleanup(con.close)
+        self.con = con
+
+    def read(self):
+        return agents_lib.check(self.doc, SESSION)
+
+    def agent(self, name, edits, status='completed', completion=None):
+        return dict(id=name, parent=None, description='d', type='Explore', model='m', status=status, started=MS, first_seen=MS,
+                    last_at=MS - 1000, tools=1, tokens=1, edits=edits, edits_omitted=0, overlaps=[], overlaps_omitted=0, last='', last_tool=None,
+                    current_turn='t', completion=completion, listed=True)
+
+    def test_brief_includes_subagent_files(self):
+        self.doc['agents'] = [self.agent('a1', [self.agent_file, '/not/in/a/repo/x.py'])]
+        pane.brief(self.con, self.repo, SESSION)
+        self.assertEqual(sorted(self.asked), sorted([self.main_file, self.agent_file]))  # the union, the file outside any repo left out
+        self.asked.clear()
+        self.doc['agents'] = []
+        pane.brief(self.con, self.repo, SESSION)
+        self.assertEqual(self.asked, [self.main_file])  # and without agents, as before
+
+    def test_the_brief_ends_with_the_agents_envelope_and_no_star_line_for_them(self):
+        done = dict(key='k', turnId='t', at=MS, reason='answer', answer='The importer drops a batch.', disposition='pending')
+        self.doc['agents'] = [self.agent('a1', [], completion=done), self.agent('a2', [], status='running'),
+                              self.agent('a3', [], status='failed', completion=dict(done, reason='error', answer='')),
+                              self.agent('a4', [], completion=dict(done, answer='  '))]
+        text = pane.brief(self.con, self.repo, SESSION)
+        (found,) = agents_lib.parse_envelopes(text)
+        payload = found[2]
+        self.assertEqual(text.splitlines()[-1], '[[/CSR:AGENTS:v1]]')
+        self.assertEqual({row['id']: row['completion'] for row in payload['agents']},
+                         {'a1': dict(turn_id='t', reason='answer', answer='The importer drops a batch.'), 'a2': None, 'a3': None, 'a4': None})
+        self.assertEqual([line for line in text.splitlines() if line.startswith('* ')], [])  # no "* " fact: not news by text
+        self.doc['agents'] = []
+        self.assertNotIn('[[CSR:AGENTS', pane.brief(self.con, self.repo, SESSION))
