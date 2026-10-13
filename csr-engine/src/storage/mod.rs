@@ -57,14 +57,33 @@ pub struct Storage {
     common_terms: vocabulary::CommonTermsCache,
 }
 
-const CONTAMINATION_META_KEY: &str = "contamination_measurement_v1";
+/// v2: the count means something else now (ownership-proven, three bins), so a
+/// v1 measurement made by the text-only predicate is never read as one.
+const CONTAMINATION_META_KEY: &str = "contamination_measurement_v2";
 
+/// Conversations in three bins over one population; see
+/// [`Storage::contamination_census`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ContaminationMeasurement {
+    /// Proven contaminated. The only bin that raises the status warning.
     pub conversations: usize,
+    /// Look like CSR output but cannot be attributed: kept, never counted clean.
+    #[serde(default)]
+    pub unjudged: usize,
+    #[serde(default)]
+    pub clean: usize,
     pub total_conversations: usize,
     pub pct: f64,
     pub last_measured: String,
+}
+
+/// The conversations behind a [`ContaminationMeasurement`], each with the first
+/// reason it was binned for.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContaminationCensus {
+    pub proven: Vec<(String, String)>,
+    pub unjudged: Vec<(String, String)>,
+    pub total_conversations: usize,
 }
 
 /// All access to a writable connection participates in maintenance exclusion.
@@ -920,56 +939,186 @@ impl Storage {
         queries::count_conversations(&conn)
     }
 
-    /// Return each distinct conversation whose persisted chunk content matches
-    /// the shared CSR-contamination predicate, with the first matching reason.
-    pub fn contaminated_conversations(&self) -> Result<Vec<(String, String)>> {
+    /// Every conversation measured against the one ownership-aware classifier,
+    /// in three bins over the same population:
+    ///
+    /// - **proven**: a stored chunk whose author is proven and whose text the
+    ///   matcher removes a span from;
+    /// - **unjudged**: no chunk is proven-removable, but one is unproven and
+    ///   looks like CSR output if read as user text. It is kept, never
+    ///   mutated, and never counted clean;
+    /// - **clean**: everything else.
+    ///
+    /// Cold path: one pass over `chunks` joined to their evidence rows, and no
+    /// source transcript is opened. A chunk that carries no CSR opening
+    /// (`could_contain_emission`) skips the proof entirely.
+    pub fn contamination_census(&self) -> Result<ContaminationCensus> {
+        use crate::import::contamination as owned;
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut statement = conn.prepare(
-            "SELECT conversation_id, content FROM chunks ORDER BY conversation_id, rowid",
+            "SELECT c.conversation_id, c.id, c.source, c.content, p.author,
+                    s.chunk_id, s.event_id, s.start_char, s.end_char, s.content_hash,
+                    e.event_id, e.conversation_id, e.message_key, e.seq, e.channel,
+                    e.trust_tier, e.parent_event_id, e.receipt_kind, e.receipt_ref, e.observed_at
+             FROM chunks c
+             LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
+             LEFT JOIN chunk_spans s ON s.chunk_id = c.id
+             LEFT JOIN provenance_events e ON e.event_id = s.event_id
+             ORDER BY c.conversation_id, c.rowid, s.start_char, s.event_id",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut contaminated = Vec::new();
-        let mut conversation = String::new();
-        let mut joined = String::new();
-        let mut selected = false;
-        for row in rows {
-            let (conversation_id, content) = row?;
-            if conversation_id != conversation {
-                if !selected {
-                    if let Some(reason) = crate::import::contamination_reason(&joined) {
-                        contaminated.push((conversation.clone(), reason.to_string()));
+
+        /// The rows of one chunk that might be contaminated, gathered until
+        /// the next chunk starts.
+        struct Pending {
+            chunk_id: String,
+            source: String,
+            content: String,
+            author: Option<crate::provenance::Speaker>,
+            spans: Vec<crate::provenance::ChunkSpan>,
+            events: Vec<crate::provenance::ProvenanceEvent>,
+        }
+        #[derive(Default)]
+        struct Conversation {
+            id: String,
+            proven: Option<owned::ContaminationReason>,
+            unjudged: Option<owned::ContaminationReason>,
+        }
+        let mut census = ContaminationCensus::default();
+        let mut conversation = Conversation::default();
+        let mut pending: Option<Pending> = None;
+        let mut current_chunk = String::new();
+        let mut skipping = false;
+
+        fn judge(conversation: &mut Conversation, pending: Pending) {
+            let evidence = owned::StoredChunkEvidence {
+                chunk_id: &pending.chunk_id,
+                conversation_id: &conversation.id,
+                source: Some(&pending.source),
+                content: &pending.content,
+                aggregate_author: pending.author,
+                spans: &pending.spans,
+                events: &pending.events,
+            };
+            match owned::prove_stored_ownership(evidence) {
+                owned::StoredOwnership::Proven(_) => {
+                    if let Some(reason) = owned::classify_stored_chunk(evidence) {
+                        conversation.proven.get_or_insert(reason);
                     }
                 }
-                conversation = conversation_id;
-                joined.clear();
-                selected = false;
+                owned::StoredOwnership::Unproven(_) => {
+                    // Plans and Codex rollouts are mentions by construction, and
+                    // so is a chunk every event of which is known to be some
+                    // other channel (a tool result): nothing there could be CSR
+                    // output, so nothing about it is left unjudged.
+                    let other_channels_only = !pending.events.is_empty()
+                        && pending.events.iter().all(|event| {
+                            !matches!(event.channel.as_str(), "user_message" | "assistant_message")
+                        });
+                    if !other_channels_only
+                        && !matches!(pending.source.as_str(), "plan" | "codex_rollout")
+                    {
+                        if let Some(reason) = owned::classify_as_user_text(&pending.content) {
+                            conversation.unjudged.get_or_insert(reason);
+                        }
+                    }
+                }
             }
-            if selected {
+        }
+        fn close(census: &mut ContaminationCensus, conversation: &mut Conversation) {
+            if conversation.id.is_empty() {
+                return;
+            }
+            census.total_conversations += 1;
+            if let Some(reason) = conversation.proven {
+                census
+                    .proven
+                    .push((conversation.id.clone(), reason.as_str().to_string()));
+            } else if let Some(reason) = conversation.unjudged {
+                census
+                    .unjudged
+                    .push((conversation.id.clone(), reason.as_str().to_string()));
+            }
+        }
+
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let chunk_id = row.get_ref(1)?.as_str()?;
+            if chunk_id != current_chunk {
+                if let Some(done) = pending.take() {
+                    judge(&mut conversation, done);
+                }
+                let conversation_id = row.get_ref(0)?.as_str()?;
+                if conversation_id != conversation.id {
+                    close(&mut census, &mut conversation);
+                    conversation = Conversation {
+                        id: conversation_id.to_string(),
+                        ..Conversation::default()
+                    };
+                }
+                current_chunk = chunk_id.to_string();
+                let content = row.get_ref(3)?.as_str()?;
+                skipping = !owned::could_contain_emission(content);
+                if !skipping {
+                    pending = Some(Pending {
+                        chunk_id: current_chunk.clone(),
+                        source: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        content: content.to_string(),
+                        author: row
+                            .get::<_, Option<String>>(4)?
+                            .and_then(|author| author.parse().ok()),
+                        spans: Vec::new(),
+                        events: Vec::new(),
+                    });
+                }
+            }
+            if skipping {
                 continue;
             }
-            if let Some(reason) = crate::import::contamination_reason(&content) {
-                contaminated.push((conversation.clone(), reason.to_string()));
-                selected = true;
-                joined.clear();
-            } else {
-                // This join selects candidates only. Scrub must independently
-                // prove continuity with spans before cutting across a boundary.
-                joined.push_str(&content);
+            let Some(pending) = pending.as_mut() else {
+                continue;
+            };
+            if let Some(event_id) = row.get::<_, Option<String>>(6)? {
+                pending.spans.push(crate::provenance::ChunkSpan {
+                    chunk_id: row.get(5)?,
+                    event_id,
+                    start_char: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(usize::MAX),
+                    end_char: usize::try_from(row.get::<_, i64>(8)?).unwrap_or(usize::MAX),
+                    content_hash: row.get(9)?,
+                });
+            }
+            if let Some(event_id) = row.get::<_, Option<String>>(10)? {
+                pending.events.push(crate::provenance::ProvenanceEvent {
+                    event_id,
+                    conversation_id: row.get(11)?,
+                    message_key: row.get(12)?,
+                    seq: usize::try_from(row.get::<_, i64>(13)?).unwrap_or(usize::MAX),
+                    channel: row.get(14)?,
+                    trust_tier: crate::provenance::TrustTier::from_db(row.get(15)?),
+                    parent_event_id: row.get(16)?,
+                    receipt_kind: row.get(17)?,
+                    receipt_ref: row.get(18)?,
+                    observed_at: row.get(19)?,
+                });
             }
         }
-        if !selected {
-            if let Some(reason) = crate::import::contamination_reason(&joined) {
-                contaminated.push((conversation, reason.to_string()));
-            }
+        if let Some(done) = pending.take() {
+            judge(&mut conversation, done);
         }
-        Ok(contaminated)
+        close(&mut census, &mut conversation);
+        Ok(census)
+    }
+
+    /// The conversations the census proves contaminated, with the first
+    /// reason: what `backfill scrub` selects and the status badge counts.
+    pub fn contaminated_conversations(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.contamination_census()?.proven)
     }
 
     pub fn refresh_contamination_cache(&self) -> Result<ContaminationMeasurement> {
-        let conversations = self.contaminated_conversations()?.len();
-        let total_conversations = self.count_conversations()?;
+        let census = self.contamination_census()?;
+        let total_conversations = census.total_conversations;
+        let conversations = census.proven.len();
+        let unjudged = census.unjudged.len();
         let pct = if total_conversations == 0 {
             0.0
         } else {
@@ -977,6 +1126,8 @@ impl Storage {
         };
         let measurement = ContaminationMeasurement {
             conversations,
+            unjudged,
+            clean: total_conversations.saturating_sub(conversations + unjudged),
             total_conversations,
             pct,
             last_measured: chrono::Utc::now().to_rfc3339(),
@@ -2812,50 +2963,186 @@ mod tests {
         );
     }
 
-    #[test]
-    fn contaminated_conversations_uses_shared_content_predicate_and_caches_measurement() {
-        let storage = Storage::open_memory().unwrap();
+    fn seed_chunk(storage: &Storage, id: &str, conversation_id: &str, source: &str, content: &str) {
         storage
             .with_connection(|conn| {
-                for (id, conversation_id, content) in [
-                    ("clean-1", "clean", "ordinary user-authored work"),
-                    (
-                        "recap-1",
-                        "recap",
-                        "[[CSR:RECAP]] generated recap paragraph",
-                    ),
-                    (
-                        "wrapper-1",
-                        "wrapper",
-                        "<system-reminder>CSR PICKUP — old context</system-reminder>",
-                    ),
-                ] {
-                    conn.execute(
-                        "INSERT INTO chunks
-                         (id, conversation_id, project_name, timestamp, content, message_count)
-                         VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1)",
-                        rusqlite::params![id, conversation_id, content],
-                    )?;
-                }
+                conn.execute(
+                    "INSERT INTO chunks
+                     (id, conversation_id, project_name, timestamp, content, message_count, source)
+                     VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1, ?4)",
+                    rusqlite::params![id, conversation_id, content, source],
+                )?;
                 Ok(())
             })
             .unwrap();
+    }
 
-        assert!(storage.cached_contamination().unwrap().is_none());
-        assert_eq!(
-            storage.contaminated_conversations().unwrap(),
-            vec![
-                ("recap".to_string(), "machine_sentinel".to_string()),
-                ("wrapper".to_string(), "system_reminder".to_string()),
-            ]
+    /// Evidence for a chunk made of exactly one event: the proof the count asks for.
+    fn seed_event_evidence(
+        storage: &Storage,
+        chunk_id: &str,
+        conversation_id: &str,
+        channel: &str,
+        content: &str,
+    ) {
+        let event = crate::provenance::ProvenanceEvent {
+            event_id: format!("event:{chunk_id}"),
+            conversation_id: conversation_id.to_string(),
+            message_key: format!("m-{chunk_id}"),
+            seq: 0,
+            channel: channel.to_string(),
+            trust_tier: crate::provenance::trust_for_channel(
+                channel,
+                crate::provenance::TrustTier::UserHistory,
+            ),
+            parent_event_id: None,
+            receipt_kind: "jsonl".to_string(),
+            receipt_ref: None,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        let span = crate::provenance::ChunkSpan {
+            chunk_id: chunk_id.to_string(),
+            event_id: event.event_id.clone(),
+            start_char: 0,
+            end_char: content.chars().count(),
+            content_hash: crate::provenance::content_hash(content),
+        };
+        storage
+            .replace_chunk_evidence(&crate::provenance::ChunkEvidence {
+                chunk_id: chunk_id.to_string(),
+                min_trust: event.trust_tier,
+                tool_result_share: Some(f64::from(u8::from(channel.starts_with("tool_result:")))),
+                events: vec![event],
+                spans: vec![span],
+            })
+            .unwrap();
+    }
+
+    const DEGRADED: &str = "CSR engine ready (degraded mode).";
+
+    #[test]
+    fn contamination_census_counts_proven_unjudged_and_clean_over_one_population() {
+        let storage = Storage::open_memory().unwrap();
+        // proven: one event owns the whole chunk and the matcher removes a span
+        seed_chunk(&storage, "proven-1", "proven", "conversation", DEGRADED);
+        seed_event_evidence(&storage, "proven-1", "proven", "user_message", DEGRADED);
+        // unjudged: the identical text with nothing to say who wrote it
+        seed_chunk(&storage, "unjudged-1", "unjudged", "conversation", DEGRADED);
+        // a non-CSR tool result holding every marker: not counted at all
+        let recap = "recap [2m ago]: Fixed it. [[CSR:RECAP]]";
+        seed_chunk(&storage, "tool-1", "tool", "conversation", recap);
+        seed_event_evidence(&storage, "tool-1", "tool", "tool_result:Bash", recap);
+        // a plan row quoting a CONTINUUM block: a document, never counted
+        seed_chunk(
+            &storage,
+            "plan-1",
+            "plan",
+            "plan",
+            "CSR CONTINUUM [2m ago]: example used in the implementation plan",
+        );
+        // clean prose, and a proven chunk that merely mentions a marker
+        seed_chunk(
+            &storage,
+            "clean-1",
+            "clean",
+            "conversation",
+            "ordinary user-authored work",
+        );
+        seed_chunk(
+            &storage,
+            "mention-1",
+            "mention",
+            "conversation",
+            "Why does [[CSR:RECAP]] exist?",
+        );
+        seed_event_evidence(
+            &storage,
+            "mention-1",
+            "mention",
+            "user_message",
+            "Why does [[CSR:RECAP]] exist?",
         );
 
+        assert!(storage.cached_contamination().unwrap().is_none());
+        let census = storage.contamination_census().unwrap();
+        assert_eq!(
+            census.proven,
+            vec![("proven".to_string(), "degraded_status".to_string())]
+        );
+        assert_eq!(
+            census.unjudged,
+            vec![("unjudged".to_string(), "degraded_status".to_string())]
+        );
+        assert_eq!(census.total_conversations, 6);
+        // scrub and the status badge select from the same proof
+        assert_eq!(storage.contaminated_conversations().unwrap(), census.proven);
+
         let measured = storage.refresh_contamination_cache().unwrap();
-        assert_eq!(measured.conversations, 2);
-        assert_eq!(measured.total_conversations, 3);
-        assert!((measured.pct - 66.666_666).abs() < 0.001);
+        assert_eq!(measured.conversations, 1);
+        assert_eq!(measured.unjudged, 1);
+        assert_eq!(measured.clean, 4);
+        assert_eq!(measured.total_conversations, 6);
+        assert_eq!(
+            measured.conversations + measured.unjudged + measured.clean,
+            measured.total_conversations
+        );
+        assert!((measured.pct - 100.0 / 6.0).abs() < 0.001);
         assert!(!measured.last_measured.is_empty());
         assert_eq!(storage.cached_contamination().unwrap(), Some(measured));
+    }
+
+    /// An unproven chunk is never mutated by being measured, and never counted
+    /// toward the warning: unjudged alone leaves `conversations` at zero.
+    #[test]
+    fn unproven_chunks_are_unjudged_not_proven_and_are_left_untouched() {
+        let storage = Storage::open_memory().unwrap();
+        // author alone is not proof
+        seed_chunk(&storage, "a", "only-author", "conversation", DEGRADED);
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO chunk_provenance (chunk_id, author, source_conv_id) VALUES ('a', 'user', 'only-author')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // proven channel, stale hash (content changed after the span was written)
+        seed_chunk(&storage, "b", "stale", "conversation", DEGRADED);
+        seed_event_evidence(
+            &storage,
+            "b",
+            "stale",
+            "user_message",
+            "different words entirely",
+        );
+        // two events: the chunk joins messages, so no one event owns it
+        seed_chunk(
+            &storage,
+            "c",
+            "two",
+            "conversation",
+            &format!("hello\n\n{DEGRADED}"),
+        );
+        let census_before = storage.contamination_census().unwrap();
+        assert!(
+            census_before.proven.is_empty(),
+            "{:?}",
+            census_before.proven
+        );
+        assert_eq!(census_before.unjudged.len(), 3);
+        let measured = storage.refresh_contamination_cache().unwrap();
+        assert_eq!(
+            (measured.conversations, measured.unjudged, measured.clean),
+            (0, 3, 0)
+        );
+        // measuring wrote nothing to the chunks
+        let content: String = storage
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT content FROM chunks WHERE id='a'", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(content, DEGRADED);
     }
 
     /// A raw `INSERT OR REPLACE INTO chunks` must not strand the replaced row's

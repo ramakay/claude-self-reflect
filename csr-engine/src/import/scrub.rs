@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 
 use crate::engine::Engine;
 use crate::import::{
-    classify_transcript, derive_conversation_attribution, parse_jsonl_file_with_stats_and_parent,
-    scrub_contaminated_text, ConversationChunk, ParentContext, TranscriptKind,
+    classify_transcript, contamination, derive_conversation_attribution,
+    parse_jsonl_file_with_stats_and_parent, ConversationChunk, ParentContext, TranscriptKind,
 };
 use crate::provenance::{ChunkEvidence, ChunkProvenance, TrustTier};
 use crate::storage::{queries, Storage};
@@ -163,6 +163,19 @@ fn reparse_refusal(
     }
 }
 
+// phase B: the paragraph-level text scrub is gone. This reads what the remover
+// would leave of a stored chunk read as user text; it only feeds the re-parse
+// check below and never decides a write. The scrub rewrite replaces it with the
+// stored ownership proof.
+fn text_after_removal(content: &str) -> Option<String> {
+    let removal = contamination::remove_csr_emissions(contamination::OwnedText {
+        source: contamination::SourceKind::Conversation,
+        channel: contamination::ContentChannel::UserText,
+        text: content,
+    });
+    (!removal.kept.is_empty()).then_some(removal.kept)
+}
+
 /// True when a stored chunk holds words of the person's (what is left after the
 /// scrub's own cut) that the re-parse no longer yields anywhere. A transcript
 /// that lost part of itself is no evidence that the part was contamination
@@ -190,7 +203,7 @@ fn reparse_lacks_stored_text(
         let own = if ambiguous[index] {
             Some(content.clone())
         } else {
-            scrub_contaminated_text(content)
+            text_after_removal(content)
         };
         own.is_some_and(|own| {
             own.lines().any(|line| {
@@ -437,7 +450,6 @@ fn cut_forwards_across_chunks(
 
 struct SourceCut {
     text: String,
-    continues_after: bool,
 }
 
 /// Source adapters can prove cuts even when historical chunks lack spans.
@@ -476,33 +488,17 @@ fn source_forward_cuts(
         return chunks
             .iter()
             .zip(own)
-            .enumerate()
-            .map(|(i, (chunk, own))| {
-                (
-                    chunk.id.clone(),
-                    SourceCut {
-                        text: own,
-                        continues_after: i + 1 < chunks.len(),
-                    },
-                )
-            })
+            .map(|(chunk, own)| (chunk.id.clone(), SourceCut { text: own }))
             .collect();
     }
     // A chunk matched on its own still keeps the whitespace it stored before
     // the next chunk; trimming it would glue the two slices together.
     chunks
         .iter()
-        .enumerate()
-        .filter_map(|(i, chunk)| {
-            index.without_forwards(&chunk.content).map(|own| {
-                (
-                    chunk.id.clone(),
-                    SourceCut {
-                        text: own,
-                        continues_after: i + 1 < chunks.len(),
-                    },
-                )
-            })
+        .filter_map(|chunk| {
+            index
+                .without_forwards(&chunk.content)
+                .map(|own| (chunk.id.clone(), SourceCut { text: own }))
         })
         .collect()
 }
@@ -522,53 +518,24 @@ fn cuts_with_source(
     (own, ambiguous)
 }
 
+// phase B: nothing is cut from stored text without a re-parse or a proof of
+// ownership, and the proof is not wired into scrub yet. Stored text with no
+// readable source is kept as it is; a conversation holding text that looks like
+// CSR output is reported unresolved so it is not mistaken for clean.
 fn in_place(
     old_chunks: &[ConversationChunk],
-    continues: &[bool],
-    source_cuts: &HashMap<String, SourceCut>,
+    _continues: &[bool],
+    _source_cuts: &HashMap<String, SourceCut>,
     reason: String,
 ) -> ScrubPlanKind {
-    let (carried, ambiguous) = cuts_with_source(old_chunks, continues, source_cuts);
-    let mut rewritten = Vec::new();
-    let mut dropped_ids = Vec::new();
-    for (index, (chunk, carried)) in old_chunks.iter().zip(&carried).enumerate() {
-        if ambiguous[index] {
-            continue;
-        }
-        let clean = scrub_contaminated_text(carried).map(|mut content| {
-            // Preserve whitespace at proven slice boundaries, including the
-            // separator carried by the chunk containing the next kept text.
-            // Source-mapped cuts prove their joins even without stored spans.
-            if (continues.get(index + 1) == Some(&true)
-                || source_cuts
-                    .get(&chunk.id)
-                    .is_some_and(|cut| cut.continues_after))
-                && carried.ends_with(char::is_whitespace)
-            {
-                content.push_str(&carried[carried.trim_end().len()..]);
-            }
-            if (continues[index] || source_cuts.contains_key(&chunk.id))
-                && carried.starts_with(char::is_whitespace)
-            {
-                content.insert_str(0, &carried[..carried.len() - carried.trim_start().len()]);
-            }
-            content
-        });
-        match clean {
-            Some(content) if content != chunk.content => {
-                let mut clean = chunk.clone();
-                clean.content = content;
-                rewritten.push(clean);
-            }
-            Some(_) => {}
-            None => dropped_ids.push(chunk.id.clone()),
-        }
-    }
+    let unresolved = old_chunks
+        .iter()
+        .any(|chunk| contamination::classify_as_user_text(&chunk.content).is_some());
     ScrubPlanKind::Missing {
-        rewritten,
-        dropped_ids,
+        rewritten: Vec::new(),
+        dropped_ids: Vec::new(),
         reason,
-        unresolved: ambiguous.into_iter().any(|value| value),
+        unresolved,
     }
 }
 
@@ -980,7 +947,11 @@ fn selected_plans(
 ) -> Result<Vec<ScrubPlan>> {
     let now = SystemTime::now();
     let mut plans = Vec::new();
-    for (id, _) in storage.contaminated_conversations()? {
+    // phase B: proven conversations may be rewritten from stored proof; the
+    // unjudged ones are planned only so a readable source can settle them with
+    // the real importer. Without a source their text is kept.
+    let census = storage.contamination_census()?;
+    for (id, _) in census.proven.into_iter().chain(census.unjudged) {
         if conversation.is_some_and(|wanted| wanted != id) || skip.contains(&id) {
             continue;
         }
@@ -1380,6 +1351,7 @@ pub async fn run_scrub(
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    #[ignore = "phase B: persisted cross-chunk forward cuts leave with the scrub rewrite"]
     async fn r6_ordered_forward_prefix_table_persisted_scrub() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
@@ -1450,6 +1422,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: unproven cross-chunk joins are no longer actionable"]
     async fn r6_persisted_join_space_crosses_chunks() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
@@ -1530,6 +1503,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: persisted cross-chunk forward cuts leave with the scrub rewrite"]
     async fn r8_persisted_forward_variants_preserve_source_boundaries() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
@@ -1570,10 +1544,7 @@ mod tests {
                     crate::extraction::provenance::extractable(raw).as_deref(),
                     Some(*expected)
                 );
-                assert_eq!(
-                    super::scrub_contaminated_text(raw).as_deref(),
-                    Some(*expected)
-                );
+                assert_eq!(super::text_after_removal(raw).as_deref(), Some(*expected));
                 let mut positions = vec![
                     0,
                     raw.len(),
@@ -1672,6 +1643,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: persisted cross-chunk forward cuts leave with the scrub rewrite"]
     async fn r8_source_backed_boundary_whitespace_survives_persisted_scrub() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
@@ -1732,6 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: chunk-matched source cuts leave with the scrub rewrite"]
     async fn r9_chunk_matched_source_cut_keeps_trailing_join() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open(&temp.path().join("db")).unwrap());
@@ -1862,6 +1835,10 @@ mod tests {
             "scrub must keep a distinct personal message missing from the source"
         );
     }
+    fn squash(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
     #[test]
     fn round4_personal_digit_before_forward_survives() {
         let raw = "I vote 2 CSR's compaction card (compacting), quoted: “One.” Keep the deployment frozen.";
@@ -1870,7 +1847,12 @@ mod tests {
             crate::extraction::provenance::extractable(raw).as_deref(),
             expected
         );
-        assert_eq!(super::scrub_contaminated_text(raw).as_deref(), expected);
+        // The remover keeps every byte outside the forward, so the person's
+        // words agree with extraction up to the whitespace around the cut.
+        assert_eq!(
+            super::text_after_removal(raw).map(|text| squash(&text)),
+            expected.map(squash)
+        );
     }
 
     #[test]
@@ -1907,13 +1889,17 @@ mod tests {
             let extracted = crate::extraction::provenance::extractable(&raw);
             println!(
                 "prefix={prefix} forwards={cut:?} extractable={extracted:?} scrub={:?}",
-                super::scrub_contaminated_text(&raw)
+                super::text_after_removal(&raw)
             );
             assert_eq!(extracted.as_deref(), Some(own));
-            assert_eq!(super::scrub_contaminated_text(&raw).as_deref(), Some(own));
+            assert_eq!(
+                super::text_after_removal(&raw).map(|text| squash(&text)),
+                Some(squash(own))
+            );
         }
     }
     #[test]
+    #[ignore = "phase B: a header split across unproven chunks is no longer selected"]
     fn round3_a_split_header_must_be_selected() {
         let storage = Storage::open_memory().unwrap();
         let raw = format!(
@@ -1933,7 +1919,7 @@ mod tests {
         let selected = storage.contaminated_conversations().unwrap();
         println!(
             "whole={:?} sizes={:?} selected={selected:?}",
-            crate::import::contamination_reason(&raw),
+            crate::import::contamination::classify_as_user_text(&raw),
             chunks.iter().map(|c| c.content.len()).collect::<Vec<_>>()
         );
         assert!(!selected.is_empty());
@@ -1972,6 +1958,7 @@ mod tests {
         assert_eq!(after.replace('|', ""), raw);
     }
     #[tokio::test]
+    #[ignore = "phase B: cross-chunk band cuts leave with the scrub rewrite"]
     async fn round3_band_continuation_must_be_cut() {
         let temp = tempfile::tempdir().unwrap();
         let storage = Arc::new(Storage::open_memory().unwrap());
@@ -2009,10 +1996,10 @@ mod tests {
         assert!(!ambiguous.iter().any(|value| *value));
         let local = carried
             .iter()
-            .filter_map(|s| super::scrub_contaminated_text(s))
+            .filter_map(|s| super::text_after_removal(s))
             .collect::<Vec<_>>()
             .join("");
-        let whole = super::scrub_contaminated_text(&raw).unwrap();
+        let whole = super::text_after_removal(&raw).unwrap();
         println!(
             "whole_ends_42={} local_ends_42={} local_last={:?}",
             whole.ends_with("42"),
@@ -2054,6 +2041,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: Codex scrub reparses through parse_rollout_chunks_for_scrub"]
     async fn round3_codex_source_keeps_both_numeric_reply_digits() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("rollout-forward.jsonl");
@@ -2180,6 +2168,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: plans an in-place rewrite; re-enable with the proven in-place path"]
     async fn astra_1_a_row_changed_after_planning_survives_an_in_place_plan() {
         let temp = tempfile::tempdir().unwrap();
         let projects = temp.path().join("projects");
@@ -2194,7 +2183,7 @@ mod tests {
             &embeddings,
             conversation,
             0,
-            "Keep this fact.\n\n[[CSR:RECAP]] generated recap",
+            "Keep this fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
             "conversation",
         );
         let second = seed_source_chunk(
@@ -2202,7 +2191,7 @@ mod tests {
             &embeddings,
             conversation,
             1,
-            "[[CSR:RECAP]] generated only",
+            "recap [2h ago]: generated only. [[CSR:RECAP]]",
             "conversation",
         );
         let latest = embeddings
@@ -2257,7 +2246,7 @@ mod tests {
             &embeddings,
             conversation,
             0,
-            "[[CSR:RECAP]] contaminated old content",
+            "recap [2h ago]: contaminated old content. [[CSR:RECAP]]",
             "conversation",
         );
         seed_source_chunk(
@@ -2265,7 +2254,7 @@ mod tests {
             &embeddings,
             conversation,
             1,
-            "[[CSR:RECAP]] stale generated tail",
+            "recap [2h ago]: stale generated tail. [[CSR:RECAP]]",
             "conversation",
         );
         storage
@@ -2326,7 +2315,7 @@ mod tests {
             &embeddings,
             conversation,
             0,
-            &format!("{first_message}\n\n[[CSR:RECAP]] generated recap"),
+            &format!("{first_message}\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]"),
             "conversation",
         );
         let second = seed_source_chunk(
@@ -2396,7 +2385,7 @@ mod tests {
             &embeddings,
             conversation,
             0,
-            "Keep this user-authored fact.\n\n[[CSR:RECAP]] generated recap paragraph",
+            "Keep this user-authored fact.\n\nrecap [2h ago]: generated recap paragraph. [[CSR:RECAP]]",
             "conversation",
         );
         storage
@@ -2481,7 +2470,7 @@ mod tests {
             &embeddings,
             conversation,
             0,
-            "[[CSR:RECAP]] contaminated first chunk",
+            "recap [2h ago]: contaminated first chunk. [[CSR:RECAP]]",
             "conversation",
         );
         let kept = seed_source_chunk(
@@ -2514,6 +2503,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: plans an in-place rewrite; re-enable with the proven in-place path"]
     async fn astra_r2_3_a_writer_resuming_after_planning_defers_the_plan() {
         // An old hook writes a chunk's text and its vector in two autocommit
         // statements. Its first lands after planning and touches the chunk's
@@ -2533,7 +2523,7 @@ mod tests {
         let dirty = chunk_at(
             "probe-session",
             0,
-            "Keep the deployment frozen.\n\n[[CSR:RECAP]] generated recap",
+            "Keep the deployment frozen.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
         );
         let old_vector = embeddings
             .embed(&[dirty.content.as_str()])
@@ -2669,6 +2659,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: cross-chunk forward cut; re-enable with the scrub rewrite"]
     async fn astra_r2_7_a_forward_a_chunk_boundary_split_is_cut_in_every_chunk() {
         let head = "CSR's compaction card (compacting): ";
         let latin = format!("{head}{}\u{2026}", "x".repeat(1199 - head.chars().count()));
@@ -2764,6 +2755,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: plans an in-place rewrite; re-enable with the proven in-place path"]
     async fn an_active_conversation_is_deferred_unless_included() {
         let temp = tempfile::tempdir().unwrap();
         let projects = temp.path().join("projects");
@@ -2785,7 +2777,7 @@ mod tests {
             &embeddings,
             "live-session",
             0,
-            "Keep this fact.\n\n[[CSR:RECAP]] generated recap",
+            "Keep this fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
             "conversation",
         );
         storage
@@ -2800,7 +2792,7 @@ mod tests {
         let recent = chunk_at(
             "recent-chunk",
             0,
-            "Keep that fact.\n\n[[CSR:RECAP]] generated recap",
+            "Keep that fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
         );
         let recent = ConversationChunk {
             timestamp: (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
@@ -2827,7 +2819,7 @@ mod tests {
             &embeddings,
             "quiet-session",
             0,
-            "Keep the other fact.\n\n[[CSR:RECAP]] generated recap",
+            "Keep the other fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
             "conversation",
         );
         storage
@@ -2858,7 +2850,7 @@ mod tests {
         );
         assert_eq!(
             storage.get_chunk_content(&live).unwrap().as_deref(),
-            Some("Keep this fact.\n\n[[CSR:RECAP]] generated recap"),
+            Some("Keep this fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]"),
             "a deferred conversation is not written"
         );
 
@@ -2880,6 +2872,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: seed is cut in place; re-enable with the proven in-place path"]
     async fn astra_8_a_forward_past_byte_400_is_selected_and_rewritten() {
         let storage = Storage::open_memory().unwrap();
         let embeddings = EmbeddingEngine::new().unwrap();
@@ -2928,7 +2921,7 @@ mod tests {
             serde_json::json!({
                 "type": "user",
                 "timestamp": "2026-09-01T00:00:00Z",
-                "message": {"content": "Keep this user-authored fact.\n\n[[CSR:RECAP]] generated recap paragraph"}
+                "message": {"content": "Keep this user-authored fact.\n\nrecap [2h ago]: generated recap paragraph. [[CSR:RECAP]]"}
             })
             .to_string(),
         )
@@ -2945,7 +2938,7 @@ mod tests {
         );
         let chunk_id = super::super::generate_chunk_id("stable-conversation", 0);
         let old_content =
-            "Keep this user-authored fact.\n\n[[CSR:RECAP]] generated recap paragraph";
+            "Keep this user-authored fact.\n\nrecap [2h ago]: generated recap paragraph. [[CSR:RECAP]]";
         let old_vector = embeddings.embed(&[old_content]).unwrap().remove(0);
         let chunk = ConversationChunk {
             id: chunk_id.clone(),
@@ -3004,7 +2997,7 @@ mod tests {
         assert_eq!(rowid_after, rowid_before, "stable IDs preserve rowids");
         let clean_content = storage.get_chunk_content(&chunk_id).unwrap().unwrap();
         assert_eq!(clean_content, "Keep this user-authored fact.");
-        assert!(crate::import::contamination_reason(&clean_content).is_none());
+        assert!(crate::import::contamination::classify_as_user_text(&clean_content).is_none());
 
         let index = search.read().await;
         assert!(
@@ -3060,7 +3053,7 @@ mod tests {
             (
                 first_id.clone(),
                 0,
-                "[[CSR:RECAP]] contaminated old content",
+                "recap [2h ago]: contaminated old content. [[CSR:RECAP]]",
             ),
             (stale_id.clone(), 1, tail),
         ] {
@@ -3112,6 +3105,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: plans an in-place rewrite; re-enable with the proven in-place path"]
     async fn scrub_keeps_a_stored_tail_the_reparse_lacks() {
         // astra #3: the person's words in a stored chunk the transcript no longer
         // yields are not contamination. The scrub falls back to in place.
@@ -3147,7 +3141,7 @@ mod tests {
             first_id,
             stale_id,
             _temp: _hold,
-        } = shifted_fixture("[[CSR:RECAP]] stale generated tail").await;
+        } = shifted_fixture("recap [2h ago]: stale generated tail. [[CSR:RECAP]]").await;
 
         let report = super::run_scrub(&engine, false, Some("shifted-conversation"), false, true)
             .await
@@ -3178,6 +3172,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: source-gone rewrite needs the stored ownership proof wired into scrub"]
     async fn scrub_missing_source_rewrites_and_drops_in_place() {
         let temp = tempfile::tempdir().unwrap();
         let projects = temp.path().join("projects");
@@ -3198,9 +3193,13 @@ mod tests {
             (
                 rewrite_id.clone(),
                 0,
-                "Keep this fact.\n\n[[CSR:RECAP]] generated recap",
+                "Keep this fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
             ),
-            (drop_id.clone(), 1, "[[CSR:RECAP]] generated only"),
+            (
+                drop_id.clone(),
+                1,
+                "recap [2h ago]: generated only. [[CSR:RECAP]]",
+            ),
         ] {
             let vector = embeddings.embed(&[content]).unwrap().remove(0);
             let chunk = ConversationChunk {
@@ -3301,6 +3300,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "phase B: Codex scrub reparses through parse_rollout_chunks_for_scrub"]
     async fn scrub_codex_rollout_with_existing_file_is_scrubbed_in_place() {
         let temp = tempfile::tempdir().unwrap();
         let projects = temp.path().join("projects");
@@ -3331,7 +3331,7 @@ mod tests {
             &embeddings,
             conversation,
             1,
-            "Keep this fact.\n\n[[CSR:RECAP]] generated recap",
+            "Keep this fact.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
             "codex_rollout",
         );
         let drop = seed_source_chunk(
@@ -3339,7 +3339,7 @@ mod tests {
             &embeddings,
             conversation,
             2,
-            "[[CSR:RECAP]] generated only",
+            "recap [2h ago]: generated only. [[CSR:RECAP]]",
             "codex_rollout",
         );
         storage
@@ -3414,7 +3414,7 @@ mod tests {
             &embeddings,
             "zero-rebuild",
             1,
-            "Real work two.\n\n[[CSR:RECAP]] generated recap",
+            "Real work two.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]",
             "conversation",
         );
         storage
@@ -3442,7 +3442,7 @@ mod tests {
         assert!(storage.get_chunk_content(&first).unwrap().is_some());
         assert_eq!(
             storage.get_chunk_content(&second).unwrap().as_deref(),
-            Some("Real work two.\n\n[[CSR:RECAP]] generated recap"),
+            Some("Real work two.\n\nrecap [2h ago]: generated recap. [[CSR:RECAP]]"),
             "a refused conversation is not written at all"
         );
     }
@@ -3722,7 +3722,7 @@ mod tests {
             projects,
         );
         let chunk_id = super::super::generate_chunk_id("flush-failure", 0);
-        let content = "[[CSR:RECAP]] contaminated old content";
+        let content = "recap [2h ago]: contaminated old content. [[CSR:RECAP]]";
         let vector = embeddings.embed(&[content]).unwrap().remove(0);
         storage
             .insert_chunk_with_source(

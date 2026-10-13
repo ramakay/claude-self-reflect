@@ -235,7 +235,13 @@ pub struct DreamVerdictTotals {
 
 #[derive(Serialize, Debug, Default, PartialEq)]
 pub struct ContaminationStatus {
+    /// Ownership-proven contaminated conversations: the only bin that raises
+    /// the compact warning.
     pub conversations: usize,
+    /// Look like CSR output but whose author cannot be proven: kept as they
+    /// are, never counted clean, never raising the warning on their own.
+    pub unjudged: usize,
+    pub clean: usize,
     pub total_conversations: usize,
     pub pct: f64,
     pub last_measured: Option<String>,
@@ -245,6 +251,8 @@ impl From<crate::storage::ContaminationMeasurement> for ContaminationStatus {
     fn from(measurement: crate::storage::ContaminationMeasurement) -> Self {
         Self {
             conversations: measurement.conversations,
+            unjudged: measurement.unjudged,
+            clean: measurement.clean,
             total_conversations: measurement.total_conversations,
             pct: measurement.pct,
             last_measured: Some(measurement.last_measured),
@@ -1988,11 +1996,16 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             format_dreaming_elapsed(dreaming.elapsed_secs)
         ));
     }
+    // Only proven contamination warns: a count nothing in the release can
+    // clear would be a warning nobody could act on. Unjudged rides along.
     if report.contamination.conversations > 0 {
         out.push_str(&format!(
             " | ⚠ {} contaminated",
             report.contamination.conversations
         ));
+        if report.contamination.unjudged > 0 {
+            out.push_str(&format!(" · {} unjudged", report.contamination.unjudged));
+        }
     }
     if let Some(holder) = &report.maintenance {
         out.push_str(&format!(" | maintenance (pid {})", holder.pid));
@@ -2329,6 +2342,8 @@ mod tests {
         let mut report = base_report();
         report.contamination = ContaminationStatus {
             conversations: 2,
+            unjudged: 3,
+            clean: 5,
             total_conversations: 10,
             pct: 20.0,
             last_measured: Some("2026-09-01T12:00:00Z".into()),
@@ -2344,6 +2359,8 @@ mod tests {
 
         let value = serde_json::to_value(report).unwrap();
         assert_eq!(value["contamination"]["conversations"], 2);
+        assert_eq!(value["contamination"]["unjudged"], 3);
+        assert_eq!(value["contamination"]["clean"], 5);
         assert_eq!(value["contamination"]["total_conversations"], 10);
         assert_eq!(value["contamination"]["pct"], 20.0);
         assert_eq!(value["dream"]["dreams"]["unfinished"], 3);
@@ -2354,21 +2371,59 @@ mod tests {
         assert_eq!(value["dream"]["events_total"], 99);
     }
 
+    fn measured(proven: usize, unjudged: usize) -> ContaminationStatus {
+        ContaminationStatus {
+            conversations: proven,
+            unjudged,
+            clean: 100 - proven - unjudged,
+            total_conversations: 100,
+            pct: proven as f64,
+            last_measured: Some("2026-09-01T12:00:00Z".into()),
+        }
+    }
+
     #[test]
     fn compact_contamination_badge_only_appears_for_a_measured_nonzero_count() {
         let mut report = base_report();
         assert!(!format_compact(&report, 0).contains("contaminated"));
 
-        report.contamination = ContaminationStatus {
-            conversations: 7,
-            total_conversations: 100,
-            pct: 7.0,
-            last_measured: Some("2026-09-01T12:00:00Z".into()),
-        };
-        assert!(format_compact(&report, 0).contains("⚠ 7 contaminated"));
+        report.contamination = measured(7, 0);
+        let line = format_compact(&report, 0);
+        assert!(line.contains("⚠ 7 contaminated"));
+        assert!(!line.contains("unjudged"));
 
         report.contamination.conversations = 0;
         assert!(!format_compact(&report, 0).contains("contaminated"));
+    }
+
+    #[test]
+    fn compact_line_warns_on_proven_only() {
+        let mut report = base_report();
+        report.contamination = measured(4, 0);
+        assert!(format_compact(&report, 0).contains("⚠ 4 contaminated"));
+        assert!(!format_compact(&report, 0).contains("unjudged"));
+    }
+
+    /// Unjudged text is kept and cannot be cleared by anything in the release:
+    /// it never raises the warning by itself, and the full status still counts it.
+    #[test]
+    fn unjudged_alone_never_raises_the_compact_warning_but_the_full_status_counts_it() {
+        let mut report = base_report();
+        report.contamination = measured(0, 9);
+        let line = format_compact(&report, 0);
+        assert!(!line.contains("contaminated"), "{line}");
+        assert!(!line.contains("unjudged"), "{line}");
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["contamination"]["conversations"], 0);
+        assert_eq!(value["contamination"]["unjudged"], 9);
+        assert_eq!(value["contamination"]["clean"], 91);
+    }
+
+    #[test]
+    fn compact_line_appends_unjudged_after_a_proven_warning() {
+        let mut report = base_report();
+        report.contamination = measured(4, 6);
+        assert!(format_compact(&report, 0).contains("⚠ 4 contaminated · 6 unjudged"));
     }
 
     #[test]

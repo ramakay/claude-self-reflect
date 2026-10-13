@@ -60,7 +60,11 @@ impl MessageIndex {
                 None,
             );
         } else {
-            let mut sanitizer = super::CsrMessageSanitizer::default();
+            let mut sanitizer = super::CsrMessageSanitizer::for_source(if codex {
+                super::contamination::SourceKind::CodexRollout
+            } else {
+                super::contamination::SourceKind::Conversation
+            });
             let mut names = HashMap::new();
             let mut floor = parent.map(|p| p.floor);
             let mut seq = 0;
