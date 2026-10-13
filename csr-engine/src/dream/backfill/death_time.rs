@@ -106,6 +106,7 @@
 //!
 //! Zero LLM calls anywhere in this module.
 
+use crate::process::CommandDeadline;
 use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::path::Path;
 use std::process::Command;
@@ -338,7 +339,7 @@ pub(super) fn git_head_oid(repo_root: &str) -> Option<String> {
     let output = git_at(repo_root)
         .arg("rev-parse")
         .arg("HEAD")
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;
@@ -358,7 +359,7 @@ fn git_commit_committer_ts(repo_root: &str, oid: &str) -> Option<i64> {
         .arg("-s")
         .arg("--format=%ct")
         .arg(oid)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;
@@ -374,7 +375,11 @@ fn git_commit_committer_ts(repo_root: &str, oid: &str) -> Option<i64> {
 /// missing at that commit, unresolvable oid, no repo) — never a guess.
 pub(super) fn git_show_bytes(repo_root: &str, oid: &str, relpath: &str) -> Option<Vec<u8>> {
     let spec = format!("{oid}:{relpath}");
-    let output = git_at(repo_root).arg("show").arg(&spec).output().ok()?;
+    let output = git_at(repo_root)
+        .arg("show")
+        .arg(&spec)
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
+        .ok()?;
     if output.status.success() {
         Some(output.stdout)
     } else {
@@ -395,7 +400,7 @@ fn merge_base_is_ancestor(repo_root: &str, ancestor_oid: &str, descendant_oid: &
         .arg("--is-ancestor")
         .arg(ancestor_oid)
         .arg(descendant_oid)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -421,7 +426,7 @@ fn first_parent_oids_capped(
         .arg("--reverse")
         .arg("--format=%H%x09%ct")
         .arg(&range)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
     else {
         return Vec::new();
     };
@@ -454,7 +459,7 @@ fn detect_rename_at(repo_root: &str, oid: &str, old_relpath: &str) -> Option<Str
         .arg("--name-status")
         .arg(format!("{oid}^"))
         .arg(oid)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;

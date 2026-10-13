@@ -4,6 +4,7 @@ use super::{
     artifact_provenance::{self as provenance, ArtifactInput, ArtifactKind, InputEnvelope},
     Storage,
 };
+use crate::process::CommandDeadline;
 use crate::provenance::{content_hash, ProvenanceEvent, TrustTier};
 use crate::transcript::intent_events::IntentEvent;
 use anyhow::Result;
@@ -207,7 +208,7 @@ pub(crate) fn record_witness(conn: &Connection, id: &str) -> Result<()> {
                 .env_remove("GIT_INDEX_FILE")
                 .env("GIT_OPTIONAL_LOCKS", "0")
                 .args(["-C", &root, "cat-file", "-e", &format!("{oid}^{{commit}}")])
-                .output()
+                .output_with_deadline(crate::process::GIT_TIMEOUT)
                 .is_ok_and(|o| o.status.success())
         });
     let input = if observed {

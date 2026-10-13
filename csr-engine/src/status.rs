@@ -76,7 +76,8 @@ pub struct StatusReport {
     pub db_size_bytes: u64,
     pub legacy_index: Option<LegacyIndexStatus>,
     pub db_path: String,
-    pub healthy: bool,
+    /// None until an integrity verdict has been cached or --deep has scanned.
+    pub healthy: Option<bool>,
     /// True when any live `mcp_stdio` process in [`stale_processes`] is
     /// running a superseded binary. Derived from the run registry (one
     /// record per process — see `binary_identity`), not a single
@@ -863,7 +864,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             db_size_bytes: 0,
             legacy_index: legacy_index_status(db_path),
             db_path: db_path.to_string_lossy().to_string(),
-            healthy: false,
+            healthy: None,
             aux: AuxStatus::default(),
             memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
@@ -933,14 +934,17 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         .unwrap_or_default();
     let newest_chunk = storage.get_newest_chunk_timestamp().unwrap_or(None);
     let db_size_bytes = storage.get_db_size().unwrap_or(0);
-    // Cached verdict (24h TTL, refreshed by the daemon or --deep). A full
-    // integrity_check costs ~10s of CPU on a multi-GB DB — must never run on
-    // the statusline path.
-    // ttl=0 + refresh forces a fresh check (and stores it); otherwise serve cache.
+    // Ordinary status is read-only and never scans, even on a cache miss.
     let healthy = if deep {
-        storage.integrity_check_cached(0, true).unwrap_or(false)
+        let verdict = storage.integrity_check().ok();
+        if let Some(ok) = verdict {
+            if let Err(error) = Storage::store_integrity_verdict(db_path, ok) {
+                tracing::debug!(%error, "could not cache deep integrity verdict");
+            }
+        }
+        verdict
     } else {
-        storage.integrity_check_cached(24, false).unwrap_or(false)
+        storage.cached_integrity().unwrap_or(None)
     };
 
     let import_percent = if total_jsonl > 0 {
@@ -1744,7 +1748,11 @@ fn count_jsonl_files(projects_dir: &Path) -> usize {
 /// - `--` prefix = submenu item
 fn print_swiftbar(report: &StatusReport) {
     // Menu bar title: health indicator + chunk count
-    let icon = if report.healthy { "🧠" } else { "⚠️" };
+    let icon = if report.healthy == Some(true) {
+        "🧠"
+    } else {
+        "⚠️"
+    };
     let focus = read_current_focus().unwrap_or_default();
     if focus.is_empty() {
         println!("{} {}c {}r", icon, report.chunks, report.reflections);
@@ -1811,10 +1819,10 @@ fn print_swiftbar(report: &StatusReport) {
 
     // Section: Health
     println!("---");
-    let health_label = if report.healthy {
-        "DB: healthy ✓ | color=green"
-    } else {
-        "DB: unhealthy ✗ | color=red"
+    let health_label = match report.healthy {
+        Some(true) => "DB: healthy ✓ | color=green",
+        Some(false) => "DB: unhealthy ✗ | color=red",
+        None => "DB: integrity unknown | color=gray",
     };
     println!("{}", health_label);
     let db_mb = report.db_size_bytes as f64 / 1_048_576.0;
@@ -1905,7 +1913,11 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
     let bar_empty = 10_usize.saturating_sub(bar_filled);
     let bar: String = "█".repeat(bar_filled) + &"░".repeat(bar_empty);
 
-    let health = if report.healthy { "ok" } else { "!!" };
+    let health = match report.healthy {
+        Some(true) => "ok",
+        Some(false) => "!!",
+        None => "integrity unknown",
+    };
 
     let mut out = format!(
         "[{} {:.0}%] [{}] {}c {}r | {}p | {}",
@@ -2081,7 +2093,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.conversations, 0);
-        assert!(!report.healthy);
+        assert_eq!(report.healthy, None);
         assert_eq!(report.import_percent, 0.0);
     }
 
@@ -2109,7 +2121,7 @@ mod tests {
             db_size_bytes: 100_000_000,
             legacy_index: None,
             db_path: "/tmp/test.db".to_string(),
-            healthy: true,
+            healthy: Some(true),
             aux: AuxStatus::default(),
             memory_registry: MemoryRegistryStatus::default(),
             dream: DreamStatus::default(),
@@ -2238,6 +2250,50 @@ mod tests {
     }
 
     #[test]
+    fn r5_status_uncached_is_unknown_and_deep_persists_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let storage = Storage::open(&db).unwrap();
+        for _ in 0..2 {
+            let report = gather_status(&db, dir.path(), false).unwrap();
+            assert_eq!(report.healthy, None);
+            assert!(serde_json::to_value(&report).unwrap()["healthy"].is_null());
+            assert!(format_compact(&report, 0).contains("integrity unknown"));
+            assert!(storage.get_meta("integrity_checked_at").unwrap().is_none());
+        }
+        assert_eq!(
+            gather_status(&db, dir.path(), true).unwrap().healthy,
+            Some(true)
+        );
+        assert_eq!(storage.cached_integrity().unwrap(), Some(true));
+        let stale = "2000-01-01T00:00:00Z";
+        storage.set_meta("integrity_checked_at", stale).unwrap();
+        let _owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        assert_eq!(
+            gather_status(&db, dir.path(), true).unwrap().healthy,
+            Some(true)
+        );
+        let reader = Storage::open_read_only(&db).unwrap();
+        assert_eq!(
+            reader.get_meta("integrity_checked_at").unwrap().as_deref(),
+            Some(stale)
+        );
+        drop(_owner);
+        assert_eq!(
+            gather_status(&db, dir.path(), false).unwrap().healthy,
+            Some(true)
+        );
+        assert_eq!(
+            gather_status(&db, dir.path(), true).unwrap().healthy,
+            Some(true)
+        );
+        assert_ne!(
+            storage.get_meta("integrity_checked_at").unwrap().as_deref(),
+            Some(stale)
+        );
+    }
+
+    #[test]
     fn round4_status_reads_during_maintenance() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
@@ -2247,7 +2303,7 @@ mod tests {
             let report = gather_status(&db, dir.path(), deep).unwrap();
             assert_eq!(report.maintenance.as_ref().unwrap().pid, std::process::id());
             assert!(format_compact(&report, 0).contains("maintenance (pid"));
-            assert!(report.healthy);
+            assert_eq!(report.healthy, deep.then_some(true));
         }
         let reader = Storage::open_read_only(&db).unwrap();
         assert!(reader.get_meta("integrity_checked_at").unwrap().is_none());
@@ -2471,7 +2527,7 @@ mod tests {
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
         assert_eq!(report.conversations, 0);
         assert_eq!(report.chunks, 0);
-        assert!(report.healthy); // empty DB passes integrity check
+        assert_eq!(report.healthy, None); // no scan without --deep
         assert_eq!(report.import_percent, 0.0);
         assert!(!report.codex_backfill.restamp.done);
         assert!(!report.codex_backfill.harness_strip.done);

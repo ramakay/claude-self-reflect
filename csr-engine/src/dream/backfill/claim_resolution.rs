@@ -35,6 +35,7 @@
 //!
 //! Zero LLM calls anywhere in this module.
 
+use crate::process::CommandDeadline;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -179,7 +180,7 @@ fn caller_occurrences(repo_root: &str, oid: &str, symbol: &str, pathspec: &str) 
         .arg(oid)
         .arg("--")
         .arg(pathspec)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     match output.status.code() {
         Some(0) | Some(1) => {}
@@ -294,7 +295,7 @@ pub fn zombie_recurrence(
         .arg(&range)
         .arg("--")
         .arg(pathspec)
-        .output();
+        .output_with_deadline(crate::process::GIT_TIMEOUT);
     let Ok(output) = output else {
         return Vec::new();
     };

@@ -250,7 +250,11 @@ impl Daemon {
             .parent()
             .unwrap_or(Path::new("."))
             .to_path_buf();
-        crate::search::vector_ipc::write_heartbeat(&data_dir);
+        let db_path = self
+            .storage
+            .with_connection(|conn| Ok(conn.path().map(PathBuf::from)))?
+            .unwrap_or_else(|| data_dir.join("csr-engine.db"));
+        crate::search::vector_ipc::write_heartbeat_for_database(&db_path);
 
         // gap-G2: a run-registry record so `status` can see this process
         // even from another `csr-engine` invocation. Best-effort — a
@@ -1225,14 +1229,14 @@ impl Daemon {
         }
         let heartbeat_handle = {
             let shutdown = shutdown.clone();
-            let data_dir = data_dir.clone();
+            let db_path = db_path.clone();
             tokio::spawn(async move {
                 let every = crate::search::vector_ipc::HEARTBEAT_EVERY;
                 let mut last = std::time::Instant::now();
                 while !shutdown.load(Ordering::SeqCst) {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     if last.elapsed() >= every {
-                        crate::search::vector_ipc::write_heartbeat(&data_dir);
+                        crate::search::vector_ipc::write_heartbeat_for_database(&db_path);
                         last = std::time::Instant::now();
                     }
                 }
@@ -1246,18 +1250,7 @@ impl Daemon {
         let vector_handle = crate::search::vector_ipc::spawn_for_daemon(
             self.embeddings.clone(),
             self.search.clone(),
-            &self.index_dir.parent().unwrap_or(Path::new(".")).join(
-                self.storage
-                    .with_connection(|conn| {
-                        Ok(conn
-                            .path()
-                            .and_then(|path| Path::new(path).file_name())
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("csr-engine.db")
-                            .to_owned())
-                    })
-                    .unwrap_or_else(|_| "csr-engine.db".to_owned()),
-            ),
+            &db_path,
             vector_shutdown.clone(),
             sync_nudge,
         );
@@ -2096,11 +2089,36 @@ async fn narrator_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut last_batch_time = tokio::time::Instant::now();
+    let mut recovered = false;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             tracing::info!("narrator loop: shutdown signal received");
             break;
+        }
+        if !recovered {
+            match storage.recover_narrative_batches() {
+                Ok(batches) => {
+                    for (batch_id, conversations) in batches {
+                        spawn_batch_poll(
+                            storage.clone(),
+                            embeddings.clone(),
+                            search.clone(),
+                            client.clone(),
+                            batch_id,
+                            conversations,
+                            poll_interval_secs,
+                            shutdown.clone(),
+                        );
+                    }
+                    recovered = true;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "narrative recovery deferred");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            }
         }
         if let Err(e) = narrator_loop_inner(
             &storage,
@@ -2203,34 +2221,50 @@ async fn narrator_loop_inner(
             }
         }
 
-        // Spawn batch polling as a separate task (D-7: non-blocking)
-        let poll_storage = storage.clone();
-        let poll_embeddings = embeddings.clone();
-        let poll_search = search.clone();
-        let poll_client = client.clone();
-        let poll_unenriched = unenriched.clone();
-        let poll_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            if let Err(e) = poll_batch_results(
-                &poll_storage,
-                &poll_embeddings,
-                &poll_search,
-                &poll_client,
-                &batch_id,
-                &poll_unenriched,
-                poll_interval_secs,
-                &poll_shutdown,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "batch polling failed");
-            }
-        });
+        spawn_batch_poll(
+            storage.clone(),
+            embeddings.clone(),
+            search.clone(),
+            client.clone(),
+            batch_id,
+            unenriched,
+            poll_interval_secs,
+            shutdown.clone(),
+        );
 
         *last_batch_time = tokio::time::Instant::now();
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_batch_poll(
+    storage: Arc<Storage>,
+    embeddings: Arc<EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+    client: Arc<dyn BatchClient>,
+    batch_id: String,
+    conversations: Vec<(String, String)>,
+    poll_interval_secs: u64,
+    shutdown: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = poll_batch_results(
+            &storage,
+            &embeddings,
+            &search,
+            &client,
+            &batch_id,
+            &conversations,
+            poll_interval_secs,
+            &shutdown,
+        )
+        .await
+        {
+            tracing::warn!(%error, "batch polling failed; stored batch id retained for restart");
+        }
+    });
 }
 
 fn build_narrative_prompt(skill_prompt: &str, messages: &[serde_json::Value]) -> String {
@@ -2323,8 +2357,8 @@ async fn poll_batch_results(
             if !deferred {
                 return Ok(());
             }
-            // Retain completed results in this task. Keep polling until all
-            // are durable; processing state prevents a duplicate submission.
+            // Keep results in memory for retry. On shutdown the stored batch id
+            // lets startup fetch them again; processing prevents resubmission.
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         } else if status.processing_status == "errored"
             || status.processing_status == "expired"
@@ -2356,6 +2390,10 @@ async fn store_narrative(
     narrative: &str,
 ) -> Result<()> {
     let _operation = storage.operation_lock()?;
+    // A restarted batch returns every item again, including durable completions.
+    if storage.is_conversation_enriched(conv_id, "ai_narrative")? {
+        return Ok(());
+    }
     let narrative_owned = narrative.to_string();
     let emb = embeddings.clone();
     let embeddings_vec =
@@ -3674,6 +3712,138 @@ mod r4_daemon_audit_probes {
 
     use super::*;
     use std::time::Duration;
+    #[tokio::test]
+    async fn r5_narrative_restart_resumes_deferred_batch_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        for conv in ["stored", "deferred", "no-batch"] {
+            storage
+                .insert_chunk(
+                    &crate::import::ConversationChunk {
+                        id: conv.into(),
+                        conversation_id: conv.into(),
+                        project_name: "p".into(),
+                        timestamp: "2026-09-01T00:00:00Z".into(),
+                        content: "Keep the deployment frozen.".into(),
+                        message_count: 1,
+                        summary: None,
+                        author: crate::provenance::Speaker::User,
+                        seq: 0,
+                        is_sidechain: false,
+                    },
+                    &vec![0.1; 384],
+                )
+                .unwrap();
+            storage
+                .upsert_import_state_explicit(&format!("{conv}.jsonl"), conv, 1, "fixture")
+                .unwrap();
+            storage.set_batch_id(conv, "batch-r5", "hash").unwrap();
+        }
+        storage.with_connection(|conn| {
+            conn.execute("UPDATE enrichment_state SET batch_id = NULL WHERE conversation_id = 'no-batch'", [])?;
+            Ok(())
+        }).unwrap();
+        store_narrative(&storage, &embeddings, &search, "stored", "Already durable.")
+            .await
+            .unwrap();
+        let client: Arc<dyn BatchClient> = Arc::new(crate::api::MockBatchClient {
+            batch_id: "batch-r5".into(),
+            results: vec![
+                crate::api::types::BatchResultItem {
+                    custom_id: "stored".into(),
+                    narrative: "Already durable.".into(),
+                },
+                crate::api::types::BatchResultItem {
+                    custom_id: "deferred".into(),
+                    narrative: "The deployment remains frozen.".into(),
+                },
+            ],
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let conversations = [("deferred".into(), "deferred.jsonl".into())];
+        let lock = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let mut poll = Box::pin(poll_batch_results(
+            &storage,
+            &embeddings,
+            &search,
+            &client,
+            "batch-r5",
+            &conversations,
+            0,
+            &shutdown,
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut poll)
+            .await
+            .is_err());
+        shutdown.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), poll)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(lock);
+        drop(storage);
+        drop(search);
+
+        let storage = Arc::new(Storage::open(&db).unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        // Recovery must preserve the batch id, and requeue only the id-less row.
+        let batches = storage.recover_narrative_batches().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches["batch-r5"], conversations);
+        assert_eq!(
+            storage
+                .get_unenriched_conversations("ai_narrative", 10)
+                .unwrap(),
+            vec![("no-batch".into(), "no-batch.jsonl".into())]
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Exercise the production startup path: it must poll without submitting.
+        let narrator = tokio::spawn(narrator_loop(
+            storage.clone(),
+            embeddings.clone(),
+            search.clone(),
+            client.clone(),
+            usize::MAX,
+            u64::MAX,
+            0,
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !storage
+                .is_conversation_enriched("deferred", "ai_narrative")
+                .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.store(true, Ordering::SeqCst);
+        narrator.abort();
+        let _ = narrator.await;
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 2);
+        assert!(storage.recover_narrative_batches().unwrap().is_empty());
+        let seq = storage.latest_embedding_change_seq().unwrap();
+        // A repeated completed poll must not even rewrite the stored embeddings.
+        poll_batch_results(
+            &storage,
+            &embeddings,
+            &search,
+            &client,
+            "batch-r5",
+            &conversations,
+            0,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 2);
+        assert_eq!(storage.latest_embedding_change_seq().unwrap(), seq);
+    }
+
     #[tokio::test]
     async fn round4_completed_batch_retries_after_maintenance() {
         let dir = tempfile::tempdir().unwrap();

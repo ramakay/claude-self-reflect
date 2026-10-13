@@ -46,6 +46,7 @@
 //!
 //! Zero LLM calls anywhere in this module.
 
+use crate::process::CommandDeadline;
 use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Command;
@@ -423,7 +424,7 @@ fn git_commit_committer_ts(repo_root: &str, oid: &str) -> Option<i64> {
         .arg("-s")
         .arg("--format=%ct")
         .arg(oid)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;

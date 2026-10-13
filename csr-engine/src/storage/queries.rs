@@ -2479,7 +2479,7 @@ pub fn get_unenriched_conversations(
          JOIN import_state i ON i.conversation_id = g.conversation_id
          LEFT JOIN enrichment_state e
              ON e.conversation_id = g.conversation_id AND e.enrichment_type = ?1
-         WHERE e.status IS NULL OR e.status = 'failed'
+         WHERE e.status IS NULL OR e.status IN ('failed', 'pending')
          ORDER BY g.latest DESC
          LIMIT ?2",
     )?;
@@ -5178,7 +5178,7 @@ mod tests {
          JOIN import_state i ON i.conversation_id = c.conversation_id
          LEFT JOIN enrichment_state e
              ON e.conversation_id = c.conversation_id AND e.enrichment_type = ?1
-         WHERE e.status IS NULL OR e.status = 'failed'
+         WHERE e.status IS NULL OR e.status IN ('failed', 'pending')
          GROUP BY c.conversation_id, i.file_path
          ORDER BY MAX(c.timestamp) DESC
          LIMIT ?2";

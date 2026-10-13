@@ -70,6 +70,8 @@ pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(10 * 60);
 /// What answers an MCP server's vector calls; recorded in its run record
 /// (`csr-engine status` lists it under `mcp_servers`) and logged on change.
 pub const PATH_DAEMON: &str = "daemon";
+/// No request has established daemon availability yet.
+pub const PATH_UNKNOWN: &str = "unknown (daemon unverified)";
 /// A server of a configured daemon that is not answering right now.
 pub const PATH_KEYWORD_ONLY: &str = "keyword-only (daemon unavailable)";
 /// A server with no configured daemon (or `CSR_NO_DAEMON_PROXY=1`).
@@ -90,6 +92,13 @@ pub fn heartbeat_path(data_dir: &Path) -> PathBuf {
 /// The daemon's heartbeat: its pid and the time, rewritten at startup and
 /// every [`HEARTBEAT_EVERY`]. Best-effort.
 pub fn write_heartbeat(data_dir: &Path) {
+    write_heartbeat_for_database(&data_dir.join("csr-engine.db"));
+}
+
+pub(crate) fn write_heartbeat_for_database(db_path: &Path) {
+    let Some(data_dir) = db_path.parent() else {
+        return;
+    };
     let path = heartbeat_path(data_dir);
     #[cfg(unix)]
     {
@@ -99,11 +108,12 @@ pub fn write_heartbeat(data_dir: &Path) {
             let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
         }
     }
-    let body = format!(
-        "{} {}\n",
-        std::process::id(),
-        chrono::Utc::now().to_rfc3339()
-    );
+    let body = serde_json::json!({
+        "pid": std::process::id(),
+        "at": chrono::Utc::now().to_rfc3339(),
+        "database": database_identity(db_path),
+    })
+    .to_string();
     let tmp = path.with_extension("alive.tmp");
     if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -111,8 +121,8 @@ pub fn write_heartbeat(data_dir: &Path) {
 }
 
 /// Whether a daemon is configured for `data_dir`: `CSR_NO_DAEMON_PROXY=1`
-/// says no; an explicit opt-in, installed launchd job, fresh heartbeat or any
-/// typed ping reply says yes. Configuration survives outages and saturation.
+/// says no; an explicit opt-in, matching launchd job, database heartbeat or
+/// verified ping/Busy reply says yes. Configuration survives outages and saturation.
 pub fn daemon_configured(data_dir: &Path) -> bool {
     daemon_configured_for_database(&data_dir.join("csr-engine.db"))
 }
@@ -133,6 +143,171 @@ pub(crate) fn daemon_configured_for_database(db_path: &Path) -> bool {
     )
 }
 
+/// Resolve existing ancestors too, so a not-yet-created database can be compared
+/// through a symlinked data directory without requiring either file to exist.
+fn database_identity(path: &Path) -> String {
+    fn resolve(path: &Path) -> PathBuf {
+        if let Ok(canonical) = path.canonicalize() {
+            return canonical;
+        }
+        if path.components().next_back() == Some(std::path::Component::ParentDir) {
+            let mut parent = resolve(path.parent().unwrap_or(Path::new("/")));
+            parent.pop();
+            return parent;
+        }
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => resolve(parent).join(name),
+            _ => path.to_path_buf(),
+        }
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
+    };
+    resolve(&absolute).to_string_lossy().into_owned()
+}
+
+fn plist_skip_misc(input: &mut &str) -> Option<()> {
+    loop {
+        *input = input.trim_start();
+        if input.starts_with("<!--") {
+            *input = &input[input.find("-->")? + 3..];
+        } else if input.starts_with("<?") {
+            *input = &input[input.find("?>")? + 2..];
+        } else if input.starts_with("<!DOCTYPE") {
+            *input = &input[input.find('>')? + 1..];
+        } else {
+            break;
+        }
+    }
+    Some(())
+}
+
+/// Read launchd's XML property-list values without executing the job. Unknown
+/// or malformed configuration is not evidence that this database has a daemon.
+fn plist_value(input: &mut &str) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    plist_skip_misc(input)?;
+    let end = input.find('>')?;
+    let tag = input.get(1..end)?;
+    let empty = tag.ends_with('/');
+    let name = tag.trim_end_matches('/').split_whitespace().next()?;
+    *input = &input[end + 1..];
+    let close = format!("</{name}>");
+    let value = match name {
+        "plist" if !empty => plist_value(input)?,
+        "dict" => {
+            let mut map = serde_json::Map::new();
+            while !empty && !input.is_empty() {
+                plist_skip_misc(input)?;
+                if input.starts_with(&close) {
+                    break;
+                }
+                let key = plist_value(input)?.as_str()?.to_owned();
+                let value = plist_value(input)?;
+                map.insert(key, value);
+            }
+            Value::Object(map)
+        }
+        "array" => {
+            let mut values = Vec::new();
+            while !empty && !input.is_empty() {
+                plist_skip_misc(input)?;
+                if input.starts_with(&close) {
+                    break;
+                }
+                values.push(plist_value(input)?);
+            }
+            Value::Array(values)
+        }
+        "string" | "key" | "integer" | "real" | "data" | "date" => {
+            let end = if empty { 0 } else { input.find(&close)? };
+            let text = &input[..end];
+            let mut decoded = String::new();
+            let mut rest = text;
+            while let Some(at) = rest.find('&') {
+                decoded.push_str(&rest[..at]);
+                let end = rest[at..].find(';')? + at;
+                let entity = &rest[at + 1..end];
+                decoded.push(match entity {
+                    "amp" => '&',
+                    "lt" => '<',
+                    "gt" => '>',
+                    "quot" => '"',
+                    "apos" => '\'',
+                    _ => {
+                        let number = if let Some(hex) = entity.strip_prefix("#x") {
+                            u32::from_str_radix(hex, 16).ok()?
+                        } else {
+                            entity.strip_prefix('#')?.parse().ok()?
+                        };
+                        char::from_u32(number)?
+                    }
+                });
+                rest = &rest[end + 1..];
+            }
+            decoded.push_str(rest);
+            *input = &input[end..];
+            Value::String(decoded)
+        }
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        _ => return None,
+    };
+    if !empty {
+        // Whitespace inside strings is data; only skip XML miscellany for containers.
+        if matches!(name, "plist" | "dict" | "array") {
+            plist_skip_misc(input)?;
+        }
+        *input = input.strip_prefix(&close)?;
+    }
+    Some(value)
+}
+
+fn launchd_database(home: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(
+        home.join("Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist"),
+    )
+    .ok()?;
+    let plist = plist_value(&mut text.as_str())?;
+    plist.as_object()?;
+    let args = plist
+        .get("ProgramArguments")
+        .and_then(serde_json::Value::as_array);
+    let argument = args.and_then(|args| {
+        args.iter().enumerate().find_map(|(i, arg)| {
+            let arg = arg.as_str()?;
+            if arg == "--db-path" {
+                args.get(i + 1)?.as_str()
+            } else {
+                arg.strip_prefix("--db-path=")
+            }
+        })
+    });
+    let env = plist.get("EnvironmentVariables");
+    let path = if let Some(path) = argument {
+        PathBuf::from(path)
+    } else {
+        env.and_then(|env| env.get("HOME"))
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.to_path_buf())
+            .join(".claude-self-reflect/csr-engine.db")
+    };
+    Some(if path.is_absolute() {
+        path
+    } else {
+        Path::new(
+            plist
+                .get("WorkingDirectory")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("/"),
+        )
+        .join(path)
+    })
+}
+
 fn daemon_configured_with(
     db_path: &Path,
     home: Option<&Path>,
@@ -145,8 +320,9 @@ fn daemon_configured_with(
     }
     if enabled
         || home.is_some_and(|home| {
-            home.join("Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist")
-                .is_file()
+            launchd_database(home).is_some_and(|configured| {
+                database_identity(&configured) == database_identity(db_path)
+            })
         })
     {
         return true;
@@ -163,7 +339,21 @@ fn daemon_configured_with(
                 .unwrap_or_default()
         })
         .is_some_and(|age| age < CONFIGURED_WITHIN);
-    fresh || ping(db_path).is_ok()
+    fresh
+        && std::fs::read_to_string(heartbeat_path(data_dir))
+            .ok()
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .is_some_and(|body| {
+                body["database"].as_str() == Some(database_identity(db_path).as_str())
+            })
+        || matches!(
+            ping(db_path),
+            Ok(Reply::Pong
+                | Reply::Error {
+                    code: ErrorCode::Busy,
+                    ..
+                })
+        )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -233,7 +423,23 @@ fn validate_work(op: &Op) -> Option<Reply> {
 #[derive(Serialize, Deserialize)]
 struct Response {
     version: u32,
+    /// Included even in pre-admission Busy replies. Old identity-free replies
+    /// cannot establish that a daemon serves the caller's database.
+    #[serde(default)]
+    database: Option<String>,
     reply: Reply,
+}
+
+impl Response {
+    fn for_database(self, database: &str) -> Result<Reply> {
+        if self.version != VERSION {
+            bail!("daemon speaks vector protocol {}", self.version);
+        }
+        if self.database.as_deref() != Some(database) {
+            bail!("daemon database identity does not match");
+        }
+        Ok(self.reply)
+    }
 }
 
 /// Run blocking socket work without stalling the async runtime: on a
@@ -260,7 +466,7 @@ impl VectorClient {
     pub fn for_database(db_path: &Path) -> Option<Self> {
         Some(Self {
             socket: socket_path(db_path.parent()?),
-            database: db_path.file_name()?.to_str()?.to_owned(),
+            database: database_identity(db_path),
         })
     }
 
@@ -281,7 +487,7 @@ impl VectorClient {
         self.send(&request, Instant::now() + timeout)
     }
 
-    // Configuration accepts any typed reply, even when serving slots are busy.
+    // Configuration accepts a verified Pong or Busy even under saturation.
     fn ping_reply(&self, timeout: Duration) -> Result<Reply> {
         let request = self.encode(Op::Ping)?;
         self.send_reply(&request, Instant::now() + timeout)
@@ -312,10 +518,7 @@ impl VectorClient {
         let mut body = vec![0; size];
         read_by(&mut stream, deadline, &mut body).context("reading reply")?;
         let response: Response = serde_json::from_slice(&body)?;
-        if response.version != VERSION {
-            bail!("daemon speaks vector protocol {}", response.version);
-        }
-        Ok(response.reply)
+        response.for_database(&self.database)
     }
 
     #[cfg(not(unix))]
@@ -546,6 +749,7 @@ pub struct VectorProxy {
     client: VectorClient,
     storage: Arc<Storage>,
     calls: AtomicU64,
+    answered: AtomicBool,
     failures: AtomicU64,
     down_since: std::sync::Mutex<Option<Instant>>,
     timings: std::sync::Mutex<ProxyTimings>,
@@ -559,6 +763,7 @@ impl VectorProxy {
             client,
             storage,
             calls: AtomicU64::new(0),
+            answered: AtomicBool::new(false),
             failures: AtomicU64::new(0),
             down_since: std::sync::Mutex::new(None),
             timings: std::sync::Mutex::new(ProxyTimings::default()),
@@ -598,8 +803,10 @@ impl VectorProxy {
     pub fn path(&self) -> &'static str {
         if self.down_since.lock().is_ok_and(|down| down.is_some()) {
             PATH_KEYWORD_ONLY
-        } else {
+        } else if self.answered.load(Ordering::Relaxed) {
             PATH_DAEMON
+        } else {
+            PATH_UNKNOWN
         }
     }
 
@@ -614,13 +821,14 @@ impl VectorProxy {
     }
 
     fn mark_up(&self) {
+        let first_reply = !self.answered.swap(true, Ordering::Relaxed);
         let was_down = self
             .down_since
             .lock()
             .map(|mut down| down.take().is_some())
             .unwrap_or(false);
-        if was_down {
-            tracing::info!("daemon answers again: semantic search resumed");
+        if was_down || first_reply {
+            tracing::info!("daemon answers: semantic search available");
             self.report_path();
         }
     }
@@ -841,11 +1049,7 @@ fn spawn_for_daemon_with(
     slots: Arc<Semaphore>,
 ) -> tokio::task::JoinHandle<()> {
     let data_dir = db_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let database = db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("csr-engine.db")
-        .to_owned();
+    let database = database_identity(db_path);
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -880,6 +1084,7 @@ fn spawn_for_daemon_with(
                 let Ok(waiting_slot) = waiting.clone().try_acquire_owned() else {
                     let bytes = serde_json::to_vec(&Response {
                         version: VERSION,
+                        database: Some(database.clone()),
                         reply: Reply::Error {
                             code: ErrorCode::Busy,
                             message: "vector daemon is busy".into(),
@@ -1003,6 +1208,7 @@ async fn serve_one(
     };
     let bytes = serde_json::to_vec(&Response {
         version: VERSION,
+        database: Some(database),
         reply,
     })
     .ok()?;
@@ -1481,7 +1687,12 @@ mod tests {
         let (db, _) = seed(tmp.path());
         let daemon = TestDaemon::start(&db).await;
         let dir = tmp.path().to_path_buf();
-        let ping = r#"{"version":1,"database":"csr-engine.db","op":{"op":"ping"}}"#;
+        let ping = serde_json::to_string(&Request {
+            version: VERSION,
+            database: database_identity(&db),
+            op: Op::Ping,
+        })
+        .unwrap();
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("not json", frame("not json")),
             (
@@ -1508,7 +1719,7 @@ mod tests {
             for (name, bytes) in cases {
                 answered.push((name, raw(&dir, &bytes, true).is_some()));
             }
-            (answered, raw(&dir, &frame(ping), false))
+            (answered, raw(&dir, &frame(&ping), false))
         })
         .await
         .unwrap();
@@ -1563,7 +1774,7 @@ mod tests {
         let search_frame = frame(
             &serde_json::to_string(&Request {
                 version: VERSION,
-                database: "csr-engine.db".into(),
+                database: database_identity(&db),
                 op: Op::SearchChunks {
                     vector,
                     limit: 3,
@@ -1573,7 +1784,14 @@ mod tests {
             })
             .unwrap(),
         );
-        let ping = frame(r#"{"version":1,"database":"csr-engine.db","op":{"op":"ping"}}"#);
+        let ping = frame(
+            &serde_json::to_string(&Request {
+                version: VERSION,
+                database: database_identity(&db),
+                op: Op::Ping,
+            })
+            .unwrap(),
+        );
         let stuck: Vec<_> = (0..SERVER_SLOTS)
             .map(|_| {
                 let (dir, bytes) = (dir.clone(), search_frame.clone());
@@ -1781,6 +1999,160 @@ mod tests {
     }
 
     #[test]
+    fn r5_plist_configuration_matches_only_its_canonical_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let plist = home.join("Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist");
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(
+            &plist,
+            include_str!("../../../scripts/launchd/com.ramakay.csr-engine.daemon.plist"),
+        )
+        .unwrap();
+        assert_eq!(
+            launchd_database(home),
+            Some(home.join(".claude-self-reflect/csr-engine.db"))
+        );
+        let default = home.join(".claude-self-reflect/csr-engine.db");
+        let other = home.join("other.db");
+        let offline = |_: &Path| anyhow::bail!("offline");
+        std::fs::write(&plist, "<plist><dict><key>ProgramArguments</key><array><string>csr-engine</string><string>daemon</string><!-- array end --></array><!-- dict end --></dict></plist>").unwrap();
+        assert!(daemon_configured_with(
+            &default,
+            Some(home),
+            false,
+            false,
+            offline
+        ));
+        assert!(!daemon_configured_with(
+            &other,
+            Some(home),
+            false,
+            false,
+            offline
+        ));
+        for arguments in [
+            format!("<key>ProgramArguments</key><array><string>csr-engine</string><string>--db-path</string><string>{}</string><string>daemon</string></array>", other.display()),
+            format!("<key>ProgramArguments</key><array><string>csr-engine</string><string>--db-path={}</string><string>daemon</string></array>", other.display()),
+        ] {
+            std::fs::write(&plist, format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>{arguments}</dict></plist>")).unwrap();
+            assert!(daemon_configured_with(&other, Some(home), false, false, offline));
+            assert!(!daemon_configured_with(&default, Some(home), false, false, offline));
+        }
+        let actual = home.join("actual & data");
+        std::fs::create_dir(&actual).unwrap();
+        let alias = home.join("alias");
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        std::fs::write(&plist, format!("<plist><dict><key>ProgramArguments</key><array><string>csr-engine</string><string>--db-path={}/test.db</string><string>daemon</string></array><key>EnvironmentVariables</key><dict><key>HOME</key><string>{}</string></dict></dict></plist>", actual.display().to_string().replace('&', "&amp;"), home.display())).unwrap();
+        assert!(daemon_configured_with(
+            &alias.join("test.db"),
+            Some(home),
+            false,
+            false,
+            offline
+        ));
+        std::fs::write(&plist, "not a plist").unwrap();
+        assert!(!daemon_configured_with(
+            &default,
+            Some(home),
+            false,
+            false,
+            offline
+        ));
+        // A heartbeat in the same directory is also scoped to its database.
+        write_heartbeat_for_database(&other);
+        assert!(!daemon_configured_with(
+            &home.join("unrelated.db"),
+            Some(home),
+            false,
+            false,
+            offline
+        ));
+    }
+
+    #[test]
+    fn r5_busy_and_ping_require_matching_database_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let identity = database_identity(&db);
+        for pong in [false, true] {
+            for database in [
+                None,
+                Some(database_identity(&dir.path().join("other"))),
+                Some(identity.clone()),
+            ] {
+                let matches = database.as_deref() == Some(identity.as_str());
+                let response = Response {
+                    version: VERSION,
+                    database,
+                    reply: if pong {
+                        Reply::Pong
+                    } else {
+                        Reply::Error {
+                            code: ErrorCode::Busy,
+                            message: "busy before admission".into(),
+                        }
+                    },
+                };
+                // Exercise the wire representation, including an old reply with
+                // no identity: it must never select another database's daemon.
+                let bytes = serde_json::to_vec(&response).unwrap();
+                let response: Response = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    daemon_configured_with(&db, None, false, false, |_| response
+                        .for_database(&identity)),
+                    matches
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r5_proxy_path_stays_unknown_until_a_successful_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let proxy = VectorProxy::new(
+            VectorClient::for_database(&db).unwrap(),
+            Arc::new(Storage::open(&db).unwrap()),
+        );
+        let record = dir.path().join("run.json");
+        let run = crate::binary_identity::RunRecord {
+            pid: std::process::id(),
+            version: "test".into(),
+            git_sha: "test".into(),
+            exe_identity: crate::binary_identity::FileIdentity::capture(&db).unwrap(),
+            role: "mcp_stdio".into(),
+            started_at: "2026-10-13T00:00:00Z".into(),
+            parent_cmd: None,
+            search_path: None,
+        };
+        std::fs::write(&record, serde_json::to_vec(&run).unwrap()).unwrap();
+        proxy.attach_run_record(record.clone());
+        let recorded = || {
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&record).unwrap())
+                .unwrap()["search_path"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(proxy.path(), PATH_UNKNOWN);
+        assert_eq!(recorded(), PATH_UNKNOWN);
+        assert_eq!(
+            crate::binary_identity::live_mcp_servers(dir.path())[0]
+                .search_path
+                .as_deref(),
+            Some(PATH_UNKNOWN)
+        );
+        proxy.mark_up();
+        assert_eq!(proxy.path(), PATH_DAEMON);
+        assert_eq!(recorded(), PATH_DAEMON);
+        proxy.mark_down(&anyhow::anyhow!("offline"));
+        assert_eq!(recorded(), PATH_KEYWORD_ONLY);
+        proxy.mark_up();
+        assert_eq!(recorded(), PATH_DAEMON);
+    }
+
+    #[test]
     fn r3_missing_or_stale_heartbeat_pings_the_actual_database() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("alternate.db");
@@ -1822,7 +2194,7 @@ mod tests {
             .path()
             .join("Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist");
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, b"installed").unwrap();
+        std::fs::write(&plist, format!("<plist><dict><key>ProgramArguments</key><array><string>csr-engine</string><string>--db-path</string><string>{}</string><string>daemon</string></array></dict></plist>", db.display())).unwrap();
         assert!(daemon_configured_with(
             &db,
             Some(dir.path()),
@@ -1891,6 +2263,10 @@ mod tests {
         let mut bytes = vec![0; size as usize];
         extra.read_exact(&mut bytes).await.unwrap();
         let response: Response = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            response.database.as_deref(),
+            Some(database_identity(&db).as_str())
+        );
         assert!(matches!(
             response.reply,
             Reply::Error {

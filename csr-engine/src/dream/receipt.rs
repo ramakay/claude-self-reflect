@@ -35,11 +35,12 @@
 //! whole-file stamps, and the commit list per `(repo, path, from, to)`.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use codewitness::{stamp_normalized, Auditor, ObjectId};
 
@@ -460,38 +461,11 @@ fn parse_commit_list(stdout: &[u8], max: usize) -> Option<Vec<String>> {
 /// on its own thread so a full pipe can never block the child (and with it
 /// the deadline poll).
 fn run_with_deadline(mut cmd: Command, deadline: Duration) -> Option<Vec<u8>> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+    use crate::process::CommandDeadline;
+    let output = cmd
+        .output_with_deadline(deadline.min(crate::process::GIT_TIMEOUT))
         .ok()?;
-    let mut pipe = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        pipe.read_to_end(&mut buf).ok().map(|_| buf)
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            // Timed out, or the wait itself failed: do not leave it running.
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    // After a kill the reader is deliberately not joined: a grandchild that
-    // inherited the pipe would hold it open and stall the caller past the
-    // deadline. The thread ends by itself once the pipe closes.
-    let status = status?;
-    let output = reader.join().ok().flatten();
-    status.success().then_some(output).flatten()
+    output.status.success().then_some(output.stdout)
 }
 
 /// Why a candidate event was withheld instead of written with a receipt.

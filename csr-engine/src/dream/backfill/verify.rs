@@ -40,6 +40,7 @@
 //! records the reason and the raw response, per the design's own framing of
 //! that table ("Stage 5 verify-failure audit log").
 
+use crate::process::CommandDeadline;
 use crate::storage::witness_verdicts::LIVE_EVENT_FLOOR_SQL;
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -450,7 +451,7 @@ fn git_oid_exists(repo_root: &str, oid: &str) -> bool {
         .arg("cat-file")
         .arg("-e")
         .arg(&spec)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }

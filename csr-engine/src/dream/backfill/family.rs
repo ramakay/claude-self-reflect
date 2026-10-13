@@ -57,6 +57,7 @@
 //! [`canon_file`] collapses that segment so the same symbol stamped from a
 //! worktree and from the main checkout joins as one identity.
 
+use crate::process::CommandDeadline;
 use std::collections::{BTreeMap, HashMap};
 use std::process::Command;
 
@@ -153,7 +154,7 @@ fn git_origin_url(repo_root: &str) -> Option<String> {
         .arg("config")
         .arg("--get")
         .arg("remote.origin.url")
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;
@@ -176,7 +177,7 @@ fn git_common_dir(repo_root: &str) -> Option<String> {
     let output = git_at(repo_root)
         .arg("rev-parse")
         .arg("--git-common-dir")
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;

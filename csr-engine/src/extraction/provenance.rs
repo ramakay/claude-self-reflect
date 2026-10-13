@@ -533,19 +533,17 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
     .min_by_key(|&(start, _, _)| start)
 }
 
-/// Start of an optional quote marker and single hotkey digit before a header.
-/// A multi-digit number belongs to the person and is preserved whole.
+/// Split the same-line prefix as P + M + D: D is one touching ASCII digit,
+/// M is the longest run of spaces, tabs and quote markers immediately before it.
+/// Only a standalone hotkey is cut; prose and multi-digit numbers stay whole.
 fn forward_prefix_start(piece: &str) -> usize {
-    let mut digits = 0;
-    for ch in piece.chars() {
-        if ch.is_ascii_digit() {
-            digits += 1;
-        } else if ch != '>' && !ch.is_whitespace() {
-            return piece.len();
-        }
-    }
-    if digits <= 1 {
+    let digit = piece.as_bytes().last().is_some_and(u8::is_ascii_digit);
+    let before_digit = piece.len() - usize::from(digit);
+    let prefix = piece[..before_digit].trim_end_matches([' ', '\t', '>']);
+    if prefix.trim().is_empty() {
         0
+    } else if !digit {
+        prefix.len()
     } else {
         piece.len()
     }
@@ -568,7 +566,7 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize, V
     while let Some((start, end, bounded)) = next_one_line_forward(line, cursor, others) {
         first.get_or_insert(start);
         let from = cursor + forward_prefix_start(&line[cursor..start]);
-        pieces.push(line[cursor..from].trim());
+        pieces.push(&line[cursor..from]);
         spans.push(ForwardSpan {
             start: from,
             end,
@@ -577,16 +575,19 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize, V
         cursor = end.max(start + 1);
     }
     let first = first?;
-    pieces.push(line[cursor..].trim());
-    Some((
-        pieces
-            .into_iter()
-            .filter(|piece| !piece.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
-        first,
-        spans,
-    ))
+    pieces.push(&line[cursor..]);
+    let mut own = String::new();
+    for piece in pieces {
+        let piece = piece.trim_start();
+        if piece.is_empty() {
+            continue;
+        }
+        if !own.is_empty() && !own.ends_with(char::is_whitespace) {
+            own.push(' ');
+        }
+        own.push_str(piece);
+    }
+    Some((own.trim_end().to_string(), first, spans))
 }
 
 /// All forward cuts in original byte coordinates, including band forwards.
@@ -1173,6 +1174,52 @@ mod tests {
             mine.unwrap_or(""),
             "strip_csr_emissions: {input}"
         );
+    }
+
+    #[test]
+    fn r5_ordered_forward_prefix_table_extraction_and_scrub() {
+        let rows = [
+            ("I vote 2 ", "I vote 2 "),
+            ("2 > ", "2 "),
+            ("2> ", "2 "),
+            ("> 2", ""),
+            (">2", ""),
+            (">>2", ""),
+            ("2", ""),
+            ("42", "42 "),
+            ("2 > >", "2 "),
+            ("2 ", "2 "),
+            ("I vote 2 > ", "I vote 2 "),
+            ("42 > ", "42 "),
+            ("1 > 2 ", "1 > 2 "),
+            ("I vote 2", "I vote 2 "),
+            ("I vote 2\n", "I vote 2\n"),
+        ];
+        for forward in [
+            "CSR's compaction card (compacting), quoted: “One.”",
+            "CSR's story of this session, rev 1, quoted: “One.”",
+            "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “One.”",
+        ] {
+            for (prefix, kept) in rows {
+                own_words_agree(
+                    &format!("{prefix}{forward} Keep the deployment frozen."),
+                    Some(&format!("{kept}Keep the deployment frozen.")),
+                );
+            }
+            let quoted = format!("> I vote 2 {forward} Keep the deployment frozen.");
+            // Extraction excludes quoted personal lines, as before. Import
+            // scrub keeps quoted personal text while removing the CSR forward.
+            assert_eq!(extractable(&quoted), None);
+            assert_eq!(
+                crate::import::scrub_contaminated_text(&quoted).as_deref(),
+                Some("> I vote 2 Keep the deployment frozen.")
+            );
+            // A kept whitespace suffix supplies the join itself.
+            own_words_agree(
+                &format!("I vote\t2{forward} Keep the deployment frozen."),
+                Some("I vote\t2 Keep the deployment frozen."),
+            );
+        }
     }
 
     /// The band's forward as `askClaude` writes it.

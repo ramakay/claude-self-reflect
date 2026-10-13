@@ -132,6 +132,7 @@
 //!   directly to `dreams_v1`, never to `dream_relations`; the bullet above
 //!   about `dream_relations` itself remains accurate and untouched.)
 
+use crate::process::CommandDeadline;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -575,7 +576,10 @@ fn git_at(repo_root: &Path) -> std::process::Command {
 /// Fail-soft: a failing/erroring git invocation yields empty output rather
 /// than aborting the whole family scan over one unresolvable target.
 fn git_stdout(repo_root: &Path, args: &[&str]) -> String {
-    let Ok(out) = git_at(repo_root).args(args).output() else {
+    let Ok(out) = git_at(repo_root)
+        .args(args)
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
+    else {
         return String::new();
     };
     if !out.status.success() {

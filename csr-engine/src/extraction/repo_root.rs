@@ -15,6 +15,7 @@
 //! guess and never an `Err` the caller has to handle. `project` is never
 //! touched by anything in this module.
 
+use crate::process::CommandDeadline;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,7 +91,7 @@ fn git_toplevel(dir: &Path) -> Option<String> {
         .arg(dir)
         .arg("rev-parse")
         .arg("--show-toplevel")
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;
@@ -128,9 +129,6 @@ pub struct GitPlace {
 /// gone, or `git` still running at `deadline` (it is killed): all `None`, and
 /// every caller treats `None` as "not the same repository".
 pub fn git_place(dir: &Path, deadline: std::time::Instant) -> Option<GitPlace> {
-    use std::io::Read;
-    use std::process::Stdio;
-
     if !dir.is_dir() || std::time::Instant::now() >= deadline {
         return None;
     }
@@ -140,7 +138,7 @@ pub fn git_place(dir: &Path, deadline: std::time::Instant) -> Option<GitPlace> {
             cmd.env_remove(&k);
         }
     }
-    let mut child = cmd
+    let output = cmd
         .arg("-C")
         .arg(dir)
         .args([
@@ -149,31 +147,16 @@ pub fn git_place(dir: &Path, deadline: std::time::Instant) -> Option<GitPlace> {
             "--show-toplevel",
             "--git-common-dir",
         ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .output_with_deadline(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(crate::process::GIT_TIMEOUT),
+        )
         .ok()?;
-    // The answer is two short lines, far below the pipe buffer, so waiting for
-    // exit before reading cannot deadlock.
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    if !status.success() {
+    if !output.status.success() {
         return None;
     }
-    let mut text = String::new();
-    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
     // Exactly two lines, in the order asked. A path holding a newline gives
     // more and is refused.
     let mut lines = text.lines();

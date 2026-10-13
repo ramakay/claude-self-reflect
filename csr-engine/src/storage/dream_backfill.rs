@@ -27,6 +27,7 @@
 //! EITHER domain (`session_id` OR `episode_id`) for exactly that reason; see
 //! its own doc comment.
 
+use crate::process::CommandDeadline;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -320,7 +321,7 @@ fn git_present_at_head(repo_root: &str, rel: &str) -> Option<bool> {
         .arg("cat-file")
         .arg("-e")
         .arg(&spec)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     Some(output.status.success())
 }
@@ -337,7 +338,7 @@ fn git_last_committer_ts(repo_root: &str, rel: &str) -> Option<i64> {
         .arg("--format=%ct")
         .arg("--")
         .arg(rel)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;

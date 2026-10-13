@@ -746,6 +746,43 @@ impl Storage {
         queries::set_batch_id(&conn, conversation_id, batch_id, prompt_hash)
     }
 
+    /// Recover interrupted narrative work before submitting any new batches.
+    /// Rows with an id still belong to the remote batch; only id-less rows may
+    /// be submitted again. This transaction is deferred during maintenance.
+    pub(crate) fn recover_narrative_batches(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Vec<(String, String)>>> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE enrichment_state SET status = 'pending', updated_at = datetime('now')
+                 WHERE enrichment_type = 'ai_narrative' AND status = 'processing'
+                   AND (batch_id IS NULL OR batch_id = '')",
+                [],
+            )?;
+            let mut batches = std::collections::BTreeMap::<String, Vec<(String, String)>>::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT e.batch_id, e.conversation_id, COALESCE(MIN(i.file_path), e.file_path, '')
+                     FROM enrichment_state e LEFT JOIN import_state i
+                       ON i.conversation_id = e.conversation_id
+                     WHERE e.enrichment_type = 'ai_narrative' AND e.status = 'processing'
+                       AND e.batch_id IS NOT NULL AND e.batch_id != ''
+                     GROUP BY e.batch_id, e.conversation_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                })?;
+                for row in rows {
+                    let (batch, conv, file) = row?;
+                    batches.entry(batch).or_default().push((conv, file));
+                }
+            }
+            tx.commit()?;
+            Ok(batches)
+        })
+    }
+
     pub fn get_conversations_by_batch(&self, batch_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_conversations_by_batch(&conn, batch_id)
@@ -1401,6 +1438,45 @@ impl Storage {
     pub fn ratification_summary(&self) -> Result<(i64, f64)> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::ratification_summary(&conn)
+    }
+
+    /// Read the cached verdict without running a scan, including on a cache miss.
+    pub fn cached_integrity(&self) -> Result<Option<bool>> {
+        Ok(
+            match (
+                self.get_meta("integrity_ok")?,
+                self.get_meta("integrity_checked_at")?,
+            ) {
+                (Some(ok), Some(at)) if chrono::DateTime::parse_from_rfc3339(&at).is_ok() => {
+                    match ok.as_str() {
+                        "1" => Some(true),
+                        "0" => Some(false),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        )
+    }
+
+    /// Publish a status --deep verdict without migrations, only if maintenance
+    /// permits writes. The guard covers opening, the transaction and closing.
+    pub(crate) fn store_integrity_verdict(path: &Path, ok: bool) -> Result<()> {
+        let data_dir = path.parent().unwrap_or(Path::new("."));
+        let Some(_operation) = crate::maintenance::try_shared(data_dir)? else {
+            return Ok(());
+        };
+        let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        queries::set_meta(&tx, "integrity_ok", if ok { "1" } else { "0" })?;
+        queries::set_meta(
+            &tx,
+            "integrity_checked_at",
+            &chrono::Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Integrity check with an app-level cache. SQLite recomputes

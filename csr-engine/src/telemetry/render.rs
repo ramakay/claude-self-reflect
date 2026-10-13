@@ -13,7 +13,11 @@ pub mod text {
 
         // ── DB / Index ────────────────────────────────────────────────────────
         let db_mb = t.status.db_size_bytes as f64 / 1_048_576.0;
-        let health = if t.status.healthy { "ok" } else { "UNHEALTHY" };
+        let health = match t.status.healthy {
+            Some(true) => "ok",
+            Some(false) => "UNHEALTHY",
+            None => "unknown",
+        };
         println!(
             "  Index   {:>7} chunks  {:>5} reflections  {:>5} conv  {:>3} proj  db={:.1}MB  health={}",
             t.status.chunks,

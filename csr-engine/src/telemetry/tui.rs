@@ -115,18 +115,12 @@ fn render(f: &mut Frame, t: &Telemetry) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, t: &Telemetry) {
-    let health_style = if t.status.healthy {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    let (color, health_label) = match t.status.healthy {
+        Some(true) => (Color::Green, "● healthy"),
+        Some(false) => (Color::Red, "● UNHEALTHY"),
+        None => (Color::Gray, "● integrity unknown"),
     };
-    let health_label = if t.status.healthy {
-        "● healthy"
-    } else {
-        "● UNHEALTHY"
-    };
+    let health_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let db_mb = t.status.db_size_bytes as f64 / 1_048_576.0;
 
     let line = Line::from(vec![

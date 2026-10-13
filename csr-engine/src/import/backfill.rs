@@ -31,6 +31,7 @@
 //! never fatal (mirrors the rest of the codebase). Tree-sitter is wrapped by the
 //! existing `catch_unwind` inside `extract_graph_fragment`.
 
+use crate::process::CommandDeadline;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -711,7 +712,7 @@ fn git_log_introducing_commit(
         .arg("--format=%H %cI")
         .arg("--reverse")
         .arg("--no-patch")
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     if !output.status.success() {
         return None;

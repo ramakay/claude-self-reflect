@@ -5,6 +5,7 @@
 //! The two call sites keep their own process plumbing (sync vs tokio); only
 //! the pure decision/parsing logic lives here.
 
+use crate::process::CommandDeadline;
 use serde_json::Value;
 
 /// Kill switch: user disabled all AI-narrative generation.
@@ -147,16 +148,18 @@ fn headless_keeps_user_settings() -> bool {
 pub fn isolation_args() -> Vec<String> {
     static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     ARGS.get_or_init(|| {
-        let help = std::process::Command::new("claude")
-            .arg("--help")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default();
+        let help = capability_help(&mut std::process::Command::new("claude"));
         isolation_args_for(&help, headless_keeps_user_settings())
     })
     .clone()
+}
+
+fn capability_help(command: &mut std::process::Command) -> String {
+    command
+        .arg("--help")
+        .output_with_deadline(std::time::Duration::from_secs(3))
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// [`isolation_args`] for a given `claude --help` text. No option is
@@ -330,6 +333,24 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn r5_claude_help_timeout_is_unsupported_under_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = crate::maintenance::shared(dir.path()).unwrap();
+    let started = std::time::Instant::now();
+    let help = capability_help(
+        std::process::Command::new("sh")
+            .args(["-c", "printf '%s' --setting-sources; exec sleep 30"]),
+    );
+    assert!(help.is_empty());
+    assert!(isolation_args_for(&help, false).is_empty());
+    assert!(started.elapsed() >= std::time::Duration::from_secs(3));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    drop(guard);
+    assert!(crate::maintenance::MaintenanceLock::acquire(dir.path()).is_ok());
 }
 
 #[cfg(test)]
