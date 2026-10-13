@@ -20,7 +20,8 @@ between sessions, the previous-session facts, likes, the error log. It holds tex
 folder is made `0700` and every file `0600`, whatever your umask; files an earlier version left looser are tightened
 the first time the plugin writes. Keys (`sk-`, `xai-`, `ghp_`, `AKIA`), `Bearer` tokens, `password=`/`token=` values
 and PEM blocks are removed from the text before it is kept. That is pattern matching: a secret in a shape it does
-not know stays. All writes go through `bin/private.py`.
+not know stays, and so does an unquoted password that is a plain word (`password: swordfish`), which cannot be told
+from prose. Links inside the folder are never followed. All writes go through `bin/private.py`.
 
 The dreamer (off until you turn it on in `/config`) checks before each look that what it has spent, plus what the
 last look cost, stays within 1 token for every 10 Claude spends. It is a check, not a cap: a fork takes no token

@@ -3527,7 +3527,7 @@ def coach_terms(now=None, newest=COACH_SESSIONS):
         for term, said in kept[path][1].items():
             sessions.setdefault(term, []).append(said)
     try:
-        private.write_atomic(COACH_KEPT, json.dumps({p: v for p, v in kept.items() if p in paths}), root=KEEP)
+        private.write_atomic(COACH_KEPT, private.dumps({p: v for p, v in kept.items() if p in paths}), root=KEEP)  # excerpts of what you said
     except OSError:
         pass
     try:

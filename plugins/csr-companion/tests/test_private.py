@@ -113,43 +113,160 @@ class Helpers(Umask022):
         self.assertEqual(ran.returncode, 2)
 
 
-# (what was said, what is kept)
-REDACTION = [
-    ('use sk-ant-api03-AbCdEf0123456789_-xyz here', 'use [redacted] here'),
-    ('OPENAI sk-proj-0123456789abcdefghij0123', 'OPENAI [redacted]'),
-    ('xai-0123456789abcdefghijKLMN', '[redacted]'),
-    ('token ghp_0123456789abcdefghijABCDEFGHIJ0123 ok', 'token [redacted] ok'),
-    ('github_pat_11ABCDEFG0123456789_abcdefghijklmnop', '[redacted]'),
-    ('id AKIAIOSFODNN7EXAMPLE and ASIAIOSFODNN7EXAMPLE', 'id [redacted] and [redacted]'),
-    ('xoxb-1234567890-abcdefghij', '[redacted]'),
-    ('curl -H "Authorization: Bearer abc123.def456-ghi789" x', 'curl -H "Authorization: Bearer [redacted]" x'),
-    ('authorization: basic dXNlcjpwYXNzd29yZA==', 'authorization: basic [redacted]'),
-    ('password=hunter2 next', 'password=[redacted] next'),
-    ('DB_PASSWORD: "correct horse battery"', 'DB_PASSWORD: "[redacted]"'),
-    ("API_KEY='abc 123'", "API_KEY='[redacted]'"),
-    ('{"token": "abc.def", "ok": 1}', '{"token": "[redacted]", "ok": 1}'),
-    ('?access_token=abc123&x=1', '?access_token=[redacted]&x=1'),
-    ('-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nabc\n-----END RSA PRIVATE KEY----- after', '[redacted] after'),
-    ('-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk', '[redacted]'),  # an excerpt cut before the END line
-    ('eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpM', '[redacted]'),
-    # what is not a credential stays
-    ('the token budget is 10% of Claude tokens: 120k', 'the token budget is 10% of Claude tokens: 120k'),
-    ('sk-short and ask-me-anything and task-12345678901234567890', 'sk-short and ask-me-anything and task-12345678901234567890'),
-    ('git push origin feat/plugin', 'git push origin feat/plugin'),
-]
+def table():
+    with open(os.path.join(HERE, 'redaction_table.json'), encoding='utf-8') as handle:
+        return json.load(handle)
 
 
 class Redaction(unittest.TestCase):
     def test_table(self):
-        for said, kept in REDACTION:
+        for said, kept in table():
             with self.subTest(said=said):
                 self.assertEqual(private.redact(said), kept)
                 self.assertEqual(private.redact(kept), kept)  # twice changes nothing more
 
     def test_every_string_in_json_shaped_data_but_not_its_keys(self):
-        got = private.redact_value({'password': 'sk-0123456789abcdefghij', 'n': 3, 'xs': ['Bearer abcdefgh12345', None, {'a': 'token=zz'}]})
+        got = private.redact_value({'password': 'sk-0123456789abcdefghij', 'n': 3, 'xs': ['Bearer abcdefgh12345', None, {'a': 'token=zz12345'}]})
         self.assertEqual(got, {'password': '[redacted]', 'n': 3, 'xs': ['Bearer [redacted]', None, {'a': 'token=[redacted]'}]})
-        self.assertEqual(json.loads(private.dumps({'line': 'password=x'})), {'line': 'password=[redacted]'})
+        self.assertEqual(json.loads(private.dumps({'line': 'password=x9y8z7w6'})), {'line': 'password=[redacted]'})
+
+
+class RedactionRound2(Umask022):
+    """Codex round 2: the JSON path, the coach cache, the status line, and prose that is not a secret."""
+
+    def run_private(self, *args, text=''):
+        return subprocess.run([sys.executable, '-I', os.path.join(BIN, 'private.py'), *args], input=text.encode(),
+                              capture_output=True, env=dict(os.environ, HOME=self.home))
+
+    def test_json_is_parsed_redacted_and_serialized_again_never_redacted_as_text(self):
+        # #1: redacting the serialized form turned the escaped quotes into a broken document that kept the password.
+        said = json.dumps({'text': 'set password="correct horse battery" now', 'n': 3, 'xs': ['token=abc123']})
+        path = os.path.join(self.root, 'compact-plan', 's.json')
+        ran = self.run_private('write', path, '--redact-json', text=said)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        kept = json.load(open(path, encoding='utf-8'))  # still JSON
+        self.assertEqual(kept, {'text': 'set password="[redacted]" now', 'n': 3, 'xs': ['token=[redacted]']})
+        self.assertNotIn('correct horse', open(path).read())
+        self.assertEqual(mode(path), 0o600)
+
+    def test_text_that_is_not_json_is_refused_by_the_json_mode_and_writes_nothing(self):
+        path = os.path.join(self.root, 'x.json')
+        ran = self.run_private('write', path, '--redact-json', text='{"cut off')
+        self.assertEqual(ran.returncode, 1)
+        self.assertFalse(os.path.exists(path))
+
+    def test_the_hooks_name_the_kind_of_text_they_redact(self):
+        with open(os.path.join(HERE, '..', 'hooks', 'register.tsx'), encoding='utf-8') as handle:
+            source = handle.read()
+        calls = re.findall(r"keepWrite\(\$, [^\n]*?, '(text|json)'\)", source)
+        self.assertEqual(sorted(calls), ['json', 'text'])  # the plan is JSON, the guard log is text
+        self.assertNotIn(', true)', ''.join(re.findall(r'keepWrite\([^\n]*', source)))
+
+    def test_the_coach_cache_keeps_no_credential_from_what_you_said(self):
+        transcript = os.path.join(self.home, '.claude', 'projects', 'p', 's1.jsonl')
+        os.makedirs(os.path.dirname(transcript))
+        open(transcript, 'w').close()
+        old = pane.HOME, pane.COACH_KEPT, pane.KEEP, pane.terms_looked_up
+        pane.HOME, pane.COACH_KEPT, pane.KEEP = self.home, os.path.join(self.root, 'coach.json'), self.root
+        pane.terms_looked_up = lambda path: {'frobnicate': 'please frobnicate with password=hunter2 and sk-0123456789abcdefghij'}
+        try:
+            pane.coach_terms(now=1.0)
+        finally:
+            pane.HOME, pane.COACH_KEPT, pane.KEEP, pane.terms_looked_up = old
+        body = open(os.path.join(self.root, 'coach.json')).read()
+        self.assertIn('frobnicate', body)
+        self.assertNotRegex(body, r'hunter2|sk-0123')
+        self.assertEqual(mode(os.path.join(self.root, 'coach.json')), 0o600)
+
+    def test_the_shared_table_gives_the_same_answers_in_the_status_line_wrapper(self):
+        script = 'const {redact} = require(process.argv[1]); const rows = JSON.parse(process.argv[2]);' \
+                 'console.log(JSON.stringify(rows.map(([said]) => [said, redact(said), redact(redact(said))])))'
+        ran = subprocess.run(['node', '-e', script, os.path.join(BIN, 'statusline.cjs'), json.dumps(table())],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        for (said, kept), (_, got, again) in zip(table(), json.loads(ran.stdout)):
+            with self.subTest(said=said):
+                self.assertEqual((got, again), (kept, kept))
+
+    def test_the_status_line_it_keeps_has_no_credential_in_it(self):
+        os.makedirs(os.path.join(self.root, 'panes'))
+        with open(os.path.join(self.root, 'panes', 's2.json'), 'w') as handle:
+            json.dump(dict(pid=os.getpid()), handle)
+        ran = subprocess.run(['node', os.path.join(BIN, 'statusline.cjs'), '--sh', 'cat >/dev/null; echo "ctx 40% token=abc123 Bearer abc123def456"'],
+                             input=json.dumps(dict(session_id='s2')).encode(), capture_output=True,
+                             env=dict(os.environ, HOME=self.home), timeout=30)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        kept = json.load(open(os.path.join(self.root, 'statusline', 's2.json')))
+        self.assertEqual(kept['line'].strip(), 'ctx 40% token=[redacted] Bearer [redacted]')
+
+
+class SymlinksAreNeverFollowed(Umask022):
+    """Codex round 2 #2: chmod and open follow links, so a link in the folder moved its target's mode or its content."""
+
+    def setUp(self):
+        super().setUp()
+        self.outside = os.path.join(self.home, 'outside')
+        os.makedirs(self.outside)
+        self.exe = os.path.join(self.outside, 'exe')
+        with open(self.exe, 'w') as handle:
+            handle.write('#!/bin/sh\n')
+        os.chmod(self.exe, 0o755)
+        self.elsewhere = os.path.join(self.outside, 'folder')
+        os.makedirs(self.elsewhere, mode=0o755)
+        os.makedirs(self.root)
+
+    def test_tighten_leaves_what_a_link_points_at_alone(self):
+        os.symlink(self.exe, os.path.join(self.root, 'link'))
+        os.symlink(self.elsewhere, os.path.join(self.root, 'folderlink'))
+        private.tighten(self.root)
+        self.assertEqual((mode(self.exe), mode(self.elsewhere)), (0o755, 0o755))
+        self.assertTrue(os.path.islink(os.path.join(self.root, 'link')))
+
+    def test_the_first_touch_and_the_script_leave_it_alone_too(self):
+        os.symlink(self.exe, os.path.join(self.root, 'link'))
+        private.ensure_dir(self.root, root=self.root)
+        subprocess.run([sys.executable, '-I', os.path.join(BIN, 'private.py'), 'tighten'], env=dict(os.environ, HOME=self.home), check=True)
+        self.assertEqual(mode(self.exe), 0o755)
+
+    def test_a_write_to_a_link_is_refused_and_its_target_is_untouched(self):
+        target = os.path.join(self.outside, 'victim.txt')
+        with open(target, 'w') as handle:
+            handle.write('keep')
+        os.chmod(target, 0o644)
+        os.symlink(target, os.path.join(self.root, 'dreams.jsonl'))
+        for write in (lambda p: private.append(p, 'x', root=self.root), lambda p: private.write_atomic(p, 'x', root=self.root)):
+            with self.assertRaises(OSError):
+                write(os.path.join(self.root, 'dreams.jsonl'))
+        self.assertEqual((open(target).read(), mode(target)), ('keep', 0o644))
+
+    def test_a_link_planted_at_the_temp_name_is_not_written_through(self):
+        target = os.path.join(self.outside, 'victim.txt')
+        with open(target, 'w') as handle:
+            handle.write('keep')
+        path = os.path.join(self.root, 'spend.json')
+        os.symlink(target, f'{path}.{os.getpid()}.tmp')
+        private.write_atomic(path, 'new', root=self.root)
+        self.assertEqual((open(target).read(), open(path).read(), mode(path)), ('keep', 'new', 0o600))
+        self.assertFalse(os.path.islink(path))
+
+    def test_a_folder_that_is_a_link_below_the_root_is_refused(self):
+        os.symlink(self.elsewhere, os.path.join(self.root, 'carry'))
+        with self.assertRaises(OSError):
+            private.write_atomic(os.path.join(self.root, 'carry', 'a.json'), '{}', root=self.root)
+        self.assertEqual((os.listdir(self.elsewhere), mode(self.elsewhere)), ([], 0o755))
+
+    @unittest.skipUnless(shutil.which('node'), 'node is not installed')
+    def test_the_status_line_wrapper_does_not_write_through_a_link_either(self):
+        os.makedirs(os.path.join(self.root, 'panes'))
+        with open(os.path.join(self.root, 'panes', 's3.json'), 'w') as handle:
+            json.dump(dict(pid=os.getpid()), handle)
+        os.symlink(self.elsewhere, os.path.join(self.root, 'statusline'))
+        ran = subprocess.run(['node', os.path.join(BIN, 'statusline.cjs'), '--sh', 'cat >/dev/null; echo drawn'],
+                             input=json.dumps(dict(session_id='s3')).encode(), capture_output=True,
+                             env=dict(os.environ, HOME=self.home), timeout=30)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual((os.listdir(self.elsewhere), mode(self.elsewhere)), ([], 0o755))
+        self.assertEqual(ran.stdout.decode().strip(), 'drawn')  # it fell back to the prompt line
 
 
 class PaneWritesArePrivate(Umask022):
@@ -176,16 +293,16 @@ class PaneWritesArePrivate(Umask022):
     def test_the_dream_log_the_likes_and_the_lost_log(self):
         pane.keep(dict(kind='dream', line='use password=hunter2 and sk-ant-api03-0123456789abcdefghij'))
         pane.keep_like('k', 'dream', 'Bearer abcdefgh12345 title', True, 1.0)
-        pane.keep_lost('k', 'dropped', 1.0, 'proj', text='token=abc')
+        pane.keep_lost('k', 'dropped', 1.0, 'proj', text='token=abc12345')
         for path in (pane.DREAM_LOG, pane.LIKES, pane.LOST_LOG):
             self.assert_private(path)
             body = open(path).read()
-            self.assertNotRegex(body, r'hunter2|sk-ant|abcdefgh12345|token=abc')
+            self.assertNotRegex(body, r'hunter2|sk-ant|abcdefgh12345|token=abc1')
             self.assertIn('[redacted]', body)
 
     def test_the_carry_and_the_previous_facts(self):
         pane.keep_json('carry', 's1', [dict(text='remember token=abc123 and sk-0123456789abcdefghij')])
-        pane.keep_json('previous', 's1', dict(said=[0, 'password: swordfish']))
+        pane.keep_json('previous', 's1', dict(said=[0, 'password: s3cret-swordfish']))
         for path in (os.path.join(self.root, 'carry', 's1.json'), os.path.join(self.root, 'previous', 's1.json')):
             self.assert_private(path)
             self.assertNotRegex(open(path).read(), r'abc123|sk-0123|swordfish')

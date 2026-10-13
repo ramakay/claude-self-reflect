@@ -37,8 +37,11 @@ const script = ($: EngineInterface) => `${$.plugin.root}/bin/pane.py`
 // the folder holds text from your transcripts. private.py makes the folders 0700 and the file 0600, and with `redact`
 // removes keys, bearer tokens, password=/token= values and PEM blocks from the text first. Rejects when it could not.
 // Files that are the person's own (settings.json, CLAUDE.md) are not the companion's and keep $.fs.write.
-async function keepWrite($: EngineInterface, path: string, text: string, redact = false): Promise<void> {
-  const ran = await $.process.run(['python3', '-I', `${$.plugin.root}/bin/private.py`, 'write', path, ...(redact ? ['--redact'] : [])], { stdin: text, timeoutMs: 10_000 })
+// `redact`: 'text' removes credentials from plain text; 'json' parses the JSON, redacts the strings in it and
+// serializes it again (redacting the serialized form would break its escaping and could leave the secret in).
+async function keepWrite($: EngineInterface, path: string, text: string, redact?: 'text' | 'json'): Promise<void> {
+  const flag = redact === 'json' ? ['--redact-json'] : redact === 'text' ? ['--redact'] : []
+  const ran = await $.process.run(['python3', '-I', `${$.plugin.root}/bin/private.py`, 'write', path, ...flag], { stdin: text, timeoutMs: 10_000 })
   if (ran.exitCode !== 0) throw new Error(`private write failed: ${ran.stderr.trim()}`)
 }
 const guard = ($: EngineInterface) => `${$.plugin.root}/bin/pane_guard.py` // runs pane.py, and outlives an edit that breaks it
@@ -195,7 +198,7 @@ async function guardOf($: EngineInterface, cwd: string): Promise<Guard | null> {
       const log = `${home}/${PANE_ERRORS}`
       const was = await $.fs.read(log).catch(() => '')
       const at = new Date(await $.clock.now()).toISOString()
-      await keepWrite($, log, `${was}${was && !was.endsWith('\n') ? '\n' : ''}${at} csr guard: ${path} is no guard (not JSON, or a key of the wrong kind); it counts for nothing\n`, true).catch(() => undefined)
+      await keepWrite($, log, `${was}${was && !was.endsWith('\n') ? '\n' : ''}${at} csr guard: ${path} is no guard (not JSON, or a key of the wrong kind); it counts for nothing\n`, 'text').catch(() => undefined)
     }
   }
   return mergeGuards(guards)
@@ -999,7 +1002,7 @@ async function showPlan($: EngineInterface, state: string, text: string | null, 
   const done = planQueue.then(async () => {
     if (!currentPlan(op)) return
     await update($, infinite, current => (currentPlan(op) ? { plan: text, story: current?.story ?? null } : current))
-    if (path && currentPlan(op)) await keepWrite($, path, JSON.stringify({ at, state, text, ...extra }), true).catch(() => undefined)
+    if (path && currentPlan(op)) await keepWrite($, path, JSON.stringify({ at, state, text, ...extra }), 'json').catch(() => undefined)
   })
   planQueue = done.catch(() => undefined)
   await done

@@ -15,11 +15,14 @@ user read them. Every write in the companion goes through here instead:
 
 Run as a script it serves the TypeScript hooks, whose $.fs.write has no mode to ask for:
 
-  python3 -I private.py write PATH [--redact] < text      write the text from stdin to PATH, privately
+  python3 -I private.py write PATH [--redact|--redact-json] < text
+                                                          write the text from stdin to PATH, privately; --redact-json
+                                                          for JSON (its strings are redacted, then it is serialized again)
   python3 -I private.py tighten                           tighten what an earlier version left looser
 
 Nothing here raises for the sake of tidiness: a write that cannot be made private is not made, and says OSError.
 """
+import errno
 import json
 import os
 import re
@@ -36,9 +39,29 @@ def _inside(path, root):
     return bool(root) and (path == root or path.startswith(root.rstrip(os.sep) + os.sep))
 
 
+NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+
+
+def _refuse_link(path):
+    """A symlink inside the companion's folder is never followed: chmod and open would act on its target."""
+    if os.path.islink(path):
+        raise OSError(errno.ELOOP, 'refusing to follow a symlink in the companion folder', path)
+
+
+def _chmod(path, mode, directory=False):
+    """chmod on the thing itself: opened without following a link, then fchmod. A symlink raises ELOOP."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW | (os.O_DIRECTORY if directory else 0))
+    try:
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
 def ensure_dir(path, root=None):
     """The folder at path, 0700, and each folder from the companion's root down to it. A path outside the root
-    gets only itself made private; the folders above it are made as usual (they are not the companion's)."""
+    gets only itself made private; the folders above it are made as usual (they are not the companion's). The
+    first folder of the chain (the root, which a person may have linked to another disk) may be a symlink and is
+    followed; any folder below it that is one is refused."""
     path, root = os.path.abspath(path), os.path.abspath(root or ROOT)
     chain = [path]
     if _inside(path, root):
@@ -47,12 +70,17 @@ def ensure_dir(path, root=None):
             if part not in ('.', ''):
                 chain.append(os.path.join(chain[-1], part))
     os.makedirs(os.path.dirname(chain[0]), exist_ok=True)
-    for folder in chain:
+    for number, folder in enumerate(chain):
+        if number:
+            _refuse_link(folder)
         try:
             os.mkdir(folder, DIR_MODE)
         except FileExistsError:
             pass
-        os.chmod(folder, DIR_MODE)  # the umask only ever removes bits; a folder made earlier may be wider
+        if number:
+            _chmod(folder, DIR_MODE, directory=True)  # the umask only ever removes bits; a folder made earlier may be wider
+        else:
+            os.chmod(folder, DIR_MODE)
     if _inside(path, root):
         tighten_once(root)
     return path
@@ -64,17 +92,13 @@ def tighten(root=None):
     if not os.path.isdir(root):
         return
     os.chmod(root, DIR_MODE)
-    for folder, dirs, files in os.walk(root):
-        for name in dirs:
-            try:
-                os.chmod(os.path.join(folder, name), DIR_MODE)
-            except OSError:
-                pass
-        for name in files:
-            try:
-                os.chmod(os.path.join(folder, name), FILE_MODE)
-            except OSError:
-                pass
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        for names, mode, directory in ((dirs, DIR_MODE, True), (files, FILE_MODE, False)):
+            for name in names:
+                try:
+                    _chmod(os.path.join(folder, name), mode, directory)  # a symlink raises: its target is not ours
+                except OSError:
+                    pass
 
 
 def tighten_once(root=None):
@@ -84,7 +108,7 @@ def tighten_once(root=None):
     if os.path.exists(marker):
         return
     tighten(root)
-    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT, FILE_MODE)
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | NOFOLLOW, FILE_MODE)
     os.fchmod(descriptor, FILE_MODE)
     os.close(descriptor)
 
@@ -94,7 +118,7 @@ def open_private(path, mode='a', encoding='utf-8', root=None):
     if mode not in ('a', 'w'):
         raise ValueError(mode)
     ensure_dir(os.path.dirname(os.path.abspath(path)), root)
-    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == 'a' else os.O_TRUNC)
+    flags = os.O_WRONLY | os.O_CREAT | NOFOLLOW | (os.O_APPEND if mode == 'a' else os.O_TRUNC)
     descriptor = os.open(path, flags, FILE_MODE)
     try:
         os.fchmod(descriptor, FILE_MODE)
@@ -108,9 +132,14 @@ def write_atomic(path, text, root=None):
     """All of text in path at 0600, by a temp file made 0600 and one rename: a reader never sees half of it."""
     path = os.path.abspath(path)
     ensure_dir(os.path.dirname(path), root)
+    _refuse_link(path)
     temp = f'{path}.{os.getpid()}.tmp'
     try:
-        descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+        os.unlink(temp)  # one an earlier crash left (or a link planted there): removed itself, never written through
+    except OSError:
+        pass
+    try:
+        descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, FILE_MODE)
         os.fchmod(descriptor, FILE_MODE)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
             handle.write(text)
@@ -133,6 +162,7 @@ def append(path, text, root=None):
 REDACTED = '[redacted]'
 _WORD = r'[A-Za-z0-9_.\-]*?'
 _NAMES = r'(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)'
+_CRED = r'[A-Za-z0-9._~+/=\-]'
 SECRETS = (
     # a PEM block, or the start of one a cut-short excerpt lost the end of
     (re.compile(r'-----BEGIN [A-Z0-9 ]+-----.*?(?:-----END [A-Z0-9 ]+-----|\Z)', re.S), REDACTED),
@@ -146,12 +176,27 @@ SECRETS = (
     (re.compile(r'\bAIza[0-9A-Za-z_\-]{35}'), REDACTED),
     (re.compile(r'\b(?:hf|npm)_[A-Za-z0-9]{30,}'), REDACTED),
     (re.compile(r'\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}'), REDACTED),
-    # Authorization headers: the scheme stays, the credential goes
-    (re.compile(r'\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=\-]{8,}', re.I), r'\1 ' + REDACTED),
-    # password=..., "token": "...", API_KEY: ...: the name and the separator stay, the value goes
-    (re.compile(r'(?i)(\b' + _WORD + _NAMES + r'["\']?\s*[=:]\s*)(?!\[redacted\])("[^"\n]*"|\'[^\'\n]*\'|[^\s,;&"\'`)\]}]+)'),
-     lambda m: m.group(1) + (REDACTED if m.group(2)[:1] not in '"\'' else m.group(2)[0] + REDACTED + m.group(2)[0])),
+    # An Authorization header: the scheme stays, the credential goes, whatever it looks like.
+    (re.compile(r'\b(authorization["\']?\s*[:=]\s*["\']?(?:bearer|basic|token)\s+)' + _CRED + r'{8,}', re.I), r'\1' + REDACTED),
+    # A bare "Bearer x" outside a header is a credential only when x looks like one (a digit or one of _~+/= in it):
+    # "Bearer authentication" is prose.
+    (re.compile(r'\b(bearer\s+)(?=' + _CRED + r'*[0-9_~+/=])' + _CRED + r'{8,}', re.I), r'\1' + REDACTED),
 )
+# password=..., "token": "...", API_KEY: ...: the name and the separator stay, the value goes when it is a secret.
+KEYED = re.compile(r'(?i)(\b' + _WORD + _NAMES + r'["\']?\s*[=:]\s*)(?!\[redacted\])("[^"\n]*"|\'[^\'\n]*\'|[^\s,;&"\'`)\]}]+)')
+
+
+def looks_secret(value):
+    """An unquoted value that is a secret rather than a word or a type (`token: string`, `token: stop`): at least 6
+    characters and a digit or one of @#$%^*!~+= in it. A quoted value is a string literal and always goes."""
+    return len(value) >= 6 and re.search(r'[0-9@#$%^*!~+=]', value) is not None
+
+
+def _keyed(match):
+    value = match.group(2)
+    if value[0] in '"\'':
+        return match.group(1) + value[0] + REDACTED + value[0]
+    return match.group(1) + (REDACTED if looks_secret(value) else value)
 
 
 def redact(text):
@@ -160,7 +205,7 @@ def redact(text):
         return text
     for pattern, replacement in SECRETS:
         text = pattern.sub(replacement, text)
-    return text
+    return KEYED.sub(_keyed, text)
 
 
 def redact_value(value):
@@ -182,12 +227,20 @@ def dumps(record, **options):
 def main(argv):
     if len(argv) >= 3 and argv[1] == 'write':
         text = sys.stdin.buffer.read().decode('utf-8', 'replace')
-        write_atomic(argv[2], redact(text) if '--redact' in argv[3:] else text)
+        if '--redact-json' in argv[3:]:  # JSON text: redact the strings in it, not the serialized form (that breaks escaping)
+            try:
+                text = json.dumps(redact_value(json.loads(text)), ensure_ascii=False, separators=(',', ':'))
+            except ValueError as error:
+                sys.stderr.write(f'private.py: --redact-json was given text that is not JSON: {error}\n')
+                return 1
+        elif '--redact' in argv[3:]:
+            text = redact(text)
+        write_atomic(argv[2], text)
         return 0
     if len(argv) == 2 and argv[1] == 'tighten':
         tighten()
         return 0
-    sys.stderr.write('usage: private.py write PATH [--redact] < text | private.py tighten\n')
+    sys.stderr.write('usage: private.py write PATH [--redact|--redact-json] < text | private.py tighten\n')
     return 2
 
 

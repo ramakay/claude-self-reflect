@@ -1,0 +1,142 @@
+[
+ [
+  "use sk-ant-api03-AbCdEf0123456789_-xyz here",
+  "use [redacted] here"
+ ],
+ [
+  "OPENAI sk-proj-0123456789abcdefghij0123",
+  "OPENAI [redacted]"
+ ],
+ [
+  "xai-0123456789abcdefghijKLMN",
+  "[redacted]"
+ ],
+ [
+  "token ghp_0123456789abcdefghijABCDEFGHIJ0123 ok",
+  "token [redacted] ok"
+ ],
+ [
+  "github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
+  "[redacted]"
+ ],
+ [
+  "id AKIAIOSFODNN7EXAMPLE and ASIAIOSFODNN7EXAMPLE",
+  "id [redacted] and [redacted]"
+ ],
+ [
+  "xoxb-1234567890-abcdefghij",
+  "[redacted]"
+ ],
+ [
+  "curl -H \"Authorization: Bearer abc123.def456-ghi789\" x",
+  "curl -H \"Authorization: Bearer [redacted]\" x"
+ ],
+ [
+  "authorization: basic dXNlcjpwYXNzd29yZA==",
+  "authorization: basic [redacted]"
+ ],
+ [
+  "password=hunter2 next",
+  "password=[redacted] next"
+ ],
+ [
+  "DB_PASSWORD: \"correct horse battery\"",
+  "DB_PASSWORD: \"[redacted]\""
+ ],
+ [
+  "API_KEY='abc 123'",
+  "API_KEY='[redacted]'"
+ ],
+ [
+  "{\"token\": \"abc.def\", \"ok\": 1}",
+  "{\"token\": \"[redacted]\", \"ok\": 1}"
+ ],
+ [
+  "?access_token=abc123&x=1",
+  "?access_token=[redacted]&x=1"
+ ],
+ [
+  "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\nabc\n-----END RSA PRIVATE KEY----- after",
+  "[redacted] after"
+ ],
+ [
+  "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk",
+  "[redacted]"
+ ],
+ [
+  "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpM",
+  "[redacted]"
+ ],
+ [
+  "the token budget is 10% of Claude tokens: 120k",
+  "the token budget is 10% of Claude tokens: 120k"
+ ],
+ [
+  "sk-short and ask-me-anything and task-12345678901234567890",
+  "sk-short and ask-me-anything and task-12345678901234567890"
+ ],
+ [
+  "git push origin feat/plugin",
+  "git push origin feat/plugin"
+ ],
+ [
+  "Basic authentication works",
+  "Basic authentication works"
+ ],
+ [
+  "Bearer authentication is used here",
+  "Bearer authentication is used here"
+ ],
+ [
+  "a cancellation token: stop work",
+  "a cancellation token: stop work"
+ ],
+ [
+  "token: string",
+  "token: string"
+ ],
+ [
+  "token: string | null;",
+  "token: string | null;"
+ ],
+ [
+  "password: required",
+  "password: required"
+ ],
+ [
+  "const secret: Secret<Key> = load()",
+  "const secret: Secret<Key> = load()"
+ ],
+ [
+  "password: s3cret-swordfish!",
+  "password: [redacted]"
+ ],
+ [
+  "password=\"correct horse battery\" now",
+  "password=\"[redacted]\" now"
+ ],
+ [
+  "secret: 'plain words in quotes'",
+  "secret: '[redacted]'"
+ ],
+ [
+  "send Bearer abc123def456 here",
+  "send Bearer [redacted] here"
+ ],
+ [
+  "Authorization: Bearer abcdefghij",
+  "Authorization: Bearer [redacted]"
+ ],
+ [
+  "Authorization: Basic dXNlcjpwYXNzd29yZA== ok",
+  "Authorization: Basic [redacted] ok"
+ ],
+ [
+  "export TOKEN=abc123",
+  "export TOKEN=[redacted]"
+ ],
+ [
+  "wrapped status token=abc123 done",
+  "wrapped status token=[redacted] done"
+ ]
+]
