@@ -321,7 +321,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - `CSR_DREAM_CONSUMPTION=off` does not gate the static report, live journal feeds or badge; `status` has no field
   for `CSR_NO_CODEX_IMPORT` (2c32256f; both still true at rc2 HEAD by code check).
 - hnsw_rs 0.3.5 still calls `process::exit(1)` on load errors (2c32256f; checked in the crate source).
-  `eval --full` passes 19 of 21: re-ranker gate lacks data; search p95 2.27 ms against a 1 ms target (82d9f837).
+  `eval --full` fails the re-ranker gate (insufficient data). Search p95 against its 1 ms target depends on load:
+  0.82 ms idle, 1.35 ms and 2.27 ms under load (82d9f837). The cache check read `index_manifest.json` and always
+  reported cold; it reads `manifest.json` now (fffa3a8e).
 - Codex recall trails Claude, hit@6 12/40 vs 22/40, mostly at the HNSW fetch (9d5ad90a). 1 of 8 fabricated probes
   scores "partial" (0.629) with no caveat (49781817). `csr_get_more` does not re-run decay or provenance rerank
   (17be7ca0). Ablation examples pass `TrustTier::Unknown` (2c32256f).
