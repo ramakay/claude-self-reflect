@@ -813,6 +813,7 @@ async fn store_story(
     covered: usize,
     extra_tags: Vec<String>,
 ) -> anyhow::Result<()> {
+    let _operation = engine.storage().operation_lock()?;
     let reflection_id = format!("story_{}", conv_id);
     let rev = prior.map_or(1, |p| p.rev + 1);
     let project_name = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());

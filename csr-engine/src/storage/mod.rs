@@ -25,7 +25,7 @@ pub use queries::{
     NarrativeUsageRow, NarrativeUsageSummary, RatificationScoreRow, ResolutionEntry,
 };
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -51,7 +51,7 @@ const READ_PATH_PRAGMAS: &str = "PRAGMA cache_size=-65536; PRAGMA mmap_size=2147
 /// SQLite storage with FTS5 for full-text search.
 /// Thread-safe via Mutex around the Connection.
 pub struct Storage {
-    conn: Mutex<Connection>,
+    conn: GuardedConnection,
     /// Frame terms measured over this store's reflections (see
     /// `injection::specificity`), with when they were measured.
     common_terms: vocabulary::CommonTermsCache,
@@ -67,7 +67,75 @@ pub struct ContaminationMeasurement {
     pub last_measured: String,
 }
 
+/// All access to a writable connection participates in maintenance exclusion.
+/// Read-only and in-memory stores need no file lock.
+struct GuardedConnection {
+    inner: Mutex<Connection>,
+    data_dir: Option<PathBuf>,
+    maintenance: Option<crate::maintenance::MaintenanceLock>,
+}
+
+impl GuardedConnection {
+    fn operation_lock(&self) -> Result<Option<crate::maintenance::SharedLock>> {
+        self.data_dir
+            .as_deref()
+            .map(|dir| match &self.maintenance {
+                Some(owner) => owner.operation(dir),
+                None => crate::maintenance::shared(dir),
+            })
+            .transpose()
+    }
+
+    fn lock(&self) -> Result<LockedConnection<'_>> {
+        let operation = self.operation_lock()?;
+        let conn = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(LockedConnection {
+            conn,
+            _operation: operation,
+        })
+    }
+}
+
+/// A database operation retains its file lock until the connection is released.
+struct LockedConnection<'a> {
+    conn: std::sync::MutexGuard<'a, Connection>,
+    _operation: Option<crate::maintenance::SharedLock>,
+}
+
+impl std::ops::Deref for LockedConnection<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::ops::DerefMut for LockedConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
 impl Storage {
+    /// Hold shared exclusion for an entire operation, including its index updates.
+    pub(crate) fn operation_lock(&self) -> Result<Option<crate::maintenance::SharedLock>> {
+        self.conn.operation_lock()
+    }
+
+    /// Use this store's explicit maintenance ownership when publishing its index.
+    pub(crate) fn publication_lock(
+        &self,
+        index_dir: &Path,
+    ) -> Result<crate::maintenance::SharedLock> {
+        let dir = index_dir.parent().unwrap_or(Path::new("."));
+        match &self.conn.maintenance {
+            Some(owner) => owner.operation(dir),
+            None => crate::maintenance::shared(dir),
+        }
+    }
+
     pub fn insert_resolutions_with_confirmation(
         &self,
         chunk_ids: &[String],
@@ -104,6 +172,18 @@ impl Storage {
 
     /// Open (or create) the database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_maintenance(path, None)
+    }
+
+    pub(crate) fn open_with_maintenance(
+        path: &Path,
+        maintenance: Option<&crate::maintenance::MaintenanceLock>,
+    ) -> Result<Self> {
+        let data_dir = path.parent().unwrap_or(Path::new("."));
+        let _operation = match maintenance {
+            Some(lock) => lock.operation(data_dir)?,
+            None => crate::maintenance::shared(data_dir)?,
+        };
         let conn = Connection::open(path)?;
         // foreign_keys=ON is explicit, not build-flag-dependent (Codex MEDIUM):
         // makes the declared chunk_provenance FK enforced deterministically.
@@ -123,7 +203,11 @@ impl Storage {
         conn.execute_batch(READ_PATH_PRAGMAS)?;
         migrations::run(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: GuardedConnection {
+                inner: Mutex::new(conn),
+                data_dir: Some(data_dir.to_path_buf()),
+                maintenance: maintenance.cloned(),
+            },
             common_terms: Default::default(),
         })
     }
@@ -133,7 +217,11 @@ impl Storage {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: GuardedConnection {
+                inner: Mutex::new(conn),
+                data_dir: None,
+                maintenance: None,
+            },
             common_terms: Default::default(),
         })
     }
@@ -144,7 +232,11 @@ impl Storage {
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;")?;
         migrations::run(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: GuardedConnection {
+                inner: Mutex::new(conn),
+                data_dir: None,
+                maintenance: None,
+            },
             common_terms: Default::default(),
         })
     }
@@ -725,15 +817,37 @@ impl Storage {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut contaminated = Vec::new();
-        let mut last_contaminated: Option<String> = None;
+        let mut conversation = String::new();
+        let mut joined = String::new();
+        let mut selected = false;
         for row in rows {
             let (conversation_id, content) = row?;
-            if last_contaminated.as_deref() == Some(&conversation_id) {
+            if conversation_id != conversation {
+                if !selected {
+                    if let Some(reason) = crate::import::contamination_reason(&joined) {
+                        contaminated.push((conversation.clone(), reason.to_string()));
+                    }
+                }
+                conversation = conversation_id;
+                joined.clear();
+                selected = false;
+            }
+            if selected {
                 continue;
             }
             if let Some(reason) = crate::import::contamination_reason(&content) {
-                last_contaminated = Some(conversation_id.clone());
-                contaminated.push((conversation_id, reason.to_string()));
+                contaminated.push((conversation.clone(), reason.to_string()));
+                selected = true;
+                joined.clear();
+            } else {
+                // This join selects candidates only. Scrub must independently
+                // prove continuity with spans before cutting across a boundary.
+                joined.push_str(&content);
+            }
+        }
+        if !selected {
+            if let Some(reason) = crate::import::contamination_reason(&joined) {
+                contaminated.push((conversation, reason.to_string()));
             }
         }
         Ok(contaminated)
@@ -3601,5 +3715,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(storage.get_csr_self_suppressed().unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_probes {
+    use super::*;
+
+    #[test]
+    fn round3_existing_storage_cannot_write_reflections_or_vectors_under_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&db).unwrap();
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        assert!(storage
+            .insert_reflection("late-hook", "must wait", &[], &vec![0.1; 384])
+            .is_err());
+        assert!(storage
+            .with_connection(|conn| {
+                conn.execute("INSERT INTO meta(key,value) VALUES ('late','writer')", [])?;
+                Ok(())
+            })
+            .is_err());
+        assert!(Storage::open(&db).is_err());
+        drop(owner);
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 0);
+        storage
+            .insert_reflection("late-hook", "retry", &[], &vec![0.1; 384])
+            .unwrap();
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 1);
     }
 }

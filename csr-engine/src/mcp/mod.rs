@@ -442,16 +442,16 @@ impl CsrServer {
             )]));
         }
 
-        // A maintenance run holds the database: wait a little for it, then say
-        // so plainly rather than write under it.
-        if let Some(data_dir) = self.index_dir.parent() {
-            if let Err(error) =
-                crate::maintenance::wait_until_clear(data_dir, std::time::Duration::from_secs(10))
-                    .await
+        let _operation = if let Some(data_dir) = self.index_dir.parent() {
+            match crate::maintenance::wait_shared(data_dir, std::time::Duration::from_secs(10))
+                .await
             {
-                return tool_result(Err(error));
+                Ok(lock) => Some(lock),
+                Err(error) => return tool_result(Err(error)),
             }
-        }
+        } else {
+            None
+        };
         if let Some(proxy) = self.proxy.clone() {
             let available = tokio::task::spawn_blocking(move || proxy.available())
                 .await

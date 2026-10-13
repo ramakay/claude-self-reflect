@@ -550,6 +550,14 @@ pub fn hook_may_persist_index(_hook_name: &str) -> bool {
     false
 }
 
+/// Skip a busy maintenance run before stdin, storage, embeddings or index startup.
+/// Hooks fail open with empty output if the lock is busy or unavailable.
+pub fn try_start(db_path: &Path) -> Option<crate::maintenance::SharedLock> {
+    crate::maintenance::try_shared(db_path.parent().unwrap_or(Path::new(".")))
+        .ok()
+        .flatten()
+}
+
 /// Main hook dispatcher: routes the parsed input to its handler.
 ///
 /// `input` is read by the caller, ahead of engine construction, because
@@ -561,6 +569,10 @@ pub async fn dispatch_hook(
     input: HookInput,
     stdin_elapsed: std::time::Duration,
 ) -> Result<()> {
+    let _operation = match engine.storage().operation_lock() {
+        Ok(lock) => lock,
+        Err(_) => return Ok(()),
+    };
     // Recursive-hook guard. The session-briefing hook spawns a nested `claude -p`
     // with CSR_DISABLE_RECURSIVE_HOOKS=1 in its env. That nested session inherits
     // the user's hook config and would otherwise fire CSR hooks — most damagingly
@@ -993,5 +1005,33 @@ mod tests {
             let input = hook_input_from(unusable);
             assert!(input.prompt.is_none() && input.transcript_path.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_probes {
+    use super::*;
+
+    #[test]
+    fn round3_hook_skips_before_storage_and_cache_miss_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("large.db");
+        // Opening this sparse non-database would fail; the hook must not open it.
+        std::fs::File::create(&db)
+            .unwrap()
+            .set_len(4 * 1024 * 1024 * 1024)
+            .unwrap();
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let start = std::time::Instant::now();
+        let mut constructed = false;
+        if let Some(_operation) = try_start(&db) {
+            constructed = true;
+            let _ = Engine::new_for_hook(&db, &dir.path().join("projects"));
+        }
+        assert!(!constructed);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!dir.path().join("index").exists());
+        drop(owner);
+        assert!(try_start(&db).is_some());
     }
 }

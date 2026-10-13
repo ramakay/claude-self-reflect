@@ -62,6 +62,9 @@ pub fn socket_path(data_dir: &Path) -> PathBuf {
 /// covers synchronous stdin, filesystem calls, and runtime shutdown. No Rust
 /// timeout can preempt those operations. Leave scheduling margin below 3s.
 pub fn run_client(db_path: &Path, projects_dir: &Path, started: Instant) {
+    let Some(_operation) = super::try_start(db_path) else {
+        return;
+    };
     let timing_probe = std::env::var_os("CSR_HOOK_TIMING_PROBE").is_some();
     if std::thread::Builder::new()
         .name("prompt-deadline".into())
@@ -418,6 +421,7 @@ pub fn spawn_for_daemon(
                             // The worker owns admission until rendering, delivery,
                             // and receipt commit/rollback have actually finished.
                             let _slot = slot;
+                            let _operation = engine.storage().operation_lock().ok()?;
                             if tokio::time::Instant::now() >= deadline {
                                 return None;
                             }

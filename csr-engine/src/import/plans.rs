@@ -410,6 +410,7 @@ fn plan_evidence(
 /// Returns the number of chunks created.
 pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     let storage = engine.storage();
+    let _operation = storage.operation_lock()?;
     let conv_id = format!("plan:{}", plan.slug);
 
     // Content can shrink between reimports; deterministic chunk ids would only

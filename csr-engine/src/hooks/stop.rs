@@ -1122,6 +1122,7 @@ async fn store_episode_supported(
     inputs: crate::storage::artifact_provenance::InputEnvelope,
     ranges: Option<Vec<(usize, usize)>>,
 ) -> Result<()> {
+    let _operation = engine.storage().operation_lock()?;
     let tags = episode_tags(episode);
     let conv_tag = format!("conv_{}", episode.session_id);
 

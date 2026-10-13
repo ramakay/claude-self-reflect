@@ -110,7 +110,7 @@ impl Engine {
     }
 
     pub fn new(db_path: &Path, projects_dir: &Path) -> Result<Self> {
-        Self::new_with_persistence(db_path, projects_dir, true)
+        Self::new_with_persistence(db_path, projects_dir, true, None)
     }
 
     /// The daemon's engine: [`Self::new`], then two things only the owner
@@ -144,14 +144,29 @@ impl Engine {
     /// Search-capable hook engine: load/reconcile in memory, never publish or
     /// clean up the daemon-owned index, including on a cache miss.
     pub fn new_for_hook(db_path: &Path, projects_dir: &Path) -> Result<Self> {
-        Self::new_with_persistence(db_path, projects_dir, false)
+        Self::new_with_persistence(db_path, projects_dir, false, None)
     }
 
-    fn new_with_persistence(db_path: &Path, projects_dir: &Path, persist: bool) -> Result<Self> {
+    /// Construct the engine under an explicitly owned maintenance lock.
+    pub fn new_for_maintenance(
+        db_path: &Path,
+        projects_dir: &Path,
+        lock: &crate::maintenance::MaintenanceLock,
+    ) -> Result<Self> {
+        Self::new_with_persistence(db_path, projects_dir, true, Some(lock))
+    }
+
+    fn new_with_persistence(
+        db_path: &Path,
+        projects_dir: &Path,
+        persist: bool,
+        maintenance: Option<&crate::maintenance::MaintenanceLock>,
+    ) -> Result<Self> {
         let t0 = std::time::Instant::now();
 
         tracing::info!(?db_path, "opening storage");
-        let storage = Arc::new(Storage::open(db_path)?);
+        let storage = Arc::new(Storage::open_with_maintenance(db_path, maintenance)?);
+        let _operation = storage.operation_lock()?;
         let t_storage = t0.elapsed();
 
         tracing::info!("initializing embedding engine");
@@ -229,7 +244,12 @@ impl Engine {
                 let reflection_count = storage
                     .count_reflection_embeddings()
                     .unwrap_or(reflection_count);
-                match search.dump_to_disk(&index_dir, chunk_count, reflection_count) {
+                match search.dump_to_disk_locked(
+                    &index_dir,
+                    chunk_count,
+                    reflection_count,
+                    &storage.publication_lock(&index_dir)?,
+                ) {
                     Err(e)
                         if crate::search::crossed_maintenance(&e) && attempt < REBUILD_ATTEMPTS =>
                     {
@@ -422,17 +442,7 @@ impl Engine {
         file_path: &Path,
         attribution: &import::ConversationAttribution,
     ) -> Result<usize> {
-        // A maintenance run (`backfill scrub`) holds the database: write
-        // nothing and leave the file's import state alone, so the watcher or
-        // the next hook imports it once the run ends.
-        if let Some(holder) = crate::maintenance::active(self.data_dir()) {
-            tracing::info!(
-                pid = holder.pid,
-                file = %file_path.display(),
-                "maintenance in progress; import skipped"
-            );
-            return Ok(0);
-        }
+        let _operation = self.storage.operation_lock()?;
         let conversation_id = file_path
             .file_stem()
             .unwrap_or_default()
@@ -584,6 +594,7 @@ impl Engine {
     /// Backfill missing import_state rows and run heuristic enrichment for all unenriched conversations.
     /// This repairs the enrichment pipeline when conversations exist in `chunks` but lack import_state entries.
     pub async fn backfill_and_enrich(&self) -> Result<(usize, usize)> {
+        let _operation = self.storage.operation_lock()?;
         // Build conv_id -> (file_path, project_name) map once for both steps
         let projects = import::discover_projects(&self.projects_dir)?;
         let mut conv_to_file: std::collections::HashMap<String, (std::path::PathBuf, String)> =
@@ -797,12 +808,15 @@ impl Engine {
     /// a maintenance pass overtook is refused publication and run again (up to
     /// [`REBUILD_ATTEMPTS`] times), so it never restores rows the pass rewrote.
     pub async fn rebuild_search_index(&self) -> Result<(usize, usize)> {
+        let _operation = self.storage.publication_lock(&self.index_dir)?;
         let mut attempt = 1;
         loop {
             let generation = crate::search::read_maintenance_generation(&self.index_dir);
             let storage = self.storage.clone();
+            let operation = _operation.clone();
             let (mut fresh, chunk_count, reflection_count) =
                 tokio::task::spawn_blocking(move || {
+                    let _operation = operation;
                     let (mut fresh, chunk_count, reflection_count, streamed) =
                         rebuild_search_index_streaming(&storage, RECONCILE_BATCH, generation)?;
                     reconcile_fresh_against_db(&storage, &mut fresh, &streamed)?;
@@ -821,10 +835,11 @@ impl Engine {
                 // Refuse a crossed rebuild before installing it. The serving
                 // engine (and its maps) stays owned until a publish succeeds.
                 if persist {
-                    fresh.dump_to_disk(
+                    fresh.dump_to_disk_locked(
                         &index_dir,
                         storage.count_chunk_embeddings()?,
                         storage.count_reflection_embeddings()?,
+                        &storage.publication_lock(&index_dir)?,
                     )?;
                 }
                 Ok::<_, anyhow::Error>((fresh, chunk_count, reflection_count))
@@ -875,7 +890,8 @@ impl Engine {
     /// fenced out of publishing its pre-maintenance graph, even once the pass's
     /// own rebuild has published (see `search::invalidate_for_maintenance`).
     pub fn invalidate_index_manifest(&self) -> Result<()> {
-        crate::search::invalidate_for_maintenance(&self.index_dir)
+        let operation = self.storage.publication_lock(&self.index_dir)?;
+        crate::search::invalidate_for_maintenance_locked(&self.index_dir, &operation)
             .map(|_| ())
             .with_context(|| {
                 format!(
@@ -2423,5 +2439,120 @@ mod tests {
              never publish from memory again once it has deferred once, \
              not just on its first post-compaction flush"
         );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_probes {
+    use super::*;
+
+    #[test]
+    fn maintenance_startup_child_entry() {
+        let Some(db) = std::env::var_os("CSR_R3_STARTUP_DB") else {
+            return;
+        };
+        let db = PathBuf::from(db);
+        let result = Engine::new(&db, &db.parent().unwrap().join("projects"));
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("maintenance in progress"));
+        assert!(!db.parent().unwrap().join("index/manifest.json").exists());
+    }
+
+    #[test]
+    fn round3_maintenance_excludes_new_cache_miss_publisher() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let index_dir = dir.path().join("index");
+        {
+            let storage = Storage::open(&db).unwrap();
+            storage
+                .insert_reflection("r3", "old vector", &[], &vec![0.1; 384])
+                .unwrap();
+        }
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        crate::search::invalidate_for_maintenance_locked(
+            &index_dir,
+            &owner.operation(dir.path()).unwrap(),
+        )
+        .unwrap();
+        let floor = crate::search::read_maintenance_generation(&index_dir);
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "engine::maintenance_probes::maintenance_startup_child_entry",
+                "--nocapture",
+            ])
+            .env("CSR_R3_STARTUP_DB", &db)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        assert_eq!(
+            crate::search::read_maintenance_generation(&index_dir),
+            floor
+        );
+        let storage = Storage::open_with_maintenance(&db, Some(&owner)).unwrap();
+        storage
+            .insert_reflection("r3", "clean vector", &[], &vec![0.2; 384])
+            .unwrap();
+        drop(storage);
+        drop(owner);
+        let engine = Engine::new(&db, &dir.path().join("projects")).unwrap();
+        assert!(engine.index_freshly_rebuilt());
+        assert_eq!(
+            engine
+                .storage()
+                .get_reflection_vectors_by_ids(&["r3".into()])
+                .unwrap()[0]
+                .1,
+            vec![0.2; 384]
+        );
+    }
+
+    #[test]
+    fn round3_maintenance_excludes_plan_writer_and_index_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let engine = Engine::new_import_only(&db, &dir.path().join("projects")).unwrap();
+        let mut plan = crate::import::plans::PlanDoc {
+            slug: "r3-final-window".into(),
+            path: dir.path().join("r3-final-window.md"),
+            mtime: "2026-09-01T00:00:00Z".into(),
+            content: "Keep the rollback plan and freeze the deployment.".into(),
+        };
+        crate::import::plans::import_plan(&engine, &plan).unwrap();
+        let ids = engine
+            .storage()
+            .get_chunk_ids_for_conversation("plan:r3-final-window")
+            .unwrap();
+        let before = engine.storage().get_chunk_vectors_by_ids(&ids).unwrap();
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        plan.content = "Remove the rollback plan and deploy the new release immediately.".into();
+        assert!(crate::import::plans::import_plan(&engine, &plan).is_err());
+        assert!(engine
+            .search()
+            .blocking_read()
+            .publish_to_disk(&dir.path().join("index"), 1, 0)
+            .is_err());
+        drop(owner);
+        assert_eq!(
+            engine.storage().get_chunk_vectors_by_ids(&ids).unwrap(),
+            before
+        );
+        assert_eq!(
+            engine
+                .storage()
+                .get_chunk_content(&ids[0])
+                .unwrap()
+                .unwrap(),
+            "Keep the rollback plan and freeze the deployment."
+        );
+        assert!(!dir.path().join("index/manifest.json").exists());
     }
 }
