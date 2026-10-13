@@ -902,3 +902,26 @@ class HandedThreads(Folder):
         self.assertTrue(named.sent[1])
         self.assertEqual({argv[3] for argv in typed if argv[1] == 'send-keys'}, {'ctrl+j'})
         self.assertTrue(all(argv[2] == 'w1:claude' for argv in typed if argv[1] in ('send-keys', 'send-text')))
+
+    def test_handoff_times_the_hooks_write_in_milliseconds_read_as_seconds(self):
+        """The hooks stamp submitted_at and ended_at from $.clock.now(), milliseconds; the pane's drafted_at is seconds. A
+        thread handed to a subagent, and one whose agent failed, must render, not raise on a year-58920 timestamp."""
+        sent, ended = T1 + 7200, T1 + 9000
+        rows = [handoff('req-1', 'failed', agent_id='a1', turn_id='t1', at=sent, ended_at=ended, reason='error')]
+        rows[0].update(submitted_at=sent * 1000, ended_at=ended * 1000)
+        path = os.path.join(self.home, 'handoffs', f'{SESSION}.json')
+        os.makedirs(os.path.dirname(path))
+        with open(path, 'w') as handle:
+            json.dump(dict(version=1, session=SESSION, handoffs=rows), handle)
+        (read,) = pane.handoffs_of(SESSION)
+        self.assertEqual((read['submitted_at'], read['ended_at']), (sent, ended))
+        clock = lambda t: pane.datetime.fromtimestamp(t)
+        failed = the_thread(threads(pane.handoffs_of(SESSION)))
+        self.assertEqual((failed['state'], failed['hidden']), ('lost', None))
+        self.assertIn(f"handed to a subagent {clock(sent):%H:%M}, which failed {clock(ended):%m-%d %H:%M}: error", failed['why'])
+        rows[0].update(outcome='succeeded', reason=None)
+        with open(path, 'w') as handle:
+            json.dump(dict(version=1, session=SESSION, handoffs=rows), handle)
+        handed = the_thread(threads(pane.handoffs_of(SESSION)))
+        self.assertEqual((handed['state'], handed['hidden']), ('handed', 'handed'))
+        self.assertIn(f"handed to a subagent {clock(sent):%H:%M} · it reported", handed['why'])

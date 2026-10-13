@@ -399,7 +399,9 @@ def handoff_of(raw, session):
         return None
     if not all(raw[k] is None or (isinstance(raw[k], str) and len(raw[k]) <= 200 and not CONTROL.search(raw[k])) for k in ids + ('reason',)):
         return None
-    return dict(raw)
+    # The hooks stamp submitted_at and ended_at from $.clock.now(), milliseconds; drafted_at is the pane's own time.time(), seconds.
+    # Everything past this reader is seconds, as with last_at and completion.at elsewhere in this module.
+    return dict(raw, **{k: raw[k] / 1000 for k in ('submitted_at', 'ended_at') if raw[k] is not None})
 
 
 def read_handoffs(state_path, drafts_path, session):
