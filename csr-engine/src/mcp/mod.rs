@@ -402,6 +402,16 @@ impl CsrServer {
             )]));
         }
 
+        // A maintenance run holds the database: wait a little for it, then say
+        // so plainly rather than write under it.
+        if let Some(data_dir) = self.index_dir.parent() {
+            if let Err(error) =
+                crate::maintenance::wait_until_clear(data_dir, std::time::Duration::from_secs(10))
+                    .await
+            {
+                return tool_result(Err(error));
+            }
+        }
         let result = tools::store_reflection(
             &self.storage,
             &self.embeddings,

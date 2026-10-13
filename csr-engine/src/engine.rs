@@ -426,6 +426,17 @@ impl Engine {
         file_path: &Path,
         attribution: &import::ConversationAttribution,
     ) -> Result<usize> {
+        // A maintenance run (`backfill scrub`) holds the database: write
+        // nothing and leave the file's import state alone, so the watcher or
+        // the next hook imports it once the run ends.
+        if let Some(holder) = crate::maintenance::active(self.data_dir()) {
+            tracing::info!(
+                pid = holder.pid,
+                file = %file_path.display(),
+                "maintenance in progress; import skipped"
+            );
+            return Ok(0);
+        }
         let conversation_id = file_path
             .file_stem()
             .unwrap_or_default()
@@ -690,6 +701,12 @@ impl Engine {
 
     pub fn index_dir(&self) -> &Path {
         &self.index_dir
+    }
+
+    /// The data directory: the database's own, where the index directory and
+    /// the maintenance lock live.
+    pub fn data_dir(&self) -> &Path {
+        self.index_dir.parent().unwrap_or(&self.index_dir)
     }
 
     /// True when this `Engine::new` call took the cache-miss path and built

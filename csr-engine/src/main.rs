@@ -456,6 +456,10 @@ enum BackfillAction {
         /// writing them.
         #[arg(long)]
         include_active: bool,
+        /// Run even though other processes hold the database open (the
+        /// preflight lists them). Their writes can race the scrub.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1338,10 +1342,34 @@ async fn run(
                 conversation,
                 agent_transcripts,
                 include_active,
+                force,
             },
     }) = &args.command
     {
-        let report = if *dry_run {
+        // Preflight: the scrub runs only with no other process on the
+        // database. A hook from an older binary writes a chunk's text and its
+        // vector in two statements no transaction can fence.
+        let checked = csr_engine::maintenance::other_holders(&args.db_path);
+        let holders = checked.as_ref().cloned().unwrap_or_default();
+        let preflight = if let Err(error) = &checked {
+            vec![format!(
+                "preflight: could not check other processes: {error:#}"
+            )]
+        } else if holders.is_empty() {
+            vec!["preflight: no other process holds the database".to_string()]
+        } else {
+            let mut lines = vec![format!(
+                "preflight: {} other process(es) hold the database open:",
+                holders.len()
+            )];
+            lines.extend(
+                holders
+                    .iter()
+                    .map(|holder| format!("  pid {} {}", holder.pid, holder.executable)),
+            );
+            lines
+        };
+        let mut report = if *dry_run {
             let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
             csr_engine::import::scrub::dry_run_scrub(
                 &storage,
@@ -1350,16 +1378,71 @@ async fn run(
                 *include_active,
             )?
         } else {
+            if let (Err(error), false) = (&checked, *force) {
+                anyhow::bail!(
+                    "refusing to scrub: cannot verify that no other process holds the database ({error:#}); rerun with --force"
+                );
+            }
+            if !holders.is_empty() && !*force {
+                for line in &preflight {
+                    eprintln!("{line}");
+                }
+                anyhow::bail!(
+                    "refusing to scrub while other processes hold the database: stop them (Claude Code sessions, the daemon, MCP servers) or rerun with --force"
+                );
+            }
+            if !holders.is_empty() {
+                eprintln!(
+                    "warning: --force: scrubbing while {} other process(es) hold the database; their writes can race it",
+                    holders.len()
+                );
+            }
+            let data_dir = args
+                .db_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+            let lock = csr_engine::maintenance::MaintenanceLock::acquire(&data_dir)?;
+            // An interrupt removes the lock too; a kill -9 leaves a lock whose
+            // process is gone, which every reader ignores.
+            let lock_path = lock.path().to_path_buf();
+            tokio::spawn(async move {
+                #[cfg(unix)]
+                {
+                    let mut terminate =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .ok();
+                    let terminated = async {
+                        match terminate.as_mut() {
+                            Some(signal) => {
+                                signal.recv().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    };
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = terminated => {}
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = tokio::signal::ctrl_c().await;
+                csr_engine::maintenance::MaintenanceLock::release(&lock_path);
+                std::process::exit(130);
+            });
             let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-            csr_engine::import::scrub::run_scrub(
+            let report = csr_engine::import::scrub::run_scrub(
                 &eng,
                 false,
                 conversation.as_deref(),
                 *agent_transcripts,
                 *include_active,
             )
-            .await?
+            .await;
+            drop(lock);
+            report?
         };
+        report.preflight = preflight;
         print!("{}", report.format_text(*dry_run));
         if !dry_run {
             println!("restart Claude Code: the running MCP server holds its own index");

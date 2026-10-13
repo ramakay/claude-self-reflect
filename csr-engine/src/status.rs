@@ -74,6 +74,9 @@ pub struct StatusReport {
     /// Watcher busy-retry backoff + daemon catch-up sweep receipts (gap-G1).
     /// See [`ImportWatcherStatus`].
     pub import_watcher: ImportWatcherStatus,
+    /// A maintenance run (`backfill scrub`) holding the database right now:
+    /// imports wait or skip until it ends. See `crate::maintenance`.
+    pub maintenance: Option<crate::maintenance::MaintenanceHolder>,
 }
 
 /// Receipts for the watcher's `database is locked` retry backoff
@@ -784,6 +787,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let total_jsonl = count_jsonl_files(projects_dir);
     let stale_processes = gather_stale_processes();
     let mcp_binary_stale = mcp_binary_stale_from(&stale_processes);
+    let maintenance = db_path.parent().and_then(crate::maintenance::active);
 
     // If DB doesn't exist yet, return empty report
     if !db_path.exists() {
@@ -819,6 +823,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
             dreaming,
+            maintenance: maintenance.clone(),
             codex_backfill: CodexBackfillStatus::default(),
             import_watcher: ImportWatcherStatus::default(),
         });
@@ -951,6 +956,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         trained_rerank,
         backfill,
         dreaming,
+        maintenance,
         codex_backfill,
         import_watcher,
     })
@@ -1926,6 +1932,9 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             report.contamination.conversations
         ));
     }
+    if let Some(holder) = &report.maintenance {
+        out.push_str(&format!(" | maintenance (pid {})", holder.pid));
+    }
     // `mcp_binary_stale` is deliberately not rendered here. The stamp behind it
     // is one file shared by every session's MCP server, last writer wins, so
     // the marker lit up in every session on each local reinstall and cleared
@@ -2056,6 +2065,7 @@ mod tests {
             trained_rerank: empty_trained_rerank_status(),
             backfill: BackfillStatus::default(),
             dreaming: None,
+            maintenance: None,
             codex_backfill: CodexBackfillStatus::default(),
             import_watcher: ImportWatcherStatus::default(),
         }
@@ -2173,6 +2183,20 @@ mod tests {
             value["trained_rerank"]["cluster_receipts"][0]["distinct_session_count"],
             2
         );
+    }
+
+    #[test]
+    fn a_maintenance_run_shows_in_the_json_and_the_compact_line() {
+        let mut report = base_report();
+        assert!(!format_compact(&report, 0).contains("maintenance"));
+        report.maintenance = Some(crate::maintenance::MaintenanceHolder {
+            pid: 4242,
+            started_at: "2026-10-12T21:00:00Z".into(),
+        });
+        assert!(format_compact(&report, 0).contains("maintenance (pid 4242)"));
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["maintenance"]["pid"], 4242);
+        assert_eq!(value["maintenance"]["started_at"], "2026-10-12T21:00:00Z");
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod import;
 pub mod injection;
 pub mod journal;
 pub mod ledger;
+pub mod maintenance;
 pub mod mcp;
 pub mod narrative;
 pub mod provenance;

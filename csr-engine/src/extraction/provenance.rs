@@ -556,6 +556,29 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> 
     Some((kept, first))
 }
 
+/// Byte spans of the one-line forwards (pane dream, compaction card, session story) in `text`, line by line, each
+/// widened over a hotkey digit or quote marker right before it. The import scrub follows a forward that a stored
+/// chunk's byte budget split across chunks: it joins the chunks of one message and cuts the parts of a span that
+/// fall in each (astra r2 #7).
+pub(crate) fn one_line_forward_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut line_start = 0;
+    for line in text.split('\n') {
+        let mut cursor = 0;
+        while let Some((start, end)) = next_one_line_forward(line, cursor, true) {
+            let from = if hotkey_or_marker(&line[cursor..start]) {
+                cursor
+            } else {
+                start
+            };
+            spans.push((line_start + from, line_start + end));
+            cursor = end.max(start + 1);
+        }
+        line_start += line.len() + 1;
+    }
+    spans
+}
+
 /// Read `text` by line for the forwards [`strip_csr_forwards`] names (the card and the story only when `others`).
 /// `None` when there are none.
 fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {

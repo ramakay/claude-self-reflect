@@ -34,6 +34,10 @@ pub struct ScrubReport {
     /// Conversations whose stored rows changed between planning and applying.
     /// Their plan is stale; nothing is written for them.
     pub skipped_changed: usize,
+    /// The longest any one plan held the database write lock, in milliseconds.
+    pub longest_transaction_ms: u64,
+    /// The preflight's findings: other processes holding the database open.
+    pub preflight: Vec<String>,
     /// Conversations removed whole because their transcript is a CSR agent prompt.
     pub agent_transcripts_purged: usize,
     pub agent_chunks_purged: usize,
@@ -46,6 +50,10 @@ pub struct ScrubReport {
 impl ScrubReport {
     pub fn format_text(&self, dry_run: bool) -> String {
         let mut output = String::new();
+        for line in &self.preflight {
+            output.push_str(line);
+            output.push('\n');
+        }
         for action in &self.actions {
             output.push_str(action);
             output.push('\n');
@@ -65,6 +73,12 @@ impl ScrubReport {
             "agent transcripts purged: {} ({} chunks, {} reflections)\n",
             self.agent_transcripts_purged, self.agent_chunks_purged, self.agent_reflections_purged
         ));
+        if !dry_run {
+            output.push_str(&format!(
+                "longest plan transaction: {} ms\n",
+                self.longest_transaction_ms
+            ));
+        }
         if let Some((chunks, reflections)) = self.index_rebuilt {
             output.push_str(&format!(
                 "index rebuilt: {chunks} chunks, {reflections} reflections\n"
@@ -165,8 +179,17 @@ fn reparse_lacks_stored_text(
             .map(|chunk| chunk.content.as_str())
             .collect::<String>(),
     );
-    old_chunks.iter().any(|chunk| {
-        scrub_contaminated_text(&chunk.content).is_some_and(|own| {
+    // Where the chunk before ends mid-line, its message may run on into this
+    // one: a forward's generated tail there is not the person's text, even
+    // when the stored spans cannot prove the two chunks are one message.
+    let continues = old_chunks
+        .iter()
+        .enumerate()
+        .map(|(index, _)| index > 0 && !old_chunks[index - 1].content.ends_with('\n'))
+        .collect::<Vec<_>>();
+    let carried = cut_forwards_across_chunks(old_chunks, &continues);
+    carried.iter().any(|content| {
+        scrub_contaminated_text(content).is_some_and(|own| {
             own.lines().any(|line| {
                 let line = squash(line);
                 !line.is_empty() && !rebuilt.contains(&line)
@@ -220,11 +243,25 @@ fn source_paths(storage: &Storage, conversation_id: &str) -> Result<Vec<PathBuf>
 /// True when a live session may still be writing the conversation: a source
 /// file, or its newest chunk, changed inside [`ACTIVE_WINDOW`] before `now`.
 fn is_active(storage: &Storage, conversation_id: &str, now: SystemTime) -> Result<bool> {
+    storage.with_connection(|conn| is_active_in(conn, conversation_id, now))
+}
+
+/// [`is_active`] on a connection the caller holds: the apply transaction asks
+/// again right before it writes (astra r2 #3).
+fn is_active_in(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    now: SystemTime,
+) -> Result<bool> {
     let horizon = now
         .checked_sub(ACTIVE_WINDOW)
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    for path in source_paths(storage, conversation_id)? {
-        if path
+    let paths = conn
+        .prepare_cached("SELECT file_path FROM import_state WHERE conversation_id = ?1")?
+        .query_map([conversation_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for path in paths {
+        if Path::new(&path)
             .metadata()
             .and_then(|metadata| metadata.modified())
             .is_ok_and(|modified| modified > horizon)
@@ -232,23 +269,118 @@ fn is_active(storage: &Storage, conversation_id: &str, now: SystemTime) -> Resul
             return Ok(true);
         }
     }
-    let newest: Option<String> = storage.with_connection(|conn| {
-        Ok(conn.query_row(
-            "SELECT MAX(timestamp) FROM chunks WHERE conversation_id = ?1",
-            [conversation_id],
-            |row| row.get(0),
-        )?)
-    })?;
+    let newest: Option<String> = conn.query_row(
+        "SELECT MAX(timestamp) FROM chunks WHERE conversation_id = ?1",
+        [conversation_id],
+        |row| row.get(0),
+    )?;
     Ok(newest
         .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(&stamp).ok())
         .is_some_and(|stamp| SystemTime::from(stamp) > horizon))
 }
 
-fn in_place(old_chunks: &[ConversationChunk], reason: String) -> ScrubPlanKind {
+/// For each chunk, whether it continues the message the chunk before it ended
+/// in: the last span of the one and the first span of the other name the same
+/// provenance event (the importer cut one long message at its byte budget).
+/// False wherever the spans cannot say.
+fn message_continuity(storage: &Storage, chunks: &[ConversationChunk]) -> Result<Vec<bool>> {
+    let ids = serde_json::to_string(&chunks.iter().map(|chunk| &chunk.id).collect::<Vec<_>>())?;
+    let spans: Vec<(String, String, i64, i64)> = storage.with_connection(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT chunk_id, event_id, start_char, end_char FROM chunk_spans
+             WHERE chunk_id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = statement
+            .query_map([&ids], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })?;
+    let mut first: HashMap<&str, (i64, &str)> = HashMap::new();
+    let mut last: HashMap<&str, (i64, &str)> = HashMap::new();
+    for (chunk, event, start, end) in &spans {
+        let earliest = first.entry(chunk).or_insert((*start, event));
+        if *start < earliest.0 {
+            *earliest = (*start, event);
+        }
+        let latest = last.entry(chunk).or_insert((*end, event));
+        if *end > latest.0 {
+            *latest = (*end, event);
+        }
+    }
+    Ok(chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            index > 0
+                && matches!(
+                    (last.get(chunks[index - 1].id.as_str()), first.get(chunk.id.as_str())),
+                    (Some((_, before)), Some((_, after))) if before == after
+                )
+        })
+        .collect())
+}
+
+/// Each chunk's content with the parts of one-line forwards that run across a
+/// chunk boundary cut out, wherever `continues[i]` says chunk `i` continues
+/// chunk `i - 1`. A stored chunk is a byte-budget slice of its message, so a
+/// forward begun in one chunk can end in the next: scrubbed alone, the next
+/// chunk kept its generated tail as the person's text (astra r2 #7). A forward
+/// inside one chunk is left to that chunk's own scrub.
+fn cut_forwards_across_chunks(chunks: &[ConversationChunk], continues: &[bool]) -> Vec<String> {
+    let mut out = chunks
+        .iter()
+        .map(|chunk| chunk.content.clone())
+        .collect::<Vec<_>>();
+    let mut start = 0;
+    while start < chunks.len() {
+        let mut end = start + 1;
+        while end < chunks.len() && continues[end] {
+            end += 1;
+        }
+        if end - start >= 2 {
+            let mut offsets = Vec::with_capacity(end - start + 1);
+            let mut joined = String::new();
+            for chunk in &chunks[start..end] {
+                offsets.push(joined.len());
+                joined.push_str(&chunk.content);
+            }
+            offsets.push(joined.len());
+            let mut cuts: Vec<Vec<(usize, usize)>> = vec![Vec::new(); end - start];
+            for (from, to) in crate::extraction::provenance::one_line_forward_spans(&joined) {
+                let first = offsets.partition_point(|&offset| offset <= from) - 1;
+                let last = offsets.partition_point(|&offset| offset < to) - 1;
+                if first == last {
+                    continue;
+                }
+                for (chunk, cut) in cuts.iter_mut().enumerate().take(last + 1).skip(first) {
+                    let lo = from.max(offsets[chunk]) - offsets[chunk];
+                    let hi = to.min(offsets[chunk + 1]) - offsets[chunk];
+                    if lo < hi {
+                        cut.push((lo, hi));
+                    }
+                }
+            }
+            for (chunk, mut cut) in cuts.into_iter().enumerate() {
+                cut.sort_unstable();
+                let text = &mut out[start + chunk];
+                for (lo, hi) in cut.into_iter().rev() {
+                    text.replace_range(lo..hi, "");
+                }
+            }
+        }
+        start = end;
+    }
+    out
+}
+
+fn in_place(old_chunks: &[ConversationChunk], continues: &[bool], reason: String) -> ScrubPlanKind {
+    let carried = cut_forwards_across_chunks(old_chunks, continues);
     let mut rewritten = Vec::new();
     let mut dropped_ids = Vec::new();
-    for chunk in old_chunks {
-        match scrub_contaminated_text(&chunk.content) {
+    for (chunk, carried) in old_chunks.iter().zip(&carried) {
+        match scrub_contaminated_text(carried) {
             Some(content) if content != chunk.content => {
                 let mut clean = chunk.clone();
                 clean.content = content;
@@ -290,6 +422,7 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
         .collect::<Result<HashMap<_, _>>>()?;
 
     let paths = source_paths(storage, conversation_id)?;
+    let continues = message_continuity(storage, &old_chunks)?;
     let mut structural_evidence = HashMap::new();
     let mut import_mark = None;
     let claude = is_claude_transcript_conversation(conversation_id, &sources);
@@ -298,6 +431,7 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
         // partial copy, so no re-parse is trusted to say what the rest held.
         [_, _, ..] if claude => in_place(
             &old_chunks,
+            &continues,
             format!("{} source paths registered", paths.len()),
         ),
         [path] if claude && path.exists() => {
@@ -328,7 +462,11 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
             if let Some(reason) = reparse_refusal(&old_chunks, &chunks, &path) {
                 ScrubPlanKind::Refused { reason }
             } else if reparse_lacks_stored_text(&old_chunks, &chunks) {
-                in_place(&old_chunks, "re-parse lacks stored text".to_string())
+                in_place(
+                    &old_chunks,
+                    &continues,
+                    "re-parse lacks stored text".to_string(),
+                )
             } else {
                 structural_evidence = parsed.evidence;
                 import_mark = before
@@ -361,6 +499,7 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
         }
         _ => in_place(
             &old_chunks,
+            &continues,
             "source missing or not a Claude transcript".to_string(),
         ),
     };
@@ -584,12 +723,6 @@ fn summarize_agent_transcript(agent: &AgentTranscript, report: &mut ScrubReport)
     ));
 }
 
-async fn replace_vector(engine: &Engine, chunk: &ConversationChunk, embedding: Vec<f32>) {
-    let mut index = engine.search().write().await;
-    index.remove_chunk(&chunk.id);
-    index.insert_chunk(chunk.id.clone(), embedding);
-}
-
 /// Reflections deleted per transaction during an agent-transcript purge.
 const PURGE_REFLECTION_BATCH: usize = 500;
 
@@ -683,6 +816,8 @@ enum Applied {
     Written,
     /// A planned row changed after the plan was read: nothing was written.
     Changed,
+    /// The conversation turned active after it was planned: nothing was written.
+    Active,
 }
 
 /// True when every `id` still holds the content the plan read for it.
@@ -713,200 +848,211 @@ fn embed_rows(engine: &Engine, rows: &[&ConversationChunk]) -> Result<Vec<Vec<f3
     engine.embeddings().embed(&texts)
 }
 
-fn mark_imported(conn: &rusqlite::Connection, plan: &ScrubPlan, chunks: usize) -> Result<()> {
-    if let Some((path, mtime)) = &plan.import_mark {
-        queries::mark_file_imported_at(conn, path, chunks, mtime)?;
-    }
-    Ok(())
+/// What one plan writes, whatever its kind.
+struct Writes<'a> {
+    /// Rows upserted, each with its source and provenance.
+    rows: Vec<(&'a ConversationChunk, &'a str, ChunkProvenance)>,
+    /// Ids whose stored content must still be what the plan read.
+    validate: Vec<&'a str>,
+    /// Replace the whole conversation: its current id set must be exactly the
+    /// planned one, and every row goes before `rows` are written.
+    whole: bool,
+    deletes: Vec<&'a str>,
+    evidence: Vec<ChunkEvidence>,
+    /// Chunk count for the import mark.
+    imported: usize,
 }
 
-/// Apply one plan. Embeddings are computed first, outside any transaction; then
-/// one `BEGIN IMMEDIATE` transaction re-reads the planned rows and writes
-/// content, vectors, provenance, evidence, deletions and the import mark only if
-/// every planned row still holds what the plan read (for a shifted plan, the
-/// conversation also still has exactly the planned ids). Otherwise nothing is
-/// written: a concurrent writer's rows survive (astra #1). Unchanged rows of a
-/// stable plan are never rewritten, so a newer vector cannot end up beside the
-/// plan's older text.
-async fn apply_plan(engine: &Engine, plan: &ScrubPlan) -> Result<Applied> {
+fn writes_of<'a>(engine: &Engine, plan: &'a ScrubPlan) -> Option<Writes<'a>> {
+    let attribution = |source_path: &Path| {
+        derive_conversation_attribution(engine.projects_dir(), source_path)
+            .parent_conversation_id
+            .unwrap_or_else(|| plan.conversation_id.clone())
+    };
+    Some(match &plan.kind {
+        ScrubPlanKind::Refused { .. } => return None,
+        ScrubPlanKind::Stable {
+            source_path,
+            chunks,
+            changed_ids,
+        } => {
+            let default_source = attribution(source_path);
+            let rows = chunks
+                .iter()
+                .filter(|chunk| changed_ids.contains(&chunk.id))
+                .map(|chunk| {
+                    (
+                        chunk,
+                        source_of(plan, &chunk.id),
+                        provenance_for(plan, chunk, &default_source),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Writes {
+                validate: rows.iter().map(|(chunk, ..)| chunk.id.as_str()).collect(),
+                evidence: rows
+                    .iter()
+                    .filter_map(|(chunk, ..)| plan.structural_evidence.get(&chunk.id).cloned())
+                    .collect(),
+                rows,
+                whole: false,
+                deletes: Vec::new(),
+                imported: chunks.len(),
+            }
+        }
+        ScrubPlanKind::Shifted {
+            source_path,
+            chunks,
+        } => {
+            let default_source = attribution(source_path);
+            let source = plan
+                .old_chunks
+                .first()
+                .map(|chunk| source_of(plan, &chunk.id))
+                .unwrap_or("conversation");
+            Writes {
+                rows: chunks
+                    .iter()
+                    .map(|chunk| (chunk, source, provenance_for(plan, chunk, &default_source)))
+                    .collect(),
+                validate: plan
+                    .old_chunks
+                    .iter()
+                    .map(|chunk| chunk.id.as_str())
+                    .collect(),
+                whole: true,
+                deletes: Vec::new(),
+                evidence: chunks
+                    .iter()
+                    .filter_map(|chunk| plan.structural_evidence.get(&chunk.id).cloned())
+                    .collect(),
+                imported: chunks.len(),
+            }
+        }
+        ScrubPlanKind::Missing {
+            rewritten,
+            dropped_ids,
+            ..
+        } => Writes {
+            rows: rewritten
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk,
+                        source_of(plan, &chunk.id),
+                        provenance_for(plan, chunk, &plan.conversation_id),
+                    )
+                })
+                .collect(),
+            validate: rewritten
+                .iter()
+                .map(|chunk| chunk.id.as_str())
+                .chain(dropped_ids.iter().map(String::as_str))
+                .collect(),
+            whole: false,
+            deletes: dropped_ids.iter().map(String::as_str).collect(),
+            evidence: rewritten
+                .iter()
+                .map(|chunk| {
+                    super::provenance_backfill::unreconstructible_chunk_evidence(chunk, None)
+                })
+                .collect(),
+            imported: 0,
+        },
+    })
+}
+
+/// Apply one plan. Embeddings are computed first, outside any transaction. Then
+/// one `BEGIN IMMEDIATE` transaction asks again whether the conversation is
+/// active (unless `include_active`), re-reads the planned rows, and writes
+/// content, vectors, provenance, evidence (relinked once, seeded by this
+/// conversation's family), deletions and the import mark only if every planned
+/// row still holds what the plan read (for a shifted plan, the conversation
+/// also still has exactly the planned ids). Otherwise nothing is written: a
+/// concurrent writer's rows survive (astra #1). Unchanged rows of a stable plan
+/// are never rewritten. Returns the outcome and how long the write lock was held.
+async fn apply_plan(
+    engine: &Engine,
+    plan: &ScrubPlan,
+    include_active: bool,
+) -> Result<(Applied, Duration)> {
+    let Some(writes) = writes_of(engine, plan) else {
+        return Ok((Applied::Written, Duration::ZERO));
+    };
     let storage = engine.storage();
     let planned = plan
         .old_chunks
         .iter()
         .map(|chunk| (chunk.id.as_str(), chunk.content.as_str()))
         .collect::<HashMap<_, _>>();
-    match &plan.kind {
-        ScrubPlanKind::Refused { .. } => Ok(Applied::Written),
-        ScrubPlanKind::Stable {
-            source_path,
-            chunks,
-            changed_ids,
-        } => {
-            let rows = chunks
-                .iter()
-                .filter(|chunk| changed_ids.contains(&chunk.id))
-                .collect::<Vec<_>>();
-            let embeddings = embed_rows(engine, &rows)?;
-            let attribution = derive_conversation_attribution(engine.projects_dir(), source_path);
-            let default_source_conv_id = attribution
-                .parent_conversation_id
-                .as_deref()
-                .unwrap_or(&plan.conversation_id);
-            let ids = rows
-                .iter()
-                .map(|chunk| chunk.id.as_str())
-                .collect::<Vec<_>>();
-            let written = retry_busy(|| {
-                storage.with_immediate_transaction(|tx| {
-                    if !rows_unchanged(tx, &ids, &planned)? {
-                        return Ok(false);
-                    }
-                    for (chunk, embedding) in rows.iter().zip(&embeddings) {
-                        queries::insert_chunk_with_source(
-                            tx,
-                            chunk,
-                            embedding,
-                            source_of(plan, &chunk.id),
-                        )?;
-                        queries::insert_chunk_provenance(
-                            tx,
-                            &chunk.id,
-                            &provenance_for(plan, chunk, default_source_conv_id),
-                        )?;
-                        if let Some(evidence) = plan.structural_evidence.get(&chunk.id) {
-                            queries::replace_chunk_evidence_in(tx, evidence)?;
-                        }
-                    }
-                    mark_imported(tx, plan, chunks.len())?;
-                    Ok(true)
-                })
-            })
-            .await?;
-            if !written {
+    let rows = writes
+        .rows
+        .iter()
+        .map(|(chunk, ..)| *chunk)
+        .collect::<Vec<_>>();
+    let embeddings = embed_rows(engine, &rows)?;
+    let now = SystemTime::now();
+    let held = std::cell::Cell::new(None::<std::time::Instant>);
+    let applied = retry_busy(|| {
+        storage.with_immediate_transaction(|tx| {
+            held.set(Some(std::time::Instant::now()));
+            if !include_active && is_active_in(tx, &plan.conversation_id, now)? {
+                return Ok(Applied::Active);
+            }
+            if writes.whole {
+                let current = queries::get_chunk_ids_for_conversation(tx, &plan.conversation_id)?;
+                let same_ids = current.len() == writes.validate.len()
+                    && current.iter().map(String::as_str).collect::<HashSet<_>>()
+                        == writes.validate.iter().copied().collect::<HashSet<_>>();
+                if !same_ids {
+                    return Ok(Applied::Changed);
+                }
+            }
+            if !rows_unchanged(tx, &writes.validate, &planned)? {
                 return Ok(Applied::Changed);
             }
-            for (chunk, embedding) in rows.into_iter().zip(embeddings) {
-                replace_vector(engine, chunk, embedding).await;
+            if writes.whole {
+                queries::delete_chunks_for_conversation(tx, &plan.conversation_id)?;
+            }
+            for ((chunk, source, provenance), embedding) in writes.rows.iter().zip(&embeddings) {
+                queries::insert_chunk_with_source(tx, chunk, embedding, source)?;
+                queries::insert_chunk_provenance(tx, &chunk.id, provenance)?;
+            }
+            for id in &writes.deletes {
+                queries::delete_chunk(tx, id)?;
+            }
+            if !writes.evidence.is_empty() {
+                queries::replace_conversation_evidence_in(
+                    tx,
+                    &plan.conversation_id,
+                    &writes.evidence,
+                )?;
+            }
+            if let Some((path, mtime)) = &plan.import_mark {
+                queries::mark_file_imported_at(tx, path, writes.imported, mtime)?;
             }
             Ok(Applied::Written)
-        }
-        ScrubPlanKind::Shifted {
-            source_path,
-            chunks,
-        } => {
-            let rows = chunks.iter().collect::<Vec<_>>();
-            let embeddings = embed_rows(engine, &rows)?;
-            let attribution = derive_conversation_attribution(engine.projects_dir(), source_path);
-            let default_source_conv_id = attribution
-                .parent_conversation_id
-                .as_deref()
-                .unwrap_or(&plan.conversation_id);
-            let old_ids = plan
-                .old_chunks
-                .iter()
-                .map(|chunk| chunk.id.as_str())
-                .collect::<Vec<_>>();
-            let source = old_ids
-                .first()
-                .map(|id| source_of(plan, id))
-                .unwrap_or("conversation");
-            let evidence = chunks
-                .iter()
-                .filter_map(|chunk| plan.structural_evidence.get(&chunk.id).cloned())
-                .collect::<Vec<_>>();
-            let written = retry_busy(|| {
-                storage.with_immediate_transaction(|tx| {
-                    let current =
-                        queries::get_chunk_ids_for_conversation(tx, &plan.conversation_id)?;
-                    let same_ids = current.len() == old_ids.len()
-                        && current.iter().map(String::as_str).collect::<HashSet<_>>()
-                            == old_ids.iter().copied().collect::<HashSet<_>>();
-                    if !same_ids || !rows_unchanged(tx, &old_ids, &planned)? {
-                        return Ok(false);
-                    }
-                    queries::delete_chunks_for_conversation(tx, &plan.conversation_id)?;
-                    for (chunk, embedding) in chunks.iter().zip(&embeddings) {
-                        queries::insert_chunk_with_source(tx, chunk, embedding, source)?;
-                        queries::insert_chunk_provenance(
-                            tx,
-                            &chunk.id,
-                            &provenance_for(plan, chunk, default_source_conv_id),
-                        )?;
-                    }
-                    queries::replace_chunk_evidence_batch_in(tx, &evidence)?;
-                    mark_imported(tx, plan, chunks.len())?;
-                    Ok(true)
-                })
-            })
-            .await?;
-            if !written {
-                return Ok(Applied::Changed);
-            }
-            let mut index = engine.search().write().await;
-            for id in &old_ids {
-                index.remove_chunk(id);
-            }
-            for (chunk, embedding) in chunks.iter().zip(embeddings) {
-                index.insert_chunk(chunk.id.clone(), embedding);
-            }
-            Ok(Applied::Written)
-        }
-        ScrubPlanKind::Missing {
-            rewritten,
-            dropped_ids,
-            ..
-        } => {
-            let rows = rewritten.iter().collect::<Vec<_>>();
-            let embeddings = embed_rows(engine, &rows)?;
-            let ids = rows
-                .iter()
-                .map(|chunk| chunk.id.as_str())
-                .chain(dropped_ids.iter().map(String::as_str))
-                .collect::<Vec<_>>();
-            let written = retry_busy(|| {
-                storage.with_immediate_transaction(|tx| {
-                    if !rows_unchanged(tx, &ids, &planned)? {
-                        return Ok(false);
-                    }
-                    for (chunk, embedding) in rows.iter().zip(&embeddings) {
-                        queries::insert_chunk_with_source(
-                            tx,
-                            chunk,
-                            embedding,
-                            source_of(plan, &chunk.id),
-                        )?;
-                        queries::insert_chunk_provenance(
-                            tx,
-                            &chunk.id,
-                            &provenance_for(plan, chunk, &plan.conversation_id),
-                        )?;
-                        queries::replace_chunk_evidence_in(
-                            tx,
-                            &super::provenance_backfill::unreconstructible_chunk_evidence(
-                                chunk, None,
-                            ),
-                        )?;
-                    }
-                    for id in dropped_ids {
-                        queries::delete_chunk(tx, id)?;
-                    }
-                    Ok(true)
-                })
-            })
-            .await?;
-            if !written {
-                return Ok(Applied::Changed);
-            }
-            for (chunk, embedding) in rows.into_iter().zip(embeddings) {
-                replace_vector(engine, chunk, embedding).await;
-            }
-            let mut index = engine.search().write().await;
-            for id in dropped_ids {
-                index.remove_chunk(id);
-            }
-            Ok(Applied::Written)
+        })
+    })
+    .await?;
+    let held = held.get().map_or(Duration::ZERO, |start| start.elapsed());
+    if applied != Applied::Written {
+        return Ok((applied, held));
+    }
+    let mut index = engine.search().write().await;
+    if writes.whole {
+        for chunk in &plan.old_chunks {
+            index.remove_chunk(&chunk.id);
         }
     }
+    for (chunk, embedding) in rows.into_iter().zip(embeddings) {
+        index.remove_chunk(&chunk.id);
+        index.insert_chunk(chunk.id.clone(), embedding);
+    }
+    for id in &writes.deletes {
+        index.remove_chunk(id);
+    }
+    Ok((Applied::Written, held))
 }
 
 pub async fn run_scrub(
@@ -980,7 +1126,11 @@ pub async fn run_scrub(
         invalidated = true;
     }
     for plan in plans {
-        match apply_plan(engine, &plan).await? {
+        let (applied, held) = apply_plan(engine, &plan, include_active).await?;
+        report.longest_transaction_ms = report
+            .longest_transaction_ms
+            .max(u64::try_from(held.as_millis()).unwrap_or(u64::MAX));
+        match applied {
             Applied::Written => summarize_plan(&plan, &mut report),
             Applied::Changed => {
                 report.skipped_changed += 1;
@@ -988,6 +1138,12 @@ pub async fn run_scrub(
                     "changed during scrub, skipped: {}",
                     plan.conversation_id
                 ));
+            }
+            Applied::Active => {
+                report.deferred_active += 1;
+                report
+                    .actions
+                    .push(format!("active, deferred: {}", plan.conversation_id));
             }
         }
     }
@@ -1396,6 +1552,246 @@ mod tests {
             storage.get_chunk_content(&kept).unwrap().as_deref(),
             Some("My only rollback plan.")
         );
+    }
+
+    #[tokio::test]
+    async fn astra_r2_3_a_writer_resuming_after_planning_defers_the_plan() {
+        // An old hook writes a chunk's text and its vector in two autocommit
+        // statements. Its first lands after planning and touches the chunk's
+        // timestamp; the apply transaction sees the conversation active again
+        // and writes nothing, so its second statement cannot leave an old
+        // vector beside scrubbed text.
+        let temp = tempfile::tempdir().unwrap();
+        let (storage, old) = shared_database(&temp);
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(100)));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            search,
+            temp.path().join("projects"),
+        );
+        let dirty = chunk_at(
+            "probe-session",
+            0,
+            "Keep the deployment frozen.\n\n[[CSR:RECAP]] generated recap",
+        );
+        let old_vector = embeddings
+            .embed(&[dirty.content.as_str()])
+            .unwrap()
+            .remove(0);
+        storage.insert_chunk(&dirty, &old_vector).unwrap();
+        let mut report = super::ScrubReport::default();
+        let plans = super::selected_plans(
+            &storage,
+            Some("probe-session"),
+            false,
+            &HashSet::new(),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!((plans.len(), report.deferred_active), (1, 0));
+        old.with_connection(|conn| {
+            conn.execute(
+                "UPDATE chunks SET timestamp = ?1, content = ?2 WHERE id = ?3",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), dirty.content, dirty.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let (applied, _) = super::apply_plan(&engine, &plans[0], false).await.unwrap();
+        assert_eq!(applied, super::Applied::Active);
+        let bytes: Vec<u8> = old_vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+        old.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO chunk_embeddings (chunk_id, embedding) VALUES (?1, ?2)
+                 ON CONFLICT(chunk_id) DO UPDATE SET embedding = excluded.embedding",
+                rusqlite::params![dirty.id, bytes],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        // Text and vector still agree: the plan waits for a later, quiet run.
+        assert_eq!(
+            storage.get_chunk_content(&dirty.id).unwrap().as_deref(),
+            Some(dirty.content.as_str())
+        );
+        assert_eq!(stored_vector(&storage, &dirty.id), old_vector);
+    }
+
+    /// One user message as an older binary stored it: cut into byte-budget chunks
+    /// by the production chunker, forwards left in, each chunk with a vector and,
+    /// when `spans`, a span naming the message's one provenance event.
+    fn seed_split_message(
+        storage: &Storage,
+        embeddings: &EmbeddingEngine,
+        conversation: &str,
+        message: &str,
+        spans: bool,
+    ) -> Vec<String> {
+        let chunks = crate::import::chunk_messages(
+            conversation,
+            "project",
+            "2026-09-01T00:00:00Z",
+            &[(Speaker::User, message.to_string())],
+            false,
+        );
+        assert!(chunks.len() >= 2, "the message must span chunks");
+        for chunk in &chunks {
+            let vector = embeddings
+                .embed(&[chunk.content.as_str()])
+                .unwrap()
+                .remove(0);
+            storage
+                .insert_chunk_with_source(chunk, &vector, "conversation")
+                .unwrap();
+        }
+        if spans {
+            storage
+                .with_connection(|conn| {
+                    crate::storage::queries::insert_provenance_event(
+                        conn,
+                        &crate::provenance::ProvenanceEvent {
+                            event_id: format!("{conversation}-message"),
+                            conversation_id: conversation.into(),
+                            message_key: "m0".into(),
+                            seq: 0,
+                            channel: "user_message".into(),
+                            trust_tier: crate::provenance::TrustTier::UserHistory,
+                            parent_event_id: None,
+                            receipt_kind: "jsonl".into(),
+                            receipt_ref: None,
+                            observed_at: "2026-09-01T00:00:00Z".into(),
+                        },
+                    )?;
+                    for chunk in &chunks {
+                        conn.execute(
+                            "INSERT INTO chunk_spans (chunk_id, event_id, start_char, end_char, content_hash)
+                             VALUES (?1, ?2, 0, ?3, ?4)",
+                            rusqlite::params![
+                                chunk.id,
+                                format!("{conversation}-message"),
+                                chunk.content.chars().count() as i64,
+                                crate::provenance::content_hash(&chunk.content)
+                            ],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        chunks.into_iter().map(|chunk| chunk.id).collect()
+    }
+
+    /// The person's words left across the conversation's chunks, in order.
+    fn conversation_text(storage: &Storage, conversation: &str) -> String {
+        storage
+            .get_chunk_ids_for_conversation(conversation)
+            .unwrap()
+            .iter()
+            .filter_map(|id| storage.get_chunk_content(id).unwrap())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    #[tokio::test]
+    async fn astra_r2_7_a_forward_a_chunk_boundary_split_is_cut_in_every_chunk() {
+        let head = "CSR's compaction card (compacting): ";
+        let latin = format!("{head}{}\u{2026}", "x".repeat(1199 - head.chars().count()));
+        let cjk = format!(
+            "{head}{}\u{2026}",
+            "\u{8981}".repeat(1199 - head.chars().count())
+        );
+        let own = "Keep the deployment frozen.";
+        for (conversation, send) in [("split-latin", &latin), ("split-cjk", &cjk)] {
+            let storage = Arc::new(Storage::open_memory().unwrap());
+            let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+            let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+            let temp = tempfile::tempdir().unwrap();
+            let engine = Engine::from_parts(
+                storage.clone(),
+                embeddings.clone(),
+                search,
+                temp.path().to_path_buf(),
+            );
+            let message = format!("{send} {own}");
+            let ids = seed_split_message(&storage, &embeddings, conversation, &message, true);
+            super::run_scrub(&engine, false, Some(conversation), false, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                conversation_text(&storage, conversation),
+                own,
+                "{conversation}: {} chunks",
+                ids.len()
+            );
+        }
+    }
+
+    #[test]
+    fn astra_r2_7_the_guard_never_counts_a_generated_tail_as_the_persons() {
+        // Without spans the chunks cannot be shown to be one message; the
+        // missing-text guard still must not read the card's tail as the
+        // person's words and force a fallback.
+        let head = "CSR's compaction card (compacting): ";
+        let send = format!("{head}{}\u{2026}", "x".repeat(1199 - head.chars().count()));
+        let own = "Keep the deployment frozen.";
+        let chunk_of = |text: &str| {
+            crate::import::chunk_messages(
+                "probe-session",
+                "probe",
+                "2026-09-01T00:00:00Z",
+                &[(Speaker::User, text.to_string())],
+                false,
+            )
+        };
+        let stored = chunk_of(&format!("{send} {own}"));
+        assert_eq!(
+            stored
+                .iter()
+                .map(|chunk| chunk.content.len())
+                .collect::<Vec<_>>(),
+            vec![900, 330]
+        );
+        assert!(!super::reparse_lacks_stored_text(&stored, &chunk_of(own)));
+        // A stored word the re-parse truly lacks still counts.
+        assert!(super::reparse_lacks_stored_text(
+            &chunk_of(&format!("{send} {own} My only rollback plan.")),
+            &chunk_of(own)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_import_skips_while_a_maintenance_run_holds_the_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(4)));
+        let engine = Engine::from_parts(storage.clone(), embeddings, search, projects.clone());
+        let source = projects.join("held-session.jsonl");
+        std::fs::write(&source, user_line("Keep this fact.")).unwrap();
+        // A live run holds the lock (this test's parent stands in for it).
+        let lock = engine.data_dir().join(crate::maintenance::LOCK_FILE);
+        std::fs::write(
+            &lock,
+            format!(
+                "pid={}\nstarted_at=now\n",
+                std::os::unix::process::parent_id()
+            ),
+        )
+        .unwrap();
+        assert_eq!(engine.import_file(&source, "project").await.unwrap(), 0);
+        assert!(
+            !storage.is_file_imported(&source).unwrap(),
+            "the file stays for the watcher"
+        );
+        std::fs::remove_file(&lock).unwrap();
+        assert!(engine.import_file(&source, "project").await.unwrap() > 0);
+        assert!(storage.is_file_imported(&source).unwrap());
     }
 
     #[tokio::test]

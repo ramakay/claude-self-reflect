@@ -100,18 +100,11 @@ pub(crate) fn parent_provenance_context(
 /// transaction. Re-importing a growing final chunk cannot leave stale spans.
 pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    replace_chunk_evidence_in(&tx, evidence)?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// [`replace_chunk_evidence`] inside a transaction the caller already holds.
-pub(crate) fn replace_chunk_evidence_in(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
-    let relink = evidence_needs_relink(conn, evidence)?;
-    replace_chunk_evidence_inner(conn, evidence)?;
+    let relink = evidence_needs_relink(&tx, evidence)?;
+    replace_chunk_evidence_inner(&tx, evidence)?;
     if relink {
         super::sidechain_provenance::relink_conversations(
-            conn,
+            &tx,
             &evidence
                 .events
                 .iter()
@@ -119,8 +112,33 @@ pub(crate) fn replace_chunk_evidence_in(conn: &Connection, evidence: &ChunkEvide
                 .collect::<Vec<_>>(),
         )?;
     } else {
-        super::artifact_provenance::lower_from(conn, &[("chunk", &evidence.chunk_id)], &[])?;
+        super::artifact_provenance::lower_from(&tx, &[("chunk", &evidence.chunk_id)], &[])?;
     }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Replace the evidence of chunks in one conversation inside a transaction the
+/// caller already holds, then relink once, seeded by that conversation and the
+/// conversations its events name: its family, never the whole corpus. The
+/// corpus-wide relink held a maintenance transaction past every hook's 5 s busy
+/// timeout on the full database (astra r2 #1: 18.4 s for its seed query alone).
+pub(crate) fn replace_conversation_evidence_in(
+    conn: &Connection,
+    conversation_id: &str,
+    evidence: &[ChunkEvidence],
+) -> Result<()> {
+    let mut seeds = vec![conversation_id.to_string()];
+    for row in evidence {
+        replace_chunk_evidence_inner(conn, row)
+            .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
+        for event in &row.events {
+            if !seeds.contains(&event.conversation_id) {
+                seeds.push(event.conversation_id.clone());
+            }
+        }
+    }
+    super::sidechain_provenance::relink_conversations(conn, &seeds)?;
     Ok(())
 }
 
@@ -149,21 +167,12 @@ fn evidence_needs_relink(conn: &Connection, evidence: &ChunkEvidence) -> Result<
 
 pub fn replace_chunk_evidence_batch(conn: &Connection, evidence: &[ChunkEvidence]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    replace_chunk_evidence_batch_in(&tx, evidence)?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// [`replace_chunk_evidence_batch`] inside a transaction the caller already holds.
-pub(crate) fn replace_chunk_evidence_batch_in(
-    conn: &Connection,
-    evidence: &[ChunkEvidence],
-) -> Result<()> {
     for row in evidence {
-        replace_chunk_evidence_inner(conn, row)
+        replace_chunk_evidence_inner(&tx, row)
             .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
     }
-    super::sidechain_provenance::relink(conn)?;
+    super::sidechain_provenance::relink(&tx)?;
+    tx.commit()?;
     Ok(())
 }
 
