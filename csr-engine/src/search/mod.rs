@@ -117,6 +117,38 @@ pub struct SearchEngine {
     /// side from memory (dirty or not) when the on-disk manifest's epoch is
     /// newer than this value — see `dump_to_disk`'s stale-generation guard.
     epoch: u64,
+    /// The maintenance generation a full rebuild read before it streamed the
+    /// stored vectors ([`Self::mark_rebuilt_at`]). A rebuild that a maintenance
+    /// pass overtook read rows the pass has since rewritten: its publish is
+    /// refused ([`CrossedMaintenance`]) instead of restoring them (astra r2 #4).
+    rebuilt_at_generation: Option<u64>,
+}
+
+/// A full rebuild tried to publish after a maintenance pass began: it read the
+/// stored vectors before the pass rewrote them. Rebuild again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrossedMaintenance {
+    pub rebuilt_at: u64,
+    pub now: u64,
+}
+
+impl std::fmt::Display for CrossedMaintenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "index rebuild read at maintenance generation {} but the index is now at {}: rebuild again",
+            self.rebuilt_at, self.now
+        )
+    }
+}
+
+impl std::error::Error for CrossedMaintenance {}
+
+/// True when `error` is (or wraps) a [`CrossedMaintenance`].
+pub fn crossed_maintenance(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<CrossedMaintenance>().is_some())
 }
 
 // HNSW parameters
@@ -311,11 +343,18 @@ impl SearchEngine {
             reflection_changes: 0,
             manifest_backed: false,
             epoch: 0,
+            rebuilt_at_generation: None,
         }
     }
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Record the maintenance generation read before this engine was rebuilt
+    /// from the stored vectors. Call it BEFORE the stream starts.
+    pub fn mark_rebuilt_at(&mut self, maintenance_generation: u64) {
+        self.rebuilt_at_generation = Some(maintenance_generation);
     }
 
     fn mark_chunk_dirty(&mut self) {
@@ -871,12 +910,26 @@ impl SearchEngine {
         // from memory now, so whatever this call publishes is guaranteed to
         // match what's actually on disk" rather than risking the same
         // id-map/graph mismatch this whole fix exists to prevent.
+        // A manifest below the maintenance generation was published from a graph
+        // loaded before the last maintenance pass (an older binary's): it is no
+        // more trustworthy than none, and carrying its fields forward would
+        // relabel it current (astra r2 #5).
+        let floor = read_maintenance_generation(dir);
         let existing_manifest: Option<IndexManifest> =
             std::fs::read_to_string(dir.join("manifest.json"))
                 .ok()
                 .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
-                .filter(|m| m.version == MANIFEST_VERSION);
+                .filter(|m| m.version == MANIFEST_VERSION && m.epoch >= floor);
         let force_full = existing_manifest.is_none();
+        if let (false, Some(rebuilt_at)) = (self.manifest_backed, self.rebuilt_at_generation) {
+            if floor > rebuilt_at {
+                return Err(CrossedMaintenance {
+                    rebuilt_at,
+                    now: floor,
+                }
+                .into());
+            }
+        }
 
         // WP-D medium (compaction epoch guard): `manifest_backed` plus the
         // per-side dirty flags stop a long-lived engine from republishing a
@@ -904,7 +957,7 @@ impl SearchEngine {
             .as_ref()
             .map(|m| m.epoch)
             .unwrap_or(0)
-            .max(read_maintenance_generation(dir));
+            .max(floor);
         let stale_generation = self.manifest_backed && on_disk_epoch > self.epoch;
         if stale_generation {
             tracing::warn!(
@@ -1343,6 +1396,7 @@ impl SearchEngine {
             reflection_changes: 0,
             manifest_backed: true,
             epoch: manifest.epoch,
+            rebuilt_at_generation: None,
         })
     }
 }
