@@ -269,6 +269,28 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   reports `stale_processes`, `status --stale` reads no database (8f0ec174, 32730957). The statusline "reconnect
   mcp" marker is gone (b4a1708c).
 
+### Companion plugin
+
+- **`plugins/csr-companion` ships in the repo** (marketplace `claude-self-reflect`, `.claude-plugin/marketplace.json`,
+  relative source path). Install with `/plugin marketplace add ramakay/claude-self-reflect` then
+  `/plugin install csr-companion@claude-self-reflect`. `csr-engine setup` and the npm package do not install it.
+- **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
+  "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
+  last told it. It reads the csr-engine database read-only
+  and makes no model call.
+- **Dreamer** (off until you turn it on in `/config`): asks one "what if...?" when your past sessions give it a
+  reason and slows down when it finds nothing. Before each look it checks that its spend, plus the last look's cost,
+  stays within 1 token for every 10 Claude spends. That is a check, not a cap: a fork takes no token ceiling, so one
+  look can cost more than guessed. The real cost is recorded the moment the fork returns, whatever becomes of the
+  look, and anything over the share is owed: no look runs until Claude's own spending covers it. What you forward
+  from it is matched by the engine's provenance guard, so it is not read back as your words.
+- **Compaction coach:** `suggest` (default) offers to compact at a quiet turn end between 181k and 269k tokens,
+  `auto` compacts on its own, `off` never does.
+- **Git guard** is off unless a `csr-guard.json` exists (`README.md` in the plugin).
+- **Private by default:** the plugin's folder `~/.claude-self-reflect/csr-companion/` is `0700` and its files `0600`
+  under any umask (looser ones are tightened on first write), and API keys, bearer tokens, `password=`/`token=`
+  values and PEM blocks are redacted from the transcript text it keeps (`bin/private.py`).
+
 ### Installer
 
 - Installers report stale csr-engine processes and `launchctl kickstart -k` the daemon (8f0ec174, 32730957).
