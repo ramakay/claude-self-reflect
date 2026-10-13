@@ -643,10 +643,12 @@ pub fn spawn_for_daemon(
         shutdown,
         sync_nudge,
         CALL_TIMEOUT,
+        Arc::new(Semaphore::new(SERVER_SLOTS)),
     )
 }
 
-/// [`spawn_for_daemon`] giving up on a connection after `serve_timeout`.
+/// [`spawn_for_daemon`] giving up on a connection after `serve_timeout`,
+/// admitting requests through `slots`.
 fn spawn_for_daemon_with(
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
@@ -654,6 +656,7 @@ fn spawn_for_daemon_with(
     shutdown: Arc<AtomicBool>,
     sync_nudge: Arc<Notify>,
     serve_timeout: Duration,
+    slots: Arc<Semaphore>,
 ) -> tokio::task::JoinHandle<()> {
     let data_dir = db_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let database = db_path
@@ -682,7 +685,6 @@ fn spawn_for_daemon_with(
                     return;
                 }
             };
-            let slots = Arc::new(Semaphore::new(SERVER_SLOTS));
             while !shutdown.load(Ordering::SeqCst) {
                 let accepted = tokio::select! {
                     accepted = bound.listener.accept() => accepted,
@@ -1331,13 +1333,16 @@ mod tests {
         .unwrap();
         let search = Arc::new(RwLock::new(index));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let slots = Arc::new(Semaphore::new(SERVER_SLOTS));
+        let serve_timeout = Duration::from_millis(200);
         let server = spawn_for_daemon_with(
             Arc::new(EmbeddingEngine::new().unwrap()),
             search.clone(),
             &db,
             shutdown.clone(),
             Arc::new(Notify::new()),
-            Duration::from_millis(200),
+            serve_timeout,
+            slots.clone(),
         );
         while !socket_path(tmp.path()).exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1366,8 +1371,22 @@ mod tests {
                 std::thread::spawn(move || raw(&dir, &bytes, false))
             })
             .collect();
-        // Well past the server's give-up time: the old code freed the slots here.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        // All eight admitted (and blocked on the lock)...
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slots.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("eight searches admitted");
+        // ...then well past the server's give-up time for each of them (the
+        // old code freed every slot then), none has come back.
+        tokio::time::sleep(serve_timeout * 3).await;
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "slots held by unfinished work"
+        );
         let (d, p) = (dir.clone(), ping.clone());
         let refused = tokio::task::spawn_blocking(move || raw(&d, &p, false))
             .await
