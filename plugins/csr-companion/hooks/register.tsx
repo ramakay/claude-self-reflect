@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelForkResult, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
 
 import type { AgentState, CompactView, CompletionKey, CompletionDisposition, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
-import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
+import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, handoffRequests, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
 import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
@@ -1006,7 +1006,13 @@ async function agentsChange($: EngineInterface, change: (state: AgentState) => A
 
 async function track($: EngineInterface, event: AgentEvent): Promise<void> {
   try {
-    await agentsChange($, state => reduceAgentEvent(state, event))
+    let moved = false
+    await agentsChange($, state => {
+      const next = reduceAgentEvent(state, event)
+      moved = next.handoffs !== state.handoffs
+      return next
+    })
+    if (moved) void writeHandoffs($).catch(() => undefined)
     void scheduleAgents($)
   } catch {}
 }
@@ -1016,7 +1022,13 @@ async function pollAgents($: EngineInterface): Promise<void> {
   try {
     const list = await $.agent.list()
     const at = await $.clock.now()
-    await agentsChange($, state => reconcileAgentList(state, list, at))
+    let moved = false
+    await agentsChange($, state => {
+      const next = reconcileAgentList(state, list, at)
+      moved = next.handoffs !== state.handoffs
+      return next
+    })
+    if (moved) void writeHandoffs($).catch(() => undefined)
     void scheduleAgents($)
   } catch {}
 }
@@ -1033,6 +1045,45 @@ async function writeAgents($: EngineInterface): Promise<void> {
   if (!home || !SESSION_NAME.test(session)) return
   const file = projectAgentsFile(ownAgents(await read($, agentSession), session), await $.clock.now())
   if (file.agents.length) await keepWrite($, `${home}/${AGENTS_DIR}/${session}.json`, JSON.stringify(file), 'json')
+}
+
+// What became of the requests to hand a Lost and found thread to a background agent (agents.ts, associateHandoff), where the
+// pane reads it: handoffs/<session>.json beside the pane's own drafts of them. Ids and words, no prompt and no report.
+const HANDOFFS_DIR = '.claude-self-reflect/csr-companion/handoffs' // under HOME
+
+async function writeHandoffs($: EngineInterface): Promise<void> {
+  const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+  const session = await $.session.id()
+  if (!home || !SESSION_NAME.test(session)) return
+  const { handoffs } = ownAgents(await read($, agentSession), session)
+  if (handoffs.length) await keepWrite($, `${home}/${HANDOFFS_DIR}/${session}.json`, JSON.stringify({ version: 1, session, handoffs }), 'json')
+}
+
+// A prompt that entered, and carried the envelope of a request the pane drafted: that request was sent. Only the text that
+// entered counts (a prompt a hook dropped did not go), and only a request the pane drafted in this session.
+async function handoffSent($: EngineInterface, entered: { text?: string; drop?: unknown }): Promise<void> {
+  try {
+    if (entered.drop !== undefined || !entered.text?.includes('[[CSR:AGENTS:v1]]')) return
+    const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+    const session = await $.session.id()
+    const asked = handoffRequests(entered.text, session)
+    if (!home || !SESSION_NAME.test(session) || !asked.length) return
+    const drafts = await $.fs.read(`${home}/${HANDOFFS_DIR}/${session}.drafts.jsonl`).catch(() => '')
+    for (const { request, thread } of asked) {
+      for (const line of drafts.split('\n')) {
+        let draft: { request?: unknown; thread?: unknown; drafted_at?: unknown } = {}
+        try {
+          draft = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (draft.request === request && draft.thread === thread && typeof draft.drafted_at === 'number') {
+          await track($, { kind: 'handoff', at: await $.clock.now(), request, thread, draftedAt: draft.drafted_at })
+          break
+        }
+      }
+    }
+  } catch {}
 }
 
 // At most one write in five seconds. The first goes at once; a change inside the interval sets one timer for its end
@@ -1786,6 +1837,7 @@ export const register: Register = (on, options) => {
       await track($, {
         kind: 'spawn', at: await $.clock.now(), toolUseId: e.tool_use_id, description: e.description, type: e.subagentType || null,
         parent: e.parentAgentId ?? null, model: e.model ?? null,
+        requests: handoffRequests(e.prompt, await $.session.id()).map(entry => entry.request), // handoffs the call's prompt carries
       })
     }
     const result = await next(e)
@@ -1991,7 +2043,9 @@ export const register: Register = (on, options) => {
         await $.store.set(await ownKey($, 'looksToSkip'), Math.min(SKIP_MAX, 2 ** (inARow - 1)))
       }
     }
-    return next(e)
+    const entered = await next(e)
+    await handoffSent($, entered)
+    return entered
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the prompt go on
 
   // While a compaction runs, a marker file says so and when it began; the pane draws the timer from it. It

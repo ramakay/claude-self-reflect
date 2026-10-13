@@ -33,6 +33,7 @@ import math
 import os
 import plistlib
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -83,6 +84,7 @@ DREAMER_SAID = "CSR's dreamer asked this while you worked"
 PANES = os.path.join(KEEP, 'panes')  # <session>.json: the pid of the pane open beside that session
 STATUS_LINES = os.path.join(KEEP, 'statusline')  # <session>.json: Claude's status line, moved into the pane
 AGENTS = os.path.join(KEEP, 'agents')  # <session>.json: the session's agents, written by hooks/agents.ts
+HANDOFFS = os.path.join(KEEP, 'handoffs')  # <session>.json (the hooks') and <session>.drafts.jsonl (the pane's): Lost and found handoffs
 
 
 def epoch(ts):
@@ -1679,7 +1681,7 @@ class Session:
                     summary_sizes=self.summary_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
                     summaries=self.summaries[-2:],  # the newest, for the compaction card's Learnt
                     lost=lost_found(self.summaries, self.typed, self.carried or (),
-                                    project_of(self.path or self.guess())),
+                                    project_of(self.path or self.guess()), handoffs_of(self.id)),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last),
                     main=list(self.main), turn_end=self.turn_end, model=self.model, told=self.told,
@@ -2981,6 +2983,21 @@ ANSWER_WORD = dict(helpful='helpful', ask_claude='asked Claude', thought_of_it="
                    rejected='you said no')
 
 
+def send_draft(agent, text):
+    """Words into Claude's prompt, unsent, over more than one line: each line is typed with send-text and a Ctrl+J, Claude Code's
+    own new line, between them; an Enter is never sent, so nothing submits. False as soon as one step fails (the pane's herdr
+    refusing a key stops it with the lines so far typed, none sent)."""
+    lines = [CONTROL.sub('', line) for line in str(text).split('\n')]
+    if not agent or not lines or any(len(line) > 4000 for line in lines):
+        return False
+    for number, line in enumerate(lines):
+        if number and herdr('pane', 'send-keys', agent, 'ctrl+j') is None:
+            return False
+        if line and herdr('pane', 'send-text', agent, line) is None:
+            return False
+    return True
+
+
 def fit(text, width):
     return text if len(text) <= width else text[:max(1, width - 1)] + '…'
 
@@ -3710,6 +3727,26 @@ def agents_of(session_id, folder=None):
     if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)):
         return agents_lib.empty()
     return agents_lib.read_agents(os.path.join(folder or AGENTS, f'{session_id}.json'), str(session_id))
+
+
+def handoffs_of(session_id, folder=None):
+    """The handoffs of a session's Lost and found, as the hooks and this pane left them: [] for none, or for files that are
+    not this session's or are malformed (bin/agents.py, read_handoffs)."""
+    if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)):
+        return []
+    base = os.path.join(folder or HANDOFFS, str(session_id))
+    return agents_lib.read_handoffs(base + '.json', base + '.drafts.jsonl', str(session_id))
+
+
+def new_handoff(session_id, thread, folder=None):
+    """A click on "-> subagent": a new request id (a retry is always a new one), kept as a draft, and the envelope that carries
+    it into the unsent prompt. (request, envelope), or (None, None) where there is no session to tie it to."""
+    if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)) or not agents_lib.THREAD.fullmatch(str(thread)):
+        return None, None
+    request = 'req-' + secrets.token_hex(8)
+    private.append(os.path.join(folder or HANDOFFS, f'{session_id}.drafts.jsonl'),
+                   private.dumps(dict(request=request, thread=thread, drafted_at=time.time())) + '\n', root=KEEP)
+    return request, agents_lib.handoff_envelope(str(session_id), request, thread)
 
 
 def flight_minutes(row, now):
@@ -6992,7 +7029,7 @@ def keep_lost(key, answer, at, project=None, **more):
     private.append(LOST_LOG, private.dumps(dict(key=key, answer=answer, at=at, project=project, **more)) + '\n', root=KEEP)
 
 
-def lost_found(summaries, typed=(), carried=(), project=None):
+def lost_found(summaries, typed=(), carried=(), project=None, handoffs=()):
     """The threads, each marked hidden: "drop" for good, "handed" once a prompt sent its hand-off (lost_asks'
     words, typed and submitted after the thread first showed), "later" until the next compaction. A thread set
     aside for later is also the one thing prep-compact hands the summary, as a reminder. The session
@@ -7007,6 +7044,9 @@ def lost_found(summaries, typed=(), carried=(), project=None):
         elif c['key'] in said and match['key'] not in said:
             said[match['key']] = said[c['key']]
     threads.sort(key=lambda t: (t['rank'], -t['last_seen']))
+    by_thread = {}
+    for h in handoffs or ():  # requests to hand a thread to a background agent, by the thread's key
+        by_thread.setdefault(h['thread'], []).append(h)
     handed = {}
     for when, quoted, how in lost_handoffs(typed):  # each names one thread: the one its quote matches best
         tied = [(len(quoted & words) / len(quoted | words), t) for t in threads if t['first_seen'] < when
@@ -7018,7 +7058,19 @@ def lost_found(summaries, typed=(), carried=(), project=None):
         answer, at = said.get(t['key'], (None, 0))
         t['hidden'] = answer if answer == 'drop' or (answer == 'later' and at > newest) else None
         t['later'] = answer == 'later'
-        if id(t) in handed and answer != 'drop':
+        decided = agents_lib.decide(by_thread.get(t['key'], ()))
+        if decided and answer != 'drop':  # a handoff tied to an agent decides, not the words typed: those prove nothing of it
+            word, h = decided
+            at = h['submitted_at'] or h['drafted_at']
+            if word == 'handed':
+                done = ' · it reported' if h['outcome'] == 'succeeded' else ''
+                t.update(hidden='handed', state='handed', why=handed_why(at, 'sub') + done)
+            elif word == 'failed':  # the agent it went to failed, was killed, or said nothing: the thread is back
+                t.update(hidden=None, later=False, state='lost', rank=0 if t['waiting'] else 1, handed_at=at, failed_at=h['ended_at'],
+                         why=f"{handed_why(at, 'sub')}, which failed {hhmm(h['ended_at'])}: {h['reason'] or 'no reason'}")
+            else:  # sent, and tied to no agent (no Agent call carried it, it was denied, or two requests were in one prompt)
+                t.update(unlinked=True, why='handoff not linked' + (f" ({h['reason']})" if h['reason'] else ''))
+        elif id(t) in handed and answer != 'drop' and t['key'] not in by_thread:
             t.update(hidden='handed', state='handed', why=handed_why(*handed[id(t)]))
     return threads
 
@@ -7118,7 +7170,7 @@ def carried_threads(path, started, prev=None):
     said = lost_log(project_of(before))
     out = []
     # what that session itself carried in and nobody dropped: a second restart loses nothing either
-    for t in lost_found(prev.summaries, prev.typed, read_carried(prev.id) or (), project_of(before)):
+    for t in lost_found(prev.summaries, prev.typed, read_carried(prev.id) or (), project_of(before), handoffs_of(prev.id)):
         if t['hidden'] in ('drop', 'handed') or t['key'] in said and said[t['key']][0] == 'drop':
             continue
         if t['state'] in ('open', 'lost'):
@@ -7280,7 +7332,7 @@ def lost_json(session_id):
         session.read_transcript()
     carried = (read_carried(session_id) or []) if session else []
     return [t for t in lost_found(session.summaries if session else [], session.typed if session else [], carried,
-                                  project_of(session and session.path)) if t['hidden'] not in ('drop', 'handed')]
+                                  project_of(session and session.path), handoffs_of(session_id)) if t['hidden'] not in ('drop', 'handed')]
 
 
 def lost_asks(thread):
@@ -7306,7 +7358,8 @@ def lost_sections(s, now, most=3):
             'quiet ' + stamp(t['last_seen'], now)[0] if t['state'] == 'lost' else 'open',
             f"{t['times']}×" if t['times'] else '') if x)
         items.append(dict(key='lost:' + t['key'], title=t['text'], lines=2, meta=meta, lost=t['key'], top=k == 0,
-                          flag='waiting on you' if t['waiting'] else '', asks=asks, send=asks['side'],
+                          flag='handoff not linked' if t.get('unlinked') else 'its subagent failed' if t.get('failed_at') else 'waiting on you' if t['waiting'] else '',
+                          asks=asks, send=asks['side'],
                           detail=[t.get('why') or f"First appeared {when(t['first_seen'])}, last {when(t['last_seen'])}, "
                                   f"carried through {t['times']} {'compaction' if t['times'] == 1 else 'compactions'}."]
                           + t['detail'][:3]))
@@ -7351,10 +7404,12 @@ def lost_click(pane, act, col):
         keep_lost(act['lost'], pick, time.time(), project)
     elif pick:
         agent = agent_pane(pane.agent)
-        went = send_text(agent, act['asks'][pick])
+        request, envelope = new_handoff(getattr(getattr(pane, 'session', None), 'id', None), act['lost']) if pick == 'sub' else (None, None)
+        # The subagent ask carries its request: the ask, then the envelope on lines of its own, both unsent.
+        went = send_draft(agent, act['asks'][pick] + '\n' + envelope) if envelope else send_text(agent, act['asks'][pick])
         pane.sent = (act['item'], went, time.time())
         if went:
-            keep_lost(act['lost'], 'sent', time.time(), project, how=pick)
+            keep_lost(act['lost'], 'sent', time.time(), project, how=pick, **({'request': request} if request else {}))
         focus_back()  # it is in Claude's prompt now: the next keys belong there
 
 

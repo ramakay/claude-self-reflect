@@ -154,6 +154,23 @@ export type AgentRec = Omit<AgentRow, 'edits' | 'edits_omitted' | 'overlaps' | '
   paths: Record<string, string>
   seenTools: string[]
   seenSteps: StepKey[]
+  first_turn: string | null // the first turn this agent ran that was seen: the one a handoff to it is bound to
+}
+
+// A request to hand a Lost and found thread to a background agent, and what became of it. Ids and words only: no prompt, no
+// report. Written to handoffs/<session>.json; the pane's draft of it is in handoffs/<session>.drafts.jsonl.
+export type AgentHandoff = {
+  request: string
+  session: string
+  thread: string // Lost and found's stable key for the thread
+  drafted_at: number
+  submitted_at: number | null
+  spawn_tool_use_id: string | null
+  agent_id: string | null
+  turn_id: string | null
+  outcome: 'draft' | 'submitted' | 'bound' | 'succeeded' | 'failed'
+  ended_at: number | null
+  reason: string | null
 }
 
 // A spawn seen before the result of `next(e)` is: what the Agent call asked for.
@@ -176,6 +193,7 @@ export type AgentState = {
   listedAt: number | null
   fileAt: number | null // when the agents file was last written
   fileDue: number | null // when a write that was held back is due (a timer sets it off; a reload sets it again)
+  handoffs: AgentHandoff[] // requests to hand a thread to a background agent, oldest first
 }
 
 declare module 'claude-code' {

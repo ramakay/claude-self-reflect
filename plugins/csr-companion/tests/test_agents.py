@@ -659,3 +659,213 @@ class TheBrief(unittest.TestCase):
         self.assertEqual([line for line in text.splitlines() if line.startswith('* ')], [])  # no "* " fact: not news by text
         self.doc['agents'] = []
         self.assertNotIn('[[CSR:AGENTS', pane.brief(self.con, self.repo, SESSION))
+
+
+# ---------------------------------------------------------------- Lost and found: handing a thread to a background agent
+
+SCENARIO = r'''
+const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm')
+const ts = require(process.argv[1])
+const mod = { exports: {} }
+vm.runInThisContext(`(function(require,module,exports){${ts.transpileModule(fs.readFileSync(path.join(process.argv[2], 'hooks/agents.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText}\n})`)(() => { throw 1 }, mod, mod.exports)
+const { emptyAgentState, reduceAgentEvent, reconcileAgentList } = mod.exports
+const input = JSON.parse(fs.readFileSync(0, 'utf8'))
+let state = emptyAgentState(input.session)
+for (const event of input.events) state = event.kind === 'list' ? reconcileAgentList(state, event.list, event.at) : reduceAgentEvent(state, event)
+process.stdout.write(JSON.stringify({ version: 1, session: state.session, handoffs: state.handoffs }))
+'''
+
+T1 = pane.epoch('2026-10-12T10:00:00Z')
+def summary(pending):
+    return '1. Primary Request and Intent:\n   - The ask.\n\n7. Pending Tasks:\n' + pending + '\n8. Current Work:\n   - Something else.\n'
+
+
+Q = summary('   - Fix the importer retry limit and ship it.\n')
+LATER = summary('   - Something else entirely is still to do.\n')
+SUMMARIES_OF = [(T1, Q), (T1 + 1800, Q), (T1 + 3600, LATER)]  # the thread in two summaries, dropped from the third: lost
+THREAD_TEXT = 'Fix the importer retry limit and ship it.'
+
+
+def threads(handoffs=(), project=None):
+    return pane.lost_found(SUMMARIES_OF, (), (), project, handoffs)
+
+
+def the_thread(found):
+    return next(t for t in found if t['text'].startswith('Fix the importer'))
+
+
+def handoff(request, outcome='submitted', thread=None, at=T1 + 7200, **more):
+    base = dict(request=request, session=SESSION, thread=thread or the_thread(threads())['key'], drafted_at=at - 10, submitted_at=at,
+                spawn_tool_use_id=None, agent_id=None, turn_id=None, outcome=outcome, ended_at=None, reason=None)
+    return dict(base, **more)
+
+
+class HandedThreads(Folder):
+    def setUp(self):
+        super().setUp()
+        self.keep = pane.KEEP, pane.LOST_LOG, pane.HANDOFFS
+        pane.KEEP, pane.LOST_LOG, pane.HANDOFFS = self.home, os.path.join(self.home, 'lost.jsonl'), os.path.join(self.home, 'handoffs')
+        self.addCleanup(lambda: setattr(pane, 'KEEP', self.keep[0]) or setattr(pane, 'LOST_LOG', self.keep[1]) or setattr(pane, 'HANDOFFS', self.keep[2]))
+
+    def test_handoff_binds_exact_request_and_turn(self):
+        compiler = compiler_path()
+        if not compiler:
+            if os.environ.get('CI'):
+                self.fail('CI installs a pinned typescript before pytest')
+            self.skipTest('An installed TypeScript compiler is unavailable')
+        key = the_thread(threads())['key']
+        spawn = lambda tool, requests, parent=None: dict(kind='spawn', at=3, toolUseId=tool, description='h', type='general-purpose', parent=parent,
+                                                         model=None, requests=requests)
+        events = [
+            dict(kind='handoff', at=1, request='req-one', thread=key, draftedAt=0),
+            dict(kind='handoff', at=1, request='req-nested', thread=key, draftedAt=0),
+            spawn('u-nested', ['req-nested'], parent='someone'),  # an agent's own call carrying the envelope: binds nothing
+            dict(kind='spawned', at=4, toolUseId='u-nested', agentId='n1', model='m'),
+            spawn('u1', ['req-one', 'req-unsent']),  # one request sent, one never: the sent one is the call's
+            dict(kind='step', at=5, agentId='a1', turnId='turn-1', index=0, answer='Looking', tokens=1),  # before the call's result
+            dict(kind='spawned', at=6, toolUseId='u1', agentId='a1', model='m'),
+            dict(kind='step', at=7, agentId='a1', turnId='turn-2', index=0, answer='again', tokens=1),  # a later run: not its turn
+            dict(kind='complete', at=8, agentId='a1', turnId='turn-2', reason='error', answer=''),  # and not its end
+        ]
+        ran = subprocess.run(['node', '-e', SCENARIO, compiler, str(ROOT)], input=json.dumps(dict(session=SESSION, events=events)),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        state = json.loads(ran.stdout)
+        by = {h['request']: h for h in state['handoffs']}
+        self.assertEqual((by['req-one']['outcome'], by['req-one']['agent_id'], by['req-one']['turn_id'], by['req-one']['spawn_tool_use_id']),
+                         ('bound', 'a1', 'turn-1', 'u1'))
+        self.assertEqual((by['req-nested']['outcome'], by['req-nested']['agent_id']), ('submitted', None))
+        self.assertNotIn('req-unsent', by)
+        # the state file as the hooks write it is what the pane reads, ids only
+        path = os.path.join(self.home, 'handoffs', f'{SESSION}.json')
+        os.makedirs(os.path.dirname(path))
+        with open(path, 'w') as handle:
+            json.dump(state, handle)
+        read = pane.handoffs_of(SESSION)
+        self.assertEqual({h['request']: h['outcome'] for h in read}, {'req-one': 'bound', 'req-nested': 'submitted'})
+        # the bound turn then ends: succeeded
+        events += [dict(kind='complete', at=9, agentId='a1', turnId='turn-1', reason='answer', answer='Done.')]
+        ran = subprocess.run(['node', '-e', SCENARIO, compiler, str(ROOT)], input=json.dumps(dict(session=SESSION, events=events)),
+                             capture_output=True, text=True, timeout=60)
+        done = {h['request']: h for h in json.loads(ran.stdout)['handoffs']}
+        self.assertEqual((done['req-one']['outcome'], done['req-one']['ended_at']), ('succeeded', 9))
+        self.assertNotIn('Done.', ran.stdout)  # no report in it
+
+    def test_handed_thread_returns_on_failure(self):
+        for ended in ('error', 'refusal', 'aborted', 'killed', 'no report'):
+            with self.subTest(ended):
+                found = threads([handoff('req-1', 'failed', agent_id='a1', turn_id='t1', ended_at=T1 + 9000, reason=ended)])
+                t = the_thread(found)
+                self.assertEqual((t['state'], t['hidden']), ('lost', None))
+                self.assertEqual((t['handed_at'], t['failed_at']), (T1 + 7200, T1 + 9000))  # the original handoff and the failure
+                self.assertIn(ended, t['why'])
+                (section,) = pane.lost_sections(dict(lost=found), T1 + 9100)
+                self.assertEqual(next(i for i in section['items'] if i['lost'] == t['key'])['flag'], 'its subagent failed')
+        # while its agent works, or after it reported, the thread is handed off, and hidden as such
+        for outcome in ('bound', 'succeeded'):
+            t = the_thread(threads([handoff('req-1', outcome, agent_id='a1', turn_id='t1')]))
+            self.assertEqual((t['hidden'], t['state']), ('handed', 'handed'))
+        # an explicit drop is the person's, and stands over any outcome
+        pane.keep_lost(the_thread(threads())['key'], 'drop', T1 + 8000)
+        self.assertEqual(the_thread(threads([handoff('req-1', 'failed', reason='error', ended_at=T1 + 9000)]))['hidden'], 'drop')
+
+    def test_unlinked_handoff_stays_visible(self):
+        for why in (None, 'spawn denied', 'ambiguous'):
+            with self.subTest(why):
+                found = threads([handoff('req-1', 'submitted', reason=why)])
+                t = the_thread(found)
+                self.assertIsNone(t['hidden'])  # not hidden as handed
+                self.assertTrue(t['unlinked'])
+                self.assertTrue(t['why'].startswith('handoff not linked'))
+                (section,) = pane.lost_sections(dict(lost=found), T1 + 9100)
+                item = next(i for i in section['items'] if i['lost'] == t['key'])
+                self.assertEqual(item['flag'], 'handoff not linked')  # and it stays a click away, asks and all
+                self.assertIn('sub', item['asks'])
+        # typed words that look like a handoff prove nothing for a thread whose handoff was tied to no agent
+        typed = [(T1 + 7300, f'Lost and found: “{THREAD_TEXT}” went quiet after 10:00. Hand it to a background subagent with a five-part spec.')]
+        t = the_thread(pane.lost_found(SUMMARIES_OF, typed, (), None,
+                                       [handoff('req-1', 'submitted')]))
+        self.assertIsNone(t['hidden'])
+        # a legacy handoff, which has no request at all, is still read from what was typed, and not guessed at any further
+        legacy = the_thread(pane.lost_found(SUMMARIES_OF, typed, (), None, ()))
+        self.assertEqual(legacy['hidden'], 'handed')
+        # a draft nobody sent says nothing
+        t = the_thread(threads([handoff('req-1', 'draft', submitted_at=None)]))
+        self.assertEqual((t['hidden'], t.get('unlinked')), (None, None))
+
+    def test_old_failure_does_not_reopen_retry(self):
+        key = the_thread(threads())['key']
+        failed = handoff('req-1', 'failed', agent_id='a1', turn_id='t1', at=T1 + 7200, ended_at=T1 + 7300, reason='error')
+        for outcome, hidden in (('bound', 'handed'), ('succeeded', 'handed')):
+            retry = handoff('req-2', outcome, agent_id='a2', turn_id='t2', at=T1 + 8000)
+            t = the_thread(threads([failed, retry]))
+            self.assertEqual((t['hidden'], t['state']), (hidden, 'handed'), outcome)  # the earlier failure cannot reopen it
+        again = handoff('req-3', 'failed', agent_id='a3', turn_id='t3', at=T1 + 9000, ended_at=T1 + 9100, reason='refusal')
+        t = the_thread(threads([failed, handoff('req-2', 'succeeded', agent_id='a2', turn_id='t2', at=T1 + 8000), again]))
+        self.assertEqual((t['state'], t['hidden']), ('lost', None))  # the newest failed: back
+        self.assertIn('refusal', t['why'])
+        # a retry only drafted, not sent yet, leaves the failure standing
+        t = the_thread(threads([failed, handoff('req-4', 'draft', at=T1 + 9500, submitted_at=None)]))
+        self.assertEqual((t['state'], t['hidden']), ('lost', None))
+        # the files: the pane's drafts and the hooks' state read together, by request
+        folder = os.path.join(self.home, 'handoffs')
+        os.makedirs(folder)
+        with open(os.path.join(folder, f'{SESSION}.drafts.jsonl'), 'w') as handle:
+            handle.write(json.dumps(dict(request='req-4', thread=key, drafted_at=T1 + 9500)) + '\n' + 'not json\n'
+                         + json.dumps(dict(request='req-1', thread=key, drafted_at=T1 + 7190)) + '\n')
+        with open(os.path.join(folder, f'{SESSION}.json'), 'w') as handle:
+            json.dump(dict(version=1, session=SESSION, handoffs=[failed]), handle)
+        read = {h['request']: h['outcome'] for h in pane.handoffs_of(SESSION)}
+        self.assertEqual(read, {'req-1': 'failed', 'req-4': 'draft'})  # the draft the state already answers is not a second one
+        self.assertEqual(pane.handoffs_of('other-session'), [])
+        self.assertEqual(pane.handoffs_of('../x'), [])
+
+    def test_a_click_on_subagent_drafts_a_request_and_types_its_envelope_without_sending(self):
+        key = the_thread(threads())['key']
+        (section,) = pane.lost_sections(dict(lost=threads()), T1 + 9100)
+        item = next(i for i in section['items'] if i['lost'] == key)
+        rows = pane.lost_rows(dict(item, top=True), 46, {}, False)
+        act = next(act for _, act in rows if any(answer == 'sub' for _, _, answer in act['spans']))
+        sub_at = next(start for start, _, answer in act['spans'] if answer == 'sub')
+        typed = []
+        saved = pane.herdr, pane.agent_pane, pane.focus_back
+        pane.herdr = lambda *argv: typed.append(argv) or ''
+        pane.agent_pane, pane.focus_back = lambda given: 'w1:p1', lambda: None
+        shell = types.SimpleNamespace(session=types.SimpleNamespace(id=SESSION, path=None), agent='w1:p1', sent=None)
+        try:
+            pane.lost_click(shell, act, sub_at)
+        finally:
+            pane.herdr, pane.agent_pane, pane.focus_back = saved
+        texts = [argv[3] for argv in typed if argv[1] == 'send-text']
+        keys = [argv[3:] for argv in typed if argv[1] == 'send-keys']
+        self.assertEqual(keys, [('ctrl+j',)] * 4)  # a new line is Ctrl+J: after the ask, and after each line of the envelope; no Enter
+        self.assertTrue(all(argv[1] in ('send-text', 'send-keys') for argv in typed))
+        self.assertTrue(texts[0].startswith('Lost and found: “Fix the importer'))
+        self.assertEqual(texts[1:], [agents_lib.OPEN, texts[2], agents_lib.CLOSE])
+        (found,) = agents_lib.parse_envelopes('\n'.join(texts[1:]) + '\n')
+        payload = found[2]
+        self.assertEqual((payload['kind'], payload['session'], payload['thread']), ('handoff', SESSION, key))
+        self.assertEqual([h['outcome'] for h in pane.handoffs_of(SESSION)], ['draft'])
+        self.assertEqual(pane.handoffs_of(SESSION)[0]['request'], payload['request'])
+        with open(pane.LOST_LOG) as handle:
+            kept = [json.loads(line) for line in handle]
+        self.assertEqual([(k['answer'], k['how'], k['request']) for k in kept], [('sent', 'sub', payload['request'])])
+        self.assertTrue(shell.sent[1])
+        # a second click is a new request
+        typed.clear()
+        pane.herdr, pane.agent_pane, pane.focus_back = (lambda *argv: typed.append(argv) or ''), (lambda given: 'w1:p1'), (lambda: None)
+        try:
+            pane.lost_click(shell, act, sub_at)
+        finally:
+            pane.herdr, pane.agent_pane, pane.focus_back = saved
+        self.assertEqual(len({h['request'] for h in pane.handoffs_of(SESSION)}), 2)
+        # the side task is still one line, as it was, and a pane with no session types the old one-line ask
+        typed.clear()
+        pane.herdr, pane.agent_pane, pane.focus_back = (lambda *argv: typed.append(argv) or ''), (lambda given: 'w1:p1'), (lambda: None)
+        try:
+            side = pane.lost_rows(dict(item, top=True), 46, {}, False)[0][1]
+            pane.lost_click(shell, side, next(start for start, _, answer in side['spans'] if answer == 'side'))
+            pane.lost_click(types.SimpleNamespace(session=None, agent='w1:p1', sent=None), act, sub_at)
+        finally:
+            pane.herdr, pane.agent_pane, pane.focus_back = saved
+        self.assertTrue(all(argv[1] == 'send-text' for argv in typed))

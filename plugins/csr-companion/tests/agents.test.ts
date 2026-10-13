@@ -7,7 +7,7 @@ import {
   FILE_BYTES, FILE_EVERY_MS, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, redactAgentValue,
   settleCompletions, stepKey, STALL_MS, utf8Length,
 } from '../hooks/agents'
-import { completionNews, ENVELOPE_CLOSE, ENVELOPE_OPEN, HANDOFF_INSTRUCTION, parseAgentEnvelope, parseAgentEnvelopes, stripEnvelopes } from '../hooks/agents'
+import { associateHandoff, completionNews, ENVELOPE_CLOSE, ENVELOPE_OPEN, HANDOFF_INSTRUCTION, parseAgentEnvelope, parseAgentEnvelopes, stripEnvelopes } from '../hooks/agents'
 import type { Ledger } from '../hooks/agents'
 import { ownWords } from '../hooks/dreamer'
 
@@ -65,6 +65,7 @@ type World = {
   breakId?: { on: boolean } // the session id cannot be read: every observer fails
   writes?: Array<{ path: string; text: string; flags: string[] }> // what bin/private.py was asked to keep
   session?: string // the session id; sess-a where left out
+  drafts?: string // what the pane's handoffs/<session>.drafts.jsonl holds
 }
 
 // A session with a person at it, the agents' tools beneath the plugin, and the clock and store in memory.
@@ -89,6 +90,8 @@ function host(on: On, world: World = {}) {
     return { result: 'ok', text: 'Saved' } as never
   })
   on('env.get', async (_$, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
+  on('fs.read', async (_$, e) => (e.path.endsWith('.drafts.jsonl') && world.drafts !== undefined ? { value: world.drafts } : { deny: `ENOENT: ${e.path}` }) as never)
+  on('prompt.submit', async (_$, e) => ({ text: e.text }))
   on('process.run', async (_$, e) => {
     if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/private.py')) { // private.py write PATH [--redact-json], text on stdin
       world.writes?.push({ path: e.argv[4] as string, text: e.init?.stdin ?? '', flags: e.argv.slice(5) })
@@ -473,4 +476,91 @@ test('completion news is the claimed runs the envelope reports, by identity', as
   expect(completionNews(null, { [key]: 'claimed' }, [key])).toEqual([])
   const failed = envelopeOf({ ...CONTEXT, agents: [{ ...CONTEXT.agents[0], status: 'failed', completion: null }] })
   expect(completionNews(parseAgentEnvelope(failed), { [key]: 'claimed' }, [key])).toEqual([])
+})
+
+// ---------------------------------------------------------------- handing a thread to a background agent
+
+const REQUEST = 'req-0123456789abcdef'
+const THREAD = '0123456789ab'
+const HANDOFF = envelopeOf({ kind: 'handoff', session: SESSION, request: REQUEST, thread: THREAD, instruction: HANDOFF_INSTRUCTION })
+const DRAFT = `${JSON.stringify({ request: REQUEST, thread: THREAD, drafted_at: T0 - 5000 })}\n`
+const handoffsOf = (writes: NonNullable<World['writes']>) => {
+  const last = writes.filter(write => write.path.endsWith('/handoffs/sess-a.json')).at(-1)
+  return last ? (JSON.parse(last.text).handoffs as Array<Record<string, unknown>>) : []
+}
+
+test('a handed thread: sent by the person, bound by the Agent call that carries its envelope, settled by that run', async ($, on) => {
+  const writes: NonNullable<World['writes']> = []
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  host(on, { writes, drafts: DRAFT, spawn: async () => { await gate; return { model: 'm', agentId: 'a1' } } })
+  await $.prompt.submit({ text: `Take this one.\n${HANDOFF}`, origin: { kind: 'composer' } } as never) // the person's Enter
+  await settle(() => handoffsOf(writes).length === 1)
+  expect(handoffsOf(writes)[0]).toMatchObject({ request: REQUEST, thread: THREAD, outcome: 'submitted', submitted_at: T0, drafted_at: T0 - 5000, agent_id: null })
+  // the Agent call, with the envelope in its prompt, and the agent's first step before the call's result
+  const spawning = $.agent.spawn({ tool_use_id: 'tu-9', prompt: `Do the task.\n${HANDOFF}`, description: 'Handoff', subagentType: 'general-purpose', background: true, fork: false } as never).catch(() => undefined)
+  await settle(async () => 'tu-9' in (await stateOf($)).spawns)
+  await step($, 'a1', 'turn-1', 0)
+  release()
+  await spawning
+  await settle(() => handoffsOf(writes)[0]?.outcome === 'bound')
+  expect(handoffsOf(writes)[0]).toMatchObject({ outcome: 'bound', agent_id: 'a1', turn_id: 'turn-1', spawn_tool_use_id: 'tu-9' })
+  await finish($, 'a1', 'turn-1', 'It is done.')
+  await settle(() => handoffsOf(writes)[0]?.outcome === 'succeeded')
+  expect(handoffsOf(writes)[0]).toMatchObject({ outcome: 'succeeded', ended_at: T0, reason: null })
+  expect(JSON.stringify(writes.filter(write => write.path.includes('/handoffs/')))).not.toContain('It is done.') // ids and words: no report, no prompt
+})
+
+test('a prompt that did not enter, or an envelope the pane never drafted, is no handoff', async ($, on) => {
+  const writes: NonNullable<World['writes']> = []
+  host(on, { writes, drafts: DRAFT })
+  const other = envelopeOf({ kind: 'handoff', session: SESSION, request: 'req-ffffffffffffffff', thread: THREAD, instruction: HANDOFF_INSTRUCTION })
+  await $.prompt.submit({ text: other, origin: { kind: 'composer' } } as never)
+  const foreign = envelopeOf({ kind: 'handoff', session: 'sess-b', request: REQUEST, thread: THREAD, instruction: HANDOFF_INSTRUCTION })
+  await $.prompt.submit({ text: foreign, origin: { kind: 'composer' } } as never)
+  await $.prompt.submit({ text: 'a bare [[CSR:AGENTS:v1]] marker', origin: { kind: 'composer' } } as never)
+  await new Promise<void>(resolve => setTimeout(() => resolve(), 50))
+  expect(handoffsOf(writes)).toEqual([])
+})
+
+test('associateHandoff: exact request, first turn, the run that ends, nothing by likeness', async () => {
+  const sent = associateHandoff([], { kind: 'submitted', at: 1, session: SESSION, request: 'r1', thread: THREAD, draftedAt: 0 })
+  expect(associateHandoff(sent, { kind: 'submitted', at: 2, session: SESSION, request: 'r1', thread: THREAD, draftedAt: 0 })).toBe(sent) // sent once
+  // a nested call's envelope binds nothing; a request nobody sent binds nothing
+  expect(associateHandoff(sent, { kind: 'spawn', at: 3, requests: ['r1'], toolUseId: 'u1', nested: true })).toBe(sent)
+  expect(associateHandoff(sent, { kind: 'spawn', at: 3, requests: ['r9'], toolUseId: 'u1', nested: false })).toBe(sent)
+  const carried = associateHandoff(sent, { kind: 'spawn', at: 3, requests: ['r1'], toolUseId: 'u1', nested: false })
+  expect(carried[0]).toMatchObject({ spawn_tool_use_id: 'u1', outcome: 'submitted' })
+  expect(associateHandoff(carried, { kind: 'spawn', at: 4, requests: ['r1'], toolUseId: 'u2', nested: false })).toBe(carried) // a second call is not it
+  expect(associateHandoff(carried, { kind: 'spawned', at: 5, toolUseId: 'u2', agentId: 'a2', turn: null })).toBe(carried) // another call's result
+  const denied = associateHandoff(carried, { kind: 'spawned', at: 5, toolUseId: 'u1', turn: null })
+  expect(denied[0]).toMatchObject({ outcome: 'submitted', agent_id: null, reason: 'spawn denied' }) // not handed off
+  const bound = associateHandoff(carried, { kind: 'spawned', at: 5, toolUseId: 'u1', agentId: 'a1', turn: null })
+  expect(bound[0]).toMatchObject({ outcome: 'bound', agent_id: 'a1', turn_id: null })
+  const turn = associateHandoff(bound, { kind: 'turn', at: 6, agentId: 'a1', turnId: 't1' })
+  expect(turn[0]).toMatchObject({ turn_id: 't1' })
+  expect(associateHandoff(turn, { kind: 'turn', at: 7, agentId: 'a1', turnId: 't2' })).toBe(turn) // the first turn only
+  expect(associateHandoff(turn, { kind: 'ended', at: 8, agentId: 'a1', turnId: 't2', reason: 'error', empty: false })).toBe(turn) // another run's end
+  expect(associateHandoff(turn, { kind: 'ended', at: 8, agentId: 'a2', turnId: 't1', reason: 'error', empty: false })).toBe(turn) // another agent's
+  for (const [reason, empty, outcome, why] of [['answer', false, 'succeeded', null], ['answer', true, 'failed', 'no report'], ['error', false, 'failed', 'error'],
+    ['refusal', false, 'failed', 'refusal'], ['aborted', false, 'failed', 'aborted'], ['killed', false, 'failed', 'killed']] as const) {
+    expect(associateHandoff(turn, { kind: 'ended', at: 8, agentId: 'a1', turnId: 't1', reason, empty })[0], reason).toMatchObject({ outcome, reason: why, ended_at: 8 })
+  }
+  // two requests in one prompt: which agent is whose cannot be told
+  const two = associateHandoff(associateHandoff([], { kind: 'submitted', at: 1, session: SESSION, request: 'r1', thread: THREAD, draftedAt: 0 }), { kind: 'submitted', at: 1, session: SESSION, request: 'r2', thread: 'ba9876543210', draftedAt: 0 })
+  const both = associateHandoff(two, { kind: 'spawn', at: 2, requests: ['r1', 'r2'], toolUseId: 'u1', nested: false })
+  expect(both.map(entry => [entry.outcome, entry.reason, entry.spawn_tool_use_id])).toEqual([['submitted', 'ambiguous', null], ['submitted', 'ambiguous', null]])
+})
+
+test('the list saying a bound agent failed or was killed settles its handoff; its absence does not', async () => {
+  let state = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'handoff', at: 1, request: 'r1', thread: THREAD, draftedAt: 0 })
+  state = reduceAgentEvent(state, { kind: 'spawn', at: 2, toolUseId: 'u1', description: 'h', type: 'general-purpose', parent: null, model: null, requests: ['r1'] })
+  state = reduceAgentEvent(state, { kind: 'spawned', at: 3, toolUseId: 'u1', agentId: 'a1', model: 'm' })
+  expect(state.handoffs[0]).toMatchObject({ outcome: 'bound', agent_id: 'a1' })
+  const gone = reconcileAgentList(state, [], 10)
+  expect(gone.handoffs).toBe(state.handoffs) // gone from the list, or stalled: not an outcome
+  const idle = reconcileAgentList(state, [{ id: 'a1', type: 'general-purpose', description: 'h', status: 'idle' }], 10)
+  expect(idle.handoffs[0]).toMatchObject({ outcome: 'bound' })
+  const killed = reconcileAgentList(state, [{ id: 'a1', type: 'general-purpose', description: 'h', status: 'killed' }], 10)
+  expect(killed.handoffs[0]).toMatchObject({ outcome: 'failed', reason: 'killed', ended_at: 10 })
 })

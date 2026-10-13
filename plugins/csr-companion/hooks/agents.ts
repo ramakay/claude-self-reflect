@@ -1,5 +1,5 @@
 import type {
-  AgentCompletion, AgentRec, AgentRow, AgentsFile, AgentState, AgentStatusWord, CompletionDisposition, CompletionKey, PendingCompletion, PendingSpawn, StepKey,
+  AgentCompletion, AgentHandoff, AgentRec, AgentRow, AgentsFile, AgentState, AgentStatusWord, CompletionDisposition, CompletionKey, PendingCompletion, PendingSpawn, StepKey,
 } from '../types'
 
 // The agents of a session, as the typed events of Claude Code 2.1.296 tell them: a lifecycle reducer, a reconciler
@@ -36,7 +36,7 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 export const isEditTool = (tool: string) => EDIT_TOOLS.has(tool)
 
 export const emptyAgentState = (session: string): AgentState => ({
-  version: 1, session, rows: {}, spawns: {}, bound: {}, main: {}, mainOmitted: 0, seen: [], pending: {}, listedAt: null, fileAt: null, fileDue: null,
+  version: 1, session, rows: {}, spawns: {}, bound: {}, main: {}, mainOmitted: 0, seen: [], pending: {}, listedAt: null, fileAt: null, fileDue: null, handoffs: [],
 })
 
 // ---------------------------------------------------------------- text that is kept
@@ -133,7 +133,8 @@ export function normalizePath(path: string, cwd: string): string {
 
 export type AgentEvent =
   // The Agent call, before `next(e)` answers: what it asked for.
-  | { kind: 'spawn'; at: number; toolUseId: string; description: string; type: string | null; parent: string | null; model: string | null }
+  // `requests`: the handoff requests (envelopes) the Agent call's prompt carries.
+  | { kind: 'spawn'; at: number; toolUseId: string; description: string; type: string | null; parent: string | null; model: string | null; requests?: readonly string[] }
   // What `next(e)` answered: the resolved model and the agent started. No agentId: it started none (denied).
   | { kind: 'spawned'; at: number; toolUseId: string; agentId?: string; model?: string }
   // A tool began in an agent's loop: it is alive, whatever it comes to.
@@ -142,6 +143,8 @@ export type AgentEvent =
   | { kind: 'tool'; at: number; agentId?: string; toolUseId: string; tool: string; ok: boolean; path?: string | null }
   | { kind: 'step'; at: number; agentId: string; turnId: string; index: number; answer: string; tokens: number }
   | { kind: 'complete'; at: number; agentId: string; turnId: string; reason: AgentCompletion['reason']; answer: string }
+  // A prompt the person's Enter sent carried the handoff envelope of a request the pane drafted.
+  | { kind: 'handoff'; at: number; request: string; thread: string; draftedAt: number }
 
 const ACTIVE = new Set<AgentStatusWord>(['pending', 'running', 'waiting'])
 const TERMINAL_STATUS = new Set<AgentStatusWord>(['completed', 'failed', 'killed'])
@@ -154,7 +157,7 @@ export const isStalled = (row: Pick<AgentRec, 'status' | 'last_at'>, now: number
 
 const provisional = (id: string, at: number, status: AgentStatusWord = 'running'): AgentRec => ({
   id, parent: null, description: '', type: null, model: null, status, started: null, first_seen: at, last_at: at, tools: 0, tokens: 0,
-  last: '', last_tool: null, current_turn: null, completion: null, listed: false, paths: {}, seenTools: [], seenSteps: [],
+  last: '', last_tool: null, current_turn: null, completion: null, listed: false, paths: {}, seenTools: [], seenSteps: [], first_turn: null,
 })
 
 const push = <T>(list: readonly T[], item: T, most: number): T[] => [...list, item].slice(-most)
@@ -180,11 +183,16 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
         at: event.at, description: oneLine(event.description, DESC_MAX), type: event.type, parent: event.parent, model: event.model,
       }
       const kept = Object.entries({ ...state.spawns, [event.toolUseId]: spawn }).slice(-SPAWNS_KEPT)
-      return { ...state, spawns: Object.fromEntries(kept) }
+      const handoffs = event.requests?.length
+        ? associateHandoff(state.handoffs, { kind: 'spawn', at: event.at, requests: event.requests, toolUseId: event.toolUseId, nested: event.parent !== null })
+        : state.handoffs
+      return { ...state, spawns: Object.fromEntries(kept), handoffs }
     }
     case 'spawned': {
       const { [event.toolUseId]: asked, ...spawns } = state.spawns
-      if (!event.agentId) return { ...state, spawns } // denied or none started: nothing is made up
+      if (!event.agentId) { // denied or none started: nothing is made up
+        return { ...state, spawns, handoffs: associateHandoff(state.handoffs, { kind: 'spawned', at: event.at, toolUseId: event.toolUseId, turn: null }) }
+      }
       const row = state.rows[event.agentId] ?? provisional(event.agentId, asked?.at ?? event.at)
       const merged: AgentRec = {
         ...row,
@@ -196,7 +204,16 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
         first_seen: Math.min(row.first_seen, asked?.at ?? row.first_seen),
         status: row.status === 'unknown' || row.status === 'pending' ? 'running' : row.status,
       }
-      return withRow({ ...state, spawns, bound: { ...state.bound, [event.toolUseId]: event.agentId } }, merged)
+      // A handoff this Agent call carried is bound to the agent it started and its first turn (events that came before this
+      // result included); a report that already came is its outcome.
+      let handoffs = associateHandoff(state.handoffs, { kind: 'spawned', at: event.at, toolUseId: event.toolUseId, agentId: event.agentId, turn: merged.first_turn })
+      if (merged.completion && merged.completion.turnId === merged.first_turn) {
+        handoffs = associateHandoff(handoffs, {
+          kind: 'ended', at: merged.completion.at, agentId: merged.id, turnId: merged.completion.turnId, reason: merged.completion.reason,
+          empty: merged.completion.disposition === 'skipped' && merged.completion.reason === 'answer',
+        })
+      }
+      return withRow({ ...state, spawns, handoffs, bound: { ...state.bound, [event.toolUseId]: event.agentId } }, merged)
     }
     case 'touch': {
       const row = state.rows[event.agentId] ?? provisional(event.agentId, event.at)
@@ -234,9 +251,11 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       if (row.seenSteps.includes(key)) return state
       const newRun = row.current_turn !== null && row.current_turn !== event.turnId
       const text = oneLine(event.answer, LAST_MAX)
-      return withRow(state, {
+      const first = row.first_turn ?? event.turnId
+      const handoffs = row.first_turn === null ? associateHandoff(state.handoffs, { kind: 'turn', at: event.at, agentId: event.agentId, turnId: event.turnId }) : state.handoffs
+      return withRow(handoffs === state.handoffs ? state : { ...state, handoffs }, {
         ...row, tokens: row.tokens + Math.max(0, event.tokens), last: text || row.last, last_at: Math.max(row.last_at, event.at),
-        current_turn: event.turnId, seenSteps: push(row.seenSteps, key, SEEN_STEPS),
+        current_turn: event.turnId, first_turn: first, seenSteps: push(row.seenSteps, key, SEEN_STEPS),
         // A step is running work: an agent that was idle, waiting or ended before this turn runs again, with no report yet.
         status: row.status === 'running' ? 'running' : isTerminal(row.status) && !newRun && row.current_turn === event.turnId ? row.status : 'running',
         completion: newRun ? null : row.completion,
@@ -255,10 +274,18 @@ export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentSta
       const pending: Record<CompletionKey, PendingCompletion> = eligible
         ? { ...state.pending, [key]: { agent: event.agentId, turnId: event.turnId, at: event.at, answer } }
         : state.pending
+      // The run's end settles a handoff bound to this agent and turn: a report is success; an error, a refusal, an interrupt or
+      // no words are not.
+      const handoffs = associateHandoff(state.handoffs, {
+        kind: 'ended', at: event.at, agentId: event.agentId, turnId: event.turnId, reason: event.reason, empty: !eligible && event.reason === 'answer',
+      })
       return withRow(
-        { ...state, pending, seen: push(state.seen, key, SEEN_COMPLETIONS) },
-        { ...row, status, completion, current_turn: event.turnId, last_at: Math.max(row.last_at, event.at) },
+        { ...state, pending, handoffs, seen: push(state.seen, key, SEEN_COMPLETIONS) },
+        { ...row, status, completion, current_turn: event.turnId, first_turn: row.first_turn ?? event.turnId, last_at: Math.max(row.last_at, event.at) },
       )
+    }
+    case 'handoff': {
+      return { ...state, handoffs: associateHandoff(state.handoffs, { kind: 'submitted', at: event.at, session: state.session, request: event.request, thread: event.thread, draftedAt: event.draftedAt }) }
     }
   }
 }
@@ -292,7 +319,14 @@ export function reconcileAgentList(state: AgentState, list: readonly Listed[], a
       completion: !keep && isActive(listed) && row.completion && isTerminal(row.status) ? null : row.completion,
     }
   }
-  return trimRows({ ...state, rows, listedAt: at })
+  // An agent the list says failed or was killed, bound to a handoff that has no outcome yet: that is its outcome. A row that is
+  // merely gone from the list, or quiet, is not.
+  let handoffs = state.handoffs
+  for (const entry of list) {
+    const word = statusOf(entry.status)
+    if (word === 'failed' || word === 'killed') handoffs = associateHandoff(handoffs, { kind: 'ended', at, agentId: entry.id, turnId: null, reason: word, empty: false })
+  }
+  return trimRows({ ...state, rows, listedAt: at, handoffs })
 }
 
 // Whether any agent is one the list should be asked about again.
@@ -381,7 +415,7 @@ function rowOf(rec: AgentRec, main: Record<string, string>): AgentRow {
   const rest = named(prints.filter(print => !(print in main)))
   const edits = [...overlaps, ...rest].slice(0, EDITS_SHOWN)
   const shownOverlaps = overlaps.slice(0, EDITS_SHOWN)
-  const { paths: _paths, seenTools: _tools, seenSteps: _steps, ...row } = rec
+  const { paths: _paths, seenTools: _tools, seenSteps: _steps, first_turn: _first, ...row } = rec
   return {
     ...row,
     id: rec.id,
@@ -613,4 +647,83 @@ export function completionNews(envelope: Envelope | null, ledger: Ledger, wanted
     row.completion && row.completion.reason === 'answer' && row.completion.answer.trim() !== ''
       ? [completionKey(session, row.id, row.completion.turn_id)] : [])
     .filter(key => wanted.includes(key) && ledger[key] === 'claimed')
+}
+
+// ---------------------------------------------------------------- handing a Lost and found thread to a background agent
+
+// The pane drafts a request (bin/pane.py, a click on "→ subagent"): an id, and the thread, in an envelope appended to the
+// unsent prompt. What follows is only ever this, by identity and never by likeness of words or "the next agent spawned":
+//  1. the person sends a prompt carrying the envelope -> submitted
+//  2. Claude's own Agent call carries the envelope in its prompt -> the call is that request's
+//  3. the call started an agent -> bound to its id and first turn; denied, or the envelope in two requests' company -> not linked
+//  4. that turn ends -> succeeded with a report, else failed (an error, a refusal, an interrupt, no words, killed)
+// A nested call (an agent's own, parentAgentId) carrying the same envelope binds nothing. A retry is a new request: an
+// earlier failure never reaches it.
+export type HandoffEvent =
+  | { kind: 'submitted'; at: number; session: string; request: string; thread: string; draftedAt: number }
+  | { kind: 'spawn'; at: number; requests: readonly string[]; toolUseId: string; nested: boolean }
+  | { kind: 'spawned'; at: number; toolUseId: string; agentId?: string; turn: string | null }
+  | { kind: 'turn'; at: number; agentId: string; turnId: string }
+  | { kind: 'ended'; at: number; agentId: string; turnId: string | null; reason: string; empty: boolean }
+
+export const HANDOFFS_KEPT = 40
+const replaceAt = <T>(list: readonly T[], index: number, item: T): T[] => list.map((entry, at) => (at === index ? item : entry))
+
+// The handoffs with one event applied; the very array when the event changes nothing.
+export function associateHandoff(handoffs: AgentHandoff[], event: HandoffEvent): AgentHandoff[] {
+  switch (event.kind) {
+    case 'submitted': {
+      const at = handoffs.findIndex(entry => entry.request === event.request)
+      if (at >= 0) {
+        const have = handoffs[at] as AgentHandoff
+        if (have.submitted_at !== null) return handoffs
+        return replaceAt(handoffs, at, { ...have, submitted_at: event.at, outcome: have.outcome === 'draft' ? 'submitted' : have.outcome })
+      }
+      const made: AgentHandoff = {
+        request: event.request, session: event.session, thread: event.thread, drafted_at: event.draftedAt, submitted_at: event.at,
+        spawn_tool_use_id: null, agent_id: null, turn_id: null, outcome: 'submitted', ended_at: null, reason: null,
+      }
+      return [...handoffs, made].slice(-HANDOFFS_KEPT)
+    }
+    case 'spawn': {
+      if (event.nested) return handoffs
+      const wanted = [...new Set(event.requests)].filter(request => handoffs.some(entry => entry.request === request && entry.outcome === 'submitted' && entry.spawn_tool_use_id === null))
+      if (!wanted.length) return handoffs
+      // Two requests in one prompt: which agent is whose cannot be told. Neither is linked.
+      if (wanted.length > 1) {
+        return handoffs.map(entry => (wanted.includes(entry.request) && entry.outcome === 'submitted' ? { ...entry, reason: 'ambiguous' } : entry))
+      }
+      const at = handoffs.findIndex(entry => entry.request === wanted[0])
+      return replaceAt(handoffs, at, { ...(handoffs[at] as AgentHandoff), spawn_tool_use_id: event.toolUseId, reason: null })
+    }
+    case 'spawned': {
+      const at = handoffs.findIndex(entry => entry.spawn_tool_use_id === event.toolUseId && entry.outcome === 'submitted')
+      if (at < 0) return handoffs
+      const have = handoffs[at] as AgentHandoff
+      if (!event.agentId) return replaceAt(handoffs, at, { ...have, reason: 'spawn denied' })
+      return replaceAt(handoffs, at, { ...have, outcome: 'bound', agent_id: event.agentId, turn_id: event.turn, reason: null })
+    }
+    case 'turn': {
+      const at = handoffs.findIndex(entry => entry.outcome === 'bound' && entry.agent_id === event.agentId && entry.turn_id === null)
+      return at < 0 ? handoffs : replaceAt(handoffs, at, { ...(handoffs[at] as AgentHandoff), turn_id: event.turnId })
+    }
+    case 'ended': {
+      // Only the run the handoff was bound to: a later run of the same agent is not its outcome, nor an earlier one.
+      const at = handoffs.findIndex(entry => entry.outcome === 'bound' && entry.agent_id === event.agentId && (entry.turn_id === null || event.turnId === null || entry.turn_id === event.turnId))
+      if (at < 0) return handoffs
+      const have = handoffs[at] as AgentHandoff
+      const ok = event.reason === 'answer' && !event.empty
+      return replaceAt(handoffs, at, {
+        ...have, turn_id: have.turn_id ?? event.turnId, ended_at: event.at, outcome: ok ? 'succeeded' : 'failed',
+        reason: ok ? null : event.reason === 'answer' ? 'no report' : event.reason,
+      })
+    }
+  }
+}
+
+// The requests (handoff envelopes) a text carries for this session, in order.
+export function handoffRequests(source: string, session: string): Array<{ request: string; thread: string }> {
+  return parseAgentEnvelopes(source).flatMap(envelope =>
+    envelope.payload.kind === 'handoff' && envelope.payload.session === session
+      ? [{ request: envelope.payload.request, thread: envelope.payload.thread }] : [])
 }

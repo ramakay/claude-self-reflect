@@ -371,3 +371,88 @@ def context_envelope(projection, session):
         except ValueError:
             continue
     return ''
+
+
+# ---------------------------------------------------------------- handing a Lost and found thread to a background agent
+#
+# Two files per session, each with one writer, so neither can overwrite the other:
+#   handoffs/<session>.drafts.jsonl   the pane's: one line for each click on "-> subagent" (request, thread, drafted_at)
+#   handoffs/<session>.json           the hooks': what became of each request that was sent, hooks/agents.ts associateHandoff
+# A request is only ever tied to an agent by the id in its envelope (see the grammar above), never by likeness of words or
+# "the next agent spawned". Ids and words only: no prompt, no report.
+HANDOFF_OUTCOMES = ('draft', 'submitted', 'bound', 'succeeded', 'failed')
+HANDOFFS_MAX = 40
+THREAD = re.compile(r'[0-9a-f]{12}')
+HANDOFF_KEYS_ALL = ('request', 'session', 'thread', 'drafted_at', 'submitted_at', 'spawn_tool_use_id', 'agent_id', 'turn_id',
+                    'outcome', 'ended_at', 'reason')
+
+
+def handoff_of(raw, session):
+    """One handoff of the state file, checked; None when malformed or another session's."""
+    if not isinstance(raw, dict) or set(raw) != set(HANDOFF_KEYS_ALL) or raw['session'] != session:
+        return None
+    ids = ('spawn_tool_use_id', 'agent_id', 'turn_id')
+    if not (isinstance(raw['request'], str) and REQUEST.fullmatch(raw['request']) and isinstance(raw['thread'], str)
+            and THREAD.fullmatch(raw['thread']) and number(raw['drafted_at']) and raw['outcome'] in HANDOFF_OUTCOMES):
+        return None
+    if not all(raw[k] is None or number(raw[k]) for k in ('submitted_at', 'ended_at')):
+        return None
+    if not all(raw[k] is None or (isinstance(raw[k], str) and len(raw[k]) <= 200 and not CONTROL.search(raw[k])) for k in ids + ('reason',)):
+        return None
+    return dict(raw)
+
+
+def read_handoffs(state_path, drafts_path, session):
+    """Every handoff of a session, oldest first, as the hooks last wrote them with the pane's drafts that were never sent
+    added as 'draft'. A file that is not this session's, malformed or too big reads as having none."""
+    if not (isinstance(session, str) and SESSION.fullmatch(session)):
+        return []
+    out = []
+    try:
+        if state_path and stat.S_ISREG(os.lstat(state_path).st_mode) and os.lstat(state_path).st_size <= 4 * MAX_BYTES:
+            with open(state_path, 'rb') as handle:
+                raw = json.loads(handle.read().decode('utf-8'))
+            if isinstance(raw, dict) and set(raw) == {'version', 'session', 'handoffs'} and raw['version'] == VERSION \
+                    and raw['session'] == session and isinstance(raw['handoffs'], list) and len(raw['handoffs']) <= HANDOFFS_MAX:
+                rows = [handoff_of(item, session) for item in raw['handoffs']]
+                out = [row for row in rows if row]
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        out = []
+    known = {row['request'] for row in out}
+    try:
+        if drafts_path and stat.S_ISREG(os.lstat(drafts_path).st_mode):
+            with open(drafts_path, 'rb') as handle:
+                lines = handle.read(4 * MAX_BYTES).decode('utf-8', 'replace').splitlines()
+            for line in lines[-HANDOFFS_MAX * 4:]:
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(item, dict) and isinstance(item.get('request'), str) and REQUEST.fullmatch(item['request'])
+                        and isinstance(item.get('thread'), str) and THREAD.fullmatch(item['thread']) and number(item.get('drafted_at'))
+                        and item['request'] not in known):
+                    known.add(item['request'])
+                    out.append(dict(request=item['request'], session=session, thread=item['thread'], drafted_at=item['drafted_at'],
+                                    submitted_at=None, spawn_tool_use_id=None, agent_id=None, turn_id=None, outcome='draft',
+                                    ended_at=None, reason=None))
+    except (OSError, UnicodeDecodeError):
+        pass
+    return sorted(out, key=lambda row: row['drafted_at'])[-HANDOFFS_MAX:]
+
+
+def handoff_envelope(session, request, thread):
+    """The envelope a click on "-> subagent" appends to the unsent prompt."""
+    return format_agents_context(dict(kind='handoff', session=session, request=request, thread=thread, instruction=HANDOFF_INSTRUCTION))
+
+
+def decide(handoffs):
+    """What the handoffs of one thread say of it: None (none was sent), or (word, record) for the newest handoff that was
+    sent. A draft nobody sent says nothing; a retry is a newer request, and the newest decides, so an earlier failure
+    never reopens a thread whose later handoff went well. word is 'unlinked' (sent, but tied to no agent), 'handed'
+    (an agent has it, or it reported) or 'failed'."""
+    sent = [row for row in handoffs if row['outcome'] != 'draft']
+    if not sent:
+        return None
+    last = max(sent, key=lambda row: (row['submitted_at'] or row['drafted_at'], row['drafted_at']))
+    word = {'submitted': 'unlinked', 'bound': 'handed', 'succeeded': 'handed', 'failed': 'failed'}[last['outcome']]
+    return word, last
