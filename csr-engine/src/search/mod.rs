@@ -81,15 +81,20 @@ pub struct SearchEngine {
     /// budget waits for enough of them before rewriting ~1.5 GB.
     settled_chunk_changes: u64,
     settled_reflection_changes: u64,
-    /// Highest `embedding_changes.seq` whose effect this engine is known to
-    /// hold: loaded from the manifest, captured before a rebuild streams
-    /// from SQLite, advanced by the daemon's index sync as it applies
-    /// changes. The sync resumes after it instead of replaying the whole
-    /// retained change log onto every loaded or swapped-in generation —
-    /// that replay turned each updated id into a fresh tombstone on every
-    /// daemon start and compaction swap (42k of them live), which kept the
-    /// tombstone share over the compaction threshold forever.
-    change_cursor: i64,
+    /// Highest `embedding_changes.seq` whose effect this engine's chunk
+    /// index is known to hold: loaded from the manifest, captured before a
+    /// rebuild streams from SQLite, advanced by the daemon's index sync as
+    /// it applies changes. The sync resumes after the lower of the two
+    /// sides' cursors and skips a change its side already holds, instead of
+    /// replaying the whole retained change log onto every loaded or
+    /// swapped-in generation — that replay turned each updated id into a
+    /// fresh tombstone on every daemon start and compaction swap (42k of
+    /// them live), which kept the tombstone share over the compaction
+    /// threshold forever. Per side, because a dump that rewrites one side
+    /// carries the other forward at its older cursor.
+    chunk_cursor: i64,
+    /// Reflection-index counterpart of `chunk_cursor`.
+    reflection_cursor: i64,
     /// Whether this engine's in-memory maps are currently known to
     /// correspond to the manifest that is (or, the instant this becomes
     /// true, was just made to be) on disk — i.e. an UNDIRTIED side's
@@ -334,12 +339,14 @@ struct IndexManifest {
     /// memory, silently reverting the compaction).
     #[serde(default)]
     epoch: u64,
-    /// The writer's `SearchEngine::change_cursor` (lowered to the previous
-    /// manifest's when a side was carried forward from it). Absent in
-    /// manifests written before it existed, which reads as 0: replay the
-    /// whole change log, exactly as before.
+    /// The change cursor each side's generation holds: the writer's cursor
+    /// for a side it wrote, the previous manifest's for a side it carried
+    /// forward. Absent in manifests written before they existed, which
+    /// reads as 0: replay the whole change log, exactly as before.
     #[serde(default)]
-    change_cursor: i64,
+    chunk_change_cursor: i64,
+    #[serde(default)]
+    reflection_change_cursor: i64,
 }
 
 fn default_chunk_basename() -> String {
@@ -379,7 +386,8 @@ impl SearchEngine {
             reflection_changes: 0,
             settled_chunk_changes: 0,
             settled_reflection_changes: 0,
-            change_cursor: 0,
+            chunk_cursor: 0,
+            reflection_cursor: 0,
             manifest_backed: false,
             epoch: 0,
             published_basenames: None,
@@ -452,14 +460,33 @@ impl SearchEngine {
         }
     }
 
-    /// See the `change_cursor` field.
+    /// Where the index sync resumes: the lower of the two sides' cursors
+    /// (see the `chunk_cursor` field).
     pub fn change_cursor(&self) -> i64 {
-        self.change_cursor
+        self.chunk_cursor.min(self.reflection_cursor)
     }
 
-    /// Record that every `embedding_changes` row up to `seq` is reflected.
+    /// The cursor of one side.
+    pub fn side_cursor(&self, reflection: bool) -> i64 {
+        if reflection {
+            self.reflection_cursor
+        } else {
+            self.chunk_cursor
+        }
+    }
+
+    /// Record that both sides reflect every `embedding_changes` row up to
+    /// `seq` (a rebuild that read SQLite after it).
     pub fn set_change_cursor(&mut self, seq: i64) {
-        self.change_cursor = seq;
+        self.chunk_cursor = seq;
+        self.reflection_cursor = seq;
+    }
+
+    /// The index sync processed every change up to `seq` in order, applying
+    /// or skipping each: both sides now reflect everything up to it.
+    pub fn advance_change_cursor(&mut self, seq: i64) {
+        self.chunk_cursor = self.chunk_cursor.max(seq);
+        self.reflection_cursor = self.reflection_cursor.max(seq);
     }
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
@@ -1193,13 +1220,20 @@ impl SearchEngine {
                 )
             };
 
-        // A side carried forward from the previous manifest reflects that
-        // manifest's cursor, not necessarily this engine's.
-        let carried_forward =
-            self.manifest_backed && (!chunk_actually_dumped || !reflection_actually_dumped);
-        let change_cursor = match (&existing_manifest, carried_forward) {
-            (Some(prev), true) => self.change_cursor.min(prev.change_cursor),
-            _ => self.change_cursor,
+        // Each side's cursor comes from the same source as its id map: this
+        // engine for a side it wrote, the previous manifest for one it
+        // carried forward.
+        let chunk_change_cursor = match &existing_manifest {
+            Some(prev) if !(chunk_actually_dumped || !self.manifest_backed) => {
+                prev.chunk_change_cursor
+            }
+            _ => self.chunk_cursor,
+        };
+        let reflection_change_cursor = match &existing_manifest {
+            Some(prev) if !(reflection_actually_dumped || !self.manifest_backed) => {
+                prev.reflection_change_cursor
+            }
+            _ => self.reflection_cursor,
         };
 
         // Write manifest atomically (tmp + rename)
@@ -1214,7 +1248,8 @@ impl SearchEngine {
             chunk_basename,
             reflection_basename,
             epoch: new_epoch,
-            change_cursor,
+            chunk_change_cursor,
+            reflection_change_cursor,
         };
 
         write_manifest_atomically(dir, &manifest)?;
@@ -1490,7 +1525,8 @@ impl SearchEngine {
             reflection_changes: 0,
             settled_chunk_changes: 0,
             settled_reflection_changes: 0,
-            change_cursor: manifest.change_cursor,
+            chunk_cursor: manifest.chunk_change_cursor,
+            reflection_cursor: manifest.reflection_change_cursor,
             manifest_backed: true,
             epoch: manifest.epoch,
             published_basenames: Some((manifest.chunk_basename, manifest.reflection_basename)),
@@ -1907,7 +1943,7 @@ mod tests {
     }
 
     #[test]
-    fn change_cursor_round_trips_and_a_carried_side_lowers_it() {
+    fn each_side_keeps_the_cursor_of_the_generation_it_names() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path();
         let mut engine = SearchEngine::new(16);
@@ -1917,33 +1953,37 @@ mod tests {
         engine.dump_to_disk(dir, 1, 1).unwrap();
 
         let mut loaded = SearchEngine::load_from_disk(dir, 1, 1).unwrap();
-        assert_eq!(loaded.change_cursor(), 7);
-        // Only the reflection side is rewritten; the chunk side is carried
-        // forward from the cursor-7 manifest, so the new one may not claim 9.
-        loaded.insert_reflection("r2".into(), unit(2));
-        loaded.set_change_cursor(9);
-        loaded.dump_to_disk(dir, 1, 2).unwrap();
         assert_eq!(
-            SearchEngine::load_from_disk(dir, 1, 2)
-                .unwrap()
-                .change_cursor(),
-            7
+            (loaded.side_cursor(false), loaded.side_cursor(true)),
+            (7, 7)
         );
-        // Both sides rewritten from memory: the engine's own cursor stands.
+        // Only the reflection side is rewritten; the chunk side is carried
+        // forward from the cursor-7 manifest and keeps 7.
+        loaded.insert_reflection("r2".into(), unit(2));
+        loaded.advance_change_cursor(9);
+        loaded.dump_to_disk(dir, 1, 2).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 1, 2).unwrap();
+        assert_eq!(
+            (reloaded.side_cursor(false), reloaded.side_cursor(true)),
+            (7, 9)
+        );
+        assert_eq!(reloaded.change_cursor(), 7, "the sync resumes at the lower");
+        // Both sides rewritten from memory: both at the engine's cursor.
         loaded.insert_chunk("c2".into(), unit(3));
         loaded.insert_reflection("r3".into(), unit(0));
         loaded.dump_to_disk(dir, 2, 3).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 2, 3).unwrap();
         assert_eq!(
-            SearchEngine::load_from_disk(dir, 2, 3)
-                .unwrap()
-                .change_cursor(),
-            9
+            (reloaded.side_cursor(false), reloaded.side_cursor(true)),
+            (9, 9)
         );
 
-        // A manifest written before the field existed reads as 0.
+        // A manifest written before the fields existed reads as 0.
         let raw = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
         let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        json.as_object_mut().unwrap().remove("change_cursor");
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("chunk_change_cursor");
+        fields.remove("reflection_change_cursor");
         std::fs::write(dir.join("manifest.json"), json.to_string()).unwrap();
         assert_eq!(
             SearchEngine::load_from_disk(dir, 2, 3)
@@ -2619,7 +2659,8 @@ mod tests {
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
             epoch: 0,
-            change_cursor: 0,
+            chunk_change_cursor: 0,
+            reflection_change_cursor: 0,
         };
         std::fs::write(
             dir.join("manifest.json"),
@@ -2830,7 +2871,8 @@ mod tests {
             chunk_basename: default_chunk_basename(),
             reflection_basename: default_reflection_basename(),
             epoch: 0,
-            change_cursor: 0,
+            chunk_change_cursor: 0,
+            reflection_change_cursor: 0,
         };
 
         write_manifest_atomically(dir, &manifest).unwrap();

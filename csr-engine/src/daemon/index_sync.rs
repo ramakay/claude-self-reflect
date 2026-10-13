@@ -166,14 +166,18 @@ fn apply_batch(
         if index.generation() != generation {
             break;
         }
-        if change.reflection {
+        // A change this side's generation already holds (it was dumped
+        // after it) is not re-applied: that would mint a tombstone and an
+        // unpublished mutation for content already on disk.
+        let held = change.seq <= index.side_cursor(change.reflection);
+        if !held && change.reflection {
             if change.invalidate || change.vector.is_none() {
                 index.remove_reflection(&change.id);
             }
             if let Some(vector) = change.vector {
                 index.insert_reflection(change.id, vector);
             }
-        } else {
+        } else if !held {
             if change.invalidate || change.vector.is_none() {
                 index.remove_chunk(&change.id);
             }
@@ -181,9 +185,7 @@ fn apply_batch(
                 index.insert_chunk(change.id, vector);
             }
         }
-        if change.seq > index.change_cursor() {
-            index.set_change_cursor(change.seq);
-        }
+        index.advance_change_cursor(change.seq);
         drop(index);
         cursor = change.seq;
         count += 1;
@@ -555,6 +557,65 @@ mod tests {
             "old vector not restored"
         );
         assert_eq!(index.change_cursor(), rebuilt_at);
+    }
+
+    /// Review finding #8: a dump that rewrites only the chunk side carries
+    /// the reflection side forward at its older cursor. Remapping that
+    /// generation must not replay the chunk updates it already holds.
+    #[test]
+    fn published_updates_stay_settled_across_dump_remap_and_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("index");
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        for i in 0..300 {
+            storage
+                .insert_chunk(&chunk(&format!("c{i}")), &axis(i))
+                .unwrap();
+        }
+        storage
+            .insert_reflection("r", "x", &[], &axis(999))
+            .unwrap();
+        let (engine, _, _) = crate::engine::rebuild_search_index_streaming(&storage, 128).unwrap();
+        let search = RwLock::new(engine);
+        let shutdown = AtomicBool::new(false);
+        assert!(matches!(
+            crate::import::watcher::flush_index_blocking(&storage, &search, &index_dir, true),
+            Some(Ok(()))
+        ));
+        for round in 0..3 {
+            // Update 40 existing chunks; the sync applies them.
+            for i in 0..40 {
+                storage
+                    .insert_chunk(&chunk(&format!("c{i}")), &axis(2_000 + round * 100 + i))
+                    .unwrap();
+            }
+            // As the loop does after a swap: resume at the engine's cursor.
+            let (_, _, applied) = sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+            assert_eq!(applied, 40, "round {round}");
+            assert!(matches!(
+                crate::import::watcher::flush_index_blocking(&storage, &search, &index_dir, true),
+                Some(Ok(()))
+            ));
+            assert!(
+                crate::engine::remap_published_generation(&storage, &search, &index_dir).unwrap(),
+                "round {round}"
+            );
+            let tombstones = search.blocking_read().chunk_tombstone_count();
+            // Reads the 40 again (the reflection side's cursor is older) and
+            // applies none of them: the chunk side already holds them.
+            sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+            let index = search.blocking_read();
+            assert_eq!(index.chunk_tombstone_count(), tombstones, "round {round}");
+            assert_eq!(
+                index.unpublished_changes(),
+                0,
+                "round {round}: no new dump owed"
+            );
+            assert_eq!(
+                index.search_chunks(&axis(2_000 + round * 100 + 7), 1, 0.99)[0].id,
+                "c7"
+            );
+        }
     }
 
     #[test]
