@@ -28,3 +28,29 @@ jobs:
         run: node --test installer/tests/*.test.js
       - name: Verify npm package
         run: npm pack --dry-run
+
+  plugin:
+    runs-on: ubuntu-latest
+    env:
+      # The plugin's tests write under $HOME/.claude-self-reflect; keep that off the runner's real home.
+      HOME: ${{ runner.temp }}/plugin-home
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare home
+        run: mkdir -p "$HOME"
+      - name: Plugin Python tests
+        # -s: test_guard drives the pane loop on the real stdin, which pytest's capture replaces.
+        run: |
+          python3 -m pip install --user pytest pillow
+          cd plugins/csr-companion && python3 -m pytest tests -q -s < /dev/null
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Plugin TypeScript tests
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude plugin test "$GITHUB_WORKSPACE/plugins/csr-companion"
+      - name: Validate plugin and marketplace manifests
+        run: |
+          claude plugin validate "$GITHUB_WORKSPACE/plugins/csr-companion"
+          claude plugin validate "$GITHUB_WORKSPACE/.claude-plugin/marketplace.json"
