@@ -1,0 +1,26 @@
+{
+  "name": "csr-companion",
+  "version": "0.5.0",
+  "description": "Claude Self-Reflect beside Claude: a pane that shows what your memory handed Claude this session, a side agent that asks \"what if...?\" when your past sessions give it a reason, and a heads up when Claude opens code that changed since you last worked on it",
+  "author": { "name": "Rama Annaswamy" },
+  "homepage": "https://github.com/ramakay/claude-self-reflect",
+  "repository": "https://github.com/ramakay/claude-self-reflect",
+  "license": "MIT",
+  "keywords": ["memory", "side-pane", "dreams", "what-if", "claude-self-reflect"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "dreams": {
+      "type": "boolean",
+      "title": "Dreams",
+      "description": "While Claude works, CSR's dreamer asks one \"what if...?\" when its memory gives a reason. It looks only when CSR has something new, slows down when it finds nothing, and never spends more than 1 token for every 10 Claude spends.",
+      "default": false
+    },
+    "autoCompact": {
+      "type": "string",
+      "title": "Compact at the right moment",
+      "description": "Compacting on its own is opt-in: choose auto for it. suggest (the default): at a quiet turn end once this session reaches 181k-269k, CSR offers to compact, and only your press compacts. auto: CSR compacts on its own, at a turn end with nothing running in the background and no question waiting, or at the next turn end past 269k; at the terminal it counts down 20 s first (1 compacts now, 0 or typing cancels), and from the phone or after 10 minutes away it compacts at once and leaves you a one-line note. off: never.",
+      "options": ["off", "suggest", "auto"],
+      "default": "suggest"
+    }
+  }
+}
