@@ -84,9 +84,29 @@ fn sync_batch(
     storage: &Storage,
     search: &RwLock<SearchEngine>,
     shutdown: &AtomicBool,
-    mut cursor: i64,
+    cursor: i64,
     generation: Option<u64>,
 ) -> Result<(i64, u64, usize)> {
+    let batch = read_batch(storage, search, cursor, generation)?;
+    Ok(apply_batch(search, shutdown, batch))
+}
+
+/// Changes read for one engine generation, not yet applied.
+struct Batch {
+    generation: u64,
+    cursor: i64,
+    changes: Vec<embedding_changes::Change>,
+}
+
+/// Read the changes after the cursor that belongs to the engine now
+/// installed. SQLite/vector decoding completes BEFORE taking the index
+/// lock: no DB IO or embedding inference takes place under it.
+fn read_batch(
+    storage: &Storage,
+    search: &RwLock<SearchEngine>,
+    mut cursor: i64,
+    generation: Option<u64>,
+) -> Result<Batch> {
     let (observed_generation, engine_cursor) = {
         let index = search.blocking_read();
         (index.generation(), index.change_cursor())
@@ -100,10 +120,33 @@ fn sync_batch(
         // daemon start and swap.
         cursor = engine_cursor;
     }
-    // SQLite/vector decoding completes BEFORE taking the index lock. No DB
-    // IO or embedding inference takes place under that lock.
     let changes =
         storage.with_connection(|conn| embedding_changes::read(conn, cursor, BATCH_SIZE))?;
+    Ok(Batch {
+        generation: observed_generation,
+        cursor,
+        changes,
+    })
+}
+
+/// Apply a batch to the engine it was read for. Every change re-checks,
+/// under the write lock it is applied with, that this engine is still the
+/// one installed: an engine swapped in meanwhile has its own cursor, and a
+/// batch read for another one would skip that engine's missing changes
+/// (one installed at an older cursor) or roll it back to vectors read
+/// before its rebuild (one installed at a newer cursor). An obsolete batch
+/// is abandoned without applying or advancing anything; the next read
+/// starts from the installed engine's cursor.
+fn apply_batch(
+    search: &RwLock<SearchEngine>,
+    shutdown: &AtomicBool,
+    batch: Batch,
+) -> (i64, u64, usize) {
+    let Batch {
+        generation,
+        mut cursor,
+        changes,
+    } = batch;
     let mut count = 0;
     for change in changes {
         if shutdown.load(Ordering::SeqCst) {
@@ -120,6 +163,9 @@ fn sync_batch(
             Err(_) if crate::search::publish_in_progress() => break,
             Err(_) => search.blocking_write(),
         };
+        if index.generation() != generation {
+            break;
+        }
         if change.reflection {
             if change.invalidate || change.vector.is_none() {
                 index.remove_reflection(&change.id);
@@ -142,7 +188,7 @@ fn sync_batch(
         cursor = change.seq;
         count += 1;
     }
-    Ok((cursor, observed_generation, count))
+    (cursor, generation, count)
 }
 
 #[cfg(test)]
@@ -442,6 +488,73 @@ mod tests {
             1,
             "only c5's new vector; c1's older update is not replayed"
         );
+    }
+
+    /// Two engines over one store, as a compaction or remap swaps them: the
+    /// one installed carries `cursor` and holds `holds` for chunk "a".
+    fn engine_at(cursor: i64, holds: usize) -> SearchEngine {
+        let mut engine = SearchEngine::new(100);
+        engine.insert_chunk("a".into(), axis(holds));
+        engine.set_change_cursor(cursor);
+        engine
+    }
+
+    #[test]
+    fn a_batch_read_before_a_swap_to_an_older_cursor_is_abandoned_not_skipped() {
+        let storage = Storage::open_memory().unwrap();
+        storage.insert_chunk(&chunk("a"), &axis(0)).unwrap();
+        let older = storage.latest_embedding_change_seq().unwrap();
+        storage.insert_chunk(&chunk("a"), &axis(1)).unwrap();
+        let newer = storage.latest_embedding_change_seq().unwrap();
+        storage.insert_chunk(&chunk("b"), &axis(2)).unwrap();
+        let search = RwLock::new(engine_at(newer, 1));
+        let shutdown = AtomicBool::new(false);
+        // Read "b" for the installed engine (cursor = newer)...
+        let batch = read_batch(&storage, &search, 0, None).unwrap();
+        assert_eq!(batch.changes.len(), 1);
+        // ...then a swap installs an engine that never saw the update to "a".
+        *search.blocking_write() = engine_at(older, 0);
+        let (_, generation, applied) = apply_batch(&search, &shutdown, batch);
+        assert_eq!(applied, 0, "the batch belonged to the replaced engine");
+        assert_eq!(
+            search.blocking_read().change_cursor(),
+            older,
+            "cursor untouched"
+        );
+        // The next poll replays from the installed engine's own cursor.
+        let (_, _, applied) =
+            sync_batch(&storage, &search, &shutdown, 0, Some(generation)).unwrap();
+        assert_eq!(applied, 2, "the update to a and the insert of b");
+        let index = search.blocking_read();
+        assert_eq!(index.search_chunks(&axis(1), 1, 0.99)[0].id, "a");
+        assert!(index.has_chunk("b"));
+    }
+
+    #[test]
+    fn a_batch_read_before_a_swap_to_a_newer_cursor_cannot_roll_it_back() {
+        let storage = Storage::open_memory().unwrap();
+        storage.insert_chunk(&chunk("a"), &axis(0)).unwrap();
+        let first = storage.latest_embedding_change_seq().unwrap();
+        let search = RwLock::new(engine_at(0, 0));
+        let shutdown = AtomicBool::new(false);
+        // Read the old vector of "a" for the installed engine...
+        let batch = read_batch(&storage, &search, 0, None).unwrap();
+        assert_eq!(batch.changes.len(), 1);
+        // ...then "a" is updated and a rebuild that holds the update is swapped in.
+        storage.insert_chunk(&chunk("a"), &axis(1)).unwrap();
+        let rebuilt_at = storage.latest_embedding_change_seq().unwrap();
+        assert!(rebuilt_at > first);
+        *search.blocking_write() = engine_at(rebuilt_at, 1);
+        let (_, _, applied) = apply_batch(&search, &shutdown, batch);
+        assert_eq!(applied, 0);
+        let index = search.blocking_read();
+        assert_eq!(index.chunk_tombstone_count(), 0, "nothing re-inserted");
+        assert_eq!(index.search_chunks(&axis(1), 1, 0.99)[0].id, "a");
+        assert!(
+            index.search_chunks(&axis(0), 1, 0.99).is_empty(),
+            "old vector not restored"
+        );
+        assert_eq!(index.change_cursor(), rebuilt_at);
     }
 
     #[test]
