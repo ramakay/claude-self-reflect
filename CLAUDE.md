@@ -37,13 +37,13 @@ protected and moves only through reviewed PRs merged by the maintainer.
 Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
-csr-engine (44MB)
-  ├── MCP server (rmcp, 15 tools)
+csr-engine (~73MB release build)
+  ├── MCP server (rmcp, 16 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
   ├── Search (HNSW, <1ms p95)
   ├── Storage (SQLite)
   ├── AST analysis (ast-grep, 6 languages)
-  ├── 6 Claude Code hooks
+  ├── 7 Claude Code hooks
   └── 3-layer enrichment pipeline
 ```
 
@@ -84,7 +84,7 @@ csr-engine eval --full         # Full eval (20 tests, ~200ms)
 csr-engine quality <file>      # AST code quality analysis
 ```
 
-## MCP Tools (15 total)
+## MCP Tools (16 total)
 
 ```
 csr_reflect_on_past   — Semantic search across past conversations
@@ -102,6 +102,7 @@ get_session_learnings — Iteration memory for Ralph loops
 csr_code_graph        — Which conversations shaped a function/file (AST anchors)
 csr_why               — Provenance chain: why does this code/decision exist (reinstatement recall)
 csr_resolve           — Record verified verdicts (resolved/still_open/regressed) on chunks; resolved demote+annotate in future searches
+csr_transcript        — Structured facts from a session transcript JSONL (stats, prompts, tool calls, files, errors, slices, grep)
 ```
 
 ## Critical Rules
@@ -145,7 +146,7 @@ cargo bench --bench spike_bench
 ### Key Patterns
 
 - **rmcp tool params**: Use `Parameters<MyStruct>` pattern, NOT individual `#[tool(param)]`
-- **rmcp tool annotations**: All 15 tools declare `annotations(...)` in the macro — hints vary per tool (most use `read_only_hint, destructive_hint, idempotent_hint`; `get_full_conversation` uses `open_world_hint` instead of `idempotent_hint`)
+- **rmcp tool annotations**: All 16 tools declare `annotations(...)` in the macro — hints vary per tool (most use `read_only_hint, destructive_hint, idempotent_hint`; `get_full_conversation` uses `open_world_hint` instead of `idempotent_hint`)
 - **rmcp builders**: `ServerInfo::new(caps).with_instructions()`, `Implementation::new()`, `ReadResourceResult::new()`
 - **fastembed**: Requires `aarch64` Rust — no x86_64-apple-darwin ONNX binaries
 - **rusqlite 0.38**: No `ToSql` for `usize` — cast to `i64`
@@ -158,7 +159,7 @@ cargo bench --bench spike_bench
 
 ## Hooks
 
-6 hooks fire at strategic moments:
+7 hooks fire at strategic moments:
 
 | Hook | When | What |
 |------|------|------|
@@ -166,10 +167,11 @@ cargo bench --bench spike_bench
 | UserPromptSubmit | Every prompt | Predictive context injection |
 | PostToolUse | After Edit/Write | Tracks file changes |
 | Stop | Every response | Stores iteration learnings |
+| SubagentStop | Subagent finishes | Captures intent events from the child transcript under the parent session |
 | PreCompact | Before compaction | Backs up state |
 | SessionEnd | Session ends | Stores narrative |
 
-Hook CLI: `csr-engine hook session-start|session-end|precompact|stop|post-tool-use|prompt-submit|install`
+Hook CLI: `csr-engine hook session-start|session-end|precompact|stop|subagent-stop|post-tool-use|prompt-submit|install`
 
 ## File Layout
 
