@@ -1224,9 +1224,7 @@ impl SearchEngine {
             .create(true)
             .truncate(false)
             .open(dir.join("index.lock"))?;
-        lock_file
-            .lock_exclusive()
-            .map_err(|e| anyhow::anyhow!("failed to acquire index lock for dump: {}", e))?;
+        lock_index(&lock_file, true, INDEX_LOCK_TIMEOUT)?;
 
         // Snapshot whatever manifest is on disk BEFORE this call writes
         // anything, while still holding the exclusive lock — no other
@@ -1582,7 +1580,7 @@ impl SearchEngine {
     }
 
     /// Load HNSW indices from a cached directory.
-    /// Returns `None` on any failure — caller falls back to full rebuild.
+    /// Returns `Ok(None)` for an invalid cache so the caller can rebuild.
     ///
     /// Validates:
     /// - Manifest version matches
@@ -1592,21 +1590,45 @@ impl SearchEngine {
     /// On full success the engine owns the `HnswIo` objects whose maps its
     /// indexes borrow (see the `mapped` field) and frees them when dropped.
     /// Failed or partially failed loads reclaim them at once.
+    /// A missing or invalid cache is `Ok(None)`; lock failures must reach the
+    /// caller instead of starting a rebuild while a publisher holds the lock.
     pub fn load_from_disk(
         dir: &Path,
         expected_chunks: usize,
         expected_reflections: usize,
+    ) -> Result<Option<Self>> {
+        Self::load_from_disk_with_budget(
+            dir,
+            expected_chunks,
+            expected_reflections,
+            INDEX_LOCK_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn load_from_disk_with_budget(
+        dir: &Path,
+        expected_chunks: usize,
+        expected_reflections: usize,
+        budget: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        let lock = match std::fs::File::open(dir.join("index.lock")) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        lock_index(&lock, false, budget)?;
+        Ok(Self::load_from_disk_locked(
+            dir,
+            expected_chunks,
+            expected_reflections,
+        ))
+    }
+
+    fn load_from_disk_locked(
+        dir: &Path,
+        expected_chunks: usize,
+        expected_reflections: usize,
     ) -> Option<Self> {
-        // Acquire shared advisory lock to avoid reading while dump_to_disk is writing.
-        // The File is held as _lock_guard for the duration of the load.
-
-        let lock_path = dir.join("index.lock");
-        let _lock_guard = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&lock_path)
-            .ok()
-            .and_then(|f| f.lock_shared().ok().map(|_| f));
-
         // Read and validate manifest
         let manifest_path = dir.join("manifest.json");
         let manifest_data = std::fs::read_to_string(&manifest_path).ok()?;
@@ -1690,7 +1712,8 @@ impl SearchEngine {
         // `chunks.hnsw.*` files a prior generation left behind and map fresh ids onto
         // those stale vectors. Gating on the id map treats that manifest as empty and
         // rebuilds from the DB instead.
-        let lock_held = _lock_guard.is_some();
+        // This helper is only entered after the shared index lock succeeds.
+        let lock_held = true;
         // hnsw_rs exits the process (`std::process::exit(1)`), rather than
         // returning an error, on several damaged-dump paths: a data record it
         // cannot read in heap mode, a pre-format-3 description, a file its
@@ -1966,8 +1989,8 @@ fn write_maintenance_generation(dir: &Path, generation: u64) -> Result<()> {
 /// past every epoch published so far and remove the manifest, both under
 /// `index.lock`, so no engine loaded before the pass can publish its graph
 /// again, and an interrupted pass leaves no manifest to trust. Returns the new
-/// generation. When the lock file cannot be opened or locked, no publisher can
-/// take it either, and the two writes go ahead without it.
+/// generation. A timeout leaves the generation unchanged. If the lock file
+/// cannot be opened, publishers cannot open it either, so invalidation proceeds.
 pub fn invalidate_for_maintenance(dir: &Path) -> Result<u64> {
     let operation = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
     invalidate_for_maintenance_locked(dir, &operation)
@@ -1979,15 +2002,23 @@ pub(crate) fn invalidate_for_maintenance_locked(
 ) -> Result<u64> {
     operation.check_directory(dir.parent().unwrap_or(Path::new(".")))?;
     std::fs::create_dir_all(dir)?;
-    let lock = std::fs::OpenOptions::new()
+    let lock = match std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(dir.join("index.lock"))
-        .and_then(|file| file.lock_exclusive().map(|()| file));
-    if let Err(error) = &lock {
-        tracing::warn!(%error, path = %dir.display(), "index lock unavailable; invalidating without it");
-    }
+    {
+        Ok(file) => {
+            lock_index(&file, true, INDEX_LOCK_TIMEOUT)?;
+            Some(file)
+        }
+        Err(error) => {
+            // A publisher cannot open this lock either. Preserve the existing
+            // invalidation fallback, but never continue after a lock timeout.
+            tracing::warn!(%error, path = %dir.display(), "index lock unavailable; invalidating without it");
+            None
+        }
+    };
     let published = std::fs::read_to_string(dir.join("manifest.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<IndexManifest>(&raw).ok())
@@ -2001,6 +2032,37 @@ pub(crate) fn invalidate_for_maintenance_locked(
     }
     drop(lock);
     Ok(generation)
+}
+
+pub(crate) const INDEX_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// No index lock may pin maintenance ownership beyond its caller's budget.
+pub(crate) fn lock_index(
+    file: &std::fs::File,
+    exclusive: bool,
+    budget: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(file)
+        } else {
+            FileExt::try_lock_shared(file)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                anyhow::ensure!(
+                    !remaining.is_zero(),
+                    "timed out acquiring index.lock after {:?}",
+                    budget
+                );
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn write_manifest_atomically(dir: &Path, manifest: &IndexManifest) -> Result<()> {
@@ -2253,6 +2315,46 @@ pub fn cleanup_stale_index_files(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round4_publisher_index_timeout_releases_maintenance_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path().join("index-v3");
+        std::fs::create_dir(&index_dir).unwrap();
+        let held = std::fs::File::create(index_dir.join("index.lock")).unwrap();
+        FileExt::try_lock_exclusive(&held).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            drop(held);
+        });
+        let result = SearchEngine::new(16).publish_to_disk(&index_dir, 0, 0);
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path());
+        releaser.join().unwrap();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("timed out acquiring index.lock"));
+        assert!(owner.is_ok());
+        assert!(!index_dir.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn round4_index_reader_respects_tighter_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::create(dir.path().join("index.lock")).unwrap();
+        FileExt::try_lock_exclusive(&held).unwrap();
+        let start = std::time::Instant::now();
+        let error = SearchEngine::load_from_disk_with_budget(
+            dir.path(),
+            0,
+            0,
+            std::time::Duration::from_millis(30),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("timed out acquiring index.lock"));
+        assert!(start.elapsed() < std::time::Duration::from_millis(300));
+    }
+
     use super::*;
 
     /// Test-only file identity check, mirroring `import::registry::file_identity`
@@ -2344,10 +2446,14 @@ mod tests {
         }
         engine.dump_to_disk(tmp.path(), 4, 4).unwrap();
         let live = || LIVE_MAPPED_GENERATIONS.with(|live| live.get());
-        let loaded = SearchEngine::load_from_disk(tmp.path(), 4, 4).unwrap();
+        let loaded = SearchEngine::load_from_disk(tmp.path(), 4, 4)
+            .unwrap()
+            .unwrap();
         assert!(loaded.is_mapped());
         assert_eq!(live(), 2, "one per index");
-        let again = SearchEngine::load_from_disk(tmp.path(), 4, 4).unwrap();
+        let again = SearchEngine::load_from_disk(tmp.path(), 4, 4)
+            .unwrap()
+            .unwrap();
         assert_eq!(live(), 4);
         assert_eq!(again.search_chunks(&unit(1), 1, 0.99)[0].id, "c1");
         drop(again);
@@ -2365,7 +2471,7 @@ mod tests {
         seed.insert_chunk("c".into(), unit(0));
         seed.insert_reflection("r".into(), unit(1));
         seed.dump_to_disk(dir, 1, 1).unwrap();
-        let mut serving = SearchEngine::load_from_disk(dir, 1, 1).unwrap();
+        let mut serving = SearchEngine::load_from_disk(dir, 1, 1).unwrap().unwrap();
         let live = || LIVE_MAPPED_GENERATIONS.with(|live| live.get());
         assert_eq!(live(), 2);
         let mut delayed = SearchEngine::new(16);
@@ -2411,7 +2517,9 @@ mod tests {
         assert_eq!(engine.unpublished_changes(), 9);
         assert!(engine.is_chunk_dirty() && engine.is_reflection_dirty());
 
-        let mut loaded = SearchEngine::load_from_disk(tmp.path(), 3, 0).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(tmp.path(), 3, 0)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.unpublished_changes(), 0, "a load is a settled state");
         loaded.note_unpublished(0, 0);
         assert!(!loaded.is_dirty(), "nothing to note, nothing dirtied");
@@ -2427,7 +2535,7 @@ mod tests {
         engine.set_change_cursor(7);
         engine.dump_to_disk(dir, 1, 1).unwrap();
 
-        let mut loaded = SearchEngine::load_from_disk(dir, 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir, 1, 1).unwrap().unwrap();
         assert_eq!(
             (loaded.side_cursor(false), loaded.side_cursor(true)),
             (7, 7)
@@ -2437,7 +2545,7 @@ mod tests {
         loaded.insert_reflection("r2".into(), unit(2));
         loaded.advance_change_cursor(9);
         loaded.dump_to_disk(dir, 1, 2).unwrap();
-        let reloaded = SearchEngine::load_from_disk(dir, 1, 2).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 1, 2).unwrap().unwrap();
         assert_eq!(
             (reloaded.side_cursor(false), reloaded.side_cursor(true)),
             (7, 9)
@@ -2447,7 +2555,7 @@ mod tests {
         loaded.insert_chunk("c2".into(), unit(3));
         loaded.insert_reflection("r3".into(), unit(0));
         loaded.dump_to_disk(dir, 2, 3).unwrap();
-        let reloaded = SearchEngine::load_from_disk(dir, 2, 3).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 2, 3).unwrap().unwrap();
         assert_eq!(
             (reloaded.side_cursor(false), reloaded.side_cursor(true)),
             (9, 9)
@@ -2462,6 +2570,7 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), json.to_string()).unwrap();
         assert_eq!(
             SearchEngine::load_from_disk(dir, 2, 3)
+                .unwrap()
                 .unwrap()
                 .change_cursor(),
             0
@@ -2549,6 +2658,7 @@ mod tests {
         // The index must still round-trip correctly: both the untouched
         // chunk side and the freshly-dumped reflection side load and search.
         let loaded = SearchEngine::load_from_disk(dir, 5, 2)
+            .unwrap()
             .expect("reload after a partial (reflection-only) dump must succeed");
         assert!(loaded.has_chunk("c0") && loaded.has_chunk("c4"));
         assert!(loaded.has_reflection("r0") && loaded.has_reflection("r1"));
@@ -2607,7 +2717,7 @@ mod tests {
 
         // "Process B" (e.g. a long-lived MCP server) loads that 5-chunk
         // state and never touches the chunk side again.
-        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 0).unwrap();
+        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 0).unwrap().unwrap();
 
         // Meanwhile "process A" imports 3 more chunks and dumps again — the
         // on-disk graph now has 8 points, but `proc_b`'s in-memory
@@ -2642,7 +2752,7 @@ mod tests {
         // Reload fresh and prove every original AND new chunk id still
         // resolves to ITS OWN vector — this is the assertion that would
         // have caught the silent wrong-answer bug.
-        let reloaded = SearchEngine::load_from_disk(dir, 8, 1).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 8, 1).unwrap().unwrap();
         assert_eq!(reloaded.chunk_count(), 8);
         for i in 0..8 {
             let q = distinct_embedding(i);
@@ -2726,7 +2836,7 @@ mod tests {
         // load_from_disk must ACCEPT this manifest (0 == 0, no drift) rather
         // than reject it as negative drift (0 < stale-3) and force a rebuild.
         assert!(
-            SearchEngine::load_from_disk(dir, 5, 0).is_some(),
+            SearchEngine::load_from_disk(dir, 5, 0).unwrap().is_some(),
             "load_from_disk rejected a correctly-published zero-reflection manifest as \
              negative drift — this is the permanent full-rebuild-on-every-startup bug"
         );
@@ -2798,7 +2908,7 @@ mod tests {
              prior successful dump"
         );
 
-        let reloaded = SearchEngine::load_from_disk(dir, 8, 2).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 8, 2).unwrap().unwrap();
         assert_eq!(reloaded.chunk_count(), 8);
         for i in 0..8 {
             let hits = reloaded.search_chunks(&distinct_embedding(i), 1, -1.0);
@@ -2831,7 +2941,7 @@ mod tests {
         }
         proc_a.dump_to_disk(dir, 5, 2).unwrap();
 
-        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 2).unwrap();
+        let mut proc_b = SearchEngine::load_from_disk(dir, 5, 2).unwrap().unwrap();
         assert!(proc_b.manifest_backed);
 
         // "Process A" grows the chunk graph to 8 points and dumps again —
@@ -2884,6 +2994,7 @@ mod tests {
         // reload takes the normal "cache behind DB" path rather than being
         // rejected as negative drift for an unrelated reason.
         let reloaded = SearchEngine::load_from_disk(dir, 8, 3)
+            .unwrap()
             .expect("manifest and chunk graph file must agree after the forced re-dump");
         assert_eq!(reloaded.chunk_count(), 5);
         for i in 0..5 {
@@ -2960,7 +3071,9 @@ mod tests {
         assert_eq!(engine.reflection_positions.get("reflection"), Some(&1));
         assert_eq!(engine.generation(), original_generation);
         engine.dump_to_disk(dir.path(), 1, 1).unwrap();
-        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1)
+            .unwrap()
+            .unwrap();
         assert_ne!(loaded.generation(), original_generation);
         assert_eq!(loaded.chunk_positions.get("chunk"), Some(&1));
         assert_eq!(loaded.reflection_positions.get("reflection"), Some(&1));
@@ -3045,10 +3158,10 @@ mod tests {
         engine.dump_to_disk(dir, 5, 1).unwrap();
 
         // Exact match → loads.
-        assert!(SearchEngine::load_from_disk(dir, 5, 1).is_some());
+        assert!(SearchEngine::load_from_disk(dir, 5, 1).unwrap().is_some());
         // Additive drift (DB grew since dump) → loads; Engine::new backfills the new rows.
         assert!(
-            SearchEngine::load_from_disk(dir, 8, 3).is_some(),
+            SearchEngine::load_from_disk(dir, 8, 3).unwrap().is_some(),
             "additive drift must load the cache, not rebuild"
         );
         // Negative drift (rows deleted) → also loads now (WP-D). A synchronous
@@ -3056,11 +3169,11 @@ mod tests {
         // `Engine::new`'s cached-load branch reconciles the vanished ids via
         // `blank_orphan_chunks`/`blank_orphan_reflections` instead.
         assert!(
-            SearchEngine::load_from_disk(dir, 4, 1).is_some(),
+            SearchEngine::load_from_disk(dir, 4, 1).unwrap().is_some(),
             "chunk deletion must still load the cache, not force an inline rebuild"
         );
         assert!(
-            SearchEngine::load_from_disk(dir, 5, 0).is_some(),
+            SearchEngine::load_from_disk(dir, 5, 0).unwrap().is_some(),
             "reflection deletion must still load the cache, not force an inline rebuild"
         );
     }
@@ -3088,7 +3201,7 @@ mod tests {
         data.write_all(&999usize.to_ne_bytes()).unwrap();
         drop(data);
 
-        assert!(SearchEngine::load_from_disk(dir, 1, 0).is_none());
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).unwrap().is_none());
     }
 
     #[test]
@@ -3147,6 +3260,7 @@ mod tests {
         .unwrap();
 
         let loaded = SearchEngine::load_from_disk(dir, 3, 0)
+            .unwrap()
             .expect("empty-map manifest loads as an empty index, not None");
         // The stale canonical vectors must not have been mapped in.
         assert!(loaded.chunk_id_map.is_empty());
@@ -3181,7 +3295,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(SearchEngine::load_from_disk(dir, 1, 0).is_none());
+        assert!(SearchEngine::load_from_disk(dir, 1, 0).unwrap().is_none());
     }
 
     #[test]
@@ -3316,7 +3430,7 @@ mod tests {
             "first generation's graph file was overwritten in place while a handle held it open"
         );
 
-        let loaded = SearchEngine::load_from_disk(dir, 2, 0).unwrap();
+        let loaded = SearchEngine::load_from_disk(dir, 2, 0).unwrap().unwrap();
         assert!(loaded.has_chunk("c0") && loaded.has_chunk("c1"));
     }
 
@@ -3386,9 +3500,9 @@ mod tests {
         data.write_all(&999usize.to_ne_bytes()).unwrap();
         drop(data);
 
-        assert!(SearchEngine::load_from_disk(dir, 1, 1).is_none());
+        assert!(SearchEngine::load_from_disk(dir, 1, 1).unwrap().is_none());
         std::fs::write(&reflection_data_path, valid_reflection_data).unwrap();
-        assert!(SearchEngine::load_from_disk(dir, 1, 1).is_some());
+        assert!(SearchEngine::load_from_disk(dir, 1, 1).unwrap().is_some());
     }
 
     #[test]
@@ -3635,7 +3749,9 @@ mod tests {
             &default_chunk_basename(),
             false
         ));
-        let loaded = SearchEngine::load_from_disk(dir, 300, 0).expect("canonical index loads");
+        let loaded = SearchEngine::load_from_disk(dir, 300, 0)
+            .unwrap()
+            .expect("canonical index loads");
         assert_self_query_correct(&loaded, &vecs[42], "c42", 3, 0.1);
     }
 
@@ -3660,7 +3776,9 @@ mod tests {
         writer.dump_to_disk(dir, 300, 0).unwrap();
 
         // A reader loads generation 1 mmap-backed (leaks an HnswIo holding the map).
-        let reader = SearchEngine::load_from_disk(dir, 300, 0).expect("load generation 1");
+        let reader = SearchEngine::load_from_disk(dir, 300, 0)
+            .unwrap()
+            .expect("load generation 1");
         let gen1_data = {
             let manifest: IndexManifest =
                 serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
@@ -3706,7 +3824,9 @@ mod tests {
         assert_self_query_correct(&reader, &vecs[7], "c7", 3, 0.1);
 
         // And a fresh load now picks up generation 2, including the newer ids.
-        let reloaded = SearchEngine::load_from_disk(dir, 500, 0).expect("load generation 2");
+        let reloaded = SearchEngine::load_from_disk(dir, 500, 0)
+            .unwrap()
+            .expect("load generation 2");
         assert!(reloaded.has_chunk("c499"));
         assert!(reloaded.has_chunk("c142"));
         // c499 is the boundary point most exposed to approximate-search recall variance
@@ -3731,7 +3851,9 @@ mod tests {
         }
         writer.dump_to_disk(dir, 300, 0).unwrap();
 
-        let mut reader = SearchEngine::load_from_disk(dir, 300, 0).expect("load generation 1");
+        let mut reader = SearchEngine::load_from_disk(dir, 300, 0)
+            .unwrap()
+            .expect("load generation 1");
 
         // Insert a new point (heap-owned) alongside the mmap-backed ones.
         let newv: Vec<f32> = (0..384).map(|j| ((j as f32) * 0.002).cos()).collect();
@@ -3745,7 +3867,9 @@ mod tests {
         // Re-dump: writes a new generation, must not truncate the mapped file, and the
         // result must round-trip both the mmap-origin ids and the new one.
         reader.dump_to_disk(dir, 301, 0).unwrap();
-        let reloaded = SearchEngine::load_from_disk(dir, 301, 0).expect("reload after redump");
+        let reloaded = SearchEngine::load_from_disk(dir, 301, 0)
+            .unwrap()
+            .expect("reload after redump");
         assert!(reloaded.has_chunk("c_new"));
         assert!(reloaded.has_chunk("c0"));
         assert!(reloaded.has_chunk("c299"));
@@ -3776,7 +3900,7 @@ mod tests {
         writer.dump_to_disk(dir, 10, 0).unwrap();
 
         // DB now reports only 6 (4 rows deleted) — negative drift.
-        let loaded = SearchEngine::load_from_disk(dir, 6, 0);
+        let loaded = SearchEngine::load_from_disk(dir, 6, 0).unwrap();
         assert!(
             loaded.is_some(),
             "load_from_disk must load a generation on negative drift, not return None \
@@ -3802,7 +3926,7 @@ mod tests {
         writer.dump_to_disk(dir, 0, 5).unwrap();
 
         // DB now reports only 2 reflections.
-        let loaded = SearchEngine::load_from_disk(dir, 0, 2);
+        let loaded = SearchEngine::load_from_disk(dir, 0, 2).unwrap();
         assert!(
             loaded.is_some(),
             "negative drift on the reflection side must also load, not rebuild inline"
@@ -3950,7 +4074,9 @@ mod tests {
         writer.dump_to_disk(dir, 10, 0).unwrap();
 
         // "Process B" loads with the DB now at 6 (4 deleted) — negative drift.
-        let mut reader = SearchEngine::load_from_disk(dir, 6, 0).expect("negative-drift load");
+        let mut reader = SearchEngine::load_from_disk(dir, 6, 0)
+            .unwrap()
+            .expect("negative-drift load");
         let remaining: std::collections::HashSet<&str> =
             ["c0", "c1", "c2", "c3", "c4", "c5"].into_iter().collect();
         let blanked = reader.blank_orphan_chunks(&remaining);
@@ -3965,7 +4091,9 @@ mod tests {
 
         // The next load, querying the DB at the SAME count (6), must see zero
         // drift — no more forced negative-drift reconciliation.
-        let reloaded = SearchEngine::load_from_disk(dir, 6, 0).expect("reload after reconcile");
+        let reloaded = SearchEngine::load_from_disk(dir, 6, 0)
+            .unwrap()
+            .expect("reload after reconcile");
         assert_eq!(reloaded.chunk_count(), 6);
         assert!(
             !reloaded.has_chunk("c9"),
@@ -3997,7 +4125,7 @@ mod tests {
         // The next dump publishes it, and the manifest loads with all six.
         engine.dump_to_disk(dir, 6, 1).unwrap();
         assert!(!engine.is_dirty());
-        let reloaded = SearchEngine::load_from_disk(dir, 6, 1).unwrap();
+        let reloaded = SearchEngine::load_from_disk(dir, 6, 1).unwrap().unwrap();
         assert!(reloaded.has_chunk("c5"));
     }
 
@@ -4060,7 +4188,9 @@ mod tests {
         let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
         manifest.as_object_mut().unwrap().remove("files");
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0).is_none());
+        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0)
+            .unwrap()
+            .is_none());
         std::fs::write(&path, original).unwrap();
         let manifest: IndexManifest =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -4072,7 +4202,9 @@ mod tests {
         bytes[middle] ^= 0x80;
         std::fs::write(graph, bytes).unwrap();
         HNSW_LOAD_CALLS.with(|calls| calls.set(0));
-        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0).is_none());
+        assert!(SearchEngine::load_from_disk(dir.path(), 1, 0)
+            .unwrap()
+            .is_none());
         HNSW_LOAD_CALLS.with(|calls| assert_eq!(calls.get(), 0));
     }
 
@@ -4097,7 +4229,9 @@ mod tests {
         index.insert_chunk("a".into(), vec![0.1; 384]);
         index.insert_reflection("r".into(), vec![0.2; 384]);
         index.dump_to_disk(dir.path(), 1, 1).unwrap();
-        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1).unwrap();
+        let mut loaded = SearchEngine::load_from_disk(dir.path(), 1, 1)
+            .unwrap()
+            .unwrap();
         for current in [&mut index, &mut loaded] {
             current.apply_vector("a".into(), Some(vec![0.1; 384]), false);
             current.apply_vector("r".into(), Some(vec![0.2; 384]), true);

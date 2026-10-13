@@ -370,6 +370,19 @@ fn cut_forwards_across_chunks(
         for span in crate::extraction::provenance::forward_spans(&joined) {
             let first = offsets.partition_point(|&offset| offset <= span.start) - 1;
             let last = offsets.partition_point(|&offset| offset < span.end) - 1;
+            // A leading digit may be the tail of a personal number in the
+            // preceding chunk. Only proven message continuity permits that cut.
+            let before = &joined[..span.start];
+            let leading_hotkey = before.trim().is_empty()
+                && !before.contains('\n')
+                && joined[span.start..span.end]
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace() || *ch == '>' || ch.is_ascii_digit())
+                    .any(|ch| ch.is_ascii_digit());
+            if leading_hotkey {
+                ambiguous[start + first..=start + last].fill(true);
+                continue;
+            }
             if span.needs_message_end && end - start == 1 && end < chunks.len() {
                 ambiguous[start + first..=start + last].fill(true);
                 continue;
@@ -1390,6 +1403,42 @@ mod tests {
             "scrub must keep a distinct personal message missing from the source"
         );
     }
+    #[test]
+    fn round4_personal_digit_before_forward_survives() {
+        let raw = "I vote 2 CSR's compaction card (compacting), quoted: “One.” Keep the deployment frozen.";
+        let expected = Some("I vote 2 Keep the deployment frozen.");
+        assert_eq!(
+            crate::extraction::provenance::extractable(raw).as_deref(),
+            expected
+        );
+        assert_eq!(super::scrub_contaminated_text(raw).as_deref(), expected);
+    }
+
+    #[test]
+    fn round4_unproven_chunk_start_preserves_hotkey() {
+        let raw = format!(
+            "{}42CSR's compaction card (compacting), quoted: “One.”",
+            "P".repeat(899)
+        );
+        let chunks = crate::import::chunk_messages(
+            "boundary",
+            "p",
+            "2026-09-01T00:00:00Z",
+            &[(Speaker::User, raw)],
+            false,
+        );
+        let (carried, ambiguous) = super::cut_forwards_across_chunks(&chunks, &[false, false]);
+        assert!(ambiguous[1] || carried.concat().ends_with("42"));
+        assert!(carried[1].starts_with('2'));
+        let storage = Storage::open_memory().unwrap();
+        for chunk in &chunks {
+            storage.insert_chunk(chunk, &vec![0.1; 384]).unwrap();
+        }
+        let report = super::dry_run_scrub(&storage, Some("boundary"), false, true).unwrap();
+        assert_eq!(report.unresolved_ambiguous_source, 1);
+        assert_eq!((report.chunks_rewritten, report.chunks_dropped), (0, 0));
+    }
+
     #[test]
     fn round3_combined_marker_hotkey_keeps_reply() {
         let own = "Keep the deployment frozen.";

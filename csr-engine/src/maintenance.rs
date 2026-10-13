@@ -1,10 +1,12 @@
 //! OS-held exclusion between maintenance and database writers or index publishers.
 //! The persistent file records status information; only its file lock owns the run.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -70,16 +72,47 @@ impl SharedLock {
     }
 }
 
+// Weak entries never extend an operation's lifetime. A nested call on this
+// thread borrows the existing ownership, including across Storage calls.
+thread_local! {
+    static OPERATIONS: RefCell<HashMap<PathBuf, (Weak<File>, PathBuf)>> = RefCell::new(HashMap::new());
+}
+
 /// Try once without blocking. A busy exclusive lock returns no guard.
 pub fn try_shared(data_dir: &Path) -> Result<Option<SharedLock>> {
+    if let Some(lock) = OPERATIONS.with(|operations| {
+        let operations = operations.borrow();
+        let (file, canonical) = operations.get(data_dir)?;
+        Some(SharedLock {
+            _file: file.upgrade()?,
+            data_dir: canonical.clone(),
+        })
+    }) {
+        return Ok(Some(lock));
+    }
     let file = open(data_dir)?;
     match FileExt::try_lock_shared(&file) {
-        Ok(()) => Ok(Some(SharedLock {
-            _file: Arc::new(file),
-            data_dir: data_dir
-                .canonicalize()
-                .context("resolving maintenance directory")?,
-        })),
+        Ok(()) => {
+            let lock = SharedLock {
+                _file: Arc::new(file),
+                data_dir: data_dir
+                    .canonicalize()
+                    .context("resolving maintenance directory")?,
+            };
+            OPERATIONS.with(|operations| {
+                let mut operations = operations.borrow_mut();
+                operations.retain(|_, (file, _)| file.strong_count() > 0);
+                operations.insert(
+                    data_dir.to_path_buf(),
+                    (Arc::downgrade(&lock._file), lock.data_dir.clone()),
+                );
+                operations.insert(
+                    lock.data_dir.clone(),
+                    (Arc::downgrade(&lock._file), lock.data_dir.clone()),
+                );
+            });
+            Ok(Some(lock))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(error) => Err(error).context("trying shared maintenance lock"),
     }
@@ -210,9 +243,13 @@ pub fn other_holders(db: &Path) -> Result<Vec<DbHolder>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut command = std::process::Command::new("lsof");
     command.arg("-t").arg("--").args(&files);
-    let output = command_output(&mut command, Duration::from_secs(3))?;
+    let output = command_output(
+        &mut command,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
     let mut pids = parse_lsof(&output)?;
     pids.retain(|&pid| pid != std::process::id());
     pids.sort_unstable();
@@ -221,19 +258,24 @@ pub fn other_holders(db: &Path) -> Result<Vec<DbHolder>> {
         .into_iter()
         .map(|pid| DbHolder {
             pid,
-            executable: executable_of(pid),
+            executable: executable_of(pid, deadline),
         })
         .collect())
 }
 
-fn executable_of(pid: u32) -> String {
+fn executable_of(pid: u32, deadline: Instant) -> String {
     if let Ok(path) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         return path.display().to_string();
     }
-    std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
+    let mut command = std::process::Command::new("ps");
+    command.args(["-o", "comm=", "-p", &pid.to_string()]);
+    executable_from_command(&mut command, deadline)
+}
+
+fn executable_from_command(command: &mut std::process::Command, deadline: Instant) -> String {
+    command_output(command, deadline.saturating_duration_since(Instant::now()))
         .ok()
+        .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown".to_string())
@@ -246,6 +288,8 @@ fn command_output(
 ) -> Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
+    anyhow::ensure!(!limit.is_zero(), "process lookup deadline expired");
+    let deadline = Instant::now() + limit;
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -282,7 +326,6 @@ fn command_output(
     }
     let stdout = reader(stdout);
     let stderr = reader(stderr);
-    let deadline = Instant::now() + limit;
     let mut status = None;
     let mut out = None;
     let mut err = None;
@@ -360,6 +403,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn round4_nested_shared_reuses_operation_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open(&dir.path().join("db")).unwrap();
+        let first = shared(dir.path()).unwrap();
+        let second = storage.operation_lock().unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first._file, &second._file));
+        drop(first);
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
+        drop(second);
+        // Concurrent process tests can briefly inherit a descriptor before exec.
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::from_secs(1)).is_ok());
+        drop(storage);
+    }
+
+    #[test]
     fn a_lock_names_its_run_and_goes_when_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let lock = MaintenanceLock::acquire(dir.path()).unwrap();
@@ -414,46 +472,111 @@ mod tests {
     #[test]
     fn round3_sixteen_exclusive_attempts_have_one_owner() {
         let dir = tempfile::tempdir().unwrap();
-        let start = Arc::new(std::sync::Barrier::new(16));
-        let finish = Arc::new(std::sync::Barrier::new(16));
-        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let workers = (0..16)
-            .map(|_| {
-                let path = dir.path().to_path_buf();
-                let start = start.clone();
-                let finish = finish.clone();
-                let owners = owners.clone();
-                std::thread::spawn(move || {
-                    start.wait();
-                    let lock = MaintenanceLock::acquire_for(&path, Duration::ZERO).ok();
-                    if lock.is_some() {
-                        owners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    finish.wait();
-                    drop(lock);
+        for trial in 0..10 {
+            let run = dir.path().join(trial.to_string());
+            std::fs::create_dir(&run).unwrap();
+            let mut children = (0..16)
+                .map(|id| {
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "maintenance::tests::round4_exclusivity_child_entry",
+                        ])
+                        .env("CSR_R4_RACE_DIR", &run)
+                        .env("CSR_R4_RACE_ID", id.to_string())
+                        .stdout(std::process::Stdio::null())
+                        .spawn()
+                        .unwrap()
                 })
-            })
-            .collect::<Vec<_>>();
-        for worker in workers {
-            worker.join().unwrap();
+                .collect::<Vec<_>>();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !(0..16).all(|id| run.join(format!("ready-{id}")).exists())
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::fs::write(run.join("start"), b"go").unwrap();
+            while !(0..16).all(|id| run.join(format!("result-{id}")).exists())
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let results = (0..16)
+                .map(|id| std::fs::read_to_string(run.join(format!("result-{id}"))).ok())
+                .collect::<Vec<_>>();
+            std::fs::write(run.join("release"), b"done").unwrap();
+            for child in &mut children {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                }
+                assert!(child.wait().unwrap().success());
+            }
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|v| v.as_deref() == Some("owner"))
+                    .count(),
+                1,
+                "trial {trial}: {results:?}"
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|v| v.as_deref() == Some("refused"))
+                    .count(),
+                15,
+                "trial {trial}: {results:?}"
+            );
         }
-        assert_eq!(owners.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn round4_exclusivity_child_entry() {
+        let Some(dir) = std::env::var_os("CSR_R4_RACE_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let id = std::env::var("CSR_R4_RACE_ID").unwrap();
+        std::fs::write(dir.join(format!("ready-{id}")), b"ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dir.join("start").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let owner = MaintenanceLock::acquire_for(&dir, Duration::ZERO).ok();
+        std::fs::write(
+            dir.join(format!("result-{id}")),
+            if owner.is_some() { "owner" } else { "refused" },
+        )
+        .unwrap();
+        while !dir.join("release").exists() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(owner);
     }
 
     #[test]
     fn round3_reused_pid_metadata_does_not_own_the_lock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(LOCK_FILE);
+        let mut unrelated = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = unrelated.id();
         std::fs::write(
             &path,
-            format!(
-                "pid={}\nstarted_at=1970-01-01T00:00:00Z\n",
-                std::process::id()
-            ),
+            format!("pid={}\nstarted_at=1970-01-01T00:00:00Z\n", pid),
         )
         .unwrap();
-        assert!(active(dir.path()).is_none());
-        let lock = MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).unwrap();
+        let inactive = active(dir.path()).is_none();
+        assert!(unrelated.try_wait().unwrap().is_none());
+        let lock = MaintenanceLock::acquire_for(dir.path(), Duration::ZERO);
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        assert!(inactive, "live unrelated pid must not own maintenance");
+        let lock = lock.unwrap();
         assert_eq!(active(dir.path()).unwrap().pid, std::process::id());
         assert!(try_shared(dir.path()).unwrap().is_none());
         drop(lock);
@@ -471,7 +594,7 @@ mod tests {
         drop(first);
         assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
         drop(second);
-        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::from_secs(1)).is_ok());
     }
 
     #[tokio::test]
@@ -549,6 +672,56 @@ mod tests {
                 parse_lsof(&command_output(&mut command, Duration::from_secs(3)).unwrap()).is_err()
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round4_ps_lookup_shares_preflight_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        std::fs::write(&db, "").unwrap();
+        for (name, body) in [
+            ("lsof", "#!/bin/sh\n/bin/sleep 2\necho 4000000000\n"),
+            ("ps", "#!/bin/sh\n/bin/sleep 5\necho late\n"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "maintenance::tests::round4_preflight_child_entry",
+                "--nocapture",
+            ])
+            .env("CSR_R4_PREFLIGHT_DB", &db)
+            .env("PATH", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn round4_preflight_child_entry() {
+        let Some(db) = std::env::var_os("CSR_R4_PREFLIGHT_DB") else {
+            return;
+        };
+        let start = Instant::now();
+        let holders = other_holders(Path::new(&db)).unwrap();
+        assert!(start.elapsed() < Duration::from_millis(3800));
+        assert_eq!(
+            holders,
+            vec![DbHolder {
+                pid: 4_000_000_000,
+                executable: "unknown".into()
+            }]
+        );
     }
 
     #[test]

@@ -2273,20 +2273,36 @@ async fn poll_batch_results(
     poll_interval_secs: u64,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
+    let mut stored = std::collections::HashSet::new();
+    let mut completed = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             tracing::info!("batch polling: shutdown signal received");
             return Ok(());
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(poll_interval_secs)).await;
-        let status = client.get_batch_status(batch_id).await?;
+        let status = if completed.is_some() {
+            crate::api::types::BatchResponse {
+                id: batch_id.to_string(),
+                processing_status: "ended".to_string(),
+            }
+        } else {
+            client.get_batch_status(batch_id).await?
+        };
 
         if status.processing_status == "ended" {
             tracing::info!(batch_id = %batch_id, "batch completed");
-            let results = client.get_batch_results(batch_id).await?;
+            if completed.is_none() {
+                completed = Some(client.get_batch_results(batch_id).await?);
+            }
+            let results = completed.as_ref().expect("completed batch results");
 
-            for item in &results {
-                if let Err(e) = store_narrative(
+            let mut deferred = false;
+            for item in results {
+                if stored.contains(&item.custom_id) {
+                    continue;
+                }
+                match store_narrative(
                     storage,
                     embeddings,
                     search,
@@ -2295,14 +2311,21 @@ async fn poll_batch_results(
                 )
                 .await
                 {
-                    tracing::warn!(
-                        conv = %item.custom_id,
-                        error = %e,
-                        "failed to store narrative"
-                    );
+                    Ok(()) => {
+                        stored.insert(item.custom_id.clone());
+                    }
+                    Err(error) => {
+                        tracing::warn!(conv = %item.custom_id, %error, "narrative storage deferred; retaining batch for retry");
+                        deferred = true;
+                    }
                 }
             }
-            return Ok(());
+            if !deferred {
+                return Ok(());
+            }
+            // Retain completed results in this task. Keep polling until all
+            // are durable; processing state prevents a duplicate submission.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         } else if status.processing_status == "errored"
             || status.processing_status == "expired"
             || status.processing_status == "canceled"
@@ -2338,34 +2361,36 @@ async fn store_narrative(
     let embeddings_vec =
         tokio::task::spawn_blocking(move || emb.embed(&[narrative_owned.as_str()])).await??;
 
-    if let Some(embedding) = embeddings_vec.into_iter().next() {
-        let reflection_id = format!("ai_narrative_{conv_id}");
-        let tags = vec!["narrative_ai".to_string(), format!("conv_{conv_id}")];
+    let embedding = embeddings_vec
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("narrative embedding missing"))?;
+    let reflection_id = format!("ai_narrative_{conv_id}");
+    let tags = vec!["narrative_ai".to_string(), format!("conv_{conv_id}")];
 
-        // Only the frozen request manifest supports this output; a missing or
-        // partial manifest is Unknown, never today's re-read of the transcript.
-        let inputs = storage
-            .load_narrative_request_inputs(conv_id)
-            .unwrap_or_else(|_| {
-                crate::storage::artifact_provenance::InputEnvelope::new(vec![
-                    crate::storage::artifact_provenance::ArtifactInput::unknown(
-                        "narrative request manifest unavailable",
-                    ),
-                ])
-            });
-        storage.insert_derived_reflection(&reflection_id, narrative, &tags, &embedding, &inputs)?;
-        let mut idx = search.write().await;
-        idx.insert_reflection(reflection_id.clone(), embedding);
+    // Only the frozen request manifest supports this output; a missing or
+    // partial manifest is Unknown, never today's re-read of the transcript.
+    let inputs = storage
+        .load_narrative_request_inputs(conv_id)
+        .unwrap_or_else(|_| {
+            crate::storage::artifact_provenance::InputEnvelope::new(vec![
+                crate::storage::artifact_provenance::ArtifactInput::unknown(
+                    "narrative request manifest unavailable",
+                ),
+            ])
+        });
+    storage.insert_derived_reflection(&reflection_id, narrative, &tags, &embedding, &inputs)?;
+    let mut idx = search.write().await;
+    idx.insert_reflection(reflection_id.clone(), embedding);
 
-        // Supersede Layer 2: delete V3 extraction reflection if it exists
-        if let Ok(Some(old_id)) = storage.get_enrichment_reflection_id(conv_id, "extracted_v3") {
-            let _ = storage.delete_reflection(&old_id);
-            idx.remove_reflection(&old_id);
-        }
-
-        storage.mark_enrichment_completed(conv_id, "ai_narrative", &reflection_id)?;
-        tracing::debug!(conv = %conv_id, "Layer 3 AI narrative stored (supersedes Layer 2)");
+    // Supersede Layer 2: delete V3 extraction reflection if it exists
+    if let Ok(Some(old_id)) = storage.get_enrichment_reflection_id(conv_id, "extracted_v3") {
+        let _ = storage.delete_reflection(&old_id);
+        idx.remove_reflection(&old_id);
     }
+
+    storage.mark_enrichment_completed(conv_id, "ai_narrative", &reflection_id)?;
+    tracing::debug!(conv = %conv_id, "Layer 3 AI narrative stored (supersedes Layer 2)");
 
     Ok(())
 }
@@ -3641,5 +3666,92 @@ mod tests {
                 "narrative prompt lost {retained}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod r4_daemon_audit_probes {
+
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test]
+    async fn round4_completed_batch_retries_after_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(&dir.path().join("db")).unwrap());
+        let conv = "r4-batch";
+        storage
+            .insert_chunk(
+                &crate::import::ConversationChunk {
+                    id: "r4-chunk".into(),
+                    conversation_id: conv.into(),
+                    project_name: "p".into(),
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                    content: "Keep the deployment frozen.".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: crate::provenance::Speaker::User,
+                    seq: 0,
+                    is_sidechain: false,
+                },
+                &vec![0.1; 384],
+            )
+            .unwrap();
+        storage
+            .upsert_import_state_explicit("r4.jsonl", conv, 1, "fixture")
+            .unwrap();
+        storage.set_batch_id(conv, "batch-r4", "hash").unwrap();
+        let client: Arc<dyn BatchClient> = Arc::new(crate::api::MockBatchClient {
+            batch_id: "batch-r4".into(),
+            results: vec![crate::api::types::BatchResultItem {
+                custom_id: conv.into(),
+                narrative: "The deployment remains frozen.".into(),
+            }],
+        });
+        let lock = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(16)));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let conversations = [(conv.into(), "r4.jsonl".into())];
+        let mut poll = Box::pin(poll_batch_results(
+            &storage,
+            &embeddings,
+            &search,
+            &client,
+            "batch-r4",
+            &conversations,
+            0,
+            &shutdown,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut poll)
+                .await
+                .is_err(),
+            "completed result must remain pending until it can be stored"
+        );
+        let snapshot = Storage::open_read_only(&dir.path().join("db")).unwrap();
+        assert_eq!(snapshot.count_reflection_embeddings().unwrap(), 0);
+        let state: String = snapshot
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT status FROM enrichment_state WHERE conversation_id = ?1",
+                    [conv],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(state, "processing");
+        drop(lock);
+        tokio::time::timeout(Duration::from_secs(10), poll)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.count_reflection_embeddings().unwrap(), 1);
+        assert_eq!(
+            storage
+                .get_enrichment_reflection_id(conv, "ai_narrative")
+                .unwrap()
+                .as_deref(),
+            Some("ai_narrative_r4-batch")
+        );
     }
 }

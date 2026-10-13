@@ -1070,6 +1070,7 @@ pub(crate) mod test_support {
             let reflections = storage.count_reflection_embeddings().unwrap();
             let index =
                 SearchEngine::load_from_disk(&data_dir.join("index-v3"), chunks, reflections)
+                    .unwrap()
                     .expect("published generation");
             let search = Arc::new(RwLock::new(index));
             let shutdown = Arc::new(AtomicBool::new(false));
@@ -1502,6 +1503,7 @@ mod tests {
             storage.count_chunk_embeddings().unwrap(),
             storage.count_reflection_embeddings().unwrap(),
         )
+        .unwrap()
         .unwrap();
         let search = Arc::new(RwLock::new(index));
         let shutdown = Arc::new(AtomicBool::new(false));

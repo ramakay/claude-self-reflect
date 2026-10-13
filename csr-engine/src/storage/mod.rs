@@ -28,7 +28,7 @@ pub use queries::{
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
@@ -76,14 +76,20 @@ struct GuardedConnection {
 }
 
 impl GuardedConnection {
+    // Outer None is contention; inner None means this store needs no lock.
+    fn try_operation_lock(&self) -> Result<Option<Option<crate::maintenance::SharedLock>>> {
+        match self.data_dir.as_deref() {
+            None => Ok(Some(None)),
+            Some(dir) => match &self.maintenance {
+                Some(owner) => Ok(Some(Some(owner.operation(dir)?))),
+                None => Ok(crate::maintenance::try_shared(dir)?.map(Some)),
+            },
+        }
+    }
+
     fn operation_lock(&self) -> Result<Option<crate::maintenance::SharedLock>> {
-        self.data_dir
-            .as_deref()
-            .map(|dir| match &self.maintenance {
-                Some(owner) => owner.operation(dir),
-                None => crate::maintenance::shared(dir),
-            })
-            .transpose()
+        self.try_operation_lock()?
+            .context("maintenance in progress, retry when it ends")
     }
 
     fn lock(&self) -> Result<LockedConnection<'_>> {
@@ -119,6 +125,12 @@ impl std::ops::DerefMut for LockedConnection<'_> {
 }
 
 impl Storage {
+    pub(crate) fn try_operation_lock(
+        &self,
+    ) -> Result<Option<Option<crate::maintenance::SharedLock>>> {
+        self.conn.try_operation_lock()
+    }
+
     /// Hold shared exclusion for an entire operation, including its index updates.
     pub(crate) fn operation_lock(&self) -> Result<Option<crate::maintenance::SharedLock>> {
         self.conn.operation_lock()
@@ -867,10 +879,12 @@ impl Storage {
             pct,
             last_measured: chrono::Utc::now().to_rfc3339(),
         };
-        self.set_meta(
-            CONTAMINATION_META_KEY,
-            &serde_json::to_string(&measurement)?,
-        )?;
+        if !self.with_connection(|conn| Ok(conn.is_readonly("main")?))? {
+            self.set_meta(
+                CONTAMINATION_META_KEY,
+                &serde_json::to_string(&measurement)?,
+            )?;
+        }
         Ok(measurement)
     }
 
@@ -1404,8 +1418,10 @@ impl Storage {
         }
 
         let ok = self.integrity_check()?;
-        self.set_meta("integrity_ok", if ok { "1" } else { "0" })?;
-        self.set_meta("integrity_checked_at", &chrono::Utc::now().to_rfc3339())?;
+        if !self.with_connection(|conn| Ok(conn.is_readonly("main")?))? {
+            self.set_meta("integrity_ok", if ok { "1" } else { "0" })?;
+            self.set_meta("integrity_checked_at", &chrono::Utc::now().to_rfc3339())?;
+        }
         Ok(ok)
     }
 
@@ -3744,5 +3760,96 @@ mod maintenance_probes {
             .insert_reflection("late-hook", "retry", &[], &vec![0.1; 384])
             .unwrap();
         assert_eq!(storage.count_reflection_embeddings().unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod r4_cost_probes {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    #[ignore = "manual release cost measurement"]
+    fn r4_lock_microbench() {
+        let t = tempfile::tempdir().unwrap();
+        for mode in [
+            "shared",
+            "nested_shared",
+            "get_meta_guarded",
+            "get_meta_unguarded",
+        ] {
+            let mut s = Storage::open(&t.path().join("micro.db")).unwrap();
+            s.set_meta("r4", "value").unwrap();
+            if mode == "get_meta_unguarded" {
+                s.conn.data_dir = None;
+            }
+            let _outer = if mode == "nested_shared" {
+                Some(crate::maintenance::shared(t.path()).unwrap())
+            } else {
+                None
+            };
+            let mut samples = Vec::new();
+            for _ in 0..10 {
+                let start = Instant::now();
+                for _ in 0..10000 {
+                    if mode.contains("get_meta") {
+                        std::hint::black_box(s.get_meta("r4").unwrap());
+                    } else {
+                        std::hint::black_box(crate::maintenance::shared(t.path()).unwrap());
+                    }
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1e6 / 10000.);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "R4_MICRO mode={mode} p50_us={:.3} max_batch_us={:.3}",
+                samples[5], samples[9]
+            );
+        }
+    }
+    #[test]
+    #[ignore = "manual release cost measurement"]
+    fn r4_storage_bulk_cost() {
+        let text="The import operation preserves the original personal message, records its source, and updates the search vector atomically. The test exercises a realistic transcript row and durable provenance. ".repeat(4);
+        for trial in 0..4 {
+            for guarded in if trial % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let t = tempfile::tempdir().unwrap();
+                let mut s = Storage::open(&t.path().join("bulk.db")).unwrap();
+                if !guarded {
+                    s.conn.data_dir = None;
+                }
+                let _outer = crate::maintenance::shared(t.path()).unwrap();
+                let start = Instant::now();
+                for i in 0..20000 {
+                    let c = crate::import::ConversationChunk {
+                        id: format!("c{i}"),
+                        conversation_id: format!("conv{}", i / 50),
+                        project_name: "r4".into(),
+                        timestamp: "2026-09-01T00:00:00Z".into(),
+                        content: text.clone(),
+                        message_count: 1,
+                        summary: None,
+                        author: crate::provenance::Speaker::User,
+                        seq: i % 50,
+                        is_sidechain: false,
+                    };
+                    s.insert_chunk_with_source(&c, &vec![0.1; 384], "conversation")
+                        .unwrap();
+                    s.insert_chunk_provenance(
+                        &c.id,
+                        &crate::provenance::ChunkProvenance {
+                            author: c.author,
+                            source_conv_id: c.conversation_id.clone(),
+                            supersedes: None,
+                        },
+                    )
+                    .unwrap();
+                }
+                println!("R4_BULK trial={trial} guarded={guarded} rows=20000 bytes_per_row={} elapsed_ms={:.3}",text.len(),start.elapsed().as_secs_f64()*1e3);
+            }
+        }
     }
 }

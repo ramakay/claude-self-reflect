@@ -536,28 +536,19 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
 /// Start of an optional quote marker and single hotkey digit before a header.
 /// A multi-digit number belongs to the person and is preserved whole.
 fn forward_prefix_start(piece: &str) -> usize {
-    let trimmed = piece.trim_end();
-    let digit_start = trimmed.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-    let digits = trimmed.len() - digit_start;
-    if digits > 1 {
-        return piece.len();
-    }
-    let mut cut = digit_start;
-    let mut marker = false;
-    loop {
-        cut = piece[..cut].trim_end().len();
-        if piece[..cut].ends_with('>') {
-            cut -= 1;
-            marker = true;
-        } else {
-            break;
+    let mut digits = 0;
+    for ch in piece.chars() {
+        if ch.is_ascii_digit() {
+            digits += 1;
+        } else if ch != '>' && !ch.is_whitespace() {
+            return piece.len();
         }
     }
-    if digits == 1 && !marker && cut == digit_start && cut > 0 {
-        // A digit attached to a word is not a band hotkey.
-        return piece.len();
+    if digits <= 1 {
+        0
+    } else {
+        piece.len()
     }
-    cut
 }
 
 /// A forward's byte range, and whether its end relies on the message ending.

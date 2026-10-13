@@ -35,7 +35,7 @@ cp ~/.claude-self-reflect/csr-engine.db ~/.claude-self-reflect/backup.db
 ### Reset
 ```bash
 rm ~/.claude-self-reflect/csr-engine.db
-rm -rf ~/.claude-self-reflect/index/
+rm -rf ~/.claude-self-reflect/index-v3/
 csr-engine setup
 ```
 

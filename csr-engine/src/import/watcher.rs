@@ -207,6 +207,53 @@ fn defer_maintenance_batch(
     }
 }
 
+struct BatchOperation {
+    _heavy_permit: Option<OwnedSemaphorePermit>,
+    _maintenance: Option<crate::maintenance::SharedLock>,
+}
+
+async fn prepare_batch_operation(
+    storage: &Storage,
+    heavy_work: Option<&Arc<Semaphore>>,
+    pending: &HashSet<PathBuf>,
+    retries: &mut HashMap<PathBuf, RetryState>,
+) -> Option<BatchOperation> {
+    // Waiting for daemon heavy work must not pin maintenance ownership.
+    let permit = match heavy_work {
+        Some(heavy_work) => Some(acquire_heavy_work_permit(heavy_work.clone()).await),
+        None => None,
+    };
+    match storage.try_operation_lock() {
+        Ok(Some(operation)) => Some(BatchOperation {
+            _heavy_permit: permit,
+            _maintenance: operation,
+        }),
+        Ok(None) => {
+            tracing::debug!("maintenance in progress; watcher batch deferred");
+            defer_maintenance_batch(pending.iter().cloned(), retries);
+            None
+        }
+        Err(error) => {
+            for path in pending {
+                let entry = retries.entry(path.clone()).or_insert(RetryState {
+                    attempts: 0,
+                    next_at: tokio::time::Instant::now(),
+                });
+                entry.attempts += 1;
+                tracing::warn!(file = %path.display(), attempts = entry.attempts, %error, "watcher maintenance lock failed");
+                if entry.attempts as usize > BUSY_RETRY_BACKOFF_SECS.len() {
+                    tracing::warn!(file = %path.display(), "giving up after maintenance lock errors");
+                    retries.remove(path);
+                } else {
+                    entry.next_at = tokio::time::Instant::now()
+                        + Duration::from_secs(BUSY_RETRY_BACKOFF_SECS[entry.attempts as usize - 1]);
+                }
+            }
+            None
+        }
+    }
+}
+
 /// The earliest `next_at` across every path still pending retry, or `None`
 /// when nothing is queued — the watcher loop's `tokio::select!` sleeps until
 /// this so a due retry runs even without a fresh notify event.
@@ -394,17 +441,15 @@ impl FileWatcher {
 
             // Process all pending files
             if !pending.is_empty() {
-                let _operation = match self.storage.operation_lock() {
-                    Ok(lock) => lock,
-                    Err(error) => {
-                        tracing::debug!(%error, "maintenance in progress; watcher batch deferred");
-                        defer_maintenance_batch(pending, &mut retry_map);
-                        continue;
-                    }
-                };
-                let _heavy_permit = match &self.heavy_work {
-                    Some(heavy_work) => Some(acquire_heavy_work_permit(heavy_work.clone()).await),
-                    None => None,
+                let Some(_operation) = prepare_batch_operation(
+                    &self.storage,
+                    self.heavy_work.as_ref(),
+                    &pending,
+                    &mut retry_map,
+                )
+                .await
+                else {
+                    continue;
                 };
                 tracing::info!(count = pending.len(), "processing new/modified JSONL files");
                 let outcome = process_batch(
@@ -1156,6 +1201,63 @@ mod tests {
 
 #[cfg(test)]
 mod maintenance_probes {
+    #[tokio::test]
+    async fn round4_watcher_lock_errors_consume_retry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db")).unwrap();
+        std::fs::remove_file(dir.path().join(crate::maintenance::LOCK_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(crate::maintenance::LOCK_FILE)).unwrap();
+        let path = dir.path().join("session.jsonl");
+        let pending = HashSet::from([path.clone()]);
+        let mut retries = HashMap::new();
+        for attempts in 1..=BUSY_RETRY_BACKOFF_SECS.len() {
+            assert!(
+                prepare_batch_operation(&storage, None, &pending, &mut retries)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(retries[&path].attempts as usize, attempts);
+        }
+        assert!(
+            prepare_batch_operation(&storage, None, &pending, &mut retries)
+                .await
+                .is_none()
+        );
+        assert!(!retries.contains_key(&path));
+    }
+
+    #[tokio::test]
+    async fn round4_watcher_waits_for_permit_before_maintenance_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db")).unwrap();
+        let heavy = Arc::new(Semaphore::new(0));
+        let pending = HashSet::from([dir.path().join("session.jsonl")]);
+        let mut retries = HashMap::new();
+        let mut prepare = Box::pin(prepare_batch_operation(
+            &storage,
+            Some(&heavy),
+            &pending,
+            &mut retries,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut prepare)
+                .await
+                .is_err()
+        );
+        assert!(crate::maintenance::try_shared(dir.path())
+            .unwrap()
+            .is_some());
+        // An exclusive owner can enter while the watcher waits for heavy work.
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        heavy.add_permits(1);
+        assert!(prepare.await.is_none());
+        assert_eq!(retries.values().next().unwrap().attempts, 0);
+        drop(owner);
+        let operation =
+            prepare_batch_operation(&storage, Some(&heavy), &pending, &mut retries).await;
+        assert!(operation.is_some());
+    }
+
     use super::*;
 
     #[tokio::test(start_paused = true)]

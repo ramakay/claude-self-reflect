@@ -75,6 +75,6 @@ csr-engine quality src/main.rs
 | Path | Contents |
 |------|----------|
 | ~/.claude-self-reflect/csr-engine.db | SQLite database |
-| ~/.claude-self-reflect/index/ | HNSW cache |
+| ~/.claude-self-reflect/index-v3/ | HNSW cache |
 | ~/.claude-self-reflect/hook-timing.log | Hook performance |
 | ~/.local/bin/csr-engine | Binary |

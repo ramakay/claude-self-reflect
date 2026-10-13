@@ -38,8 +38,8 @@ async fn main() -> Result<()> {
     let chunks = storage.count_chunk_embeddings()?;
     let reflections = storage.count_reflection_embeddings()?;
     let started = Instant::now();
-    let search =
-        SearchEngine::load_from_disk(&index, chunks, reflections).context("index cache missing")?;
+    let search = SearchEngine::load_from_disk(&index, chunks, reflections)?
+        .context("index cache missing")?;
     let load_ms = started.elapsed().as_millis();
     let embeddings = Arc::new(EmbeddingEngine::new()?);
     embeddings.warm()?;

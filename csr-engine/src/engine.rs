@@ -190,14 +190,18 @@ impl Engine {
         let mut index_freshly_rebuilt = false;
         let mut startup_backfill = (0, 0);
         let cached = if persist {
-            load_reconciled(&storage, &index_dir, chunk_count, reflection_count, true)
+            load_reconciled(&storage, &index_dir, chunk_count, reflection_count, true)?
         } else {
-            SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count).map(|search| {
-                LoadedIndex {
-                    search,
-                    chunks_added: 0,
-                    reflections_added: 0,
-                }
+            SearchEngine::load_from_disk_with_budget(
+                &index_dir,
+                chunk_count,
+                reflection_count,
+                std::time::Duration::from_millis(100),
+            )?
+            .map(|search| LoadedIndex {
+                search,
+                chunks_added: 0,
+                reflections_added: 0,
             })
         };
         let search = if let Some(loaded) = cached {
@@ -317,9 +321,8 @@ impl Engine {
                 .truncate(false)
                 .open(index_dir.join("index.lock"))
             {
-                if fs2::FileExt::lock_exclusive(&lock_file).is_ok() {
-                    crate::search::cleanup_stale_index_files(&index_dir);
-                }
+                crate::search::lock_index(&lock_file, true, crate::search::INDEX_LOCK_TIMEOUT)?;
+                crate::search::cleanup_stale_index_files(&index_dir);
                 // lock released on drop
             }
         }
@@ -1074,7 +1077,7 @@ pub(crate) fn load_reconciled(
     chunk_count: usize,
     reflection_count: usize,
     persist: bool,
-) -> Option<LoadedIndex> {
+) -> Result<Option<LoadedIndex>> {
     load_reconciled_expecting(
         storage,
         index_dir,
@@ -1094,11 +1097,14 @@ fn load_reconciled_expecting(
     reflection_count: usize,
     persist: bool,
     expected: Option<&(String, String)>,
-) -> Option<LoadedIndex> {
-    let _operation = storage.publication_lock(index_dir).ok()?;
-    let mut search = SearchEngine::load_from_disk(index_dir, chunk_count, reflection_count)?;
+) -> Result<Option<LoadedIndex>> {
+    let _operation = storage.publication_lock(index_dir)?;
+    let Some(mut search) = SearchEngine::load_from_disk(index_dir, chunk_count, reflection_count)?
+    else {
+        return Ok(None);
+    };
     if expected.is_some_and(|expected| search.published_basenames() != Some(expected)) {
-        return None;
+        return Ok(None);
     }
     let mut chunks_added = 0usize;
     let mut reflections_added = 0usize;
@@ -1201,11 +1207,11 @@ fn load_reconciled_expecting(
     // daemon's compaction loop may swap in concurrently. See
     // `clear_reconciliation_dirty`'s doc comment (WP-D medium #2).
     search.clear_reconciliation_dirty();
-    Some(LoadedIndex {
+    Ok(Some(LoadedIndex {
         search,
         chunks_added,
         reflections_added,
-    })
+    }))
 }
 
 /// Daemon only: replace the in-memory index with the generation it just
@@ -1229,6 +1235,7 @@ pub(crate) fn remap_published_generation(
     search: &RwLock<SearchEngine>,
     index_dir: &Path,
 ) -> Result<bool> {
+    // Includes reconciliation's needs_compaction marker and the final swap.
     let _operation = storage.publication_lock(index_dir)?;
     let (expected, generation) = {
         let index = search.blocking_read();
@@ -1247,7 +1254,8 @@ pub(crate) fn remap_published_generation(
         reflection_count,
         true,
         Some(&expected),
-    ) else {
+    )?
+    else {
         return Ok(false);
     };
     if !loaded.search.is_mapped() {
@@ -1712,16 +1720,16 @@ mod tests {
         let dir = tmp.path();
         graph_with_x(0).dump_to_disk(dir, 41, 0).unwrap();
         let old_manifest = std::fs::read(dir.join("manifest.json")).unwrap();
-        let mut peer = SearchEngine::load_from_disk(dir, 41, 0).unwrap();
+        let mut peer = SearchEngine::load_from_disk(dir, 41, 0).unwrap().unwrap();
         crate::search::invalidate_for_maintenance(dir).unwrap();
         // An older binary, blind to the generation, puts the pre-pass manifest back.
         std::fs::write(dir.join("manifest.json"), old_manifest).unwrap();
-        assert!(SearchEngine::load_from_disk(dir, 41, 0).is_none());
+        assert!(SearchEngine::load_from_disk(dir, 41, 0).unwrap().is_none());
         // A peer of this binary loaded before the pass flushes: it must not
         // relabel those files current.
         peer.insert_chunk("y".into(), axis(2));
         peer.dump_to_disk(dir, 42, 0).unwrap();
-        assert!(SearchEngine::load_from_disk(dir, 42, 0).is_none());
+        assert!(SearchEngine::load_from_disk(dir, 42, 0).unwrap().is_none());
     }
 
     #[test]
@@ -1740,7 +1748,7 @@ mod tests {
         // The delayed rebuild finishes: refused, nothing written.
         let error = delayed.dump_to_disk(dir, 41, 0).unwrap_err();
         assert!(crate::search::crossed_maintenance(&error), "{error:#}");
-        let loaded = SearchEngine::load_from_disk(dir, 41, 0).unwrap();
+        let loaded = SearchEngine::load_from_disk(dir, 41, 0).unwrap().unwrap();
         assert_eq!(
             loaded
                 .search_chunks(&axis(1), 1, 0.99)
@@ -2558,12 +2566,16 @@ mod tests {
         bytes[middle] ^= 0x01;
         std::fs::write(data, bytes).unwrap();
         crate::search::HNSW_LOAD_CALLS.with(|calls| calls.set(0));
-        assert!(SearchEngine::load_from_disk(&index_dir, 32, 0).is_none());
+        assert!(SearchEngine::load_from_disk(&index_dir, 32, 0)
+            .unwrap()
+            .is_none());
         let engine = Engine::new(&db, &projects).unwrap();
         assert!(engine.index_freshly_rebuilt());
         assert_eq!(engine.search.blocking_read().chunk_count(), 32);
         crate::search::HNSW_LOAD_CALLS.with(|calls| assert_eq!(calls.get(), 0));
-        assert!(SearchEngine::load_from_disk(&index_dir, 32, 0).is_some());
+        assert!(SearchEngine::load_from_disk(&index_dir, 32, 0)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -2683,6 +2695,53 @@ mod tests {
 
 #[cfg(test)]
 mod maintenance_probes {
+    #[test]
+    fn round4_startup_index_timeout_releases_maintenance_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        drop(Storage::open(&db).unwrap());
+        let index = dir.path().join("index-v3");
+        std::fs::create_dir(&index).unwrap();
+        let held = std::fs::File::create(index.join("index.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+        // Release even on old code, so a regression fails instead of hanging.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let result = Engine::new(&db, &dir.path().join("projects"));
+        let elapsed = started.elapsed();
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path());
+        releaser.join().unwrap();
+        let error = result.err().expect("busy index must time out, not rebuild");
+        assert!(error.to_string().contains("timed out acquiring index.lock"));
+        assert!(
+            elapsed < std::time::Duration::from_millis(11500),
+            "{elapsed:?}"
+        );
+        assert!(owner.is_ok());
+    }
+
+    #[test]
+    fn round4_remap_cannot_write_marker_during_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("db")).unwrap();
+        let index = dir.path().join("index-v3");
+        let mut search = SearchEngine::new(16);
+        for i in 0..4 {
+            search.insert_chunk(format!("orphan-{i}"), vec![0.1; 384]);
+        }
+        search.dump_to_disk(&index, 4, 0).unwrap();
+        let search = RwLock::new(search);
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        assert!(remap_published_generation(&storage, &search, &index).is_err());
+        assert!(!index.join("needs_compaction").exists());
+        drop(owner);
+        remap_published_generation(&storage, &search, &index).unwrap();
+        assert!(index.join("needs_compaction").exists());
+    }
+
     use super::*;
 
     #[test]

@@ -877,7 +877,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         });
     }
 
-    let storage = Storage::open(db_path)?;
+    let storage = Storage::open_read_only(db_path)?;
     let narratives = gather_narratives(&storage);
 
     let conversations = storage.count_conversations().unwrap_or(0);
@@ -2235,6 +2235,23 @@ mod tests {
             value["trained_rerank"]["cluster_receipts"][0]["distinct_session_count"],
             2
         );
+    }
+
+    #[test]
+    fn round4_status_reads_during_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        drop(Storage::open(&db).unwrap());
+        let _owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        for deep in [false, true] {
+            let report = gather_status(&db, dir.path(), deep).unwrap();
+            assert_eq!(report.maintenance.as_ref().unwrap().pid, std::process::id());
+            assert!(format_compact(&report, 0).contains("maintenance (pid"));
+            assert!(report.healthy);
+        }
+        let reader = Storage::open_read_only(&db).unwrap();
+        assert!(reader.get_meta("integrity_checked_at").unwrap().is_none());
+        assert!(reader.cached_contamination().unwrap().is_none());
     }
 
     #[test]

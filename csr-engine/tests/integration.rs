@@ -2123,7 +2123,9 @@ fn test_hnsw_persistence_roundtrip() {
     let results_before = engine.search_chunks(&query, 3, 0.0);
 
     // Load from disk
-    let loaded = SearchEngine::load_from_disk(&index_dir, 50, 5).unwrap();
+    let loaded = SearchEngine::load_from_disk(&index_dir, 50, 5)
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.chunk_count(), 50);
     assert_eq!(loaded.reflection_count(), 5);
 
@@ -2151,7 +2153,7 @@ fn test_hnsw_stale_index_detection() {
 
     // DB grew since the dump (additive drift) — cache loads so Engine::new can
     // incrementally backfill the new rows instead of doing a full rebuild.
-    let result = SearchEngine::load_from_disk(&index_dir, 15, 0);
+    let result = SearchEngine::load_from_disk(&index_dir, 15, 0).unwrap();
     assert!(
         result.is_some(),
         "additive drift should load the cache (backfill), not rebuild"
@@ -2163,14 +2165,14 @@ fn test_hnsw_stale_index_detection() {
     // cached-load branch reconciles the vanished ids via
     // `blank_orphan_chunks`/`blank_orphan_reflections`, and `search_index`
     // overfetches past the resulting tombstones.
-    let result = SearchEngine::load_from_disk(&index_dir, 5, 0);
+    let result = SearchEngine::load_from_disk(&index_dir, 5, 0).unwrap();
     assert!(
         result.is_some(),
         "negative drift should load the cache, not force an inline rebuild"
     );
 
     // Exact match should work
-    let result = SearchEngine::load_from_disk(&index_dir, 10, 0);
+    let result = SearchEngine::load_from_disk(&index_dir, 10, 0).unwrap();
     assert!(result.is_some(), "should accept matching cache");
 }
 
@@ -2181,7 +2183,7 @@ fn test_hnsw_missing_files_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let nonexistent = dir.path().join("nonexistent_index");
 
-    let result = SearchEngine::load_from_disk(&nonexistent, 100, 10);
+    let result = SearchEngine::load_from_disk(&nonexistent, 100, 10).unwrap();
     assert!(result.is_none(), "should return None for missing directory");
 }
 
@@ -2208,7 +2210,9 @@ fn test_hnsw_persistence_soft_delete() {
     engine.dump_to_disk(&index_dir, 0, 5).unwrap();
 
     // Load expects DB counts to match manifest
-    let loaded = SearchEngine::load_from_disk(&index_dir, 0, 5).unwrap();
+    let loaded = SearchEngine::load_from_disk(&index_dir, 0, 5)
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.reflection_count(), 4);
 
     // Searching should not return the removed reflection
@@ -2241,7 +2245,7 @@ fn test_hnsw_cached_load_timing() {
 
     // Time the cached load
     let start = std::time::Instant::now();
-    let loaded = SearchEngine::load_from_disk(&index_dir, 1000, 0);
+    let loaded = SearchEngine::load_from_disk(&index_dir, 1000, 0).unwrap();
     let elapsed = start.elapsed();
 
     assert!(loaded.is_some(), "cached load should succeed");
