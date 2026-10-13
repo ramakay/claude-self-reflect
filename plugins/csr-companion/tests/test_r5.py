@@ -10,10 +10,18 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def unavailable(reason):
+    """No node or no TypeScript compiler: a skip on a laptop, a failure in CI, where a skip would pass a job that ran
+    none of the hook regressions (Codex review of the imported plugin, #3). GitHub Actions sets CI=true."""
+    if os.environ.get('CI'):
+        pytest.fail(f'{reason}; CI installs a pinned typescript before pytest (.github/workflows/ci.yml)', pytrace=False)
+    pytest.skip(reason)
+
+
 @pytest.fixture(scope='module')
 def typescript():
     if not shutil.which('node'):
-        pytest.skip('Node is unavailable')
+        unavailable('Node is unavailable')
     candidates = [parent / 'node_modules/typescript/lib/typescript.js' for parent in ROOT.parents]
     if shutil.which('npm'):
         found = subprocess.run(['npm', 'root', '-g'], capture_output=True, text=True, check=True)
@@ -24,7 +32,7 @@ def typescript():
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    pytest.skip('An installed TypeScript compiler is unavailable')
+    unavailable('An installed TypeScript compiler is unavailable')
 
 
 def probe(typescript, name):
