@@ -897,16 +897,7 @@ async fn run(
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
-        // The daemon owns the generation on disk: what startup reconciliation
-        // added on top of it counts toward the daemon's dump budget, so a
-        // backlog left by a crash is written back instead of re-backfilled
-        // by every loader until enough new content arrives.
-        let (chunks_added, reflections_added) = eng.startup_backfill();
-        eng.search()
-            .write()
-            .await
-            .note_unpublished(chunks_added, reflections_added);
+        let eng = engine::Engine::new_for_daemon(&args.db_path, &args.projects_dir).await?;
         // The daemon embeds on its very first extraction tick (no initial
         // sleep) — warm the model now, synchronously, instead of paying
         // the load on that first tick with no log line to explain the

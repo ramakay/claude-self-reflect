@@ -113,6 +113,34 @@ impl Engine {
         Self::new_with_persistence(db_path, projects_dir, true)
     }
 
+    /// The daemon's engine: [`Self::new`], then two things only the owner
+    /// of the generation on disk does. What startup reconciliation added on
+    /// top of the loaded generation counts toward the dump budget, so a
+    /// backlog left by a crash is written back instead of re-backfilled by
+    /// every loader until enough new content arrives. And a cache miss that
+    /// rebuilt and published the index from SQLite is remapped from that
+    /// publication, so the daemon does not keep ~1.1 GB of heap vector
+    /// copies of what it just wrote (review finding #9).
+    pub async fn new_for_daemon(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        let engine = Self::new(db_path, projects_dir)?;
+        let (chunks_added, reflections_added) = engine.startup_backfill();
+        engine
+            .search
+            .write()
+            .await
+            .note_unpublished(chunks_added, reflections_added);
+        if engine.index_freshly_rebuilt {
+            match engine.remap_published().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!("startup rebuild kept on the heap (no mapped publication)")
+                }
+                Err(error) => tracing::warn!(%error, "startup remap failed (non-fatal)"),
+            }
+        }
+        Ok(engine)
+    }
+
     /// Search-capable hook engine: load/reconcile in memory, never publish or
     /// clean up the daemon-owned index, including on a cache miss.
     pub fn new_for_hook(db_path: &Path, projects_dir: &Path) -> Result<Self> {
@@ -1566,6 +1594,30 @@ mod tests {
                 .collect();
             assert_eq!(unchanged, expected[..unchanged.len()].to_vec(), "query {q}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_daemon_that_rebuilt_at_startup_serves_the_rebuild_mapped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = tmp.path().join("csr-engine.db");
+        let projects = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        {
+            let storage = Storage::open(&db).unwrap();
+            for i in 0..300 {
+                insert_direction(&storage, &format!("c{i}"), i);
+            }
+        }
+        // No cache: the engine rebuilds from SQLite and publishes.
+        let engine = Engine::new_for_daemon(&db, &projects).await.unwrap();
+        assert!(engine.index_freshly_rebuilt());
+        let index = engine.search().read().await;
+        assert!(
+            index.is_mapped(),
+            "served from the publication, not heap copies"
+        );
+        assert_eq!(index.chunk_count(), 300);
+        assert_eq!(index.search_chunks(&direction(42), 1, 0.99)[0].id, "c42");
     }
 
     #[test]
