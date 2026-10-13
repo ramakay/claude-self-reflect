@@ -1,0 +1,439 @@
+{
+ "cases": [
+  {
+   "chars": 73,
+   "cut": false,
+   "id": "card-done",
+   "producer": "compact_section",
+   "reason": "plugin_compaction_card",
+   "text": "CSR's compaction card (compacted by csr), quoted: “Context: 278k tokens.”"
+  },
+  {
+   "chars": 67,
+   "cut": false,
+   "id": "card-running",
+   "producer": "compact_section",
+   "reason": "plugin_compaction_card",
+   "text": "CSR's compaction card (compacting), quoted: “Summarizing 278k · w.”"
+  },
+  {
+   "chars": 82,
+   "cut": false,
+   "id": "card-skipped",
+   "producer": "compact_section",
+   "reason": "plugin_compaction_card",
+   "text": "CSR's compaction card (compaction skipped), quoted: “Did not run: a hook said no.”"
+  },
+  {
+   "chars": 268,
+   "cut": false,
+   "id": "card-skipped-long",
+   "producer": "compact_section",
+   "reason": "plugin_compaction_card",
+   "text": "CSR's compaction card (compaction skipped), quoted: “Did not run: The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span a….”"
+  },
+  {
+   "chars": 60,
+   "cut": false,
+   "id": "card-soon",
+   "producer": "compact_section",
+   "reason": "plugin_compaction_card",
+   "text": "CSR's compaction card (compacting soon), quoted: “278k · w.”"
+  },
+  {
+   "chars": 177,
+   "cut": false,
+   "id": "default-long-recap-last-1",
+   "producer": "page_default:last",
+   "reason": "plugin_last_session",
+   "text": "Last session 00000000 (“Fix scrub”): 12m active, 6 prompts, 1 compactions, last row 01-15 07:50. The rest of it: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 66,
+   "cut": false,
+   "id": "default-long-recap-todos-2",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Run the clone replay” (pending)."
+  },
+  {
+   "chars": 68,
+   "cut": false,
+   "id": "default-long-recap-todos-3",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "default-long-recap-told-0",
+   "producer": "page_default:told",
+   "reason": "plugin_recap_forward",
+   "text": "CSR's recap at the start of this session: recap [5h ago]: Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span ownership and keep every retained byte. Fix the importer span own… The rest: csr_reflect_on_past(\"conv_00000000-1111-4222-8…"
+  },
+  {
+   "chars": 368,
+   "cut": false,
+   "id": "default-long-title-last-1",
+   "producer": "page_default:last",
+   "reason": "plugin_last_session",
+   "text": "Last session 00000000 (“The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span a…”): 12m active, 6 prompts, 1 compactions, last row 01-15 07:50. The rest of it: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 66,
+   "cut": false,
+   "id": "default-long-title-todos-2",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Run the clone replay” (pending)."
+  },
+  {
+   "chars": 68,
+   "cut": false,
+   "id": "default-long-title-todos-3",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 90,
+   "cut": false,
+   "id": "default-long-title-told-0",
+   "producer": "page_default:told",
+   "reason": "plugin_recap_forward",
+   "text": "CSR's recap at the start of this session: recap [5h ago]: Fix the importer span ownership."
+  },
+  {
+   "chars": 177,
+   "cut": false,
+   "id": "default-recap-bare-last-1",
+   "producer": "page_default:last",
+   "reason": "plugin_last_session",
+   "text": "Last session 00000000 (“Fix scrub”): 12m active, 6 prompts, 1 compactions, last row 01-15 07:50. The rest of it: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 66,
+   "cut": false,
+   "id": "default-recap-bare-todos-2",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Run the clone replay” (pending)."
+  },
+  {
+   "chars": 68,
+   "cut": false,
+   "id": "default-recap-bare-todos-3",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 90,
+   "cut": false,
+   "id": "default-recap-bare-told-0",
+   "producer": "page_default:told",
+   "reason": "plugin_recap_forward",
+   "text": "CSR's recap at the start of this session: recap [5h ago]: Fix the importer span ownership."
+  },
+  {
+   "chars": 177,
+   "cut": false,
+   "id": "default-recap-full-last-1",
+   "producer": "page_default:last",
+   "reason": "plugin_last_session",
+   "text": "Last session 00000000 (“Fix scrub”): 12m active, 6 prompts, 1 compactions, last row 01-15 07:50. The rest of it: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 66,
+   "cut": false,
+   "id": "default-recap-full-todos-2",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Run the clone replay” (pending)."
+  },
+  {
+   "chars": 68,
+   "cut": false,
+   "id": "default-recap-full-todos-3",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 197,
+   "cut": false,
+   "id": "default-recap-full-told-0",
+   "producer": "page_default:told",
+   "reason": "plugin_recap_forward",
+   "text": "CSR's recap at the start of this session: recap [5h ago]: Fix the importer span ownership: Preserve owned spans (abc1234). The rest: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 196,
+   "cut": false,
+   "id": "default-recap-plain-last-1",
+   "producer": "page_default:last",
+   "reason": "plugin_last_session",
+   "text": "Last session 00000000 (“Fix “scrub” and the importer”): 12m active, 6 prompts, 1 compactions, last row 01-15 07:50. The rest of it: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 66,
+   "cut": false,
+   "id": "default-recap-plain-todos-2",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Run the clone replay” (pending)."
+  },
+  {
+   "chars": 68,
+   "cut": false,
+   "id": "default-recap-plain-todos-3",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 75,
+   "cut": false,
+   "id": "default-recap-plain-told-0",
+   "producer": "page_default:told",
+   "reason": "plugin_recap_forward",
+   "text": "CSR's recap at the start of this session: Welcome back. Nothing is pending."
+  },
+  {
+   "chars": 128,
+   "cut": false,
+   "id": "log-0",
+   "producer": "page_log",
+   "reason": "plugin_code_shift",
+   "text": "Since our past sessions, commit abc1234 “fix importer” (2026-10-13) changed code we worked on: import/mod.rs (sanitize_content)."
+  },
+  {
+   "chars": 127,
+   "cut": false,
+   "id": "log-1",
+   "producer": "page_log",
+   "reason": "plugin_code_shift",
+   "text": "Since our past sessions, commit 0123456 “tighten “scrub”” (2026-10-12) changed code we worked on: import/scrub.rs (whole file)."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "log-2",
+   "producer": "page_log",
+   "reason": "plugin_code_shift",
+   "text": "Since our past sessions, commit fedcba9 “a wide change” (2026-10-11) changed code we worked on: import/module_0.rs (symbol_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa), import/module_1.rs (symbol_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb), import/module_2.rs (sym…"
+  },
+  {
+   "chars": 169,
+   "cut": false,
+   "id": "lost-side",
+   "producer": "lost_asks",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Tidy” went quiet after 07:59. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line."
+  },
+  {
+   "chars": 231,
+   "cut": false,
+   "id": "lost-sub",
+   "producer": "lost_asks",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Tidy” went quiet after 07:59. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  {
+   "chars": 73,
+   "cut": false,
+   "id": "main-compacted-1",
+   "producer": "page_main:compacted",
+   "reason": "plugin_compaction_card",
+   "text": "CSR's compaction card (compacted by csr), quoted: “Context: 278k tokens.”"
+  },
+  {
+   "chars": 142,
+   "cut": false,
+   "id": "main-dreams-2",
+   "producer": "page_main:dreams",
+   "reason": "plugin_dream_forward",
+   "text": "CSR's dreamer asked this while you worked, quoted: “What if the pane said \"fresh\" first?” Its reasoning: “Say \"fresh\". It reads \" oddly. Two.”"
+  },
+  {
+   "chars": 191,
+   "cut": false,
+   "id": "main-lost-4",
+   "producer": "page_main:lost",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Run source-gone validation” went quiet after 07:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line."
+  },
+  {
+   "chars": 191,
+   "cut": false,
+   "id": "main-lost-4-side",
+   "producer": "page_main:lost:asks",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Run source-gone validation” went quiet after 07:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line."
+  },
+  {
+   "chars": 253,
+   "cut": false,
+   "id": "main-lost-4-sub",
+   "producer": "page_main:lost:asks",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Run source-gone validation” went quiet after 07:50. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  {
+   "chars": 405,
+   "cut": false,
+   "id": "main-lost-5",
+   "producer": "page_main:lost",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keep…” went quiet after 07:40. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line."
+  },
+  {
+   "chars": 405,
+   "cut": false,
+   "id": "main-lost-5-side",
+   "producer": "page_main:lost:asks",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keep…” went quiet after 07:40. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line."
+  },
+  {
+   "chars": 467,
+   "cut": false,
+   "id": "main-lost-5-sub",
+   "producer": "page_main:lost:asks",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keep…” went quiet after 07:40. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  {
+   "chars": 48,
+   "cut": false,
+   "id": "main-rules-6",
+   "producer": "page_main:rules",
+   "reason": "plugin_standing_rule",
+   "text": "A standing rule from sometime i: “Keep receipts”"
+  },
+  {
+   "chars": 56,
+   "cut": false,
+   "id": "main-rules-7",
+   "producer": "page_main:rules",
+   "reason": "plugin_standing_rule",
+   "text": "A standing rule from 10-13: “Never delete unproven text”"
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "main-rules-8",
+   "producer": "page_main:rules",
+   "reason": "plugin_standing_rule",
+   "text": "A standing rule from 10-12: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The …"
+  },
+  {
+   "chars": 103,
+   "cut": false,
+   "id": "main-story-0",
+   "producer": "page_main:story",
+   "reason": "plugin_session_story",
+   "text": "CSR's story of this session, rev 2, quoted: “We moved the \"queue\". The importer now keeps owned spans.”"
+  },
+  {
+   "chars": 122,
+   "cut": false,
+   "id": "reading-line",
+   "producer": "reading_items",
+   "reason": "plugin_pane_reading",
+   "text": "Earlier you read me this way: “Read the whole request as a plan to ship tonight”. Check that reading before relying on it."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "reading-line-long",
+   "producer": "reading_items",
+   "reason": "plugin_pane_reading",
+   "text": "Earlier you read me this way: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. Th…"
+  },
+  {
+   "chars": 86,
+   "cut": false,
+   "id": "reading-read-as",
+   "producer": "reading_items",
+   "reason": "plugin_pane_reading",
+   "text": "Earlier you read my “keep it” as “delete it”. Check that reading before relying on it."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "reading-read-as-long",
+   "producer": "reading_items",
+   "reason": "plugin_pane_reading",
+   "text": "Earlier you read my “keep it” as “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else.…"
+  },
+  {
+   "chars": 79,
+   "cut": false,
+   "id": "reading-unclear",
+   "producer": "reading_items",
+   "reason": "plugin_pane_reading",
+   "text": "Earlier you read my “dknr” as unclear. Check that reading before relying on it."
+  },
+  {
+   "chars": 45,
+   "cut": false,
+   "id": "recall-note-bare",
+   "producer": "recall_act",
+   "reason": "plugin_pane_recall",
+   "text": "CSR remembered: “Never delete unproven text”."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "recall-note-long",
+   "producer": "recall_act",
+   "reason": "plugin_pane_recall",
+   "text": "CSR remembered: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer kee…"
+  },
+  {
+   "chars": 84,
+   "cut": false,
+   "id": "recall-note-where",
+   "producer": "recall_act",
+   "reason": "plugin_pane_recall",
+   "text": "CSR remembered: “Use component ownership before chunking” (3 days ago · csr-engine)."
+  },
+  {
+   "chars": 164,
+   "cut": false,
+   "id": "recall-session",
+   "producer": "recall_act",
+   "reason": "plugin_pane_recall",
+   "text": "CSR remembered a past session: “Fix the scrub overmatch” (5 days ago · csr-engine). The rest of it: csr_reflect_on_past(\"conv_00000000-1111-4222-8333-444455556666\")"
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "recall-session-long",
+   "producer": "recall_act",
+   "reason": "plugin_pane_recall",
+   "text": "CSR remembered a past session: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. T…"
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "story-long-story-0",
+   "producer": "page_main:story",
+   "reason": "plugin_session_story",
+   "text": "CSR's story of this session, rev 11, quoted: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops …”"
+  }
+ ],
+ "generator": "plugins/csr-companion/tests/export-emissions.py",
+ "limits": {
+  "card": 1200,
+  "send": 700,
+  "story": 700
+ },
+ "schema": "pane-emissions-v1",
+ "source": {
+  "file": "plugins/csr-companion/bin/pane.py",
+  "sha256": "2cce5177eaf70259a9dca73d7e00a684482a25b9102d67aae830b1e586f3ebde"
+ }
+}
