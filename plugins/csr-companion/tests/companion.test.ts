@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
-import { canAfford, charge, facts, freshChapter, freshPace, median, owed, paceText, settle as settleTurn, spacing } from '../hooks/pace'
+import { canAfford, facts, freshChapter, freshPace, median, owed, paceText, spacing } from '../hooks/pace'
 const rankOfRoot = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1) // as register.tsx ranks a copy
 import { addTerm, AS_TEXT, commands, gitParse, gitVerdict, HOOKS_OFF, isBareDigit, mergeGuards, parseGuard, NO_VERIFY, PROTECTED, RELEASE, tripwire, UNRESOLVED } from '../hooks/coach'
 import type { Guard } from '../hooks/coach'
@@ -445,7 +445,7 @@ test('dreams are off by default, as You should know is: no look, however long Cl
   expect(said).toContain('/config')
 })
 
-test('on: the first look waits until Claude has spent 10 tokens for each one it costs; subagents count, and start no look', ON, async ($, on) => {
+test('on: the first look waits until Claude has spent 10 tokens for each one it costs; subagents do not count, and start no look', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   const band = await $.ui.mount(BAND)
   await steps($, 6) // 6 steps of Claude's: a look would be 1 in 6, over the share
@@ -455,13 +455,13 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   expect(seen.kept.slice(1)).toEqual([expect.objectContaining({ kind: 'look', outcome: 'budget', every: 6, session: 'sess-1' })])
   // both sides of the check: Claude's 6 steps against the next look's estimate (Claude's last step)
   expect(seen.kept[1]).toEqual(expect.objectContaining({ claude: 6 * LOOK, dreamer: 0, next: LOOK }))
-  await steps($, 12, 'sub-1') // a subagent's 12 steps: Claude's spend too, and no step of the chapter, no look
+  await steps($, 12, 'sub-1') // a subagent's 12 steps: not Claude's spend, no step of the chapter, no look
   await settle(() => false)
   expect(seen.forks).toEqual([])
   expect(seen.store.get('chapter:sess-1')).toEqual(expect.objectContaining({ steps: 6 }))
-  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ claude: 18 * LOOK }))
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ claude: 6 * LOOK }))
 
-  await steps($, 6) // 12 steps of the chapter: the subagent's spend has made the share room for it
+  await steps($, 6) // 12 steps: 1 in 12, within it
   await settle(async () => (await band.find({ text: /What if the notes also read/ })) !== undefined)
   expect(seen.forks.length).toBe(1)
   expect(seen.forks[0]).toContain(BRIEF)
@@ -469,7 +469,7 @@ test('on: the first look waits until Claude has spent 10 tokens for each one it 
   expect(seen.forks[0]).toContain('You should know')
   expect(await band.find({ text: /Dream · / })).toBeDefined()
   expect(await band.find({ type: 'Button', text: 'Already thought of it' })).toBeDefined()
-  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 24 * LOOK }))
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ looks: 1, dreams: 1, dreamer: LOOK, claude: 12 * LOOK }))
   // 4 left in the chapter, spread over the rest of a usual one: (120 - 12) / 4 = 27 steps
   expect(seen.kept.find(record => record.kind === 'dream')).toEqual(expect.objectContaining({
     line: DREAM_LINE, tokens: LOOK, session: 'sess-1', outcome: 'dream', left: 4, of: 5, every: 27,
@@ -2411,54 +2411,27 @@ function roomy(seen: ReturnType<typeof host>, pace: Partial<ReturnType<typeof fr
   seen.store.set(`pace:${SID}`, { ...freshPace(SID), claude: 5_000_000, step: LOOK, ...pace })
 }
 
-test('agent_usage_counts_once_without_advancing_chapter', ON, async ($, on) => {
+test('agent_usage_never_counts_towards_the_share_or_the_chapter', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true })
   await steps($, 2)
-  await steps($, 3, 'sub-1') // a subagent's three steps: all four counts of each, in Claude's spend
-  await steps($, 3, 'sub-1') // the same three again (a replay): charged once
+  await steps($, 3, 'sub-1') // a subagent's three steps: the dreamer reads the main conversation, so none of it is Claude's spend
+  await steps($, 3, 'sub-1') // and a replay changes nothing either
   await settle(() => false)
-  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK }))
+  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 2 * LOOK }))
   expect(seen.store.get(`chapter:${SID}`)).toEqual(expect.objectContaining({ steps: 2 })) // only Claude's own steps are the chapter's
   expect(seen.forks).toEqual([])
   expect(seen.kept.filter(record => record.kind === 'look')).toEqual([])
-  // the pure rule beneath it
-  const pace = freshPace(SID)
-  const once = charge(pace, '["a","t"]', 0, 100)
-  expect(charge(once, '["a","t"]', 0, 100)).toBe(once)
-  expect(charge(once, '["a","t"]', 1, 100).claude).toBe(200)
 })
 
-test('completion_usage_reconciles_without_double_counting', ON, async ($, on) => {
+test('completion_usage_never_counts_towards_the_share', ON, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true })
-  await steps($, 3, 'sub-1') // three steps seen: 3 * LOOK charged
-  await reported($, 'sub-1', 'turn-1', REPORT, { usage: AGENT_USAGE_5 }) // the turn's total is five steps': 2 * LOOK the steps never showed
+  await steps($, 3, 'sub-1')
+  await reported($, 'sub-1', 'turn-1', REPORT, { usage: AGENT_USAGE_5 }) // the turn's total: not Claude's spend either
+  await reported($, 'sub-1', 'turn-1', REPORT, { usage: AGENT_USAGE_5 })
+  await steps($, 5, 'sub-1')
   await settle(() => false)
-  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK }))
-  await reported($, 'sub-1', 'turn-1', REPORT, { usage: AGENT_USAGE_5 }) // reported twice: nothing more
-  await steps($, 5, 'sub-1') // late steps of a turn already settled add no tokens: they are in its total
-  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK }))
-  await reported($, 'sub-2', 'turn-1', REPORT, { usage: { ...AGENT_USAGE_5, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 10 } }) // a total under what was charged
-  expect(seen.store.get(`pace:${SID}`)).toEqual(expect.objectContaining({ claude: 5 * LOOK + 10 }))
-  expect(settleTurn(freshPace(SID), '["a","t"]', 50).claude).toBe(50)
-  expect(settleTurn(charge(freshPace(SID), '["a","t"]', 0, 80), '["a","t"]', 50).claude).toBe(80) // below what the steps charged: none
-})
-
-test('a fan-out of more than 60 open subagent turns evicts no receipt: the first one settles to its true total', () => {
-  const key = (n: number) => JSON.stringify([`agent-${n}`, 'turn'])
-  let pace = freshPace(SID)
-  for (let step = 0; step < 2; step++) for (let n = 0; n < 70; n++) pace = charge(pace, key(n), step, 10) // 70 turns, interleaved
-  expect(pace.claude).toBe(70 * 20)
-  pace = settleTurn(pace, key(0), 20) // the first turn's total is its two steps: nothing more
-  expect(pace.claude).toBe(70 * 20)
-  pace = settleTurn(pace, key(0), 25) // a total with 5 tokens the steps never showed: only those
-  expect(pace.claude).toBe(70 * 20 + 5)
-  // closed receipts are what is trimmed, oldest first, and an open one is never in their count
-  for (let n = 0; n < 70; n++) pace = settleTurn(pace, key(n), 20)
-  const kept = Object.values(pace.turns ?? {})
-  expect(kept.filter(receipt => receipt.closed).length).toBeLessThanOrEqual(60)
-  expect(pace.claude).toBe(70 * 20 + 5)
-  pace = charge(pace, key(69), 0, 10) // the newest closed receipt remembers its step
-  expect(pace.claude).toBe(70 * 20 + 5)
+  expect(seen.store.get(`pace:${SID}`)?.claude ?? 0).toBe(0)
+  expect(seen.store.get(`pace:${SID}`)?.turns).toBeUndefined()
 })
 
 // A report, the main session's next step and the 20 s timer all reach for it: one claim, one look, whatever the order.

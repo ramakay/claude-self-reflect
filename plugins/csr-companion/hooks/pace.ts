@@ -32,46 +32,6 @@ export type Pace = {
   dreams: number
   lastLook: number // tokens the last look cost: the estimate for the next
   step?: number // tokens the main session's last step spent: the estimate for a look no step of its own started
-  turns?: Record<string, Receipt> // what a subagent's turns have been charged, so a replay or a reload never charges twice
-}
-
-// What one subagent turn has been charged to `claude`: the step indexes charged, their tokens, and whether the turn's
-// own total (turn.complete's usage, a sum of its steps, not more usage) has been settled against them.
-export type Receipt = { tokens: number; steps: number[]; closed?: boolean }
-export const TURNS_KEPT = 60 // closed receipts kept (oldest go first): they only guard a late step or a second settle
-export const OPEN_KEPT = 1000 // a safety bound on receipts of turns that never closed; far above any fan-out
-
-// The pace with a subagent step's tokens charged to the main session's spend (the share is measured against everything
-// Claude spends), once: a step already charged changes nothing. After the turn's total was settled a late step adds no
-// tokens (they are in the total) but is remembered.
-export function charge(pace: Pace, turn: string, index: number, tokens: number): Pace {
-  const seen = pace.turns?.[turn]
-  if (seen?.steps.includes(index)) return pace
-  const add = seen?.closed ? 0 : Math.max(0, tokens)
-  const { [turn]: _old, ...others } = pace.turns ?? {}
-  const turns = { ...others, [turn]: { ...seen, tokens: (seen?.tokens ?? 0) + add, steps: [...(seen?.steps ?? []), index] } }
-  return { ...pace, claude: pace.claude + add, turns: keepTurns(turns) }
-}
-
-// turn.complete's usage is the turn's total, steps included. Only what the steps seen did not already charge is added
-// (steps the hooks never saw), never the total again; a total below what was charged adds nothing.
-export function settle(pace: Pace, turn: string, total: number): Pace {
-  const seen = pace.turns?.[turn]
-  const more = Math.max(0, total - (seen?.tokens ?? 0))
-  const { [turn]: _old, ...others } = pace.turns ?? {}
-  const turns = { ...others, [turn]: { tokens: (seen?.tokens ?? 0) + more, steps: seen?.steps ?? [], closed: true } }
-  return { ...pace, claude: pace.claude + more, turns: keepTurns(turns) }
-}
-
-// An open receipt is what stops settle() charging a turn's whole total again on top of its steps, so a fan-out of any width
-// keeps them all: only closed receipts are trimmed, oldest first (OPEN_KEPT is a bound for turns that never close).
-const keepTurns = (turns: Record<string, Receipt>) => {
-  const entries = Object.entries(turns)
-  const closed = entries.filter(([, receipt]) => receipt.closed)
-  const open = entries.filter(([, receipt]) => !receipt.closed).slice(-OPEN_KEPT)
-  const drop = new Set(closed.slice(0, Math.max(0, closed.length - TURNS_KEPT)).map(([key]) => key))
-  const keep = new Set([...open.map(([key]) => key), ...closed.map(([key]) => key)].filter(key => !drop.has(key)))
-  return Object.fromEntries(entries.filter(([key]) => keep.has(key)))
 }
 
 export const freshPace = (session: string): Pace => ({

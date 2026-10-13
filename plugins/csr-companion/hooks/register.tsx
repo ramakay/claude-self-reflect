@@ -7,7 +7,7 @@ import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
-import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, charge, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, settle, spacing } from './pace'
+import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
 import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, mergeGuards, parseGuard, protectedFromGit, reasonFor, UNRESOLVED } from './coach'
 import type { LeaseStep } from './dreamer'
@@ -1798,11 +1798,6 @@ export const register: Register = (on, options) => {
       // An agent's turn ends: a run of that agent. e.answer is its report (the hook result's text is not).
       if (await isPerson($).catch(() => false)) {
         await track($, { kind: 'complete', at: await $.clock.now(), agentId: e.agentId, turnId: e.turnId, reason: e.reason, answer: e.answer })
-        // The turn's total is its steps' sum: only what the steps seen did not charge is added.
-        if (dreamsOn && e.usage) {
-          const total = tokensOf(e.usage)
-          await changePace($, pace => settle(pace, JSON.stringify([e.agentId, e.turnId]), total)).catch(() => undefined)
-        }
         if (dreamsOn && e.reason === 'answer' && e.answer.trim() && (await admitted($, completionKey(await $.session.id(), e.agentId, e.turnId)))) {
           void armCompletions($, fleet).catch(() => undefined)
         }
@@ -1865,14 +1860,13 @@ export const register: Register = (on, options) => {
     const person = await isPerson($).catch(() => false)
     const spent = result?.usage ? tokensOf(result.usage) : 0
     if (e.agentId !== undefined) {
-      // A subagent's step: its tokens count towards what Claude spends (once: a replay is the same step), it is a row's
-      // activity, and that is all. It never counts as a step of the chapter and never starts a look of the main schedule.
+      // A subagent's step: a row's activity (its tokens show on its row), and that is all. The dreamer reads the main
+      // conversation, so its share is measured against that: a subagent's tokens are never Claude's spend here, and its
+      // step never counts as a step of the chapter nor starts a look of the main schedule.
       if (person) {
         const turn = result?.turnId ?? e.turnId
         const index = result?.index ?? e.index
         await track($, { kind: 'step', at: await $.clock.now(), agentId: e.agentId, turnId: turn, index, answer: result?.answer ?? '', tokens: spent })
-        const id = e.agentId
-        if (dreamsOn && spent) await changePace($, pace => charge(pace, JSON.stringify([id, turn]), index, spent)).catch(() => undefined)
       }
       return result
     }
