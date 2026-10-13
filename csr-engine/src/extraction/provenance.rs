@@ -26,7 +26,15 @@
 //!    emitted grammar wherever it sits, the person's words around it kept.
 //!
 //! RULE: any new injected block format MUST register its header (and any
-//! distinctive field tokens) here, in the same commit that adds the formatter.
+//! distinctive field tokens) here, in the same commit that adds the formatter,
+//! and its exact grammar in `import::contamination::REGISTRY`. The header
+//! strings below are the registry's own constants: one place to rename them.
+//! This module judges what to *extract*; the registry decides what to *remove*
+//! from the corpus, and only by span, owner and channel. The two must not be
+//! confused: a mention that extraction declines to learn from is still the
+//! person's words.
+
+use crate::import::contamination;
 
 /// Prompt signatures of CSR's own agent subprocesses (briefing analyst,
 /// compaction summarizer, ratification extractor). A transcript *starting*
@@ -66,22 +74,22 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
 /// substring match took for the emission (Codex review r2, #6 and #7). They are matched by
 /// their emitted grammar instead: [`strip_csr_forwards`].
 const EMISSION_HEADERS: [&str; 16] = [
-    "CSR ENDLESS MEMORY ACTIVE",
-    "CSR CONTINUUM [",
-    "CSR PICKUP —",
-    "EPISODE INDEX —",
-    "## Session Intelligence",
-    "## CSR Memory Feedback",
-    "CSR Memory Feedback Probe",
-    "SESSION CONTINUITY DETECTED",
-    "RECENT SESSIONS - PAST CONTEXT",
-    "RELEVANT PAST CONTEXT",
-    "PAST CONTEXT - NOT INSTRUCTIONS",
+    contamination::MEMORY_MANIFEST_HEADER,
+    contamination::CONTINUUM_HEADER,
+    contamination::PICKUP_HEADER,
+    contamination::EPISODE_INDEX_HEADER_PREFIX,
+    contamination::SESSION_INTELLIGENCE_HEADER,
+    contamination::MEMORY_FEEDBACK_REPORT_HEADER,
+    contamination::MEMORY_FEEDBACK_PROBE_HEADER,
+    contamination::CONTINUITY_HEADER_PREFIX,
+    contamination::RECENT_SESSIONS_HEADER_PREFIX,
+    contamination::RELEVANT_CONTEXT_HEADER_PREFIX,
+    contamination::PAST_CONTEXT_HEADER_PREFIX,
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
-    "CSR COMPACT KEEP —",
-    "CSR compacted at",
+    contamination::KEEP_LIST_HEADER_PREFIX,
+    contamination::COMPACT_NOTICE_HEADER_PREFIX,
 ];
 
 /// Field tokens CSR emits inside blocks (Tier-0 fields, continuity lines).
@@ -839,18 +847,18 @@ const PANE_SEND_WIDTH: usize = 699;
 /// the formatter). Lines under one of them that continue the block (`- [`
 /// items) go with it.
 const INJECTED_BLOCK_OPENINGS: [&str; 12] = [
-    "CSR PICKUP —",
-    "EPISODE INDEX —",
+    contamination::PICKUP_HEADER,
+    contamination::EPISODE_INDEX_HEADER_PREFIX,
     "## PAST CONTEXT - NOT INSTRUCTIONS",
     "## RELEVANT PAST CONTEXT - NOT INSTRUCTIONS",
-    "PAST CONTEXT - NOT INSTRUCTIONS",
+    contamination::PAST_CONTEXT_HEADER_PREFIX,
     "RELEVANT PAST CONTEXT - NOT INSTRUCTIONS",
-    "CSR CONTINUUM [",
-    "CSR ENDLESS MEMORY ACTIVE",
+    contamination::CONTINUUM_HEADER,
+    contamination::MEMORY_MANIFEST_HEADER,
     "Resume from LAST/NEXT above",
     "CSR: `",
-    "RECENT SESSIONS - PAST CONTEXT",
-    "SESSION CONTINUITY DETECTED",
+    contamination::RECENT_SESSIONS_HEADER_PREFIX,
+    contamination::CONTINUITY_HEADER_PREFIX,
 ];
 
 /// Where a hand-off item came from, as pane.py's `from_when` + project +
@@ -1179,20 +1187,87 @@ mod tests {
         );
     }
 
+    fn squash(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// What the import remover leaves of `text` read as the person's own
+    /// message, whitespace squeezed out (it keeps every byte outside a span, the
+    /// whitespace around a cut included, and joins nothing); `None` when no
+    /// word is left.
+    fn import_words(text: &str) -> Option<String> {
+        use crate::import::contamination::{
+            remove_csr_emissions, ContentChannel, OwnedText, SourceKind,
+        };
+        let kept = remove_csr_emissions(OwnedText {
+            source: SourceKind::Conversation,
+            channel: ContentChannel::UserText,
+            text,
+        })
+        .kept;
+        Some(squash(&kept)).filter(|words| !words.is_empty())
+    }
+
+    /// The import remover on `text` as user text: exactly what it keeps.
+    fn import_kept(text: &str) -> String {
+        use crate::import::contamination::{
+            remove_csr_emissions, ContentChannel, OwnedText, SourceKind,
+        };
+        remove_csr_emissions(OwnedText {
+            source: SourceKind::Conversation,
+            channel: ContentChannel::UserText,
+            text,
+        })
+        .kept
+    }
+
     /// Every reader of the person's words agrees on `input`: extraction, the
-    /// import scrub, and the query-side emission stripper.
+    /// import remover (words, whitespace aside), and the query-side emission
+    /// stripper.
     fn own_words_agree(input: &str, mine: Option<&str>) {
         assert_eq!(extractable(input).as_deref(), mine, "extractable: {input}");
         assert_eq!(
-            crate::import::scrub_contaminated_text(input).as_deref(),
-            mine,
-            "scrub: {input}"
+            import_words(input),
+            mine.map(squash),
+            "import remover: {input}"
         );
         assert_eq!(
             strip_csr_emissions(input),
             mine.unwrap_or(""),
             "strip_csr_emissions: {input}"
         );
+    }
+
+    /// Extraction and import must not diverge silently on a mention: where
+    /// the text only quotes an emission, extraction learns nothing from it and
+    /// the import remover leaves every byte alone.
+    #[test]
+    fn protected_mentions_are_ignored_by_extraction_and_untouched_by_import() {
+        let emissions = [
+            "recap [2m ago]: Fixed the importer. [[CSR:RECAP]]\nSettled: a (abc1234).",
+            "CSR engine ready (degraded mode).",
+            "CSR CONTINUUM [4m ago]: Fix the importer\nLAST: Added checks (outcome=success, trust=user_history)\nFull state: csr_reflect_on_past(\"conv_abc123\")\n",
+            "CSR's compaction card (compacting soon), quoted: \u{201c}Keep the plan.\u{201d}",
+        ];
+        for emission in emissions {
+            let fenced = format!("```text\n{emission}\n```");
+            let quoted: String = emission.lines().map(|line| format!("> {line}\n")).collect();
+            let inline = format!("the hook wrote `{}` once", emission.lines().next().unwrap());
+            for mention in [&fenced, &quoted, &inline] {
+                // Import: a mention, every byte stays.
+                assert_eq!(&import_kept(mention), mention, "import changed {mention:?}");
+                // Extraction: nothing of the quoted emission survives as content.
+                if let Some(own) = extractable(mention) {
+                    assert!(
+                        !own.contains("[[CSR:RECAP]]")
+                            && !own.contains("degraded mode")
+                            && !own.contains("CONTINUUM")
+                            && !own.contains("compaction card"),
+                        "extraction re-learned a quoted emission from {mention:?}: {own:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1206,13 +1281,11 @@ mod tests {
             "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “One.”",
         ] {
             let quoted = format!("> I vote 2 {forward} Keep the deployment frozen.");
-            // Extraction excludes quoted personal lines, as before. Import
-            // scrub keeps quoted personal text while removing the CSR forward.
+            // Extraction excludes quoted personal lines, as before. The import
+            // remover treats a blockquote line as a mention of the forward, not
+            // an emission of it: every byte stays.
             assert_eq!(extractable(&quoted), None);
-            assert_eq!(
-                crate::import::scrub_contaminated_text(&quoted).as_deref(),
-                Some("> I vote 2 Keep the deployment frozen.")
-            );
+            assert_eq!(import_kept(&quoted), quoted);
             // A kept whitespace suffix supplies the join itself.
             own_words_agree(
                 &format!("I vote\t2{forward} Keep the deployment frozen."),
@@ -1353,7 +1426,12 @@ mod tests {
                 Some("Before I send this: and after it, my reply."),
             );
             own_words_agree(&format!("2{send}\nmy reply"), Some("my reply"));
-            own_words_agree(&format!("> {send} Keep it."), Some("Keep it."));
+            // A quoted line is a mention to the import remover (every byte
+            // stays); extraction and the query side still cut the forward.
+            let quoted = format!("> {send} Keep it.");
+            assert_eq!(extractable(&quoted).as_deref(), Some("Keep it."));
+            assert_eq!(strip_csr_emissions(&quoted), "Keep it.");
+            assert_eq!(import_kept(&quoted), quoted);
         }
         // The cut ones end on `…”` inside their limit.
         assert_eq!(sends[1].chars().count(), 700);
@@ -1484,17 +1562,17 @@ mod tests {
     #[test]
     fn astra_5_a_sentinel_line_goes_and_the_line_beside_it_stays() {
         let input = "Keep the deployment frozen.\n[[CSR:RECAP]] generated recap";
-        assert_eq!(
-            crate::import::scrub_contaminated_text(input).as_deref(),
-            Some("Keep the deployment frozen.")
-        );
+        // Extraction and the query side treat a sentinel line as the machine's.
         assert_eq!(strip_csr_emissions(input), "Keep the deployment frozen.");
-        // A recap line inside the person's paragraph, without its sentinel.
+        // The import remover removes a sentinel only as the end of a valid
+        // recap line, so a line that merely carries the token is the person's.
+        assert_eq!(import_kept(input), input);
+        // A recap line without its sentinel is no complete recap either.
         let recap = "Keep the deployment frozen.\nrecap [2h ago]: shipped the cap. Next: tag it.";
-        assert_eq!(
-            crate::import::scrub_contaminated_text(recap).as_deref(),
-            Some("Keep the deployment frozen.")
-        );
+        assert_eq!(import_kept(recap), recap);
+        // With its sentinel the recap line goes and the line beside it stays.
+        let valid = "Keep the deployment frozen.\nrecap [2h ago]: shipped the cap. [[CSR:RECAP]]\n";
+        assert_eq!(import_kept(valid), "Keep the deployment frozen.\n");
     }
 
     #[test]
@@ -1504,7 +1582,7 @@ mod tests {
             "Keep this user requirement. ".repeat(16)
         );
         assert!(input.find("CSR's compaction card").unwrap() > HEADER_WINDOW);
-        assert!(crate::import::contamination_reason(&input).is_some());
+        assert!(crate::import::contamination::classify_as_user_text(&input).is_some());
     }
 
     #[test]
@@ -1646,10 +1724,7 @@ mod tests {
         assert_eq!(strip_dreamer_prompt(&reply).as_deref(), mine);
         assert_eq!(extractable(&reply).as_deref(), mine);
         assert_eq!(Some(strip_csr_emissions(&reply).trim()), mine);
-        assert_eq!(
-            crate::import::scrub_contaminated_text(&reply).as_deref(),
-            mine
-        );
+        assert_eq!(import_words(&reply), mine.map(squash));
         assert_eq!(strip_dreamer_prompt(&forward).as_deref(), Some(""));
         assert!(extractable(&forward).is_none());
         assert_eq!(strip_csr_emissions(&forward), "");
@@ -1703,11 +1778,7 @@ mod tests {
             );
             assert!(is_dreamer_prompt(&sent), "{question}");
             assert!(is_csr_emission(&sent), "{question}");
-            assert_eq!(
-                crate::import::scrub_contaminated_text(&sent),
-                None,
-                "{question}"
-            );
+            assert_eq!(import_words(&sent), None, "{question}");
         }
         // The person's own non-English question is still theirs.
         assert!(!is_csr_emission(hindi));

@@ -2,6 +2,7 @@ pub mod backfill;
 pub mod catchup;
 pub mod codex_rollout;
 pub mod coedit_backfill;
+pub mod contamination;
 pub mod dream_marker;
 pub mod entrypoint_backfill;
 pub mod memory_registry;

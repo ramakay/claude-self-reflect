@@ -511,10 +511,7 @@ async fn handle_inner(
             let names: Vec<(String, String)> =
                 rows.into_iter().map(|(sid, a)| (sid, a.name)).collect();
             if let Some((sid, name)) = symbol_overlap(prompt, &names) {
-                writeln!(output,
-                    "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
-                    name, sid
-                )?;
+                writeln!(output, "{}", format_anchor_notice(&name, &sid))?;
                 effects.record_impression(
                     input.session_id.as_deref(),
                     &project,
@@ -1146,20 +1143,35 @@ fn is_continuation_prompt(prompt: &str) -> bool {
         .any(|ph| p == *ph || p.starts_with(&format!("{ph} ")))
 }
 
+/// The last line of a CSR PICKUP block.
+pub(crate) const PICKUP_RESUME_LINE: &str =
+    "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.";
+
 /// Emit the CSR PICKUP block: reason line, Tier-0 episode state, resume
 /// imperative. Used only by Route A lineage pickup (is_continuation_prompt /
 /// Continue / StateRecall) — the CONTINUUM banner is reserved for the active
 /// conversation lineage, never for a Route-B topic match.
-fn emit_pickup(output: &mut String, ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
+pub(crate) fn emit_pickup(
+    output: &mut String,
+    ep: &crate::hooks::stop::Episode,
+    age: &str,
+    reason: &str,
+) {
     output.push_str(&format!("CSR PICKUP — {}\n", reason));
     output.push_str(&crate::hooks::session_start::format_tier0_block(
         ep,
         &[],
         age,
     ));
-    output.push_str(
-        "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.\n",
-    );
+    output.push_str(PICKUP_RESUME_LINE);
+    output.push('\n');
+}
+
+/// The one-line pointer for a prompt that names an anchored function.
+pub(crate) fn format_anchor_notice(symbol: &str, session_id: &str) -> String {
+    format!(
+        "CSR: `{symbol}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{session_id}\")"
+    )
 }
 
 /// What an episode asked: its first prompt, plus its latest task when that
@@ -1230,7 +1242,11 @@ fn pick_lineage_episode(
 /// conversation lineage (Route A / SessionStart), so a topic match can
 /// never be mistaken for "this is the session you're resuming". Renders
 /// as a PICKUP reason line + a single EPISODE-INDEX-style line.
-fn format_semantic_pickup(ep: &crate::hooks::stop::Episode, age: &str, score: f32) -> String {
+pub(crate) fn format_semantic_pickup(
+    ep: &crate::hooks::stop::Episode,
+    age: &str,
+    score: f32,
+) -> String {
     let reason = format!(
         "CSR PICKUP — this prompt matches a past episode (similarity {:.2}); \
          the work may already exist — verify against it before re-deriving.\n",
