@@ -326,7 +326,7 @@ fn summarize_plan(plan: &ScrubPlan, report: &mut ScrubReport) {
             report.chunks_dropped += dropped_ids.len();
             report.vectors_replaced += rewritten.len();
             report.actions.push(format!(
-                "{}: source missing, rewrite {} chunks, drop {}, and replace {} vectors in place",
+                "{}: no re-parse (source missing or not a Claude transcript), rewrite {} chunks, drop {}, and replace {} vectors in place",
                 plan.conversation_id,
                 rewritten.len(),
                 dropped_ids.len(),
