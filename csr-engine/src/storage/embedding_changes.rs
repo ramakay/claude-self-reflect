@@ -84,6 +84,17 @@ pub(crate) fn read(conn: &Connection, after: i64, limit: usize) -> Result<Vec<Ch
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Sequence of the newest retained change (0 when none). A rebuild that
+/// captures this before it streams vectors from SQLite holds the effect of
+/// every change up to it, so the index sync may resume after it.
+pub(crate) fn latest_seq(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM embedding_changes",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

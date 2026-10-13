@@ -51,6 +51,10 @@ pub struct Engine {
     /// is compact by construction and already dumped+`clear_needs_compaction`ed
     /// before this field is set — see [`Self::index_freshly_rebuilt`].
     index_freshly_rebuilt: bool,
+    /// Points `Engine::new`'s reconciliation added on top of the loaded
+    /// generation, `(chunks, reflections)`: what that generation is missing
+    /// relative to SQLite. The daemon counts them toward its dump budget.
+    startup_backfill: (usize, usize),
 }
 
 impl Engine {
@@ -97,6 +101,7 @@ impl Engine {
             index_dir,
             skip_index_persistence: false,
             index_freshly_rebuilt: false,
+            startup_backfill: (0, 0),
         }
     }
 
@@ -131,18 +136,10 @@ impl Engine {
 
         // Try loading from disk cache first
         let mut index_freshly_rebuilt = false;
-        let search = if let Some(cached) =
-            SearchEngine::load_from_disk(&index_dir, chunk_count, reflection_count)
+        let mut startup_backfill = (0, 0);
+        let search = if let Some(loaded) =
+            load_reconciled(&storage, &index_dir, chunk_count, reflection_count, persist)
         {
-            // Track the additive-backfill delta and the loaded cache's
-            // on-disk age purely as a staleness diagnostic (logged below) —
-            // how far behind SQLite the on-disk HNSW cache was at load time,
-            // and how long it's been since anything last flushed it. Local
-            // to this branch; nothing downstream of `Engine::new` reads
-            // either value (there is no cache staleness to report on the
-            // rebuild path below — a fresh dump has zero drift and zero age
-            // by construction).
-            let mut backfill_added = 0usize;
             let cache_age = std::fs::metadata(index_dir.join("manifest.json"))
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -164,67 +161,7 @@ impl Engine {
                 reflections = reflection_count,
                 "search index loaded from cache"
             );
-            // Reconcile HNSW cache with DB:
-            // 1. Blank orphan entries (deleted from DB since last dump)
-            // 2. Backfill missing entries (added to DB since last dump)
-            let mut search = cached;
-            if let Ok(db_ids) = storage.load_all_reflection_ids() {
-                let db_id_set: std::collections::HashSet<&str> =
-                    db_ids.iter().map(|s| s.as_str()).collect();
-                let blanked = search.blank_orphan_reflections(&db_id_set);
-                if blanked > 0 {
-                    tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
-                }
-
-                // Backfill reflections that exist in DB but not in HNSW.
-                // Fetch only the missing ids, in bounded batches — never the
-                // whole reflection table.
-                let missing: Vec<String> = db_id_set
-                    .iter()
-                    .filter(|id| !search.has_reflection(id))
-                    .map(|s| s.to_string())
-                    .collect();
-                if !missing.is_empty() {
-                    if let Ok(added) = backfill_missing_reflections(&storage, &mut search, &missing)
-                    {
-                        if added > 0 {
-                            tracing::info!(added, "backfilled missing reflections into HNSW cache");
-                        }
-                        backfill_added += added;
-                    }
-                }
-            }
-
-            // Backfill chunks added to DB since the last dump (additive drift).
-            // Cheap ID probe first; only fetch the vectors that are actually
-            // missing (in bounded batches) if something is missing. This is what
-            // lets a stale-but-additive cache load in ~ms instead of triggering a
-            // full HNSW rebuild (~tens of seconds), while keeping peak transient
-            // memory O(batch) rather than O(corpus).
-            if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
-                // The manifest count is written by whoever dumps, from the DB at
-                // dump time. A long-running process that loaded before a purge
-                // and dumps after it persists every purged vector under a count
-                // that matches the DB, so the count check above accepts it.
-                let db_id_set: std::collections::HashSet<&str> =
-                    db_chunk_ids.iter().map(|s| s.as_str()).collect();
-                let orphan_chunks = search.blank_orphan_chunks(&db_id_set);
-                if orphan_chunks > 0 {
-                    tracing::info!(orphan_chunks, "blanked orphan chunk entries in HNSW cache");
-                }
-                let missing: Vec<String> = db_chunk_ids
-                    .into_iter()
-                    .filter(|id| !search.has_chunk(id))
-                    .collect();
-                if !missing.is_empty() {
-                    if let Ok(added) = backfill_missing_chunks(&storage, &mut search, &missing) {
-                        if added > 0 {
-                            tracing::info!(added, "backfilled missing chunks into HNSW cache");
-                        }
-                        backfill_added += added;
-                    }
-                }
-            }
+            let backfill_added = loaded.chunks_added + loaded.reflections_added;
             if backfill_added > 0 {
                 tracing::info!(
                     backfill_added,
@@ -232,47 +169,8 @@ impl Engine {
                     "HNSW cache behind DB at startup — additive backfill applied"
                 );
             }
-            // hnsw_rs cannot delete. A blanked slot still takes a neighbour
-            // position, so a cache that is materially tombstones eventually
-            // wants a full rebuild for compactness. `Engine::new` runs in
-            // foreground processes (MCP serve, hooks, CLI query commands) —
-            // never synchronously here: that used to be the ~minutes-long
-            // stall a fresh MCP handshake cannot afford under Claude Code's
-            // 30s CONNECT_TIMEOUT. `search_index`/`search_chunks_filtered`
-            // already overfetch past tombstoned slots, so this process keeps
-            // serving full-page results with the cache as-is; a
-            // `needs_compaction` marker tells the daemon's compaction loop
-            // (or the explicit `rebuild-index` command) to do the rebuild
-            // out-of-band.
-            //
-            // Materiality is the CUMULATIVE blank share of each id map
-            // (`chunk_tombstone_count`/`reflection_tombstone_count`, both
-            // O(1)) after this reconciliation, not the count of ids blanked
-            // during this one load. A per-load delta resets to 0 on every
-            // subsequent load/dump round trip (blanks persist through
-            // `dump_to_disk`), so a corpus that loses a handful of ids every
-            // few minutes would never cross the per-load threshold even as
-            // its cumulative tombstone share grows without bound.
-            let orphans_material = search.chunk_tombstone_count() * ORPHAN_REBUILD_DIVISOR
-                > search.chunk_slot_count().max(1)
-                || search.reflection_tombstone_count() * ORPHAN_REBUILD_DIVISOR
-                    > search.reflection_slot_count().max(1);
-            if orphans_material && persist {
-                tracing::info!(
-                    "HNSW cache holds purged vectors — serving with tombstones, marked needs_compaction"
-                );
-                crate::search::mark_needs_compaction(&index_dir);
-            }
-            // Everything above (blank_orphan_*/backfill_missing_*) is pure
-            // DB-mirroring reconciliation, not new content this process
-            // should feel responsible for publishing — clear the dirty
-            // flags it set so this process's NEXT dump (a real
-            // `store_reflection` insert, an import) doesn't republish this
-            // possibly-stale reconciliation over a newer generation the
-            // daemon's compaction loop may swap in concurrently. See
-            // `clear_reconciliation_dirty`'s doc comment (WP-D medium #2).
-            search.clear_reconciliation_dirty();
-            search
+            startup_backfill = (loaded.chunks_added, loaded.reflections_added);
+            loaded.search
         } else {
             // Cache miss — rebuild from SQLite vectors, streaming in bounded
             // batches so peak transient memory is O(batch) instead of
@@ -348,6 +246,7 @@ impl Engine {
             index_dir,
             skip_index_persistence: !persist,
             index_freshly_rebuilt,
+            startup_backfill,
         })
     }
 
@@ -376,6 +275,7 @@ impl Engine {
             index_dir,
             skip_index_persistence: true,
             index_freshly_rebuilt: false,
+            startup_backfill: (0, 0),
         })
     }
 
@@ -705,6 +605,11 @@ impl Engine {
         self.index_freshly_rebuilt
     }
 
+    /// See the `startup_backfill` field.
+    pub fn startup_backfill(&self) -> (usize, usize) {
+        self.startup_backfill
+    }
+
     /// Flush the HNSW index to disk if it has been modified.
     /// Safe to call multiple times — skips if not dirty.
     pub async fn flush_index(&self) {
@@ -906,6 +811,136 @@ impl Engine {
     }
 }
 
+/// A cached generation reconciled against SQLite (see [`load_reconciled`]).
+pub(crate) struct LoadedIndex {
+    pub(crate) search: SearchEngine,
+    /// Chunk points the generation lacked and the reconciliation inserted.
+    pub(crate) chunks_added: usize,
+    /// Reflection counterpart of `chunks_added`.
+    pub(crate) reflections_added: usize,
+}
+
+/// Load the on-disk generation and reconcile it with SQLite: blank ids the DB
+/// no longer has, insert ids it gained since the dump (fetching only the
+/// missing vectors, in bounded batches). `None` when there is no usable
+/// cache. `persist` lets the caller mark `needs_compaction` when tombstones
+/// became material; foreground engines that never publish pass `false`.
+pub(crate) fn load_reconciled(
+    storage: &Storage,
+    index_dir: &Path,
+    chunk_count: usize,
+    reflection_count: usize,
+    persist: bool,
+) -> Option<LoadedIndex> {
+    let mut search = SearchEngine::load_from_disk(index_dir, chunk_count, reflection_count)?;
+    let mut chunks_added = 0usize;
+    let mut reflections_added = 0usize;
+    // Reconcile HNSW cache with DB:
+    // 1. Blank orphan entries (deleted from DB since last dump)
+    // 2. Backfill missing entries (added to DB since last dump)
+    if let Ok(db_ids) = storage.load_all_reflection_ids() {
+        let db_id_set: std::collections::HashSet<&str> =
+            db_ids.iter().map(|s| s.as_str()).collect();
+        let blanked = search.blank_orphan_reflections(&db_id_set);
+        if blanked > 0 {
+            tracing::info!(blanked, "blanked orphan reflection entries in HNSW cache");
+        }
+
+        // Backfill reflections that exist in DB but not in HNSW.
+        // Fetch only the missing ids, in bounded batches — never the
+        // whole reflection table.
+        let missing: Vec<String> = db_id_set
+            .iter()
+            .filter(|id| !search.has_reflection(id))
+            .map(|s| s.to_string())
+            .collect();
+        if !missing.is_empty() {
+            if let Ok(added) = backfill_missing_reflections(storage, &mut search, &missing) {
+                if added > 0 {
+                    tracing::info!(added, "backfilled missing reflections into HNSW cache");
+                }
+                reflections_added += added;
+            }
+        }
+    }
+
+    // Backfill chunks added to DB since the last dump (additive drift).
+    // Cheap ID probe first; only fetch the vectors that are actually
+    // missing (in bounded batches) if something is missing. This is what
+    // lets a stale-but-additive cache load in ~ms instead of triggering a
+    // full HNSW rebuild (~tens of seconds), while keeping peak transient
+    // memory O(batch) rather than O(corpus).
+    if let Ok(db_chunk_ids) = storage.load_all_chunk_ids() {
+        // The manifest count is written by whoever dumps, from the DB at
+        // dump time. A long-running process that loaded before a purge
+        // and dumps after it persists every purged vector under a count
+        // that matches the DB, so the count check above accepts it.
+        let db_id_set: std::collections::HashSet<&str> =
+            db_chunk_ids.iter().map(|s| s.as_str()).collect();
+        let orphan_chunks = search.blank_orphan_chunks(&db_id_set);
+        if orphan_chunks > 0 {
+            tracing::info!(orphan_chunks, "blanked orphan chunk entries in HNSW cache");
+        }
+        let missing: Vec<String> = db_chunk_ids
+            .into_iter()
+            .filter(|id| !search.has_chunk(id))
+            .collect();
+        if !missing.is_empty() {
+            if let Ok(added) = backfill_missing_chunks(storage, &mut search, &missing) {
+                if added > 0 {
+                    tracing::info!(added, "backfilled missing chunks into HNSW cache");
+                }
+                chunks_added += added;
+            }
+        }
+    }
+    // hnsw_rs cannot delete. A blanked slot still takes a neighbour
+    // position, so a cache that is materially tombstones eventually
+    // wants a full rebuild for compactness. `Engine::new` runs in
+    // foreground processes (MCP serve, hooks, CLI query commands) —
+    // never synchronously here: that used to be the ~minutes-long
+    // stall a fresh MCP handshake cannot afford under Claude Code's
+    // 30s CONNECT_TIMEOUT. `search_index`/`search_chunks_filtered`
+    // already overfetch past tombstoned slots, so this process keeps
+    // serving full-page results with the cache as-is; a
+    // `needs_compaction` marker tells the daemon's compaction loop
+    // (or the explicit `rebuild-index` command) to do the rebuild
+    // out-of-band.
+    //
+    // Materiality is the CUMULATIVE blank share of each id map
+    // (`chunk_tombstone_count`/`reflection_tombstone_count`, both
+    // O(1)) after this reconciliation, not the count of ids blanked
+    // during this one load. A per-load delta resets to 0 on every
+    // subsequent load/dump round trip (blanks persist through
+    // `dump_to_disk`), so a corpus that loses a handful of ids every
+    // few minutes would never cross the per-load threshold even as
+    // its cumulative tombstone share grows without bound.
+    let orphans_material = search.chunk_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+        > search.chunk_slot_count().max(1)
+        || search.reflection_tombstone_count() * ORPHAN_REBUILD_DIVISOR
+            > search.reflection_slot_count().max(1);
+    if orphans_material && persist {
+        tracing::info!(
+            "HNSW cache holds purged vectors — serving with tombstones, marked needs_compaction"
+        );
+        crate::search::mark_needs_compaction(index_dir);
+    }
+    // Everything above (blank_orphan_*/backfill_missing_*) is pure
+    // DB-mirroring reconciliation, not new content this process
+    // should feel responsible for publishing — clear the dirty
+    // flags it set so this process's NEXT dump (a real
+    // `store_reflection` insert, an import) doesn't republish this
+    // possibly-stale reconciliation over a newer generation the
+    // daemon's compaction loop may swap in concurrently. See
+    // `clear_reconciliation_dirty`'s doc comment (WP-D medium #2).
+    search.clear_reconciliation_dirty();
+    Some(LoadedIndex {
+        search,
+        chunks_added,
+        reflections_added,
+    })
+}
+
 /// A loaded cache is rebuilt when orphan slots in either index exceed 1/N of
 /// its live rows (5%). Below that the blanked slots cost less than a rebuild.
 const ORPHAN_REBUILD_DIVISOR: usize = 20;
@@ -1044,15 +1079,19 @@ fn reconcile_fresh_against_db(storage: &Storage, fresh: &mut SearchEngine) {
 /// each batch's vectors are moved (not cloned) into the index and dropped
 /// before the next batch is fetched. Returns the built index plus the
 /// (chunks, reflections) counts actually inserted.
-fn rebuild_search_index_streaming(
+pub(crate) fn rebuild_search_index_streaming(
     storage: &Storage,
     batch_size: usize,
 ) -> Result<(SearchEngine, usize, usize)> {
+    // Every change up to here is visible to the reads below, so the index
+    // sync may resume after it once this engine is swapped in.
+    let change_cursor = storage.latest_embedding_change_seq()?;
     let chunk_ids = storage.load_all_chunk_ids()?;
     let reflection_ids = storage.load_all_reflection_ids()?;
 
     let estimated_size = (chunk_ids.len() + 1000).max(10_000);
     let mut search = SearchEngine::new(estimated_size);
+    search.set_change_cursor(change_cursor);
 
     let mut chunk_total = 0usize;
     for batch in chunk_ids.chunks(batch_size.max(1)) {

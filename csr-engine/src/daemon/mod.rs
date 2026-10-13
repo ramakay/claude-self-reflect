@@ -330,7 +330,8 @@ impl Daemon {
             self.search.clone(),
             self.index_dir.clone(),
         )
-        .with_heavy_work_permit(heavy_work.clone());
+        .with_heavy_work_permit(heavy_work.clone())
+        .with_flush_budget();
         let watcher_handle = watcher.spawn();
         tracing::info!("file watcher started");
 

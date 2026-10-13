@@ -2426,15 +2426,23 @@ pub fn get_unenriched_conversations(
     // but don't have completed enrichment of this type.
     // Uses equality JOIN on conversation_id (not LIKE) for correctness and performance.
     // Ordered by most recent chunk timestamp so recent conversations are enriched first.
+    //
+    // The per-conversation MAX is taken in a subquery grouped by
+    // `conversation_id` alone, which streams off `idx_chunks_conversation`.
+    // Grouping the join by `(conversation_id, file_path)` instead built a
+    // temp B-tree over every chunk row: 65.7 MB written to a SQLite temp
+    // file on every call at 777k chunks, i.e. every extraction tick (30 s in
+    // the daemon, 60 s in each MCP server) — ~3.9 GB/h per server. Same rows,
+    // same order; the outer sort only sees one row per conversation.
     let mut stmt = conn.prepare(
-        "SELECT c.conversation_id, i.file_path
-         FROM chunks c
-         JOIN import_state i ON i.conversation_id = c.conversation_id
+        "SELECT g.conversation_id, i.file_path
+         FROM (SELECT conversation_id, MAX(timestamp) AS latest
+               FROM chunks GROUP BY conversation_id) g
+         JOIN import_state i ON i.conversation_id = g.conversation_id
          LEFT JOIN enrichment_state e
-             ON e.conversation_id = c.conversation_id AND e.enrichment_type = ?1
+             ON e.conversation_id = g.conversation_id AND e.enrichment_type = ?1
          WHERE e.status IS NULL OR e.status = 'failed'
-         GROUP BY c.conversation_id, i.file_path
-         ORDER BY MAX(c.timestamp) DESC
+         ORDER BY g.latest DESC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(params![enrichment_type, limit as i64], |row| {
@@ -5112,6 +5120,90 @@ mod tests {
             seq: 0,
             is_sidechain: false,
         }
+    }
+
+    /// The pre-rewrite statement, kept verbatim as the oracle for
+    /// `get_unenriched_conversations`'s streaming-aggregate form.
+    const UNENRICHED_ORACLE: &str = "SELECT c.conversation_id, i.file_path
+         FROM chunks c
+         JOIN import_state i ON i.conversation_id = c.conversation_id
+         LEFT JOIN enrichment_state e
+             ON e.conversation_id = c.conversation_id AND e.enrichment_type = ?1
+         WHERE e.status IS NULL OR e.status = 'failed'
+         GROUP BY c.conversation_id, i.file_path
+         ORDER BY MAX(c.timestamp) DESC
+         LIMIT ?2";
+
+    #[test]
+    fn unenriched_conversations_match_the_grouped_join_they_replace() {
+        let conn = mem();
+        // Nine conversations, one with two transcript files, one imported
+        // but chunkless, and every enrichment status.
+        for conv in 0..9 {
+            // Newest chunk day 20 + 7c mod 9: distinct per conversation
+            // (no ties to order arbitrarily), not insertion order.
+            for (n, day) in [(0, conv), (1, 20 + conv * 7 % 9)] {
+                let mut chunk = test_chunk(&format!("c{conv}-{n}"), "content");
+                chunk.conversation_id = format!("conv-{conv}");
+                chunk.timestamp = format!("2026-08-{:02}T00:00:00Z", 1 + day);
+                insert_chunk(&conn, &chunk, &[0.1; 4]).unwrap();
+            }
+            upsert_import_state_explicit(
+                &conn,
+                &format!("/p/conv-{conv}.jsonl"),
+                &format!("conv-{conv}"),
+                2,
+                "2026-09-01T00:00:00Z",
+            )
+            .unwrap();
+        }
+        upsert_import_state_explicit(&conn, "/p/sub/conv-4.jsonl", "conv-4", 1, "x").unwrap();
+        upsert_import_state_explicit(&conn, "/p/empty.jsonl", "empty", 0, "x").unwrap();
+        mark_enrichment_completed(&conn, "conv-1", "extracted_v3", "r1").unwrap();
+        mark_enrichment_failed(&conn, "conv-2", "extracted_v3", "boom").unwrap();
+        mark_enrichment_completed(&conn, "conv-5", "ratification", "r5").unwrap();
+        conn.execute(
+            "INSERT INTO enrichment_state (conversation_id, enrichment_type, status)
+             VALUES ('conv-7', 'extracted_v3', 'unavailable')",
+            [],
+        )
+        .unwrap();
+
+        for kind in ["extracted_v3", "ratification", "ai_narrative"] {
+            for limit in [1, 3, 5, 50] {
+                let oracle: Vec<(String, String)> = conn
+                    .prepare(UNENRICHED_ORACLE)
+                    .unwrap()
+                    .query_map(params![kind, limit as i64], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                let rewritten = get_unenriched_conversations(&conn, kind, limit).unwrap();
+                // Same conversations in the same order; the two files of one
+                // conversation tie on its timestamp, so compare those as a set.
+                let order = |rows: &[(String, String)]| -> Vec<String> {
+                    rows.iter().map(|(conv, _)| conv.clone()).collect()
+                };
+                assert_eq!(order(&rewritten), order(&oracle), "{kind} limit {limit}");
+                let mut rows = rewritten.clone();
+                let mut expected = oracle.clone();
+                rows.sort();
+                expected.sort();
+                assert_eq!(rows, expected, "{kind} limit {limit}");
+            }
+        }
+        let all = get_unenriched_conversations(&conn, "extracted_v3", 50).unwrap();
+        assert!(all
+            .iter()
+            .all(|(conv, _)| conv != "conv-1" && conv != "conv-7"));
+        assert!(
+            all.iter().any(|(conv, _)| conv == "conv-2"),
+            "failed retries"
+        );
+        assert!(all.iter().all(|(conv, _)| conv != "empty"), "needs chunks");
+        assert_eq!(all.iter().filter(|(conv, _)| conv == "conv-4").count(), 2);
     }
 
     #[test]

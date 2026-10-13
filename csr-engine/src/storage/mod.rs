@@ -815,6 +815,12 @@ impl Storage {
         queries::count_reflection_embeddings(&conn)
     }
 
+    /// See [`embedding_changes::latest_seq`].
+    pub fn latest_embedding_change_seq(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        embedding_changes::latest_seq(&conn)
+    }
+
     /// Run SQLite integrity check. Returns true if database is healthy.
     pub fn integrity_check(&self) -> Result<bool> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;

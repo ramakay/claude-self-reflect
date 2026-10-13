@@ -28,8 +28,9 @@ async fn run(
     shutdown: Arc<AtomicBool>,
     interval: Duration,
 ) {
-    // Replay retained deltas on restart as well: the last disk snapshot can
-    // predate an update of an existing ID even when startup backfill finds it.
+    // Resume after the loaded generation's change cursor (see
+    // `SearchEngine::change_cursor`): the startup id backfill cannot see an
+    // update of an id the generation already holds, the change log can.
     let mut cursor = 0;
     let mut generation = None;
     while !shutdown.load(Ordering::SeqCst) {
@@ -71,11 +72,18 @@ fn sync_batch(
     mut cursor: i64,
     generation: Option<u64>,
 ) -> Result<(i64, u64, usize)> {
-    let observed_generation = search.blocking_read().generation();
+    let (observed_generation, engine_cursor) = {
+        let index = search.blocking_read();
+        (index.generation(), index.change_cursor())
+    };
     if generation != Some(observed_generation) {
-        // A concurrent compaction/rebuild can swap in a snapshot older than
-        // updates we applied. Revisit retained deltas on the new index.
-        cursor = 0;
+        // A load, compaction or remap swapped in another engine. It holds
+        // every change up to its own cursor (manifest, or the sequence a
+        // rebuild captured before streaming); replay only what follows.
+        // Replaying from 0 re-applied every retained update as a remove
+        // plus insert, minting one tombstone per updated id on every
+        // daemon start and swap.
+        cursor = engine_cursor;
     }
     // SQLite/vector decoding completes BEFORE taking the index lock. No DB
     // IO or embedding inference takes place under that lock.
@@ -111,6 +119,9 @@ fn sync_batch(
             if let Some(vector) = change.vector {
                 index.insert_chunk(change.id, vector);
             }
+        }
+        if change.seq > index.change_cursor() {
+            index.set_change_cursor(change.seq);
         }
         drop(index);
         cursor = change.seq;
@@ -309,6 +320,113 @@ mod tests {
         shutdown.store(true, Ordering::SeqCst);
         sync.await.unwrap();
         server.await.unwrap();
+    }
+
+    /// A deterministic pseudo-random direction per seed. Orthogonal axes
+    /// would leave HNSW's greedy walk with nothing to follow.
+    fn axis(seed: usize) -> Vec<f32> {
+        let mut state = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..384)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 2001) as f32 / 1000.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn chunk(id: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv".into(),
+            project_name: "proj".into(),
+            timestamp: "2026-10-12T00:00:00Z".into(),
+            content: id.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn sync_resumes_after_the_engine_cursor_without_minting_tombstones() {
+        let storage = Storage::open_memory().unwrap();
+        storage.insert_chunk(&chunk("a"), &axis(0)).unwrap();
+        // An update before the rebuild: retained as an invalidating change.
+        storage.insert_chunk(&chunk("a"), &axis(1)).unwrap();
+        let (engine, _, _) = crate::engine::rebuild_search_index_streaming(&storage, 100).unwrap();
+        assert!(engine.change_cursor() > 0);
+        let search = RwLock::new(engine);
+        let shutdown = AtomicBool::new(false);
+        let (cursor, generation, count) =
+            sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+        assert_eq!(count, 0, "the rebuild already holds that update");
+        assert_eq!(search.blocking_read().chunk_tombstone_count(), 0);
+
+        storage.insert_chunk(&chunk("a"), &axis(2)).unwrap();
+        let (_, _, count) =
+            sync_batch(&storage, &search, &shutdown, cursor, Some(generation)).unwrap();
+        assert_eq!(count, 1);
+        let index = search.blocking_read();
+        assert_eq!(index.chunk_tombstone_count(), 1);
+        assert_eq!(index.search_chunks(&axis(2), 1, 0.99)[0].id, "a");
+        assert_eq!(
+            index.change_cursor(),
+            storage.latest_embedding_change_seq().unwrap()
+        );
+    }
+
+    /// The dump budget skips dumps, so a restart must recover everything the
+    /// skipped generation lacks: new ids from the startup backfill, a new
+    /// vector for an id it already holds from the change log after its
+    /// cursor, and nothing replayed from before that cursor.
+    #[test]
+    fn a_skipped_dump_loses_no_vector_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let storage = Storage::open(&db).unwrap();
+        for i in 0..300 {
+            storage
+                .insert_chunk(&chunk(&format!("c{i}")), &axis(i))
+                .unwrap();
+        }
+        // An update that predates the dump: replaying it would mint a tombstone.
+        storage.insert_chunk(&chunk("c1"), &axis(301)).unwrap();
+        // First start: no cache, so the engine rebuilds and dumps.
+        drop(Engine::new(&db, &projects).unwrap());
+
+        // A daemon that kept serving without dumping: 20 new ids, and a new
+        // vector for one the generation holds.
+        for i in 300..320 {
+            storage
+                .insert_chunk(&chunk(&format!("c{i}")), &axis(i))
+                .unwrap();
+        }
+        storage.insert_chunk(&chunk("c5"), &axis(350)).unwrap();
+
+        let restarted = Engine::new(&db, &projects).unwrap();
+        assert_eq!(restarted.startup_backfill(), (20, 0));
+        let shutdown = AtomicBool::new(false);
+        let search = restarted.search().clone();
+        let (_, _, applied) = sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+        // c5's update plus the 20 inserts (already present, so no-ops).
+        assert_eq!(applied, 21);
+        let index = search.blocking_read();
+        for i in 0..320 {
+            assert!(index.has_chunk(&format!("c{i}")), "c{i}");
+        }
+        assert_eq!(index.search_chunks(&axis(350), 1, 0.99)[0].id, "c5");
+        assert_eq!(index.search_chunks(&axis(301), 1, 0.99)[0].id, "c1");
+        assert_eq!(
+            index.chunk_tombstone_count(),
+            1,
+            "only c5's new vector; c1's older update is not replayed"
+        );
     }
 
     #[test]

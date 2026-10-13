@@ -45,6 +45,41 @@ fn flush_is_due(last_flush: Option<Instant>, now: Instant) -> bool {
     }
 }
 
+/// The daemon's dump budget: a generation rewrite costs ~1.55 GB at the live
+/// corpus size, and at `MIN_FLUSH_INTERVAL_SECS` that was ~20 GB/h for a
+/// trickle of new chunks. The daemon dumps only when at least this long has
+/// passed since its last dump...
+const BUDGET_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// ...and the generation on disk is missing at least this many vector
+/// mutations, or [`BUDGET_MIN_FRACTION`] of the index if that is fewer —
+/// plus once on clean shutdown (`Daemon::run`). Skipping a dump loses
+/// nothing: every vector is in SQLite first, any loader backfills ids the
+/// generation lacks, and the daemon's index sync replays updates after the
+/// generation's change cursor.
+const BUDGET_MIN_NEW: u64 = 2_000;
+const BUDGET_MIN_FRACTION: f64 = 0.005;
+
+/// When a watcher rewrites the index generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlushPolicy {
+    /// At most once per `MIN_FLUSH_INTERVAL_SECS`, the first batch at once:
+    /// a foreground `--watch` importer.
+    Interval,
+    /// The daemon: [`BUDGET_MIN_INTERVAL`] and [`budget_threshold`] both met.
+    Budget,
+}
+
+/// Unpublished mutations that justify rewriting an index of `slots` points.
+fn budget_threshold(slots: usize) -> u64 {
+    let fraction = (slots as f64 * BUDGET_MIN_FRACTION).ceil() as u64;
+    fraction.clamp(1, BUDGET_MIN_NEW)
+}
+
+/// Whether the daemon's budget allows a dump now.
+fn budget_flush_due(last_flush: Instant, now: Instant, unpublished: u64, slots: usize) -> bool {
+    now.duration_since(last_flush) >= BUDGET_MIN_INTERVAL && unpublished >= budget_threshold(slots)
+}
+
 /// Backoff schedule (seconds) for a file whose import keeps failing with
 /// `database is locked`/`database is busy`. Index is `attempts - 1`; once
 /// `attempts` exceeds this schedule's length the file is dropped with a WARN
@@ -257,6 +292,7 @@ pub struct FileWatcher {
     /// `Engine::start_watcher`) — opt-in via [`Self::with_heavy_work_permit`] so
     /// this stays additive for every existing caller.
     heavy_work: Option<Arc<Semaphore>>,
+    flush_policy: FlushPolicy,
 }
 
 impl FileWatcher {
@@ -274,7 +310,15 @@ impl FileWatcher {
             search,
             index_dir,
             heavy_work: None,
+            flush_policy: FlushPolicy::Interval,
         }
+    }
+
+    /// Dump under the daemon's budget ([`FlushPolicy::Budget`]) instead of
+    /// every `MIN_FLUSH_INTERVAL_SECS`.
+    pub fn with_flush_budget(mut self) -> Self {
+        self.flush_policy = FlushPolicy::Budget;
+        self
     }
 
     /// Share the daemon's exclusive heavy-work semaphore. The watcher waits
@@ -318,8 +362,13 @@ impl FileWatcher {
         watcher.watch(&self.projects_dir, RecursiveMode::Recursive)?;
         tracing::info!(dir = %self.projects_dir.display(), "file watcher started");
 
-        // Debounce loop: collect changed files over DEBOUNCE_SECS, then process
-        let mut last_flush: Option<Instant> = None;
+        // Debounce loop: collect changed files over DEBOUNCE_SECS, then process.
+        // Under the budget the generation just loaded counts as a dump: the
+        // first one waits for the interval and the unpublished threshold.
+        let mut last_flush: Option<Instant> = match self.flush_policy {
+            FlushPolicy::Interval => None,
+            FlushPolicy::Budget => Some(Instant::now()),
+        };
         let mut retry_map: HashMap<PathBuf, RetryState> = HashMap::new();
         loop {
             let Some(pending) = wait_for_batch(&mut rx, &retry_map).await else {
@@ -356,10 +405,21 @@ impl FileWatcher {
                     }
                 }
 
-                // Flush the HNSW index at most once per MIN_FLUSH_INTERVAL_SECS.
-                // See the const for why deferring the dump is safe.
+                // See the consts for why deferring the dump is safe.
                 let now = Instant::now();
-                if flush_is_due(last_flush, now) {
+                let due = match self.flush_policy {
+                    FlushPolicy::Interval => flush_is_due(last_flush, now),
+                    FlushPolicy::Budget => {
+                        let index = self.search.read().await;
+                        budget_flush_due(
+                            last_flush.unwrap_or(now),
+                            now,
+                            index.unpublished_changes(),
+                            index.chunk_slot_count() + index.reflection_slot_count(),
+                        )
+                    }
+                };
+                if due {
                     match self.flush_index().await {
                         None => {}
                         Some(result) => {
@@ -721,6 +781,33 @@ pub(crate) async fn acquire_heavy_work_permit(heavy_work: Arc<Semaphore>) -> Own
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn budget_threshold_is_two_thousand_or_half_a_percent_whichever_is_fewer() {
+        assert_eq!(budget_threshold(773_457), 2_000);
+        assert_eq!(budget_threshold(400_000), 2_000);
+        assert_eq!(budget_threshold(100_000), 500);
+        assert_eq!(budget_threshold(10), 1);
+        assert_eq!(budget_threshold(0), 1);
+    }
+
+    #[test]
+    fn budget_needs_both_the_interval_and_the_threshold() {
+        let now = Instant::now();
+        let long_ago = now.checked_sub(BUDGET_MIN_INTERVAL).unwrap();
+        let recent = now
+            .checked_sub(BUDGET_MIN_INTERVAL - Duration::from_secs(1))
+            .unwrap();
+        let slots = 773_457;
+        assert!(budget_flush_due(long_ago, now, 2_000, slots));
+        assert!(!budget_flush_due(long_ago, now, 1_999, slots), "too few");
+        assert!(!budget_flush_due(recent, now, 50_000, slots), "too soon");
+        // Five minutes of the old cadence never qualifies on its own.
+        let five_minutes = now
+            .checked_sub(Duration::from_secs(MIN_FLUSH_INTERVAL_SECS))
+            .unwrap();
+        assert!(!budget_flush_due(five_minutes, now, 50_000, slots));
+    }
 
     #[test]
     fn first_batch_flushes_immediately() {
