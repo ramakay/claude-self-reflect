@@ -58,7 +58,7 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
 /// - the csr-companion compaction's keep list (the summarizer's instructions, which a summary
 ///   may echo) and the one-line notice it leaves after compacting (plugins/csr-companion/hooks/
 ///   compact.ts `KEEP_HEADER`, `NOTICE_HEADER`)
-const EMISSION_HEADERS: [&str; 17] = [
+const EMISSION_HEADERS: [&str; 18] = [
     "CSR ENDLESS MEMORY ACTIVE",
     "CSR CONTINUUM [",
     "CSR PICKUP —",
@@ -76,6 +76,8 @@ const EMISSION_HEADERS: [&str; 17] = [
     "CSR's dreamer asked this while you worked",
     "CSR COMPACT KEEP —",
     "CSR compacted at",
+    // The companion's compaction card draft, every stage: "(compacted by csr):", "(compacting soon):", ...
+    "CSR's compaction card (",
 ];
 
 /// Field tokens CSR emits inside blocks (Tier-0 fields, continuity lines).
@@ -320,6 +322,44 @@ pub fn is_dreamer_prompt(text: &str) -> bool {
         && paragraphs[at + 1..].iter().all(|p| quoted(p))
 }
 
+/// If `text` carries the companion dreamer's "ask Claude" message, the person's own words around it (empty when
+/// there are none); `None` when it carries none. The dreamer's part is read by paragraph, never in a byte window:
+/// its question (the one-line paragraph just above the attribution, ending on a question mark), the attribution
+/// paragraph, and the blockquote paragraphs right after it. Every other paragraph, before or after, is the
+/// person's. A long question in a non-ASCII script put the attribution past HEADER_WINDOW, and a reply under it
+/// broke the whole-message grammar: the question was kept as the person's prose (Codex review 10-12, #14).
+pub fn strip_dreamer_prompt(text: &str) -> Option<String> {
+    let normalized = text.replace("\r\n", "\n");
+    let paragraphs: Vec<&str> = normalized.trim().split("\n\n").collect();
+    let at = paragraphs
+        .iter()
+        .position(|p| p.trim_start().starts_with(DREAMER_ATTRIBUTION))?;
+    let asks = |p: &str| {
+        let line = p.trim();
+        !line.is_empty() && !line.contains('\n') && line.ends_with(['?', '\u{ff1f}', '\u{61f}'])
+    };
+    let quoted = |p: &str| {
+        p.lines()
+            .all(|line| line.trim_start().starts_with('>') || line.trim().is_empty())
+    };
+    let first = if at > 0 && asks(paragraphs[at - 1]) {
+        at - 1
+    } else {
+        at
+    };
+    let mut end = at + 1;
+    while end < paragraphs.len() && quoted(paragraphs[end]) {
+        end += 1;
+    }
+    let own: Vec<&str> = paragraphs[..first]
+        .iter()
+        .chain(paragraphs[end..].iter())
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    Some(own.join("\n\n"))
+}
+
 /// Opener shared by every side-agent note a person can forward into the
 /// prompt: Claude Code's "You should know" agent writes `... offered by a side
 /// agent:` and CSR's own band writes `... offered by CSR (claude-self-reflect):`.
@@ -529,9 +569,17 @@ fn strip_line_emissions(line: &str) -> String {
 /// mentions CSR is left alone. Retrieval must run on what this returns: run on
 /// the paste, it finds the items the paste lists.
 pub fn strip_csr_emissions(text: &str) -> String {
-    if is_dreamer_prompt(text) {
-        return String::new();
-    }
+    // The dreamer's message is cut by its shape first: the attribution cut
+    // below would keep its question and drop a reply typed under it.
+    let own;
+    let text = match strip_dreamer_prompt(text) {
+        Some(words) if words.is_empty() => return String::new(),
+        Some(words) => {
+            own = words;
+            own.as_str()
+        }
+        None => text,
+    };
     let mut kept: Vec<String> = Vec::new();
     let mut changed = false;
     let mut in_block = false;
@@ -589,6 +637,15 @@ pub fn extractable(text: &str) -> Option<String> {
     if contains_machine_sentinel(&unplumbed) {
         return None;
     }
+    // The dreamer's message is read by its blockquote, which strip_quoted
+    // erases: cut first, by its shape, or a long question pushes the marker
+    // past HEADER_WINDOW and the question is kept as the person's. What the
+    // person wrote around it goes on.
+    let unplumbed = match strip_dreamer_prompt(&unplumbed) {
+        Some(own) if own.trim().is_empty() => return None,
+        Some(own) => own,
+        None => unplumbed,
+    };
     let prose = strip_quoted(&unplumbed);
     let cleaned = prose.trim();
     if cleaned.is_empty() || is_csr_emission(cleaned) {
@@ -718,6 +775,64 @@ mod tests {
         ));
         assert!(!is_dreamer_prompt(
             "Q?\n\nCSR's dreamer asked this while you worked. Its reasoning:"
+        ));
+    }
+
+    #[test]
+    fn a_reply_under_a_long_hindi_dream_keeps_only_the_persons_words() {
+        // Codex review 10-12, #14: the person's reply under a forwarded dream breaks the whole-message grammar, and
+        // a 223-character Devanagari question (553 bytes) puts the attribution past HEADER_WINDOW: the question was
+        // kept as the person's prose, and strip_csr_emissions cut at the attribution, dropping the reply instead.
+        let question = format!(
+            "\u{915}\u{94d}\u{92f}\u{93e} \u{939}\u{94b} \u{905}\u{917}\u{930} {}?",
+            "\u{939}\u{92e} \u{92a}\u{947}\u{928} \u{915}\u{947} \u{930}\u{902}\u{917} \u{921}\u{947}\u{915} \u{915}\u{940} \u{938}\u{94d}\u{92f}\u{93e}\u{939}\u{940} \u{938}\u{947} \u{932}\u{947}\u{902} "
+                .repeat(6)
+        );
+        assert!(question.len() > HEADER_WINDOW);
+        let forward = format!(
+            "{question}\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> **Share the palette**\n> * Two surfaces read the same inks."
+        );
+        let reply = format!("{forward}\n\nNo, keep the current palette.");
+        let mine = Some("No, keep the current palette.");
+        assert_eq!(strip_dreamer_prompt(&reply).as_deref(), mine);
+        assert_eq!(extractable(&reply).as_deref(), mine);
+        assert_eq!(Some(strip_csr_emissions(&reply).trim()), mine);
+        assert_eq!(
+            crate::import::scrub_contaminated_text(&reply).as_deref(),
+            mine
+        );
+        assert_eq!(strip_dreamer_prompt(&forward).as_deref(), Some(""));
+        assert!(extractable(&forward).is_none());
+        assert_eq!(strip_csr_emissions(&forward), "");
+        // the pane's one-line send, words above and below it
+        let pane = "Look.\n\nCSR's dreamer asked this while you worked: \u{201c}What if?\u{201d} Its reasoning: x.\n\nNot now.";
+        assert_eq!(
+            strip_dreamer_prompt(pane).as_deref(),
+            Some("Look.\n\nNot now.")
+        );
+        // no dreamer message at all: None, and the text is left to the other checks
+        assert_eq!(
+            strip_dreamer_prompt("what if the dreamer asked less?"),
+            None
+        );
+    }
+
+    #[test]
+    fn emission_detects_the_compaction_cards_draft_a_click_puts_in_the_prompt() {
+        // Codex review 10-12, #13: a double click on the companion's done compaction card puts this draft in the
+        // prompt box; sent, it was imported as the person's words, its "Learnt:" lines as their own.
+        let card = "CSR's compaction card (compacted by csr): Context: 274k \u{2192} 70k tokens. \
+                    Each API call now sends 204k fewer tokens. Learnt: Never skip validation.";
+        assert!(is_csr_emission(card));
+        assert!(extractable(card).is_none());
+        for stage in ["compacting soon", "compacting", "compaction skipped"] {
+            assert!(is_csr_emission(&format!(
+                "CSR's compaction card ({stage}): 278k"
+            )));
+        }
+        // the person's own words about the card stay theirs
+        assert!(!is_csr_emission(
+            "the compaction card should say it in prompts"
         ));
     }
 

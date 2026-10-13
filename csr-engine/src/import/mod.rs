@@ -62,13 +62,20 @@ pub fn contamination_reason(text: &str) -> Option<&'static str> {
 /// Remove exact wrapper spans and paragraphs that are themselves CSR output.
 /// `None` means the content was pure contamination and should be dropped.
 pub(crate) fn scrub_contaminated_text(text: &str) -> Option<String> {
-    // The companion dreamer's message is machine-owned from its first word to
-    // its last: drop it whole BEFORE paragraph scrubbing, which would remove
-    // only the attribution paragraph and keep the question and the quoted
-    // reasoning as the person's own words.
-    if crate::extraction::provenance::is_dreamer_prompt(text) {
-        return None;
-    }
+    // The companion dreamer's message is machine-owned from its question to
+    // its reasoning: cut it by shape BEFORE paragraph scrubbing, which would
+    // remove only the attribution paragraph and keep the question and the
+    // quoted reasoning as the person's own words. A reply typed under it is
+    // the person's and stays.
+    let dreamt;
+    let text = match crate::extraction::provenance::strip_dreamer_prompt(text) {
+        Some(own) if own.is_empty() => return None,
+        Some(own) => {
+            dreamt = own;
+            dreamt.as_str()
+        }
+        None => text,
+    };
     // A forwarded side-agent note is the side agent's words, not the person's:
     // cut the opener and its blockquote, keep what the person typed after it.
     let forwarded;
