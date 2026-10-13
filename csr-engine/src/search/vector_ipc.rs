@@ -45,7 +45,9 @@ const PING_TIMEOUT: Duration = Duration::from_millis(1500);
 /// the whole graph) so a busy daemon is not mistaken for a dead one. An
 /// absolute deadline: connecting, writing and reading all count.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
-/// The caller's deadline for a `Sync`.
+/// How long the daemon waits for its index sync to apply a stored change
+/// before acknowledging a `Sync` anyway, and the caller's deadline for it.
+const SYNC_WAIT: Duration = Duration::from_secs(3);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(4);
 /// After a failed call, re-ping the daemon from this delay, doubling, for up
 /// to [`BACKOFF_TOTAL`] before answering keyword-only. A restart leaves no
@@ -149,8 +151,8 @@ enum Op {
         limit: usize,
         min_score: f32,
     },
-    /// The caller committed embedding changes up to `seq`: wake the index
-    /// sync.
+    /// The caller committed embedding changes up to `seq`: apply them, then
+    /// answer (or answer after [`SYNC_WAIT`] regardless).
     Sync {
         seq: i64,
     },
@@ -610,8 +612,10 @@ impl VectorProxy {
         }
     }
 
-    /// The server committed an embedding to SQLite: wake the daemon's index
-    /// sync. `true` when the daemon confirmed it applied the change.
+    /// The server committed an embedding to SQLite. Ask the daemon to apply
+    /// every change up to the latest one before answering, so a search right
+    /// after a store finds it (bounded by [`SYNC_WAIT`]; the keyword index
+    /// has it regardless). `true` when the daemon confirmed it applied them.
     pub(crate) fn sync_committed(&self) -> bool {
         let Ok(seq) = self.storage.latest_embedding_change_seq() else {
             return false;
@@ -767,9 +771,20 @@ async fn serve_one(
                     .map(|hit| (hit.id, hit.score))
                     .collect(),
             },
-            Op::Sync { seq: _ } => {
-                nudge.notify_one();
-                Reply::Synced { applied: false }
+            Op::Sync { seq } => {
+                // Answer once the index sync has applied the caller's
+                // committed changes, or after SYNC_WAIT regardless.
+                let deadline = Instant::now() + SYNC_WAIT;
+                loop {
+                    if search.blocking_read().change_cursor() >= seq {
+                        break Reply::Synced { applied: true };
+                    }
+                    if Instant::now() >= deadline {
+                        break Reply::Synced { applied: false };
+                    }
+                    nudge.notify_one();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         })
     })
@@ -864,6 +879,7 @@ pub(crate) mod test_support {
         shutdown: Arc<AtomicBool>,
         handles: Vec<tokio::task::JoinHandle<()>>,
         pub(crate) search: Arc<RwLock<SearchEngine>>,
+        pub(crate) embeddings: Arc<EmbeddingEngine>,
     }
 
     impl TestDaemon {
@@ -883,8 +899,9 @@ pub(crate) mod test_support {
                 shutdown.clone(),
                 nudge.clone(),
             );
+            let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
             let server = spawn_for_daemon(
-                Arc::new(EmbeddingEngine::new().unwrap()),
+                embeddings.clone(),
                 search.clone(),
                 db,
                 shutdown.clone(),
@@ -903,6 +920,7 @@ pub(crate) mod test_support {
                 shutdown,
                 handles: vec![sync, server],
                 search,
+                embeddings,
             }
         }
 
@@ -1037,8 +1055,8 @@ mod tests {
             "queries were embedded by the daemon"
         );
 
-        // A reflection stored through the server reaches the daemon's index
-        // now (the sync nudge), not at its next 10 s poll.
+        // A reflection stored through the server is in the daemon's index
+        // when the store returns (review finding #7), not at its next poll.
         crate::mcp::tools::store_reflection_internal(
             proxied.storage(),
             proxied.embeddings(),
@@ -1048,15 +1066,61 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while daemon.search.read().await.reflection_count() != 41 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the daemon's index has the reflection well before its 10 s poll");
+        assert_eq!(daemon.search.read().await.reflection_count(), 41);
         assert!(!proxied.embeddings().is_loaded());
         daemon.stop().await;
+    }
+
+    /// Review finding #7: a store returns only after the daemon applied it,
+    /// so the very next vector search finds the stored reflection. The
+    /// daemon's sync loop polls every 10 s; only the acknowledged Sync can
+    /// make this immediate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stored_reflection_is_searchable_when_the_store_returns() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let proxied = Engine::new_proxied(&db, &projects).unwrap().unwrap();
+        for round in 0..5 {
+            let content = format!("stored then searched, round {round}");
+            crate::mcp::tools::store_reflection_internal(
+                proxied.storage(),
+                proxied.embeddings(),
+                proxied.search(),
+                &content,
+                &["solution".into()],
+            )
+            .await
+            .unwrap();
+            let vector = daemon_embedding(&daemon, &content).await;
+            let hits = proxied
+                .search()
+                .read()
+                .await
+                .search_reflections(&vector, 1, 0.99);
+            assert_eq!(hits.len(), 1, "round {round}: found right after the store");
+        }
+        // The acknowledgement itself: a change committed to SQLite is in the
+        // daemon's index when Sync answers `applied`.
+        let proxy = proxied.search().read().await.proxy().unwrap().clone();
+        proxied
+            .storage()
+            .insert_reflection("acked", "acked", &[], &direction(77_777))
+            .unwrap();
+        let synced = tokio::task::spawn_blocking(move || proxy.sync_committed())
+            .await
+            .unwrap();
+        assert!(synced, "the daemon confirms it applied the change");
+        assert!(daemon.search.read().await.has_reflection("acked"));
+        daemon.stop().await;
+    }
+
+    async fn daemon_embedding(daemon: &TestDaemon, text: &str) -> Vec<f32> {
+        let embeddings = daemon.embeddings.clone();
+        let text = text.to_string();
+        tokio::task::spawn_blocking(move || embeddings.embed_single(&text).unwrap())
+            .await
+            .unwrap()
     }
 
     fn fast(proxy: &VectorProxy) {
