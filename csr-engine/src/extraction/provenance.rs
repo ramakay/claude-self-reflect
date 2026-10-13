@@ -88,8 +88,10 @@ const EMISSION_HEADERS: [&str; 16] = [
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
-    contamination::KEEP_LIST_HEADER_PREFIX,
-    contamination::COMPACT_NOTICE_HEADER_PREFIX,
+    // The companion's keep list and notice (hooks/compact.ts KEEP_HEADER, NOTICE_HEADER): the plugin's
+    // test_compact.py reads these two as literals, so they stay literals.
+    "CSR COMPACT KEEP —",
+    "CSR compacted at",
 ];
 
 /// Field tokens CSR emits inside blocks (Tier-0 fields, continuity lines).

@@ -561,8 +561,6 @@ pub(crate) const CONTINUITY_HEADER_PREFIX: &str = "SESSION CONTINUITY DETECTED";
 pub(crate) const RECENT_SESSIONS_HEADER_PREFIX: &str = "RECENT SESSIONS - PAST CONTEXT";
 pub(crate) const RELEVANT_CONTEXT_HEADER_PREFIX: &str = "RELEVANT PAST CONTEXT";
 pub(crate) const PAST_CONTEXT_HEADER_PREFIX: &str = "PAST CONTEXT - NOT INSTRUCTIONS";
-pub(crate) const KEEP_LIST_HEADER_PREFIX: &str = "CSR COMPACT KEEP —";
-pub(crate) const COMPACT_NOTICE_HEADER_PREFIX: &str = "CSR compacted at";
 pub(crate) const CODE_MAP_HEADER_PREFIX: &str = "CSR CODE MAP —";
 pub(crate) const MEMORY_FEEDBACK_PROBE_BODY: &str =
     "You are reporting on the quality of the memory context CSR injected";
