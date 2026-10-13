@@ -269,6 +269,22 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   reports `stale_processes`, `status --stale` reads no database (8f0ec174, 32730957). The statusline "reconnect
   mcp" marker is gone (b4a1708c).
 
+### Companion plugin
+
+- **`plugins/csr-companion` ships in the repo** (marketplace `claude-self-reflect`, `.claude-plugin/marketplace.json`,
+  relative source path). Install with `/plugin marketplace add ramakay/claude-self-reflect` then
+  `/plugin install csr-companion@claude-self-reflect`. `csr-engine setup` and the npm package do not install it.
+- **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
+  "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
+  last told it. It reads the csr-engine database read-only
+  and makes no model call.
+- **Dreamer** (off until you turn it on in `/config`): asks one "what if...?" when your past sessions give it a
+  reason, slows down when it finds nothing, and spends at most 1 token for every 10 Claude spends. What you forward
+  from it is matched by the engine's provenance guard, so it is not read back as your words.
+- **Compaction coach:** `suggest` (default) offers to compact at a quiet turn end between 181k and 269k tokens,
+  `auto` compacts on its own, `off` never does.
+- **Git guard** is off unless a `csr-guard.json` exists (`README.md` in the plugin).
+
 ### Installer
 
 - Installers report stale csr-engine processes and `launchctl kickstart -k` the daemon (8f0ec174, 32730957).
