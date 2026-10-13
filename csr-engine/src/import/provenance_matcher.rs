@@ -186,6 +186,55 @@ impl MessageIndex {
         self.documents[0].inputs()
     }
 
+    /// Map complete-message forward cuts onto an exact stored slice.
+    /// Repeated source text is usable only when every occurrence agrees.
+    pub(super) fn without_forwards(&self, content: &str) -> Option<String> {
+        if content.is_empty() {
+            return None;
+        }
+        let mut agreed: Option<Vec<(usize, usize)>> = None;
+        for document in &self.documents {
+            for &start in document
+                .anchors
+                .get(&anchor(content.as_bytes()))
+                .into_iter()
+                .flatten()
+            {
+                let end = start + content.len();
+                if document.text.get(start..end) != Some(content) {
+                    continue;
+                }
+                let mut cuts = Vec::new();
+                let first = document.pieces.partition_point(|piece| piece.end <= start);
+                for piece in document.pieces[first..]
+                    .iter()
+                    .take_while(|piece| piece.start < end)
+                {
+                    for span in crate::extraction::provenance::forward_spans(
+                        &document.text[piece.start..piece.end],
+                    ) {
+                        let lo = start.max(piece.start + span.start);
+                        let hi = end.min(piece.start + span.end);
+                        if lo < hi {
+                            cuts.push((lo - start, hi - start));
+                        }
+                    }
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                if agreed.as_ref().is_some_and(|prior| prior != &cuts) {
+                    return None;
+                }
+                agreed = Some(cuts);
+            }
+        }
+        let mut own = content.to_string();
+        for (start, end) in agreed?.into_iter().rev() {
+            own.replace_range(start..end, "");
+        }
+        Some(own)
+    }
+
     pub(super) fn locate(&self, chunk_id: &str, content: &str) -> Option<ChunkEvidence> {
         if content.is_empty() {
             return None;

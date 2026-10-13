@@ -1001,6 +1001,7 @@ fn import_rollout_with_retries(
 /// `Ok(None)` means the rollout vanished between discovery and reading it,
 /// which is routine: Codex deletes session files aggressively.
 fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutStreamOutcome>> {
+    let _operation = engine.storage().operation_lock()?;
     let storage = engine.storage();
     let Some(metadata) = scan_rollout_metadata(&file.path)? else {
         return Ok(None);

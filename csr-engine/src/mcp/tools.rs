@@ -2073,6 +2073,7 @@ pub async fn store_reflection_internal(
     content: &str,
     tags: &[String],
 ) -> Result<String> {
+    let _operation = storage.operation_lock()?;
     let id = uuid::Uuid::new_v4().to_string();
 
     let embedding = {
@@ -2092,6 +2093,7 @@ async fn store_embedded_reflection(
     tags: &[String],
     embedding: Vec<f32>,
 ) -> Result<String> {
+    let _operation = storage.operation_lock()?;
     storage.insert_reflection(&id, content, tags, &embedding)?;
 
     let acknowledged = {

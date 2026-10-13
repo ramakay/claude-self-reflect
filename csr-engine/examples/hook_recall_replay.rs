@@ -47,7 +47,7 @@
 //!                                   optional in this mode (used only for the
 //!                                   source_project_items_exposed count when
 //!                                   present).
-//!   CSR_HOOKRECALL_EXPECT_MANIFEST blake3 hex of index/manifest.json. When
+//!   CSR_HOOKRECALL_EXPECT_MANIFEST blake3 hex of index-v3/manifest.json. When
 //!                                   set, the manifest hash is computed BEFORE
 //!                                   the Engine is constructed and the run
 //!                                   aborts on mismatch. The hash is always
@@ -204,7 +204,7 @@ struct Config {
     sample_project: Option<String>,
     /// Explicit-ids mode: bypass project sampling, load exactly these ids.
     sample_ids_path: Option<PathBuf>,
-    /// blake3 hex of `index/manifest.json` the run must match, if set.
+    /// blake3 hex of `index-v3/manifest.json` the run must match, if set.
     expect_manifest: Option<String>,
     cwd: PathBuf,
     n: usize,
@@ -814,7 +814,7 @@ struct Provenance {
     db_path: String,
     db_size_bytes: u64,
     index_dir_size_bytes: u64,
-    /// `index/manifest.json`'s own `created_at` (empty string if the manifest
+    /// `index-v3/manifest.json`'s own `created_at` (empty string if the manifest
     /// is missing or unreadable). Two arms whose clones came from different
     /// live index dumps carry different `created_at` values even when the DB
     /// clone step ran identically, because an HNSW re-dump changes the graph
@@ -837,7 +837,7 @@ struct Provenance {
     exposure_lists_blake3: String,
 }
 
-/// Identity fields pulled from `index/manifest.json` so a base/fix arm pair
+/// Identity fields pulled from `index-v3/manifest.json` so a base/fix arm pair
 /// built from different live-index dumps is visible in the results instead
 /// of silently producing a shifted HNSW top-k. Read as generic JSON, not the
 /// crate's private `search::IndexManifest`, mirroring the read-only access

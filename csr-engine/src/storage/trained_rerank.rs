@@ -524,7 +524,11 @@ impl Storage {
     /// Hook-safe exposure write. Never waits for the in-process mutex or a
     /// SQLite writer lock; `false` means telemetry was intentionally dropped.
     pub fn try_record_rerank_exposure(&self, impression: &ExposureImpression) -> Result<bool> {
-        let conn = match self.conn.try_lock() {
+        let _operation = match self.operation_lock() {
+            Ok(lock) => lock,
+            Err(_) => return Ok(false),
+        };
+        let conn = match self.conn.inner.try_lock() {
             Ok(conn) => conn,
             Err(TryLockError::WouldBlock) => return Ok(false),
             Err(TryLockError::Poisoned(error)) => {

@@ -1,27 +1,20 @@
-//! One-shot maintenance runs (`backfill scrub`) quiesce the database instead of
-//! racing the processes that write it.
-//!
-//! Two parts. A preflight ([`other_holders`]) lists every other process that has
-//! the database (or its WAL) open; the scrub refuses to start while any does,
-//! because a hook from an older binary writes a chunk's text and its vector in
-//! two statements no transaction of ours can fence (astra r2 #3, #6). And a
-//! lock file ([`MaintenanceLock`]) for the whole run, which every writer of
-//! this binary honours: hook imports skip (the watcher picks the file up later,
-//! its import state untouched), the watcher sleeps, `store_reflection` waits.
-//! A lock whose process is gone is ignored by every reader.
+//! OS-held exclusion between maintenance and database writers or index publishers.
+//! The persistent file records status information; only its file lock owns the run.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 
-/// The lock file, in the data directory (the database's directory).
+/// The persistent lock file in the database directory.
 pub const LOCK_FILE: &str = "maintenance.lock";
+const RETRY: Duration = Duration::from_millis(50);
 
-/// How long the watcher sleeps between looks at a held lock.
-pub const POLL: Duration = Duration::from_secs(2);
-
-/// The maintenance run a lock file names.
+/// Informational metadata for the current maintenance run.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MaintenanceHolder {
     pub pid: u32,
@@ -45,110 +38,157 @@ fn read(data_dir: &Path) -> Option<MaintenanceHolder> {
     })
 }
 
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks that the process exists and may be signalled.
-    let sent = unsafe { libc::kill(pid, 0) };
-    sent == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+fn open(data_dir: &Path) -> Result<File> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating maintenance directory {}", data_dir.display()))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(data_dir.join(LOCK_FILE))
+        .with_context(|| format!("opening {}", data_dir.join(LOCK_FILE).display()))
 }
 
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    true
+/// A shared file lock held for one complete writer or publisher operation.
+#[derive(Debug, Clone)]
+pub struct SharedLock {
+    _file: Arc<File>,
+    data_dir: PathBuf,
 }
 
-/// The maintenance run in progress for `data_dir`, if any: a lock file naming a
-/// live process other than this one. A stale lock (its process gone) is none.
+impl SharedLock {
+    pub(crate) fn check_directory(&self, data_dir: &Path) -> Result<()> {
+        anyhow::ensure!(
+            self.data_dir
+                == data_dir
+                    .canonicalize()
+                    .context("resolving publication directory")?,
+            "operation lock belongs to another data directory"
+        );
+        Ok(())
+    }
+}
+
+/// Try once without blocking. A busy exclusive lock returns no guard.
+pub fn try_shared(data_dir: &Path) -> Result<Option<SharedLock>> {
+    let file = open(data_dir)?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(Some(SharedLock {
+            _file: Arc::new(file),
+            data_dir: data_dir
+                .canonicalize()
+                .context("resolving maintenance directory")?,
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error).context("trying shared maintenance lock"),
+    }
+}
+
+/// Acquire a shared lock immediately or ask the caller to retry later.
+pub fn shared(data_dir: &Path) -> Result<SharedLock> {
+    try_shared(data_dir)?.context("maintenance in progress, retry when it ends")
+}
+
+/// Wait asynchronously using nonblocking attempts, retaining the successful lock.
+pub async fn wait_shared(data_dir: &Path, limit: Duration) -> Result<SharedLock> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if let Some(lock) = try_shared(data_dir)? {
+            return Ok(lock);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("maintenance in progress, retry when it ends");
+        }
+        tokio::time::sleep(
+            RETRY.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+        )
+        .await;
+    }
+}
+
+/// Probe the OS lock without blocking. Metadata never determines ownership.
 pub fn active(data_dir: &Path) -> Option<MaintenanceHolder> {
-    read(data_dir).filter(|holder| holder.pid != std::process::id() && pid_alive(holder.pid))
+    // Status must not create a file or require write access to an idle directory.
+    let file = File::open(data_dir.join(LOCK_FILE)).ok()?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Some(read(data_dir).unwrap_or(MaintenanceHolder {
+                pid: 0,
+                started_at: String::new(),
+            }))
+        }
+        Err(_) => None,
+    }
 }
 
-/// Held for a maintenance run's whole length; the file goes when this drops
-/// (an error or a panic included). A signal handler calls [`Self::release`].
-#[derive(Debug)]
+/// Exclusive ownership of a maintenance run. Clones retain the same OS lock.
+/// The file is never removed or renamed, including on errors and process exit.
+#[derive(Debug, Clone)]
 pub struct MaintenanceLock {
+    file: Arc<File>,
     path: PathBuf,
 }
 
 impl MaintenanceLock {
-    /// Take the lock in `data_dir`, replacing a stale one. Fails while another
-    /// live maintenance run holds it.
+    /// Try nonblocking acquisition for at most thirty seconds before refusing.
     pub fn acquire(data_dir: &Path) -> Result<Self> {
-        if let Some(holder) = active(data_dir) {
-            anyhow::bail!(
-                "another maintenance run (pid {}) has held {} since {}",
-                holder.pid,
-                data_dir.join(LOCK_FILE).display(),
-                holder.started_at
-            );
+        Self::acquire_for(data_dir, Duration::from_secs(30))
+    }
+
+    fn acquire_for(data_dir: &Path, limit: Duration) -> Result<Self> {
+        let mut file = open(data_dir)?;
+        let deadline = Instant::now() + limit;
+        loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        anyhow::bail!("refusing maintenance: writers or another maintenance run hold {} after {} seconds", data_dir.join(LOCK_FILE).display(), limit.as_secs());
+                    }
+                    std::thread::sleep(
+                        RETRY.min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(error) => return Err(error).context("trying exclusive maintenance lock"),
+            }
         }
-        std::fs::create_dir_all(data_dir)?;
-        let path = data_dir.join(LOCK_FILE);
-        let tmp = data_dir.join(format!("{LOCK_FILE}.{}", std::process::id()));
-        std::fs::write(
-            &tmp,
-            format!(
-                "pid={}\nstarted_at={}\n",
-                std::process::id(),
-                chrono::Utc::now().to_rfc3339()
-            ),
+        file.set_len(0)
+            .context("clearing maintenance status metadata")?;
+        write!(
+            file,
+            "pid={}\nstarted_at={}\n",
+            std::process::id(),
+            chrono::Utc::now().to_rfc3339()
         )
-        .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(Self { path })
+        .context("writing maintenance status metadata")?;
+        Ok(Self {
+            file: Arc::new(file),
+            path: data_dir
+                .canonicalize()
+                .context("resolving maintenance directory")?
+                .join(LOCK_FILE),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Remove the lock now, if it is still this process's.
-    pub fn release(path: &Path) {
-        let ours = path
-            .parent()
-            .and_then(read)
-            .is_some_and(|holder| holder.pid == std::process::id());
-        if ours {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-impl Drop for MaintenanceLock {
-    fn drop(&mut self) {
-        Self::release(&self.path);
-    }
-}
-
-/// Wait up to `limit` for a maintenance run in `data_dir` to end. An error says
-/// so, for a caller that must not write meanwhile and cannot queue the write.
-pub async fn wait_until_clear(data_dir: &Path, limit: Duration) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + limit;
-    while let Some(holder) = active(data_dir) {
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "maintenance in progress (pid {}, since {}): retry when it ends",
-                holder.pid,
-                holder.started_at
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(250).min(limit)).await;
-    }
-    Ok(())
-}
-
-/// Sleep while a maintenance run in `data_dir` is in progress.
-pub async fn sleep_while_active(data_dir: &Path) {
-    let mut said = false;
-    while let Some(holder) = active(data_dir) {
-        if !said {
-            tracing::info!(pid = holder.pid, "maintenance in progress; import paused");
-            said = true;
-        }
-        tokio::time::sleep(POLL).await;
+    /// Retain this run's exclusive ownership for an operation in its directory.
+    pub(crate) fn operation(&self, data_dir: &Path) -> Result<SharedLock> {
+        let dir = data_dir
+            .canonicalize()
+            .context("resolving operation directory")?;
+        anyhow::ensure!(
+            self.path.parent() == Some(dir.as_path()),
+            "maintenance lock belongs to another data directory"
+        );
+        Ok(SharedLock {
+            _file: self.file.clone(),
+            data_dir: dir,
+        })
     }
 }
 
@@ -170,24 +210,11 @@ pub fn other_holders(db: &Path) -> Result<Vec<DbHolder>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
-    let output = std::process::Command::new("lsof")
-        .arg("-t")
-        .arg("--")
-        .args(&files)
-        .output()
-        .context("running lsof to find other processes holding the database")?;
-    // lsof exits 1 with no output when no process has the files open.
-    if !output.status.success() && !output.stdout.is_empty() {
-        anyhow::bail!(
-            "lsof failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let mut pids = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .filter_map(|pid| pid.parse::<u32>().ok())
-        .filter(|&pid| pid != std::process::id())
-        .collect::<Vec<_>>();
+    let mut command = std::process::Command::new("lsof");
+    command.arg("-t").arg("--").args(&files);
+    let output = command_output(&mut command, Duration::from_secs(3))?;
+    let mut pids = parse_lsof(&output)?;
+    pids.retain(|&pid| pid != std::process::id());
     pids.sort_unstable();
     pids.dedup();
     Ok(pids
@@ -212,6 +239,122 @@ fn executable_of(pid: u32) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Collect both pipes while enforcing a deadline on the process and its output.
+fn command_output(
+    command: &mut std::process::Command,
+    limit: Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running lsof to find other processes holding the database")?;
+    let stdout = child.stdout.take().context("opening lsof stdout")?;
+    let stderr = child.stderr.take().context("opening lsof stderr")?;
+    fn reader(
+        pipe: impl Read + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+        let (send, recv) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .and_then(|_| {
+                    if bytes.len() > 1024 * 1024 {
+                        Err(std::io::Error::other(
+                            "lsof output exceeded the enumeration limit",
+                        ))
+                    } else {
+                        Ok(bytes)
+                    }
+                });
+            let _ = send.send(result);
+        });
+        recv
+    }
+    let stdout = reader(stdout);
+    let stderr = reader(stderr);
+    let deadline = Instant::now() + limit;
+    let mut status = None;
+    let mut out = None;
+    let mut err = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait().context("waiting for lsof")?;
+        }
+        if out.is_none() {
+            out = stdout.try_recv().ok();
+        }
+        if err.is_none() {
+            err = stderr.try_recv().ok();
+        }
+        if status.is_some() && out.is_some() && err.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            // SAFETY: the child was started in its own process group above.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!(
+                "lsof timed out after {} seconds; holder enumeration is incomplete",
+                limit.as_secs_f64()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(std::process::Output {
+        status: status.context("missing lsof exit status")?,
+        stdout: out
+            .context("missing lsof stdout")?
+            .context("reading lsof stdout")?,
+        stderr: err
+            .context("missing lsof stderr")?
+            .context("reading lsof stderr")?,
+    })
+}
+
+fn parse_lsof(output: &std::process::Output) -> Result<Vec<u32>> {
+    anyhow::ensure!(
+        output.stderr.is_empty(),
+        "lsof reported an error: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    if output.status.code() == Some(1) && output.stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        output.status.success(),
+        "lsof failed with {}",
+        output.status
+    );
+    let text = std::str::from_utf8(&output.stdout).context("lsof returned non-UTF-8 output")?;
+    anyhow::ensure!(
+        !text.trim().is_empty(),
+        "lsof succeeded without valid holder output"
+    );
+    text.lines()
+        .map(|line| {
+            let pid = line
+                .parse::<u32>()
+                .context("lsof returned an invalid process id")?;
+            anyhow::ensure!(pid > 0, "lsof returned a zero process id");
+            Ok(pid)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,18 +364,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock = MaintenanceLock::acquire(dir.path()).unwrap();
         assert!(lock.path().exists());
-        let holder = read(dir.path()).unwrap();
-        assert_eq!(holder.pid, std::process::id());
-        // This process's own lock never blocks it.
-        assert!(active(dir.path()).is_none());
+        assert_eq!(read(dir.path()).unwrap().pid, std::process::id());
+        assert_eq!(active(dir.path()).unwrap().pid, std::process::id());
+        assert!(try_shared(dir.path()).unwrap().is_none());
         drop(lock);
-        assert!(!dir.path().join(LOCK_FILE).exists());
+        // Ownership goes away; the persistent inode must never be removed.
+        assert!(dir.path().join(LOCK_FILE).exists());
+        assert!(active(dir.path()).is_none());
+        assert!(try_shared(dir.path()).unwrap().is_some());
     }
 
     #[test]
     fn a_lock_of_a_dead_process_is_ignored_and_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        // A pid no live process has (pid_max is far below this on macOS and Linux).
         std::fs::write(
             dir.path().join(LOCK_FILE),
             "pid=99999999\nstarted_at=2026-10-12T00:00:00Z\n",
@@ -244,37 +388,201 @@ mod tests {
         drop(lock);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_live_lock_blocks_writers_until_it_goes() {
         let dir = tempfile::tempdir().unwrap();
-        // Another live process: this test's parent, which outlives the test.
-        let parent = std::os::unix::process::parent_id();
-        std::fs::write(
-            dir.path().join(LOCK_FILE),
-            format!("pid={parent}\nstarted_at=2026-10-12T00:00:00Z\n"),
-        )
-        .unwrap();
-        assert_eq!(active(dir.path()).map(|holder| holder.pid), Some(parent));
-        assert!(MaintenanceLock::acquire(dir.path()).is_err());
-        let error = wait_until_clear(dir.path(), Duration::from_millis(300))
+        // An OS-held lock, rather than PID metadata, proves live ownership.
+        let owner = MaintenanceLock::acquire(dir.path()).unwrap();
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
+        let error = wait_shared(dir.path(), Duration::from_millis(30))
             .await
             .unwrap_err();
-        assert!(
-            error.to_string().contains("maintenance in progress"),
-            "{error}"
-        );
-        let path = dir.path().join(LOCK_FILE);
-        let remover = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            std::fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("maintenance in progress"));
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(owner);
         });
-        wait_until_clear(dir.path(), Duration::from_secs(5))
+        let writer = wait_shared(dir.path(), Duration::from_secs(5))
             .await
             .unwrap();
-        remover.await.unwrap();
+        releaser.await.unwrap();
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
+        drop(writer);
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
     }
 
+    #[test]
+    fn round3_sixteen_exclusive_attempts_have_one_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = Arc::new(std::sync::Barrier::new(16));
+        let finish = Arc::new(std::sync::Barrier::new(16));
+        let owners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers = (0..16)
+            .map(|_| {
+                let path = dir.path().to_path_buf();
+                let start = start.clone();
+                let finish = finish.clone();
+                let owners = owners.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let lock = MaintenanceLock::acquire_for(&path, Duration::ZERO).ok();
+                    if lock.is_some() {
+                        owners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    finish.wait();
+                    drop(lock);
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(owners.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn round3_reused_pid_metadata_does_not_own_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LOCK_FILE);
+        std::fs::write(
+            &path,
+            format!(
+                "pid={}\nstarted_at=1970-01-01T00:00:00Z\n",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        assert!(active(dir.path()).is_none());
+        let lock = MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).unwrap();
+        assert_eq!(active(dir.path()).unwrap().pid, std::process::id());
+        assert!(try_shared(dir.path()).unwrap().is_none());
+        drop(lock);
+        assert!(path.exists());
+        assert!(active(dir.path()).is_none());
+        assert!(try_shared(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_operations_exclude_maintenance_until_every_handle_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = shared(dir.path()).unwrap();
+        let second = shared(dir.path()).unwrap();
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
+        drop(first);
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
+        drop(second);
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reflection_wait_retains_the_acquired_shared_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = MaintenanceLock::acquire(dir.path()).unwrap();
+        let error = wait_shared(dir.path(), Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("maintenance in progress"));
+        drop(owner);
+        let writer = wait_shared(dir.path(), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
+        drop(writer);
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round3_lsof_errors_and_malformed_output_refuse_preflight() {
+        use std::os::unix::process::ExitStatusExt;
+        for code in [1, 2, 127] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: b"lsof: forced failure\n".to_vec(),
+            };
+            assert!(parse_lsof(&output).is_err(), "exit {code}");
+        }
+        for (code, stdout, stderr, accepted) in [
+            (1, "", "", true),
+            (2, "", "", false),
+            (127, "", "", false),
+            (0, "123\n456\n", "", true),
+            (0, "bogus\n", "", false),
+            (0, "0\n", "", false),
+            (0, "123\n", "warning\n", false),
+        ] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: stderr.as_bytes().to_vec(),
+            };
+            assert_eq!(
+                parse_lsof(&output).is_ok(),
+                accepted,
+                "exit {code}, {stdout:?}, {stderr:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round3_lsof_four_second_stub_is_killed_at_deadline() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "/bin/sleep 4; exit 1"]);
+        let start = Instant::now();
+        let error = command_output(&mut command, Duration::from_secs(3)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_millis(3800));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round3_lsof_stderr_stub_cannot_masquerade_as_no_match() {
+        for code in [1, 2, 127] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!("echo 'lsof: forced failure' >&2; exit {code}"),
+            ]);
+            assert!(
+                parse_lsof(&command_output(&mut command, Duration::from_secs(3)).unwrap()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_child_entry() {
+        let Some(path) = std::env::var_os("CSR_R3_LOCK_CHILD") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let _owner = MaintenanceLock::acquire(&path).unwrap();
+        std::fs::write(path.join("ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn os_releases_maintenance_after_process_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "maintenance::tests::maintenance_child_entry"])
+            .env("CSR_R3_LOCK_CHILD", dir.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("ready").exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let held = active(dir.path()).is_some();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(held);
+        assert!(dir.path().join(LOCK_FILE).exists());
+        assert!(active(dir.path()).is_none());
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+    }
     #[test]
     fn the_preflight_lists_another_process_holding_the_database() {
         let dir = tempfile::tempdir().unwrap();

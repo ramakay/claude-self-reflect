@@ -662,6 +662,15 @@ fn main() -> Result<()> {
         );
     }
     let args = Args::parse();
+    let _hook_operation = match &args.command {
+        Some(Commands::Hook { name, .. }) if name != "install" => {
+            let Some(operation) = csr_engine::hooks::try_start(&args.db_path) else {
+                return Ok(());
+            };
+            Some(operation)
+        }
+        _ => None,
+    };
     if matches!(&args.command, Some(Commands::Hook { name, .. }) if name == "prompt-submit") {
         let _ = std::panic::catch_unwind(|| {
             csr_engine::hooks::prompt_transport::run_client(
@@ -1346,6 +1355,8 @@ async fn run(
             },
     }) = &args.command
     {
+        let data_dir = args.db_path.parent().unwrap_or(std::path::Path::new("."));
+        let lock = csr_engine::maintenance::MaintenanceLock::acquire(data_dir)?;
         // Preflight: the scrub runs only with no other process on the
         // database. A hook from an older binary writes a chunk's text and its
         // vector in two statements no transaction can fence.
@@ -1369,6 +1380,25 @@ async fn run(
             );
             lines
         };
+        if let (Err(error), false) = (&checked, *force) {
+            anyhow::bail!(
+                "refusing to scrub: cannot verify that no other process holds the database ({error:#}); rerun with --force"
+            );
+        }
+        if !holders.is_empty() && !*force {
+            for line in &preflight {
+                eprintln!("{line}");
+            }
+            anyhow::bail!(
+                "refusing to scrub while other processes hold the database: stop them (Claude Code sessions, the daemon, MCP servers) or rerun with --force"
+            );
+        }
+        if !holders.is_empty() {
+            eprintln!(
+                "warning: --force: scrubbing while {} other process(es) hold the database; their writes can race it",
+                holders.len()
+            );
+        }
         let mut report = if *dry_run {
             let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
             csr_engine::import::scrub::dry_run_scrub(
@@ -1378,34 +1408,7 @@ async fn run(
                 *include_active,
             )?
         } else {
-            if let (Err(error), false) = (&checked, *force) {
-                anyhow::bail!(
-                    "refusing to scrub: cannot verify that no other process holds the database ({error:#}); rerun with --force"
-                );
-            }
-            if !holders.is_empty() && !*force {
-                for line in &preflight {
-                    eprintln!("{line}");
-                }
-                anyhow::bail!(
-                    "refusing to scrub while other processes hold the database: stop them (Claude Code sessions, the daemon, MCP servers) or rerun with --force"
-                );
-            }
-            if !holders.is_empty() {
-                eprintln!(
-                    "warning: --force: scrubbing while {} other process(es) hold the database; their writes can race it",
-                    holders.len()
-                );
-            }
-            let data_dir = args
-                .db_path
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_path_buf();
-            let lock = csr_engine::maintenance::MaintenanceLock::acquire(&data_dir)?;
-            // An interrupt removes the lock too; a kill -9 leaves a lock whose
-            // process is gone, which every reader ignores.
-            let lock_path = lock.path().to_path_buf();
+            // Process exit releases the OS lock, including after a signal.
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
@@ -1427,10 +1430,10 @@ async fn run(
                 }
                 #[cfg(not(unix))]
                 let _ = tokio::signal::ctrl_c().await;
-                csr_engine::maintenance::MaintenanceLock::release(&lock_path);
                 std::process::exit(130);
             });
-            let eng = engine::Engine::new(&args.db_path, &args.projects_dir)?;
+            let eng =
+                engine::Engine::new_for_maintenance(&args.db_path, &args.projects_dir, &lock)?;
             let report = csr_engine::import::scrub::run_scrub(
                 &eng,
                 false,

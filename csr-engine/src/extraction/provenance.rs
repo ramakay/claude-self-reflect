@@ -414,6 +414,7 @@ struct Forwards {
     own: String,
     /// Byte offset of the first forward in the CRLF-normalised, trimmed text.
     first: usize,
+    spans: Vec<ForwardSpan>,
 }
 
 /// Byte offset just past the `…` pane.py's `one_line(text, chars)` appends when it cut a send that starts at
@@ -440,24 +441,31 @@ fn closing_quote(line: &str, from: usize, limit: usize) -> Option<usize> {
 }
 
 /// End of a v1 (legacy) one-line send that starts at `start`: its cut, else the end of its line.
-fn legacy_end(line: &str, start: usize, chars: usize) -> usize {
-    send_truncation_end(line, start, chars).unwrap_or(line.len())
+fn legacy_end(line: &str, start: usize, chars: usize) -> (usize, bool) {
+    let end = send_truncation_end(line, start, chars);
+    (end.unwrap_or(line.len()), end.is_some())
 }
 
 /// A one-line forward whose header ends at `header` (the stage, or the story's number): its end, v2 or v1, or
 /// `None` when what follows is neither form.
-fn body_forward_end(line: &str, start: usize, header: usize, chars: usize) -> Option<usize> {
+fn body_forward_end(
+    line: &str,
+    start: usize,
+    header: usize,
+    chars: usize,
+) -> Option<(usize, bool)> {
     let rest = &line[header..];
     if rest.starts_with(QUOTED_OPEN) {
         let limit = send_limit(line, start, chars);
-        return Some(closing_quote(line, header + QUOTED_OPEN.len(), limit).unwrap_or(line.len()));
+        let end = closing_quote(line, header + QUOTED_OPEN.len(), limit);
+        return Some((end.unwrap_or(line.len()), end.is_some()));
     }
     rest.starts_with(':')
         .then(|| legacy_end(line, start, chars))
 }
 
 /// The pane's dream starting at `start` (where the attribution sentence is): its end, or `None`.
-fn pane_dream_end(line: &str, start: usize) -> Option<usize> {
+fn pane_dream_end(line: &str, start: usize) -> Option<(usize, bool)> {
     let after = start + DREAMER_ATTRIBUTION.len();
     let rest = &line[after..];
     if rest.starts_with(QUOTED_OPEN) {
@@ -466,7 +474,7 @@ fn pane_dream_end(line: &str, start: usize) -> Option<usize> {
         let reasoning = question
             .filter(|&end| line[end..].starts_with(DREAMER_PANE_QUOTED_REASONING))
             .and_then(|end| closing_quote(line, end + DREAMER_PANE_QUOTED_REASONING.len(), limit));
-        return Some(reasoning.unwrap_or(line.len()));
+        return Some((reasoning.unwrap_or(line.len()), reasoning.is_some()));
     }
     let question = rest.strip_prefix(DREAMER_PANE_LEGACY_OPEN)?;
     question
@@ -476,10 +484,12 @@ fn pane_dream_end(line: &str, start: usize) -> Option<usize> {
 
 /// The first one-line forward in `line` at or after byte `from`: its `(start, end)`. The card and the story count
 /// only when `others`.
-fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize, usize)> {
+fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize, usize, bool)> {
     let dream = line[from..]
         .match_indices(DREAMER_ATTRIBUTION)
-        .find_map(|(at, _)| pane_dream_end(line, from + at).map(|end| (from + at, end)));
+        .find_map(|(at, _)| {
+            pane_dream_end(line, from + at).map(|(end, bounded)| (from + at, end, bounded))
+        });
     let card = || {
         line[from..]
             .match_indices(COMPACTION_CARD_OPEN)
@@ -494,7 +504,7 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
                             let header = stage + known.len() + ")".len();
                             body_forward_end(line, start, header, COMPACTION_CARD_SEND_CHARS)
                         })
-                        .map(|end| (start, end))
+                        .map(|(end, bounded)| (start, end, bounded))
                 })
             })
     };
@@ -510,7 +520,7 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
                 (digits > 0)
                     .then(|| body_forward_end(line, start, number + digits, STORY_SEND_CHARS))
                     .flatten()
-                    .map(|end| (start, end))
+                    .map(|(end, bounded)| (start, end, bounded))
             })
     };
     [
@@ -520,63 +530,99 @@ fn next_one_line_forward(line: &str, from: usize, others: bool) -> Option<(usize
     ]
     .into_iter()
     .flatten()
-    .min_by_key(|&(start, _)| start)
+    .min_by_key(|&(start, _, _)| start)
 }
 
-/// True for what a band hotkey or a quote marker leaves right before a forward: one digit, or `>` marks.
-fn hotkey_or_marker(piece: &str) -> bool {
-    let piece = piece.trim();
-    let mut chars = piece.chars();
-    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_ascii_digit())
-        || piece.chars().all(|c| c == '>' || c.is_whitespace())
+/// Start of an optional quote marker and single hotkey digit before a header.
+/// A multi-digit number belongs to the person and is preserved whole.
+fn forward_prefix_start(piece: &str) -> usize {
+    let trimmed = piece.trim_end();
+    let digit_start = trimmed.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let digits = trimmed.len() - digit_start;
+    if digits > 1 {
+        return piece.len();
+    }
+    let mut cut = digit_start;
+    let mut marker = false;
+    loop {
+        cut = piece[..cut].trim_end().len();
+        if piece[..cut].ends_with('>') {
+            cut -= 1;
+            marker = true;
+        } else {
+            break;
+        }
+    }
+    if digits == 1 && !marker && cut == digit_start && cut > 0 {
+        // A digit attached to a word is not a band hotkey.
+        return piece.len();
+    }
+    cut
 }
 
-/// Cut every one-line forward out of `line`. `None` when it has none; otherwise the person's words left on it
-/// (pieces joined by a space) and the offset of its first forward. A single digit (a band hotkey) or `>` alone
-/// right before a forward goes with it; any other piece, `42` included, is the person's (astra r2 #8).
-fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> {
-    let mut pieces: Vec<&str> = Vec::new();
+/// A forward's byte range, and whether its end relies on the message ending.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForwardSpan {
+    pub start: usize,
+    pub end: usize,
+    pub needs_message_end: bool,
+}
+
+/// Cut one-line forwards using the same prefix and span grammar as scrub.
+fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize, Vec<ForwardSpan>)> {
+    let mut pieces = Vec::new();
+    let mut spans = Vec::new();
     let mut cursor = 0;
     let mut first = None;
-    while let Some((start, end)) = next_one_line_forward(line, cursor, others) {
+    while let Some((start, end, bounded)) = next_one_line_forward(line, cursor, others) {
         first.get_or_insert(start);
-        let before = &line[cursor..start];
-        if !hotkey_or_marker(before) {
-            pieces.push(before.trim());
-        }
+        let from = cursor + forward_prefix_start(&line[cursor..start]);
+        pieces.push(line[cursor..from].trim());
+        spans.push(ForwardSpan {
+            start: from,
+            end,
+            needs_message_end: end == line.len() && !bounded,
+        });
         cursor = end.max(start + 1);
     }
     let first = first?;
     pieces.push(line[cursor..].trim());
-    let kept = pieces
-        .into_iter()
-        .filter(|piece| !piece.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some((kept, first))
+    Some((
+        pieces
+            .into_iter()
+            .filter(|piece| !piece.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        first,
+        spans,
+    ))
 }
 
-/// Byte spans of the one-line forwards (pane dream, compaction card, session story) in `text`, line by line, each
-/// widened over a hotkey digit or quote marker right before it. The import scrub follows a forward that a stored
-/// chunk's byte budget split across chunks: it joins the chunks of one message and cuts the parts of a span that
-/// fall in each (astra r2 #7).
-pub(crate) fn one_line_forward_spans(text: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut line_start = 0;
-    for line in text.split('\n') {
-        let mut cursor = 0;
-        while let Some((start, end)) = next_one_line_forward(line, cursor, true) {
-            let from = if hotkey_or_marker(&line[cursor..start]) {
-                cursor
-            } else {
-                start
-            };
-            spans.push((line_start + from, line_start + end));
-            cursor = end.max(start + 1);
-        }
-        line_start += line.len() + 1;
-    }
-    spans
+/// All forward cuts in original byte coordinates, including band forwards.
+/// Extraction and scrub obtain their cuts from the same complete-message parser.
+pub(crate) fn forward_spans(text: &str) -> Vec<ForwardSpan> {
+    let Some(found) = scan_forwards(text, true) else {
+        return Vec::new();
+    };
+    let normalized = text.replace("\r\n", "\n");
+    let leading = normalized.len() - normalized.trim_start().len();
+    let bytes = text.as_bytes();
+    let mut offsets = (0..bytes.len())
+        .filter(|&at| bytes[at] != b'\r' || bytes.get(at + 1) != Some(&b'\n'))
+        .collect::<Vec<_>>();
+    offsets.push(text.len());
+    found
+        .spans
+        .into_iter()
+        .map(|span| ForwardSpan {
+            start: offsets[leading + span.start],
+            end: offsets[leading + span.end],
+            // A newline present in the stored text supplies the line's end even
+            // when trimming removed it before parsing.
+            needs_message_end: span.needs_message_end
+                && !normalized[leading + span.end..].contains('\n'),
+        })
+        .collect()
 }
 
 /// Read `text` by line for the forwards [`strip_csr_forwards`] names (the card and the story only when `others`).
@@ -602,6 +648,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
     // `None`: the line is cut whole; `Some(text)`: what is left of it.
     let mut kept: Vec<Option<&str>> = lines.iter().map(|line| Some(*line)).collect();
     let mut first: Option<usize> = None;
+    let mut spans = Vec::new();
     let mark = |at: usize, first: &mut Option<usize>| {
         *first = Some(first.map_or(at, |seen| seen.min(at)));
     };
@@ -646,6 +693,17 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
             continue;
         }
         let to = if reasoning { end } else { at + 1 };
+        let span_start = question.map_or(starts[at], |(line, open)| starts[line] + open);
+        let span_end = if to < lines.len() {
+            starts[to]
+        } else {
+            body.len()
+        };
+        spans.push(ForwardSpan {
+            start: span_start,
+            end: span_end,
+            needs_message_end: to == lines.len(),
+        });
         let from = match question {
             Some((line, open)) => {
                 let before = lines[line][..open].trim_end();
@@ -664,7 +722,12 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
     for (index, line) in kept.iter().enumerate() {
         let Some(line) = line else { continue };
         match strip_one_line_forwards(line, others) {
-            Some((own, at)) => {
+            Some((own, at, cuts)) => {
+                spans.extend(cuts.into_iter().map(|cut| ForwardSpan {
+                    start: starts[index] + cut.start,
+                    end: starts[index] + cut.end,
+                    needs_message_end: cut.needs_message_end && index + 1 == lines.len(),
+                }));
                 mark(starts[index] + at, &mut first);
                 if !own.is_empty() {
                     left.push(own);
@@ -688,6 +751,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
     Some(Forwards {
         own: paragraphs.join("\n\n"),
         first,
+        spans,
     })
 }
 

@@ -277,6 +277,7 @@ fn store_briefing(
     briefing: &str,
     episode_ids: &[String],
 ) -> Result<()> {
+    let _operation = engine.storage().operation_lock()?;
     let project_tag = format!("project_{}", project);
     let tags = vec![
         "session_briefing".to_string(),

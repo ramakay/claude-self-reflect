@@ -125,6 +125,7 @@ pub async fn enrich_conversation(
     embeddings: &std::sync::Arc<crate::embeddings::EmbeddingEngine>,
     search: &tokio::sync::RwLock<crate::search::SearchEngine>,
 ) -> anyhow::Result<()> {
+    let _operation = storage.operation_lock()?;
     let messages = crate::import::parse_jsonl_messages_for_search(file_path)?;
     if messages.is_empty() {
         return Ok(());

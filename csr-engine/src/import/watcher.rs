@@ -190,6 +190,23 @@ where
     outcome
 }
 
+/// Retain every deferred file without consuming the database-busy retry budget.
+fn defer_maintenance_batch(
+    paths: impl IntoIterator<Item = PathBuf>,
+    retry_map: &mut HashMap<PathBuf, RetryState>,
+) {
+    let next_at = tokio::time::Instant::now() + Duration::from_secs(2);
+    for path in paths {
+        retry_map
+            .entry(path)
+            .or_insert(RetryState {
+                attempts: 0,
+                next_at,
+            })
+            .next_at = next_at;
+    }
+}
+
 /// The earliest `next_at` across every path still pending retry, or `None`
 /// when nothing is queued — the watcher loop's `tokio::select!` sleeps until
 /// this so a due retry runs even without a fresh notify event.
@@ -377,10 +394,14 @@ impl FileWatcher {
 
             // Process all pending files
             if !pending.is_empty() {
-                // A maintenance run holds the database: the batch waits for it.
-                if let Some(data_dir) = self.index_dir.parent() {
-                    crate::maintenance::sleep_while_active(data_dir).await;
-                }
+                let _operation = match self.storage.operation_lock() {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        tracing::debug!(%error, "maintenance in progress; watcher batch deferred");
+                        defer_maintenance_batch(pending, &mut retry_map);
+                        continue;
+                    }
+                };
                 let _heavy_permit = match &self.heavy_work {
                     Some(heavy_work) => Some(acquire_heavy_work_permit(heavy_work.clone()).await),
                     None => None,
@@ -548,6 +569,7 @@ pub(crate) async fn import_file_content_diff(
     projects_dir: &Path,
     file_path: &Path,
 ) -> Result<()> {
+    let _operation = storage.operation_lock()?;
     // Security: resolve symlinks and verify the file is within our projects directory
     let canonical = file_path
         .canonicalize()
@@ -756,6 +778,10 @@ pub(crate) fn flush_index_blocking(
     index_dir: &Path,
     strict_counts: bool,
 ) -> Option<Result<()>> {
+    let operation = match storage.publication_lock(index_dir) {
+        Ok(lock) => lock,
+        Err(error) => return Some(Err(error)),
+    };
     let index = search.blocking_read();
     if !index.is_dirty() {
         return None;
@@ -772,10 +798,11 @@ pub(crate) fn flush_index_blocking(
         ),
     };
     let started = Instant::now();
-    let published = match index.publish_to_disk(index_dir, chunk_count, reflection_count) {
-        Ok(published) => published,
-        Err(e) => return Some(Err(e)),
-    };
+    let published =
+        match index.publish_to_disk_locked(index_dir, chunk_count, reflection_count, &operation) {
+            Ok(published) => published,
+            Err(e) => return Some(Err(e)),
+        };
     drop(index);
     let written = started.elapsed();
     search.blocking_write().settle_publish(published);
@@ -1124,5 +1151,23 @@ mod tests {
         drop(reader);
         assert!(flushed.await.unwrap().unwrap().is_ok());
         assert!(!search.read().await.is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod maintenance_probes {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_deferral_retries_without_a_new_file_event() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let path = PathBuf::from("/tmp/maintenance-session.jsonl");
+        let mut retries = HashMap::new();
+        defer_maintenance_batch([path.clone()], &mut retries);
+        assert_eq!(retries[&path].attempts, 0);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let batch = wait_for_batch(&mut receiver, &retries).await.unwrap();
+        assert!(batch.contains(&path));
+        drop(sender);
     }
 }

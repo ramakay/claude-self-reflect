@@ -87,6 +87,7 @@ fn sync_batch(
     cursor: i64,
     generation: Option<u64>,
 ) -> Result<(i64, u64, usize)> {
+    let _operation = storage.operation_lock()?;
     let batch = read_batch(storage, search, cursor, generation)?;
     Ok(apply_batch(search, shutdown, batch))
 }
@@ -189,6 +190,52 @@ mod tests {
     use crate::engine::Engine;
     use crate::hooks::{prompt_transport, HookInput};
     use crate::import::ConversationChunk;
+
+    #[test]
+    fn merged_maintenance_defers_identical_vector_cursor_without_publication_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        storage.insert_chunk(&chunk("same"), &axis(0)).unwrap();
+        let search = RwLock::new(SearchEngine::new(10));
+        let shutdown = AtomicBool::new(false);
+        sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+        let (cursor, generation, debt) = {
+            let index = search.blocking_read();
+            (
+                index.change_cursor(),
+                index.generation(),
+                index.unpublished_changes(),
+            )
+        };
+        storage.insert_chunk(&chunk("same"), &axis(0)).unwrap();
+        assert!(storage.latest_embedding_change_seq().unwrap() > cursor);
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        assert!(sync_batch(&storage, &search, &shutdown, cursor, Some(generation)).is_err());
+        assert_eq!(search.blocking_read().change_cursor(), cursor);
+        drop(owner);
+        sync_batch(&storage, &search, &shutdown, cursor, Some(generation)).unwrap();
+        let index = search.blocking_read();
+        assert!(index.change_cursor() > cursor);
+        assert_eq!(index.unpublished_changes(), debt);
+        assert_eq!(index.chunk_tombstone_count(), 0);
+    }
+
+    #[test]
+    fn round3_maintenance_defers_index_sync_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("csr-engine.db")).unwrap();
+        storage.insert_chunk(&chunk("pending"), &axis(0)).unwrap();
+        let search = RwLock::new(SearchEngine::new(10));
+        let shutdown = AtomicBool::new(false);
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let start = Instant::now();
+        assert!(sync_batch(&storage, &search, &shutdown, 0, None).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!search.blocking_read().has_chunk("pending"));
+        drop(owner);
+        sync_batch(&storage, &search, &shutdown, 0, None).unwrap();
+        assert!(search.blocking_read().has_chunk("pending"));
+    }
 
     #[test]
     fn scrub_changes_survive_sync_and_a_batch_read_before_the_rebuild() {

@@ -1369,18 +1369,22 @@ impl Daemon {
         }
         watcher_handle.abort(); // Watcher uses notify which doesn't check shutdown flag
 
-        // Flush HNSW index to disk before exit
+        // Flush HNSW index to disk before exit. A busy maintenance run skips it.
+        let operation = self.storage.publication_lock(&self.index_dir);
         let mut idx = self.search.write().await;
-        if idx.is_dirty() {
-            let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
-            let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
-            if let Err(e) = idx.dump_to_disk(&self.index_dir, chunk_count, refl_count) {
-                tracing::warn!(error = %e, "failed to flush HNSW index on shutdown");
-            } else {
-                tracing::info!("HNSW index flushed to disk on shutdown");
+        if let Ok(operation) = operation {
+            if idx.is_dirty() {
+                let chunk_count = self.storage.count_chunk_embeddings().unwrap_or(0);
+                let refl_count = self.storage.count_reflection_embeddings().unwrap_or(0);
+                if let Err(e) =
+                    idx.dump_to_disk_locked(&self.index_dir, chunk_count, refl_count, &operation)
+                {
+                    tracing::warn!(error = %e, "failed to flush HNSW index on shutdown");
+                } else {
+                    tracing::info!("HNSW index flushed to disk on shutdown");
+                }
             }
         }
-
         let _ = heartbeat_handle.await;
         // Last: MCP servers kept searching through the teardown.
         vector_shutdown.store(true, Ordering::SeqCst);
@@ -1974,6 +1978,7 @@ async fn process_v3_extraction(
     file_path: &Path,
     projects_dir: &Path,
 ) -> Result<()> {
+    let _operation = storage.operation_lock()?;
     let messages = import::parse_jsonl_messages_for_search(file_path)?;
     if messages.is_empty() {
         return Ok(());
@@ -2327,6 +2332,7 @@ async fn store_narrative(
     conv_id: &str,
     narrative: &str,
 ) -> Result<()> {
+    let _operation = storage.operation_lock()?;
     let narrative_owned = narrative.to_string();
     let emb = embeddings.clone();
     let embeddings_vec =
@@ -2425,6 +2431,7 @@ async fn run_consolidation(
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
 ) -> Result<()> {
+    let _operation = storage.operation_lock()?;
     let unconsolidated = storage.get_unconsolidated_conversations(10)?;
     if unconsolidated.is_empty() {
         return Ok(());

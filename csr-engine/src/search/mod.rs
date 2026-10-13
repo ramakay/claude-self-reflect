@@ -1175,9 +1175,8 @@ impl SearchEngine {
         db_chunk_count: usize,
         db_reflection_count: usize,
     ) -> Result<()> {
-        let published = self.publish_to_disk(dir, db_chunk_count, db_reflection_count)?;
-        self.settle_publish(published);
-        Ok(())
+        let operation = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
+        self.dump_to_disk_locked(dir, db_chunk_count, db_reflection_count, &operation)
     }
 
     /// The writing half of [`Self::dump_to_disk`], from a shared borrow: every
@@ -1191,6 +1190,31 @@ impl SearchEngine {
         db_chunk_count: usize,
         db_reflection_count: usize,
     ) -> Result<Published> {
+        let lock = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
+        self.publish_to_disk_locked(dir, db_chunk_count, db_reflection_count, &lock)
+    }
+
+    pub(crate) fn dump_to_disk_locked(
+        &mut self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+        lock: &crate::maintenance::SharedLock,
+    ) -> Result<()> {
+        let published =
+            self.publish_to_disk_locked(dir, db_chunk_count, db_reflection_count, lock)?;
+        self.settle_publish(published);
+        Ok(())
+    }
+
+    pub(crate) fn publish_to_disk_locked(
+        &self,
+        dir: &Path,
+        db_chunk_count: usize,
+        db_reflection_count: usize,
+        lock: &crate::maintenance::SharedLock,
+    ) -> Result<Published> {
+        lock.check_directory(dir.parent().unwrap_or(Path::new(".")))?;
         let _publishing = PublishingGuard::enter();
         std::fs::create_dir_all(dir)?;
 
@@ -1945,6 +1969,15 @@ fn write_maintenance_generation(dir: &Path, generation: u64) -> Result<()> {
 /// generation. When the lock file cannot be opened or locked, no publisher can
 /// take it either, and the two writes go ahead without it.
 pub fn invalidate_for_maintenance(dir: &Path) -> Result<u64> {
+    let operation = crate::maintenance::shared(dir.parent().unwrap_or(Path::new(".")))?;
+    invalidate_for_maintenance_locked(dir, &operation)
+}
+
+pub(crate) fn invalidate_for_maintenance_locked(
+    dir: &Path,
+    operation: &crate::maintenance::SharedLock,
+) -> Result<u64> {
+    operation.check_directory(dir.parent().unwrap_or(Path::new(".")))?;
     std::fs::create_dir_all(dir)?;
     let lock = std::fs::OpenOptions::new()
         .write(true)

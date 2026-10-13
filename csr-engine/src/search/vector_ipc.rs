@@ -464,11 +464,16 @@ fn write_by(
 }
 
 fn wait_for_sync(
+    data_dir: &Path,
     search: &RwLock<SearchEngine>,
     seq: i64,
     nudge: &Notify,
     deadline: Instant,
 ) -> bool {
+    // Hold exclusion through the acknowledgement, including already-applied/no-op cursors.
+    let Ok(_operation) = crate::maintenance::shared(data_dir) else {
+        return false;
+    };
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -859,6 +864,7 @@ fn spawn_for_daemon_with(
                     continue;
                 };
                 let (embeddings, search) = (embeddings.clone(), search.clone());
+                let data_dir = data_dir.clone();
                 let (database, nudge, slots) =
                     (database.clone(), sync_nudge.clone(), slots.clone());
                 tokio::spawn(async move {
@@ -874,7 +880,7 @@ fn spawn_for_daemon_with(
                     drop(waiting_slot);
                     let _ = tokio::time::timeout(
                         serve_timeout,
-                        serve_one(stream, embeddings, search, database, nudge, slot),
+                        serve_one(stream, embeddings, search, database, data_dir, nudge, slot),
                     )
                     .await;
                 });
@@ -891,6 +897,7 @@ async fn serve_one(
     embeddings: Arc<EmbeddingEngine>,
     search: Arc<RwLock<SearchEngine>>,
     database: String,
+    data_dir: PathBuf,
     nudge: Arc<Notify>,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) -> Option<()> {
@@ -950,7 +957,13 @@ async fn serve_one(
                         .collect(),
                 },
                 Op::Sync { seq } => Reply::Synced {
-                    applied: wait_for_sync(&search, seq, &nudge, Instant::now() + SYNC_WAIT),
+                    applied: wait_for_sync(
+                        &data_dir,
+                        &search,
+                        seq,
+                        &nudge,
+                        Instant::now() + SYNC_WAIT,
+                    ),
                 },
             })
         })
@@ -1620,13 +1633,35 @@ mod tests {
     }
 
     #[test]
+    fn merged_sync_refuses_an_applied_cursor_during_maintenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let search = RwLock::new(SearchEngine::new(8));
+        search.blocking_write().set_change_cursor(7);
+        let owner = crate::maintenance::MaintenanceLock::acquire(dir.path()).unwrap();
+        let wait = || {
+            wait_for_sync(
+                dir.path(),
+                &search,
+                7,
+                &Notify::new(),
+                Instant::now() + Duration::from_millis(50),
+            )
+        };
+        assert!(!wait());
+        drop(owner);
+        assert!(wait());
+    }
+
+    #[test]
     fn r3_sync_wait_does_not_block_on_a_writer() {
         let search = Arc::new(RwLock::new(SearchEngine::new(8)));
         let held = search.blocking_write();
         let other = search.clone();
         let start = Instant::now();
         let waiter = std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
             wait_for_sync(
+                dir.path(),
                 &other,
                 1,
                 &Notify::new(),

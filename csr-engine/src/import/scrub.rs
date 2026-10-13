@@ -28,6 +28,8 @@ pub struct ScrubReport {
     /// Conversations whose re-parse plan would have wiped most of the stored
     /// corpus. Nothing is written for them.
     pub refused: usize,
+    /// Conversations whose missing source or spans leave a forward cut ambiguous.
+    pub unresolved_ambiguous_source: usize,
     /// Conversations left alone because they were active inside
     /// [`ACTIVE_WINDOW`]. Nothing is read or written for them.
     pub deferred_active: usize,
@@ -59,13 +61,14 @@ impl ScrubReport {
             output.push('\n');
         }
         output.push_str(&format!(
-            "{} summary\nconversations scrubbed: {}\nchunks rewritten: {}\nchunks dropped: {}\nvectors replaced: {}\nrefused: {}\ndeferred (active): {}\nskipped (changed during scrub): {}\n",
+            "{} summary\nconversations scrubbed: {}\nchunks rewritten: {}\nchunks dropped: {}\nvectors replaced: {}\nrefused: {}\nunresolved (ambiguous source): {}\ndeferred (active): {}\nskipped (changed during scrub): {}\n",
             if dry_run { "scrub dry-run" } else { "scrub" },
             self.conversations_scrubbed,
             self.chunks_rewritten,
             self.chunks_dropped,
             self.vectors_replaced,
             self.refused,
+            self.unresolved_ambiguous_source,
             self.deferred_active,
             self.skipped_changed
         ));
@@ -104,6 +107,7 @@ enum ScrubPlanKind {
         rewritten: Vec<ConversationChunk>,
         dropped_ids: Vec<String>,
         reason: String,
+        unresolved: bool,
     },
     /// A re-parse that would rebuild nothing, or drop most of what is stored,
     /// is a parser mismatch rather than a scrub. No writes.
@@ -167,6 +171,8 @@ fn reparse_refusal(
 fn reparse_lacks_stored_text(
     old_chunks: &[ConversationChunk],
     new_chunks: &[ConversationChunk],
+    continues: &[bool],
+    source_cuts: &HashMap<String, String>,
 ) -> bool {
     let squash = |text: &str| {
         text.chars()
@@ -179,17 +185,14 @@ fn reparse_lacks_stored_text(
             .map(|chunk| chunk.content.as_str())
             .collect::<String>(),
     );
-    // Where the chunk before ends mid-line, its message may run on into this
-    // one: a forward's generated tail there is not the person's text, even
-    // when the stored spans cannot prove the two chunks are one message.
-    let continues = old_chunks
-        .iter()
-        .enumerate()
-        .map(|(index, _)| index > 0 && !old_chunks[index - 1].content.ends_with('\n'))
-        .collect::<Vec<_>>();
-    let carried = cut_forwards_across_chunks(old_chunks, &continues);
-    carried.iter().any(|content| {
-        scrub_contaminated_text(content).is_some_and(|own| {
+    let (carried, ambiguous) = cuts_with_source(old_chunks, continues, source_cuts);
+    carried.iter().enumerate().any(|(index, content)| {
+        let own = if ambiguous[index] {
+            Some(content.clone())
+        } else {
+            scrub_contaminated_text(content)
+        };
+        own.is_some_and(|own| {
             own.lines().any(|line| {
                 let line = squash(line);
                 !line.is_empty() && !rebuilt.contains(&line)
@@ -285,101 +288,198 @@ fn is_active_in(
 /// False wherever the spans cannot say.
 fn message_continuity(storage: &Storage, chunks: &[ConversationChunk]) -> Result<Vec<bool>> {
     let ids = serde_json::to_string(&chunks.iter().map(|chunk| &chunk.id).collect::<Vec<_>>())?;
-    let spans: Vec<(String, String, i64, i64)> = storage.with_connection(|conn| {
+    let spans: Vec<(String, String, i64, i64, String)> = storage.with_connection(|conn| {
         let mut statement = conn.prepare(
-            "SELECT chunk_id, event_id, start_char, end_char FROM chunk_spans
-             WHERE chunk_id IN (SELECT value FROM json_each(?1))",
+            "SELECT s.chunk_id, s.event_id, s.start_char, s.end_char, s.content_hash
+             FROM chunk_spans s JOIN provenance_events e ON e.event_id = s.event_id
+             JOIN chunks c ON c.id = s.chunk_id
+             WHERE s.chunk_id IN (SELECT value FROM json_each(?1))
+             AND e.conversation_id = c.conversation_id",
         )?;
         let rows = statement
             .query_map([&ids], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     })?;
-    let mut first: HashMap<&str, (i64, &str)> = HashMap::new();
-    let mut last: HashMap<&str, (i64, &str)> = HashMap::new();
-    for (chunk, event, start, end) in &spans {
-        let earliest = first.entry(chunk).or_insert((*start, event));
-        if *start < earliest.0 {
-            *earliest = (*start, event);
-        }
-        let latest = last.entry(chunk).or_insert((*end, event));
-        if *end > latest.0 {
-            *latest = (*end, event);
-        }
+    let mut by_chunk: HashMap<&str, Vec<_>> = HashMap::new();
+    for (chunk, event, start, end, hash) in &spans {
+        by_chunk
+            .entry(chunk)
+            .or_default()
+            .push((event, *start, *end, hash));
     }
-    Ok(chunks
+    // The importer slices long messages into their own chunks. Multiple events
+    // or a changed hash cannot establish a complete slice of one message.
+    let proven = chunks
+        .iter()
+        .map(|chunk| {
+            let spans = by_chunk.get(chunk.id.as_str())?;
+            let [(event, start, end, hash)] = spans.as_slice() else {
+                return None;
+            };
+            (*start >= 0
+                && *end - *start == chunk.content.chars().count() as i64
+                && **hash == crate::provenance::content_hash(&chunk.content))
+            .then_some((event.as_str(), *start, *end))
+        })
+        .collect::<Vec<_>>();
+    Ok(proven
         .iter()
         .enumerate()
-        .map(|(index, chunk)| {
+        .map(|(index, span)| {
             index > 0
-                && matches!(
-                    (last.get(chunks[index - 1].id.as_str()), first.get(chunk.id.as_str())),
-                    (Some((_, before)), Some((_, after))) if before == after
-                )
+                && matches!((proven[index - 1], *span),
+            (Some((before, _, end)), Some((after, start, _))) if before == after && end == start)
         })
         .collect())
 }
 
-/// Each chunk's content with the parts of one-line forwards that run across a
-/// chunk boundary cut out, wherever `continues[i]` says chunk `i` continues
-/// chunk `i - 1`. A stored chunk is a byte-budget slice of its message, so a
-/// forward begun in one chunk can end in the next: scrubbed alone, the next
-/// chunk kept its generated tail as the person's text (astra r2 #7). A forward
-/// inside one chunk is left to that chunk's own scrub.
-fn cut_forwards_across_chunks(chunks: &[ConversationChunk], continues: &[bool]) -> Vec<String> {
+/// Compute every forward cut in message context and map it to chunk bytes.
+/// Unproven boundaries never join messages for a destructive cut.
+fn cut_forwards_across_chunks(
+    chunks: &[ConversationChunk],
+    continues: &[bool],
+) -> (Vec<String>, Vec<bool>) {
     let mut out = chunks
         .iter()
         .map(|chunk| chunk.content.clone())
         .collect::<Vec<_>>();
+    let mut ambiguous = vec![false; chunks.len()];
     let mut start = 0;
     while start < chunks.len() {
         let mut end = start + 1;
         while end < chunks.len() && continues[end] {
             end += 1;
         }
-        if end - start >= 2 {
-            let mut offsets = Vec::with_capacity(end - start + 1);
-            let mut joined = String::new();
-            for chunk in &chunks[start..end] {
-                offsets.push(joined.len());
-                joined.push_str(&chunk.content);
-            }
+        let mut offsets = Vec::with_capacity(end - start + 1);
+        let mut joined = String::new();
+        for chunk in &chunks[start..end] {
             offsets.push(joined.len());
-            let mut cuts: Vec<Vec<(usize, usize)>> = vec![Vec::new(); end - start];
-            for (from, to) in crate::extraction::provenance::one_line_forward_spans(&joined) {
-                let first = offsets.partition_point(|&offset| offset <= from) - 1;
-                let last = offsets.partition_point(|&offset| offset < to) - 1;
-                if first == last {
-                    continue;
-                }
-                for (chunk, cut) in cuts.iter_mut().enumerate().take(last + 1).skip(first) {
-                    let lo = from.max(offsets[chunk]) - offsets[chunk];
-                    let hi = to.min(offsets[chunk + 1]) - offsets[chunk];
-                    if lo < hi {
-                        cut.push((lo, hi));
-                    }
+            joined.push_str(&chunk.content);
+        }
+        offsets.push(joined.len());
+        let mut cuts: Vec<Vec<(usize, usize)>> = vec![Vec::new(); end - start];
+        for span in crate::extraction::provenance::forward_spans(&joined) {
+            let first = offsets.partition_point(|&offset| offset <= span.start) - 1;
+            let last = offsets.partition_point(|&offset| offset < span.end) - 1;
+            if span.needs_message_end && end - start == 1 && end < chunks.len() {
+                ambiguous[start + first..=start + last].fill(true);
+                continue;
+            }
+            for (chunk, cut) in cuts.iter_mut().enumerate().take(last + 1).skip(first) {
+                let lo = span.start.max(offsets[chunk]) - offsets[chunk];
+                let hi = span.end.min(offsets[chunk + 1]) - offsets[chunk];
+                if lo < hi {
+                    cut.push((lo, hi));
                 }
             }
-            for (chunk, mut cut) in cuts.into_iter().enumerate() {
-                cut.sort_unstable();
-                let text = &mut out[start + chunk];
-                for (lo, hi) in cut.into_iter().rev() {
-                    text.replace_range(lo..hi, "");
-                }
+        }
+        for (chunk, mut cut) in cuts.into_iter().enumerate() {
+            cut.sort_unstable();
+            for (lo, hi) in cut.into_iter().rev() {
+                out[start + chunk].replace_range(lo..hi, "");
             }
         }
         start = end;
     }
-    out
+    // A split header can select a conversation without proving a message.
+    // Detect that uncertainty for reporting only; never use this join to cut.
+    let mut joined = String::new();
+    let mut offsets = Vec::new();
+    for chunk in chunks {
+        offsets.push(joined.len());
+        joined.push_str(&chunk.content);
+    }
+    offsets.push(joined.len());
+    for span in crate::extraction::provenance::forward_spans(&joined) {
+        let first = offsets.partition_point(|&offset| offset <= span.start) - 1;
+        let last = offsets.partition_point(|&offset| offset < span.end) - 1;
+        if (first + 1..=last).any(|index| !continues[index]) {
+            ambiguous[first..=last].fill(true);
+        }
+    }
+    for (index, uncertain) in ambiguous.iter().enumerate() {
+        if *uncertain {
+            out[index] = chunks[index].content.clone();
+        }
+    }
+    (out, ambiguous)
 }
 
-fn in_place(old_chunks: &[ConversationChunk], continues: &[bool], reason: String) -> ScrubPlanKind {
-    let carried = cut_forwards_across_chunks(old_chunks, continues);
+/// Source adapters can prove cuts even when historical chunks lack spans.
+fn source_forward_cuts(
+    path: &Path,
+    conversation_id: &str,
+    chunks: &[ConversationChunk],
+    sources: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let codex = conversation_id.starts_with("codex:")
+        || sources.values().any(|source| source == "codex_rollout");
+    let plan =
+        conversation_id.starts_with("plan:") || sources.values().any(|source| source == "plan");
+    if !codex && !plan && !is_claude_transcript_conversation(conversation_id, sources) {
+        return HashMap::new();
+    }
+    let needles = chunks
+        .iter()
+        .map(|chunk| chunk.content.as_str())
+        .collect::<Vec<_>>();
+    let Ok(index) = super::provenance_matcher::MessageIndex::read(
+        path,
+        conversation_id,
+        codex,
+        plan,
+        None,
+        &needles,
+    ) else {
+        return HashMap::new();
+    };
+    chunks
+        .iter()
+        .filter_map(|chunk| {
+            index
+                .without_forwards(&chunk.content)
+                .map(|own| (chunk.id.clone(), own))
+        })
+        .collect()
+}
+
+fn cuts_with_source(
+    chunks: &[ConversationChunk],
+    continues: &[bool],
+    source_cuts: &HashMap<String, String>,
+) -> (Vec<String>, Vec<bool>) {
+    let (mut own, mut ambiguous) = cut_forwards_across_chunks(chunks, continues);
+    for (index, chunk) in chunks.iter().enumerate() {
+        if let Some(proven) = source_cuts.get(&chunk.id) {
+            own[index] = proven.clone();
+            ambiguous[index] = false;
+        }
+    }
+    (own, ambiguous)
+}
+
+fn in_place(
+    old_chunks: &[ConversationChunk],
+    continues: &[bool],
+    source_cuts: &HashMap<String, String>,
+    reason: String,
+) -> ScrubPlanKind {
+    let (carried, ambiguous) = cuts_with_source(old_chunks, continues, source_cuts);
     let mut rewritten = Vec::new();
     let mut dropped_ids = Vec::new();
-    for (chunk, carried) in old_chunks.iter().zip(&carried) {
+    for (index, (chunk, carried)) in old_chunks.iter().zip(&carried).enumerate() {
+        if ambiguous[index] {
+            continue;
+        }
         match scrub_contaminated_text(carried) {
             Some(content) if content != chunk.content => {
                 let mut clean = chunk.clone();
@@ -394,6 +494,7 @@ fn in_place(old_chunks: &[ConversationChunk], continues: &[bool], reason: String
         rewritten,
         dropped_ids,
         reason,
+        unresolved: ambiguous.into_iter().any(|value| value),
     }
 }
 
@@ -426,12 +527,26 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
     let mut structural_evidence = HashMap::new();
     let mut import_mark = None;
     let claude = is_claude_transcript_conversation(conversation_id, &sources);
+    let source_before = match paths.as_slice() {
+        [path] => source_revision(path),
+        _ => None,
+    };
+    let mut source_cuts = match paths.as_slice() {
+        [path] if source_before.is_some() => {
+            source_forward_cuts(path, conversation_id, &old_chunks, &sources)
+        }
+        _ => HashMap::new(),
+    };
+    if paths.first().and_then(|path| source_revision(path)) != source_before {
+        source_cuts.clear();
+    }
     let kind = match paths.as_slice() {
         // More than one transcript recorded for one id: the one picked may be a
         // partial copy, so no re-parse is trusted to say what the rest held.
         [_, _, ..] if claude => in_place(
             &old_chunks,
             &continues,
+            &source_cuts,
             format!("{} source paths registered", paths.len()),
         ),
         [path] if claude && path.exists() => {
@@ -450,10 +565,13 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
                     });
             // The revision is read before the parse and checked after it: a file
             // that grew meanwhile is never recorded as read in full.
-            let before = source_revision(&path);
+            let before = source_before;
             let parsed = parse_jsonl_file_with_stats_and_parent(&path, project, parent.as_ref())
                 .with_context(|| format!("re-parsing {}", path.display()))?;
             let after = source_revision(&path);
+            if before != after {
+                source_cuts.clear();
+            }
             let chunks = parsed.chunks;
             let new_ids = chunks
                 .iter()
@@ -461,10 +579,11 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
                 .collect::<Vec<_>>();
             if let Some(reason) = reparse_refusal(&old_chunks, &chunks, &path) {
                 ScrubPlanKind::Refused { reason }
-            } else if reparse_lacks_stored_text(&old_chunks, &chunks) {
+            } else if reparse_lacks_stored_text(&old_chunks, &chunks, &continues, &source_cuts) {
                 in_place(
                     &old_chunks,
                     &continues,
+                    &source_cuts,
                     "re-parse lacks stored text".to_string(),
                 )
             } else {
@@ -500,6 +619,7 @@ fn load_plan(storage: &Storage, conversation_id: &str) -> Result<ScrubPlan> {
         _ => in_place(
             &old_chunks,
             &continues,
+            &source_cuts,
             "source missing or not a Claude transcript".to_string(),
         ),
     };
@@ -545,7 +665,20 @@ fn summarize_plan(plan: &ScrubPlan, report: &mut ScrubReport) {
             .push(format!("{}: {reason}", plan.conversation_id));
         return;
     }
-    report.conversations_scrubbed += 1;
+    if matches!(
+        plan.kind,
+        ScrubPlanKind::Missing {
+            unresolved: true,
+            ..
+        }
+    ) {
+        report.actions.push(format!(
+            "{}: unresolved (ambiguous source); uncertain text preserved",
+            plan.conversation_id
+        ));
+    } else {
+        report.conversations_scrubbed += 1;
+    }
     match &plan.kind {
         ScrubPlanKind::Refused { .. } => unreachable!("returned above"),
         ScrubPlanKind::Stable {
@@ -592,7 +725,9 @@ fn summarize_plan(plan: &ScrubPlan, report: &mut ScrubReport) {
             rewritten,
             dropped_ids,
             reason,
+            unresolved,
         } => {
+            report.unresolved_ambiguous_source += usize::from(*unresolved);
             report.chunks_rewritten += rewritten.len();
             report.chunks_dropped += dropped_ids.len();
             report.vectors_replaced += rewritten.len();
@@ -871,6 +1006,11 @@ fn writes_of<'a>(engine: &Engine, plan: &'a ScrubPlan) -> Option<Writes<'a>> {
     };
     Some(match &plan.kind {
         ScrubPlanKind::Refused { .. } => return None,
+        ScrubPlanKind::Missing {
+            rewritten,
+            dropped_ids,
+            ..
+        } if rewritten.is_empty() && dropped_ids.is_empty() => return None,
         ScrubPlanKind::Stable {
             source_path,
             chunks,
@@ -1081,8 +1221,7 @@ pub async fn run_scrub(
         engine.invalidate_index_manifest()?;
         invalidated = true;
     }
-    // One short transaction per conversation: hooks and importers in live
-    // sessions keep writing between them. The index is not edited slot by slot
+    // One short transaction per conversation keeps each write bounded. The index is not edited slot by slot
     // (`remove_chunk` is a linear scan); the rebuild below drops every purged id.
     // Reflections go last, after every enrichment row that cites them is gone,
     // so an interrupted run never leaves a row pointing at a deleted reflection.
@@ -1118,10 +1257,16 @@ pub async fn run_scrub(
     };
     #[cfg(test)]
     tests::after_planning();
-    if plans
-        .iter()
-        .any(|plan| !matches!(plan.kind, ScrubPlanKind::Refused { .. }))
-    {
+    if plans.iter().any(|plan| match &plan.kind {
+        ScrubPlanKind::Refused { .. } => false,
+        ScrubPlanKind::Missing {
+            rewritten,
+            dropped_ids,
+            ..
+        } => !rewritten.is_empty() || !dropped_ids.is_empty(),
+        ScrubPlanKind::Stable { changed_ids, .. } => !changed_ids.is_empty(),
+        ScrubPlanKind::Shifted { .. } => true,
+    }) {
         engine.invalidate_index_manifest()?;
         invalidated = true;
     }
@@ -1160,6 +1305,312 @@ pub async fn run_scrub(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round3_guard_does_not_guess_message_continuity() {
+        let old = vec![
+            chunk_at(
+                "probe",
+                0,
+                "CSR's compaction card (compacting): Generated summary.",
+            ),
+            chunk_at("probe", 1, "Keep the rollback plan."),
+            chunk_at("probe", 2, "Already backed up."),
+        ];
+        let rebuilt = vec![chunk_at("probe", 0, "Already backed up.")];
+        let lost = super::reparse_lacks_stored_text(
+            &old,
+            &rebuilt,
+            &[false, false, false],
+            &std::collections::HashMap::new(),
+        );
+        println!("missing_personal_text_detected={lost}");
+        assert!(lost);
+    }
+    #[tokio::test]
+    async fn round3_incomplete_source_must_keep_a_separate_personal_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = temp.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let source = projects.join("incomplete.jsonl");
+        let safe = "S".repeat(901);
+        let header = "CSR's compaction card (compacting): ";
+        let card = format!("{header}{}", "x".repeat(850 - header.len()));
+        let own = format!("Keep my only rollback plan.{}", "z".repeat(73));
+        std::fs::write(
+            &source,
+            format!("{}\n{}\n", user_line(&safe), user_line(&card)),
+        )
+        .unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(32)));
+        let engine = Engine::from_parts(storage.clone(), embeddings.clone(), search, projects);
+        let chunks = crate::import::chunk_messages(
+            "incomplete",
+            "project",
+            "2026-09-01T00:00:00Z",
+            &[
+                (Speaker::User, safe),
+                (Speaker::User, card),
+                (Speaker::User, own.clone()),
+            ],
+            false,
+        );
+        println!(
+            "old_sizes={:?}",
+            chunks.iter().map(|c| c.content.len()).collect::<Vec<_>>()
+        );
+        for c in &chunks {
+            storage
+                .insert_chunk_with_source(c, &vec![0.1; 384], "conversation")
+                .unwrap();
+        }
+        storage
+            .upsert_import_state_explicit(
+                source.to_str().unwrap(),
+                "incomplete",
+                chunks.len(),
+                "fixture",
+            )
+            .unwrap();
+        let plan = super::load_plan(&storage, "incomplete").unwrap();
+        println!("chosen_plan={:?}", plan.kind);
+        let (applied, _) = super::apply_plan(&engine, &plan, true).await.unwrap();
+        let after = conversation_text(&storage, "incomplete");
+        println!(
+            "applied={applied:?} personal_survives={} rows_after={}",
+            after.contains(&own),
+            storage
+                .get_chunk_ids_for_conversation("incomplete")
+                .unwrap()
+                .len()
+        );
+        assert!(
+            after.contains(&own),
+            "scrub must keep a distinct personal message missing from the source"
+        );
+    }
+    #[test]
+    fn round3_combined_marker_hotkey_keeps_reply() {
+        let own = "Keep the deployment frozen.";
+        for prefix in [">2", "> 2", ">>2"] {
+            let raw = format!("{prefix}CSR's compaction card (compacting), quoted: “One.” {own}");
+            let cut = crate::extraction::provenance::strip_csr_forwards(&raw);
+            let extracted = crate::extraction::provenance::extractable(&raw);
+            println!(
+                "prefix={prefix} forwards={cut:?} extractable={extracted:?} scrub={:?}",
+                super::scrub_contaminated_text(&raw)
+            );
+            assert_eq!(extracted.as_deref(), Some(own));
+            assert_eq!(super::scrub_contaminated_text(&raw).as_deref(), Some(own));
+        }
+    }
+    #[test]
+    fn round3_a_split_header_must_be_selected() {
+        let storage = Storage::open_memory().unwrap();
+        let raw = format!(
+            "{}CSR's compaction card (compacting), quoted: “One.” Keep the deployment frozen.",
+            "P".repeat(890)
+        );
+        let chunks = crate::import::chunk_messages(
+            "split-head",
+            "p",
+            "2026-09-01T00:00:00Z",
+            &[(Speaker::User, raw.clone())],
+            false,
+        );
+        for c in &chunks {
+            storage.insert_chunk(c, &vec![0.1; 384]).unwrap();
+        }
+        let selected = storage.contaminated_conversations().unwrap();
+        println!(
+            "whole={:?} sizes={:?} selected={selected:?}",
+            crate::import::contamination_reason(&raw),
+            chunks.iter().map(|c| c.content.len()).collect::<Vec<_>>()
+        );
+        assert!(!selected.is_empty());
+        let report = super::dry_run_scrub(&storage, Some("split-head"), false, true).unwrap();
+        assert_eq!(report.unresolved_ambiguous_source, 1);
+        assert_eq!((report.chunks_rewritten, report.chunks_dropped), (0, 0));
+    }
+    #[tokio::test]
+    async fn round3_missing_source_without_spans_reports_unresolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let header = "CSR's compaction card (compacting): ";
+        let raw = format!(
+            "{header}{}… Keep the deployment frozen.",
+            "x".repeat(1199 - header.chars().count())
+        );
+        seed_split_message(&storage, &embeddings, "no-spans", &raw, false);
+        let report = super::run_scrub(&engine, false, Some("no-spans"), false, true)
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_ambiguous_source, 1);
+        assert_eq!(report.conversations_scrubbed, 0);
+        assert!(report.index_rebuilt.is_none());
+        assert!(report
+            .format_text(false)
+            .contains("unresolved (ambiguous source): 1"));
+        let after = conversation_text(&storage, "no-spans");
+        println!("after={after:?}");
+        assert_eq!(after.replace('|', ""), raw);
+    }
+    #[tokio::test]
+    async fn round3_band_continuation_must_be_cut() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let raw=format!("“Question?”\n\nCSR's dreamer asked this while you worked, quoted. Its reasoning:\n\n> {}\nKeep the deployment frozen.","x".repeat(1200));
+        seed_split_message(&storage, &embeddings, "band-split", &raw, true);
+        super::run_scrub(&engine, false, Some("band-split"), false, true)
+            .await
+            .unwrap();
+        let after = conversation_text(&storage, "band-split");
+        println!("after={after:?}");
+        assert_eq!(after, "Keep the deployment frozen.");
+    }
+
+    #[test]
+    fn round3_numeric_reply_split_at_boundary() {
+        let raw = format!(
+            "{}42CSR's compaction card (compacting), quoted: “One.”",
+            "P".repeat(899)
+        );
+        let chunks = crate::import::chunk_messages(
+            "numeric-boundary",
+            "p",
+            "2026-09-01T00:00:00Z",
+            &[(Speaker::User, raw.clone())],
+            false,
+        );
+        let (carried, ambiguous) = super::cut_forwards_across_chunks(&chunks, &[false, true]);
+        assert!(!ambiguous.iter().any(|value| *value));
+        let local = carried
+            .iter()
+            .filter_map(|s| super::scrub_contaminated_text(s))
+            .collect::<Vec<_>>()
+            .join("");
+        let whole = super::scrub_contaminated_text(&raw).unwrap();
+        println!(
+            "whole_ends_42={} local_ends_42={} local_last={:?}",
+            whole.ends_with("42"),
+            local.ends_with("42"),
+            &local[local.len() - 3..]
+        );
+        assert_eq!(local, whole, "numeric reply must survive a chunk boundary");
+    }
+    #[tokio::test]
+    async fn round3_source_recovers_legacy_forward_without_stored_spans() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source-forward.jsonl");
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let header = "CSR's compaction card (compacting): ";
+        let raw = format!(
+            "{header}{}… Keep the deployment frozen.",
+            "x".repeat(1199 - header.chars().count())
+        );
+        std::fs::write(&source, user_line(&raw)).unwrap();
+        seed_split_message(&storage, &embeddings, "source-forward", &raw, false);
+        storage
+            .upsert_import_state_explicit(source.to_str().unwrap(), "source-forward", 2, "fixture")
+            .unwrap();
+        let report = super::run_scrub(&engine, false, Some("source-forward"), false, true)
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_ambiguous_source, 0);
+        assert_eq!(
+            conversation_text(&storage, "source-forward"),
+            "Keep the deployment frozen."
+        );
+    }
+
+    #[tokio::test]
+    async fn round3_codex_source_keeps_both_numeric_reply_digits() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("rollout-forward.jsonl");
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings.clone(),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let prefix = format!("{}42", "P".repeat(899));
+        let raw = format!("{prefix}CSR's compaction card (compacting), quoted: “One.”");
+        std::fs::write(&source, serde_json::json!({"timestamp":"2026-09-01T00:00:00Z", "type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"type":"input_text", "text":raw}]}}).to_string()).unwrap();
+        seed_split_message(&storage, &embeddings, "codex:source-forward", &raw, false);
+        storage
+            .upsert_import_state_explicit(
+                source.to_str().unwrap(),
+                "codex:source-forward",
+                2,
+                "fixture",
+            )
+            .unwrap();
+        let report = super::run_scrub(&engine, false, Some("codex:source-forward"), false, true)
+            .await
+            .unwrap();
+        assert_eq!(report.unresolved_ambiguous_source, 0);
+        assert_eq!(
+            conversation_text(&storage, "codex:source-forward").replace('|', ""),
+            prefix
+        );
+    }
+
+    #[test]
+    fn round3_nonadjacent_or_changed_spans_do_not_prove_continuity() {
+        let storage = Storage::open_memory().unwrap();
+        let embeddings = EmbeddingEngine::new().unwrap();
+        let raw = format!(
+            "CSR's compaction card (compacting), quoted: “{}” Keep the rollback plan.",
+            "x".repeat(950)
+        );
+        let ids = seed_split_message(&storage, &embeddings, "span-gap", &raw, true);
+        let chunks = storage.get_chunks_by_ids_with_provenance(&ids).unwrap();
+        assert_eq!(
+            super::message_continuity(&storage, &chunks).unwrap(),
+            vec![false, true]
+        );
+        storage.with_connection(|conn| {
+            conn.execute("UPDATE chunk_spans SET start_char=start_char+5,end_char=end_char+5 WHERE chunk_id=?1", [&ids[1]])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            super::message_continuity(&storage, &chunks).unwrap(),
+            vec![false, false]
+        );
+        storage.with_connection(|conn| {
+            conn.execute("UPDATE chunk_spans SET start_char=start_char-5,end_char=end_char-5,content_hash='changed' WHERE chunk_id=?1", [&ids[1]])?;
+            Ok(())
+        }).unwrap();
+        assert_eq!(
+            super::message_continuity(&storage, &chunks).unwrap(),
+            vec![false, false]
+        );
+    }
+
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1665,17 +2116,21 @@ mod tests {
                             observed_at: "2026-09-01T00:00:00Z".into(),
                         },
                     )?;
+                    let mut start_char = 0_i64;
                     for chunk in &chunks {
+                        let end_char = start_char + chunk.content.chars().count() as i64;
                         conn.execute(
                             "INSERT INTO chunk_spans (chunk_id, event_id, start_char, end_char, content_hash)
-                             VALUES (?1, ?2, 0, ?3, ?4)",
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
                             rusqlite::params![
                                 chunk.id,
                                 format!("{conversation}-message"),
-                                chunk.content.chars().count() as i64,
+                                start_char,
+                                end_char,
                                 crate::provenance::content_hash(&chunk.content)
                             ],
                         )?;
+                        start_char = end_char;
                     }
                     Ok(())
                 })
@@ -1731,9 +2186,7 @@ mod tests {
 
     #[test]
     fn astra_r2_7_the_guard_never_counts_a_generated_tail_as_the_persons() {
-        // Without spans the chunks cannot be shown to be one message; the
-        // missing-text guard still must not read the card's tail as the
-        // person's words and force a fallback.
+        // Explicit provenance continuity lets the guard remove the generated tail.
         let head = "CSR's compaction card (compacting): ";
         let send = format!("{head}{}\u{2026}", "x".repeat(1199 - head.chars().count()));
         let own = "Keep the deployment frozen.";
@@ -1754,11 +2207,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![900, 330]
         );
-        assert!(!super::reparse_lacks_stored_text(&stored, &chunk_of(own)));
+        assert!(!super::reparse_lacks_stored_text(
+            &stored,
+            &chunk_of(own),
+            &[false, true],
+            &std::collections::HashMap::new(),
+        ));
         // A stored word the re-parse truly lacks still counts.
         assert!(super::reparse_lacks_stored_text(
             &chunk_of(&format!("{send} {own} My only rollback plan.")),
-            &chunk_of(own)
+            &chunk_of(own),
+            &[false, true],
+            &std::collections::HashMap::new(),
         ));
     }
 
@@ -1768,28 +2228,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let projects = temp.path().join("projects");
         std::fs::create_dir_all(&projects).unwrap();
-        let storage = Arc::new(Storage::open_memory().unwrap());
+        let storage = Arc::new(Storage::open(&temp.path().join("csr-engine.db")).unwrap());
         let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
         let search = Arc::new(RwLock::new(SearchEngine::new(4)));
         let engine = Engine::from_parts(storage.clone(), embeddings, search, projects.clone());
         let source = projects.join("held-session.jsonl");
         std::fs::write(&source, user_line("Keep this fact.")).unwrap();
-        // A live run holds the lock (this test's parent stands in for it).
-        let lock = engine.data_dir().join(crate::maintenance::LOCK_FILE);
-        std::fs::write(
-            &lock,
-            format!(
-                "pid={}\nstarted_at=now\n",
-                std::os::unix::process::parent_id()
-            ),
-        )
-        .unwrap();
-        assert_eq!(engine.import_file(&source, "project").await.unwrap(), 0);
+        let lock = crate::maintenance::MaintenanceLock::acquire(temp.path()).unwrap();
+        assert!(engine.import_file(&source, "project").await.is_err());
+        drop(lock);
         assert!(
             !storage.is_file_imported(&source).unwrap(),
             "the file stays for the watcher"
         );
-        std::fs::remove_file(&lock).unwrap();
         assert!(engine.import_file(&source, "project").await.unwrap() > 0);
         assert!(storage.is_file_imported(&source).unwrap());
     }
