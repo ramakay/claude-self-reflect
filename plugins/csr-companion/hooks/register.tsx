@@ -1,7 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelForkResult, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
 
-import type { CompactView, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
+import type { AgentState, CompactView, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
+import { anyActive, emptyAgentState, isEditTool, LIST_EVERY_MS, normalizePath, reconcileAgentList, reduceAgentEvent } from './agents'
+import type { AgentEvent } from './agents'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
@@ -948,7 +950,49 @@ const CS = {
   theirs: new Map<string, string>(), // background tasks a subagent started: task id -> the subagent
 }
 
+// Whether the main loop is mid-turn, and when it last stepped: a completion's look waits for a quiet main loop.
+const mainTurn = { active: false, stepAt: 0 }
+
 const taskOwners = atom({ plugin: 'csr-companion', key: 'taskOwners' } as const, {} as TaskOwners)
+
+// ---------------------------------------------------------------- the agents of this session (./agents.ts)
+
+// What the typed events say of the session's agents: their lifecycle, files, completions. Kept in the host's state,
+// so a reload of the module keeps it, and keyed by the session id on every entry point (a /clear starts it over).
+// These observers change nothing: every one lets `next` answer first or alone, and a failure in one is swallowed
+// where it happens, so it can never fail a call or run a tool twice.
+const agentSession = atom({ plugin: 'csr-companion', key: 'agentSession' } as const, emptyAgentState(''))
+const ownAgents = (state: AgentState, session: string): AgentState => (state.session === session ? state : emptyAgentState(session))
+
+async function agentsChange($: EngineInterface, change: (state: AgentState) => AgentState): Promise<void> {
+  const session = await $.session.id()
+  await update($, agentSession, current => change(ownAgents(current, session)))
+}
+
+async function track($: EngineInterface, event: AgentEvent): Promise<void> {
+  try {
+    await agentsChange($, state => reduceAgentEvent(state, event))
+  } catch {}
+}
+
+// $.agent.list() into the state: once at the start, after a main turn, and every minute while any agent is running.
+async function pollAgents($: EngineInterface): Promise<void> {
+  try {
+    const list = await $.agent.list()
+    const at = await $.clock.now()
+    await agentsChange($, state => reconcileAgentList(state, list, at))
+  } catch {}
+}
+
+// The minute poll, from the session start (the API fires it on every fresh module load, a reload included, and the host
+// cancels the old module's timers): it asks $.agent.list() only while an agent is pending, running or waiting.
+function watchAgents($: EngineInterface): void {
+  $.clock.every(LIST_EVERY_MS, () => {
+    void (async () => {
+      if (anyActive(ownAgents(await read($, agentSession), await $.session.id()))) await pollAgents($)
+    })().catch(() => undefined)
+  })
+}
 
 async function restoreOwners($: EngineInterface): Promise<void> {
   const owners = await read($, taskOwners)
@@ -1437,11 +1481,6 @@ export const register: Register = (on, options) => {
       return next(e)
     }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the stop go on
 
-    on('turn.start', async ($, e, next) => {
-      await turnStarted($)
-      return next(e)
-    }).catch((_$, e, next) => next(e))
-
     // A matcher of its own: the file-tool hook below is the one that takes every call.
     on('tool.call', { tool: ['AskUserQuestion', 'Edit', 'Write', 'NotebookEdit', 'Bash', 'Agent', 'Workflow', 'Monitor'] }, async ($, e, next) => {
       const file = 'file_path' in e && typeof e.file_path === 'string' ? e.file_path
@@ -1496,25 +1535,60 @@ export const register: Register = (on, options) => {
       return next(e)
     }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the prompt go on
 
-    on('turn.complete', async ($, e, next) => {
-      const result = await next(e)
-      if (e.agentId !== undefined) return result
-      CS.turnRunning = false
-      try {
-        if (e.reason === 'answer' && !CS.compacting && (await isPerson($))) {
-          await atTurnEnd($, e.answer)
-        }
-      } catch {
-      } finally {
-        CS.edits = 0
-        CS.commit = undefined
-        CS.gate = false
-      }
-      return result
-    }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the turn end
-
   }
 
+  // The main loop's turn boundaries, whatever the settings: compaction (when it is on) and the agents both read them.
+  on('turn.start', async ($, e, next) => {
+    mainTurn.active = true
+    if (CS.setting !== 'off') await turnStarted($)
+    return next(e)
+  }).catch((_$, e, next) => next(e))
+
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId !== undefined) {
+      // An agent's turn ends: a run of that agent. e.answer is its report (the hook result's text is not).
+      if (await isPerson($).catch(() => false)) {
+        await track($, { kind: 'complete', at: await $.clock.now(), agentId: e.agentId, turnId: e.turnId, reason: e.reason, answer: e.answer })
+      }
+      return result
+    }
+    mainTurn.active = false
+    if (await isPerson($).catch(() => false)) void pollAgents($)
+    if (CS.setting === 'off') return result
+    CS.turnRunning = false
+    try {
+      if (e.reason === 'answer' && !CS.compacting && (await isPerson($))) {
+        await atTurnEnd($, e.answer)
+      }
+    } catch {
+    } finally {
+      CS.edits = 0
+      CS.commit = undefined
+      CS.gate = false
+    }
+    return result
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the turn end
+
+  // The agent tool's spawn, whoever's loop it happens in. What was asked is recorded before `next` answers (and no
+  // lock is held across it); what came back, after. A spawn that started nothing makes no row.
+  on('agent.spawn', async ($, e, next) => {
+    const person = await isPerson($).catch(() => false)
+    if (person) {
+      await track($, {
+        kind: 'spawn', at: await $.clock.now(), toolUseId: e.tool_use_id, description: e.description, type: e.subagentType || null,
+        parent: e.parentAgentId ?? null, model: e.model ?? null,
+      })
+    }
+    const result = await next(e)
+    if (person) {
+      await track($, {
+        kind: 'spawned', at: await $.clock.now(), toolUseId: e.tool_use_id,
+        ...(result.deny === undefined && result.agentId ? { agentId: result.agentId, model: result.model } : {}),
+      })
+    }
+    return result
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the spawn go on
 
   // Typing cancels a countdown and sets the walkthrough aside; a lone digit into an empty box is a band hotkey on
   // its way, not typing.
@@ -1528,6 +1602,13 @@ export const register: Register = (on, options) => {
 
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
+    if (e.agentId !== undefined && (await isPerson($).catch(() => false))) {
+      await track($, {
+        kind: 'step', at: await $.clock.now(), agentId: e.agentId, turnId: result?.turnId ?? e.turnId, index: result?.index ?? e.index,
+        answer: result?.answer ?? '', tokens: result?.usage ? tokensOf(result.usage) : 0,
+      })
+    }
+    if (e.agentId === undefined) mainTurn.stepAt = await $.clock.now()
     if (!dreamsOn || e.agentId !== undefined || !(await isPerson($))) return result
     // Count what Claude spends: the dreamer's share is measured against it.
     const spent = result?.usage ? tokensOf(result.usage) : 0
@@ -1634,7 +1715,23 @@ export const register: Register = (on, options) => {
         : 'notebook_path' in e && typeof e.notebook_path === 'string' ? e.notebook_path : undefined
       if (file) void offerFor($, file, e.tool === 'Read' ? 'You should know' : 'Heads up').catch(() => undefined)
     }
-    return next(e)
+    // The agents: an agent's tool is alive when it begins and counted when it ends; the main loop's writes are kept
+    // for the files an agent also wrote. `next` answers once, whatever these observations come to.
+    const tracked = e.agentId !== undefined || isEditTool(e.tool)
+    const person = tracked && (await isPerson($).catch(() => false))
+    if (person && e.agentId !== undefined) await track($, { kind: 'touch', at: await $.clock.now(), agentId: e.agentId, tool: e.tool })
+    const result = await next(e)
+    if (person) {
+      try {
+        const file = 'file_path' in e && typeof e.file_path === 'string' ? e.file_path
+          : 'notebook_path' in e && typeof e.notebook_path === 'string' ? e.notebook_path : null
+        await track($, {
+          kind: 'tool', at: await $.clock.now(), agentId: e.agentId, toolUseId: e.tool_use_id, tool: e.tool,
+          ok: result.deny === undefined && !result.isError, path: file ? normalizePath(file, await $.session.cwd()) : null,
+        })
+      } catch {}
+    }
+    return result
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the call go on
 
   on('prompt.submit', async ($, e, next) => {
@@ -1898,6 +1995,8 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     person = e.isInteractive
     if (!e.isInteractive) return started
+    watchAgents($) // the agents of this session: the minute poll, and one look at the list now
+    await pollAgents($)
     await resumeArmed($).catch(() => undefined) // a reload mid-countdown: it runs on, never stuck at 0s
     await startSetup($).catch(() => undefined) // the walkthrough, at the start after the plugin is added
     void sweepSessions($).catch(() => undefined)

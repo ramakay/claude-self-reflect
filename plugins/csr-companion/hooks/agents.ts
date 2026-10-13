@@ -1,0 +1,348 @@
+import type {
+  AgentCompletion, AgentRec, AgentState, AgentStatusWord, CompletionDisposition, CompletionKey, PendingCompletion, PendingSpawn, StepKey,
+} from '../types'
+
+// The agents of a session, as the typed events of Claude Code 2.1.296 tell them: a lifecycle reducer, a reconciler
+// for $.agent.list(), and the redaction every text of an agent passes before it is kept. Pure: the hooks in
+// register.tsx hand it events and keep the state it returns in the host's atom. Nothing here reads a transcript.
+//
+// What the events carry (claude-code.d.ts):
+//  - agent.spawn: the input has tool_use_id, description, subagentType, parentAgentId and the requested model; what
+//    `next(e)` resolves to has the resolved model and, when a subagent started, its agentId (none: nothing started,
+//    and no row is made up for it).
+//  - tool.call: `agentId` is the loop the call runs in (none on main); the tool's arguments are spread on `e`.
+//  - turn.step: the result has turnId, index, answer and usage (null when no response came).
+//  - turn.complete: agentId, turnId, answer, reason ('answer' | 'aborted' | 'refusal' | 'error').
+//  - $.agent.list(): id, parentId, type, description, status. No model and no start time.
+
+export const completionKey = (session: string, agent: string, turn: string): CompletionKey => JSON.stringify([session, agent, turn])
+export const stepKey = (session: string, agent: string | null | undefined, turn: string, index: number): StepKey =>
+  JSON.stringify([session, agent ?? null, turn, index])
+
+export const STALL_MS = 10 * 60 * 1000 // a running agent with no event for this long is shown as stalled
+export const LIST_EVERY_MS = 60 * 1000 // $.agent.list() while any agent is pending, running or waiting
+export const ANSWER_MAX = 700 // code points of an agent's report that are kept
+export const LAST_MAX = 240
+export const DESC_MAX = 160
+export const ROWS_KEPT = 60 // agents the session state keeps; the oldest finished ones go first
+export const PATHS_KEPT = 400 // files an agent wrote whose names are kept; past it only the fingerprint is
+export const PATHS_MEMBERS = 4000 // fingerprints of an agent's files, the membership an overlap is found by
+export const MAIN_KEPT = 4000
+const SEEN_TOOLS = 400
+const SEEN_STEPS = 400
+const SEEN_COMPLETIONS = 400
+const SPAWNS_KEPT = 100
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
+export const isEditTool = (tool: string) => EDIT_TOOLS.has(tool)
+
+export const emptyAgentState = (session: string): AgentState => ({
+  version: 1, session, rows: {}, spawns: {}, bound: {}, main: {}, mainOmitted: 0, seen: [], pending: {}, listedAt: null,
+})
+
+// ---------------------------------------------------------------- text that is kept
+
+const codePoints = (text: string) => Array.from(text)
+export const cap = (text: string, most: number): string => {
+  const points = codePoints(text)
+  return points.length <= most ? text : `${points.slice(0, Math.max(0, most - 1)).join('')}…`
+}
+
+// Terminal escape sequences and control characters out of any text shown or kept: CSI, OSC (BEL or ST ended), other
+// two-character escapes, the C1 range, and the C0 controls but newline and tab.
+const TERMINAL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]|\x1b.|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g
+export const stripTerminal = (text: string) => text.replace(TERMINAL, '')
+
+// bin/private.py's redact, pattern for pattern (tests/redaction_table.json is the table both are held to), and the
+// two kinds of text the design adds: a KEY/TOKEN/SECRET assignment line and a run of 32 or more hexadecimal digits.
+const REDACTED = '[redacted]'
+const CRED = '[A-Za-z0-9._~+/=\\-]'
+const NAMES = '(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)'
+const SECRETS: Array<[RegExp, string]> = [
+  [/-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g, REDACTED],
+  [/\bsk-[A-Za-z0-9_\-]{16,}/g, REDACTED],
+  [/\bxai-[A-Za-z0-9]{16,}/g, REDACTED],
+  [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, REDACTED],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, REDACTED],
+  [/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, REDACTED],
+  [/\bxox[abposr]-[A-Za-z0-9\-]{10,}/g, REDACTED],
+  [/\bAIza[0-9A-Za-z_\-]{35}/g, REDACTED],
+  [/\b(?:hf|npm)_[A-Za-z0-9]{30,}/g, REDACTED],
+  [/\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}/g, REDACTED],
+  [new RegExp(`\\b(authorization["']?\\s*[:=]\\s*["']?(?:bearer|basic|token)\\s+)${CRED}{8,}`, 'gi'), `$1${REDACTED}`],
+  [new RegExp(`\\b(bearer\\s+)(?=${CRED}*[0-9_~+/=])${CRED}{8,}`, 'gi'), `$1${REDACTED}`],
+]
+const KEYED = new RegExp(`(\\b[A-Za-z0-9_.\\-]*?${NAMES}["']?\\s*[=:]\\s*)(?!\\[redacted\\])("[^"\\n]*"|'[^'\\n]*'|[^\\s,;&"'\`)\\]}]+)`, 'gi')
+const looksSecret = (value: string) => value.length >= 6 && /[0-9@#$%^*!~+=]/.test(value)
+const ENV_LINE = /^([ \t]*(?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET)[A-Z0-9_]*[ \t]*[=:][ \t]*)(?!['"]?\[redacted\])\S.*$/gm
+const HEX_RUN = /\b[0-9a-fA-F]{32,}\b/g
+
+// Credentials out of a text. Applying it twice changes nothing more.
+export function redactText(text: string): string {
+  if (typeof text !== 'string' || !text) return text
+  let out = text
+  for (const [pattern, replacement] of SECRETS) out = out.replace(pattern, replacement)
+  out = out.replace(KEYED, (_whole, head: string, value: string) => {
+    if (value[0] === '"' || value[0] === "'") return `${head}${value[0]}${REDACTED}${value[0]}`
+    return `${head}${looksSecret(value) ? REDACTED : value}`
+  })
+  return out.replace(ENV_LINE, `$1${REDACTED}`).replace(HEX_RUN, REDACTED)
+}
+
+// Every string inside JSON-shaped data redacted and cleaned of terminal control; keys and numbers stay.
+export function redactAgentValue<T>(value: T): T {
+  if (typeof value === 'string') return redactText(stripTerminal(value)) as unknown as T
+  if (Array.isArray(value)) return value.map(inner => redactAgentValue(inner)) as unknown as T
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, inner]) => [key, redactAgentValue(inner)])) as T
+  }
+  return value
+}
+
+// One line of the agent's own words for a row: redacted first, then cut (a secret cut in half is no longer matched).
+const oneLine = (text: string, most: number) => cap(redactAgentValue(text).replace(/\s+/g, ' ').trim(), most)
+const report = (text: string) => cap(redactAgentValue(text).replace(/[ \t]+\n/g, '\n').trim(), ANSWER_MAX)
+
+// ---------------------------------------------------------------- files
+
+// A short fingerprint of a path (cyrb53, base 36): membership of a file in an agent's writes without keeping the file.
+export function fingerprint(path: string): string {
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < path.length; i++) {
+    const code = path.charCodeAt(i)
+    h1 = Math.imul(h1 ^ code, 2654435761)
+    h2 = Math.imul(h2 ^ code, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)
+}
+
+// An absolute path with . and .. resolved; a relative one is taken from `cwd`.
+export function normalizePath(path: string, cwd: string): string {
+  const joined = path.startsWith('/') ? path : `${cwd.replace(/\/+$/, '')}/${path}`
+  const parts: string[] = []
+  for (const part of joined.split('/')) {
+    if (part === '..') parts.pop()
+    else if (part && part !== '.') parts.push(part)
+  }
+  return `/${parts.join('/')}`
+}
+
+// ---------------------------------------------------------------- events
+
+export type AgentEvent =
+  // The Agent call, before `next(e)` answers: what it asked for.
+  | { kind: 'spawn'; at: number; toolUseId: string; description: string; type: string | null; parent: string | null; model: string | null }
+  // What `next(e)` answered: the resolved model and the agent started. No agentId: it started none (denied).
+  | { kind: 'spawned'; at: number; toolUseId: string; agentId?: string; model?: string }
+  // A tool began in an agent's loop: it is alive, whatever it comes to.
+  | { kind: 'touch'; at: number; agentId: string; tool: string }
+  // A tool finished. `agentId` absent: the main loop's (only its writes are kept). `ok`: it ran and did not fail.
+  | { kind: 'tool'; at: number; agentId?: string; toolUseId: string; tool: string; ok: boolean; path?: string | null }
+  | { kind: 'step'; at: number; agentId: string; turnId: string; index: number; answer: string; tokens: number }
+  | { kind: 'complete'; at: number; agentId: string; turnId: string; reason: AgentCompletion['reason']; answer: string }
+
+const ACTIVE = new Set<AgentStatusWord>(['pending', 'running', 'waiting'])
+const TERMINAL_STATUS = new Set<AgentStatusWord>(['completed', 'failed', 'killed'])
+export const isActive = (status: AgentStatusWord) => ACTIVE.has(status)
+export const isTerminal = (status: AgentStatusWord) => TERMINAL_STATUS.has(status)
+
+// Stalled is a display flag, never a status: a running agent no event has touched for STALL_MS. Waiting and idle
+// are not stalled, and a list poll never refreshes last_at.
+export const isStalled = (row: Pick<AgentRec, 'status' | 'last_at'>, now: number) => row.status === 'running' && now - row.last_at >= STALL_MS
+
+const provisional = (id: string, at: number, status: AgentStatusWord = 'running'): AgentRec => ({
+  id, parent: null, description: '', type: null, model: null, status, started: null, first_seen: at, last_at: at, tools: 0, tokens: 0,
+  last: '', last_tool: null, current_turn: null, completion: null, listed: false, paths: {}, seenTools: [], seenSteps: [],
+})
+
+const push = <T>(list: readonly T[], item: T, most: number): T[] => [...list, item].slice(-most)
+
+// The rows the state keeps: the newest by last activity; a row with a completion waiting is never the one to go.
+function trimRows(state: AgentState): AgentState {
+  const ids = Object.keys(state.rows)
+  if (ids.length <= ROWS_KEPT) return state
+  const waiting = new Set(Object.values(state.pending).map(entry => entry.agent))
+  const order = ids.filter(id => !waiting.has(id)).sort((a, b) => (state.rows[a]!.last_at - state.rows[b]!.last_at))
+  const drop = new Set(order.slice(0, ids.length - ROWS_KEPT))
+  const rows = Object.fromEntries(Object.entries(state.rows).filter(([id]) => !drop.has(id)))
+  return { ...state, rows }
+}
+
+const withRow = (state: AgentState, row: AgentRec): AgentState => trimRows({ ...state, rows: { ...state.rows, [row.id]: row } })
+
+// One event into the state. The state is never changed in place.
+export function reduceAgentEvent(state: AgentState, event: AgentEvent): AgentState {
+  switch (event.kind) {
+    case 'spawn': {
+      const spawn: PendingSpawn = {
+        at: event.at, description: oneLine(event.description, DESC_MAX), type: event.type, parent: event.parent, model: event.model,
+      }
+      const kept = Object.entries({ ...state.spawns, [event.toolUseId]: spawn }).slice(-SPAWNS_KEPT)
+      return { ...state, spawns: Object.fromEntries(kept) }
+    }
+    case 'spawned': {
+      const { [event.toolUseId]: asked, ...spawns } = state.spawns
+      if (!event.agentId) return { ...state, spawns } // denied or none started: nothing is made up
+      const row = state.rows[event.agentId] ?? provisional(event.agentId, asked?.at ?? event.at)
+      const merged: AgentRec = {
+        ...row,
+        description: asked?.description || row.description,
+        type: asked?.type ?? row.type,
+        parent: row.parent ?? asked?.parent ?? null,
+        model: event.model ?? asked?.model ?? row.model,
+        started: row.started ?? asked?.at ?? event.at,
+        first_seen: Math.min(row.first_seen, asked?.at ?? row.first_seen),
+        status: row.status === 'unknown' || row.status === 'pending' ? 'running' : row.status,
+      }
+      return withRow({ ...state, spawns, bound: { ...state.bound, [event.toolUseId]: event.agentId } }, merged)
+    }
+    case 'touch': {
+      const row = state.rows[event.agentId] ?? provisional(event.agentId, event.at)
+      const status = row.status === 'unknown' || row.status === 'pending' ? 'running' : row.status
+      return withRow(state, { ...row, status, last_at: Math.max(row.last_at, event.at), last_tool: cap(event.tool, 60) })
+    }
+    case 'tool': {
+      const wrote = event.ok && isEditTool(event.tool) && event.path ? event.path : null
+      if (event.agentId === undefined) {
+        // The main loop: only what it wrote matters here, for the files an agent also wrote.
+        if (!wrote) return state
+        const print = fingerprint(wrote)
+        if (print in state.main) return state
+        if (Object.keys(state.main).length >= MAIN_KEPT) return { ...state, mainOmitted: state.mainOmitted + 1 }
+        return { ...state, main: { ...state.main, [print]: wrote } }
+      }
+      const row = state.rows[event.agentId] ?? provisional(event.agentId, event.at)
+      if (row.seenTools.includes(event.toolUseId)) return state
+      let paths = row.paths
+      if (wrote) {
+        const print = fingerprint(wrote)
+        if (!(print in paths) && Object.keys(paths).length < PATHS_MEMBERS) {
+          paths = { ...paths, [print]: Object.keys(paths).length < PATHS_KEPT ? wrote : '' }
+        }
+      }
+      return withRow(state, {
+        ...row, tools: row.tools + 1, last_tool: cap(event.tool, 60), last_at: Math.max(row.last_at, event.at), paths,
+        seenTools: push(row.seenTools, event.toolUseId, SEEN_TOOLS),
+        status: row.status === 'unknown' || row.status === 'pending' ? 'running' : row.status,
+      })
+    }
+    case 'step': {
+      const key = stepKey(state.session, event.agentId, event.turnId, event.index)
+      const row = state.rows[event.agentId] ?? provisional(event.agentId, event.at)
+      if (row.seenSteps.includes(key)) return state
+      const newRun = row.current_turn !== null && row.current_turn !== event.turnId
+      const text = oneLine(event.answer, LAST_MAX)
+      return withRow(state, {
+        ...row, tokens: row.tokens + Math.max(0, event.tokens), last: text || row.last, last_at: Math.max(row.last_at, event.at),
+        current_turn: event.turnId, seenSteps: push(row.seenSteps, key, SEEN_STEPS),
+        // A step is running work: an agent that was idle, waiting or ended before this turn runs again, with no report yet.
+        status: row.status === 'running' ? 'running' : isTerminal(row.status) && !newRun && row.current_turn === event.turnId ? row.status : 'running',
+        completion: newRun ? null : row.completion,
+      })
+    }
+    case 'complete': {
+      const key = completionKey(state.session, event.agentId, event.turnId)
+      if (state.seen.includes(key)) return state
+      const row = state.rows[event.agentId] ?? provisional(event.agentId, event.at)
+      const answer = event.reason === 'answer' ? report(event.answer) : ''
+      const eligible = event.reason === 'answer' && answer.trim() !== ''
+      const completion: AgentCompletion = {
+        key, turnId: event.turnId, at: event.at, reason: event.reason, answer, disposition: eligible ? 'pending' : 'skipped',
+      }
+      const status: AgentStatusWord = event.reason === 'answer' ? 'completed' : event.reason === 'aborted' ? 'killed' : 'failed'
+      const pending: Record<CompletionKey, PendingCompletion> = eligible
+        ? { ...state.pending, [key]: { agent: event.agentId, turnId: event.turnId, at: event.at, answer } }
+        : state.pending
+      return withRow(
+        { ...state, pending, seen: push(state.seen, key, SEEN_COMPLETIONS) },
+        { ...row, status, completion, current_turn: event.turnId, last_at: Math.max(row.last_at, event.at) },
+      )
+    }
+  }
+}
+
+// ---------------------------------------------------------------- $.agent.list()
+
+export type Listed = { id: string; parentId?: string; type?: string; description?: string; status?: string }
+
+const WORDS: ReadonlySet<string> = new Set(['pending', 'running', 'waiting', 'idle', 'completed', 'failed', 'killed'])
+const statusOf = (word: string | undefined): AgentStatusWord => (word && WORDS.has(word) ? (word as AgentStatusWord) : 'unknown')
+
+// The list brought into the state. A row the list no longer has is not finished, failed or killed: it keeps its last
+// state, marked not listed. A row that ended in an event keeps that unless the list says it runs again (it resumed
+// under the same id). The list gives no model, no start and no activity: last_at is never moved by it.
+export function reconcileAgentList(state: AgentState, list: readonly Listed[], at: number): AgentState {
+  const ids = new Set(list.map(entry => entry.id))
+  const rows: Record<string, AgentRec> = {}
+  for (const [id, row] of Object.entries(state.rows)) rows[id] = ids.has(id) ? row : row.listed ? { ...row, listed: false } : row
+  for (const entry of list) {
+    const row = rows[entry.id] ?? provisional(entry.id, at, statusOf(entry.status))
+    const listed = statusOf(entry.status)
+    const keep = isTerminal(row.status) && !isActive(listed)
+    rows[entry.id] = {
+      ...row,
+      listed: true,
+      parent: row.parent ?? entry.parentId ?? null,
+      type: row.type ?? (entry.type || null),
+      description: row.description || oneLine(entry.description ?? '', DESC_MAX),
+      status: keep ? row.status : listed,
+      // A resumed agent runs again with no report of its own yet; the earlier one stays in the ledger.
+      completion: !keep && isActive(listed) && row.completion && isTerminal(row.status) ? null : row.completion,
+    }
+  }
+  return trimRows({ ...state, rows, listedAt: at })
+}
+
+// Whether any agent is one the list should be asked about again.
+export const anyActive = (state: AgentState) => Object.values(state.rows).some(row => isActive(row.status))
+
+// ---------------------------------------------------------------- completions: pending, claimed, consumed
+
+// The ledger of completion identities, kept in the store under the session (identifiers and dispositions only: no
+// report, no path, no prompt). It, not the 12-row file and not the state's own list, says what was taken, and a
+// completion a look claimed is never offered again. 'pending' may be scheduled; every other word is final but 'claimed',
+// which a look turns into looked, skipped or failed when it ends (a reload in between leaves it claimed: consumed).
+export type Ledger = Record<CompletionKey, CompletionDisposition>
+export const LEDGER_MAX = 1500
+
+// A completion enters the ledger once. At the limit nothing is evicted to make room (a consumed identity forgotten is a
+// completion looked at twice): the entry is refused, and the caller suppresses completion looks.
+export function admitCompletion(ledger: Ledger, key: CompletionKey): { ledger: Ledger; fresh: boolean; full: boolean } {
+  if (key in ledger) return { ledger, fresh: false, full: false }
+  if (Object.keys(ledger).length >= LEDGER_MAX) return { ledger, fresh: false, full: true }
+  return { ledger: { ...ledger, [key]: 'pending' }, fresh: true, full: false }
+}
+
+export type PendingEntry = PendingCompletion & { key: CompletionKey }
+
+// The completions a look may still take, oldest first: pending in the state, and pending in the ledger too.
+export function pendingCompletions(state: AgentState, ledger: Ledger): PendingEntry[] {
+  return Object.entries(state.pending)
+    .filter(([key]) => ledger[key] === 'pending')
+    .map(([key, entry]) => ({ key, ...entry }))
+    .sort((a, b) => a.at - b.at)
+}
+
+// The pending ones among `keys` become claimed, all at once; the others (taken already, unknown) are not.
+export function claimCompletions(ledger: Ledger, keys: readonly CompletionKey[]): { ledger: Ledger; claimed: CompletionKey[] } {
+  const claimed = keys.filter(key => ledger[key] === 'pending')
+  if (!claimed.length) return { ledger, claimed }
+  return { ledger: { ...ledger, ...Object.fromEntries(claimed.map(key => [key, 'claimed' as const])) }, claimed }
+}
+
+// A claimed look ended: its completions looked, skipped or failed. Only a claimed one moves.
+export function settleCompletions(ledger: Ledger, keys: readonly CompletionKey[], disposition: 'looked' | 'skipped' | 'failed'): Ledger {
+  const moved = keys.filter(key => ledger[key] === 'claimed')
+  return moved.length ? { ...ledger, ...Object.fromEntries(moved.map(key => [key, disposition])) } : ledger
+}
+
+// The state told what became of those completions: they are no longer pending, and their rows say so.
+export function markDisposition(state: AgentState, keys: readonly CompletionKey[], disposition: CompletionDisposition): AgentState {
+  const gone = new Set(keys)
+  const pending = Object.fromEntries(Object.entries(state.pending).filter(([key]) => !gone.has(key) || disposition === 'pending'))
+  const rows = Object.fromEntries(Object.entries(state.rows).map(([id, row]) =>
+    [id, row.completion && gone.has(row.completion.key) ? { ...row, completion: { ...row.completion, disposition } } : row]))
+  return { ...state, pending, rows }
+}
