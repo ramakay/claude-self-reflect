@@ -18,8 +18,8 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 /// should call `warm()` right after construction.
 pub struct EmbeddingEngine {
     model: Mutex<Option<TextEmbedding>>,
-    /// An MCP server proxied to the live daemon embeds there and only loads
-    /// the model itself if that fails (see `search::vector_ipc`).
+    /// An MCP server of a configured daemon embeds there and never loads the
+    /// model itself (see `search::vector_ipc`).
     remote: Option<std::sync::Arc<crate::search::vector_ipc::VectorProxy>>,
 }
 
@@ -162,15 +162,11 @@ impl EmbeddingEngine {
     /// Embed a batch of texts. Returns one 384-dim vector per input.
     /// Loads the model on first call if it hasn't been `warm()`ed already.
     pub fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        if let Some(vectors) = self.remote.as_ref().and_then(|proxy| proxy.embed(texts)) {
-            // The daemon answers again after a fallback: free the model.
-            let dropped = self.model.lock().ok().and_then(|mut model| model.take());
-            if dropped.is_some() {
-                drop(dropped);
-                crate::runtime::release_freed_pages();
-                tracing::info!("daemon answers again: dropped the in-process embedding model");
-            }
-            return Ok(vectors);
+        if let Some(proxy) = &self.remote {
+            // A server of a configured daemon never loads the model itself.
+            return proxy
+                .embed(texts)
+                .ok_or_else(|| anyhow::anyhow!(crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
         }
         self.ensure_loaded()?;
         let docs: Vec<String> = texts.iter().map(|s| s.to_string()).collect();

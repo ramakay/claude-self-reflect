@@ -491,7 +491,8 @@ impl SearchEngine {
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
         if let Some(proxy) = &self.proxy {
-            proxy.note_mutation(|index| index.insert_chunk(id, embedding));
+            // SQLite holds the change; the daemon applies it before answering.
+            proxy.sync_committed();
             return;
         }
         if self.chunk_positions.contains_key(&id) {
@@ -506,7 +507,8 @@ impl SearchEngine {
 
     pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) {
         if let Some(proxy) = &self.proxy {
-            proxy.note_mutation(|index| index.insert_reflection(id, embedding));
+            // SQLite holds the change; the daemon applies it before answering.
+            proxy.sync_committed();
             return;
         }
         if self.reflection_positions.contains_key(&id) {
@@ -526,7 +528,8 @@ impl SearchEngine {
     /// index but maps to nothing.
     pub fn remove_reflection(&mut self, id: &str) {
         if let Some(proxy) = &self.proxy {
-            proxy.note_mutation(|index| index.remove_reflection(id));
+            // SQLite holds the change; the daemon applies it before answering.
+            proxy.sync_committed();
             return;
         }
         if let Some(pos) = self.reflection_positions.remove(id) {
@@ -543,7 +546,8 @@ impl SearchEngine {
     /// HIGH), so stale plan content kept matching forever.
     pub fn remove_chunk(&mut self, id: &str) {
         if let Some(proxy) = &self.proxy {
-            proxy.note_mutation(|index| index.remove_chunk(id));
+            // SQLite holds the change; the daemon applies it before answering.
+            proxy.sync_committed();
             return;
         }
         if let Some(pos) = self.chunk_positions.remove(id) {

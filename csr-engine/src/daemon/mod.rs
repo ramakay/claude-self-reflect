@@ -243,6 +243,14 @@ impl Daemon {
     ) -> Result<i32> {
         let _lock = Self::acquire_lock()?;
         tracing::info!("daemon started, acquired lockfile");
+        // Heartbeat: MCP servers started within a day of it leave the index
+        // and the model to this daemon, even while it restarts.
+        let data_dir = self
+            .index_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        crate::search::vector_ipc::write_heartbeat(&data_dir);
 
         // gap-G2: a run-registry record so `status` can see this process
         // even from another `csr-engine` invocation. Best-effort — a
@@ -1215,6 +1223,21 @@ impl Daemon {
         if journal_handle.is_some() {
             tracing::info!("journal server started (v10.1 journal v4)");
         }
+        let heartbeat_handle = {
+            let shutdown = shutdown.clone();
+            let data_dir = data_dir.clone();
+            tokio::spawn(async move {
+                let every = crate::search::vector_ipc::HEARTBEAT_EVERY;
+                let mut last = std::time::Instant::now();
+                while !shutdown.load(Ordering::SeqCst) {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    if last.elapsed() >= every {
+                        crate::search::vector_ipc::write_heartbeat(&data_dir);
+                        last = std::time::Instant::now();
+                    }
+                }
+            })
+        };
         // MCP servers started while this daemon is live search through it
         // instead of loading their own index and model. Its own shutdown
         // flag: it keeps answering through the whole teardown below, so a
@@ -1358,6 +1381,7 @@ impl Daemon {
             }
         }
 
+        let _ = heartbeat_handle.await;
         // Last: MCP servers kept searching through the teardown.
         vector_shutdown.store(true, Ordering::SeqCst);
         let _ = vector_handle.await;

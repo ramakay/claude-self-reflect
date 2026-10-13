@@ -590,6 +590,37 @@ pub async fn reflect_on_past(
     .await
 }
 
+/// Keyword-only recall for a server whose configured daemon is not
+/// answering: the production pipeline in FTS mode — no query embedding, no
+/// vector search, nothing loaded in-process.
+pub async fn reflect_keyword_only(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<String> {
+    let partition_enabled = validity_partition_enabled();
+    reflect_on_past_with_vec_mode(
+        storage,
+        search,
+        &[],
+        query,
+        limit.max(1),
+        0.0,
+        project,
+        0,
+        partition_enabled,
+        consumption_mode_for_partition(partition_enabled),
+        active_forgetting_enabled(),
+        "other",
+        SearchMode::Fts,
+        RecallRerankMode::Baseline,
+        true,
+    )
+    .await
+}
+
 /// Reranker selection for the production recall pipeline. Runtime honors the
 /// deployment flag/latest gate, Baseline forces the deterministic policy, and
 /// Candidate applies an explicit not-yet-persisted model for offline gating.

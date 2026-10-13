@@ -243,6 +243,9 @@ pub struct CsrServer {
     /// path clones `self`) so the "check at most every 30s" cadence is
     /// process-wide, not per-clone.
     binary_watch: Arc<crate::binary_identity::ReplacementWatch>,
+    /// Set when a daemon is configured: vector primitives go to it, and
+    /// vector-backed tools answer keyword-only while it does not answer.
+    proxy: Option<Arc<crate::search::vector_ipc::VectorProxy>>,
 }
 
 /// How often `call_tool` re-stats the on-disk binary. Cheap between checks
@@ -274,6 +277,10 @@ impl CsrServer {
             .join("csr-engine.db")
             .to_string_lossy()
             .to_string();
+        let proxy = search
+            .try_read()
+            .ok()
+            .and_then(|index| index.proxy().cloned());
         Self {
             storage,
             embeddings,
@@ -281,6 +288,7 @@ impl CsrServer {
             projects_dir,
             index_dir,
             db_path,
+            proxy,
             task_manager: TaskManager::new(),
             binary_watch: Arc::new(crate::binary_identity::ReplacementWatch::new(
                 startup_exe_path,
@@ -316,6 +324,39 @@ impl CsrServer {
             .list_all()
             .into_iter()
             .find(|t| t.name == name)
+    }
+
+    /// Run a vector-backed tool. Without a configured daemon this is just
+    /// `run`. With one, the daemon must answer first (off the runtime, with
+    /// the proxy's backoff); if it does not, or stops answering during the
+    /// call, the tool answers keyword-only for `query` with a one-line note
+    /// instead of loading the index or the model in-process.
+    async fn vector_backed(
+        &self,
+        query: &str,
+        limit: usize,
+        project: Option<&str>,
+        run: impl std::future::Future<Output = anyhow::Result<String>>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let Some(proxy) = self.proxy.clone() else {
+            return tool_result(run.await);
+        };
+        let check = proxy.clone();
+        let available = tokio::task::spawn_blocking(move || check.available())
+            .await
+            .unwrap_or(false);
+        if available {
+            let failures = proxy.failures();
+            let result = run.await;
+            if proxy.failures() == failures {
+                return tool_result(result);
+            }
+        }
+        let keyword =
+            tools::reflect_keyword_only(&self.storage, &self.search, query, limit, project)
+                .await
+                .map(|text| format!("{}\n\n{text}", crate::search::vector_ipc::KEYWORD_ONLY_NOTE));
+        tool_result(keyword)
     }
 
     /// Flush the HNSW index to disk if dirty.
@@ -361,7 +402,7 @@ impl CsrServer {
         let limit = p.limit.unwrap_or(5);
         let min_score = p.min_score.unwrap_or(0.3);
 
-        let result = tools::reflect_on_past(
+        let run = tools::reflect_on_past(
             &self.storage,
             &self.embeddings,
             &self.search,
@@ -369,10 +410,9 @@ impl CsrServer {
             limit,
             min_score,
             p.project.as_deref(),
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.query, limit, p.project.as_deref(), run)
+            .await
     }
 
     #[tool(
@@ -402,6 +442,17 @@ impl CsrServer {
             )]));
         }
 
+        if let Some(proxy) = self.proxy.clone() {
+            let available = tokio::task::spawn_blocking(move || proxy.available())
+                .await
+                .unwrap_or(false);
+            if !available {
+                return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                    "Reflection not stored: {}. Try again shortly.",
+                    crate::search::vector_ipc::KEYWORD_ONLY_NOTE
+                ))]));
+            }
+        }
         let result = tools::store_reflection(
             &self.storage,
             &self.embeddings,
@@ -434,17 +485,16 @@ impl CsrServer {
         let p = params.0;
         let min_score = p.min_score.unwrap_or(0.3);
 
-        let result = tools::quick_check(
+        let run = tools::quick_check(
             &self.storage,
             &self.embeddings,
             &self.search,
             &p.query,
             min_score,
             p.project.as_deref(),
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.query, 2, p.project.as_deref(), run)
+            .await
     }
 
     // ─── Insights & aggregation (1) ───
@@ -464,16 +514,15 @@ impl CsrServer {
         params: Parameters<SearchInsightsParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
-        let result = tools::search_insights(
+        let run = tools::search_insights(
             &self.storage,
             &self.embeddings,
             &self.search,
             &p.query,
             p.project.as_deref(),
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.query, 10, p.project.as_deref(), run)
+            .await
     }
 
     // ─── Temporal tools (3) ───
@@ -520,7 +569,7 @@ impl CsrServer {
         let limit = p.limit.unwrap_or(10);
         let min_score = p.min_score.unwrap_or(0.3);
 
-        let result = tools::search_by_recency(
+        let run = tools::search_by_recency(
             &self.storage,
             &self.embeddings,
             &self.search,
@@ -531,10 +580,9 @@ impl CsrServer {
             limit,
             min_score,
             p.project.as_deref(),
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.query, limit, p.project.as_deref(), run)
+            .await
     }
 
     #[tool(
@@ -603,17 +651,16 @@ impl CsrServer {
         let p = params.0;
         let limit = p.limit.unwrap_or(10);
 
-        let result = tools::search_by_concept(
+        let run = tools::search_by_concept(
             &self.storage,
             &self.embeddings,
             &self.search,
             &p.concept,
             limit,
             p.project.as_deref(),
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.concept, limit, p.project.as_deref(), run)
+            .await
     }
 
     // ─── Pagination (1) ───
@@ -637,7 +684,7 @@ impl CsrServer {
         let limit = p.limit.unwrap_or(3);
         let min_score = p.min_score.unwrap_or(0.3);
 
-        let result = tools::get_more_results(
+        let run = tools::get_more_results(
             &self.storage,
             &self.embeddings,
             &self.search,
@@ -646,10 +693,9 @@ impl CsrServer {
             limit,
             min_score,
             p.project.as_deref(),
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.query, offset + limit, p.project.as_deref(), run)
+            .await
     }
 
     // ─── Conversation & session (2) ───
@@ -805,17 +851,16 @@ impl CsrServer {
             ..Default::default()
         };
 
-        let result = tools::why(
+        let run = tools::why(
             &self.storage,
             &self.embeddings,
             &self.search,
             &p.query,
             p.project.as_deref(),
             &cfg,
-        )
-        .await;
-
-        tool_result(result)
+        );
+        self.vector_backed(&p.query, limit, p.project.as_deref(), run)
+            .await
     }
 
     #[tool(
@@ -1083,6 +1128,89 @@ impl ServerHandler for CsrServer {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    fn text(result: Result<CallToolResult, rmcp::ErrorData>) -> String {
+        result
+            .unwrap()
+            .content
+            .iter()
+            .filter_map(|block| block.as_text().map(|text| text.text.clone()))
+            .collect()
+    }
+
+    /// Review findings #2/#4/#10 at the MCP layer: while a configured daemon
+    /// is down, vector-backed tools answer keyword-only with a note (no
+    /// index, no model loaded); when it answers they are semantic again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vector_tools_answer_keyword_only_while_the_daemon_is_down() {
+        use crate::search::vector_ipc::test_support::{seed, TestDaemon};
+        use crate::search::vector_ipc::{ProxyTimings, KEYWORD_ONLY_NOTE};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        crate::search::vector_ipc::write_heartbeat(tmp.path());
+        let engine = crate::engine::Engine::new_proxied(&db, &projects)
+            .unwrap()
+            .expect("configured");
+        let proxy = engine.search().read().await.proxy().unwrap().clone();
+        proxy.set_timings(ProxyTimings {
+            backoff_first: std::time::Duration::from_millis(20),
+            backoff_total: std::time::Duration::from_millis(100),
+            down_window: std::time::Duration::from_secs(30),
+        });
+        let server = CsrServer::new(
+            engine.storage().clone(),
+            engine.embeddings().clone(),
+            engine.search().clone(),
+            projects.clone(),
+            tmp.path().join("index"),
+            None,
+            None,
+        );
+        let reflect = |query: &str| ReflectOnPastParams {
+            query: query.into(),
+            limit: Some(5),
+            min_score: Some(0.0),
+            project: Some("all".into()),
+        };
+
+        // Daemon down: keyword (FTS) results under the note.
+        let down = text(
+            server
+                .reflect_on_past(Parameters(reflect("socket handshake")))
+                .await,
+        );
+        assert!(down.starts_with(KEYWORD_ONLY_NOTE), "{down}");
+        assert!(down.contains("daemon lock and socket handshake"), "{down}");
+        let quick = text(
+            server
+                .quick_check(Parameters(QuickCheckParams {
+                    query: "socket handshake".into(),
+                    min_score: None,
+                    project: Some("all".into()),
+                }))
+                .await,
+        );
+        assert!(quick.starts_with(KEYWORD_ONLY_NOTE), "{quick}");
+        assert!(!engine.embeddings().is_loaded());
+
+        // Daemon up: semantic again, no note.
+        let daemon = TestDaemon::start(&db).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let up = text(
+            server
+                .reflect_on_past(Parameters(reflect("socket handshake")))
+                .await,
+        );
+        assert!(!up.starts_with(KEYWORD_ONLY_NOTE), "{up}");
+        assert!(up.contains("<id>"), "{up}");
+        assert!(
+            !engine.embeddings().is_loaded(),
+            "the daemon embedded the query"
+        );
+        daemon.stop().await;
+    }
     use super::*;
 
     // ─── adversarial review finding 2: text-mode csr_transcript output

@@ -283,50 +283,36 @@ impl Engine {
         })
     }
 
-    /// An MCP server engine that leaves the index and the embedding model to
-    /// the live daemon, or `None` when no daemon answers for this database
-    /// (the caller then builds the full engine, as before).
+    /// An MCP server engine for a data dir with a configured daemon
+    /// (`vector_ipc::daemon_configured`), or `None` without one (the caller
+    /// then builds the full in-process engine, as before).
     ///
     /// Single owner: such a server never loads the HNSW index or the ONNX
-    /// model up front, never starts the watcher or the enrichment loops,
-    /// never imports and never publishes. Its tools read SQLite directly and
-    /// send the vector primitives to the daemon; if the daemon stops
-    /// answering, the proxy loads the index in-process once (as a hook
-    /// would, without publishing) and the model on first embed.
+    /// model, never starts the watcher or the enrichment loops, never imports
+    /// and never publishes — whether or not the daemon answers right now. Its
+    /// tools read SQLite directly and send the vector primitives to the
+    /// daemon; while it does not answer, they answer keyword-only (see
+    /// `mcp::CsrServer`) and try the daemon again on every call.
     pub fn new_proxied(db_path: &Path, projects_dir: &Path) -> Result<Option<Self>> {
-        use crate::search::vector_ipc::{daemon_lock_live, VectorClient, VectorProxy};
-        // Escape hatch: `CSR_NO_DAEMON_PROXY=1` keeps a server fully in-process.
-        if std::env::var("CSR_NO_DAEMON_PROXY").is_ok_and(|v| v == "1" || v == "true") {
-            return Ok(None);
-        }
+        use crate::search::vector_ipc::{daemon_configured, VectorClient, VectorProxy};
         let Some(data_dir) = db_path.parent() else {
             return Ok(None);
         };
-        if !daemon_lock_live(data_dir) {
+        if !daemon_configured(data_dir) {
             return Ok(None);
         }
         let Some(client) = VectorClient::for_database(db_path) else {
             return Ok(None);
         };
-        if let Err(error) = client.ping() {
-            tracing::info!(%error, "daemon live but its vector socket is not answering");
-            return Ok(None);
-        }
         let storage = Arc::new(Storage::open(db_path)?);
-        let index_dir = data_dir.join("index");
-        let loader = {
-            let storage = storage.clone();
-            let index_dir = index_dir.clone();
-            Box::new(move || load_index_in_process(&storage, &index_dir))
-        };
-        let proxy = Arc::new(VectorProxy::new(client, loader));
-        tracing::info!("daemon live: MCP vector search and embedding go to the daemon");
+        let proxy = Arc::new(VectorProxy::new(client, storage.clone()));
+        tracing::info!("daemon configured: MCP vector search and embedding go to the daemon");
         Ok(Some(Self {
             storage,
             embeddings: Arc::new(EmbeddingEngine::with_remote(proxy.clone())),
             search: Arc::new(RwLock::new(SearchEngine::proxied(proxy))),
             projects_dir: projects_dir.to_path_buf(),
-            index_dir,
+            index_dir: data_dir.join("index"),
             skip_index_persistence: true,
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
@@ -928,20 +914,6 @@ impl Engine {
 
         Ok(())
     }
-}
-
-/// The in-process index a proxied server falls back to: the published
-/// generation reconciled with SQLite, or a rebuild from SQLite when there is
-/// none — the same as a searching hook's, and never published.
-fn load_index_in_process(storage: &Storage, index_dir: &Path) -> Result<SearchEngine> {
-    let chunk_count = storage.count_chunk_embeddings()?;
-    let reflection_count = storage.count_reflection_embeddings()?;
-    if let Some(loaded) = load_reconciled(storage, index_dir, chunk_count, reflection_count, false)
-    {
-        return Ok(loaded.search);
-    }
-    let (search, _, _) = rebuild_search_index_streaming(storage, RECONCILE_BATCH)?;
-    Ok(search)
 }
 
 /// A cached generation reconciled against SQLite (see [`load_reconciled`]).
