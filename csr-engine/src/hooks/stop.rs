@@ -115,6 +115,18 @@ pub struct Episode {
     /// whose completions were the anchor's own.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub completions_untied: bool,
+    /// Latest renderable typed task after the first, for same-session compact
+    /// recaps only. Additive v2 JSON field: old rows default to today's anchor;
+    /// no database migration or transcript read at SessionStart is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_anchor: Option<CompactAnchor>,
+}
+
+/// A compact intent and whether the displayed receipts belong to that task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactAnchor {
+    pub request: String,
+    pub completions_untied: bool,
 }
 
 /// A completion with the evidence that proves it.
@@ -430,7 +442,8 @@ const MIN_FALLBACK_WORDS: usize = 6;
 /// The anchor task and its segment index. The first task anchors the recap
 /// (blind labels picked it in 9 of 11 sessions, the most-work segment in 7).
 /// If it has no clean rendering, the heaviest other segment with any work is
-/// tried; otherwise the intent abstains.
+/// tried; otherwise the intent abstains. Same-session compact recaps instead
+/// use the latest renderable typed segment captured by `latest_typed_segment`.
 fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Option<usize>) {
     if segments.is_empty() {
         return (None, None);
@@ -458,6 +471,25 @@ fn anchor_segment(segments: &[TaskSegment]) -> (Option<String>, Option<usize>) {
         }
     }
     (None, None)
+}
+
+/// Compact resumes need the current task, not the session's first one.
+/// Skip notes and thin side requests; allow the same clause cut as the first
+/// anchor. If no later segment renders, keep `anchor_segment` unchanged.
+fn latest_typed_segment(segments: &[TaskSegment]) -> Option<(String, usize)> {
+    segments
+        .iter()
+        .enumerate()
+        .skip(1)
+        .rev()
+        .find_map(|(index, task)| {
+            if task.note {
+                return None;
+            }
+            crate::hooks::recap::anchor_intent(&task.prose)
+                .filter(|intent| intent.split_whitespace().count() >= MIN_FALLBACK_WORDS)
+                .map(|intent| (intent, index))
+        })
 }
 
 /// A typed prompt's text for the recap, and whether it is a forwarded note.
@@ -561,7 +593,16 @@ fn typed_row_text(val: &serde_json::Value) -> Option<String> {
     let flagged = ["isMeta", "isCompactSummary", "isSidechain"]
         .iter()
         .any(|key| val.get(key).and_then(|v| v.as_bool()).unwrap_or(false));
-    if flagged {
+    // Scheduled /loop, ScheduleWakeup and cron re-fires are isMeta rows;
+    // system-origin harness messages are not typed even without that flag.
+    let harness = val.get("promptSource").and_then(|v| v.as_str()) == Some("system")
+        || matches!(
+            val.get("origin")
+                .and_then(|o| o.get("kind"))
+                .and_then(|k| k.as_str()),
+            Some("task-notification" | "peer")
+        );
+    if flagged || harness {
         return None;
     }
     let content = val.get("message").and_then(|m| m.get("content"))?;
@@ -971,9 +1012,17 @@ fn extract_episode_from_messages(
         completions.into_iter().unzip();
     // Receipts read as the anchor's result only when every receipt the recap
     // shows was produced under the anchor segment; otherwise "Latest:".
-    let completions_untied = crate::hooks::recap::displayed_receipts(&completions)
-        .iter()
-        .any(|(index, _)| anchor_index.is_none() || origins[*index] != anchor_index);
+    let displayed = crate::hooks::recap::displayed_receipts(&completions);
+    let untied = |anchor: Option<usize>| {
+        displayed
+            .iter()
+            .any(|(index, _)| anchor.is_none() || origins[*index] != anchor)
+    };
+    let completions_untied = untied(anchor_index);
+    let compact_anchor = latest_typed_segment(&segments).map(|(request, index)| CompactAnchor {
+        request,
+        completions_untied: untied(Some(index)),
+    });
 
     // Determine outcome (task-aware: incomplete todos cap success at partial)
     let success_signal = crate::extraction::has_success_signal(&completed);
@@ -1016,6 +1065,7 @@ fn extract_episode_from_messages(
         anchor_request,
         completions,
         completions_untied,
+        compact_anchor,
     }
 }
 
@@ -2129,6 +2179,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
         };
 
         let json = serde_json::to_string(&ep).unwrap();
@@ -2185,6 +2236,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
         };
 
         let tags = episode_tags(&ep);
@@ -2869,6 +2921,36 @@ mod tests {
     fn extract(lines: &[String]) -> Episode {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         extract_episode(&refs, "6ca2a4d5", "claude-self-reflect")
+    }
+
+    #[test]
+    fn compact_anchor_allows_clause_cut_and_tracks_receipt_origins() {
+        let first = "Design the discussion side pane for users.";
+        let latest = "Drive release readiness and verify all candidate checks";
+        let long = format!(
+            "{latest}, {}",
+            "with extensive detailed verification ".repeat(20)
+        );
+        assert!(crate::hooks::recap::clean_intent(&long).is_none());
+        for old_receipt in [false, true] {
+            let mut lines = segment(first, "first", 1);
+            if old_receipt {
+                lines.extend(committed("old", "abcdef1", "feat(pane): add side pane"));
+                lines.push(turn_end_line());
+            }
+            lines.extend(segment(&long, "latest", 1));
+            lines.extend(committed(
+                "new",
+                "abcdef2",
+                "fix(release): verify candidate",
+            ));
+            let ep = extract(&lines);
+            let anchor = ep.compact_anchor.as_ref().unwrap();
+            assert_eq!(anchor.request, latest);
+            assert_eq!(anchor.completions_untied, old_receipt);
+            assert_eq!(ep.anchor_request.as_deref(), Some(first));
+            assert!(ep.completions_untied);
+        }
     }
 
     #[test]

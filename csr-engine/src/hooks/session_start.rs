@@ -186,6 +186,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             &verdicts,
             age,
             input.session_id.as_deref(),
+            input.source.as_deref(),
         ));
         output.push_str(&format_episode_index(&episodes[1..]));
         output.push_str(DEEPER_CONTEXT_FOOTER);
@@ -889,6 +890,7 @@ fn format_session_start_tier0_for_session(
     anchor_verdicts: &[(String, AnchorVerdict)],
     age: &str,
     target_session_id: Option<&str>,
+    source: Option<&str>,
 ) -> String {
     let recap = if recap_disabled() {
         None
@@ -944,7 +946,8 @@ fn format_session_start_tier0_for_session(
             open_proposals,
             top_dream,
         };
-        let composed = crate::hooks::recap::compose_recap_with_deliveries(ep, &feeds, age);
+        let recap_ep = recap_episode(ep, source, target_session_id);
+        let composed = crate::hooks::recap::compose_recap_with_deliveries(&recap_ep, &feeds, age);
         if let (Some(composed), Some(id)) = (composed.as_ref(), dream_id) {
             let text = &composed.text;
             if text.contains(crate::hooks::recap::DREAM_CLAUSE_PREFIX) {
@@ -973,6 +976,29 @@ fn format_session_start_tier0_for_session(
         .episode_floor_for_session(&ep.session_id)
         .unwrap_or(crate::provenance::TrustTier::Unknown);
     format_tier0_block_with_recap(ep, anchor_verdicts, age, recap.as_deref(), trust)
+}
+
+/// Only the recap changes after compaction; fragment fallback and the episode
+/// index keep the stored session anchor. No transcript I/O on this path.
+fn recap_episode<'a>(
+    ep: &'a Episode,
+    source: Option<&str>,
+    target_session_id: Option<&str>,
+) -> std::borrow::Cow<'a, Episode> {
+    if source == Some("compact")
+        && target_session_id == Some(ep.session_id.as_str())
+        && ep.recap_evidence_version.is_some()
+    {
+        if let Some(anchor) = &ep.compact_anchor {
+            if let Some(intent) = crate::hooks::recap::anchor_intent(&anchor.request) {
+                let mut current = ep.clone();
+                current.anchor_request = Some(intent);
+                current.completions_untied = anchor.completions_untied;
+                return std::borrow::Cow::Owned(current);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(ep)
 }
 
 fn format_tier0_block_with_recap(
@@ -1784,6 +1810,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         };
         let verdicts = vec![
@@ -1847,6 +1874,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2h ago");
@@ -1889,6 +1917,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1w ago");
@@ -1933,6 +1962,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "2m ago");
@@ -1978,6 +2008,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         };
         let block = format_tier0_block(&ep, &[], "1m ago");
@@ -2193,6 +2224,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         }
     }
@@ -2258,6 +2290,7 @@ mod tests {
             &verdicts,
             "2h ago",
             None,
+            None,
         );
 
         assert!(block.starts_with(
@@ -2307,6 +2340,7 @@ mod tests {
             &[],
             "now",
             Some(target_session),
+            None,
         );
 
         assert!(block.contains("Corrected: Never bypass verification (12345678:6,"));
@@ -2350,8 +2384,15 @@ mod tests {
             }])
             .unwrap();
 
-        let block =
-            format_session_start_tier0_for_session(&storage, &ep.project, &ep, &[], "now", None);
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &[],
+            "now",
+            None,
+            None,
+        );
 
         assert!(block.contains("Corrected: Never bypass verification"));
         let delivered: i64 = storage
@@ -2366,6 +2407,261 @@ mod tests {
         assert_eq!(delivered, 0);
     }
 
+    const COMPACT_TASKS: [&str; 3] = [
+        "Design the GitHub discussion side pane for users.",
+        "Show the subscription cost as a percentage of usage.",
+        "Drive release readiness and verify all candidate checks.",
+    ];
+
+    fn compact_episode(extra_prompts: &[serde_json::Value]) -> Episode {
+        let mut rows = Vec::new();
+        for task in COMPACT_TASKS {
+            rows.push(serde_json::json!({
+                "type": "user", "promptSource": "typed", "message": {"content": task}
+            }));
+            rows.push(serde_json::json!({
+                "type": "assistant", "message": {"content": "Work finished.", "stop_reason": "end_turn"}
+            }));
+        }
+        rows.extend_from_slice(extra_prompts);
+        let lines: Vec<String> = rows.iter().map(serde_json::Value::to_string).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        // Round-trip through the stored episode representation, as SessionStart does.
+        serde_json::from_str(
+            &serde_json::to_string(&crate::hooks::stop::extract_episode(&refs, "s", "p")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn compact_block(ep: &Episode, source: &str, session: Option<&str>) -> String {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            ep,
+            &[],
+            "1m ago",
+            session,
+            Some(source),
+        )
+    }
+
+    #[test]
+    fn compact_same_session_anchors_on_third_task() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let ep = compact_episode(&[]);
+        let block = compact_block(&ep, "compact", Some("s"));
+        assert!(
+            block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])),
+            "{block}"
+        );
+        assert!(block.contains(crate::extraction::provenance::RECAP_SENTINEL));
+        assert!(!block.contains("Next:"));
+        assert!(block.lines().next().unwrap().chars().count() <= 700);
+    }
+
+    #[test]
+    fn compact_skips_notes_short_requests_and_harness_rows() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        for (prompt, fields) in [
+            ("Here is a note offered by a side agent:\n\n> **Review the auth middleware before the next release.**", serde_json::json!({})),
+            ("stopped check now.", serde_json::json!({})),
+            ("What if memory notes included their originating session?\n\nCSR's dreamer asked this while you worked. It is a question, not a task.\n\n> Notes should show their origin.", serde_json::json!({})),
+            ("Review all outstanding work and report any remaining problems.", serde_json::json!({"promptSource": "system", "origin": {"kind": "task-notification"}})),
+            ("Review all outstanding work and report any remaining problems.", serde_json::json!({"isCompactSummary": true})),
+            ("Review all outstanding work and report any remaining problems.", serde_json::json!({"isSidechain": true})),
+        ] {
+            let mut row = serde_json::json!({"type": "user", "message": {"content": prompt}});
+            row.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            let ep = compact_episode(&[row]);
+            let block = compact_block(&ep, "compact", Some("s"));
+            assert!(block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])), "{prompt}: {block}");
+        }
+    }
+
+    #[test]
+    fn compact_excludes_schedule_wakeup_loop_and_cron_refires() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        // Claude Code's scheduler enqueues isMeta=true prompts. Transcripts
+        // record promptSource=system (anthropics/claude-code#96215).
+        for prompt in [
+            "<<autonomous-loop-dynamic>>",
+            "<<autonomous-loop>>",
+            "Check the build status and report failures immediately.",
+        ] {
+            let ep = compact_episode(&[serde_json::json!({
+                "type": "user", "isMeta": true, "promptSource": "system",
+                "message": {"content": prompt}
+            })]);
+            let block = compact_block(&ep, "compact", Some("s"));
+            assert!(
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[2])),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_resume_clear_keep_first_task_after_compact_capture() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let ep = compact_episode(&[]);
+        for source in ["startup", "resume", "clear"] {
+            let block = compact_block(&ep, source, Some("s"));
+            assert!(
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])),
+                "{source}: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_different_or_missing_session_keeps_first_task() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let ep = compact_episode(&[]);
+        for session in [Some("different"), None] {
+            let block = compact_block(&ep, "compact", session);
+            assert!(
+                block.starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_failed_feeds_preserve_fragment_bytes() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        storage.with_connection(|conn| {
+            conn.execute_batch("DROP TABLE resolution_ledger; DROP TABLE witness_verdicts; DROP TABLE intent_events; DROP TABLE dreams_v1;")?;
+            Ok(())
+        }).unwrap();
+        assert!(storage.recap_ledger_feeds("p", "s").is_err());
+        assert!(storage.recap_corrections("p", "2026-01-01", 2).is_err());
+        assert!(storage.recap_open_proposals("p").is_err());
+        let ep = minimal_episode("", "", Some("continue work"));
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &[],
+            "2h ago",
+            Some("s"),
+            Some("compact"),
+        );
+        assert_eq!(
+            block.as_bytes(),
+            format_tier0_block(&ep, &[], "2h ago").as_bytes()
+        );
+        assert_eq!(block, "CSR CONTINUUM [2h ago]: (command-only session)\nLAST: (filtered: CSR meta) (outcome=success, trust=unknown)\nNEXT: continue work | TODOS: 0 open\nFull state: csr_reflect_on_past(\"conv_s\")\n");
+    }
+
+    #[test]
+    fn compact_old_episodes_and_unrenderable_later_tasks_keep_original_anchor() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let ep = compact_episode(&[]);
+        let mut old = serde_json::to_value(&ep).unwrap();
+        old.as_object_mut().unwrap().remove("compact_anchor");
+        let old: Episode = serde_json::from_value(old).unwrap();
+        assert!(old.compact_anchor.is_none());
+        assert!(compact_block(&old, "compact", Some("s"))
+            .starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])));
+        for later in ["stopped check now.".to_string(), "word ".repeat(80)] {
+            let rows = [
+                serde_json::json!({"type": "user", "message": {"content": COMPACT_TASKS[0]}}).to_string(),
+                serde_json::json!({"type": "assistant", "message": {"content": "Done.", "stop_reason": "end_turn"}}).to_string(),
+                serde_json::json!({"type": "user", "message": {"content": later}}).to_string(),
+            ];
+            let ep = crate::hooks::stop::extract_episode(
+                &rows.iter().map(String::as_str).collect::<Vec<_>>(),
+                "s",
+                "p",
+            );
+            assert!(ep.compact_anchor.is_none());
+            assert!(compact_block(&ep, "compact", Some("s"))
+                .starts_with(&format!("recap [1m ago]: {}", COMPACT_TASKS[0])));
+        }
+    }
+
+    #[test]
+    #[ignore = "65 MB transcript latency measurement; run explicitly in release mode"]
+    fn compact_cached_anchor_cost_on_65mb_transcript() {
+        use std::hint::black_box;
+        use std::io::Write;
+        use std::time::Instant;
+
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_RECAP");
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let padding =
+            serde_json::json!({"type": "progress", "data": "x".repeat(65_000)}).to_string();
+        for task in COMPACT_TASKS {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type": "user", "message": {"content": task}})
+            )
+            .unwrap();
+            for _ in 0..334 {
+                writeln!(file, "{padding}").unwrap();
+            }
+            writeln!(file, "{}", serde_json::json!({"type": "assistant", "message": {"content": "Done.", "stop_reason": "end_turn"}})).unwrap();
+        }
+        let bytes = file.as_file().metadata().unwrap().len();
+        assert!(bytes >= 65_000_000);
+        let raw = std::fs::read_to_string(file.path()).unwrap();
+        let start = Instant::now();
+        let ep = crate::hooks::stop::extract_episode(&raw.lines().collect::<Vec<_>>(), "s", "p");
+        let extraction = start.elapsed();
+        let json = serde_json::to_string(&ep).unwrap();
+        let ep: Episode = serde_json::from_str(&json).unwrap();
+        // Removing the transcript proves SessionStart's recap never reopens it.
+        file.close().unwrap();
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let mut timings = [Vec::new(), Vec::new()];
+        for _ in 0..100 {
+            for (index, source) in ["startup", "compact"].into_iter().enumerate() {
+                let start = Instant::now();
+                black_box(format_session_start_tier0_for_session(
+                    &storage,
+                    &ep.project,
+                    &ep,
+                    &[],
+                    "1m ago",
+                    Some("s"),
+                    Some(source),
+                ));
+                timings[index].push(start.elapsed().as_nanos());
+            }
+        }
+        for times in &mut timings {
+            times.sort_unstable();
+        }
+        eprintln!("transcript_bytes={bytes} stop_extract_ms={:.3} episode_bytes={} startup_p50_us={:.3} compact_p50_us={:.3} compact_p95_us={:.3}",
+            extraction.as_secs_f64() * 1000.0, json.len(), timings[0][50] as f64 / 1000.0,
+            timings[1][50] as f64 / 1000.0, timings[1][95] as f64 / 1000.0);
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            black_box(recap_episode(black_box(&ep), Some("compact"), Some("s")));
+        }
+        eprintln!(
+            "compact_selection_mean_us={:.3}",
+            start.elapsed().as_secs_f64() * 100.0
+        );
+        assert_eq!(
+            recap_episode(&ep, Some("compact"), Some("s"))
+                .anchor_request
+                .as_deref(),
+            Some(COMPACT_TASKS[2])
+        );
+    }
+
     #[test]
     fn session_start_tier0_none_is_byte_identical_to_fragment_snapshot() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
@@ -2373,8 +2669,15 @@ mod tests {
         let storage = crate::storage::Storage::open_memory().unwrap();
         let ep = minimal_episode("", "", Some("continue work"));
 
-        let block =
-            format_session_start_tier0_for_session(&storage, &ep.project, &ep, &[], "2h ago", None);
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &[],
+            "2h ago",
+            None,
+            None,
+        );
 
         assert_eq!(
             block,
@@ -2540,8 +2843,15 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         );
         seed_recap_feeds(&storage, &ep);
 
-        let block =
-            format_session_start_tier0_for_session(&storage, &ep.project, &ep, &[], "2h ago", None);
+        let block = format_session_start_tier0_for_session(
+            &storage,
+            &ep.project,
+            &ep,
+            &[],
+            "2h ago",
+            None,
+            None,
+        );
         std::env::remove_var("CSR_NO_RECAP");
 
         assert!(block.starts_with("CSR CONTINUUM [2h ago]: Fix the auth middleware regression\n"));

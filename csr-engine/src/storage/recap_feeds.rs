@@ -1036,6 +1036,7 @@ mod tests {
             anchor_request: None,
             completions: vec![],
             completions_untied: false,
+            compact_anchor: None,
             anchors: vec![],
         };
         let feeds = RecapFeeds {
