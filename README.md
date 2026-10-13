@@ -161,6 +161,17 @@ csr-engine setup
 
 </details>
 
+### The companion pane (optional)
+
+A Claude Code plugin that sits beside the session: what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It is not bundled with the binary and setup does not install it: adding a plugin is your own step, in Claude Code (2.1.296 or later).
+
+```
+/plugin marketplace add ramakay/claude-self-reflect
+/plugin install csr-companion@claude-self-reflect
+```
+
+`csr-engine setup` ends by printing these two lines.
+
 <details>
 <summary><strong>What You'll Ask</strong> — after install, just ask Claude naturally</summary>
 
