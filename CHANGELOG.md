@@ -279,7 +279,10 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   last told it. It reads the csr-engine database read-only
   and makes no model call.
 - **Dreamer** (off until you turn it on in `/config`): asks one "what if...?" when your past sessions give it a
-  reason, slows down when it finds nothing, and spends at most 1 token for every 10 Claude spends. What you forward
+  reason and slows down when it finds nothing. Before each look it checks that its spend, plus the last look's cost,
+  stays within 1 token for every 10 Claude spends. That is a check, not a cap: a fork takes no token ceiling, so one
+  look can cost more than guessed. The real cost is recorded the moment the fork returns, whatever becomes of the
+  look, and anything over the share is owed: no look runs until Claude's own spending covers it. What you forward
   from it is matched by the engine's provenance guard, so it is not read back as your words.
 - **Compaction coach:** `suggest` (default) offers to compact at a quiet turn end between 181k and 269k tokens,
   `auto` compacts on its own, `off` never does.

@@ -21,3 +21,8 @@ folder is made `0700` and every file `0600`, whatever your umask; files an earli
 the first time the plugin writes. Keys (`sk-`, `xai-`, `ghp_`, `AKIA`), `Bearer` tokens, `password=`/`token=` values
 and PEM blocks are removed from the text before it is kept. That is pattern matching: a secret in a shape it does
 not know stays. All writes go through `bin/private.py`.
+
+The dreamer (off until you turn it on in `/config`) checks before each look that what it has spent, plus what the
+last look cost, stays within 1 token for every 10 Claude spends. It is a check, not a cap: a fork takes no token
+ceiling, so one look can cost more than that guess. The real cost is recorded as soon as the fork returns, and any
+amount over the share is owed: no look runs until Claude's own spending has covered it. `/csr dreams` shows it.

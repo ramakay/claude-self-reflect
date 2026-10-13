@@ -12,8 +12,11 @@
 //  3. Something new. A look happens only when CSR's brief holds a line about the
 //     work in hand (a "* " line: a note on a file Claude handled lately, a thing
 //     the person built that came up) the last look did not have.
-//  4. A share of the work. The dreamer never spends more than 1 token for every
-//     10 the main session spends.
+//  4. A share of the work. Before each look the dreamer checks that what it has spent, plus what the last look
+//     cost, stays within 1 token for every 10 the main session has spent. The check is a guess: a fork takes no
+//     token ceiling (ModelForkRequest is a prompt and nothing else), so one look can cost more than the last and
+//     end over the share. That is not forgiven: the excess is owed, every look after it waits, and the wait
+//     ends when Claude's own spending brings the total back within the share.
 
 export const FIRST_EVERY = 6
 export const PER_CHAPTER = 5
@@ -86,10 +89,17 @@ export function facts(brief: string): string[] {
 
 export const hasNews = (now: readonly string[], before: readonly string[]) => now.some(line => !before.includes(line))
 
+// Tokens the dreamer has spent past its share: 0 while it is within it. A look that cost more than the guess ends
+// here with a number above 0, and it stays until `claude` has grown enough to cover it.
+export const owed = (pace: Pace) => Math.max(0, pace.dreamer - SHARE * pace.claude)
+
+// The cost of a spend that is not known (a fork that threw may have been paid for): charged as the guess.
+export const guess = (pace: Pace, lastStep: number) => pace.lastLook || lastStep
+
 // What the next look would cost, guessed from the last look, else from the
-// main session's last step (a fork re-reads the same context).
+// main session's last step (a fork re-reads the same context). Nothing runs while anything is owed.
 export const canAfford = (pace: Pace, lastStep: number) =>
-  pace.dreamer + (pace.lastLook || lastStep) <= SHARE * pace.claude
+  owed(pace) === 0 && pace.dreamer + guess(pace, lastStep) <= SHARE * pace.claude
 
 export function paceText(pace: Pace | null, chapter: Chapter | null, on: boolean): string {
   if (!on) return 'Dreams are off. Turn them on in /config: csr-companion, Dreams.'
@@ -99,9 +109,11 @@ export function paceText(pace: Pace | null, chapter: Chapter | null, on: boolean
       : `No dreams left in this chapter; it starts over at the next compaction.`
     : `${PER_CHAPTER} dreams to a chapter, which starts over at each compaction.`
   if (!pace || pace.looks === 0) {
-    return `Dreams are on. ${now} The dreamer looks only when CSR has something new about the work in hand, and never spends more than 1 token for every 10 Claude spends. No looks yet this session.`
+    return `Dreams are on. ${now} The dreamer looks only when CSR has something new about the work in hand, and checks before each look that its spend stays within 1 token for every 10 Claude spends. No looks yet this session.`
   }
   const k = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`)
   const share = pace.claude ? Math.round((pace.dreamer / pace.claude) * 100) : 0
-  return `Dreams are on. ${now} This session: ${pace.looks} ${pace.looks === 1 ? 'look' : 'looks'}, ${pace.dreams} ${pace.dreams === 1 ? 'dream' : 'dreams'}, ${k(pace.dreamer)} tokens (${share}% of Claude's ${k(pace.claude)}).`
+  const over = owed(pace)
+  const debt = over > 0 ? ` A look ran over its share by ${k(over)}; the next waits until Claude's spending has caught up.` : ''
+  return `Dreams are on. ${now} This session: ${pace.looks} ${pace.looks === 1 ? 'look' : 'looks'}, ${pace.dreams} ${pace.dreams === 1 ? 'dream' : 'dreams'}, ${k(pace.dreamer)} tokens (${share}% of Claude's ${k(pace.claude)}).${debt}`
 }

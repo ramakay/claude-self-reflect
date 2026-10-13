@@ -12,7 +12,7 @@
     "dreams": {
       "type": "boolean",
       "title": "Dreams",
-      "description": "While Claude works, CSR's dreamer asks one \"what if...?\" when its memory gives a reason. It looks only when CSR has something new, slows down when it finds nothing, and never spends more than 1 token for every 10 Claude spends.",
+      "description": "While Claude works, CSR's dreamer asks one \"what if...?\" when its memory gives a reason. It looks only when CSR has something new, slows down when it finds nothing, and checks before each look that its spend stays within 1 token for every 10 Claude spends. A look can still run over, since a fork takes no token cap; the next one waits until Claude has caught up.",
       "default": false
     },
     "autoCompact": {

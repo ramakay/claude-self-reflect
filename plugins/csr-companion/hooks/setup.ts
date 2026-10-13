@@ -27,7 +27,8 @@ export const CHOICES: Record<StepId, Choice[]> = {
 export const LINES: Record<StepId, string[]> = {
   dreams: [
     'Dreams: while Claude works, a side agent asks one "what if…?" when CSR\'s memory gives a reason.',
-    'It looks only when CSR has something new, and spends at most 1 token for every 10 Claude spends.',
+    'It looks only when CSR has something new, and checks before each look that its spend stays within',
+    '1 token for every 10 Claude spends. A look can run over; the next waits until Claude has caught up.',
   ],
   autoCompact: [
     `Compact for you: CSR compacts at a quiet turn end once context reaches ${k(BAND.low)}–${k(BAND.high)}.`,

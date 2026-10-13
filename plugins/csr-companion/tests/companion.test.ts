@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
-import { facts, freshChapter, median, spacing } from '../hooks/pace'
+import { canAfford, facts, freshChapter, freshPace, median, owed, paceText, spacing } from '../hooks/pace'
 const rankOfRoot = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1) // as register.tsx ranks a copy
 import { addTerm, AS_TEXT, commands, gitParse, gitVerdict, HOOKS_OFF, isBareDigit, mergeGuards, parseGuard, NO_VERIFY, PROTECTED, RELEASE, tripwire, UNRESOLVED } from '../hooks/coach'
 import type { Guard } from '../hooks/coach'
@@ -84,6 +84,8 @@ type World = {
   headless?: boolean // a `claude -p` child: draws on no surface
   firstRun?: boolean // the plugin just added: no setup answered yet, so the walkthrough shows
   forkReason?: string // a fork that comes back without text, for this reason
+  forkUsage?: Array<typeof USAGE> // what each fork cost, in order; USAGE where left out
+  forkFails?: boolean // a fork that rejects (a timeout), what it cost unknown
   storeGate?: (key: string, value: unknown) => Promise<void> | undefined // a write that lands only once this settles
 }
 const HOME = '/home/u'
@@ -183,9 +185,11 @@ function host(on: On, world: World) {
   on('model.fork', async (_$, e) => {
     forks.push(e.prompt)
     if (world.forkGate) await world.forkGate
-    if (world.forkReason) return { value: { isAnswered: false, reason: world.forkReason, usage: USAGE } } as never
+    if (world.forkFails) return { deny: 'timed out after 60000 ms' } as never
+    const usage = world.forkUsage?.[forks.length - 1] ?? USAGE
+    if (world.forkReason) return { value: { isAnswered: false, reason: world.forkReason, usage } } as never
     const text = world.replies?.[forks.length - 1] ?? 'dream: none'
-    return { value: { isAnswered: true, text, usage: USAGE } }
+    return { value: { isAnswered: true, text, usage } }
   })
   // The band beneath: empty, or You should know's note with its own 4: Disable.
   on('ui.render', async ($, e) => {
@@ -1148,6 +1152,82 @@ test("a look's spend and Claude's steps both land when they interleave: pace cha
   await going
   await settle(() => seen.kept.some(record => record.kind === 'look' && record.outcome === 'none'))
   expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ claude: 15 * LOOK, dreamer: LOOK, looks: 1, lastLook: LOOK }))
+})
+
+// Codex review of the imported plugin, #2: "at most 1 token in 10" was not enforced. The check before a look guesses
+// the look's cost from the last one, and a fork takes no token ceiling (ModelForkRequest is a prompt and nothing
+// else, claude-code.d.ts 2.1.296), so one look can cost far more than its share. What the plugin can do, and now
+// does: write the real cost down at once, owe the excess, and run no look until Claude's own spending covers it.
+const BIG = { ...USAGE, cache_read_input_tokens: 5 * LOOK - 1_000 } // a look that costs 5 steps of Claude's
+test('the share: owed is what the dreamer spent past 1 token in 10, and nothing runs while any is owed', () => {
+  const at = (claude: number, dreamer: number, lastLook = 0) => ({ ...freshPace('s'), claude, dreamer, lastLook })
+  expect(owed(at(1_000, 100))).toBe(0)
+  expect(Math.round(owed(at(1_000, 160)))).toBe(60)
+  expect(canAfford(at(1_000, 0), 100)).toBe(true) // 100 more is exactly the share
+  expect(canAfford(at(1_000, 0), 101)).toBe(false) // the guess alone is over it
+  expect(canAfford(at(1_000, 60, 40), 0)).toBe(true) // the last look's cost is the guess when there is one
+  expect(canAfford(at(1_000, 60, 41), 0)).toBe(false)
+  // Over the share (a look that cost more than guessed): even a guess of 0 does not run a look.
+  expect(canAfford(at(1_000, 160), 0)).toBe(false)
+  expect(canAfford(at(1_000, 160, 0), 0)).toBe(false)
+  // Claude's spending is what pays it back: the same dreamer total, once Claude has spent enough that the total and the guess fit.
+  expect(canAfford(at(1_600, 160, 160), 0)).toBe(false) // 320 > 160
+  expect(canAfford(at(3_200, 160, 160), 0)).toBe(true) // 320 <= 320
+})
+
+test('the pane says when a look ran over its share, and does not claim "never"', () => {
+  const over = { ...freshPace('s'), claude: 100_000, dreamer: 160_000, looks: 1, lastLook: 160_000 }
+  expect(paceText(over, null, true)).toContain('A look ran over its share by 150k; the next waits until Claude\'s spending has caught up.')
+  expect(paceText({ ...over, claude: 2_000_000 }, null, true)).not.toContain('ran over')
+  expect(paceText(null, null, true)).toContain('checks before each look that its spend stays within 1 token for every 10 Claude spends')
+  expect(paceText(null, null, true)).not.toMatch(/never spends|at most/)
+})
+
+test('an overshooting look is owed: the next looks are refused until Claude has spent enough to cover it', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, replies: ['dream: none', 'dream: none'], forkUsage: [BIG] })
+  await $.ui.mount(BAND)
+  await steps($, 12) // 12 steps: the first look is within the share (1 in 12) by its guess, and costs 5 steps of Claude's
+  await settle(() => seen.kept.some(record => record.kind === 'look' && record.outcome === 'none'))
+  expect(seen.forks.length).toBe(1)
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ claude: 12 * LOOK, dreamer: 5 * LOOK, looks: 1, lastLook: 5 * LOOK }))
+  const first = seen.kept.find(record => record.kind === 'look' && record.outcome === 'none')
+  expect(Math.round((first as { owed: number }).owed)).toBe(Math.round(5 * LOOK - 1.2 * LOOK)) // 205k spent against a 49.2k share
+
+  const looks = () => seen.kept.filter(record => record.kind === 'look' && record.outcome !== 'none')
+  await steps($, 30) // the next look is due at 34, and every 6 steps after a refusal
+  await settle(() => looks().length >= 3)
+  expect(seen.forks.length).toBe(1) // not a second fork
+  expect(looks().every(record => record.outcome === 'budget')).toBe(true)
+  expect((looks().at(-1) as { owed: number }).owed).toBeGreaterThan(0) // still over the share at step 40
+
+  // Claude spends on: the total and the guess fit again, so the gate opens (the brief holds nothing new: quiet, no fork).
+  seen.store.set('pace:sess-1', { ...(seen.store.get('pace:sess-1') as object), claude: 100 * LOOK })
+  const before = looks().length
+  await steps($, 12)
+  await settle(() => looks().length > before && looks().at(-1)?.outcome !== 'budget')
+  expect(looks().at(-1)).toEqual(expect.objectContaining({ outcome: 'quiet', owed: 0 }))
+})
+
+test('a fork is paid for even when its look is dropped: a lost lease does not lose the spend', ON, async ($, on) => {
+  let open = () => undefined as void
+  const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY], forkGate: new Promise<void>(done => (open = done)), forkUsage: [BIG] })
+  await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(() => seen.forks.length >= 1)
+  seen.files.set(LEASE, JSON.stringify({ root: '/elsewhere/dev-mods/csr-companion', rank: 9, at: NOW })) // another copy holds it now
+  open()
+  await settle(() => ((seen.store.get('pace:sess-1') as { dreamer?: number } | undefined)?.dreamer ?? 0) > 0)
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ dreamer: 5 * LOOK, looks: 1, lastLook: 5 * LOOK }))
+  await settle(() => false)
+  expect(seen.kept.filter(record => record.kind === 'dream')).toEqual([]) // the look was dropped; the money was not forgotten
+})
+
+test('a fork that rejects may have been paid for: it is charged as the guess', ON, async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, forkFails: true })
+  await $.ui.mount(BAND)
+  await steps($, 12)
+  await settle(() => ((seen.store.get('pace:sess-1') as { looks?: number } | undefined)?.looks ?? 0) >= 1)
+  expect(seen.store.get('pace:sess-1')).toEqual(expect.objectContaining({ looks: 1, dreamer: LOOK })) // Claude's last step
 })
 
 test('a compaction carries the dream that is up once, marked still open; the next one folds it', ON, async ($, on) => {
@@ -2206,7 +2286,8 @@ test('the plugin just added: two steps above the prompt, each digit writes its /
   await $.session.start(START as never)
   const band = await $.ui.mount(BAND)
   expect(await band.find({ text: /CSR setup 1\/2/ })).toBeDefined()
-  expect(await band.find({ text: /spends at most 1 token for every 10 Claude spends/ })).toBeDefined()
+  expect(await band.find({ text: /checks before each look that its spend stays within/ })).toBeDefined() // not "at most": a fork has no token cap
+  expect(await band.find({ text: /A look can run over; the next waits until Claude has caught up/ })).toBeDefined()
   expect(await band.find({ type: 'Button', text: 'Off (now)' })).toBeDefined() // dreams start off
   await band.press({ key: 'setup-dreams-1' })
   expect(seen.configured).toEqual([{ key: 'csr-companion.dreams', value: true }])

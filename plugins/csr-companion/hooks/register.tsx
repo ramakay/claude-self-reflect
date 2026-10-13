@@ -1,11 +1,11 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
+import type { EngineInterface, ModelForkResult, ModelUsage, Register, RenderElement, RenderInput, Settings, SettingsSource, Timer } from 'claude-code'
 
 import type { CompactView, InfiniteRow, Note, NoteView, SetupView, Shift, ShiftsData, StepId, TaskOwners } from '../types'
 import { carryBlock, waitingOn } from './carry'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
-import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, hasNews, mayLook, median, paceText, spacing } from './pace'
+import { allowance, CHAPTER_MS, FIRST_EVERY, canAfford, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
 import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, mergeGuards, parseGuard, protectedFromGit, reasonFor, UNRESOLVED } from './coach'
 import type { LeaseStep } from './dreamer'
@@ -519,7 +519,7 @@ async function lookCameTo($: EngineInterface, owns: () => Promise<boolean>, cwd:
 
 // The two sides of the spend check, kept on every look: "budget" can be checked against what Claude really spent.
 // 10-11/12, before pace was kept per session, all 39 budget looks were false; nothing in the log could show it.
-const sidesOf = (pace: Pace, lastStep: number) => ({ claude: pace.claude, dreamer: pace.dreamer, next: pace.lastLook || lastStep })
+const sidesOf = (pace: Pace, lastStep: number) => ({ claude: pace.claude, dreamer: pace.dreamer, next: guess(pace, lastStep), owed: owed(pace) })
 
 // The next look, counted from the step that started this one (Claude's steps go on while a look runs):
 // soon after a look that cost nothing, else the chapter's dreams left spread over the rest of it.
@@ -634,17 +634,28 @@ async function look($: EngineInterface, lastStep: number, base: number, model?: 
   const known = await strings($, 'knownDreams')
   const asked = await strings($, await ownKey($, 'asked'))
   if (!(await owns())) return
-  const reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known, asked) })
+  // A fork takes no token ceiling (ModelForkRequest is a prompt and nothing else), so the check above is a guess and
+  // one look can cost more. What it did cost is written down the moment the fork returns, before anything asks whether
+  // this look is still wanted (a lost lease, a compaction): money spent is spent. Owed past the share, it holds back
+  // every look after it (pace.ts, owed). A fork that threw may have been paid for and says nothing of what: it is
+  // charged as the guess.
+  let reply: ModelForkResult
+  try {
+    reply = await $.model.fork({ prompt: dreamPrompt(brief, seen, known, asked) })
+  } catch (error) {
+    await changePace($, current => ({ ...current, looks: current.looks + 1, dreamer: current.dreamer + guess(current, lastStep) }))
+    throw error
+  }
+  const used = 'usage' in reply ? tokensOf(reply.usage) : 0
+  pace = await changePace($, current => ({ ...current, looks: current.looks + 1, dreamer: current.dreamer + used, lastLook: used || current.lastLook }))
   if (!(await owns())) return
   if (!reply.isAnswered) reason = reply.reason
-  const used = 'usage' in reply ? tokensOf(reply.usage) : 0
   const spent: Spent | undefined = 'usage' in reply
     ? { usage: reply.usage, model: model ?? (await $.session.model().catch(() => undefined)) }
     : undefined
   const briefKey = await ownKey($, 'briefFacts')
   if (!(await owns())) return
   await $.store.set(briefKey, [...before.filter(line => !now.includes(line)), ...now].slice(-FACTS_KEPT))
-  pace = await ownPace(current => ({ ...current, looks: current.looks + 1, dreamer: current.dreamer + used, lastLook: used || current.lastLook }))
   // A compaction that started a new chapter while the fork ran: this answer was about the old one, whose
   // context is gone. Its tokens count; the new chapter is left as the compaction made it.
   const same = (chapter: Chapter) =>
@@ -2041,8 +2052,8 @@ export const register: Register = (on, options) => {
         ...(sample ? [{ text: asked, color: PAPER.faint }, { text: `“${sample.line}”`, bold: true }, { text: '' }] : []),
         {
           text: sample
-            ? 'Turned on, it asks one "what if...?" like this while Claude works, when your past sessions give it a reason. It looks only when CSR has something new, and never spends more than 1 token for every 10 Claude spends.'
-            : 'Turn them on, and while Claude works a side agent asks one "what if...?" when your past sessions give it a reason. It looks only when CSR has something new, and never spends more than 1 token for every 10 Claude spends.',
+            ? 'Turned on, it asks one "what if...?" like this while Claude works, when your past sessions give it a reason. It looks only when CSR has something new, and checks before each look that its spend stays within 1 token for every 10 Claude spends. A look that runs over is paid back before the next.'
+            : 'Turn them on, and while Claude works a side agent asks one "what if...?" when your past sessions give it a reason. It looks only when CSR has something new, and checks before each look that its spend stays within 1 token for every 10 Claude spends. A look that runs over is paid back before the next.',
           color: PAPER.quiet,
         },
         { text: 'The switch is in your user settings: it covers all your Claude sessions.', color: PAPER.quiet },
