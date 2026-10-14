@@ -1747,6 +1747,12 @@ async fn search_reflections_with_vec(
                 continue;
             }
 
+            // Shift Ledger rows are the model's readings of code shifts, kept for
+            // search on request; they are never injected unasked.
+            if crate::story_map::store::is_ledger_row(&tags) {
+                continue;
+            }
+
             // A row whose rendered excerpt is its writer's frame alone
             // ("Session in <p> project using <tools>", "[Heuristic] Project:
             // … Messages: …") says nothing about the work. See

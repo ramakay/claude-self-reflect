@@ -531,7 +531,11 @@ fn get_latest_v3_enrichment(storage: &Arc<Storage>, project: &str) -> Option<Str
     let reflections = storage.get_reflections_by_tag(&tag, 5).ok()?;
     reflections
         .into_iter()
-        .find(|(_, _, tags, _)| tags.iter().any(|t| t.starts_with("narrative_")))
+        .find(|(_, _, tags, _)| {
+            // a Shift Ledger row is `narrative_shift`: not a session analysis
+            !crate::story_map::store::is_ledger_row(tags)
+                && tags.iter().any(|t| t.starts_with("narrative_"))
+        })
         .map(|(_, content, _, _)| {
             // Cap at 1500 chars for prompt budget
             content.chars().take(1500).collect()
@@ -570,7 +574,11 @@ async fn find_related_sessions(
     let now = chrono::Utc::now();
     let mut related = Vec::new();
     for r in results {
-        if let Ok(Some((content, _tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
+        if let Ok(Some((content, tags, timestamp))) = storage.get_reflection_by_id(&r.id) {
+            // shift ledger rows never feed a story prompt
+            if crate::story_map::store::is_ledger_row(&tags) {
+                continue;
+            }
             let age = crate::temporal::format_relative_time(
                 &crate::temporal::parse_timestamp(&timestamp).unwrap_or(now),
             );
@@ -704,7 +712,7 @@ pub async fn generate_story_cli(
                     &conv_id,
                 )
                 .await
-                .map(|story| (story, "story_by_haiku"));
+                .map(|(story, shifts)| (story, shifts, "story_by_haiku"));
             }
             if told.is_none() && mode == StoryMode::FromCompaction {
                 // Not opted in, or Haiku failed: CSR's own extract, no model call
@@ -712,15 +720,16 @@ pub async fn generate_story_cli(
                     if !templated {
                         log_story_event(&project, &conv_id, "aux_schema_miss:compaction_summary");
                     }
-                    (story, "story_extracted")
+                    (story, Vec::new(), "story_extracted")
                 });
             }
             match told {
-                Some((story, how)) => {
+                Some((story, shifts, how)) => {
                     let mut tags = vec![how.to_string()];
                     if mode == StoryMode::FromCompaction {
                         tags.push("story_from_compaction".to_string());
                     }
+                    let rev = prior.as_ref().map_or(1, |p| p.rev + 1);
                     store_story(
                         engine,
                         cwd,
@@ -731,7 +740,20 @@ pub async fn generate_story_cli(
                         messages.len(),
                         tags,
                     )
-                    .await
+                    .await?;
+                    if how == "story_by_haiku" {
+                        crate::story_map::store::record_story_map(
+                            engine,
+                            &project,
+                            &conv_id,
+                            rev,
+                            messages.len(),
+                            "Haiku",
+                            shifts,
+                        )
+                        .await;
+                    }
+                    Ok(())
                 }
                 None => {
                     log_story_event(&project, &conv_id, "skip:summary_unusable");
@@ -747,14 +769,14 @@ pub async fn generate_story_cli(
     result
 }
 
-/// One metered Haiku call for a story: its text, or None when narratives are off or the call
-/// failed. A failed call is metered too.
+/// One metered Haiku call for a story: its prose and parsed shift entries, or None when
+/// narratives are off or the call failed. A failed call is metered too.
 async fn haiku_story(
     engine: &Engine,
     prompt: &str,
     project: &str,
     conv_id: &str,
-) -> Option<String> {
+) -> Option<(String, Vec<crate::story_map::ShiftEntry>)> {
     if crate::narrative::narratives_disabled() {
         log_story_event(project, conv_id, "skip:narratives_disabled");
         return None;
@@ -798,7 +820,7 @@ async fn haiku_story(
                 &format!("shifts_parsed:{}", entries.len()),
             );
         }
-        prose
+        (prose, entries)
     })
 }
 
@@ -812,9 +834,11 @@ async fn generate_and_store(
     prior: Option<&PriorStory>,
 ) -> anyhow::Result<()> {
     let ctx = build_story_context(engine, cwd, messages).await;
-    let Some(story) = haiku_story(engine, &build_prompt(&ctx), project, conv_id).await else {
+    let Some((story, shifts)) = haiku_story(engine, &build_prompt(&ctx), project, conv_id).await
+    else {
         return Ok(());
     };
+    let rev = prior.map_or(1, |p| p.rev + 1);
     store_story(
         engine,
         cwd,
@@ -825,7 +849,18 @@ async fn generate_and_store(
         messages.len(),
         Vec::new(),
     )
-    .await
+    .await?;
+    crate::story_map::store::record_story_map(
+        engine,
+        project,
+        conv_id,
+        rev,
+        messages.len(),
+        "Haiku",
+        shifts,
+    )
+    .await;
+    Ok(())
 }
 
 /// Store a session's story in place of the one it had, and how many of its messages it covers.
@@ -1339,6 +1374,71 @@ Summary:
         let mut ids = found.ids.clone();
         ids.sort();
         assert_eq!(ids, vec!["new", "old"]);
+    }
+
+    #[test]
+    fn a_story_rewrite_never_finds_ledger_rows_in_prior_story() {
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .insert_reflection(
+                "story-1",
+                "session story prose",
+                &[
+                    "session_story".to_string(),
+                    "conv_c1".to_string(),
+                    "story_rev_1".to_string(),
+                ],
+                &[0.0f32; 384],
+            )
+            .unwrap();
+        for (id, sig) in [
+            ("ledger-1", "1111111111111111"),
+            ("ledger-2", "2222222222222222"),
+        ] {
+            storage
+                .insert_reflection(
+                    id,
+                    "[shift: model-derived, kind=shift, rev=1, receipts=evo:1] a => b - claim",
+                    &[
+                        "narrative_shift".to_string(),
+                        "shift_project:csr".to_string(),
+                        "shift_conv:c1".to_string(),
+                        "shift_rev_1".to_string(),
+                        "shift_kind_shift".to_string(),
+                        format!("shift_sig_{sig}"),
+                        "shift_grounded".to_string(),
+                    ],
+                    &[0.0f32; 384],
+                )
+                .unwrap();
+        }
+        let found = prior_story(&storage, "c1").expect("story exists");
+        assert_eq!(found.ids, vec!["story-1".to_string()]);
+    }
+
+    #[test]
+    fn the_v3_lookup_never_takes_a_shift_ledger_row_for_an_analysis() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let tag = |t: &str| t.to_string();
+        storage
+            .insert_reflection(
+                "v3",
+                "Tools: Edit | Files: main.rs",
+                &[tag("project_csr"), tag("narrative_extracted_v3")],
+                &[0.0f32; 384],
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        storage
+            .insert_reflection(
+                "shift",
+                "[shift: model-derived, kind=risk, rev=1, receipts=evo:1] a => b - claim",
+                &[tag("project_csr"), tag("narrative_shift")],
+                &[0.0f32; 384],
+            )
+            .unwrap();
+        let got = get_latest_v3_enrichment(&storage, "csr").unwrap();
+        assert!(got.starts_with("Tools: Edit"), "{got}");
     }
 
     #[test]

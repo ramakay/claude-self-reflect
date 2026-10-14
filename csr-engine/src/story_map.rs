@@ -15,6 +15,7 @@ const MAX_SYM_CHARS: usize = 40;
 const MAX_CLAIM_CHARS: usize = 72;
 
 pub mod ground;
+pub mod store;
 
 /// Kill switch (`CSR_NO_STORY_MAP=1`): disables `@shifts` prompt requests,
 /// ledger writes, and Shift Map rendering.
