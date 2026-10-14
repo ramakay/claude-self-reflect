@@ -313,16 +313,26 @@ pub fn parse_shifts_block(block: &str, cut_off: bool) -> Vec<ShiftEntry> {
     out
 }
 
+/// Whether one line is the `@shifts` sentinel, allowing the decoration a model
+/// puts around it. A line that merely mentions `@shifts` is not one.
+fn is_shifts_sentinel(line: &str) -> bool {
+    line.trim_end_matches(['\r', '\n'])
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '#' | '*' | '`'))
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '*' | '`'))
+        .eq_ignore_ascii_case("@shifts")
+}
+
 /// Splits raw story model output into `(prose, shifts)`.
 ///
-/// If a line whose trimmed text equals `@shifts` is present, returns the prose
+/// If a sentinel line is present (`@shifts`, case-insensitive, once whitespace,
+/// leading `#`/`*`/`` ` `` and trailing `:`/`*`/`` ` `` are trimmed off, so
+/// `@shifts:`, `**@shifts**`, `### @shifts` and `@Shifts` count), returns the prose
 /// before that line (trailing whitespace trimmed) and parsed entries from the
 /// remainder. If absent, returns `(raw.to_string(), vec![])` byte-for-byte.
 pub fn split_story_output(raw: &str, cut_off: bool) -> (String, Vec<ShiftEntry>) {
     let mut offset = 0usize;
     for segment in raw.split_inclusive('\n') {
-        let trimmed = segment.trim_end_matches(['\r', '\n']).trim();
-        if trimmed == "@shifts" {
+        if is_shifts_sentinel(segment) {
             let prose = raw[..offset].trim_end().to_string();
             let rest = &raw[offset + segment.len()..];
             return (prose, parse_shifts_block(rest, cut_off));
@@ -437,6 +447,54 @@ mod tests {
     fn missing_sentinel_returns_input_unchanged() {
         let raw = "  Untrimmed prose with trailing newline and spaces.  \n\n";
         let (prose, entries) = split_story_output(raw, false);
+        assert_eq!(prose, raw);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn decorated_sentinel_variants_still_cut_the_block_from_the_prose() {
+        let block = "shift|a.rs:f~|a.rs:g+|Keep the map\n";
+        for variant in [
+            "@shifts:",
+            "**@shifts**",
+            "`@shifts`",
+            "### @shifts",
+            "@Shifts",
+            "@SHIFTS",
+            "**@shifts:**",
+            "  ## `@Shifts`:  ",
+        ] {
+            let raw = format!("The story prose.\n{variant}\n{block}");
+            let (prose, entries) = split_story_output(&raw, false);
+            assert_eq!(prose, "The story prose.", "variant {variant:?}");
+            assert_eq!(entries.len(), 1, "variant {variant:?}");
+            let (capped, _) = finish_story_output(&raw, true);
+            assert!(
+                !capped.contains('|'),
+                "variant {variant:?} leaked: {capped}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_that_only_mentions_shifts_is_not_a_sentinel() {
+        for raw in [
+            "We read @shifts from the model output and kept going.\nshift|a.rs|b.rs|c\n",
+            "See `@shifts` for the format.\n",
+            "The @shifts: block is optional.\n",
+            "@shifts and more\nshift|a.rs|b.rs|c\n",
+            "@shiftsX\n",
+        ] {
+            let (prose, entries) = split_story_output(raw, false);
+            assert_eq!(prose, raw);
+            assert!(entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_kill_switch_path_is_untouched_by_decorated_sentinels() {
+        let raw = "Prose.\n**@shifts**\nshift|a.rs|b.rs|c\n";
+        let (prose, entries) = finish_story_output(raw, false);
         assert_eq!(prose, raw);
         assert!(entries.is_empty());
     }
