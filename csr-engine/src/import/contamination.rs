@@ -29,6 +29,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::extraction::provenance::{DREAM_SENTINEL, LESSONS_SENTINEL, RECAP_SENTINEL};
+use crate::storage::dream_attribution::{
+    DREAM_CARD_PROPOSAL_HEADER, DREAM_CARD_SPAN_BOUNDARIES, DREAM_CARD_TAKE_HEADER, MARKER_PREFIX,
+};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -55,6 +58,7 @@ pub enum ContaminationReason {
     AnchorNotice,
     MemoryFeedback,
     AgentSubprocess,
+    DreamCardJudgment,
     PluginDreamForward,
     PluginCompactionCard,
     PluginSessionStory,
@@ -97,6 +101,7 @@ impl ContaminationReason {
             Self::AnchorNotice => "anchor_notice",
             Self::MemoryFeedback => "memory_feedback",
             Self::AgentSubprocess => "agent_subprocess",
+            Self::DreamCardJudgment => "dream_card_judgment",
             Self::PluginDreamForward => "plugin_dream_forward",
             Self::PluginCompactionCard => "plugin_compaction_card",
             Self::PluginSessionStory => "plugin_session_story",
@@ -160,7 +165,7 @@ pub struct Hit {
 /// Every place `text` matches a registered CSR grammar, in order, without
 /// overlap. Reports only: the text is not touched.
 pub fn detect(text: &str) -> Vec<Hit> {
-    if !TRIGGER_RE.is_match(text) {
+    if !could_contain_emission(text) {
         return Vec::new();
     }
     scan(text)
@@ -178,7 +183,8 @@ pub fn has_csr_text(text: &str) -> bool {
 
 /// Cheap prefilter: a text with none of the formatters' openings cannot hit.
 pub fn could_contain_emission(text: &str) -> bool {
-    TRIGGER_RE.is_match(text)
+    // A dream card is only a card when its marker line closes it.
+    TRIGGER_RE.is_match(text) || text.contains(MARKER_PREFIX)
 }
 
 /// Whether a stored chunk is the kind of text CSR could have put in a
@@ -345,6 +351,9 @@ pub static REGISTRY: &[Formatter] = &[
         "first user prompt begins `# Ratification Dialog-Act Extraction`", Matcher::Transcript),
     formatter!("agent_narrator", Engine, AgentSubprocess,
         "first user prompt begins `[[CSR:RECAP]] machine-marker:`", Matcher::Transcript),
+    formatter!("dream_card_judgment", Engine, DreamCardJudgment,
+        "a dreams-CLI card's `Dream's take — not a fact:` / `Proposal — requires verdict:` span, header to the next card boundary, when a `↳ csr-dream <id>` line closes the card (the marker line itself is not a hit)",
+        Matcher::Block(m_dream_card)),
     formatter!("plugin_dream_forward", Plugin, PluginDreamForward,
         "the companion's forwarded dream: band (question / attribution / `>` reasoning) or pane one-liner, v1 and v2",
         Matcher::Inline),
@@ -605,6 +614,11 @@ struct Doc<'a> {
     lines: Vec<Line>,
     /// Bytes of a UTF-8 BOM at byte zero (0 or 3).
     bom: usize,
+    /// For each line, whether it sits inside a dreams-CLI card: a `PROJECT `
+    /// line opened a card above it with no marker line since, and a marker line
+    /// closes it below before any fresh card opens. Built once, on first use,
+    /// in two linear passes.
+    card_inside: std::cell::OnceCell<Vec<bool>>,
 }
 
 impl<'a> Doc<'a> {
@@ -630,7 +644,12 @@ impl<'a> Doc<'a> {
             lines.push(Line { start, end, next });
             start = next;
         }
-        Self { text, lines, bom }
+        Self {
+            text,
+            lines,
+            bom,
+            card_inside: std::cell::OnceCell::new(),
+        }
     }
 
     fn len(&self) -> usize {
@@ -646,6 +665,39 @@ impl<'a> Doc<'a> {
         };
         let skip = if index == 0 { self.bom } else { 0 };
         &self.text[(line.start + skip).min(line.end)..line.end]
+    }
+
+    /// Whether line `index` is inside a complete dreams-CLI card: opened by a
+    /// `PROJECT ` line and closed by a `↳ csr-dream` marker line. Header phrases
+    /// outside one are somebody's sentences.
+    fn inside_dream_card(&self, index: usize) -> bool {
+        let inside = self.card_inside.get_or_init(|| {
+            let n = self.lines.len();
+            let mut open = false;
+            let mut opened = vec![false; n];
+            for (line, slot) in opened.iter_mut().enumerate() {
+                let text = self.line(line).trim_start();
+                if text.starts_with("PROJECT ") {
+                    open = true;
+                } else if text.starts_with(MARKER_PREFIX) {
+                    open = false;
+                }
+                *slot = open;
+            }
+            let mut closing = false;
+            let mut inside = vec![false; n];
+            for line in (0..n).rev() {
+                let text = self.line(line).trim_start();
+                if text.starts_with(MARKER_PREFIX) {
+                    closing = true;
+                } else if text.starts_with("PROJECT ") {
+                    closing = false;
+                }
+                inside[line] = opened[line] && closing;
+            }
+            inside
+        });
+        inside.get(index).copied().unwrap_or(false)
     }
 
     fn is_blank(&self, index: usize) -> bool {
@@ -1037,6 +1089,39 @@ fn m_code_shift(doc: &Doc<'_>, at: usize) -> Option<usize> {
 
 fn m_lost_and_found(doc: &Doc<'_>, at: usize) -> Option<usize> {
     one_line(doc, at, &LOST_RE)
+}
+
+/// A dreams-CLI card's model-authored span: a `Dream's take` or `Proposal`
+/// header at column zero, through the line before the next card boundary. The
+/// same rule as `strip_card_judgment`: it counts only when a marker line closes
+/// its card (and, so that two lines of somebody's prose cannot pass for one, a
+/// `PROJECT ` line opened it), so prose that merely says "my take" is never
+/// touched. The marker
+/// line is not part of the span; it carries only an id and `bind_markers` needs
+/// it on the stored chunk.
+fn m_dream_card(doc: &Doc<'_>, at: usize) -> Option<usize> {
+    let line = doc.line(at);
+    if ![DREAM_CARD_TAKE_HEADER, DREAM_CARD_PROPOSAL_HEADER]
+        .iter()
+        .any(|header| line.starts_with(header))
+    {
+        return None;
+    }
+    if !doc.inside_dream_card(at) {
+        return None;
+    }
+    let mut end = at + 1;
+    while end < doc.len() {
+        let next = doc.line(end).trim_start();
+        if DREAM_CARD_SPAN_BOUNDARIES
+            .iter()
+            .any(|boundary| next.starts_with(boundary))
+        {
+            break;
+        }
+        end += 1;
+    }
+    Some(end)
 }
 
 fn m_handed_legacy(doc: &Doc<'_>, at: usize) -> Option<usize> {
@@ -1486,8 +1571,12 @@ fn scan(text: &str) -> Vec<Hit> {
                 };
                 // A block whose lines hold a fence, a quote or code its
                 // formatter never writes has run into somebody's markdown.
-                if formatter.reason != ContaminationReason::PluginSideNote
-                    && body_is_protected(&doc, index, end_line)
+                // (A side note quotes by design; a dream card's span is a
+                // model's free prose, which may hold anything.)
+                if !matches!(
+                    formatter.reason,
+                    ContaminationReason::PluginSideNote | ContaminationReason::DreamCardJudgment
+                ) && body_is_protected(&doc, index, end_line)
                 {
                     continue;
                 }

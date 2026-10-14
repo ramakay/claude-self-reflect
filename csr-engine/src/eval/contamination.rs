@@ -216,6 +216,10 @@ pub struct Output {
     /// bare injection section (found inside it), and the sends that read like a
     /// person's sentence.
     pub canary: bool,
+    /// The byte where the canary expects the first hit to start: 0 for a whole
+    /// send, the first judgment header for a dreams-CLI card (its facts above
+    /// are not CSR's prose to label).
+    pub hit_at: usize,
     /// Whether the detector labels the raw output at all.
     pub detected: bool,
 }
@@ -240,7 +244,28 @@ fn output(id: &str, formatter: &'static str, reason: ContaminationReason, text: 
         assistant_relay: true,
         mixed: Mixed::Detected,
         canary: true,
+        hit_at: 0,
         detected: true,
+    }
+}
+
+/// A dreams-CLI card the real renderers wrote: the labeled part is the
+/// judgment spans, from the first header on.
+fn dream_card_output(id: &str, text: String) -> Output {
+    use crate::storage::dream_attribution::{DREAM_CARD_PROPOSAL_HEADER, DREAM_CARD_TAKE_HEADER};
+    let hit_at = [DREAM_CARD_TAKE_HEADER, DREAM_CARD_PROPOSAL_HEADER]
+        .iter()
+        .filter_map(|header| text.find(&format!("\n{header}")).map(|at| at + 1))
+        .min()
+        .expect("a rendered card has a judgment header");
+    Output {
+        hit_at,
+        ..output(
+            id,
+            "dream_card_judgment",
+            ContaminationReason::DreamCardJudgment,
+            text,
+        )
     }
 }
 
@@ -748,6 +773,25 @@ pub fn engine_outputs() -> Vec<Output> {
         wrapped.assistant_relay = false;
         out.push(wrapped);
     }
+
+    // the dreams CLI's cards, from the real renderers: a pasted card's judgment
+    // spans are labeled
+    out.push(dream_card_output(
+        "dream-card-unfinished",
+        crate::dream::cli::canary_card(),
+    ));
+    out.push(dream_card_output(
+        "dream-card-strategy",
+        crate::dream::strategy::canary_card(),
+    ));
+    out.push(dream_card_output(
+        "dream-card-supersession",
+        crate::dream::backfill::compose::canary_supersession_card(),
+    ));
+    out.push(dream_card_output(
+        "dream-card-unfinished-backfill",
+        crate::dream::backfill::compose::canary_unfinished_card(),
+    ));
     out
 }
 
@@ -892,6 +936,7 @@ pub fn pane_outputs() -> Vec<Output> {
                 assistant_relay: true,
                 mixed: Mixed::Detected,
                 canary: !prose,
+                hit_at: 0,
                 detected: !prose,
             }
         })
@@ -1162,7 +1207,7 @@ pub fn run_canary() -> CanaryReport {
     {
         report.generated += 1;
         match detect(&output.text).first() {
-            Some(hit) if hit.reason == output.reason && hit.start_byte == 0 => {
+            Some(hit) if hit.reason == output.reason && hit.start_byte == output.hit_at => {
                 report.correctly_detected += 1
             }
             other => report.failures.push(format!(

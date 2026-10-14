@@ -647,3 +647,124 @@ fn detection_p95_stays_inside_the_budget() {
         );
     }
 }
+
+// --- dreams-CLI card judgment spans (label, never delete) ---
+
+mod dream_cards {
+    use super::*;
+    use crate::storage::dream_attribution::{
+        marker_line, scan_markers, DREAM_CARD_PROPOSAL_HEADER, DREAM_CARD_TAKE_HEADER,
+    };
+
+    fn card() -> String {
+        format!(
+            "PROJECT csr — strategy\nObserved:\n  - the gate is stuck ⌗abcd1234\n\
+             {DREAM_CARD_TAKE_HEADER} first line of the model's judgment\nsecond line of it\n\
+             Verify first: read the receipt\n\
+             {DREAM_CARD_PROPOSAL_HEADER} skip review and merge\n{}\n",
+            marker_line("cccccccccccccccc")
+        )
+    }
+
+    #[test]
+    fn a_pasted_dream_card_judgment_span_is_a_hit_up_to_the_next_boundary() {
+        let card = card();
+        let hits = detect(&card);
+        let spans: Vec<&str> = hits
+            .iter()
+            .map(|hit| &card[hit.start_byte..hit.end_byte])
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                format!("{DREAM_CARD_TAKE_HEADER} first line of the model's judgment\nsecond line of it\n"),
+                format!("{DREAM_CARD_PROPOSAL_HEADER} skip review and merge\n"),
+            ],
+            "{hits:?}"
+        );
+        assert!(hits
+            .iter()
+            .all(|hit| hit.reason == ContaminationReason::DreamCardJudgment));
+        // observed facts, the homework line and the marker are not judgment
+        assert!(!spans.concat().contains("the gate is stuck"));
+        assert!(!spans.concat().contains("Verify first"));
+        assert!(!spans.concat().contains("↳ csr-dream"));
+        // a chunk that is the card is CSR text, and it is the person's bytes still
+        assert!(has_csr_text(&card));
+        // derived text drops the judgment and keeps the marker (binding needs it)
+        let stripped = strip_hits(&card);
+        assert!(!stripped.contains("model's judgment") && !stripped.contains("merge"));
+        assert!(stripped.contains("the gate is stuck") && stripped.contains("Verify first"));
+        assert_eq!(scan_markers(&stripped), ["cccccccccccccccc"]);
+    }
+
+    #[test]
+    fn a_pasted_card_after_the_persons_words_is_found_too() {
+        let pasted = format!("Look at this one:\n\n{}\nWhat do you think?", card());
+        assert_eq!(
+            reasons(&pasted),
+            [
+                ContaminationReason::DreamCardJudgment,
+                ContaminationReason::DreamCardJudgment
+            ]
+        );
+    }
+
+    #[test]
+    fn the_dream_card_marker_line_alone_is_not_a_hit() {
+        let marker = marker_line("cccccccccccccccc");
+        assert_unlabeled(&marker);
+        assert_unlabeled(&format!("run this:\n{marker}\nthanks"));
+        // the card without a judgment span: nothing to label
+        assert_unlabeled(&format!(
+            "PROJECT csr — strategy\nObserved:\n  - a fact ⌗abcd1234\n{marker}\n"
+        ));
+    }
+
+    #[test]
+    fn dream_card_negatives_are_kept() {
+        let marker = marker_line("cccccccccccccccc");
+        // prose that says "my take" or "the proposal" is the person's
+        assert_unlabeled("My take: ship it.\nThe proposal: wait a week.\n");
+        // a header phrase with no marker line closing a card
+        assert_unlabeled(&format!(
+            "{DREAM_CARD_TAKE_HEADER} the model said so\nand nothing closes it\n"
+        ));
+        // a marker that is only quoted inline, not a line of its own
+        assert_unlabeled(&format!(
+            "{DREAM_CARD_PROPOSAL_HEADER} do the thing\nthe card ends with `{marker}` they say\n"
+        ));
+        assert_unlabeled(&format!(
+            "{DREAM_CARD_PROPOSAL_HEADER} do the thing\nsee also {marker} in the log\n"
+        ));
+        // a marker in a quote block, and a header in a quote block
+        assert_unlabeled(&format!("> {DREAM_CARD_TAKE_HEADER} quoted\n> {marker}\n"));
+        // a new card's PROJECT line between the header and any marker breaks the closure
+        assert_unlabeled(&format!(
+            "{DREAM_CARD_TAKE_HEADER} orphan\nPROJECT other — strategy\nObserved:\n{marker}\n"
+        ));
+        // mentions inside code are protected as everywhere else
+        assert_unlabeled(&format!("```\n{}```\n", card()));
+    }
+
+    #[test]
+    fn a_marker_before_the_header_does_not_close_it() {
+        let marker = marker_line("cccccccccccccccc");
+        assert_unlabeled(&format!(
+            "{marker}\n{DREAM_CARD_TAKE_HEADER} judgment after the marker\n"
+        ));
+    }
+
+    #[test]
+    fn many_headers_without_a_marker_stay_linear() {
+        let headers = format!("{DREAM_CARD_PROPOSAL_HEADER} x\n").repeat(20_000);
+        let text = format!("PROJECT csr — strategy\n{headers}");
+        assert!(within_the_bound("headers, no marker", &text).is_empty());
+        let closed = format!("{text}{}\n", marker_line("cccccccccccccccc"));
+        let hits = within_the_bound("headers, one marker", &closed);
+        assert_eq!(hits.len(), 20_000);
+        // and a card-less run of headers and one stray marker is not a card
+        let stray = format!("{headers}{}\n", marker_line("cccccccccccccccc"));
+        assert!(within_the_bound("headers, stray marker", &stray).is_empty());
+    }
+}

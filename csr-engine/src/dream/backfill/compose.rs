@@ -465,6 +465,39 @@ pub(super) fn render_unfinished_backfill_card(
     out
 }
 
+/// The supersession card the contamination canary pastes back: the real
+/// renderer over invented episodes.
+pub(crate) fn canary_supersession_card() -> String {
+    render_supersession_card(
+        "demo",
+        "ep-old-1234",
+        "ep-new-5678",
+        "replaced_by",
+        "ledger",
+        "witnessed",
+        "we believed X was the right approach",
+        "we now do Y instead",
+        Some("abcdef1234567890"),
+        Some(12),
+        "0123456789abcdef",
+    )
+}
+
+/// The backfill unfinished card, likewise.
+pub(crate) fn canary_unfinished_card() -> String {
+    let facts = EpisodeFacts {
+        episode_id: "ep-1234abcd".to_string(),
+        session_id: "s1".to_string(),
+        ts: "2026-10-01T00:00:00Z".to_string(),
+        request: "fix the flaky test".to_string(),
+        completed: "diagnosed the race".to_string(),
+        next_steps: Some("add a retry guard".to_string()),
+        blockers: None,
+        files: vec![],
+    };
+    render_unfinished_backfill_card("demo", &facts, 0.5, "0123456789abcdef")
+}
+
 fn content_hash(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for p in parts {
@@ -1040,6 +1073,12 @@ mod tests {
         assert!(card.contains("last touched 12 day(s) ago"));
         assert!(card.contains(DREAM_CARD_PROPOSAL_HEADER));
         assert!(card.contains(&marker_line("deadbeefcafef00d")));
+        let hits = crate::import::contamination::detect(&card);
+        assert_eq!(hits.len(), 1, "the proposal span: {hits:?}");
+        assert_eq!(
+            &card[hits[0].start_byte..hits[0].end_byte],
+            format!("{DREAM_CARD_PROPOSAL_HEADER} confirm via csr_resolve whether this supersession still holds.\n")
+        );
         assert_no_hedge_words(&card);
     }
 
@@ -1083,6 +1122,8 @@ mod tests {
         assert!(card.contains("CI is red"));
         assert!(card.contains("0.742"));
         assert!(card.contains(DREAM_CARD_PROPOSAL_HEADER));
+        let hits = crate::import::contamination::detect(&card);
+        assert_eq!(hits.len(), 1, "the proposal span: {hits:?}");
         assert_no_hedge_words(&card);
     }
 

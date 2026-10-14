@@ -127,7 +127,7 @@ pub const DREAM_CARD_PROPOSAL_HEADER: &str = "Proposal — requires verdict:";
 /// judgment header (so a Take span stops where a Proposal begins), the
 /// deterministic homework header, a fresh card's own leading header, and the
 /// marker line that closes every card.
-const DREAM_CARD_SPAN_BOUNDARIES: [&str; 4] = [
+pub(crate) const DREAM_CARD_SPAN_BOUNDARIES: [&str; 4] = [
     DREAM_CARD_PROPOSAL_HEADER,
     "Verify first:",
     "PROJECT ",
@@ -635,6 +635,13 @@ mod tests {
             "receipt-anchored facts are not judgment and must survive"
         );
         assert_eq!(joined, card.trim(), "stored as the person pasted it");
+        // ...and search labels it: the chunk is CSR text, not a person's words
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| crate::import::contamination::chunk_hit(chunk).is_some()),
+            "a pasted strategy card is a CSR-text hit"
+        );
 
         let storage = Storage::open_memory().expect("storage");
         let bound =

@@ -503,6 +503,18 @@ fn render_strategy_card(project: &str, parsed: &ParsedStrategyCard, dream_id: &s
     out
 }
 
+/// The card the contamination canary pastes back: the real renderer over an
+/// invented card.
+pub(crate) fn canary_card() -> String {
+    let parsed = ParsedStrategyCard {
+        observed: vec!["the release gate is stuck ⌗abcd1234".to_string()],
+        take: "the gate waits on a review nobody is doing".to_string(),
+        verify: Some("read the receipt for the last green run".to_string()),
+        proposal: "assign the review and rerun the gate".to_string(),
+    };
+    render_strategy_card("demo", &parsed, "0123456789abcdef")
+}
+
 // ─── cache ──────────────────────────────────────────────────────────────
 
 /// `(dream_id, prose)` of the newest `dreams_v1` row at
@@ -1057,5 +1069,31 @@ mod tests {
         assert_eq!(evidence.open_items[0].item_id, "a");
         assert_eq!(evidence.threads.len(), 1);
         assert_eq!(evidence.threads[0].session_id, "sess-e");
+    }
+    #[test]
+    fn a_strategy_card_pasted_back_is_labeled_csr_text_on_its_judgment_spans() {
+        use crate::import::contamination::{detect, ContaminationReason};
+        let parsed = ParsedStrategyCard {
+            observed: vec!["the gate is stuck ⌗abcd1234".to_string()],
+            take: "drop review and ship the hotfix".to_string(),
+            verify: Some("read the receipt".to_string()),
+            proposal: "merge directly to main".to_string(),
+        };
+        let card = render_strategy_card("csr", &parsed, "cccccccccccccccc");
+        let hits = detect(&card);
+        let spans: Vec<&str> = hits
+            .iter()
+            .map(|hit| &card[hit.start_byte..hit.end_byte])
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                format!("{HDR_TAKE} drop review and ship the hotfix\n"),
+                format!("{HDR_PROPOSAL} merge directly to main\n"),
+            ]
+        );
+        assert!(hits
+            .iter()
+            .all(|hit| hit.reason == ContaminationReason::DreamCardJudgment));
     }
 }

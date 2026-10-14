@@ -518,6 +518,21 @@ fn render_unfinished_card(dream: &WeekDream, dream_id: &str) -> String {
     out
 }
 
+/// The card the contamination canary pastes back: the real renderer over an
+/// invented dream.
+pub(crate) fn canary_card() -> String {
+    let dream = WeekDream {
+        title: "fix the release gate".to_string(),
+        hypothesis: Some("release gate blocked on codex review".to_string()),
+        hypothesis_session: Some("sess-hyp01".to_string()),
+        how: vec!["review week.rs ⌗abc12345".to_string()],
+        project: "demo".to_string(),
+        item_id: "item1234abcd5678".to_string(),
+        kind_label: "natural direction",
+    };
+    render_unfinished_card(&dream, "0123456789abcdef")
+}
+
 /// Existing OPEN `dreams_v1` row's dream_id at
 /// `(project, category, subject_key, revision_hash)`, if one exists —
 /// idempotency for a category (like `unfinished`) whose logical identity
@@ -840,6 +855,11 @@ mod tests {
         assert!(text.contains("Dream's take — not a fact:"));
         assert!(text.contains("Proposal — requires verdict:"));
         assert!(text.contains(&dream_attribution::marker_line(&dream_id)));
+        // a pasted copy of this very card is labeled CSR text, judgment spans only
+        let hits = crate::import::contamination::detect(&text);
+        assert_eq!(hits.len(), 2, "take and proposal: {hits:?}");
+        assert!(hits.iter().all(|hit| hit.reason
+            == crate::import::contamination::ContaminationReason::DreamCardJudgment));
         // has_plan == true (kind_label == "natural direction") -> no Verify
         // first homework line.
         assert!(!text.contains("Verify first:"));

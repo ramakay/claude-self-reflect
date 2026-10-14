@@ -354,3 +354,26 @@ fn plugin_agents_production_fixture_digest_matches() {
         Err(error) => eprintln!("python3 unavailable, digest check skipped: {error}"),
     }
 }
+
+#[test]
+fn the_canary_generates_every_dream_card_emitter() {
+    let outputs = engine_outputs();
+    let cards: Vec<&Output> = outputs
+        .iter()
+        .filter(|output| output.formatter == "dream_card_judgment")
+        .collect();
+    let ids: Vec<&str> = cards.iter().map(|output| output.id.as_str()).collect();
+    // the dreams CLI's unfinished card, the strategy card, the two backfill cards
+    assert_eq!(
+        ids,
+        [
+            "dream-card-unfinished",
+            "dream-card-strategy",
+            "dream-card-supersession",
+            "dream-card-unfinished-backfill"
+        ]
+    );
+    let before = run_canary();
+    assert!(before.failures.is_empty(), "{:#?}", before.failures);
+    assert!(before.generated >= 4 && before.generated == before.correctly_detected);
+}
