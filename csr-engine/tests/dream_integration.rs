@@ -213,8 +213,8 @@ fn dream_end_to_end_supersession_rerun_idempotency_and_reinstatement() {
     assert_eq!(v1.verdict, VerdictKind::SupersededBy);
     assert_eq!(
         v1.receipt_oid.as_deref(),
-        Some(c3.as_str()),
-        "commit1's successor must be the live HEAD (c3) that ran the join"
+        Some(c2.as_str()),
+        "commit1's receipt must be c2, the first commit after c1 whose symbol content differs"
     );
     let v2_run1 = engine
         .storage()
@@ -222,6 +222,11 @@ fn dream_end_to_end_supersession_rerun_idempotency_and_reinstatement() {
         .unwrap()
         .unwrap();
     assert_eq!(v2_run1.verdict, VerdictKind::SupersededBy);
+    assert_eq!(
+        v2_run1.receipt_oid.as_deref(),
+        Some(c3.as_str()),
+        "commit2's receipt must be c3, the first commit after c2 whose symbol content differs"
+    );
 
     // ── Run 2: rerun at the SAME HEAD (c3) — must write nothing new ──
     let run2 = csr_engine::dream::run_dream(&engine, None, false).unwrap();
