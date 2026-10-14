@@ -107,6 +107,7 @@ fn registry_ids_are_unique_and_every_appendix_b_formatter_is_registered() {
         "plugin_recap_forward",
         "plugin_last_session",
         "plugin_leftover",
+        "plugin_agents_v1",
         "plugin_code_shift",
         "plugin_lost_and_found",
         "plugin_handed_legacy",
@@ -524,6 +525,36 @@ fn a_long_quote_prefix_with_many_candidates_is_linear() {
     );
     // ...and a plain quote of one is still a mention
     assert_unlabeled("> CSR's compaction card (compacting), quoted: “One.”");
+}
+
+/// The companion's agents envelope (bin/agents.py): an opening marker line, one
+/// JSON line, a closing marker line. Each marker line is a hit; the JSON between
+/// them carries no marker of its own.
+#[test]
+fn the_agents_envelope_marker_lines_are_each_a_hit() {
+    let envelope = "[[CSR:AGENTS:v1]]\n{\"kind\":\"handoff\",\"session\":\"synthetic-session\",\"request\":\"req-0123456789abcdef\",\"thread\":\"000000000001\",\"instruction\":\"Copy this envelope unchanged into the background agent's prompt.\"}\n[[/CSR:AGENTS:v1]]\n";
+    let hits = detect(envelope);
+    let formatters: Vec<&str> = hits.iter().map(|hit| hit.formatter).collect();
+    assert_eq!(
+        formatters,
+        ["plugin_agents_v1", "plugin_agents_v1"],
+        "{hits:?}"
+    );
+    assert_eq!(
+        &envelope[hits[0].start_byte..hits[0].end_byte],
+        "[[CSR:AGENTS:v1]]\n"
+    );
+    assert_eq!(
+        &envelope[hits[1].start_byte..hits[1].end_byte],
+        "[[/CSR:AGENTS:v1]]\n"
+    );
+    // a pasted envelope after the person's words is still two hits, CRLF too
+    let pasted = format!("here it is:\n{}", envelope.replace('\n', "\r\n"));
+    assert_eq!(detect(&pasted).len(), 2, "{pasted:?}");
+    // a mention is not one
+    assert_unlabeled("the marker [[CSR:AGENTS:v1]] opens it");
+    assert_unlabeled("`[[CSR:AGENTS:v1]]`");
+    assert_unlabeled("> [[CSR:AGENTS:v1]]");
 }
 
 #[test]

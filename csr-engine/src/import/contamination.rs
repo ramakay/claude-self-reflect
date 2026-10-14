@@ -70,6 +70,7 @@ pub enum ContaminationReason {
     PluginLeftover,
     PluginCodeShift,
     PluginLostAndFound,
+    PluginAgentsEnvelope,
     HarnessRow,
     CsrToolUse,
     CsrToolResult,
@@ -109,6 +110,7 @@ impl ContaminationReason {
             Self::PluginRecapForward => "plugin_recap_forward",
             Self::PluginLastSession => "plugin_last_session",
             Self::PluginLeftover => "plugin_leftover",
+            Self::PluginAgentsEnvelope => "plugin_agents_envelope",
             Self::PluginCodeShift => "plugin_code_shift",
             Self::PluginLostAndFound => "plugin_lost_and_found",
             Self::HarnessRow => "harness_row",
@@ -380,6 +382,9 @@ pub static REGISTRY: &[Formatter] = &[
     formatter!("plugin_leftover", Plugin, PluginLeftover,
         "Left over from session <id8>: “<subject>” (<status>).",
         Matcher::Block(m_leftover)),
+    formatter!("plugin_agents_v1", Plugin, PluginAgentsEnvelope,
+        "[[CSR:AGENTS:v1]] / <one JSON line> / [[/CSR:AGENTS:v1]] (each marker line)",
+        Matcher::Block(m_agents_envelope)),
     formatter!("plugin_code_shift", Plugin, PluginCodeShift,
         "Since our past sessions, commit <sha7> “<subject>” (<date>) changed code we worked on: <files>.",
         Matcher::Block(m_code_shift)),
@@ -530,6 +535,7 @@ re!(
     LEFTOVER_RE,
     r"^Left over from session [^\s:]*: “.+” \(.+\)\.$"
 );
+re!(AGENTS_ENVELOPE_RE, r"^\[\[/?CSR:AGENTS:v1\]\]$");
 re!(
     CODE_SHIFT_RE,
     r"^Since our past sessions, commit \S{1,40} “.+” \([^)\n]+\) changed code we worked on: .*\.$"
@@ -1010,6 +1016,13 @@ fn m_recap_forward(doc: &Doc<'_>, at: usize) -> Option<usize> {
 
 fn m_last_session(doc: &Doc<'_>, at: usize) -> Option<usize> {
     one_send(doc, at, &LAST_SESSION_RE, &CUT_LAST_SESSION_RE)
+}
+
+/// An agents-envelope marker line (bin/agents.py writes three lines; the JSON
+/// between the markers carries no marker of its own, so each marker line is the
+/// hit).
+fn m_agents_envelope(doc: &Doc<'_>, at: usize) -> Option<usize> {
+    one_line(doc, at, &AGENTS_ENVELOPE_RE)
 }
 
 fn m_leftover(doc: &Doc<'_>, at: usize) -> Option<usize> {
