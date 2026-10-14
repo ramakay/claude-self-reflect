@@ -878,7 +878,13 @@ pub(crate) fn episode_is_csr_text(ep: &Episode) -> bool {
     ]
     .into_iter()
     .flatten()
-    .chain(ep.todos.iter().map(|todo| todo.content.as_str()))
+    // only an open todo can render (as a next step); a completed one never does
+    .chain(
+        ep.todos
+            .iter()
+            .filter(|todo| todo.status != "completed")
+            .map(|todo| todo.content.as_str()),
+    )
     .any(has_csr_text)
 }
 
@@ -1052,7 +1058,11 @@ fn recap_episode<'a>(
         && ep.recap_evidence_version.is_some()
     {
         if let Some(anchor) = &ep.compact_anchor {
-            if let Some(intent) = crate::hooks::recap::anchor_intent(&anchor.request) {
+            if let Some(intent) = Some(&anchor.request)
+                .filter(|request| !crate::import::contamination::has_csr_text(request))
+                .and_then(|request| crate::hooks::recap::anchor_intent(request))
+                .filter(|intent| !crate::import::contamination::has_csr_text(intent))
+            {
                 let mut current = ep.clone();
                 current.anchor_request = Some(intent);
                 current.completions_untied = anchor.completions_untied;
@@ -2988,6 +2998,69 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             Some("fix the briefing staleness bug"),
             None
         )));
+    }
+
+    /// A selected clean episode takes a compact anchor only when the anchor's
+    /// request is not CSR text.
+    #[test]
+    fn a_compact_anchor_that_is_csr_text_is_not_taken_after_selection() {
+        let mut ep = minimal_episode("Fix the auth middleware regression", "Fixed it", None);
+        ep.recap_evidence_version = Some(crate::hooks::stop::RECAP_EVIDENCE_VERSION);
+        ep.anchor_request = Some("Fix the auth middleware regression.".into());
+        ep.compact_anchor = Some(crate::hooks::stop::CompactAnchor {
+            request: RULE_TEXT.into(),
+            completions_untied: false,
+        });
+        let taken = recap_episode(&ep, Some("compact"), Some(ep.session_id.as_str()));
+        assert_eq!(
+            taken.anchor_request.as_deref(),
+            Some("Fix the auth middleware regression."),
+            "the CSR-text anchor must not replace the clean intent"
+        );
+        // a clean anchor is still taken
+        ep.compact_anchor = Some(crate::hooks::stop::CompactAnchor {
+            request: "Now wire the staging endpoint.".into(),
+            completions_untied: false,
+        });
+        let taken = recap_episode(&ep, Some("compact"), Some(ep.session_id.as_str()));
+        assert_eq!(
+            taken.anchor_request.as_deref(),
+            Some("Now wire the staging endpoint.")
+        );
+    }
+
+    /// Only text that can render decides: a completed todo never renders, so
+    /// one that reads like CSR text does not drop a clean episode.
+    #[test]
+    fn a_completed_csr_text_todo_does_not_drop_a_clean_episode() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let mut ep = minimal_episode(
+            "Fix the auth middleware regression",
+            "Fixed the token check",
+            None,
+        );
+        ep.session_id = "clean".into();
+        ep.project = "proj".into();
+        ep.todos = vec![crate::hooks::stop::TodoItem {
+            content: RULE_TEXT.into(),
+            status: "completed".into(),
+        }];
+        storage
+            .insert_reflection(
+                "ep-clean",
+                &serde_json::to_string(&ep).unwrap(),
+                &crate::hooks::stop::episode_tags(&ep),
+                &[0.0; 4],
+            )
+            .unwrap();
+        let sessions: Vec<String> = recent_project_episodes(&storage, "proj", 10)
+            .into_iter()
+            .map(|(ep, _)| ep.session_id)
+            .collect();
+        assert_eq!(sessions, ["clean"]);
+        // an open todo does render, so one that is CSR text does drop it
+        ep.todos[0].status = "pending".into();
+        assert!(episode_is_csr_text(&ep));
     }
 
     #[test]

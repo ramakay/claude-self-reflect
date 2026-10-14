@@ -481,7 +481,9 @@ pub(crate) fn displayed_receipts(
     const MAX_CLAIM_CHARS: usize = 100;
     let render = |done: &crate::hooks::stop::CompletionReceipt| {
         let receipt = normalize_feed_text(&done.receipt);
-        let claim = extractable(&done.claim).map(|claim| sanitize_preview(&claim))?;
+        let claim = extractable(&done.claim)
+            .filter(|claim| !crate::import::contamination::has_csr_text(claim))
+            .map(|claim| sanitize_preview(&claim))?;
         (!receipt.is_empty() && has_substance(&claim) && claim.chars().count() <= MAX_CLAIM_CHARS)
             .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
     };
@@ -1552,6 +1554,29 @@ mod tests {
         );
         let recorded: Vec<u32> = composed.corrections.iter().map(|c| c.turn).collect();
         assert_eq!(recorded, [2], "the identity recorded is the one shown");
+    }
+
+    /// A completion claim that is CSR text is not rendered; a clean one beside
+    /// it is.
+    #[test]
+    fn a_completion_claim_that_is_csr_text_is_not_injected() {
+        let mut ep = episode();
+        ep.completions = vec![
+            CompletionReceipt {
+                claim: "Implemented deterministic recap output".into(),
+                receipt: "abc1234".into(),
+            },
+            CompletionReceipt {
+                claim: "A standing rule from 10-12: “Keep receipts”".into(),
+                receipt: "def5678".into(),
+            },
+        ];
+        let recap = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(!recap.contains("Keep receipts"), "{recap}");
+        assert!(
+            recap.contains("Implemented deterministic recap output"),
+            "{recap}"
+        );
     }
 
     #[test]
