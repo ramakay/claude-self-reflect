@@ -1258,6 +1258,17 @@ re!(
     QUOTED_HOTKEY_RE,
     r"^(?:>[ \t]*)+\d(?:CSR's dreamer|CSR's compaction card|CSR's story)"
 );
+re!(QUOTED_HOTKEY_PREFIX_RE, r"^(?:>[ \t]*)+\d");
+
+/// Where, in a quote line, the companion's hotkey digit leaves a CSR send: the
+/// byte (relative to the line) just past `> ... <digit>`, when one of the three
+/// sends follows it. Decided once per line, however many candidates it holds.
+fn quoted_hotkey_start(line: &str) -> Option<usize> {
+    QUOTED_HOTKEY_RE.is_match(line).then_some(())?;
+    QUOTED_HOTKEY_PREFIX_RE
+        .find(line)
+        .map(|prefix| prefix.end())
+}
 
 struct Candidate {
     start: usize,
@@ -1410,6 +1421,7 @@ fn scan(text: &str) -> Vec<Hit> {
     // The marks of the line being scanned, computed once however many
     // candidates the line holds.
     let mut line_marks: Option<(usize, LineMarks<'_>)> = None;
+    let mut hotkey_cache: Option<(usize, Option<usize>)> = None;
 
     'scan: while pos < text.len() {
         let index = doc.line_of(pos);
@@ -1484,8 +1496,14 @@ fn scan(text: &str) -> Vec<Hit> {
             }
             let marks = &line_marks.as_ref().expect("set above").1;
             let structural = candidate.reason == ContaminationReason::SystemReminder;
+            if hotkey_cache.as_ref().map(|(at, _)| *at) != Some(index) {
+                hotkey_cache = Some((index, quoted_hotkey_start(content)));
+            }
             let quote_ok = kind != LineKind::Quote
-                || QUOTED_HOTKEY_RE.is_match(&text[content_start..candidate.end]);
+                || hotkey_cache
+                    .as_ref()
+                    .and_then(|(_, start)| *start)
+                    .is_some_and(|start| rel == start);
             let allowed = kind != LineKind::Indented
                 && quote_ok
                 && !marks.in_code(rel)

@@ -506,6 +506,26 @@ fn the_scan_is_linear_on_the_inputs_that_made_the_old_one_quadratic() {
     within_the_bound("blank runs", &format!("{DEGRADED}\n{}", "\n".repeat(n * 4)));
 }
 
+/// A quote line of n `>` marks, a hotkey digit, then n cards: deciding whether
+/// the quote carries a hotkey must not be redone for every candidate.
+#[test]
+fn a_long_quote_prefix_with_many_candidates_is_linear() {
+    let n = 40_000;
+    let text = format!(
+        "{}2{}",
+        ">".repeat(n),
+        "CSR's compaction card (compacting), quoted: “x” ".repeat(n)
+    );
+    within_the_bound("quote prefix, many candidates", &text);
+    // the hotkey form itself still labels the card it precedes
+    assert_eq!(
+        reasons(">2CSR's compaction card (compacting), quoted: “One.” Keep it frozen."),
+        [ContaminationReason::PluginCompactionCard]
+    );
+    // ...and a plain quote of one is still a mention
+    assert_unlabeled("> CSR's compaction card (compacting), quoted: “One.”");
+}
+
 #[test]
 fn which_chunks_can_carry_csr_text() {
     assert!(labelable(Some("conversation"), Some(Speaker::User)));
