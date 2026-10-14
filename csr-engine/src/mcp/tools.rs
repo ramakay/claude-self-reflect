@@ -4938,6 +4938,218 @@ mod tests {
         out[start..end].to_string()
     }
 
+    /// The production write path (`store_reflection_internal`, real embeddings)
+    /// for a story and a ledger row with the same words: every tool that reads
+    /// reflections returns the story and never the shift.
+    #[tokio::test]
+    async fn shift_ledger_rows_written_for_real_never_reach_the_search_tools() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+        let words = "the scheduler now retries the upload queue after a timeout";
+        store_reflection_internal(
+            &storage,
+            &embeddings,
+            &search,
+            &format!("{words} STORYPROSE"),
+            &[
+                "session_story".to_string(),
+                "project_shiftleak".to_string(),
+                "conv_leak1".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        store_reflection_internal(
+            &storage,
+            &embeddings,
+            &search,
+            &format!("[shift: model-derived] {words} LEAKEDSHIFT"),
+            &[
+                "narrative_shift".to_string(),
+                "shift_project:shiftleak".to_string(),
+                "shift_conv:leak1".to_string(),
+                "shift_sig_00aa11bb22cc33dd".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            storage
+                .get_ledger_reflections_by_tag("narrative_shift", 5)
+                .unwrap()
+                .len(),
+            1,
+            "the ledger row is stored (never deleted)"
+        );
+
+        let replies = [
+            reflect_on_past(&storage, &embeddings, &search, words, 5, 0.0, None)
+                .await
+                .unwrap(),
+            get_more_results(&storage, &embeddings, &search, words, 0, 5, 0.0, None)
+                .await
+                .unwrap(),
+            why(
+                &storage,
+                &embeddings,
+                &search,
+                words,
+                None,
+                &crate::search::reinstatement::ReinstateConfig::default(),
+            )
+            .await
+            .unwrap(),
+            quick_check(&storage, &embeddings, &search, words, 0.0, None)
+                .await
+                .unwrap(),
+            search_insights(&storage, &embeddings, &search, words, None)
+                .await
+                .unwrap(),
+            search_by_concept(&storage, &embeddings, &search, words, 5, None)
+                .await
+                .unwrap(),
+        ];
+        for (i, reply) in replies.iter().enumerate() {
+            assert!(!reply.contains("LEAKEDSHIFT"), "tool {i} leaked:\n{reply}");
+        }
+        assert!(
+            replies[0].contains("STORYPROSE"),
+            "the story still comes back:\n{}",
+            replies[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn shift_ledger_rows_never_reach_mcp_or_hook_outputs() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        let query_vec = [1.0_f32, 0.0, 0.0, 0.0];
+        let story_vec = vec![0.85_f32, (1.0 - 0.85 * 0.85_f32).sqrt(), 0.0, 0.0];
+        let ledger_vec = vec![0.99_f32, (1.0 - 0.99 * 0.99_f32).sqrt(), 0.0, 0.0];
+
+        let story_text =
+            "MEMORY-ARCHIVE quarantine-shift-canary story prose about quarantine-shift-canary";
+        let ledger_text =
+            "MEMORY-ARCHIVE quarantine-shift-canary [shift: model-derived] LEAKED_SHIFT_CLAIM";
+
+        storage
+            .insert_reflection(
+                "story-clean",
+                story_text,
+                &[
+                    "session_story".to_string(),
+                    "project_csr".to_string(),
+                    "conv_q1".to_string(),
+                    "session_q1".to_string(),
+                ],
+                &story_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("story-clean".to_string(), story_vec);
+
+        storage
+            .insert_reflection(
+                "ledger-secret",
+                ledger_text,
+                &[
+                    "narrative_shift".to_string(),
+                    "shift_project:csr".to_string(),
+                    "shift_conv:q1".to_string(),
+                    "shift_rev_1".to_string(),
+                    "shift_kind_risk".to_string(),
+                    "shift_sig_0123456789abcdef".to_string(),
+                    "shift_grounded".to_string(),
+                    "project_csr".to_string(),
+                    "conv_q1".to_string(),
+                    "session_q1".to_string(),
+                ],
+                &ledger_vec,
+            )
+            .unwrap();
+        engine.insert_reflection("ledger-secret".to_string(), ledger_vec);
+
+        let search = Arc::new(RwLock::new(engine));
+
+        for mode in [SearchMode::Vector, SearchMode::Fts, SearchMode::Hybrid] {
+            let out = reflect_on_past_with_vec_mode(
+                &storage,
+                &search,
+                &query_vec,
+                "MEMORY-ARCHIVE quarantine-shift-canary",
+                5,
+                0.0,
+                Some("csr"),
+                0,
+                false,
+                ConsumptionMode::Off,
+                false,
+                "other",
+                mode,
+                RecallRerankMode::Baseline,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(
+                out.contains("story prose"),
+                "expected story-clean in {mode:?} output:\n{out}"
+            );
+            assert!(
+                !out.contains("LEAKED_SHIFT_CLAIM"),
+                "ledger row leaked in {mode:?} output:\n{out}"
+            );
+        }
+
+        let kw_only = reflect_keyword_only(
+            &storage,
+            &search,
+            "MEMORY-ARCHIVE quarantine-shift-canary",
+            5,
+            Some("csr"),
+        )
+        .await
+        .unwrap();
+        assert!(kw_only.contains("story prose"), "{kw_only}");
+        assert!(
+            !kw_only.contains("LEAKED_SHIFT_CLAIM"),
+            "ledger row leaked in reflect_keyword_only:\n{kw_only}"
+        );
+
+        let by_conv = lookup_by_conv_tag(
+            &storage,
+            "q1",
+            "quarantine-shift-canary",
+            10,
+            ConsumptionMode::Off,
+            false,
+        )
+        .unwrap()
+        .expect("conv_q1 has story");
+        assert!(by_conv.contains("story prose"), "{by_conv}");
+        assert!(
+            !by_conv.contains("LEAKED_SHIFT_CLAIM"),
+            "ledger row leaked in lookup_by_conv_tag:\n{by_conv}"
+        );
+
+        let learnings = get_session_learnings(&storage, "q1", 10).unwrap();
+        assert!(learnings.contains("story prose"), "{learnings}");
+        assert!(
+            !learnings.contains("LEAKED_SHIFT_CLAIM"),
+            "ledger row leaked in get_session_learnings:\n{learnings}"
+        );
+
+        // Hook / anti-pattern / csr_why HNSW reflection lookup gate:
+        let raw_hits = search.read().await.search_reflections(&query_vec, 10, 0.0);
+        assert!(raw_hits.iter().any(|r| r.id == "ledger-secret"));
+        let hydrated: Vec<String> = raw_hits
+            .iter()
+            .filter_map(|r| storage.get_reflection_by_id(&r.id).ok().flatten())
+            .map(|(content, _, _)| content)
+            .collect();
+        assert_eq!(hydrated, vec![story_text.to_string()]);
+    }
+
     // Vector mode already multiplies an out-of-family score by 0.3, so the
     // story must beat the chunk after that multiplier for the sink to decide.
     #[tokio::test]

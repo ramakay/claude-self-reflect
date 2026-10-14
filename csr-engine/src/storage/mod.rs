@@ -705,6 +705,17 @@ impl Storage {
         queries::get_reflections_by_tag(&conn, tag, limit)
     }
 
+    /// Unfiltered tag lookup that includes `narrative_shift` ledger rows (for
+    /// Shift Ledger dedupe and internal ledger tests).
+    pub fn get_ledger_reflections_by_tag(
+        &self,
+        tag: &str,
+        limit: usize,
+    ) -> Result<Vec<queries::ReflectionRow>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_ledger_reflections_by_tag(&conn, tag, limit)
+    }
+
     /// The `session_episode` rows behind each conversation's `conv_<id>` tag
     /// (see [`queries::episode_rows_by_conversation`]).
     pub fn episode_rows_by_conversation(

@@ -1487,7 +1487,7 @@ Summary:
             .await;
 
             let ledger_before: Vec<String> = storage
-                .get_reflections_by_tag("narrative_shift", 10)
+                .get_ledger_reflections_by_tag("narrative_shift", 10)
                 .unwrap()
                 .into_iter()
                 .map(|(id, _, _, _)| id)
@@ -1516,7 +1516,7 @@ Summary:
             assert_eq!(stories[0].1, "Second rewritten session story.");
 
             let ledger_after: Vec<String> = storage
-                .get_reflections_by_tag("narrative_shift", 10)
+                .get_ledger_reflections_by_tag("narrative_shift", 10)
                 .unwrap()
                 .into_iter()
                 .map(|(id, _, _, _)| id)

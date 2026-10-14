@@ -1747,8 +1747,8 @@ async fn search_reflections_with_vec(
                 continue;
             }
 
-            // Shift Ledger rows are the model's readings of code shifts, kept for
-            // search on request; they are never injected unasked.
+            // Shift Ledger rows are kept for the companion pane and ledger dedupe
+            // only; they must never reach Claude through hook injection or search.
             if crate::story_map::store::is_ledger_row(&tags) {
                 continue;
             }

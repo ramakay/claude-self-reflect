@@ -1010,6 +1010,14 @@ pub fn load_all_reflection_vectors(conn: &Connection) -> Result<Vec<(String, Vec
     Ok(results)
 }
 
+/// LIKE pattern matching a whole `narrative_shift` element of a tags JSON array.
+fn ledger_tag_like_pattern() -> String {
+    format!("%\"{}\"%", crate::story_map::store::LEDGER_TAG)
+}
+
+/// One reflection by id. A Shift Ledger row (`narrative_shift`) is invisible
+/// here: shift text never reaches Claude, and every search, why and hook path
+/// hydrates its hits through this reader.
 pub fn get_reflection_by_id(
     conn: &Connection,
     id: &str,
@@ -1026,6 +1034,9 @@ pub fn get_reflection_by_id(
     if let Some(row) = rows.next() {
         let (content, tags_json, timestamp) = row?;
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        if crate::story_map::store::is_ledger_row(&tags) {
+            return Ok(None);
+        }
         Ok(Some((content, tags, timestamp)))
     } else {
         Ok(None)
@@ -1954,14 +1965,17 @@ pub fn fts5_search_reflections(
     let Some(fts_query) = fts5_match_expr(query) else {
         return Ok(Vec::new());
     };
+    let ledger_pat = ledger_tag_like_pattern();
     let mut stmt = conn.prepare(
-        "SELECT id, bm25(reflections_fts)
+        "SELECT reflections_fts.id, bm25(reflections_fts)
          FROM reflections_fts
+         JOIN reflections r ON r.id = reflections_fts.id
          WHERE reflections_fts MATCH ?1
+           AND (r.tags IS NULL OR r.tags NOT LIKE ?2)
          ORDER BY rank
-         LIMIT ?2",
+         LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+    let rows = stmt.query_map(params![fts_query, ledger_pat, limit as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
     })?;
     let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2024,12 +2038,15 @@ pub fn fts5_reflection_prefix_matches(
     // least `limit` rows so a legitimately small match set is never cut
     // short before the boundary filter below runs.
     let fetch_limit = (MAX_PROMOTED_PREFIX_MATCHES + 1).max(limit);
+    let ledger_pat = ledger_tag_like_pattern();
     let mut stmt = conn.prepare(
-        "SELECT id, content FROM reflections WHERE content LIKE ?1 || '%' ESCAPE '\\' \
-         ORDER BY timestamp DESC LIMIT ?2",
+        "SELECT id, content FROM reflections
+         WHERE content LIKE ?1 || '%' ESCAPE '\\'
+           AND (tags IS NULL OR tags NOT LIKE ?2)
+         ORDER BY timestamp DESC LIMIT ?3",
     )?;
     let rows = stmt
-        .query_map(params![escaped, fetch_limit as i64], |row| {
+        .query_map(params![escaped, ledger_pat, fetch_limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2113,14 +2130,36 @@ pub fn fts5_search_in_window(
 // ─── Reflection tag queries ───
 
 /// Get reflections matching a specific tag substring (for session learnings).
+/// Shift Ledger rows (`narrative_shift`) are excluded inside the LIMIT window;
+/// ledger code asks for them through [`get_ledger_reflections_by_tag`].
 pub fn get_reflections_by_tag(
     conn: &Connection,
     tag: &str,
     limit: usize,
 ) -> Result<Vec<ReflectionRow>> {
+    reflections_by_tag(conn, tag, limit, false)
+}
+
+/// [`get_reflections_by_tag`] without the ledger exclusion: the Shift Ledger's
+/// own dedupe and tests. Never route its rows to a tool output or a hook.
+pub fn get_ledger_reflections_by_tag(
+    conn: &Connection,
+    tag: &str,
+    limit: usize,
+) -> Result<Vec<ReflectionRow>> {
+    reflections_by_tag(conn, tag, limit, true)
+}
+
+fn reflections_by_tag(
+    conn: &Connection,
+    tag: &str,
+    limit: usize,
+    include_ledger: bool,
+) -> Result<Vec<ReflectionRow>> {
     // Escape LIKE wildcards to prevent injection
     let escaped_tag = tag.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("%{}%", escaped_tag);
+    let ledger_pat = ledger_tag_like_pattern();
     // The match runs on `idx_reflections_tags_timestamp` alone (a covering
     // scan of ~2 MB): `tags` sits after `content` in the row, so filtering the
     // table itself walks every reflection's overflow pages. Only the rows that
@@ -2129,22 +2168,28 @@ pub fn get_reflections_by_tag(
         "SELECT id, content, tags, timestamp FROM reflections
          WHERE rowid IN (SELECT rowid FROM reflections
                          WHERE tags LIKE ?1 ESCAPE '\\'
-                         ORDER BY timestamp DESC LIMIT ?2)
+                           AND (?3 = 1 OR tags NOT LIKE ?2)
+                         ORDER BY timestamp DESC LIMIT ?4)
          ORDER BY timestamp DESC",
     )?;
-    let rows = stmt.query_map(params![pattern, limit as i64], |row| {
-        let id: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let tags_json: String = row.get(2)?;
-        let timestamp: String = row.get(3)?;
-        Ok((id, content, tags_json, timestamp))
-    })?;
+    let rows = stmt.query_map(
+        params![pattern, ledger_pat, include_ledger as i64, limit as i64],
+        |row| {
+            let id: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let tags_json: String = row.get(2)?;
+            let timestamp: String = row.get(3)?;
+            Ok((id, content, tags_json, timestamp))
+        },
+    )?;
 
     let mut results = Vec::new();
     for row in rows {
         let (id, content, tags_json, timestamp) = row?;
         let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        results.push((id, content, tags, timestamp));
+        if include_ledger || !crate::story_map::store::is_ledger_row(&tags) {
+            results.push((id, content, tags, timestamp));
+        }
     }
     Ok(results)
 }
@@ -2269,12 +2314,14 @@ pub fn get_reflections_by_two_tags(
     };
     let pat_a = format!("%\"{}\"%", esc(tag_a));
     let pat_b = format!("%\"{}\"%", esc(tag_b));
+    let ledger_pat = ledger_tag_like_pattern();
     let mut stmt = conn.prepare(
         "SELECT id, content, tags, timestamp FROM reflections
          WHERE tags LIKE ?1 ESCAPE '\\' AND tags LIKE ?2 ESCAPE '\\'
-         ORDER BY timestamp DESC LIMIT ?3",
+           AND tags NOT LIKE ?3
+         ORDER BY timestamp DESC LIMIT ?4",
     )?;
-    let rows = stmt.query_map(params![pat_a, pat_b, limit as i64], |row| {
+    let rows = stmt.query_map(params![pat_a, pat_b, ledger_pat, limit as i64], |row| {
         let id: String = row.get(0)?;
         let content: String = row.get(1)?;
         let tags_json: String = row.get(2)?;
@@ -7335,5 +7382,120 @@ mod tests {
                 assert_eq!(batched.get(id), Some(&one), "{id} window {window}");
             }
         }
+    }
+
+    #[test]
+    fn reflection_readers_exclude_narrative_shift_ledger_rows_while_table_keeps_them() {
+        let conn = mem();
+        let text = "MEMORY-ARCHIVE shift-quarantine-token shared words in story and ledger";
+        let vec = [0.5f32, 0.5, 0.5, 0.5];
+        insert_reflection(
+            &conn,
+            "story-row",
+            text,
+            &[
+                "session_story".to_string(),
+                "project_csr".to_string(),
+                "conv_x".to_string(),
+                "session_x".to_string(),
+            ],
+            &vec,
+        )
+        .unwrap();
+        // Give the ledger row a newer timestamp AND conv_x/session_x/project_csr
+        // tags so LIMIT 1 would pick the ledger row first if SQL failed to filter it.
+        insert_reflection(
+            &conn,
+            "ledger-row",
+            text,
+            &[
+                "narrative_shift".to_string(),
+                "shift_project:csr".to_string(),
+                "shift_conv:x".to_string(),
+                "shift_sig_deadbeefcafebabe".to_string(),
+                "project_csr".to_string(),
+                "conv_x".to_string(),
+                "session_x".to_string(),
+                "session_story".to_string(),
+            ],
+            &vec,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE reflections SET timestamp = '2099-01-02T00:00:00Z' WHERE id = 'ledger-row'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE reflections SET timestamp = '2099-01-01T00:00:00Z' WHERE id = 'story-row'",
+            [],
+        )
+        .unwrap();
+
+        assert!(get_reflection_by_id(&conn, "story-row").unwrap().is_some());
+        assert!(
+            get_reflection_by_id(&conn, "ledger-row").unwrap().is_none(),
+            "get_reflection_by_id must return None for narrative_shift rows"
+        );
+
+        let fts_hits = fts5_search_reflections(&conn, "shift-quarantine-token", 1).unwrap();
+        assert_eq!(
+            fts_hits
+                .iter()
+                .map(|(id, _, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["story-row"]
+        );
+
+        let prefix_hits =
+            fts5_reflection_prefix_matches(&conn, "MEMORY-ARCHIVE shift-quarantine-token", 1)
+                .unwrap();
+        assert_eq!(prefix_hits, vec!["story-row".to_string()]);
+
+        for tag in ["conv_x", "session_x", "project_csr", "narrative_shift"] {
+            let rows = get_reflections_by_tag(&conn, tag, 1).unwrap();
+            assert!(
+                rows.iter().all(|(id, _, _, _)| id != "ledger-row"),
+                "get_reflections_by_tag({tag}) leaked ledger-row: {rows:?}"
+            );
+        }
+        assert_eq!(
+            get_reflections_by_tag(&conn, "conv_x", 1).unwrap()[0].0,
+            "story-row"
+        );
+
+        let two_tag_rows =
+            get_reflections_by_two_tags(&conn, "project_csr", "session_story", 1).unwrap();
+        assert_eq!(two_tag_rows.len(), 1);
+        assert_eq!(two_tag_rows[0].0, "story-row");
+
+        // Row stays in the table for the pane and ledger dedupe.
+        let raw_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reflections WHERE id = 'ledger-row'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_count, 1);
+    }
+
+    #[test]
+    fn get_ledger_reflections_by_tag_returns_ledger_rows() {
+        let conn = mem();
+        insert_reflection(
+            &conn,
+            "ledger-row",
+            "[shift: model-derived] a => b - claim",
+            &[
+                "narrative_shift".to_string(),
+                "shift_sig_1234567890abcdef".to_string(),
+            ],
+            &[0.1f32; 4],
+        )
+        .unwrap();
+        let rows = get_ledger_reflections_by_tag(&conn, "shift_sig_1234567890abcdef", 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "ledger-row");
     }
 }

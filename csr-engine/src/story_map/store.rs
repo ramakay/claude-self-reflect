@@ -13,6 +13,9 @@ use crate::storage::Storage;
 /// `by` of a map derived from receipts alone (no model wrote it).
 pub const RECEIPTS_BY: &str = "receipts";
 
+/// Tag marking a Shift Ledger row in `reflections`.
+pub const LEDGER_TAG: &str = "narrative_shift";
+
 const LEDGER_VERSION: u32 = 1;
 const LEDGER_MAX_ENTRIES: usize = 200;
 const LEDGER_MAX_BYTES: usize = 32_768;
@@ -188,7 +191,7 @@ impl<'de> Deserialize<'de> for GroundedShift {
 
 /// Returns true when `tags` marks a Shift Ledger reflection (`narrative_shift`).
 pub fn is_ledger_row(tags: &[String]) -> bool {
-    tags.iter().any(|t| t == "narrative_shift")
+    tags.iter().any(|t| t == LEDGER_TAG)
 }
 
 pub(super) fn ledger_meta_key(project: &str) -> String {
@@ -258,7 +261,7 @@ fn format_ledger_tags(
     sig: &str,
 ) -> Vec<String> {
     let mut tags = vec![
-        "narrative_shift".to_string(),
+        LEDGER_TAG.to_string(),
         format!("shift_project:{project}"),
         format!("shift_conv:{conv_id}"),
         format!("shift_rev_{rev}"),
@@ -349,7 +352,7 @@ pub fn plan_ledger(
         }
         let sig_tag = format!("shift_sig_{}", shift.sig);
         let already_in_reflections = storage
-            .get_reflections_by_tag(&sig_tag, 1)
+            .get_ledger_reflections_by_tag(&sig_tag, 1)
             .map(|rows| {
                 rows.iter()
                     .any(|(_, _, tags, _)| tags.iter().any(|t| t == &sig_tag))
@@ -1404,7 +1407,7 @@ mod tests {
         ));
 
         let rows = storage
-            .get_reflections_by_tag("narrative_shift", 10)
+            .get_ledger_reflections_by_tag("narrative_shift", 10)
             .unwrap();
         assert_eq!(rows.len(), 1);
         let (refl_id, _, _, _) = &rows[0];
@@ -1462,7 +1465,7 @@ mod tests {
         });
 
         let rows = storage
-            .get_reflections_by_tag("narrative_shift", 10)
+            .get_ledger_reflections_by_tag("narrative_shift", 10)
             .unwrap();
         assert_eq!(rows.len(), 1);
         let ledger = load_ledger(&storage, "csr");
@@ -1504,7 +1507,7 @@ mod tests {
         std::env::remove_var("CSR_NO_STORY_MAP");
 
         let rows = storage
-            .get_reflections_by_tag("narrative_shift", 10)
+            .get_ledger_reflections_by_tag("narrative_shift", 10)
             .unwrap();
         assert!(rows.is_empty());
         assert!(storage.get_meta("story_map:conv-kill").unwrap().is_none());
