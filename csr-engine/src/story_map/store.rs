@@ -10,6 +10,9 @@ use super::ground::{ground_shifts, GroundedShift, Part};
 use super::{story_map_disabled, ShiftEntry};
 use crate::storage::Storage;
 
+/// `by` of a map derived from receipts alone (no model wrote it).
+pub const RECEIPTS_BY: &str = "receipts";
+
 const LEDGER_VERSION: u32 = 1;
 const LEDGER_MAX_ENTRIES: usize = 200;
 const LEDGER_MAX_BYTES: usize = 32_768;
@@ -227,6 +230,7 @@ pub fn render_parts(parts: &[Part]) -> String {
 }
 
 fn format_ledger_content(
+    by: &str,
     kind: &str,
     rev: usize,
     receipts: &[String],
@@ -235,19 +239,25 @@ fn format_ledger_content(
     claim: &str,
 ) -> String {
     format!(
-        "[shift: model-derived, kind={kind}, rev={rev}, receipts={}] {before} => {after} - {claim}",
+        "[shift: {}, kind={kind}, rev={rev}, receipts={}] {before} => {after} - {claim}",
+        if by == RECEIPTS_BY {
+            "from receipts"
+        } else {
+            "model-derived"
+        },
         receipts.join(",")
     )
 }
 
 fn format_ledger_tags(
+    by: &str,
     project: &str,
     conv_id: &str,
     rev: usize,
     kind: &str,
     sig: &str,
 ) -> Vec<String> {
-    vec![
+    let mut tags = vec![
         "narrative_shift".to_string(),
         format!("shift_project:{project}"),
         format!("shift_conv:{conv_id}"),
@@ -255,7 +265,11 @@ fn format_ledger_tags(
         format!("shift_kind_{kind}"),
         format!("shift_sig_{sig}"),
         "shift_grounded".to_string(),
-    ]
+    ];
+    if by == RECEIPTS_BY {
+        tags.push("shift_by_receipts".to_string());
+    }
+    tags
 }
 
 fn union_receipts(a: &[String], b: &[String]) -> Vec<String> {
@@ -312,6 +326,7 @@ pub fn plan_ledger(
     conv_id: &str,
     rev: usize,
     now: i64,
+    by: &str,
     shifts: &[GroundedShift],
 ) -> LedgerPlan {
     let ledger = load_ledger(storage, project);
@@ -347,9 +362,16 @@ pub fn plan_ledger(
         let before = render_parts(&shift.before);
         let after = render_parts(&shift.after);
         let receipts = union_receipts(&[], &shift.receipts);
-        let content =
-            format_ledger_content(&shift.kind, rev, &receipts, &before, &after, &shift.claim);
-        let tags = format_ledger_tags(project, conv_id, rev, &shift.kind, &shift.sig);
+        let content = format_ledger_content(
+            by,
+            &shift.kind,
+            rev,
+            &receipts,
+            &before,
+            &after,
+            &shift.claim,
+        );
+        let tags = format_ledger_tags(by, project, conv_id, rev, &shift.kind, &shift.sig);
         let entry = LedgerEntry {
             sig: shift.sig.clone(),
             kind: shift.kind.clone(),
@@ -596,7 +618,7 @@ pub async fn record_story_map(
     }
 
     let now = chrono::Utc::now().timestamp();
-    let plan = plan_ledger(engine.storage(), project, conv_id, rev, now, &grounded);
+    let plan = plan_ledger(engine.storage(), project, conv_id, rev, now, by, &grounded);
 
     let mut inserted: Vec<(String, String)> = Vec::with_capacity(plan.new_rows.len());
     for row in &plan.new_rows {
@@ -707,7 +729,7 @@ mod tests {
             shifts.push(sample_grounded("csr", &line, true, &["evo:e1"]));
         }
 
-        let plan1 = plan_ledger(&storage, "csr", "c1", 1, 1000, &shifts[..100]);
+        let plan1 = plan_ledger(&storage, "csr", "c1", 1, 1000, "Haiku", &shifts[..100]);
         let ins1: Vec<(String, String)> = plan1
             .new_rows
             .iter()
@@ -716,7 +738,7 @@ mod tests {
             .collect();
         commit_ledger(&storage, "csr", &plan1, &ins1).unwrap();
 
-        let plan2 = plan_ledger(&storage, "csr", "c2", 2, 2000, &shifts[100..]);
+        let plan2 = plan_ledger(&storage, "csr", "c2", 2, 2000, "Haiku", &shifts[100..]);
         let ins2: Vec<(String, String)> = plan2
             .new_rows
             .iter()
@@ -810,7 +832,7 @@ mod tests {
             false,
             &[],
         );
-        let plan = plan_ledger(&storage, "csr", "c1", 1, 1000, &[g.clone(), m]);
+        let plan = plan_ledger(&storage, "csr", "c1", 1, 1000, "Haiku", &[g.clone(), m]);
         assert_eq!(plan.new_rows.len(), 1);
         assert_eq!(plan.new_rows[0].sig, g.sig);
     }
@@ -824,7 +846,15 @@ mod tests {
             true,
             &["evo:e1", "node:n1", "evo:e2", "evo:e3"],
         );
-        let plan1 = plan_ledger(&storage, "csr", "c1", 1, 1000, std::slice::from_ref(&s1));
+        let plan1 = plan_ledger(
+            &storage,
+            "csr",
+            "c1",
+            1,
+            1000,
+            "Haiku",
+            std::slice::from_ref(&s1),
+        );
         assert_eq!(plan1.new_rows.len(), 1);
         commit_ledger(
             &storage,
@@ -842,7 +872,7 @@ mod tests {
         );
         assert_eq!(s1.sig, s2.sig);
 
-        let plan2 = plan_ledger(&storage, "csr", "c2", 3, 2500, &[s2]);
+        let plan2 = plan_ledger(&storage, "csr", "c2", 3, 2500, "Haiku", &[s2]);
         assert!(plan2.new_rows.is_empty());
         assert_eq!(plan2.existing.len(), 1);
         let updated = &plan2.existing[0];
@@ -878,7 +908,7 @@ mod tests {
             )
             .unwrap();
 
-        let plan = plan_ledger(&storage, "csr", "c1", 1, 1000, &[s]);
+        let plan = plan_ledger(&storage, "csr", "c1", 1, 1000, "Haiku", &[s]);
         assert!(plan.new_rows.is_empty());
         assert!(plan.existing.is_empty());
     }
@@ -888,7 +918,15 @@ mod tests {
         let storage = Storage::open_memory().unwrap();
         let s1 = sample_grounded("csr", "shift|a.rs:f1~|a.rs:f2+|One", true, &["evo:1"]);
         let s2 = sample_grounded("csr", "shift|b.rs:g1~|b.rs:g2+|Two", true, &["evo:2"]);
-        let plan = plan_ledger(&storage, "csr", "c1", 1, 1000, &[s1.clone(), s2.clone()]);
+        let plan = plan_ledger(
+            &storage,
+            "csr",
+            "c1",
+            1,
+            1000,
+            "Haiku",
+            &[s1.clone(), s2.clone()],
+        );
         assert_eq!(plan.new_rows.len(), 2);
 
         // Only s1 succeeded; s2 failed to insert.
@@ -906,7 +944,7 @@ mod tests {
         assert_eq!(ledger.entries[0].reflection_id.as_deref(), Some("refl-ok"));
 
         // Next run still plans s2 because it was not committed.
-        let plan_retry = plan_ledger(&storage, "csr", "c1", 2, 1100, &[s1, s2.clone()]);
+        let plan_retry = plan_ledger(&storage, "csr", "c1", 2, 1100, "Haiku", &[s1, s2.clone()]);
         assert_eq!(plan_retry.new_rows.len(), 1);
         assert_eq!(plan_retry.new_rows[0].sig, s2.sig);
     }
@@ -915,7 +953,15 @@ mod tests {
     fn second_run_of_the_same_shifts_adds_no_rows() {
         let storage = Storage::open_memory().unwrap();
         let s = sample_grounded("csr", "shift|a.rs:f1~|a.rs:f2+|One", true, &["evo:1"]);
-        let plan1 = plan_ledger(&storage, "csr", "c1", 1, 1000, std::slice::from_ref(&s));
+        let plan1 = plan_ledger(
+            &storage,
+            "csr",
+            "c1",
+            1,
+            1000,
+            "Haiku",
+            std::slice::from_ref(&s),
+        );
         assert_eq!(plan1.new_rows.len(), 1);
         commit_ledger(
             &storage,
@@ -925,7 +971,7 @@ mod tests {
         )
         .unwrap();
 
-        let plan2 = plan_ledger(&storage, "csr", "c1", 2, 2000, &[s]);
+        let plan2 = plan_ledger(&storage, "csr", "c1", 2, 2000, "Haiku", &[s]);
         assert!(plan2.new_rows.is_empty());
         commit_ledger(&storage, "csr", &plan2, &[]).unwrap();
         assert_eq!(load_ledger(&storage, "csr").entries.len(), 1);
@@ -946,6 +992,7 @@ mod tests {
             "conv-42",
             4,
             1000,
+            "Haiku",
             std::slice::from_ref(&s),
         );
         let tags = &plan.new_rows[0].tags;
@@ -961,6 +1008,45 @@ mod tests {
     }
 
     #[test]
+    fn receipts_only_rows_say_from_receipts_and_carry_the_by_tag() {
+        let storage = Storage::open_memory().unwrap();
+        let s = sample_grounded("csr", "shift|-|a.rs:f~|Changed f", true, &["evo:9f12a0c1"]);
+        let plan = plan_ledger(
+            &storage,
+            "csr",
+            "c1",
+            2,
+            1000,
+            RECEIPTS_BY,
+            std::slice::from_ref(&s),
+        );
+        let row = &plan.new_rows[0];
+        assert!(
+            row.content
+                .starts_with("[shift: from receipts, kind=shift, rev=2, receipts=evo:9f12a0c1] "),
+            "{}",
+            row.content
+        );
+        assert!(!row.content.contains("model-derived"));
+        assert!(row.tags.contains(&"shift_by_receipts".to_string()));
+        let haiku = plan_ledger(
+            &storage,
+            "csr",
+            "c1",
+            2,
+            1000,
+            "Haiku",
+            std::slice::from_ref(&s),
+        );
+        assert!(haiku.new_rows[0]
+            .content
+            .starts_with("[shift: model-derived, "));
+        assert!(!haiku.new_rows[0]
+            .tags
+            .contains(&"shift_by_receipts".to_string()));
+    }
+
+    #[test]
     fn row_content_has_the_model_derived_label_and_receipts() {
         let storage = Storage::open_memory().unwrap();
         let s = sample_grounded(
@@ -969,7 +1055,7 @@ mod tests {
             true,
             &["evo:9f12a0c1", "node:44b18e20"],
         );
-        let plan = plan_ledger(&storage, "csr", "c1", 4, 1000, &[s]);
+        let plan = plan_ledger(&storage, "csr", "c1", 4, 1000, "Haiku", &[s]);
         assert_eq!(
             plan.new_rows[0].content,
             "[shift: model-derived, kind=shift, rev=4, receipts=node:44b18e20,evo:9f12a0c1] summarizer.rs:store_story~ -> reflections- => summarizer.rs:store_story~ -> reflections:narrative_shift+ - Keep prior shift reflections"

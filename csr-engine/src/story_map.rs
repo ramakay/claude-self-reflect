@@ -14,6 +14,7 @@ const MAX_SCOPE_CHARS: usize = 48;
 const MAX_SYM_CHARS: usize = 40;
 const MAX_CLAIM_CHARS: usize = 72;
 
+pub mod derive;
 pub mod ground;
 pub mod store;
 

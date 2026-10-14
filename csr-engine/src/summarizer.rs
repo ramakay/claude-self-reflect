@@ -720,7 +720,9 @@ pub async fn generate_story_cli(
                     if !templated {
                         log_story_event(&project, &conv_id, "aux_schema_miss:compaction_summary");
                     }
-                    (story, Vec::new(), "story_extracted")
+                    let shifts =
+                        crate::story_map::derive::derive_receipt_shifts(engine.storage(), &conv_id);
+                    (story, shifts, "story_extracted")
                 });
             }
             match told {
@@ -741,18 +743,21 @@ pub async fn generate_story_cli(
                         tags,
                     )
                     .await?;
-                    if how == "story_by_haiku" {
-                        crate::story_map::store::record_story_map(
-                            engine,
-                            &project,
-                            &conv_id,
-                            rev,
-                            messages.len(),
-                            "Haiku",
-                            shifts,
-                        )
-                        .await;
-                    }
+                    let by = if how == "story_by_haiku" {
+                        "Haiku"
+                    } else {
+                        crate::story_map::store::RECEIPTS_BY
+                    };
+                    crate::story_map::store::record_story_map(
+                        engine,
+                        &project,
+                        &conv_id,
+                        rev,
+                        messages.len(),
+                        by,
+                        shifts,
+                    )
+                    .await;
                     Ok(())
                 }
                 None => {
