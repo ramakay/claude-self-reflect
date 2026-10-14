@@ -2891,7 +2891,32 @@ pub(crate) fn mark_file_imported_with_suppression(
     chunks: usize,
     suppression: CsrSuppressionStats,
 ) -> Result<()> {
+    mark_file_imported_with_suppression_at(conn, path, chunks, suppression, &file_mtime_str(path))
+}
+
+/// [`mark_file_imported_with_suppression`] with the revision the caller parsed,
+/// not one sampled now: a file that grew since must still read as changed.
+pub(crate) fn mark_file_imported_with_suppression_at(
+    conn: &mut Connection,
+    path: &Path,
+    chunks: usize,
+    suppression: CsrSuppressionStats,
+    mtime: &str,
+) -> Result<()> {
     let tx = conn.transaction()?;
+    mark_imported_in(&tx, path, chunks, suppression, mtime)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The body of the two functions above, inside a transaction the caller owns.
+pub(crate) fn mark_imported_in(
+    tx: &Connection,
+    path: &Path,
+    chunks: usize,
+    suppression: CsrSuppressionStats,
+    mtime: &str,
+) -> Result<()> {
     let path_str = path.to_string_lossy().to_string();
     let (previous, previous_secrets) = tx
         .query_row(
@@ -2930,7 +2955,6 @@ pub(crate) fn mark_file_imported_with_suppression(
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mtime = file_mtime_str(path);
 
     tx.execute(
         "INSERT OR REPLACE INTO import_state
@@ -2947,34 +2971,32 @@ pub(crate) fn mark_file_imported_with_suppression(
             stamp
         ],
     )?;
-    bump_secret_counters(&tx, &previous_secrets, &persisted_secrets)?;
+    bump_secret_counters(tx, &previous_secrets, &persisted_secrets)?;
 
     if tool_delta > 0 {
-        let split_value = get_meta(&tx, "csr_tool_blocks_suppressed")?;
+        let split_value = get_meta(tx, "csr_tool_blocks_suppressed")?;
         let current = match split_value {
             Some(value) => Some(value),
-            None => get_meta(&tx, "csr_self_suppressed")?,
+            None => get_meta(tx, "csr_self_suppressed")?,
         }
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
         set_meta(
-            &tx,
+            tx,
             "csr_tool_blocks_suppressed",
             &(current + tool_delta).to_string(),
         )?;
     }
     if wrapper_delta > 0 {
-        let current = get_meta(&tx, "csr_hook_wrappers_scrubbed")?
+        let current = get_meta(tx, "csr_hook_wrappers_scrubbed")?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         set_meta(
-            &tx,
+            tx,
             "csr_hook_wrappers_scrubbed",
             &(current + wrapper_delta).to_string(),
         )?;
     }
-
-    tx.commit()?;
     Ok(())
 }
 
@@ -3412,6 +3434,47 @@ pub fn import_secrets_stamped(conn: &Connection, path: &Path) -> Result<bool> {
         )
         .optional()?;
     Ok(stamp.flatten().is_some())
+}
+
+/// What a conversation's stored import state looked like at one moment: the
+/// `import_state` row and how many chunk rows the conversation has. A rebuild
+/// that embeds for a long time swaps its rows in only if this is still true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRowState {
+    pub row: Option<(i64, String, Option<String>)>,
+    pub chunk_rows: i64,
+}
+
+/// [`ImportRowState`] plus the source revision a parse of the file now sees.
+#[derive(Debug, Clone)]
+pub struct ImportSnapshot {
+    pub state: ImportRowState,
+    /// The file's mtime sampled before it is read: what a checkpoint records
+    /// for the revision actually parsed. A file that grows after this reads as
+    /// changed on the next pass.
+    pub source_mtime: String,
+}
+
+pub fn import_row_state(
+    conn: &Connection,
+    path: &Path,
+    conversation_id: &str,
+) -> Result<ImportRowState> {
+    let path_str = path.to_string_lossy();
+    let row = conn
+        .query_row(
+            "SELECT chunks_imported, file_mtime, secrets_redacted
+             FROM import_state WHERE file_path = ?1",
+            params![path_str.as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let chunk_rows = conn.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    )?;
+    Ok(ImportRowState { row, chunk_rows })
 }
 
 pub fn get_imported_chunk_count(conn: &Connection, path: &Path) -> Result<usize> {

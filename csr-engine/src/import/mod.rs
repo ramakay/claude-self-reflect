@@ -1413,26 +1413,31 @@ fn redact_content_secrets(value: &mut serde_json::Value, counts: &mut crate::red
         }
         serde_json::Value::Object(map) => {
             // Keys too: a token-to-account map keeps its credential in the key.
-            // Two keys that redact to the same marker stay apart (`#2`).
+            // Keys the scrub leaves alone go in first, so a renamed key never
+            // lands on one of them (it may sort before or after); two keys that
+            // redact to the same marker stay apart (`#2`).
+            let mut renamed = Vec::new();
             for (key, mut item) in std::mem::take(map) {
                 redact_content_secrets(&mut item, counts);
                 let redacted = match crate::redact::redact_secrets_counted(&key, counts) {
                     std::borrow::Cow::Owned(redacted) => Some(redacted),
                     std::borrow::Cow::Borrowed(_) => None,
                 };
-                let key = match redacted {
-                    Some(base) => {
-                        let mut renamed = base.clone();
-                        let mut n = 1;
-                        while map.contains_key(&renamed) {
-                            n += 1;
-                            renamed = format!("{base} #{n}");
-                        }
-                        renamed
+                match redacted {
+                    Some(base) => renamed.push((base, item)),
+                    None => {
+                        map.insert(key, item);
                     }
-                    None => key,
-                };
-                map.insert(key, item);
+                }
+            }
+            for (base, item) in renamed {
+                let mut name = base.clone();
+                let mut n = 1;
+                while map.contains_key(&name) {
+                    n += 1;
+                    name = format!("{base} #{n}");
+                }
+                map.insert(name, item);
             }
         }
         _ => {}
@@ -3736,6 +3741,22 @@ mod tests {
         assert_eq!(accounts.len(), 3, "{text}");
         assert!(accounts.values().any(|v| v == "first"));
         assert!(accounts.values().any(|v| v == "second"));
+    }
+
+    #[test]
+    fn a_renamed_key_never_lands_on_a_key_that_was_already_there() {
+        let aws = format!("AKIA{}", "B".repeat(16));
+        let marker = "[secret redacted: aws_access_key]";
+        // `AKIA...` sorts before the marker, so it is visited first.
+        let mut value = serde_json::json!({
+            "accounts": {aws.clone(): "credential", marker: "existing", "z": 1},
+        });
+        let mut counts = crate::redact::SecretCounts::default();
+        redact_content_secrets(&mut value, &mut counts);
+        let accounts = value["accounts"].as_object().unwrap();
+        assert_eq!(accounts.len(), 3, "{value}");
+        assert_eq!(accounts[marker], "existing");
+        assert!(accounts.values().any(|v| v == "credential"));
     }
 
     #[test]

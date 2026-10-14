@@ -1273,6 +1273,71 @@ impl Storage {
         Ok(())
     }
 
+    /// The conversation's stored import state and the mtime of the source as it
+    /// is now. Take it before reading the file; see [`Self::replace_conversation_if_unchanged`].
+    pub fn import_snapshot(
+        &self,
+        path: &Path,
+        conversation_id: &str,
+    ) -> Result<queries::ImportSnapshot> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        Ok(queries::ImportSnapshot {
+            state: queries::import_row_state(&conn, path, conversation_id)?,
+            source_mtime: queries::file_mtime_str(path),
+        })
+    }
+
+    /// [`Self::replace_conversation_chunks_atomic`] for a rebuild that parsed and
+    /// embedded long before it swaps: a compare-and-swap. Inside one write
+    /// transaction the conversation's import state is read again, and when it is
+    /// not `expected` (another import added or replaced chunks meanwhile) nothing
+    /// is touched and `false` comes back; the next import retries. On success the
+    /// witness bindings of the replaced chunk ids are dropped (the new chunk at a
+    /// reused id holds other text) and the import checkpoint is written for the
+    /// revision that was parsed, all in the same transaction.
+    pub(crate) fn replace_conversation_if_unchanged(
+        &self,
+        path: &Path,
+        conversation_id: &str,
+        expected: &queries::ImportRowState,
+        rows: &[(ConversationChunk, Vec<f32>, ChunkProvenance, String)],
+        suppression: CsrSuppressionStats,
+        parsed_mtime: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if &queries::import_row_state(&tx, path, conversation_id)? != expected {
+            return Ok(false);
+        }
+        // `witness_ledger` and `witness_verdicts` are append-only and stay. The
+        // chunk binding is a separate mutable relation keyed by chunk id, and ids
+        // are positions: after the swap the same id names different content.
+        tx.execute(
+            "DELETE FROM witness_chunk_bindings
+             WHERE chunk_id IN (SELECT id FROM chunks WHERE conversation_id = ?1)",
+            rusqlite::params![conversation_id],
+        )?;
+        queries::delete_chunks_for_conversation(&tx, conversation_id)?;
+        for (chunk, embedding, provenance, source) in rows {
+            queries::insert_chunk_with_source(&tx, chunk, embedding, source)?;
+            queries::insert_chunk_provenance(&tx, &chunk.id, provenance)?;
+        }
+        queries::mark_imported_in(&tx, path, rows.len(), suppression, parsed_mtime)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn mark_file_imported_with_suppression_at(
+        &self,
+        path: &Path,
+        chunks: usize,
+        suppression: CsrSuppressionStats,
+        mtime: &str,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::mark_file_imported_with_suppression_at(&mut conn, path, chunks, suppression, mtime)
+    }
+
     /// Atomically remove one conversation that should never have been corpus.
     /// See `queries::purge_conversation`. Returns the number of chunks removed.
     ///

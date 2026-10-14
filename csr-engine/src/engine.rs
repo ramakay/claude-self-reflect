@@ -21,6 +21,10 @@ fn log_timing(line: &str) {
 /// hold one session's worth of new chunks without reallocation.
 const IMPORT_ONLY_INDEX_CAPACITY: usize = 4096;
 
+/// A test-only callback fired at a chosen point inside the engine.
+#[cfg(test)]
+pub(crate) type TestHook = Box<dyn Fn() + Send + Sync>;
+
 /// Orchestrates all subsystems: storage, embeddings, search, import, and MCP.
 #[derive(Clone)]
 pub struct Engine {
@@ -58,6 +62,10 @@ pub struct Engine {
     /// An MCP server that found the daemon live: vector search and query
     /// embedding go to the daemon (see [`Self::new_proxied`]).
     proxied: bool,
+    /// Runs in a conversation rebuild after its rows are embedded, just before
+    /// they are swapped in: the window in which another import can win.
+    #[cfg(test)]
+    pub(crate) before_rebuild_swap: Arc<std::sync::Mutex<Option<TestHook>>>,
 }
 
 impl Engine {
@@ -106,6 +114,8 @@ impl Engine {
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
             proxied: false,
+            #[cfg(test)]
+            before_rebuild_swap: Default::default(),
         }
     }
 
@@ -342,6 +352,8 @@ impl Engine {
             index_freshly_rebuilt,
             startup_backfill,
             proxied: false,
+            #[cfg(test)]
+            before_rebuild_swap: Default::default(),
         })
     }
 
@@ -381,6 +393,8 @@ impl Engine {
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
             proxied: true,
+            #[cfg(test)]
+            before_rebuild_swap: Default::default(),
         }))
     }
 
@@ -415,6 +429,8 @@ impl Engine {
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
             proxied: false,
+            #[cfg(test)]
+            before_rebuild_swap: Default::default(),
         })
     }
 
@@ -511,6 +527,13 @@ impl Engine {
             return Ok(0);
         }
 
+        // The stored state and the source revision this import is about to read.
+        // A rebuild swaps its rows in only if the stored state is still this, and
+        // every checkpoint below records this revision's mtime, not the file's
+        // mtime at the moment of writing: a file that grew meanwhile stays changed.
+        let snapshot = self.storage.import_snapshot(file_path, &conversation_id)?;
+        let parsed_mtime = snapshot.source_mtime.as_str();
+
         let parent_context = attribution
             .parent_conversation_id
             .as_deref()
@@ -540,8 +563,12 @@ impl Engine {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent
             // counts it as processed instead of silently under-reporting.
-            self.storage
-                .mark_file_imported_with_suppression(file_path, 0, suppression)?;
+            self.storage.mark_file_imported_with_suppression_at(
+                file_path,
+                0,
+                suppression,
+                parsed_mtime,
+            )?;
             return Ok(0);
         }
 
@@ -565,23 +592,32 @@ impl Engine {
             && !suppression.secrets.is_empty()
             && !self.storage.import_secrets_stamped(file_path)?
         {
-            let rebuilt = self
-                .rebuild_conversation(file_path, &conversation_id, attribution, &chunks, &evidence)
-                .await?;
-            self.storage.mark_file_imported_with_suppression(
-                file_path,
-                chunks.len(),
-                suppression,
-            )?;
+            let Some(rebuilt) = self
+                .rebuild_conversation(
+                    file_path,
+                    &conversation_id,
+                    attribution,
+                    &chunks,
+                    &evidence,
+                    &snapshot,
+                    suppression,
+                )
+                .await?
+            else {
+                // Another import changed this conversation while this one was
+                // embedding: its rows stand and the next import tries again.
+                return Ok(0);
+            };
             self.storage.relink_conversation(&conversation_id)?;
             return Ok(rebuilt);
         }
         if chunks.len() <= prev_count {
             // File parsed to same/fewer chunks — just update mtime
-            self.storage.mark_file_imported_with_suppression(
+            self.storage.mark_file_imported_with_suppression_at(
                 file_path,
                 chunks.len(),
                 suppression,
+                parsed_mtime,
             )?;
             self.storage.relink_conversation(&conversation_id)?;
             return Ok(0);
@@ -626,8 +662,12 @@ impl Engine {
             }
         }
 
-        self.storage
-            .mark_file_imported_with_suppression(file_path, chunks.len(), suppression)?;
+        self.storage.mark_file_imported_with_suppression_at(
+            file_path,
+            chunks.len(),
+            suppression,
+            parsed_mtime,
+        )?;
         self.storage.relink_conversation(&conversation_id)?;
 
         // Layer 1: Heuristic enrichment only on first import (not incremental updates)
@@ -762,7 +802,10 @@ impl Engine {
     }
 
     /// Replace one conversation's chunks with `chunks`, all embedded before the
-    /// swap so a failure leaves the old rows in place. Returns the chunk count.
+    /// swap so a failure leaves the old rows in place. Returns the chunk count,
+    /// or `None` when the conversation's stored state changed since `snapshot`
+    /// (a concurrent import won) and nothing was touched.
+    #[allow(clippy::too_many_arguments)]
     async fn rebuild_conversation(
         &self,
         file_path: &Path,
@@ -770,7 +813,9 @@ impl Engine {
         attribution: &import::ConversationAttribution,
         chunks: &[import::ConversationChunk],
         evidence: &std::collections::HashMap<String, crate::provenance::ChunkEvidence>,
-    ) -> Result<usize> {
+        snapshot: &crate::storage::queries::ImportSnapshot,
+        suppression: import::CsrSuppressionStats,
+    ) -> Result<Option<usize>> {
         const BATCH_SIZE: usize = 10;
         let mut rows = Vec::with_capacity(chunks.len());
         for batch in chunks.chunks(BATCH_SIZE) {
@@ -798,11 +843,27 @@ impl Engine {
                 ));
             }
         }
+        #[cfg(test)]
+        if let Some(hook) = self.before_rebuild_swap.lock().unwrap().as_ref() {
+            hook();
+        }
         let old_ids = self
             .storage
             .get_chunk_ids_for_conversation(conversation_id)?;
-        self.storage
-            .replace_conversation_chunks_atomic(conversation_id, &rows)?;
+        if !self.storage.replace_conversation_if_unchanged(
+            file_path,
+            conversation_id,
+            &snapshot.state,
+            &rows,
+            suppression,
+            &snapshot.source_mtime,
+        )? {
+            tracing::info!(
+                file = %file_path.display(),
+                "conversation changed during a rebuild; left for the next import"
+            );
+            return Ok(None);
+        }
         for (chunk, ..) in &rows {
             if let Some(chunk_evidence) = evidence.get(&chunk.id) {
                 self.storage.replace_chunk_evidence(chunk_evidence)?;
@@ -820,7 +881,7 @@ impl Engine {
             chunks = chunks.len(),
             "rebuilt a conversation stored before secret redaction existed"
         );
-        Ok(chunks.len())
+        Ok(Some(chunks.len()))
     }
 
     // ─── Accessors for hooks ───

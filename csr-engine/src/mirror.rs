@@ -152,17 +152,42 @@ fn scrub_string(text: &str) -> Cow<'_, str> {
 /// order and whitespace are left exactly as written; only a string that the
 /// scrubs change is re-encoded. `None` means nothing changed.
 fn rewrite_json_strings(line: &str) -> Result<Option<String>> {
+    /// A string the scrubs changed, to be spliced over `line[start..=end]`.
+    struct Edit {
+        start: usize,
+        end: usize,
+        as_written: bool,
+        scrubbed: String,
+    }
     let bytes = line.as_bytes();
-    let mut out = String::new();
-    let mut copied = 0usize;
+    let mut edits: Vec<Edit> = Vec::new();
+    // Per object: the keys the scrubs left alone, and the edits that renamed one.
+    let mut objects: Vec<(HashSet<Cow<str>>, Vec<usize>)> = Vec::new();
+    let mut open: Vec<Option<usize>> = Vec::new();
     let mut i = 0usize;
-    // Redacted keys already written: two credentials redact to the same
-    // marker, and a duplicate key would drop one value on the next parse.
-    let mut redacted_keys: HashSet<String> = HashSet::new();
     while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
+        match bytes[i] {
+            b'{' => {
+                objects.push((HashSet::new(), Vec::new()));
+                open.push(Some(objects.len() - 1));
+                i += 1;
+                continue;
+            }
+            b'[' => {
+                open.push(None);
+                i += 1;
+                continue;
+            }
+            b'}' | b']' => {
+                open.pop();
+                i += 1;
+                continue;
+            }
+            b'"' => {}
+            _ => {
+                i += 1;
+                continue;
+            }
         }
         let start = i;
         let mut end = i + 1;
@@ -179,7 +204,11 @@ fn rewrite_json_strings(line: &str) -> Result<Option<String>> {
         while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
             after += 1;
         }
-        let is_key = bytes.get(after) == Some(&b':');
+        let object = if bytes.get(after) == Some(&b':') {
+            open.last().copied().flatten()
+        } else {
+            None
+        };
         let inner = &line[start + 1..end];
         // A string that will not decode (a lone surrogate escape) is scrubbed
         // as written; the markers are JSON-safe, so it is spliced back as is.
@@ -195,28 +224,56 @@ fn rewrite_json_strings(line: &str) -> Result<Option<String>> {
         } else {
             Cow::Borrowed(inner)
         };
-        if let Cow::Owned(mut scrubbed) = scrub_string(&decoded) {
-            if is_key {
-                let base = scrubbed.clone();
-                let mut n = 1;
-                while !redacted_keys.insert(scrubbed.clone()) {
-                    n += 1;
-                    scrubbed = format!("{base} #{n}");
+        match scrub_string(&decoded) {
+            Cow::Owned(scrubbed) => {
+                if let Some(object) = object {
+                    objects[object].1.push(edits.len());
+                }
+                edits.push(Edit {
+                    start,
+                    end,
+                    as_written,
+                    scrubbed,
+                });
+            }
+            Cow::Borrowed(_) => {
+                if let Some(object) = object {
+                    objects[object].0.insert(decoded);
                 }
             }
-            out.push_str(&line[copied..start]);
-            if as_written {
-                out.push('"');
-                out.push_str(&scrubbed);
-                out.push('"');
-            } else {
-                out.push_str(&serde_json::to_string(&scrubbed)?);
-            }
-            copied = end + 1;
         }
     }
-    if copied == 0 {
+    if edits.is_empty() {
         return Ok(None);
+    }
+    // Two credentials redact to the same marker, and a duplicate key would drop
+    // one value on the next parse. Every key the scrubs left alone is reserved
+    // first, so a renamed key never lands on one of them, wherever it sits.
+    for (reserved, renamed) in &mut objects {
+        for &at in renamed.iter() {
+            let base = edits[at].scrubbed.clone();
+            let mut name = base.clone();
+            let mut n = 1;
+            while reserved.contains(name.as_str()) {
+                n += 1;
+                name = format!("{base} #{n}");
+            }
+            reserved.insert(Cow::Owned(name.clone()));
+            edits[at].scrubbed = name;
+        }
+    }
+    let mut out = String::new();
+    let mut copied = 0usize;
+    for edit in &edits {
+        out.push_str(&line[copied..edit.start]);
+        if edit.as_written {
+            out.push('"');
+            out.push_str(&edit.scrubbed);
+            out.push('"');
+        } else {
+            out.push_str(&serde_json::to_string(&edit.scrubbed)?);
+        }
+        copied = edit.end + 1;
     }
     out.push_str(&line[copied..]);
     Ok(Some(out))
@@ -483,6 +540,11 @@ pub struct Mirror<'a> {
     /// in which another process can change a row the pass is holding.
     #[cfg(test)]
     after_snapshot: std::cell::RefCell<Option<Box<dyn Fn() + 'a>>>,
+    /// Runs in `try_sync_file` right after the source is first opened, before
+    /// any lock: the window in which the source can be replaced and another
+    /// process can mirror the replacement.
+    #[cfg(test)]
+    after_source_open: std::cell::RefCell<Option<Box<dyn Fn() + 'a>>>,
 }
 
 impl<'a> Mirror<'a> {
@@ -495,6 +557,8 @@ impl<'a> Mirror<'a> {
             seal_after: seal_after_from_env(),
             #[cfg(test)]
             after_snapshot: std::cell::RefCell::new(None),
+            #[cfg(test)]
+            after_source_open: std::cell::RefCell::new(None),
         }
     }
 
@@ -617,6 +681,10 @@ impl<'a> Mirror<'a> {
             }
             Err(error) => return Err(error.into()),
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_source_open.borrow().as_ref() {
+            hook();
+        }
         let size = source_file.metadata()?.len();
         // The common call: nothing new since the last pass. One stat of the
         // source and of the mirror file, a 4 KB read, one lookup.
@@ -659,7 +727,18 @@ impl<'a> Mirror<'a> {
             return Ok(SyncOutcome::Busy);
         };
 
-        // Everything below sees a stable mirror file and state row.
+        // Everything below sees a stable mirror file and state row. The
+        // descriptor from before the locks may point at a source that was
+        // replaced while this call waited, and another process may have
+        // mirrored the replacement: compare the state row against what the
+        // path holds now, not against the old inode.
+        let mut source_file = match File::open(source) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SyncOutcome::SourceGone)
+            }
+            Err(error) => return Err(error.into()),
+        };
         let size = source_file.metadata()?.len();
         let had_row = self
             .storage
@@ -1763,6 +1842,69 @@ mod tests {
     }
 
     #[test]
+    fn a_source_replaced_while_waiting_for_the_locks_does_not_clobber_the_newer_mirror() {
+        let rig = Rig::new();
+        let src = rig.source("swap.jsonl");
+        let rel = "-tmp-proj/swap.jsonl";
+        append(&src, line(1, "old one").as_bytes());
+        rig.mirror().sync_file(&src);
+        append(&src, line(2, "old two").as_bytes());
+
+        // This call opens the old inode. Before it takes any lock, the source is
+        // replaced and another process mirrors the replacement.
+        let replacement = format!(
+            "{}{}{}",
+            line(7, "new seven"),
+            line(8, "new eight"),
+            line(9, "new nine")
+        );
+        let mirror = rig.mirror();
+        {
+            let src = src.clone();
+            let replacement = replacement.clone();
+            let rig = &rig;
+            mirror.after_source_open.replace(Some(Box::new(move || {
+                let staged = src.with_extension("new");
+                fs::write(&staged, &replacement).unwrap();
+                fs::rename(&staged, &src).unwrap();
+                assert!(matches!(
+                    rig.mirror().sync_file(&src),
+                    SyncOutcome::Rewritten { .. }
+                ));
+            })));
+        }
+        mirror.sync_file(&src);
+        // The replacement is later deleted: the mirror is its only copy.
+        fs::remove_file(&src).unwrap();
+
+        assert_eq!(rig.decoded("swap.jsonl"), replacement.as_bytes());
+        let row = rig.storage.mirror_row(rel).unwrap().unwrap();
+        assert_eq!(row.source_bytes, replacement.len() as u64);
+    }
+
+    #[test]
+    fn a_renamed_key_never_lands_on_a_key_that_was_already_there() {
+        let rig = Rig::new();
+        let src = rig.source("collide.jsonl");
+        let aws = format!("AKIA{}", "B".repeat(16));
+        let marker = "[secret redacted: aws_access_key]";
+        let text = format!(
+            "{{\"input\":{{\"{aws}\":\"credential\",\"{marker}\":\"existing\",\"z\":1}},\"other\":{{\"{aws}\":\"alone\"}}}}\n"
+        );
+        fs::write(&src, &text).unwrap();
+        rig.mirror().sync_file(&src);
+        let decoded = String::from_utf8(rig.decoded("collide.jsonl")).unwrap();
+        assert!(!decoded.contains("AKIA"), "{decoded}");
+        let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        let input = value["input"].as_object().unwrap();
+        assert_eq!(input.len(), 3, "{decoded}");
+        assert_eq!(input[marker], "existing");
+        assert!(input.values().any(|v| v == "credential"));
+        // A different object is its own namespace: no suffix needed there.
+        assert_eq!(value["other"][marker], "alone");
+    }
+
+    #[test]
     fn purge_waits_for_a_running_sync_and_a_sync_waits_for_purge() {
         let rig = Rig::new();
         let src = rig.source("lk.jsonl");
@@ -2083,6 +2225,187 @@ mod tests {
         filetime_touch(&src);
         engine.import_file(&src, "proj").await.unwrap();
         assert_eq!(chunks_like(&engine, "freshly appended charlie"), 1);
+    }
+
+    /// A conversation stored by a build without the scrubber, so the next import
+    /// with the scrub on takes the rebuild path. Returns the conversation id.
+    async fn legacy_conversation(engine: &crate::engine::Engine, src: &Path) -> String {
+        let pem = format!(
+            "{}{}\n{}\n{}{}",
+            "-----BEGIN RSA PRIV",
+            "ATE KEY-----",
+            "Zm9vYmFy".repeat(200),
+            "-----END RSA PRIV",
+            "ATE KEY-----"
+        );
+        let _off = crate::redact::DisabledForTest::set(true);
+        let mut body = String::new();
+        for n in 0..4 {
+            body.push_str(&session_message(n, &format!("dump {n}\n{pem}\nend {n}")));
+        }
+        fs::write(src, body).unwrap();
+        assert!(engine.import_file(src, "proj").await.unwrap() >= 4);
+        assert!(chunks_like(engine, "Zm9vYmFy") >= 4);
+        src.file_stem().unwrap().to_string_lossy().to_string()
+    }
+
+    fn session_message(n: usize, text: &str) -> String {
+        serde_json::json!({
+            "type": "user", "uuid": format!("r-{n}"),
+            "timestamp": format!("2026-10-14T10:00:{n:02}Z"),
+            "message": {"content": text}
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_that_lost_the_race_leaves_the_newer_import_alone() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-race.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+
+        // While this import embeds its replacement, another import adds a chunk
+        // and checkpoints the conversation.
+        {
+            let storage = engine.storage().clone();
+            let conv = conv.clone();
+            *engine.before_rebuild_swap.lock().unwrap() = Some(Box::new(move || {
+                storage
+                    .with_connection(|conn| {
+                        conn.execute(
+                            "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                             VALUES ('newer-tail', ?1, 'proj', '2026-10-14T11:00:00Z', 'the newer import', 1)",
+                            [&conv],
+                        )?;
+                        conn.execute(
+                            "UPDATE import_state SET chunks_imported = chunks_imported + 1, file_mtime = 'newer'",
+                            [],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+        }
+        filetime_touch(&src);
+        assert_eq!(engine.import_file(&src, "proj").await.unwrap(), 0);
+
+        // Nothing was replaced and the checkpoint is the newer import's.
+        assert_eq!(chunks_like(&engine, "the newer import"), 1);
+        assert!(chunks_like(&engine, "Zm9vYmFy") >= 4);
+        let mtime: String = engine
+            .storage()
+            .with_connection(|conn| {
+                Ok(conn.query_row("SELECT file_mtime FROM import_state", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert_eq!(mtime, "newer");
+
+        // The next import, with nobody racing, completes the rebuild.
+        *engine.before_rebuild_swap.lock().unwrap() = None;
+        engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM chunks WHERE id = 'newer-tail'", [])?;
+                conn.execute(
+                    "UPDATE import_state SET chunks_imported = chunks_imported - 1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        filetime_touch(&src);
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        assert_eq!(chunks_like(&engine, "Zm9vYmFy"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_checkpoints_the_revision_it_parsed_not_the_files_mtime_now() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-grow.jsonl");
+        legacy_conversation(&engine, &src).await;
+
+        // The transcript grows after the rebuild parsed it, before it checkpoints.
+        {
+            let src = src.clone();
+            *engine.before_rebuild_swap.lock().unwrap() = Some(Box::new(move || {
+                // Long enough to open a chunk of its own (see the drift test).
+                let long = format!("grown while rebuilding {}", "lorem ipsum ".repeat(120));
+                append(&src, session_message(20, &long).as_bytes());
+                filetime_touch(&src);
+            }));
+        }
+        filetime_touch(&src);
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        *engine.before_rebuild_swap.lock().unwrap() = None;
+
+        // The checkpoint must not claim the grown file as imported.
+        engine.import_file(&src, "proj").await.unwrap();
+        assert_eq!(chunks_like(&engine, "grown while rebuilding"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_drops_witness_bindings_of_the_chunk_ids_it_reuses() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-wit.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+
+        let (bound, other_bound) = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO witness_ledger (project, file, symbol, stamp, tier, source_kind)
+                     VALUES ('proj', '/repo/a.rs', 'foo', 'b3:1', 'committed', 'test')",
+                    [],
+                )?;
+                let witness: i64 =
+                    conn.query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))?;
+                let chunk: String = conn.query_row(
+                    "SELECT id FROM chunks WHERE conversation_id = ?1 ORDER BY id LIMIT 1",
+                    [&conv],
+                    |r| r.get(0),
+                )?;
+                conn.execute(
+                    "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('elsewhere-0', 'other-conv', 'proj', '2026-10-14T11:00:00Z', 'unrelated', 1)",
+                    [],
+                )?;
+                for chunk_id in [chunk.as_str(), "elsewhere-0"] {
+                    conn.execute(
+                        "INSERT INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, ?2)",
+                        rusqlite::params![witness, chunk_id],
+                    )?;
+                }
+                Ok((chunk, "elsewhere-0".to_string()))
+            })
+            .unwrap();
+
+        filetime_touch(&src);
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+
+        let (bindings, ledger): (Vec<String>, i64) = engine
+            .storage()
+            .with_connection(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT chunk_id FROM witness_chunk_bindings ORDER BY chunk_id")?;
+                let ids = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let ledger =
+                    conn.query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))?;
+                Ok((ids, ledger))
+            })
+            .unwrap();
+        assert!(!bindings.contains(&bound), "{bindings:?}");
+        assert_eq!(
+            bindings,
+            vec![other_bound],
+            "other conversations keep theirs"
+        );
+        assert_eq!(ledger, 1, "the witness ledger is append-only and stays");
     }
 
     /// The import-state check compares mtimes; make sure an append inside the
