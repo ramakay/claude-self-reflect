@@ -1,13 +1,18 @@
 //! Emitter contamination canary: every output CSR's own formatters can write
-//! must be removed whole by the ownership-aware remover, and every way of
-//! merely mentioning that output must come back byte for byte.
+//! must be detected by the registry's grammars, and every way of merely
+//! mentioning that output (a fence, a quote, a grep line, an assertion, an
+//! analysis) must not be.
 //!
 //! The engine outputs below are produced by calling the production formatter
 //! functions (or, for the two memory-feedback shapes that have no formatter in
 //! this tree, their registered header constants). Nothing here copies an output
 //! string, so a formatter that changes its wording turns the canary red until
-//! the registry's grammar follows. Plugin grammars appear as synthetic cases
-//! only; the generated plugin artifact is a later phase.
+//! the registry's grammar follows. The companion's sends come from
+//! `plugins/csr-companion/tests/export-emissions.py`, which calls the pane's
+//! own formatters; the plugin's TypeScript emitters appear as synthetic cases.
+//!
+//! A detected hit is a label, never an edit: every row in `cases.jsonl` expects
+//! the input back byte for byte, with the reason the detector gives it.
 //!
 //! `cases.jsonl` is the checked-in fixture: the hand-written cases first, then
 //! the materialised matrix (`matrix-*` rows), regenerated from this module by
@@ -21,9 +26,8 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 
 use super::EvalResult;
-use crate::import::contamination::{
-    remove_csr_emissions, ContaminationReason, ContentChannel, OwnedText, SourceKind, REGISTRY,
-};
+use crate::import::contamination::{detect, labelable, ContaminationReason, REGISTRY};
+use crate::provenance::Speaker;
 
 const CASES_JSONL: &str = include_str!("../../tests/fixtures/contamination/cases.jsonl");
 
@@ -56,31 +60,41 @@ pub fn cases() -> Vec<Case> {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CaseReport {
     pub total: usize,
-    /// Rows whose `reason` is set: something must be removed.
-    pub removal_rows: usize,
-    /// Rows whose `reason` is null: every byte must be kept.
-    pub kept_rows: usize,
+    /// Rows whose `reason` is set: the detector must label them.
+    pub labeled_rows: usize,
+    /// Rows whose `reason` is null: no hit.
+    pub unlabeled_rows: usize,
     pub passed: usize,
     pub failures: Vec<String>,
 }
 
-/// Run one fixture row; `Err` names how it failed.
-pub fn run_case(case: &Case) -> std::result::Result<(), String> {
-    let Some(channel) = ContentChannel::from_name(&case.channel) else {
-        return Err(format!("{}: unknown channel {}", case.id, case.channel));
+/// Whether a row's (source, channel) is one a chunk can carry CSR text in.
+/// Only user and assistant text of a Claude transcript is; a tool result, a
+/// Codex rollout, a plan, a CSR tool block or an unknown channel is a mention.
+fn row_is_labelable(case: &Case) -> bool {
+    let author = match case.channel.as_str() {
+        "user_text" => Speaker::User,
+        "assistant_text" => Speaker::Assistant,
+        "non_csr_tool_result" => Speaker::ToolResult,
+        _ => return false,
     };
-    let removal = remove_csr_emissions(OwnedText {
-        source: SourceKind::from_chunk_source(Some(&case.source)),
-        channel,
-        text: &case.input,
-    });
-    let reason = removal.removed.first().map(|span| span.reason);
-    if removal.kept != case.expected {
+    labelable(Some(&case.source), Some(author))
+}
+
+/// Run one fixture row; `Err` names how it failed. A detection never edits, so
+/// the row's `expected` is the input itself.
+pub fn run_case(case: &Case) -> std::result::Result<(), String> {
+    if case.expected != case.input {
         return Err(format!(
-            "{}: kept {:?}, expected {:?}",
-            case.id, removal.kept, case.expected
+            "{}: a detection keeps the text, expected differs",
+            case.id
         ));
     }
+    let reason = if row_is_labelable(case) {
+        detect(&case.input).first().map(|hit| hit.reason)
+    } else {
+        None
+    };
     if reason != case.reason {
         return Err(format!(
             "{}: reason {:?}, expected {:?}",
@@ -95,9 +109,9 @@ pub fn run_cases() -> CaseReport {
     for case in cases() {
         report.total += 1;
         if case.reason.is_some() {
-            report.removal_rows += 1;
+            report.labeled_rows += 1;
         } else {
-            report.kept_rows += 1;
+            report.unlabeled_rows += 1;
         }
         match run_case(&case) {
             Ok(()) => report.passed += 1,
@@ -119,7 +133,7 @@ pub struct Output {
     pub formatter: &'static str,
     pub reason: ContaminationReason,
     pub text: String,
-    /// Whether an assistant relaying the whole output is removable too.
+    /// Whether an assistant relaying the whole output is labeled too.
     pub assistant_relay: bool,
     /// What prose in front of the output does to it.
     pub mixed: Mixed,
@@ -127,13 +141,12 @@ pub struct Output {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mixed {
-    /// The output is cut out; the words around it stay.
-    Removed,
+    /// The output is found with prose in front of and behind it.
+    Detected,
     /// The formatter owns a component only from its first bytes (the
     /// memory-feedback report): behind prose it is a mention.
     Kept,
-    /// The output has no end of its own to cut at (a briefing's last paragraph
-    /// ends where the component does), so there is no mixed form to state.
+    /// There is no mixed form to state.
     Skipped,
 }
 
@@ -144,7 +157,7 @@ fn output(id: &str, formatter: &'static str, reason: ContaminationReason, text: 
         reason,
         text,
         assistant_relay: true,
-        mixed: Mixed::Removed,
+        mixed: Mixed::Detected,
     }
 }
 
@@ -622,11 +635,10 @@ pub fn engine_outputs() -> Vec<Output> {
             prompt_submit::emit_pickup(&mut pickup, &plain, age, "continue");
             pickup
         }),
-        (
-            "wrapped-injection",
-            formatter::format_with_budget(&everything, 2000),
-        ),
     ] {
+        // Only a wrapper that opens with a CSR header is the importer's cut; an
+        // envelope around a bare injection section is the section's, and its
+        // raw form is already an output above.
         let mut wrapped = output(
             id,
             "system_reminder",
@@ -687,19 +699,25 @@ fn pane_formatter(reason: ContaminationReason) -> &'static str {
     }
 }
 
+/// Pane sends the detector leaves unlabeled on purpose, because their text
+/// reads like a person's sentence: the plain-line recap fallback, and a
+/// standing rule whose date field fell back to a free-text slice.
+pub const PANE_SENDS_READ_AS_PROSE: [&str; 2] = ["default-recap-plain-told-0", "main-rules-6"];
+
 /// Every send the pane's real formatters produced for the fixture's invented
 /// inputs, as canary outputs.
 pub fn pane_outputs() -> Vec<Output> {
     pane_document()
         .cases
         .into_iter()
+        .filter(|case| !PANE_SENDS_READ_AS_PROSE.contains(&case.id.as_str()))
         .map(|case| Output {
             id: format!("pane-{}", case.id),
             formatter: pane_formatter(case.reason),
             reason: case.reason,
             text: case.text,
             assistant_relay: true,
-            mixed: Mixed::Removed,
+            mixed: Mixed::Detected,
         })
         .collect()
 }
@@ -849,101 +867,71 @@ pub fn protected_forms(output: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn row(
-    id: String,
-    source: &str,
-    channel: &str,
-    input: String,
-    expected: String,
-    reason: Option<ContaminationReason>,
-) -> Case {
-    Case {
-        id,
-        source: source.to_string(),
-        channel: channel.to_string(),
-        input,
-        expected,
-        reason,
-    }
-}
-
-/// The matrix rows for `outputs`, in fixture order.
+/// The matrix rows for `outputs`, in fixture order. A detection keeps the
+/// text, so every row expects its input back.
 pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
     let mut rows = Vec::new();
+    let mut push =
+        |id: String, channel: &str, input: String, reason: Option<ContaminationReason>| {
+            rows.push(Case {
+                id,
+                source: "conversation".to_string(),
+                channel: channel.to_string(),
+                expected: input.clone(),
+                input,
+                reason,
+            });
+        };
     for output in outputs {
         let id = format!("{MATRIX_PREFIX}{}", output.id);
         let text = &output.text;
-        rows.push(row(
+        push(
             format!("{id}-raw"),
-            "conversation",
             "user_text",
             text.clone(),
-            String::new(),
             Some(output.reason),
-        ));
+        );
         for (form, input) in protected_forms(text) {
-            rows.push(row(
-                format!("{id}-{form}"),
-                "conversation",
-                "user_text",
-                input.clone(),
-                input,
-                None,
-            ));
+            push(format!("{id}-{form}"), "user_text", input, None);
         }
         // The text's own line ending closes it; a text that has none gets one.
         let line_end = if text.ends_with('\n') { "" } else { "\n" };
         let mixed = format!("Please look at this.\n\n{text}{line_end}Now answer.");
         match output.mixed {
-            Mixed::Removed => rows.push(row(
+            Mixed::Detected => push(
                 format!("{id}-mixed"),
-                "conversation",
                 "user_text",
                 mixed,
-                "Please look at this.\n\nNow answer.".to_string(),
                 Some(output.reason),
-            )),
-            Mixed::Kept => rows.push(row(
-                format!("{id}-mixed"),
-                "conversation",
-                "user_text",
-                mixed.clone(),
-                mixed,
-                None,
-            )),
+            ),
+            Mixed::Kept => push(format!("{id}-mixed"), "user_text", mixed, None),
             Mixed::Skipped => {}
         }
         if output.assistant_relay {
-            rows.push(row(
+            push(
                 format!("{id}-assistant-relay"),
-                "conversation",
                 "assistant_text",
                 text.clone(),
-                String::new(),
                 Some(output.reason),
-            ));
+            );
         }
         let analysis = protected_forms(text)
             .into_iter()
             .find(|(form, _)| *form == "analysis")
             .expect("analysis form")
             .1;
-        rows.push(row(
+        push(
             format!("{id}-assistant-analysis"),
-            "conversation",
             "assistant_text",
-            analysis.clone(),
             analysis,
             None,
-        ));
-        rows.push(row(
+        );
+        push(
             format!("{id}-non-csr-tool"),
-            "conversation",
             "non_csr_tool_result",
             text.clone(),
-            text.clone(),
             None,
-        ));
+        );
     }
     rows
 }
@@ -980,50 +968,38 @@ pub fn render_fixture() -> String {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CanaryReport {
-    /// Real engine outputs produced and tried raw.
+    /// Real formatter outputs produced and tried raw.
     pub generated: usize,
-    pub correctly_removed: usize,
+    pub correctly_detected: usize,
     /// Mention forms tried over those outputs.
     pub protected: usize,
-    pub correctly_kept: usize,
+    pub correctly_unlabeled: usize,
     pub failures: Vec<String>,
 }
 
 pub fn run_canary() -> CanaryReport {
     let mut report = CanaryReport::default();
-    let removes = |text: &str, channel: ContentChannel| {
-        let removal = remove_csr_emissions(OwnedText {
-            source: SourceKind::Conversation,
-            channel,
-            text,
-        });
-        (removal.kept.is_empty() && !removal.removed.is_empty())
-            .then(|| removal.removed.first().map(|span| span.reason))
-            .flatten()
-    };
     for output in engine_outputs().into_iter().chain(pane_outputs()) {
         report.generated += 1;
-        match removes(&output.text, ContentChannel::UserText) {
-            Some(reason) if reason == output.reason => report.correctly_removed += 1,
+        match detect(&output.text).first() {
+            Some(hit) if hit.reason == output.reason && hit.start_byte == 0 => {
+                report.correctly_detected += 1
+            }
             other => report.failures.push(format!(
-                "{}: raw output not removed whole (got {:?}, wanted {:?})",
-                output.id, other, output.reason
+                "{}: raw output not detected (got {:?}, wanted {:?})",
+                output.id,
+                other.map(|hit| hit.reason),
+                output.reason
             )),
         }
         for (form, input) in protected_forms(&output.text) {
             report.protected += 1;
-            let kept = remove_csr_emissions(OwnedText {
-                source: SourceKind::Conversation,
-                channel: ContentChannel::UserText,
-                text: &input,
-            });
-            if kept.kept == input && kept.removed.is_empty() {
-                report.correctly_kept += 1;
-            } else {
-                report.failures.push(format!(
-                    "{}: `{form}` mention was altered: {:?}",
-                    output.id, kept.kept
-                ));
+            match detect(&input).first() {
+                None => report.correctly_unlabeled += 1,
+                Some(hit) => report.failures.push(format!(
+                    "{}: `{form}` mention was labeled {:?}",
+                    output.id, hit.reason
+                )),
             }
         }
     }
@@ -1051,7 +1027,7 @@ pub fn run_canary() -> CanaryReport {
         .collect();
     if stored != expected_matrix() {
         report.failures.push(
-            "cases.jsonl matrix rows differ from the current formatters; run `cargo test regenerate_fixture_matrix -- --ignored`"
+            "cases.jsonl matrix rows differ from the current formatters; run `cargo test --lib regenerate_fixture_matrix -- --ignored`"
                 .to_string(),
         );
     }
@@ -1072,27 +1048,25 @@ pub fn require_green() -> Result<()> {
     )
 }
 
-/// The ownership census over the database being evaluated: the three bins of
-/// one population, the same classifier the status badge and scrub use. It
-/// reports; it never fails the run (unjudged text is kept, not an error).
+/// The census over the database being evaluated: the conversations and chunks
+/// the detector labels, out of all conversations. The same detector the search
+/// annotation and the status line use. It reports; it never fails the run (CSR
+/// text in the record is kept and labeled, not an error).
 pub fn census_result(storage: &crate::storage::Storage) -> EvalResult {
     let start = Instant::now();
     let duration = |start: Instant| start.elapsed().as_secs_f64() * 1000.0;
     match storage.contamination_census() {
-        Ok(census) => {
-            let proven = census.proven.len();
-            let unjudged = census.unjudged.len();
-            let total = census.total_conversations;
-            EvalResult::pass(
-                "Contamination Census",
-                "contamination",
-                duration(start),
-                format!(
-                    "proven {proven} / unjudged {unjudged} / clean {} of {total} conversations",
-                    total.saturating_sub(proven + unjudged)
-                ),
-            )
-        }
+        Ok(census) => EvalResult::pass(
+            "Contamination Census",
+            "contamination",
+            duration(start),
+            format!(
+                "{} CSR-text chunks labeled in {} of {} conversations",
+                census.chunks,
+                census.conversations.len(),
+                census.total_conversations
+            ),
+        ),
         Err(error) => EvalResult::fail(
             "Contamination Census",
             "contamination",
@@ -1107,15 +1081,15 @@ pub fn emitter_canary() -> EvalResult {
     let report = run_canary();
     let cases = run_cases();
     let detail = format!(
-        "generated {} / removed {} / protected {} / kept {}; cases.jsonl {}/{} ({} removal, {} keep)",
+        "generated {} / detected {} / protected {} / unlabeled {}; cases.jsonl {}/{} ({} labeled, {} unlabeled)",
         report.generated,
-        report.correctly_removed,
+        report.correctly_detected,
         report.protected,
-        report.correctly_kept,
+        report.correctly_unlabeled,
         cases.passed,
         cases.total,
-        cases.removal_rows,
-        cases.kept_rows
+        cases.labeled_rows,
+        cases.unlabeled_rows
     );
     let duration = start.elapsed().as_secs_f64() * 1000.0;
     if report.failures.is_empty() {

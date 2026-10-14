@@ -1,15 +1,13 @@
-//! Component classification cost: 10,000 clean 900-byte components and 10,000
-//! components that carry CSR emissions. Budget: p95 at most 100 µs per
-//! component (`import::contamination::tests::classification_p95_stays_inside_the_budget`
-//! asserts it on every release test run; this reports the distribution).
+//! Detector cost: 10,000 clean 900-byte components and 10,000 components that
+//! carry CSR text. Budget: p95 at most 100 µs per component
+//! (`import::contamination::tests::detection_p95_stays_inside_the_budget`
+//! asserts it on every test run; this reports the distribution).
 
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
 
-use csr_engine::import::contamination::{
-    classify_csr_contamination, ContentChannel, OwnedText, SourceKind,
-};
+use csr_engine::import::contamination::has_csr_text;
 
 const COMPONENTS: usize = 10_000;
 
@@ -29,12 +27,7 @@ fn matching_component() -> String {
 }
 
 fn classify(text: &str) -> bool {
-    classify_csr_contamination(OwnedText {
-        source: SourceKind::Conversation,
-        channel: ContentChannel::UserText,
-        text,
-    })
-    .is_some()
+    has_csr_text(text)
 }
 
 fn bench_classification(c: &mut Criterion) {

@@ -67,6 +67,14 @@
   {
    "chars": 700,
    "cut": true,
+   "id": "default-long-recap-todos-4",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+  },
+  {
+   "chars": 700,
+   "cut": true,
    "id": "default-long-recap-told-0",
    "producer": "page_default:told",
    "reason": "plugin_recap_forward",
@@ -95,6 +103,14 @@
    "producer": "page_default:todos",
    "reason": "plugin_leftover",
    "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "default-long-title-todos-4",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
   },
   {
    "chars": 90,
@@ -129,6 +145,14 @@
    "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
   },
   {
+   "chars": 700,
+   "cut": true,
+   "id": "default-recap-bare-todos-4",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+  },
+  {
    "chars": 90,
    "cut": false,
    "id": "default-recap-bare-told-0",
@@ -161,6 +185,14 @@
    "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
   },
   {
+   "chars": 700,
+   "cut": true,
+   "id": "default-recap-full-todos-4",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+  },
+  {
    "chars": 197,
    "cut": false,
    "id": "default-recap-full-told-0",
@@ -191,6 +223,14 @@
    "producer": "page_default:todos",
    "reason": "plugin_leftover",
    "text": "Left over from session 00000000: “Write “the” report” (in_progress)."
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "default-recap-plain-todos-4",
+   "producer": "page_default:todos",
+   "reason": "plugin_leftover",
+   "text": "Left over from session 00000000: “xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
   },
   {
    "chars": 75,
@@ -417,12 +457,52 @@
    "text": "CSR remembered a past session: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. T…"
   },
   {
+   "chars": 49,
+   "cut": false,
+   "id": "rule-nodate-rules-0",
+   "producer": "page_main:rules",
+   "reason": "plugin_standing_rule",
+   "text": "A standing rule from : “Keep a rule with no date”"
+  },
+  {
    "chars": 700,
    "cut": true,
    "id": "story-long-story-0",
    "producer": "page_main:story",
    "reason": "plugin_session_story",
    "text": "CSR's story of this session, rev 11, quoted: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops …”"
+  },
+  {
+   "chars": 186,
+   "cut": false,
+   "id": "threads-0",
+   "producer": "draw_threads",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Sweep the stale index” went quiet after 07:45. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line."
+  },
+  {
+   "chars": 158,
+   "cut": false,
+   "id": "unfolded-dreams-3",
+   "producer": "page_main:dreams",
+   "reason": "plugin_dream_forward",
+   "text": "CSR's dreamer asked this while you worked, quoted: “What if spans were authoritative?” Its reasoning: “Ownership boundary. It would avoid text-only deletion.”"
+  },
+  {
+   "chars": 700,
+   "cut": true,
+   "id": "unfolded-dreams-4",
+   "producer": "page_main:dreams",
+   "reason": "plugin_dream_forward",
+   "text": "CSR's dreamer asked this while you worked, quoted: “What if we cut the card?” Its reasoning: “Card. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The im…”"
+  },
+  {
+   "chars": 72,
+   "cut": false,
+   "id": "unfolded-remembered-7",
+   "producer": "page_main:remembered",
+   "reason": "plugin_pane_recall",
+   "text": "CSR remembered: “Use **component** ownership” (3 days ago · csr-engine)."
   }
  ],
  "generator": "plugins/csr-companion/tests/export-emissions.py",

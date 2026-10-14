@@ -1,28 +1,27 @@
-//! Ownership-aware CSR contamination: which byte ranges of a piece of text did
-//! CSR's own formatters produce, and where could CSR have put them?
+//! CSR text detector: which byte ranges of a stored text match a registered
+//! CSR formatter's grammar?
 //!
-//! The old predicate asked whether text *mentioned* a CSR marker and dropped
-//! the paragraph or chunk that did. Quoting a marker (code, grep output, an
-//! analysis, a plan) is not emitting one; a measured clone run dropped 552
-//! chunks, at least 322 of them legitimate. This module removes only the spans
-//! a registered formatter grammar accounts for, and only from channels CSR can
-//! write into:
+//! A grammar hit is a **label**, never an edit. A pattern cannot prove who typed
+//! a line: two rounds of grammar fixes kept removing the person's own words, and
+//! the design that could prove authorship (a receipt for every send) is not in
+//! this release. So nothing here removes, rewrites or trims stored user or
+//! assistant text. What the release does with a hit:
 //!
-//! - **Eligible**: Claude user text (every grammar) and assistant text
-//!   (complete blocks that stand alone: set off by blank lines or the
-//!   component's edges, whole lines of their own). Structural channels (CSR
-//!   tool blocks, harness rows) are removed whole by the importer's own
-//!   identity checks.
-//! - **Never touched**: non-CSR tool output, Codex prose, plans, unknown
-//!   sources. Those are mentions by construction.
-//! - **Protected**: fenced blocks, inline code, blockquote lines, indented
-//!   code, and inline candidates glued to a quote or a path prefix. A header
-//!   must also sit at column zero; the exact two-space continuation lines the
-//!   formatters emit belong to the block they continue.
+//! - **search** annotates the chunk `[CSR text]` and, where dream verdicts
+//!   already demote, sinks it the same way (never drops it);
+//! - **hook injection** skips the chunk when choosing context (selection);
+//! - **status** and `eval --full` count the chunks and conversations that hit.
 //!
-//! Retention is byte-exact: no trim, no paragraph splitting, no whole-text
-//! sentinel rejection. A bare `[[CSR:RECAP]]` in prose is prose; it counts only
-//! as the terminal token of a valid recap line.
+//! What stays structural (not grammar, not here): CSR's own MCP tool calls and
+//! results are suppressed by tool name, CSR's own narrator and subprocess
+//! transcripts are skipped by their first prompt, and a complete hook-labelled
+//! `<system-reminder>` wrapper is cut by the importer exactly as before.
+//!
+//! The detector is linear in the text: one pass over its lines, each block
+//! grammar bounded by the lines it consumes, the inline forms found by regexes
+//! that the regex engine runs in linear time. It reports what it finds and
+//! protects what is plainly a mention: fenced blocks, inline code, blockquote
+//! lines, indented code, strings, and anything not at column zero.
 
 use std::sync::LazyLock;
 
@@ -30,106 +29,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::extraction::provenance::{DREAM_SENTINEL, LESSONS_SENTINEL, RECAP_SENTINEL};
-use crate::provenance::{ChunkSpan, ProvenanceEvent, Speaker};
 
 // ---------------------------------------------------------------------------
-// Public types
+// Public API
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceKind {
-    Conversation,
-    Sidechain,
-    CodexRollout,
-    Plan,
-    Unknown,
-}
-
-impl SourceKind {
-    /// The `chunks.source` column. A missing or unrecognised value is
-    /// `Unknown`, never `Conversation`.
-    pub fn from_chunk_source(source: Option<&str>) -> Self {
-        match source {
-            Some("conversation") => Self::Conversation,
-            Some("sidechain") => Self::Sidechain,
-            Some("codex_rollout") => Self::CodexRollout,
-            Some("plan") => Self::Plan,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Conversation => "conversation",
-            Self::Sidechain => "sidechain",
-            Self::CodexRollout => "codex_rollout",
-            Self::Plan => "plan",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    fn is_claude_transcript(self) -> bool {
-        matches!(self, Self::Conversation | Self::Sidechain)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentChannel {
-    UserText,
-    AssistantText,
-    CsrToolUse,
-    CsrToolResult,
-    NonCsrToolResult,
-    HarnessRow,
-    CodexUser,
-    CodexAssistant,
-    CodexTool,
-    PlanFile,
-    Unknown,
-}
-
-impl ContentChannel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::UserText => "user_text",
-            Self::AssistantText => "assistant_text",
-            Self::CsrToolUse => "csr_tool_use",
-            Self::CsrToolResult => "csr_tool_result",
-            Self::NonCsrToolResult => "non_csr_tool_result",
-            Self::HarnessRow => "harness_row",
-            Self::CodexUser => "codex_user",
-            Self::CodexAssistant => "codex_assistant",
-            Self::CodexTool => "codex_tool",
-            Self::PlanFile => "plan_file",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        [
-            Self::UserText,
-            Self::AssistantText,
-            Self::CsrToolUse,
-            Self::CsrToolResult,
-            Self::NonCsrToolResult,
-            Self::HarnessRow,
-            Self::CodexUser,
-            Self::CodexAssistant,
-            Self::CodexTool,
-            Self::PlanFile,
-            Self::Unknown,
-        ]
-        .into_iter()
-        .find(|channel| channel.as_str() == name)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct OwnedText<'a> {
-    pub source: SourceKind,
-    pub channel: ContentChannel,
-    pub text: &'a str,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -215,169 +118,93 @@ impl ContaminationReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemovedSpan {
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub reason: ContaminationReason,
+/// `text` without its complete hook-labelled `<system-reminder>` wrappers (the
+/// ones whose payload opens with one of CSR's headers), counting them. This is
+/// the importer's structural cut, kept exactly: it never reads a grammar of
+/// the person's or Claude's own prose.
+pub fn remove_hook_wrappers(text: &str, count: &mut usize) -> String {
+    *count += WRAPPER_RE.find_iter(text).count();
+    WRAPPER_RE.replace_all(text, "").to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removal {
-    pub kept: String,
-    pub removed: Vec<RemovedSpan>,
-}
-
-/// The reason of the first removed span; `None` when nothing is removable.
-pub fn classify_csr_contamination(input: OwnedText<'_>) -> Option<ContaminationReason> {
-    remove_csr_emissions(input)
-        .removed
-        .first()
-        .map(|span| span.reason)
-}
-
-/// Remove the byte ranges CSR's formatters produced. Everything else is kept
-/// exactly, byte for byte.
-pub fn remove_csr_emissions(input: OwnedText<'_>) -> Removal {
-    let spans = removal_spans(input);
-    let mut kept = String::with_capacity(input.text.len());
-    let mut cursor = 0;
-    for span in &spans {
-        kept.push_str(&input.text[cursor..span.start_byte]);
-        cursor = span.end_byte;
+/// `text` with every detected range dropped. For derived artifacts only (a
+/// summary must not learn CSR's own words); the stored conversation is never
+/// passed through this.
+pub fn strip_hits(text: &str) -> String {
+    let hits = detect(text);
+    if hits.is_empty() {
+        return text.to_string();
     }
-    kept.push_str(&input.text[cursor..]);
-    Removal {
-        kept,
-        removed: spans,
-    }
-}
-
-/// Whether `text` could contain anything the matcher would remove: the cheap
-/// prefilter every classification starts with.
-pub fn could_contain_emission(text: &str) -> bool {
-    TRIGGER_RE.is_match(text)
-}
-
-/// The reason the matcher would remove something from `text` if it were Claude
-/// user text. Used to count stored chunks that look like CSR output but whose
-/// author cannot be proven: they are kept, never mutated.
-pub fn classify_as_user_text(text: &str) -> Option<ContaminationReason> {
-    classify_csr_contamination(OwnedText {
-        source: SourceKind::Conversation,
-        channel: ContentChannel::UserText,
-        text,
-    })
-}
-
-/// `text` with only CSR's hook wrappers removed (every other emission stays).
-/// For reading a transcript's opening prompt, where a prompt behind a wrapper
-/// must still lead but a sentinel-led narrator prompt must stay recognisable.
-pub fn without_hook_wrappers(text: &str) -> String {
-    let removal = remove_csr_emissions(OwnedText {
-        source: SourceKind::Conversation,
-        channel: ContentChannel::UserText,
-        text,
-    });
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    for span in removal
-        .removed
-        .iter()
-        .filter(|span| span.reason == ContaminationReason::SystemReminder)
-    {
-        out.push_str(&text[cursor..span.start_byte]);
-        cursor = span.end_byte;
+    for hit in hits {
+        out.push_str(&text[cursor..hit.start_byte]);
+        cursor = hit.end_byte;
     }
     out.push_str(&text[cursor..]);
     out
 }
 
-// ---------------------------------------------------------------------------
-// Stored-chunk ownership proof
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-pub struct StoredChunkEvidence<'a> {
-    pub chunk_id: &'a str,
-    pub conversation_id: &'a str,
-    pub source: Option<&'a str>,
-    pub content: &'a str,
-    pub aggregate_author: Option<Speaker>,
-    pub spans: &'a [ChunkSpan],
-    pub events: &'a [ProvenanceEvent],
+/// One place a text matches a registered CSR formatter's grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    /// The registry formatter id.
+    pub formatter: &'static str,
+    pub reason: ContaminationReason,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoredOwnership {
-    Proven(ContentChannel),
-    Unproven(&'static str),
+/// Every place `text` matches a registered CSR grammar, in order, without
+/// overlap. Reports only: the text is not touched.
+pub fn detect(text: &str) -> Vec<Hit> {
+    if !TRIGGER_RE.is_match(text) {
+        return Vec::new();
+    }
+    scan(text)
 }
 
-/// A source-gone stored chunk is attributable only when one event owns every
-/// byte of it. `chunk_provenance.author` alone is never proof: it is the
-/// highest-authority aggregate over the chunk, not byte ownership.
-pub fn prove_stored_ownership(evidence: StoredChunkEvidence<'_>) -> StoredOwnership {
-    if !matches!(evidence.source, Some("conversation" | "sidechain")) {
-        return StoredOwnership::Unproven("source is not an explicit Claude transcript");
-    }
-    let [span] = evidence.spans else {
-        return StoredOwnership::Unproven("chunk does not carry exactly one span");
-    };
-    let [event] = evidence.events else {
-        return StoredOwnership::Unproven("chunk does not carry exactly one event");
-    };
-    if span.chunk_id != evidence.chunk_id || span.event_id != event.event_id {
-        return StoredOwnership::Unproven("span does not name the event");
-    }
-    if event.conversation_id != evidence.conversation_id {
-        return StoredOwnership::Unproven("event belongs to another conversation");
-    }
-    let channel = match event.channel.as_str() {
-        "user_message" => ContentChannel::UserText,
-        "assistant_message" => ContentChannel::AssistantText,
-        _ => return StoredOwnership::Unproven("event channel is not user or assistant text"),
-    };
-    // The chunker trims a chunk's edges, and a long component is split. A
-    // slice that starts past its component's first byte has lost the context
-    // that decides whether it was code, a quote or a fence: its hash proves
-    // the bytes are the event's, not that they were an emission.
-    if span.start_char != 0 {
-        return StoredOwnership::Unproven("chunk does not start at its component's first byte");
-    }
-    if span.end_char < span.start_char
-        || span.end_char - span.start_char != evidence.content.chars().count()
-    {
-        return StoredOwnership::Unproven("span does not cover the whole chunk");
-    }
-    if span.content_hash != crate::provenance::content_hash(evidence.content) {
-        return StoredOwnership::Unproven("span hash does not match the stored content");
-    }
-    let compatible = matches!(
-        (evidence.aggregate_author, channel),
-        (None, _)
-            | (Some(Speaker::User), ContentChannel::UserText)
-            | (Some(Speaker::Assistant), ContentChannel::AssistantText)
-    );
-    if !compatible {
-        return StoredOwnership::Unproven("chunk author contradicts the event channel");
-    }
-    StoredOwnership::Proven(channel)
+/// The reason of the first hit, if there is one.
+pub fn first_reason(text: &str) -> Option<ContaminationReason> {
+    detect(text).first().map(|hit| hit.reason)
 }
 
-/// The shared stored-chunk classifier behind both the status count and scrub:
-/// a reason only when ownership is proven and the matcher finds a span.
-pub fn classify_stored_chunk(evidence: StoredChunkEvidence<'_>) -> Option<ContaminationReason> {
-    let source = SourceKind::from_chunk_source(evidence.source);
-    let content = evidence.content;
-    match prove_stored_ownership(evidence) {
-        StoredOwnership::Proven(channel) => classify_csr_contamination(OwnedText {
-            source,
-            channel,
-            text: content,
-        }),
-        StoredOwnership::Unproven(_) => None,
+/// Whether `text` holds any CSR text.
+pub fn has_csr_text(text: &str) -> bool {
+    !detect(text).is_empty()
+}
+
+/// Cheap prefilter: a text with none of the formatters' openings cannot hit.
+pub fn could_contain_emission(text: &str) -> bool {
+    TRIGGER_RE.is_match(text)
+}
+
+/// Whether a stored chunk is the kind of text CSR could have put in a
+/// conversation: a Claude transcript (not a plan, not a Codex rollout) and not
+/// pure tool output. Tool results that quote CSR text are mentions.
+pub fn labelable(source: Option<&str>, author: Option<crate::provenance::Speaker>) -> bool {
+    matches!(source, Some("conversation" | "sidechain"))
+        && matches!(
+            author,
+            None | Some(crate::provenance::Speaker::User | crate::provenance::Speaker::Assistant)
+        )
+}
+
+/// [`labelable`] for a chunk read without its source column: the conversation
+/// id says plan and Codex chunks apart.
+pub fn labelable_chunk(chunk: &crate::import::ConversationChunk) -> bool {
+    !chunk.conversation_id.starts_with("codex:")
+        && !chunk.conversation_id.starts_with("plan:")
+        && chunk.author != crate::provenance::Speaker::ToolResult
+}
+
+/// The first hit in a chunk's text, when the chunk is one that can carry CSR
+/// text. This is the one question search, hooks and status ask.
+pub fn chunk_hit(chunk: &crate::import::ConversationChunk) -> Option<Hit> {
+    if !labelable_chunk(chunk) {
+        return None;
     }
+    detect(&chunk.content).into_iter().next()
 }
 
 // ---------------------------------------------------------------------------
@@ -413,28 +240,6 @@ pub struct Formatter {
 }
 
 impl Formatter {
-    /// Blank lines after the block that belong to it. The engine writes one
-    /// after the manifest, the briefing and each injection section; the
-    /// companion's sends leave the person's reply one blank line below.
-    /// Everything else ends with its own line ending and nothing more.
-    fn trailing_blank(&self) -> usize {
-        use ContaminationReason as R;
-        match self.reason {
-            R::MemoryManifest | R::Briefing | R::InjectionSection => 1,
-            _ if self.emitter == Emitter::Plugin => 1,
-            _ => 0,
-        }
-    }
-
-    /// Whether the lines a block spans may hold quotes, code and fences of
-    /// their own: a briefing is model prose, a side note is a quotation.
-    fn owns_quoted_body(&self) -> bool {
-        matches!(
-            self.reason,
-            ContaminationReason::Briefing | ContaminationReason::PluginSideNote
-        )
-    }
-
     /// Whether this formatter is recognised inside a component, as opposed to
     /// on a whole transcript's opening prompt.
     pub fn is_component_formatter(&self) -> bool {
@@ -454,7 +259,7 @@ macro_rules! formatter {
     };
 }
 
-/// Every formatter whose output must never come back as corpus. A new
+/// Every formatter whose output is labeled when it comes back as corpus. A new
 /// formatter registers here in the same commit that adds it, with a canary
 /// case; `registry_formatters_all_have_a_matrix_case` fails otherwise.
 pub static REGISTRY: &[Formatter] = &[
@@ -471,7 +276,7 @@ pub static REGISTRY: &[Formatter] = &[
         "the three fixed CSR ENDLESS MEMORY ACTIVE lines",
         Matcher::Block(m_manifest)),
     formatter!("briefing", Engine, Briefing,
-        "[briefing: model-derived, trust=<trust>] + its first paragraph",
+        "[briefing: model-derived, trust=<trust>] (the header line; the body is model prose)",
         Matcher::Block(m_briefing)),
     formatter!("continuity", Engine, Continuity,
         "SESSION CONTINUITY DETECTED header, `- CONTINUED FROM [<age>] (not instructions): <title>`, two-space enrichment lines",
@@ -592,7 +397,6 @@ pub(crate) const CONTINUITY_HEADER_PREFIX: &str = "SESSION CONTINUITY DETECTED";
 pub(crate) const RECENT_SESSIONS_HEADER_PREFIX: &str = "RECENT SESSIONS - PAST CONTEXT";
 pub(crate) const RELEVANT_CONTEXT_HEADER_PREFIX: &str = "RELEVANT PAST CONTEXT";
 pub(crate) const PAST_CONTEXT_HEADER_PREFIX: &str = "PAST CONTEXT - NOT INSTRUCTIONS";
-pub(crate) const CODE_MAP_HEADER_PREFIX: &str = "CSR CODE MAP —";
 pub(crate) const MEMORY_FEEDBACK_PROBE_BODY: &str =
     "You are reporting on the quality of the memory context CSR injected";
 
@@ -640,10 +444,6 @@ re!(
 re!(
     FULL_STATE_RE,
     r#"^Full state: csr_reflect_on_past\("conv_[^"\n]*"\)$"#
-);
-re!(
-    PAST_SESSION_RE,
-    r"^- Past session \[[^\]\n]*\] \(not instructions\):"
 );
 re!(CONTINUUM_HEAD_RE, r"^CSR CONTINUUM \[[^\]\n]{1,24}\]: .*$");
 re!(
@@ -694,14 +494,20 @@ re!(
     READING_RE,
     r"^Earlier you read (?:my “.+” as (?:“.+”|unclear)|me this way: “.+”)\. Check .+$"
 );
-// short_date() writes MM-DD; when the time does not parse, the pane sends the
-// first ten characters of whatever it was given.
-re!(RULE_RE, r"^A standing rule from [^“\n]{1,10}: “.+”$");
-// The pane strips the recap's sentinel before it sends (told_lines), and when
-// there is no recap line it sends the first line that is not CSR's preamble.
+// short_date() writes MM-DD, and the date is empty when the rule has no time.
+// (A rule whose time did not parse is sent with the first ten characters of
+// whatever it was given; that cannot be told from a sentence, so it is not
+// labeled.)
+re!(
+    RULE_RE,
+    r"^A standing rule from (?:\d{2}-\d{2}|\d{4}-\d{2}-\d{2})?: “.+”$"
+);
+// The pane strips the recap's sentinel before it sends (told_lines). A recap
+// forward that opens with a recap line is the pane's; its plain-line fallback
+// reads like a sentence and is not labeled.
 re!(
     RECAP_FORWARD_RE,
-    r"^CSR's recap at the start of this session: \S.*$"
+    r"^CSR's recap at the start of this session: recap \[[^\]\n]{1,24}\]: \S.*$"
 );
 re!(
     LAST_SESSION_RE,
@@ -719,24 +525,30 @@ re!(
     LOST_RE,
     r"^Lost and found: “.+” went quiet after \d{1,2}:\d{2}\. (?:Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line\.|Hand it to a background subagent with a five-part spec \(objective, files, interfaces, constraints, verification\), keep working on the current task, and report its result when it lands\.)$"
 );
-re!(
-    HOOK_LABEL_RE,
-    r"^[A-Za-z]+(?::[A-Za-z_-]+)? hook (?:success|additional context): "
-);
 // A send `one_line` cut at its 700-character limit ends in `…` with no
 // closing quote or period. Only the openings of the sends it can cut count, and
 // each send keeps its own opening.
 re!(CUT_RECALL_RE, r"^CSR remembered(?: a past session)?: “");
 re!(CUT_READING_RE, r"^Earlier you read (?:my “|me this way: “)");
-re!(CUT_RULE_RE, r"^A standing rule from [^“\n]{1,10}: “");
+re!(
+    CUT_RULE_RE,
+    r"^A standing rule from (?:\d{2}-\d{2}|\d{4}-\d{2}-\d{2})?: “"
+);
 re!(
     CUT_CODE_SHIFT_RE,
-    r"^Since our past sessions, commit \S{1,40} “"
+    r"^Since our past sessions, commit [0-9a-f]{7,40} “"
 );
 re!(CUT_LAST_SESSION_RE, r"^Last session \S* \(“");
 re!(CUT_LEFTOVER_RE, r"^Left over from session [^\s:]*: “");
 const ONE_LINE_LIMIT: usize = 700;
 re!(HANDED_RE, r"^CSR handed you these this session: .+ · .+$");
+// The hook wrapper the importer has always cut, exactly as it did before the
+// detector: a complete `<system-reminder>` whose payload opens with one of CSR's
+// own headers.
+re!(
+    WRAPPER_RE,
+    r"(?s)<system-reminder>[ \t\r\n]*(?:CSR ENDLESS MEMORY ACTIVE|CSR PICKUP —|EPISODE INDEX —|(?:RELEVANT )?PAST CONTEXT - NOT INSTRUCTIONS).*?</system-reminder>"
+);
 re!(
     SEMANTIC_PICKUP_RE,
     r"^CSR PICKUP — this prompt matches a past episode \(similarity [0-9.]+\); .+$"
@@ -817,16 +629,6 @@ impl<'a> Doc<'a> {
 
     fn is_blank(&self, index: usize) -> bool {
         self.line(index).trim().is_empty()
-    }
-
-    /// `index` moved past at most `most` blank lines.
-    fn skip_blank_up_to(&self, mut index: usize, most: usize) -> usize {
-        let mut skipped = 0;
-        while skipped < most && index < self.len() && self.is_blank(index) {
-            index += 1;
-            skipped += 1;
-        }
-        index
     }
 
     fn line_of(&self, byte: usize) -> usize {
@@ -953,29 +755,10 @@ fn m_manifest(doc: &Doc<'_>, at: usize) -> Option<usize> {
     lines_equal(doc, at, &expected)
 }
 
+/// The briefing's header line. Its body is model prose with no end of its own
+/// (paragraphs, lists, even fences), so the header is the label.
 fn m_briefing(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    if !BRIEFING_HEAD_RE.is_match(doc.line(at)) {
-        return None;
-    }
-    // The body is the briefing's text: model prose, paragraphs, lists, even
-    // fences, and the SessionStart envelope puts the next block right under it.
-    // So it runs to that block. With nothing after it the body cannot be told
-    // from the person's words, and only its first paragraph is the briefing's.
-    if let Some(next) = briefing_next_block(doc, at) {
-        return Some(next);
-    }
-    let mut end = at + 1;
-    while end < doc.len() && !doc.is_blank(end) {
-        end += 1;
-    }
-    (end > at + 1).then_some(end)
-}
-
-/// The first line under a briefing that starts another registered block.
-fn briefing_next_block(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    (at + 1..doc.len()).find(|&line| {
-        line_kind(doc.line(line)) == LineKind::Normal && block_at(doc, line, false).is_some()
-    })
+    BRIEFING_HEAD_RE.is_match(doc.line(at)).then_some(at + 1)
 }
 
 fn m_continuity(doc: &Doc<'_>, at: usize) -> Option<usize> {
@@ -987,27 +770,6 @@ fn m_continuity(doc: &Doc<'_>, at: usize) -> Option<usize> {
     // spaces, then text. Four spaces is code.
     while is_two_space_line(doc.line(end)) {
         end += 1;
-    }
-    // With no episodes to index, the other past sessions follow as bare rows
-    // (no RECENT SESSIONS header), then the cross-project pulse, then the
-    // footer. A pulse row is the engine's only when the footer closes the run.
-    let mut rows = 0;
-    while PAST_SESSION_RE.is_match(doc.line(end)) {
-        end += 1;
-        rows += 1;
-        while is_two_space_line(doc.line(end)) {
-            end += 1;
-        }
-    }
-    if rows > 0 {
-        let mut pulse = end;
-        while doc.line(pulse).starts_with("- ") {
-            pulse += 1;
-        }
-        if pulse > end && m_deeper_context(doc, pulse).is_none() {
-            pulse = end;
-        }
-        end = pulse;
     }
     Some(end)
 }
@@ -1257,56 +1019,12 @@ fn m_handed_legacy(doc: &Doc<'_>, at: usize) -> Option<usize> {
 // The scan
 // ---------------------------------------------------------------------------
 
-fn removal_spans(input: OwnedText<'_>) -> Vec<RemovedSpan> {
-    use ContentChannel as C;
-    let whole = |reason| {
-        if input.text.is_empty() {
-            Vec::new()
-        } else {
-            vec![RemovedSpan {
-                start_byte: 0,
-                end_byte: input.text.len(),
-                reason,
-            }]
-        }
-    };
-    // Structural channels are identified by the importer from tool identity
-    // and row metadata, never from their text: the whole component goes.
-    if matches!(
-        input.source,
-        SourceKind::Conversation | SourceKind::Sidechain | SourceKind::CodexRollout
-    ) {
-        match input.channel {
-            C::CsrToolUse => return whole(ContaminationReason::CsrToolUse),
-            C::CsrToolResult => return whole(ContaminationReason::CsrToolResult),
-            C::HarnessRow => return whole(ContaminationReason::HarnessRow),
-            _ => {}
-        }
-    }
-    if !input.source.is_claude_transcript()
-        || !matches!(input.channel, C::UserText | C::AssistantText)
-    {
-        return Vec::new();
-    }
-    if !TRIGGER_RE.is_match(input.text) {
-        return Vec::new();
-    }
-    let user = input.channel == C::UserText;
-    if let Some(reason) = whole_component_reason(input.text) {
-        return whole(reason);
-    }
-    if !user && assistant_briefing_echo(input.text) {
-        return whole(ContaminationReason::Briefing);
-    }
-    scan(input.text, user)
-}
-
 /// A component that is, from its first bytes, a memory-feedback report or the
 /// command prompt that asks for one.
-fn whole_component_reason(text: &str) -> Option<ContaminationReason> {
+fn whole_component_reason(text: &str) -> Option<(ContaminationReason, bool)> {
     let body = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     if body.starts_with(&format!("{MEMORY_FEEDBACK_REPORT_HEADER} — ")) {
-        return Some(ContaminationReason::MemoryFeedback);
+        return Some((ContaminationReason::MemoryFeedback, false));
     }
     // The probe arrives behind its command tags: `<command-message>…` lines.
     let mut rest = body;
@@ -1317,14 +1035,7 @@ fn whole_component_reason(text: &str) -> Option<ContaminationReason> {
     let probe = format!("{MEMORY_FEEDBACK_PROBE_HEADER}\n{MEMORY_FEEDBACK_PROBE_BODY}");
     rest.replace("\r\n", "\n")
         .starts_with(&probe)
-        .then_some(ContaminationReason::MemoryFeedback)
-}
-
-/// An assistant echo of the briefing is removable only when the entire
-/// component is that briefing.
-fn assistant_briefing_echo(text: &str) -> bool {
-    let body = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-    body.starts_with(&format!("{SESSION_INTELLIGENCE_HEADER} (CSR v9.2)")) && !body.contains("\n\n")
+        .then_some((ContaminationReason::MemoryFeedback, true))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1376,42 +1087,140 @@ fn fence_closes(line: &str, fence: Fence) -> bool {
     run >= fence.length && trimmed[run..].trim().is_empty()
 }
 
-/// Whether byte `at` of `line` lies inside an inline code span.
-fn in_inline_code(line: &str, at: usize) -> bool {
+/// The spans of `line` that are inline code, in one pass: an opening run of
+/// backticks closes at the next run of exactly its length; one with no closer
+/// is literal text.
+fn code_spans(line: &str) -> Vec<(usize, usize)> {
     let bytes = line.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'`' {
-            index += 1;
-            continue;
-        }
-        let run = bytes[index..].iter().take_while(|&&b| b == b'`').count();
-        let after = index + run;
-        let mut search = after;
-        let mut close = None;
-        while search < bytes.len() {
-            if bytes[search] == b'`' {
-                let candidate = bytes[search..].iter().take_while(|&&b| b == b'`').count();
-                if candidate == run {
-                    close = Some(search + candidate);
-                    break;
-                }
-                search += candidate;
-            } else {
-                search += 1;
-            }
-        }
-        match close {
-            Some(end) => {
-                if at >= index && at < end {
-                    return true;
-                }
-                index = end;
-            }
-            None => index = after,
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'`' {
+            let len = bytes[at..].iter().take_while(|&&b| b == b'`').count();
+            runs.push((at, len));
+            at += len;
+        } else {
+            at += 1;
         }
     }
-    false
+    let mut closer: Vec<Option<usize>> = vec![None; runs.len()];
+    let mut nearest: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for k in (0..runs.len()).rev() {
+        closer[k] = nearest.get(&runs[k].1).copied();
+        nearest.insert(runs[k].1, k);
+    }
+    let mut spans = Vec::new();
+    let mut k = 0;
+    while k < runs.len() {
+        match closer[k] {
+            Some(m) => {
+                spans.push((runs[k].0, runs[m].0 + runs[m].1));
+                k = m + 1;
+            }
+            None => k += 1,
+        }
+    }
+    spans
+}
+
+re!(TRIPLE_RE, r#""""|'''"#);
+
+/// Which triple-quoted string (if any) is open after the tokens of `line` that
+/// start before byte `until`, given the state `open` at the line's start.
+fn triple_state(line: &str, until: usize, mut open: Option<&'static str>) -> Option<&'static str> {
+    for token in TRIPLE_RE.find_iter(line) {
+        if token.start() >= until {
+            break;
+        }
+        let kind = if token.as_str() == "\"\"\"" {
+            "\"\"\""
+        } else {
+            "'''"
+        };
+        open = match open {
+            None => Some(kind),
+            Some(current) if current == kind => None,
+            other => other,
+        };
+    }
+    open
+}
+
+/// What marks a candidate on one line as a mention: inside inline code, inside
+/// a quoted string, inside a triple-quoted string. Computed once per line.
+struct LineMarks<'a> {
+    line: &'a str,
+    code: Vec<(usize, usize)>,
+    quotes: Vec<usize>,
+    open_at_start: Option<&'static str>,
+    /// Where each triple-quote token starts, and the state it leaves behind.
+    triples: Vec<(usize, Option<&'static str>)>,
+}
+
+impl<'a> LineMarks<'a> {
+    fn new(line: &'a str, open_at_start: Option<&'static str>) -> Self {
+        let mut quotes = Vec::new();
+        let mut escaped = false;
+        for (at, c) in line.char_indices() {
+            match c {
+                '\\' if !escaped => {
+                    escaped = true;
+                    continue;
+                }
+                '"' if !escaped => quotes.push(at),
+                _ => {}
+            }
+            escaped = false;
+        }
+        let mut triples = Vec::new();
+        let mut open = open_at_start;
+        for token in TRIPLE_RE.find_iter(line) {
+            let kind = if token.as_str() == "\"\"\"" {
+                "\"\"\""
+            } else {
+                "'''"
+            };
+            open = match open {
+                None => Some(kind),
+                Some(current) if current == kind => None,
+                other => other,
+            };
+            triples.push((token.start(), open));
+        }
+        let mut code = code_spans(line);
+        code.sort_unstable();
+        Self {
+            line,
+            code,
+            quotes,
+            open_at_start,
+            triples,
+        }
+    }
+
+    fn in_code(&self, at: usize) -> bool {
+        let before = self.code.partition_point(|&(start, _)| start <= at);
+        self.code[..before]
+            .iter()
+            .rev()
+            .take(1)
+            .any(|&(_, end)| at < end)
+    }
+
+    /// Inside a double-quoted string: an odd number of unescaped quotes before it.
+    fn in_string(&self, at: usize) -> bool {
+        self.quotes.partition_point(|&quote| quote < at) % 2 == 1
+    }
+
+    fn in_triple(&self, at: usize) -> bool {
+        let _ = self.line;
+        let before = self.triples.partition_point(|&(start, _)| start < at);
+        match before.checked_sub(1) {
+            Some(last) => self.triples[last].1,
+            None => self.open_at_start,
+        }
+        .is_some()
+    }
 }
 
 /// What a mention is glued to when it is quoted, escaped or path-prefixed.
@@ -1437,51 +1246,157 @@ re!(
     r"^(?:>[ \t]*)+\d(?:CSR's dreamer|CSR's compaction card|CSR's story)"
 );
 
-/// Inline candidates need a line the person could have typed them into: not
-/// inside a fence (handled by the caller), not code, not a blockquote, not
-/// inside backticks. The companion's own hotkey marker (`>2` before a send) is
-/// the one blockquote shape that is its bytes, not a quote of them.
-fn inline_candidate_allowed(line: &str, kind: LineKind, rel: usize, span: &str) -> bool {
-    match kind {
-        LineKind::Indented => return false,
-        LineKind::Quote if !QUOTED_HOTKEY_RE.is_match(span) => return false,
-        _ => {}
-    }
-    !in_inline_code(line, rel) && !in_string_literal(line, rel) && standalone_start(line, rel)
-}
-
-/// Whether byte `at` of `line` sits inside a double-quoted string: an odd
-/// number of unescaped quotes before it. A JSON value or a code literal that
-/// holds a send is quoting it, wherever in the string it sits.
-fn in_string_literal(line: &str, at: usize) -> bool {
-    let mut open = false;
-    let mut escaped = false;
-    for c in line[..at].chars() {
-        match c {
-            '\\' if !escaped => escaped = true,
-            '"' if !escaped => open = !open,
-            _ => escaped = false,
-        }
-        if c != '\\' {
-            escaped = false;
-        }
-    }
-    open
-}
-
 struct Candidate {
     start: usize,
     end: usize,
+    formatter: &'static str,
     reason: ContaminationReason,
 }
 
-fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
+re!(
+    DREAM_PANE_RE,
+    r"CSR's dreamer asked this while you worked, quoted: “[^”\n]*” Its reasoning: “[^”\n]*”"
+);
+re!(
+    DREAM_PANE_V1_RE,
+    r"CSR's dreamer asked this while you worked: “[^”\n]*” Its reasoning: [^\n]*"
+);
+re!(
+    CARD_RE,
+    r"CSR's compaction card \((?:compacting soon|compacting|compaction skipped|compacted by csr)\)(?:, quoted: “[^”\n]*”|: [^\n]*)"
+);
+re!(
+    STORY_RE,
+    r"CSR's story of this session, rev \d+(?:, quoted: “[^”\n]*”|: [^\n]*)"
+);
+const BAND_QUOTED: &str = "CSR's dreamer asked this while you worked, quoted. Its reasoning:";
+const BAND_LEGACY: [&str; 2] = [
+    "CSR's dreamer asked this while you worked. Its reasoning:",
+    "CSR's dreamer asked this while you worked. It is a question, not a task.",
+];
+
+/// The forms that may start mid-line or span lines, found by the regex engine
+/// (linear in the text) and by one look at each band attribution line.
+fn inline_candidates(text: &str, doc: &Doc<'_>) -> Vec<Candidate> {
+    let mut found: Vec<Candidate> = Vec::new();
+    let mut push = |re: &Regex, formatter: &'static str, reason: ContaminationReason| {
+        for hit in re.find_iter(text) {
+            found.push(Candidate {
+                start: hit.start(),
+                end: hit.end(),
+                formatter,
+                reason,
+            });
+        }
+    };
+    push(
+        &WRAPPER_RE,
+        "system_reminder",
+        ContaminationReason::SystemReminder,
+    );
+    push(
+        &DREAM_PANE_RE,
+        "plugin_dream_forward",
+        ContaminationReason::PluginDreamForward,
+    );
+    push(
+        &DREAM_PANE_V1_RE,
+        "plugin_dream_forward",
+        ContaminationReason::PluginDreamForward,
+    );
+    push(
+        &CARD_RE,
+        "plugin_compaction_card",
+        ContaminationReason::PluginCompactionCard,
+    );
+    push(
+        &STORY_RE,
+        "plugin_session_story",
+        ContaminationReason::PluginSessionStory,
+    );
+    // The band's dream: the attribution line, with the question above it
+    // and/or the quoted reasoning under it, each past a blank line.
+    for at in 0..doc.len() {
+        let line = doc.line(at).trim();
+        let v2 = line == BAND_QUOTED;
+        if !v2 && !BAND_LEGACY.contains(&line) {
+            continue;
+        }
+        let mut below = at + 1;
+        while below < doc.len() && doc.is_blank(below) {
+            below += 1;
+        }
+        let mut end = below;
+        if below > at + 1 {
+            while end < doc.len() && doc.line(end).trim_start().starts_with('>') {
+                end += 1;
+            }
+        }
+        let reasoning = end > below;
+        let mut above = at;
+        while above > 0 && doc.is_blank(above - 1) {
+            above -= 1;
+        }
+        let question = (above < at && above > 0).then(|| above - 1).filter(|&q| {
+            let text = doc.line(q).trim_end();
+            if v2 {
+                text.ends_with('\u{201d}') && text.contains('\u{201c}')
+            } else {
+                text.ends_with(['?', '\u{ff1f}', '\u{61f}'])
+            }
+        });
+        if !reasoning && question.is_none() {
+            continue;
+        }
+        let start = question.map_or(doc.byte_of(at), |q| doc.byte_of(q));
+        let stop = if reasoning {
+            doc.byte_of(end)
+        } else {
+            doc.byte_of(at + 1)
+        };
+        found.push(Candidate {
+            start,
+            end: stop,
+            formatter: "plugin_dream_forward",
+            reason: ContaminationReason::PluginDreamForward,
+        });
+    }
+    found.sort_by_key(|candidate| (candidate.start, candidate.end));
+    found
+}
+
+/// Whether the lines under a block's first line hold something its formatter
+/// never writes: a fence opener, a quote line, or code.
+fn body_is_protected(doc: &Doc<'_>, start: usize, end: usize) -> bool {
+    (start + 1..end.min(doc.len())).any(|line| {
+        let text = doc.line(line);
+        fence_open(text).is_some() || line_kind(text) != LineKind::Normal
+    })
+}
+
+fn scan(text: &str) -> Vec<Hit> {
+    if let Some(reason) = whole_component_reason(text) {
+        return vec![Hit {
+            formatter: if reason.1 {
+                "memory_feedback_probe"
+            } else {
+                "memory_feedback_report"
+            },
+            reason: reason.0,
+            start_byte: 0,
+            end_byte: text.len(),
+        }];
+    }
     let doc = Doc::new(text);
-    let forwards = forward_candidates(text);
-    let mut close = CloseCursor::default();
-    let mut spans: Vec<RemovedSpan> = Vec::new();
+    let candidates = inline_candidates(text, &doc);
+    let mut next_candidate = 0;
+    let mut hits: Vec<Hit> = Vec::new();
     let mut fence: Option<Fence> = None;
+    let mut triple: Option<&'static str> = None;
     let mut pos = 0usize;
+    // The marks of the line being scanned, computed once however many
+    // candidates the line holds.
+    let mut line_marks: Option<(usize, LineMarks<'_>)> = None;
 
     'scan: while pos < text.len() {
         let index = doc.line_of(pos);
@@ -1489,7 +1404,6 @@ fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
         let content = doc.line(index);
         let content_start = line.end - content.len();
         let at_line_start = pos <= line.start;
-        let pos_in_line = pos.max(line.start);
 
         if at_line_start {
             if let Some(open) = fence {
@@ -1504,338 +1418,87 @@ fn scan(text: &str, user: bool) -> Vec<RemovedSpan> {
                 pos = line.next;
                 continue;
             }
+            // Inside a triple-quoted string every line is a string's.
+            if triple.is_some() {
+                triple = triple_state(content, usize::MAX, triple);
+                pos = line.next;
+                continue;
+            }
         }
         let kind = line_kind(content);
 
         if at_line_start && kind == LineKind::Normal {
-            let follows_removal = spans.last().is_some_and(|span| span.end_byte == line.start);
             for formatter in REGISTRY {
                 let Matcher::Block(block) = formatter.matcher else {
                     continue;
                 };
-                let Some(mut end_line) = block(&doc, index) else {
+                let Some(end_line) = block(&doc, index) else {
                     continue;
                 };
-                // A briefing that is all there is of a component (it opens the
-                // component, or follows the rest of a SessionStart emission)
-                // runs to its end: nothing else can be the briefing's.
-                if formatter.reason == ContaminationReason::Briefing
-                    && (index == 0 || follows_removal)
-                    && briefing_next_block(&doc, index).is_none()
+                // A block whose lines hold a fence, a quote or code its
+                // formatter never writes has run into somebody's markdown.
+                if formatter.reason != ContaminationReason::PluginSideNote
+                    && body_is_protected(&doc, index, end_line)
                 {
-                    end_line = doc.len();
-                }
-                // Protected ranges come first: a block whose lines hold a
-                // fence, a quote or code that its formatter does not write
-                // has run into somebody's markdown.
-                if !formatter.owns_quoted_body() && body_is_protected(&doc, index, end_line) {
                     continue;
                 }
-                if !user && !assistant_boundaries_ok(&doc, index, end_line, follows_removal) {
-                    continue;
-                }
-                // The footer that closes a SessionStart emission carries the
-                // blank line above it.
-                let end_line =
-                    if doc.is_blank(end_line) && doc.line(end_line + 1) == DEEPER_CONTEXT_FIRST {
-                        end_line + 1
-                    } else {
-                        doc.skip_blank_up_to(end_line, formatter.trailing_blank())
-                    };
                 let end = doc.byte_of(end_line);
-                spans.push(RemovedSpan {
+                hits.push(Hit {
+                    formatter: formatter.id,
+                    reason: formatter.reason,
                     start_byte: line.start,
                     end_byte: end,
-                    reason: formatter.reason,
                 });
                 pos = end;
                 continue 'scan;
             }
         }
 
-        // Inline candidates that start in this line, earliest first. One that
-        // is protected, or that would swallow a fence line, is passed over and
-        // the rest of the line is searched. The harness's hook wrappers are
-        // only ever in the person's turn.
-        let mut from = pos_in_line.max(content_start);
-        while from < line.next {
-            let wrapper = if user {
-                find_wrapper(text, from, line.end, &mut close)
-            } else {
-                None
-            };
-            let forward = forwards
-                .get(forwards.partition_point(|forward| forward.start < from))
-                .filter(|forward| forward.start < line.next)
-                .map(Candidate::from);
-            let found = match (wrapper, forward) {
-                (Some(w), Some(f)) => Some(if f.start < w.start { f } else { w }),
-                (w, f) => w.or(f),
-            };
-            let Some(found) = found else { break };
-            // Judge where the formatter's own bytes begin: a forward's span
-            // can open on the separator that followed the person's words.
-            let raw = &text[found.start..found.end];
-            let begins = found.start + raw.len() - raw.trim_start().len();
-            let rel = begins.saturating_sub(content_start).min(content.len());
-            let structural = found.reason == ContaminationReason::SystemReminder;
-            let allowed = inline_candidate_allowed(content, kind, rel, &text[begins..found.end])
-                && (structural || !spans_a_fence(&text[found.start..found.end]))
-                && (user || {
-                    let follows_removal = spans
-                        .last()
-                        .is_some_and(|span| span.end_byte == doc.lines[doc.line_of(begins)].start);
-                    standalone_relay(&doc, &found, follows_removal)
-                });
+        // Inline candidates that start in this line, in order. One that is
+        // protected is passed over; each is looked at once.
+        while next_candidate < candidates.len() && candidates[next_candidate].start < pos {
+            next_candidate += 1;
+        }
+        while next_candidate < candidates.len() && candidates[next_candidate].start < line.next {
+            let candidate = &candidates[next_candidate];
+            next_candidate += 1;
+            let rel = candidate
+                .start
+                .saturating_sub(content_start)
+                .min(content.len());
+            if line_marks.as_ref().map(|(at, _)| *at) != Some(index) {
+                line_marks = Some((index, LineMarks::new(content, triple)));
+            }
+            let marks = &line_marks.as_ref().expect("set above").1;
+            let structural = candidate.reason == ContaminationReason::SystemReminder;
+            let quote_ok = kind != LineKind::Quote
+                || QUOTED_HOTKEY_RE.is_match(&text[content_start..candidate.end]);
+            let allowed = kind != LineKind::Indented
+                && quote_ok
+                && !marks.in_code(rel)
+                && !marks.in_string(rel)
+                && !marks.in_triple(rel)
+                && standalone_start(content, rel)
+                && (structural || !spans_a_fence(&text[candidate.start..candidate.end]));
             if allowed {
-                let blank_after = usize::from(!structural);
-                let (start, end) = settle_span(&doc, &found, blank_after);
-                spans.push(RemovedSpan {
-                    start_byte: start,
-                    end_byte: end,
-                    reason: found.reason,
+                hits.push(Hit {
+                    formatter: candidate.formatter,
+                    reason: candidate.reason,
+                    start_byte: candidate.start,
+                    end_byte: candidate.end,
                 });
-                pos = end;
+                pos = candidate.end;
                 continue 'scan;
             }
-            from = found.start + text[found.start..].chars().next().map_or(1, char::len_utf8);
         }
+        triple = triple_state(content, usize::MAX, triple);
         pos = line.next;
     }
-    merge_overlaps(spans)
-}
-
-/// An assistant relay is a complete block standing alone: set off from the
-/// text around it by blank lines or the component's edges. Blocks the engine
-/// writes back to back (a whole SessionStart emission) stand alone together,
-/// so a neighbouring registered block counts as a boundary too.
-fn assistant_boundaries_ok(doc: &Doc<'_>, start: usize, end: usize, follows_removal: bool) -> bool {
-    let before = follows_removal || start == 0 || doc.is_blank(start - 1);
-    let after = end >= doc.len() || doc.is_blank(end) || block_at(doc, end, true).is_some();
-    before && after
-}
-
-/// A forward the assistant relays is removable only as a whole line (or lines)
-/// of its own: nothing but whitespace shares them, and blank lines or the
-/// component's edges set it off.
-fn standalone_relay(doc: &Doc<'_>, found: &Candidate, follows_removal: bool) -> bool {
-    let text = doc.text;
-    let raw = &text[found.start..found.end];
-    let begins = found.start + raw.len() - raw.trim_start().len();
-    let ends = found.start + raw.trim_end().len();
-    if ends <= begins {
-        return false;
-    }
-    let first = doc.line_of(begins);
-    let last = doc.line_of(ends - 1);
-    let whole_lines = text[doc.lines[first].start..begins].trim().is_empty()
-        && text[ends..doc.lines[last].end].trim().is_empty();
-    whole_lines && assistant_boundaries_ok(doc, first, last + 1, follows_removal)
-}
-
-/// Whether the lines under a block's first line hold something its formatter
-/// never writes: a fence opener, a quote line, or code.
-fn body_is_protected(doc: &Doc<'_>, start: usize, end: usize) -> bool {
-    (start + 1..end.min(doc.len())).any(|line| {
-        let text = doc.line(line);
-        fence_open(text).is_some() || line_kind(text) != LineKind::Normal
-    })
-}
-
-/// The end of the registered block that starts at line `at`, if one does. The
-/// briefing is left out when asked: its own end is what is being looked for.
-fn block_at(doc: &Doc<'_>, at: usize, with_briefing: bool) -> Option<usize> {
-    REGISTRY
-        .iter()
-        .find_map(|formatter| match formatter.matcher {
-            Matcher::Block(block)
-                if with_briefing || formatter.reason != ContaminationReason::Briefing =>
-            {
-                block(doc, at)
-            }
-            _ => None,
-        })
+    hits
 }
 
 fn spans_a_fence(span: &str) -> bool {
     span.lines().any(|line| fence_open(line).is_some())
-}
-
-/// Trim a candidate to the formatter's own bytes. A span that begins its line
-/// also takes its own line ending, and up to `blank_after` blank lines the
-/// formatter leaves under it; mid-line spans leave their neighbours exactly as
-/// typed.
-fn settle_span(doc: &Doc<'_>, candidate: &Candidate, blank_after: usize) -> (usize, usize) {
-    let text = doc.text;
-    let raw = &text[candidate.start..candidate.end];
-    let lead = raw.len() - raw.trim_start().len();
-    let mut start = candidate.start + lead;
-    let mut end = start + raw.trim().len();
-    if end <= start {
-        return (candidate.start, candidate.end);
-    }
-    let first = doc.line_of(start);
-    let prefix_blank = text[doc.lines[first].start..start]
-        .chars()
-        .all(|c| c == ' ' || c == '\t' || c == '\u{FEFF}');
-    if prefix_blank {
-        start = doc.lines[first].start;
-    }
-    let last = doc.line_of(end.saturating_sub(1));
-    let suffix_blank = text[end..doc.lines[last].end].trim().is_empty();
-    if prefix_blank && suffix_blank {
-        end = doc.byte_of(doc.skip_blank_up_to(last + 1, blank_after));
-    }
-    (start, end)
-}
-
-fn merge_overlaps(mut spans: Vec<RemovedSpan>) -> Vec<RemovedSpan> {
-    spans.sort_by_key(|span| (span.start_byte, span.end_byte));
-    let mut merged: Vec<RemovedSpan> = Vec::with_capacity(spans.len());
-    for span in spans {
-        match merged.last_mut() {
-            Some(last) if span.start_byte < last.end_byte => {
-                last.end_byte = last.end_byte.max(span.end_byte);
-            }
-            _ => merged.push(span),
-        }
-    }
-    merged
-}
-
-const WRAPPER_OPEN: &str = "<system-reminder>";
-const WRAPPER_CLOSE: &str = "</system-reminder>";
-
-/// Where the next closing tag is. An opener asks; the answer for one opener
-/// holds for every later opener before that tag, and "nowhere" holds for all
-/// later ones, so a component of unclosed openers is read once, not once each.
-#[derive(Default)]
-struct CloseCursor {
-    asked_from: usize,
-    answer: Option<Option<usize>>,
-}
-
-impl CloseCursor {
-    fn next_close(&mut self, text: &str, from: usize) -> Option<usize> {
-        if let Some(answer) = self.answer {
-            if from >= self.asked_from {
-                match answer {
-                    None => return None,
-                    Some(at) if at >= from => return Some(at),
-                    Some(_) => {}
-                }
-            }
-        }
-        let found = text[from..].find(WRAPPER_CLOSE).map(|at| from + at);
-        self.asked_from = from;
-        self.answer = Some(found);
-        found
-    }
-}
-
-/// The first `<system-reminder>` at or after `from` (within the line) whose
-/// first nonblank payload is a registered engine emission, through its close.
-fn find_wrapper(
-    text: &str,
-    from: usize,
-    line_end: usize,
-    close: &mut CloseCursor,
-) -> Option<Candidate> {
-    let mut search = from;
-    while search < line_end {
-        let open = search + text[search..line_end].find(WRAPPER_OPEN)?;
-        let payload_start = open + WRAPPER_OPEN.len();
-        if let Some(close_at) = close.next_close(text, payload_start) {
-            let payload = text[payload_start..close_at].trim_start();
-            // The harness labels hook output it wraps: `SessionStart:startup
-            // hook success: <the hook's stdout>`. The label is not CSR's; what
-            // follows it decides.
-            let payload = HOOK_LABEL_RE
-                .find(payload)
-                .map_or(payload, |label| &payload[label.end()..]);
-            if starts_registered_emission(payload) {
-                return Some(Candidate {
-                    start: open,
-                    end: close_at + WRAPPER_CLOSE.len(),
-                    reason: ContaminationReason::SystemReminder,
-                });
-            }
-        }
-        search = payload_start;
-    }
-    None
-}
-
-/// Whether `payload` opens with a header some engine formatter writes.
-fn starts_registered_emission(payload: &str) -> bool {
-    const HEADERS: [&str; 14] = [
-        MEMORY_MANIFEST_HEADER,
-        PICKUP_HEADER,
-        EPISODE_INDEX_HEADER_PREFIX,
-        CONTINUUM_HEADER,
-        CONTINUITY_HEADER_PREFIX,
-        RECENT_SESSIONS_HEADER_PREFIX,
-        PAST_CONTEXT_HEADER_PREFIX,
-        RELEVANT_CONTEXT_HEADER_PREFIX,
-        CODE_MAP_HEADER_PREFIX,
-        "[briefing: model-derived",
-        "recap [",
-        "CSR ☾ dream:",
-        "CSR engine ready",
-        "CSR: `",
-    ];
-    let first_line = payload.lines().next().unwrap_or("");
-    if let Some(title) = first_line.strip_prefix("## ") {
-        let title = title.trim_end();
-        return crate::injection::formatter::INJECTION_SECTION_TITLES.contains(&title)
-            || title.starts_with("CSR Memory Feedback");
-    }
-    HEADERS.iter().any(|header| payload.starts_with(header))
-        || EMPTY_STATUS_RE.is_match(first_line)
-        || strip_sentinel_suffix(first_line, LESSONS_SENTINEL)
-            .is_some_and(|prefix| prefix.trim().is_empty())
-}
-
-struct Forward {
-    start: usize,
-    end: usize,
-    reason: ContaminationReason,
-}
-
-impl From<&Forward> for Candidate {
-    fn from(forward: &Forward) -> Self {
-        Candidate {
-            start: forward.start,
-            end: forward.end,
-            reason: forward.reason,
-        }
-    }
-}
-
-/// The companion's forwarded dream, compaction card and story, as byte spans
-/// of `text`, sorted by start. One grammar, shared with extraction.
-fn forward_candidates(text: &str) -> Vec<Forward> {
-    let mut found: Vec<Forward> = crate::extraction::provenance::forward_spans(text)
-        .into_iter()
-        .filter(|span| span.start < span.end && span.end <= text.len())
-        .map(|span| {
-            let body = &text[span.start..span.end];
-            let reason = if body.contains("CSR's compaction card (") {
-                ContaminationReason::PluginCompactionCard
-            } else if body.contains("CSR's story of this session, rev ") {
-                ContaminationReason::PluginSessionStory
-            } else {
-                ContaminationReason::PluginDreamForward
-            };
-            Forward {
-                start: span.start,
-                end: span.end,
-                reason,
-            }
-        })
-        .collect();
-    found.sort_by_key(|forward| (forward.start, forward.end));
-    found
 }
 
 /// Formatter ids, for tests that check every registration has a matrix case.

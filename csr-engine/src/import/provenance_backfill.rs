@@ -299,27 +299,6 @@ fn failure_evidence(
     }
 }
 
-pub(crate) fn unreconstructible_chunk_evidence(
-    chunk: &super::ConversationChunk,
-    source_path: Option<String>,
-) -> ChunkEvidence {
-    failure_evidence(
-        &ProvenanceBackfillRow {
-            id: chunk.id.clone(),
-            conversation_id: chunk.conversation_id.clone(),
-            project_name: chunk.project_name.clone(),
-            timestamp: chunk.timestamp.clone(),
-            content: chunk.content.clone(),
-            source: "conversation".into(),
-            is_sidechain: chunk.is_sidechain,
-            source_path: source_path.clone(),
-            failure_observed_at: None,
-        },
-        source_path,
-        "source_unmatched",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

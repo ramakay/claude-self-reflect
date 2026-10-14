@@ -213,8 +213,7 @@ where
     let mut harness_context_stripped = 0usize;
     let mut summary = None;
     let mut is_subagent = false;
-    let mut sanitizer =
-        super::CsrMessageSanitizer::for_source(super::contamination::SourceKind::CodexRollout);
+    let mut sanitizer = super::CsrMessageSanitizer::for_chunks();
 
     let mut reader = BufReader::new(file);
     let mut byte_offset = 0u64;
@@ -883,24 +882,6 @@ fn rollout_chunks(parsed: &ParsedRollout) -> Vec<ConversationChunk> {
         .expect("collecting rollout chunks cannot fail");
     }
     chunks
-}
-
-/// Re-parse a rollout for scrub: the production Codex parser and structural
-/// sanitizer, so a re-parse can never disagree with an import. Codex prose and
-/// tool text are never classified by formatter text; only the structural
-/// harness and CSR-tool items are removed. Errors when the file is gone.
-// phase B: scrub reparses Codex rollouts through this seam; only tests call it yet.
-#[allow(dead_code)]
-pub(crate) fn parse_rollout_chunks_for_scrub(path: &Path) -> Result<Vec<ConversationChunk>> {
-    let Some(metadata) = scan_rollout_metadata(path)? else {
-        anyhow::bail!("Codex rollout vanished: {}", path.display());
-    };
-    let mut chunks = Vec::new();
-    stream_rollout_chunk_batches(path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
-        chunks.extend_from_slice(batch);
-        Ok(())
-    })?;
-    Ok(chunks)
 }
 
 fn scan_rollout_metadata(path: &Path) -> Result<Option<RolloutMetadata>> {
@@ -2894,7 +2875,13 @@ mod tests {
         )
         .unwrap();
 
-        let chunks = parse_rollout_chunks_for_scrub(&path).unwrap();
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        stream_rollout_chunk_batches(&path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
+            chunks.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap();
         let all = chunks
             .iter()
             .map(|chunk| chunk.content.as_str())
@@ -2918,29 +2905,6 @@ mod tests {
         let parsed = parse_rollout(&path).unwrap().unwrap();
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
         assert_eq!(parsed.suppression.csr_hook_wrappers_scrubbed, 0);
-    }
-
-    #[test]
-    fn scrub_reparse_seam_yields_exactly_the_chunks_an_import_would() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_rollout_modern.jsonl");
-        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
-        let mut streamed = Vec::new();
-        stream_rollout_chunk_batches(&path, &metadata, 1, |batch, _| {
-            streamed.extend_from_slice(batch);
-            Ok(())
-        })
-        .unwrap();
-        let seam = parse_rollout_chunks_for_scrub(&path).unwrap();
-        assert!(!seam.is_empty());
-        assert_eq!(
-            seam.iter().map(|c| (&c.id, &c.content)).collect::<Vec<_>>(),
-            streamed
-                .iter()
-                .map(|c| (&c.id, &c.content))
-                .collect::<Vec<_>>()
-        );
-        assert!(parse_rollout_chunks_for_scrub(&path.with_extension("gone")).is_err());
     }
 
     #[test]

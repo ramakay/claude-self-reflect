@@ -107,61 +107,32 @@ pub(crate) struct CsrSuppressionStats {
 }
 
 struct CsrMessageSanitizer {
-    /// Which transcript format the messages came from: it decides which
-    /// channels CSR could have written into.
-    source: contamination::SourceKind,
+    /// Derived artifacts (learnings, episodes, narratives, recap feeds) may skip
+    /// CSR's own text; the stored conversation never does. Chunk import keeps
+    /// every byte a grammar matches and only cuts what is structural: CSR's
+    /// own tool calls and results, and a complete hook-labelled wrapper.
+    derived: bool,
     suppressed_tool_use_ids: HashSet<String>,
     stats: CsrSuppressionStats,
 }
 
 impl CsrMessageSanitizer {
-    fn for_source(source: contamination::SourceKind) -> Self {
+    /// The stored conversation: chunk import, and the matchers that mirror it.
+    fn for_chunks() -> Self {
         Self {
-            source,
+            derived: false,
             suppressed_tool_use_ids: HashSet::new(),
             stats: CsrSuppressionStats::default(),
         }
     }
-}
 
-/// Claude transcripts, main and sidechain alike: the only default there is.
-impl Default for CsrMessageSanitizer {
-    fn default() -> Self {
-        Self::for_source(contamination::SourceKind::Conversation)
+    /// Input to a derived artifact.
+    fn for_derived() -> Self {
+        Self {
+            derived: true,
+            ..Self::for_chunks()
+        }
     }
-}
-
-/// A text component after the remover has run: what survives, and how many
-/// spans of each kind went. Components are sanitized before they are joined
-/// into messages, so a dropped component contributes no separator.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SanitizedComponent {
-    pub text: String,
-    pub removed: Vec<contamination::RemovedSpan>,
-}
-
-/// Remove CSR's own emissions from one component, byte-exactly. `None` when
-/// nothing is left of it.
-pub(crate) fn sanitize_component(
-    source: contamination::SourceKind,
-    channel: contamination::ContentChannel,
-    text: &str,
-    stats: &mut CsrSuppressionStats,
-) -> Option<SanitizedComponent> {
-    let removal = contamination::remove_csr_emissions(contamination::OwnedText {
-        source,
-        channel,
-        text,
-    });
-    stats.csr_hook_wrappers_scrubbed += removal
-        .removed
-        .iter()
-        .filter(|span| span.reason == contamination::ContaminationReason::SystemReminder)
-        .count();
-    (!removal.kept.is_empty()).then_some(SanitizedComponent {
-        text: removal.kept,
-        removed: removal.removed,
-    })
 }
 
 /// Namespace UUID for deterministic chunk IDs (UUIDv5).
@@ -407,7 +378,8 @@ pub(crate) fn opening_prompt_candidate(parsed: &serde_json::Value) -> Option<Str
     if injected {
         return None;
     }
-    let text = contamination::without_hook_wrappers(&extract_message_text_raw(parsed));
+    let mut ignored = 0;
+    let text = scrub_csr_system_reminders(&extract_message_text_raw(parsed), &mut ignored);
     // A slash command is something a person ran: the session opens here.
     if text.contains("<command-name>") {
         return Some(text);
@@ -613,7 +585,7 @@ pub(crate) fn parse_jsonl_file_observing(
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
     let mut agent_prompt_checked = false;
-    let mut csr_sanitizer = CsrMessageSanitizer::default();
+    let mut csr_sanitizer = CsrMessageSanitizer::for_chunks();
     let mut entrypoint: Option<String> = None;
 
     loop {
@@ -1371,7 +1343,7 @@ pub(crate) fn parse_jsonl_messages_for_search(path: &Path) -> Result<Vec<serde_j
 pub(crate) fn sanitize_messages_for_search(
     messages: &[serde_json::Value],
 ) -> (Vec<serde_json::Value>, CsrSuppressionStats) {
-    let mut sanitizer = CsrMessageSanitizer::default();
+    let mut sanitizer = CsrMessageSanitizer::for_derived();
     let mut sanitized = messages.to_vec();
     for message in &mut sanitized {
         sanitize_message_for_search(message, &mut sanitizer);
@@ -1387,13 +1359,11 @@ fn sanitize_message_for_search(
         .get("type")
         .and_then(|value| value.as_str())
         .map(str::to_owned);
-    let is_user = matches!(msg_type.as_deref(), Some("user" | "human"));
-    let text = if is_user && is_harness_written_row(message) {
+    let scrub_wrappers = matches!(msg_type.as_deref(), Some("user" | "human"));
+    let text = if scrub_wrappers && is_harness_written_row(message) {
         RowText::Drop
     } else {
-        RowText::Keep {
-            channel: text_channel(sanitizer.source, msg_type.as_deref()),
-        }
+        RowText::Keep { scrub_wrappers }
     };
 
     if let Some(content) = message
@@ -1406,31 +1376,11 @@ fn sanitize_message_for_search(
     }
 }
 
-/// The ownership channel a message's prose belongs to. Codex prose is the
-/// person's or the model's own words: never classified by formatter text.
-fn text_channel(
-    source: contamination::SourceKind,
-    msg_type: Option<&str>,
-) -> contamination::ContentChannel {
-    use contamination::{ContentChannel, SourceKind};
-    match (source, msg_type) {
-        (SourceKind::CodexRollout, Some("user" | "human")) => ContentChannel::CodexUser,
-        (SourceKind::CodexRollout, Some("assistant")) => ContentChannel::CodexAssistant,
-        (SourceKind::Conversation | SourceKind::Sidechain, Some("user" | "human")) => {
-            ContentChannel::UserText
-        }
-        (SourceKind::Conversation | SourceKind::Sidechain, Some("assistant")) => {
-            ContentChannel::AssistantText
-        }
-        _ => ContentChannel::Unknown,
-    }
-}
-
 /// What the sanitizer does with a row's prose. Tool blocks are judged on their own.
 #[derive(Clone, Copy)]
 enum RowText {
     Keep {
-        channel: contamination::ContentChannel,
+        scrub_wrappers: bool,
     },
     /// The harness wrote this row into the user channel; nobody typed it.
     Drop,
@@ -1458,7 +1408,9 @@ fn sanitize_content(
 ) {
     if let Some(text) = content.as_str() {
         *content = serde_json::Value::String(match row_text {
-            RowText::Keep { channel } => sanitize_text_for_search(text, channel, sanitizer),
+            RowText::Keep { scrub_wrappers } => {
+                sanitize_text_for_search(text, scrub_wrappers, sanitizer)
+            }
             RowText::Drop => String::new(),
         });
         return;
@@ -1494,13 +1446,15 @@ fn sanitize_content(
                 }
             }
             Some("text") => {
-                let RowText::Keep { channel } = row_text else {
+                let RowText::Keep { scrub_wrappers } = row_text else {
                     continue;
                 };
                 if let Some(text) = item.get_mut("text") {
                     if let Some(raw) = text.as_str() {
                         *text = serde_json::Value::String(sanitize_text_for_search(
-                            raw, channel, sanitizer,
+                            raw,
+                            scrub_wrappers,
+                            sanitizer,
                         ));
                     }
                 }
@@ -1512,23 +1466,36 @@ fn sanitize_content(
     *items = kept;
 }
 
-/// One text component's search-sanitization: strip any pasted dreams-CLI card's
-/// model-authored judgment spans (cheap no-op absent a marker — see
-/// `dream_attribution::strip_card_judgment`), then remove the byte spans CSR's
-/// own formatters produced, if this channel is one CSR can write into. Applied
-/// uniformly to plain string content and to `type: "text"` content-array items
-/// alike, so a pasted card is caught regardless of which shape Claude Code
-/// stored it in. Each block is its own component: whatever it loses is gone
-/// before the blocks are joined.
+/// One text span's search-sanitization. The stored conversation keeps every
+/// byte except a complete hook-labelled `<system-reminder>` wrapper in the
+/// person's turn (`scrub_wrappers`), which the importer has always cut. A
+/// derived artifact additionally drops a pasted dreams-CLI card's judgment
+/// spans and whatever the CSR text detector matches: those inputs are not the
+/// conversation, and must not teach a summary CSR's own words.
 fn sanitize_text_for_search(
     text: &str,
-    channel: contamination::ContentChannel,
+    scrub_wrappers: bool,
     sanitizer: &mut CsrMessageSanitizer,
 ) -> String {
-    let stripped = crate::storage::dream_attribution::strip_card_judgment(text);
-    sanitize_component(sanitizer.source, channel, &stripped, &mut sanitizer.stats)
-        .map(|component| component.text)
-        .unwrap_or_default()
+    let stripped = if sanitizer.derived {
+        crate::storage::dream_attribution::strip_card_judgment(text)
+    } else {
+        text.to_string()
+    };
+    let unwrapped = if scrub_wrappers {
+        scrub_csr_system_reminders(&stripped, &mut sanitizer.stats.csr_hook_wrappers_scrubbed)
+    } else {
+        stripped
+    };
+    if sanitizer.derived {
+        contamination::strip_hits(&unwrapped)
+    } else {
+        unwrapped
+    }
+}
+
+fn scrub_csr_system_reminders(text: &str, count: &mut usize) -> String {
+    contamination::remove_hook_wrappers(text, count)
 }
 
 /// Extract text content from a JSONL message entry.
@@ -1572,10 +1539,17 @@ pub(crate) fn chunk_is_sidechain(sidechain_flags: &[bool], conversation_id: &str
     sidechain_flags.iter().any(|&s| s) || conversation_id.starts_with("agent-")
 }
 
-/// A message's prose with privacy-tagged content redacted. CSR's own
-/// emissions are removed earlier, per component, by the shared sanitizer.
 fn extract_message_text(msg: &serde_json::Value) -> String {
-    strip_private_tags(&extract_message_text_raw(msg))
+    let raw = extract_message_text_raw(msg);
+    // Strip privacy-tagged content before storage/embedding
+    let without_private = strip_private_tags(&raw);
+    let msg_type = msg.get("type").and_then(|value| value.as_str());
+    if matches!(msg_type, Some("user" | "human")) {
+        let mut ignored_count = 0;
+        scrub_csr_system_reminders(&without_private, &mut ignored_count)
+    } else {
+        without_private
+    }
 }
 
 fn extract_message_text_raw(msg: &serde_json::Value) -> String {
@@ -1776,152 +1750,13 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 mod tests {
     use super::*;
 
-    use contamination::{
-        classify_csr_contamination, remove_csr_emissions, ContaminationReason, ContentChannel,
-        OwnedText, SourceKind,
-    };
-
-    fn removal(source: SourceKind, channel: ContentChannel, text: &str) -> contamination::Removal {
-        remove_csr_emissions(OwnedText {
-            source,
-            channel,
-            text,
-        })
-    }
-
-    fn user_removal(text: &str) -> contamination::Removal {
-        removal(SourceKind::Conversation, ContentChannel::UserText, text)
-    }
-
-    /// The ownership table: who wrote the bytes decides whether a CSR-looking
-    /// span is an emission or a mention. Replaces the text-only predicate tests.
     #[test]
-    fn ownership_table_decides_what_is_removable() {
-        use ContaminationReason as R;
-        const RECAP: &str = "recap [2h ago]: fixed the stale index. [[CSR:RECAP]]";
-        const WRAPPER: &str =
-            "<system-reminder>CSR ENDLESS MEMORY ACTIVE\nPAST CONTEXT</system-reminder>";
-        // (source, channel, text, reason when the whole text is an emission)
-        let table = [
-            // Claude user text: complete emissions and the hook wrapper go.
-            (
-                SourceKind::Conversation,
-                ContentChannel::UserText,
-                RECAP,
-                Some(R::Recap),
-            ),
-            (
-                SourceKind::Sidechain,
-                ContentChannel::UserText,
-                RECAP,
-                Some(R::Recap),
-            ),
-            (
-                SourceKind::Conversation,
-                ContentChannel::UserText,
-                WRAPPER,
-                Some(R::SystemReminder),
-            ),
-            // A bare sentinel is a token someone is naming, not an emission.
-            (
-                SourceKind::Conversation,
-                ContentChannel::UserText,
-                "ordinary text\n\n[[CSR:LESSONS]] generated memory",
-                None,
-            ),
-            (
-                SourceKind::Conversation,
-                ContentChannel::UserText,
-                "We fixed the stale HNSW vector by replacing it explicitly.",
-                None,
-            ),
-            // Assistant text: a standalone, complete relay goes; discussion stays.
-            (
-                SourceKind::Conversation,
-                ContentChannel::AssistantText,
-                RECAP,
-                Some(R::Recap),
-            ),
-            (
-                SourceKind::Conversation,
-                ContentChannel::AssistantText,
-                "The line `recap [2h ago]: fixed it. [[CSR:RECAP]]` is what the hook writes.",
-                None,
-            ),
-            // Channels CSR cannot write into are mentions, whatever they say.
-            (
-                SourceKind::Conversation,
-                ContentChannel::NonCsrToolResult,
-                RECAP,
-                None,
-            ),
-            (
-                SourceKind::CodexRollout,
-                ContentChannel::CodexUser,
-                RECAP,
-                None,
-            ),
-            (
-                SourceKind::CodexRollout,
-                ContentChannel::CodexAssistant,
-                RECAP,
-                None,
-            ),
-            (
-                SourceKind::CodexRollout,
-                ContentChannel::CodexTool,
-                RECAP,
-                None,
-            ),
-            (SourceKind::Plan, ContentChannel::PlanFile, RECAP, None),
-            (SourceKind::Unknown, ContentChannel::Unknown, RECAP, None),
-            // Eligible channel, wrong source: nothing is proven about the bytes.
-            (SourceKind::Plan, ContentChannel::UserText, RECAP, None),
-            (SourceKind::Unknown, ContentChannel::UserText, RECAP, None),
-            // Structural channels are decided by identity, not by text.
-            (
-                SourceKind::Conversation,
-                ContentChannel::CsrToolUse,
-                "anything",
-                Some(R::CsrToolUse),
-            ),
-            (
-                SourceKind::Conversation,
-                ContentChannel::CsrToolResult,
-                "anything",
-                Some(R::CsrToolResult),
-            ),
-            (
-                SourceKind::Conversation,
-                ContentChannel::HarnessRow,
-                "anything",
-                Some(R::HarnessRow),
-            ),
-        ];
-        for (source, channel, text, expected) in table {
-            let got = removal(source, channel, text);
-            assert_eq!(
-                classify_csr_contamination(OwnedText {
-                    source,
-                    channel,
-                    text
-                }),
-                expected,
-                "{source:?} {channel:?} {text:?}"
-            );
-            match expected {
-                Some(_) => assert_eq!(got.kept, "", "{source:?} {channel:?} {text:?}"),
-                None => assert_eq!(got.kept, text, "{source:?} {channel:?} {text:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn parser_never_emits_cross_message_contamination() {
+    fn parser_keeps_every_message_and_never_invents_a_cross_message_label() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("cross-message.jsonl");
         // Each message alone is a lone field token; neither is a formatter's
         // block, and joined across the message boundary they are still not one.
+        // The third message reads like an emission and is kept like the rest.
         let lines = [
             serde_json::json!({
                 "type": "user",
@@ -1935,8 +1770,6 @@ mod tests {
                 "timestamp": "2026-09-01T00:00:01Z",
                 "message": {"content": "NEXT: generated continuation"}
             }),
-            // A real emission in its own message is removed at the component,
-            // before anything is joined.
             serde_json::json!({
                 "type": "user",
                 "uuid": "u2",
@@ -1959,15 +1792,16 @@ mod tests {
         let chunk = &parsed.chunks[0];
         assert_eq!(
             chunk.content,
-            "LAST: prior generated state\n\nNEXT: generated continuation"
+            "LAST: prior generated state\n\nNEXT: generated continuation\n\nCSR engine ready (degraded mode)."
         );
-        assert!(classify_csr_contamination(OwnedText {
-            source: SourceKind::Conversation,
-            channel: ContentChannel::UserText,
-            text: &chunk.content,
-        })
-        .is_none());
-        // The evidence names exactly the two retained messages, byte for byte.
+        // The two lines that joined are not a block: only the third is labeled.
+        let hits = contamination::detect(&chunk.content);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(
+            &chunk.content[hits[0].start_byte..hits[0].end_byte],
+            "CSR engine ready (degraded mode)."
+        );
+        // The evidence names the retained messages, byte for byte.
         let evidence = &parsed.evidence[&chunk.id];
         let spans: Vec<(&str, usize, usize, &str)> = evidence
             .spans
@@ -1988,6 +1822,7 @@ mod tests {
             .collect();
         let user = "LAST: prior generated state";
         let assistant = "NEXT: generated continuation";
+        let third = "CSR engine ready (degraded mode).";
         assert_eq!(
             spans,
             [
@@ -2003,88 +1838,73 @@ mod tests {
                     assistant.chars().count(),
                     crate::provenance::content_hash(assistant).as_str()
                 ),
+                (
+                    "u2",
+                    0,
+                    third.chars().count(),
+                    crate::provenance::content_hash(third).as_str()
+                ),
             ]
         );
-        // The removed message left no event behind.
-        assert!(evidence
-            .events
-            .iter()
-            .all(|event| event.message_key != "u2"));
     }
 
     fn text_block(text: &str) -> serde_json::Value {
         serde_json::json!({"type": "text", "text": text})
     }
 
-    /// Each text block is its own component: a block the remover empties is
-    /// gone before the blocks are joined, so it leaves no blank separator.
+    const EMISSION: &str = "recap [2m ago]: Fixed it. [[CSR:RECAP]]";
+
+    /// Derived input: each block is its own component, so a block that is only
+    /// a wrapper or CSR text leaves no blank separator behind.
     #[test]
-    fn components_are_sanitized_before_they_are_joined() {
+    fn derived_components_drop_the_wrapper_and_the_csr_text_before_they_are_joined() {
         let message = serde_json::json!({
             "type": "user",
             "message": {"content": [
                 text_block("first words"),
-                text_block("CSR engine ready (degraded mode)."),
+                text_block(EMISSION),
+                text_block("<system-reminder>CSR PICKUP — x</system-reminder>"),
                 text_block("last words"),
             ]}
         });
-        let (sanitized, _) = sanitize_messages_for_search(&[message]);
+        let (sanitized, stats) = sanitize_messages_for_search(&[message]);
         assert_eq!(
             extract_message_text(&sanitized[0]),
-            "first words\nlast words"
+            "first words\nlast words",
+            "the derived path also drops the CSR text it reads"
         );
-    }
-
-    #[test]
-    fn sanitize_component_reports_what_it_removed_and_what_it_kept() {
-        let mut stats = CsrSuppressionStats::default();
-        let kept = sanitize_component(
-            SourceKind::Conversation,
-            ContentChannel::UserText,
-            "keep\n<system-reminder>CSR PICKUP — x</system-reminder>\nkeep too",
-            &mut stats,
-        )
-        .unwrap();
-        assert_eq!(kept.text, "keep\nkeep too");
-        assert_eq!(kept.removed.len(), 1);
-        assert_eq!(kept.removed[0].reason, ContaminationReason::SystemReminder);
         assert_eq!(stats.csr_hook_wrappers_scrubbed, 1);
-        // nothing left: the component is omitted
-        assert!(sanitize_component(
-            SourceKind::Conversation,
-            ContentChannel::UserText,
-            "CSR engine ready (degraded mode).",
-            &mut stats,
-        )
-        .is_none());
-        // a channel CSR cannot write into is returned as it came
-        let tool = sanitize_component(
-            SourceKind::Conversation,
-            ContentChannel::NonCsrToolResult,
-            "CSR engine ready (degraded mode).",
-            &mut stats,
-        )
-        .unwrap();
-        assert_eq!(tool.text, "CSR engine ready (degraded mode).");
-        assert!(tool.removed.is_empty());
     }
 
     #[test]
-    fn codex_and_sidechain_sources_follow_their_own_ownership_rules() {
-        let user = |text: &str| serde_json::json!({"type": "user", "message": {"content": [text_block(text)]}});
-        let emission = "recap [2m ago]: Fixed it. [[CSR:RECAP]]";
-        // Codex prose is the person's words: nothing is cut, wrapper included.
-        let mut codex = CsrMessageSanitizer::for_source(SourceKind::CodexRollout);
-        let mut message = user(&format!(
-            "{emission}\n<system-reminder>CSR PICKUP — x</system-reminder>"
-        ));
-        sanitize_message_for_search(&mut message, &mut codex);
-        assert_eq!(
-            extract_message_text(&message),
-            format!("{emission}\n<system-reminder>CSR PICKUP — x</system-reminder>")
+    fn chunk_mode_cuts_only_the_wrapper_and_derived_mode_also_strips_csr_text() {
+        let text = format!(
+            "keep\n<system-reminder>CSR PICKUP — x</system-reminder>\n{EMISSION}\nkeep too"
         );
-        assert_eq!(codex.stats, CsrSuppressionStats::default());
-        // Sidechain transcripts parse as Claude transcripts: same component rules.
+        let mut chunks = CsrMessageSanitizer::for_chunks();
+        let kept = sanitize_text_for_search(&text, true, &mut chunks);
+        assert_eq!(kept, format!("keep\n\n{EMISSION}\nkeep too"));
+        assert_eq!(chunks.stats.csr_hook_wrappers_scrubbed, 1);
+        // an assistant row has no wrapper cut at all
+        let mut chunks = CsrMessageSanitizer::for_chunks();
+        assert_eq!(sanitize_text_for_search(&text, false, &mut chunks), text);
+        let mut derived = CsrMessageSanitizer::for_derived();
+        let stripped = sanitize_text_for_search(&text, true, &mut derived);
+        assert!(!stripped.contains("recap ["), "{stripped:?}");
+        assert!(stripped.contains("keep"));
+    }
+
+    #[test]
+    fn codex_and_sidechain_text_is_kept_as_written() {
+        let user = |text: &str| serde_json::json!({"type": "user", "message": {"content": [text_block(text)]}});
+        // Chunk mode on a prose row with a complete wrapper still cuts it only
+        // when the row is the person's turn; the emission line stays.
+        let mut chunks = CsrMessageSanitizer::for_chunks();
+        let mut message = user(&format!("{EMISSION}\nafter"));
+        sanitize_message_for_search(&mut message, &mut chunks);
+        assert_eq!(extract_message_text(&message), format!("{EMISSION}\nafter"));
+        assert_eq!(chunks.stats, CsrSuppressionStats::default());
+        // Sidechain transcripts parse as Claude transcripts: same rule.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-child.jsonl");
         std::fs::write(
@@ -2094,13 +1914,16 @@ mod tests {
                 "isSidechain": true,
                 "uuid": "c1",
                 "timestamp": "2026-10-13T00:00:00Z",
-                "message": {"content": format!("{emission}\nkeep this reply")}
+                "message": {"content": format!("{EMISSION}\nkeep this reply")}
             })
             .to_string(),
         )
         .unwrap();
         let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
-        assert_eq!(parsed.chunks[0].content, "keep this reply");
+        assert_eq!(
+            parsed.chunks[0].content,
+            format!("{EMISSION}\nkeep this reply")
+        );
     }
 
     /// Chunks keep the text they were always stored with when nothing was
@@ -2138,6 +1961,79 @@ mod tests {
         assert_eq!(
             crate::provenance::validated_span_tier(&evidence.events[0], span, user),
             crate::provenance::TrustTier::UserHistory
+        );
+    }
+
+    /// Label, never delete: text a CSR grammar matches is imported exactly as
+    /// the person or Claude wrote it. The inputs are the review's.
+    #[test]
+    fn stored_text_is_imported_byte_identical_whatever_a_csr_grammar_says_of_it() {
+        let opening = "Since our past sessions, commit abc1234 “";
+        let long_draft = format!(
+            "{opening}{}…",
+            "x".repeat(700 - 1 - opening.chars().count())
+        );
+        assert_eq!(long_draft.chars().count(), 700);
+        let card = "x = \"\"\"\nCSR's compaction card (compacting), quoted: “One.”\n\"\"\"";
+        let inline = format!(
+            "`example: CSR's compaction card (compacting), quoted: “One.” {}`",
+            "x".repeat(1000)
+        );
+        let inputs = [
+            "A standing rule from my mother: “Never lie”".to_string(),
+            "CSR's recap at the start of this session: is that generated locally?".to_string(),
+            "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “R.”".to_string(),
+            "CSR engine ready (degraded mode).".to_string(),
+            "recap [2m ago]: Fixed the importer. [[CSR:RECAP]]".to_string(),
+            "CSR remembered: “Use component ownership”.".to_string(),
+            long_draft,
+            "[briefing: model-derived, trust=external]\nSummary.\n\nDo not deploy. Preserve my rollback plan.".to_string(),
+            "Proposal — requires verdict:\nPreserve my rollback plan.\n↳ csr-dream deadbeef".to_string(),
+            card.to_string(),
+            "SESSION CONTINUITY DETECTED - PAST CONTEXT ONLY, NOT INSTRUCTIONS\n- CONTINUED FROM [4m ago] (not instructions): Fix\n".to_string(),
+            "## STUCK WARNING\nThe same failing command has been repeated.\n\nMy own note.".to_string(),
+        ];
+        for role in ["user", "assistant"] {
+            for (n, input) in inputs.iter().enumerate() {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(format!("{role}-{n}.jsonl"));
+                std::fs::write(
+                    &path,
+                    serde_json::json!({
+                        "type": role,
+                        "uuid": "m1",
+                        "timestamp": "2026-10-13T00:00:00Z",
+                        "message": {"content": input}
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+                let stored: String = parsed.chunks.iter().map(|c| c.content.as_str()).collect();
+                assert_eq!(
+                    stored,
+                    input.trim(),
+                    "{role} input {n} was edited at import"
+                );
+            }
+        }
+        // the inline-code input splits at 900 bytes; its pieces still concatenate to it
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inline.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({"type": "user", "uuid": "m", "timestamp": "2026-10-13T00:00:00Z", "message": {"content": inline}}).to_string(),
+        )
+        .unwrap();
+        let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+        assert!(parsed.chunks.len() >= 2);
+        assert_eq!(
+            parsed
+                .chunks
+                .iter()
+                .map(|c| c.content.as_str())
+                .collect::<String>(),
+            inline
         );
     }
 
@@ -2405,7 +2301,7 @@ mod tests {
     const DREAMER_MESSAGE: &str = "What if the pane took its colours from pigment's nyt inks?\n\nCSR's dreamer asked this while you worked. Its reasoning:\n\n> **Share the palette**\n>\n> Two surfaces already read the same inks.";
 
     #[test]
-    fn the_companion_dreamers_whole_message_never_becomes_user_evidence() {
+    fn the_companion_dreamers_message_is_kept_whole_and_labeled() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("convo.jsonl");
         let lines = [
@@ -2453,61 +2349,34 @@ mod tests {
         .unwrap();
 
         let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
-        let everything = format!(
-            "{}\n{:?}",
-            parsed
-                .chunks
-                .iter()
-                .map(|chunk| chunk.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            parsed.evidence
-        );
-        for dreamer_word in [
-            "colours",
-            "pigment",
-            "dreamer",
-            "Share the palette",
-            "same inks",
-        ] {
-            assert!(
-                !everything.contains(dreamer_word),
-                "dreamer text `{dreamer_word}` survived import: {everything}"
-            );
-        }
-        // no event, user_message or otherwise, was minted for either dreamer message
-        let seqs: Vec<usize> = parsed
-            .evidence
-            .values()
-            .flat_map(|e| e.events.iter().map(|event| event.seq))
-            .collect();
-        assert_eq!(
-            seqs,
-            [0, 1, 4, 5],
-            "events for messages 2 and 3 exist: {seqs:?}"
-        );
-        // the person's own words, and the assistant's, are untouched
-        for kept in ["flaky retry test", "bounded backoff", "importer suite"] {
-            assert!(everything.contains(kept), "`{kept}` was lost: {everything}");
-        }
-        // Both dreamer messages went whole, before any join: the four retained
-        // messages meet with nothing between them, and each one's evidence
-        // span hashes exactly its own bytes.
-        let retained = [
+        // Label, never delete: both dreamer messages are stored as written,
+        // between the person's and the assistant's, each with its own evidence.
+        let messages = [
             "please fix the flaky retry test in the importer",
             "Looking at the retry test now.",
+            DREAMER_MESSAGE,
+            DREAMER_MESSAGE,
             "The retry test needed a bounded backoff.",
             "good, now run the whole importer suite",
         ];
         assert_eq!(parsed.chunks.len(), 1);
-        assert_eq!(parsed.chunks[0].content, retained.join("\n\n"));
-        let evidence = &parsed.evidence[&parsed.chunks[0].id];
+        let chunk = &parsed.chunks[0];
+        assert_eq!(chunk.content, messages.join("\n\n"));
+        let hits = contamination::detect(&chunk.content);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        for hit in &hits {
+            assert_eq!(
+                chunk.content[hit.start_byte..hit.end_byte].trim_end(),
+                DREAMER_MESSAGE
+            );
+        }
+        let evidence = &parsed.evidence[&chunk.id];
         let hashes: Vec<&str> = evidence
             .spans
             .iter()
             .map(|s| s.content_hash.as_str())
             .collect();
-        let expected: Vec<String> = retained
+        let expected: Vec<String> = messages
             .iter()
             .map(|text| crate::provenance::content_hash(text))
             .collect();
@@ -2517,109 +2386,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_r2_6_to_8_remover_keeps_what_extractable_keeps() {
-        use crate::extraction::provenance::{extractable, probes};
-        // #6: a request about the compaction card is the person's.
-        let card = probes::CARD_REQUEST;
-        assert_eq!(user_removal(card).kept, card);
-        assert!(user_removal(card).removed.is_empty());
-        // #7: a sentence that opens with the attribution's words is the person's.
-        let talk = probes::attribution_talk();
-        assert_eq!(user_removal(&talk).kept, talk);
-        // #8: both forwarded dreams go, the reply between them stays. Every
-        // byte outside the two forwards is kept, the blank line before the
-        // second one included.
-        let f = probes::hindi_forward();
-        let twice = format!("{f}\n\nNo, keep the current palette.\n\n{f}");
-        let cut = user_removal(&twice);
-        assert_eq!(cut.kept, "No, keep the current palette.\n\n");
-        assert_eq!(cut.removed.len(), 2);
-        assert!(cut
-            .removed
-            .iter()
-            .all(|span| span.reason == ContaminationReason::PluginDreamForward));
-        for text in [card.to_string(), talk, twice] {
-            assert_eq!(
-                user_removal(&text).kept.trim(),
-                extractable(&text).as_deref().unwrap_or(""),
-                "{text}"
-            );
-        }
-    }
-
-    #[test]
-    fn prose_that_merely_mentions_the_dreamer_is_kept() {
-        for kept in [
-            "what if the dreamer asked fewer questions while I work?",
-            "CSR's dreamer asked this while you worked yesterday, but I wrote today's question myself.",
-            "The attribution line reads CSR's dreamer asked this while you worked, quoted. Its reasoning: and then the quote.",
-            "Please change CSR's compaction card (the one in the sidebar) to show savings in tokens.",
-            "I read CSR's story of this session, rev 3 and liked it.",
-        ] {
-            let cut = user_removal(kept);
-            assert_eq!(cut.kept, kept);
-            assert!(cut.removed.is_empty(), "{kept}");
-        }
-    }
-
     const YSK_FORWARD: &str = "Here is a note offered by a side agent:\n\n> **Retry storm fixed**\n>\n> Heads up \u{b7} the importer retry loop was capped [commit f154ead].\n> It no longer re-queues failed chunks.";
 
+    /// Forwarded dreams, forwarded side-agent notes and prose that only
+    /// mentions them all import byte-identical; the detector may label a
+    /// forward, never cut it.
     #[test]
-    fn a_forwarded_side_agent_note_alone_is_dropped() {
-        let cut = user_removal(YSK_FORWARD);
-        assert_eq!(cut.kept, "");
-        assert_eq!(cut.removed.len(), 1);
-        assert_eq!(cut.removed[0].reason, ContaminationReason::PluginSideNote);
-        assert_eq!(
-            (cut.removed[0].start_byte, cut.removed[0].end_byte),
-            (0, YSK_FORWARD.len())
-        );
-    }
-
-    #[test]
-    fn prose_typed_after_a_forwarded_note_is_kept() {
-        let text = format!("{YSK_FORWARD}\n\nwhat do you think about this?");
-        assert_eq!(user_removal(&text).kept, "what do you think about this?");
-        let before = format!("First, my own line.\n\n{YSK_FORWARD}\n\nand this is after.");
-        assert_eq!(
-            user_removal(&before).kept,
-            "First, my own line.\n\nand this is after."
-        );
-    }
-
-    #[test]
-    fn a_forwarded_csr_band_note_is_dropped() {
-        let text = "Here is a note offered by CSR (claude-self-reflect):\n\n> **Settled**\n>\n> The cap landed [commit f154ead].";
-        assert_eq!(user_removal(text).kept, "");
-    }
-
-    #[test]
-    fn a_crlf_forwarded_note_is_dropped() {
-        let text = YSK_FORWARD.replace('\n', "\r\n");
-        assert_eq!(user_removal(&text).kept, "");
-    }
-
-    #[test]
-    fn a_crlf_forwarded_note_keeps_trailing_prose() {
-        let text = format!("{YSK_FORWARD}\n\nship it").replace('\n', "\r\n");
-        assert_eq!(user_removal(&text).kept, "ship it");
-        let padded = format!("{YSK_FORWARD}\n\n  ship it  \n").replace('\n', "\r\n");
-        assert_eq!(user_removal(&padded).kept, "  ship it  \r\n", "no trim");
-    }
-
-    #[test]
-    fn prose_that_merely_mentions_the_note_phrase_is_kept() {
-        for kept in [
-            "I wonder why here is a note offered by YSK shows up",
-            "Here is a note offered by a side agent\n> x",
-            "Here is a note offered by a side agent: it was wrong.",
-            "> Here is a note offered by a side agent:\n>\n> quoted by me",
-        ] {
-            let cut = user_removal(kept);
-            assert_eq!(cut.kept, kept);
-            assert!(cut.removed.is_empty(), "{kept}");
+    fn forwarded_notes_and_mentions_import_byte_identical() {
+        use crate::extraction::provenance::probes;
+        let forward = probes::hindi_forward();
+        let inputs = vec![
+            probes::CARD_REQUEST.to_string(),
+            probes::attribution_talk(),
+            format!("{forward}\n\nNo, keep the current palette.\n\n{forward}"),
+            YSK_FORWARD.to_string(),
+            format!("{YSK_FORWARD}\n\nwhat do you think about this?"),
+            format!("First, my own line.\n\n{YSK_FORWARD}\n\nand this is after."),
+            "Here is a note offered by CSR (claude-self-reflect):\n\n> **Settled**\n>\n> The cap landed [commit f154ead].".to_string(),
+            YSK_FORWARD.replace('\n', "\r\n"),
+            format!("{YSK_FORWARD}\n\n  ship it  \n"),
+            "what if the dreamer asked fewer questions while I work?".to_string(),
+            "Here is a note offered by a side agent: it was wrong.".to_string(),
+            "> Here is a note offered by a side agent:\n>\n> quoted by me".to_string(),
+        ];
+        for (n, input) in inputs.iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("forward-{n}.jsonl"));
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "type": "user",
+                    "uuid": "m1",
+                    "timestamp": "2026-10-13T00:00:00Z",
+                    "message": {"content": input}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+            let stored: String = parsed.chunks.iter().map(|c| c.content.as_str()).collect();
+            if parsed.chunks.len() == 1 {
+                assert_eq!(stored, input.trim(), "input {n} was edited at import");
+            } else {
+                // chunk edges trim the whitespace they split at; nothing else moves
+                let squeeze = |t: &str| t.split_whitespace().collect::<String>();
+                assert_eq!(
+                    squeeze(&stored),
+                    squeeze(input),
+                    "input {n} was edited at import"
+                );
+            }
         }
+        // the forwarded side-agent note is a detector hit (a label), not a cut
+        assert!(contamination::has_csr_text(YSK_FORWARD));
+        assert!(!contamination::has_csr_text(probes::CARD_REQUEST));
     }
 
     use crate::provenance::Speaker;
@@ -2791,8 +2611,8 @@ mod tests {
         assert_eq!(parsed.suppression.csr_hook_wrappers_scrubbed, 1);
         assert_eq!(parsed.chunks.len(), 1);
         let chunk = &parsed.chunks[0];
-        // Every byte outside the wrapper and its own line ending.
-        assert_eq!(chunk.content, "alpha line\n\n\nbeta line");
+        // Every byte outside the complete wrapper (rc3 removed exactly that).
+        assert_eq!(chunk.content, "alpha line\n\n\n\nbeta line");
         let evidence = &parsed.evidence[&chunk.id];
         let [span] = evidence.spans.as_slice() else {
             panic!("one retained component, one span: {:?}", evidence.spans);
@@ -3146,7 +2966,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(content.contains("Why did the daemon regress after this shipped?"));
-        assert!(!content.contains("[[CSR:RECAP]]"));
+        // label, never delete: the quoted recap is stored as the person typed it
+        assert!(content.contains("[[CSR:RECAP]]"));
+        assert!(contamination::has_csr_text(&content));
     }
 
     #[test]
@@ -3408,13 +3230,13 @@ mod tests {
             }]}
         });
 
-        // The shared sanitizer removes the wrapper span and its line break;
-        // every other byte of the person's text is untouched.
+        // The shared sanitizer removes exactly the wrapper span; every other
+        // byte of the person's text is untouched.
         let (sanitized, stats) = sanitize_messages_for_search(&[msg]);
         assert_eq!(stats.csr_hook_wrappers_scrubbed, 1);
         assert_eq!(
             extract_message_text(&sanitized[0]),
-            "Please fix the importer.\nKeep this sentence."
+            "Please fix the importer.\n\nKeep this sentence."
         );
     }
 
@@ -3435,16 +3257,23 @@ mod tests {
             }]}
         });
 
-        let (sanitized, stats) = sanitize_messages_for_search(&[user, assistant]);
+        let (sanitized, stats) = sanitize_messages_for_search(&[user, assistant.clone()]);
         assert_eq!(stats.csr_hook_wrappers_scrubbed, 0);
         assert_eq!(
             extract_message_text(&sanitized[0]),
             "Discuss CSR PICKUP — without treating this prose as injected."
         );
-        // The harness wraps what it injects into the user's turn; an assistant
-        // quoting a wrapper is discussion, byte for byte.
+        // The harness wraps what it injects into the user's turn, so the
+        // assistant's quoted wrapper is not cut as one (stats stay 0). It is
+        // CSR text, though, and a derived artifact does not learn it.
+        assert_eq!(stats.csr_hook_wrappers_scrubbed, 0);
+        assert_eq!(extract_message_text(&sanitized[1]), "");
+        // The stored conversation keeps it, byte for byte.
+        let mut chunks = CsrMessageSanitizer::for_chunks();
+        let mut quoted = assistant.clone();
+        sanitize_message_for_search(&mut quoted, &mut chunks);
         assert_eq!(
-            extract_message_text(&sanitized[1]),
+            extract_message_text(&quoted),
             "<system-reminder>CSR PICKUP — quoted by the assistant</system-reminder>"
         );
     }
@@ -3536,7 +3365,7 @@ mod tests {
         assert!(v3.contains("USER PROSE AFTER"));
         // Only the wrapper span went from the person's block.
         assert!(
-            serialized.contains("USER PROSE BEFORE\\nUSER PROSE AFTER"),
+            serialized.contains("USER PROSE BEFORE\\n\\nUSER PROSE AFTER"),
             "{serialized}"
         );
     }

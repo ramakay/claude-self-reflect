@@ -439,16 +439,17 @@ enum BackfillAction {
         #[arg(long)]
         ledger: Option<PathBuf>,
     },
-    /// Remove persisted CSR emissions and replace their stale search vectors.
+    /// Plan what a re-parse would change. Deletes nothing: a real run refuses,
+    /// CSR text is labeled in search instead.
     Scrub {
-        /// Print per-conversation actions without changing SQLite or HNSW.
+        /// Print per-conversation plans (the only mode that runs).
         #[arg(long)]
         dry_run: bool,
-        /// Restrict remediation to one contaminated conversation.
+        /// Restrict the plan to one conversation holding labeled CSR text.
         #[arg(long)]
         conversation: Option<String>,
-        /// Only purge conversations whose transcript is a CSR agent prompt
-        /// (narrator, ratification, briefing children); skip the emission scrub.
+        /// Only list conversations whose transcript is a CSR agent prompt
+        /// (narrator, ratification, briefing children).
         #[arg(long)]
         agent_transcripts: bool,
         /// Also scrub conversations active in the last 15 minutes (source file
@@ -1365,11 +1366,16 @@ async fn run(
             },
     }) = &args.command
     {
+        // Scrub deletes nothing in this release: refuse before taking any lock
+        // or opening anything for writing. `--dry-run` prints the plan.
+        if !*dry_run {
+            anyhow::bail!(csr_engine::import::scrub::SCRUB_REFUSAL);
+        }
         let data_dir = args.db_path.parent().unwrap_or(std::path::Path::new("."));
         let lock = csr_engine::maintenance::MaintenanceLock::acquire(data_dir)?;
-        // Preflight: the scrub runs only with no other process on the
-        // database. A hook from an older binary writes a chunk's text and its
-        // vector in two statements no transaction can fence.
+        // Preflight: the plan reads with no other process on the database, as
+        // a writer would have needed. A hook from an older binary writes a
+        // chunk's text and its vector in two statements no transaction can fence.
         let checked = csr_engine::maintenance::other_holders(&args.db_path);
         let holders = checked.as_ref().cloned().unwrap_or_default();
         let preflight = if let Err(error) = &checked {
@@ -1409,57 +1415,19 @@ async fn run(
                 holders.len()
             );
         }
-        let mut report = if *dry_run {
+        let mut report = {
             let storage = csr_engine::storage::Storage::open_read_only(&args.db_path)?;
-            csr_engine::import::scrub::dry_run_scrub(
+            let report = csr_engine::import::scrub::dry_run_scrub(
                 &storage,
                 conversation.as_deref(),
                 *agent_transcripts,
                 *include_active,
-            )?
-        } else {
-            // Process exit releases the OS lock, including after a signal.
-            tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    let mut terminate =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .ok();
-                    let terminated = async {
-                        match terminate.as_mut() {
-                            Some(signal) => {
-                                signal.recv().await;
-                            }
-                            None => std::future::pending::<()>().await,
-                        }
-                    };
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {}
-                        _ = terminated => {}
-                    }
-                }
-                #[cfg(not(unix))]
-                let _ = tokio::signal::ctrl_c().await;
-                std::process::exit(130);
-            });
-            let eng =
-                engine::Engine::new_for_maintenance(&args.db_path, &args.projects_dir, &lock)?;
-            let report = csr_engine::import::scrub::run_scrub(
-                &eng,
-                false,
-                conversation.as_deref(),
-                *agent_transcripts,
-                *include_active,
-            )
-            .await;
+            )?;
             drop(lock);
-            report?
+            report
         };
         report.preflight = preflight;
-        print!("{}", report.format_text(*dry_run));
-        if !dry_run {
-            println!("restart Claude Code: the running MCP server holds its own index");
-        }
+        print!("{}", report.format_text(true));
         return Ok(());
     }
 
