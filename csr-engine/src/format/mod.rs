@@ -761,6 +761,12 @@ pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
         "    <preview>{}</preview>\n",
         xml_escape(&preview)
     ));
+    if let Some(note) = &top.resolution {
+        out.push_str(&format!(
+            "    <resolution>{}</resolution>\n",
+            xml_escape(note)
+        ));
+    }
     out.push_str("  </top_result>\n");
 
     out.push_str("</quick_search>\n");
@@ -772,7 +778,12 @@ pub fn format_keyword_quick_check(results: &[EnrichedResult]) -> String {
     let Some(top) = results.first() else {
         return "<quick_search>\n  <found>false</found>\n  <count>0</count>\n  <collections_with_matches>0</collections_with_matches>\n  <message>No keyword matches found</message>\n</quick_search>\n".into();
     };
-    format!("<quick_search>\n  <found>true</found>\n  <count>1</count>\n  <relevance>keyword</relevance>\n  <collections_with_matches>1</collections_with_matches>\n  <top_result>\n    <score>n/a</score>\n    <margin>n/a</margin>\n    <timestamp>{}</timestamp>\n    <preview>{}</preview>\n  </top_result>\n</quick_search>\n",
+    let resolution = top
+        .resolution
+        .as_deref()
+        .map(|note| format!("    <resolution>{}</resolution>\n", xml_escape(note)))
+        .unwrap_or_default();
+    format!("<quick_search>\n  <found>true</found>\n  <count>1</count>\n  <relevance>keyword</relevance>\n  <collections_with_matches>1</collections_with_matches>\n  <top_result>\n    <score>n/a</score>\n    <margin>n/a</margin>\n    <timestamp>{}</timestamp>\n    <preview>{}</preview>\n{resolution}  </top_result>\n</quick_search>\n",
         age_stamp(&top.chunk.timestamp), xml_escape(truncate_chars(&top.chunk.content, PREVIEW_CHARS)))
 }
 
@@ -822,7 +833,11 @@ pub fn format_search_insights(results: &[EnrichedResult], query: &str) -> String
 }
 
 /// Format recent work results as XML.
-pub fn format_recent_work(chunks: &[ConversationChunk], group_by: &str) -> String {
+pub fn format_recent_work(
+    chunks: &[ConversationChunk],
+    group_by: &str,
+    notes: &std::collections::HashMap<String, String>,
+) -> String {
     let mut out = String::new();
 
     if chunks.is_empty() {
@@ -896,6 +911,12 @@ pub fn format_recent_work(chunks: &[ConversationChunk], group_by: &str) -> Strin
                     "    <preview>{}</preview>\n",
                     xml_escape(&preview)
                 ));
+                if let Some(note) = notes.get(&most_recent.id) {
+                    out.push_str(&format!(
+                        "    <resolution>{}</resolution>\n",
+                        xml_escape(note)
+                    ));
+                }
                 out.push_str("  </conversation>\n");
             }
             out.push_str("</recent_work>");
@@ -1067,7 +1088,12 @@ pub fn format_more_results(
 /// Format file-based search results. `indexed` reports whether the code
 /// graph has any extraction record for this file at all — false here means
 /// this is a pure keyword fallback with no graph backing whatsoever.
-pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str, indexed: bool) -> String {
+pub fn format_file_results(
+    chunks: &[ConversationChunk],
+    file_path: &str,
+    indexed: bool,
+    notes: &std::collections::HashMap<String, String>,
+) -> String {
     let mut out = String::new();
 
     if chunks.is_empty() {
@@ -1105,6 +1131,12 @@ pub fn format_file_results(chunks: &[ConversationChunk], file_path: &str, indexe
             "    <conversation_id>{}</conversation_id>\n",
             xml_escape(&chunk.conversation_id)
         ));
+        if let Some(note) = notes.get(&chunk.id) {
+            out.push_str(&format!(
+                "    <resolution>{}</resolution>\n",
+                xml_escape(note)
+            ));
+        }
         out.push_str("  </result>\n");
     }
 
@@ -2413,7 +2445,7 @@ mod tests {
         let mut oldest = make_chunk("z-oldest", "zzzz-oldest", "oldest content");
         oldest.timestamp = "2026-09-01T10:00:00Z".into();
 
-        let xml = format_recent_work(&[newest, oldest], "session");
+        let xml = format_recent_work(&[newest, oldest], "session", &Default::default());
         let newest_pos = xml.find("aaaa-newest").unwrap();
         let oldest_pos = xml.find("zzzz-oldest").unwrap();
         assert!(

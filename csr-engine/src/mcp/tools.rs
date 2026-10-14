@@ -776,8 +776,14 @@ pub(crate) async fn keyword_fallback(
                     trust: r.trust,
                 })
                 .collect();
-            let mut rendered =
-                format_why(query, &items, &HashSet::new(), &ReinstateTrace::default());
+            let labels = why_csr_text_labels(storage, &items);
+            let mut rendered = format_why_labeled(
+                query,
+                &items,
+                &HashSet::new(),
+                &ReinstateTrace::default(),
+                &labels,
+            );
             append_memory_provenance_hop(storage, &items, &mut rendered)?;
             Ok(rendered)
         }
@@ -2240,6 +2246,9 @@ async fn quick_check_with_vec(
         })
         .collect();
     apply_trust_labels(&mut enriched, storage);
+    let labeled_chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
+    let validity = csr_text_labels_only(storage, &labeled_chunks);
+    apply_validity_partition(&mut enriched, &validity, false);
 
     Ok(format::format_quick_check(&enriched, query))
 }
@@ -2291,7 +2300,8 @@ pub async fn get_recent_work(
     group_by: &str,
 ) -> Result<String> {
     let chunks = storage.get_recent_chunks(limit, project)?;
-    Ok(format::format_recent_work(&chunks, group_by))
+    let notes = csr_text_notes(storage, &chunks);
+    Ok(format::format_recent_work(&chunks, group_by, &notes))
 }
 
 fn recency_window(
@@ -2441,10 +2451,12 @@ pub async fn search_by_file(
         .into_iter()
         .map(|(chunk, _, _)| chunk)
         .collect();
+    let notes = csr_text_notes(storage, &chunks);
     Ok(format::format_file_results(
         &chunks,
         file_path,
         ledger.indexed,
+        &notes,
     ))
 }
 
@@ -2719,11 +2731,13 @@ pub async fn why(
         let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
     }
 
-    let mut rendered = format_why(
+    let labels = why_csr_text_labels(storage, &ranking.items);
+    let mut rendered = format_why_labeled(
         query,
         &ranking.items,
         &ranking.hoisted_chunk_ids,
         &reinstatement.trace,
+        &labels,
     );
 
     append_memory_provenance_hop(storage, &ranking.items, &mut rendered)?;
@@ -2798,11 +2812,34 @@ fn sanitize_memory_description(s: &str) -> String {
 
 /// Format evidence items as: header, grouped-by-conversation body (in the
 /// ranked order `items` already carries), footer summary.
+/// `[CSR text]` notes for the evidence chunks that hold CSR text, by chunk id.
+/// The excerpt shown is a cut of the chunk; the detector reads the whole chunk.
+fn why_csr_text_labels(
+    storage: &Arc<Storage>,
+    items: &[crate::search::reinstatement::EvidenceItem],
+) -> HashMap<String, String> {
+    let ids: Vec<String> = items.iter().map(|item| item.chunk_id.clone()).collect();
+    match storage.get_chunks_by_ids(&ids) {
+        Ok(chunks) => csr_text_notes(storage, &chunks),
+        Err(_) => HashMap::new(),
+    }
+}
+
 pub(crate) fn format_why(
     query: &str,
     items: &[crate::search::reinstatement::EvidenceItem],
     hoisted_chunk_ids: &HashSet<String>,
     trace: &crate::search::reinstatement::ReinstateTrace,
+) -> String {
+    format_why_labeled(query, items, hoisted_chunk_ids, trace, &HashMap::new())
+}
+
+pub(crate) fn format_why_labeled(
+    query: &str,
+    items: &[crate::search::reinstatement::EvidenceItem],
+    hoisted_chunk_ids: &HashSet<String>,
+    trace: &crate::search::reinstatement::ReinstateTrace,
+    labels: &HashMap<String, String>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!("WHY: {query}\n\n"));
@@ -2859,6 +2896,9 @@ pub(crate) fn format_why(
                     it.conversation_id,
                     it.excerpt
                 ));
+                if let Some(note) = labels.get(&it.chunk_id) {
+                    out.push_str(&format!("    {note}\n"));
+                }
             }
             out.push('\n');
         }
@@ -3804,6 +3844,26 @@ fn resolve_validity_checked(
 /// output. Same style as `[stale anchor]` / `[evolved]`.
 const CSR_TEXT_LABEL: &str = "[CSR text]";
 
+fn csr_text_note(hit: &crate::import::contamination::Hit) -> String {
+    format!(
+        "{CSR_TEXT_LABEL} this chunk holds CSR's own output ({})",
+        hit.formatter
+    )
+}
+
+/// The `[CSR text]` note for each of these chunks that holds CSR text, for the
+/// tools that list chunks without a validity pass. Read-only; no row is dropped.
+fn csr_text_notes(
+    storage: &Arc<Storage>,
+    chunks: &[crate::import::ConversationChunk],
+) -> HashMap<String, String> {
+    storage
+        .csr_text_hits(chunks)
+        .iter()
+        .map(|(id, hit)| (id.clone(), csr_text_note(hit)))
+        .collect()
+}
+
 /// Label the results whose chunk text matches a CSR formatter's grammar, the
 /// way a dream verdict labels a stale anchor: a `[CSR text]` note, and the same
 /// rank sink wherever the dream consumption mode already sinks (`full`), never
@@ -3819,10 +3879,7 @@ fn add_csr_text_labels(
         let Some(hit) = hits.get(&chunk.id) else {
             continue;
         };
-        let note = format!(
-            "{CSR_TEXT_LABEL} this chunk holds CSR's own output ({})",
-            hit.formatter
-        );
+        let note = csr_text_note(hit);
         match validity.get_mut(&chunk.id) {
             Some(existing) => {
                 existing.note = format!("{}; {note}", existing.note);
@@ -6530,6 +6587,122 @@ mod tests {
             assert!(clean < csr, "{mode:?}: clean first, CSR second\n{out}");
             assert!(out.contains("[CSR text]"), "{mode:?}: labeled\n{out}");
         }
+    }
+
+    const CSR_RULE_TEXT: &str =
+        "A standing rule from 10-12: “Keep receipts”\nsee libfile in the tree";
+
+    /// A stored user chunk holding CSR text (and its true author in
+    /// chunk_provenance), with a vector for the search index.
+    fn store_csr_text_chunk(
+        storage: &Arc<Storage>,
+        search: &mut SearchEngine,
+        id: &str,
+        conversation: &str,
+        content: &str,
+        vector: [f32; 4],
+    ) {
+        let chunk = crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: conversation.into(),
+            project_name: "test".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &vector).unwrap();
+        storage
+            .insert_chunk_provenance(
+                id,
+                &crate::provenance::ChunkProvenance {
+                    author: crate::provenance::Speaker::User,
+                    source_conv_id: conversation.into(),
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        search.insert_chunk(id.to_string(), vector.to_vec());
+    }
+
+    /// Every chunk-returning tool labels a chunk holding CSR text and never
+    /// drops its row: quick check, recent work, the file search fallback.
+    #[tokio::test]
+    async fn the_other_chunk_returning_tools_label_csr_text_and_keep_the_row() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut index = SearchEngine::new(8);
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "csr-chunk",
+            "conv-csr",
+            CSR_RULE_TEXT,
+            [1.0, 0.0, 0.0, 0.0],
+        );
+        let search = Arc::new(RwLock::new(index));
+
+        let quick = quick_check_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "q",
+            0.1,
+            Some("all"),
+        )
+        .await
+        .unwrap();
+        assert!(quick.contains("<found>true</found>"), "{quick}");
+        assert!(quick.contains("[CSR text]"), "quick check: {quick}");
+
+        let recent = get_recent_work(&storage, 5, None, "conversation")
+            .await
+            .unwrap();
+        assert!(recent.contains("conv-csr"), "the row is kept: {recent}");
+        assert!(recent.contains("[CSR text]"), "recent work: {recent}");
+
+        let by_file = search_by_file(&storage, "libfile", 5, None).await.unwrap();
+        assert!(by_file.contains("conv-csr"), "the row is kept: {by_file}");
+        assert!(by_file.contains("[CSR text]"), "file search: {by_file}");
+    }
+
+    #[test]
+    fn why_evidence_from_a_csr_text_chunk_is_labeled_and_kept() {
+        use crate::search::reinstatement::{EvidenceItem, ReinstateTrace, Via};
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut index = SearchEngine::new(8);
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "csr-chunk",
+            "conv-csr",
+            CSR_RULE_TEXT,
+            [1.0, 0.0, 0.0, 0.0],
+        );
+        let item = EvidenceItem {
+            chunk_id: "csr-chunk".into(),
+            conversation_id: "conv-csr".into(),
+            score: 0.9,
+            best_route: Via::Keyword,
+            routes: [Via::Keyword].into_iter().collect(),
+            route_scores: [(Via::Keyword, 0.9)].into_iter().collect(),
+            timestamp: "2026-10-13T00:00:00Z".into(),
+            excerpt: "A standing rule".into(),
+            ratification: None,
+            trust: crate::provenance::TrustTier::Unknown,
+        };
+        let labels = why_csr_text_labels(&storage, std::slice::from_ref(&item));
+        let rendered = format_why_labeled(
+            "q",
+            &[item],
+            &HashSet::new(),
+            &ReinstateTrace::default(),
+            &labels,
+        );
+        assert!(rendered.contains("conv_conv-csr"), "kept: {rendered}");
+        assert!(rendered.contains("[CSR text]"), "{rendered}");
     }
 
     #[tokio::test]
