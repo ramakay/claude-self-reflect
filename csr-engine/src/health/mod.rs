@@ -10,9 +10,10 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::search::SearchEngine;
 use crate::storage::{queries, Storage};
@@ -336,6 +337,156 @@ pub async fn run_health(
     })
 }
 
+/// How many five-minute ticks a due measurement waits for a due dream pass
+/// before running anyway: dreaming goes first, but a stuck dream pass must not
+/// starve the health measurement.
+pub const MAX_DREAM_DEFERRALS: u32 = 12;
+/// Seconds between cadence checks.
+const TICK_SECS: u64 = 300;
+/// Seconds the loop waits after daemon start before its first check, so the
+/// watcher's first import batches are not competing with it.
+const START_DELAY_SECS: u64 = 120;
+
+/// Whether a dream pass is due and will want the heavy-work permit.
+pub fn dream_pending(storage: &Storage, now: DateTime<Utc>) -> bool {
+    use crate::daemon::dream_cadence as dc;
+    !dc::dreaming_disabled()
+        && !dc::consent_declined(storage)
+        && dc::is_due(dc::read_last_run(storage), now, dc::interval_secs())
+}
+
+/// A due measurement yields to a due dream pass, a bounded number of ticks.
+pub fn defer_for_dream(dream_pending: bool, deferred_ticks: u32) -> bool {
+    dream_pending && deferred_ticks < MAX_DREAM_DEFERRALS
+}
+
+/// Persist the canary verdict for this binary (daemon start). Pure and
+/// database-free to evaluate; only the record is written.
+pub fn record_canary(storage: &Storage, now: DateTime<Utc>) -> Result<()> {
+    let canary = crate::eval::contamination::emitter_canary();
+    let mut snapshot = load_health(storage)?;
+    snapshot.state.version = 1;
+    snapshot.state.canary = Some(CanaryRecord {
+        at: now.to_rfc3339(),
+        passed: canary.passed,
+        detail: canary.detail,
+    });
+    save_health(storage, &snapshot)
+}
+
+/// What one cadence check did.
+#[derive(Debug)]
+pub enum Tick {
+    NotDue,
+    /// Due, but yielding to a due dream pass.
+    Deferred,
+    Ran(Box<HealthRun>),
+    Failed(String),
+    Shutdown,
+}
+
+/// One cadence check: measure when six hours have passed since the last
+/// attempt, behind the shared heavy-work permit and after a due dream pass.
+/// With dreaming disabled the measurement runs when due all the same.
+pub async fn health_tick(
+    storage: &Storage,
+    search: &Arc<RwLock<SearchEngine>>,
+    backend: &dyn probe::ProbeBackend,
+    heavy_work: &Arc<Semaphore>,
+    shutdown: &AtomicBool,
+    now: DateTime<Utc>,
+    deferred_ticks: u32,
+) -> Tick {
+    if shutdown.load(Ordering::SeqCst) {
+        return Tick::Shutdown;
+    }
+    if !health_due(storage, now) {
+        return Tick::NotDue;
+    }
+    if defer_for_dream(dream_pending(storage, now), deferred_ticks) {
+        return Tick::Deferred;
+    }
+    let Ok(permit) = heavy_work.clone().acquire_owned().await else {
+        return Tick::Shutdown;
+    };
+    if shutdown.load(Ordering::SeqCst) {
+        return Tick::Shutdown;
+    }
+    let outcome = run_health(storage, search, backend, false, now).await;
+    drop(permit);
+    match outcome {
+        Ok(run) => Tick::Ran(Box::new(run)),
+        Err(error) => Tick::Failed(error.to_string()),
+    }
+}
+
+async fn pause(seconds: u64, shutdown: &AtomicBool) -> bool {
+    for _ in 0..seconds.div_ceil(10) {
+        if shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    }
+    !shutdown.load(Ordering::SeqCst)
+}
+
+/// The daemon's health cadence: canary at start, then the six-hour
+/// measurement on the shared heavy-work permit. Restart-safe: the schedule is
+/// the persisted last attempt, not process memory.
+pub async fn health_loop(
+    storage: Arc<Storage>,
+    embeddings: Arc<crate::embeddings::EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: Arc<AtomicBool>,
+) {
+    if let Err(error) = record_canary(&storage, Utc::now()) {
+        tracing::warn!(%error, "could not record the canary verdict");
+    }
+    let backend = probe::EngineBackend {
+        storage: storage.clone(),
+        embeddings,
+        search: search.clone(),
+    };
+    if !pause(START_DELAY_SECS, &shutdown).await {
+        return;
+    }
+    let mut deferred = 0;
+    loop {
+        match health_tick(
+            &storage,
+            &search,
+            &backend,
+            &heavy_work,
+            &shutdown,
+            Utc::now(),
+            deferred,
+        )
+        .await
+        {
+            Tick::Shutdown => return,
+            Tick::Deferred => deferred += 1,
+            Tick::NotDue => deferred = 0,
+            Tick::Ran(run) => {
+                deferred = 0;
+                tracing::info!(
+                    grade = run.probe.grade.as_str(),
+                    hits = run.probe.hits,
+                    n = run.probe.n,
+                    "memory health measured"
+                );
+            }
+            Tick::Failed(error) => {
+                deferred = 0;
+                tracing::warn!(%error, "memory health measurement failed");
+            }
+        }
+        if !pause(TICK_SECS, &shutdown).await {
+            return;
+        }
+    }
+}
+
 /// What one `run_health` measured, beside everything now persisted.
 #[derive(Debug, Clone)]
 pub struct HealthRun {
@@ -494,5 +645,164 @@ mod tests {
             now + Duration::hours(5) + Duration::minutes(59)
         ));
         assert!(health_due(&storage, now + Duration::hours(6)));
+    }
+    struct Silent;
+
+    #[async_trait::async_trait]
+    impl probe::ProbeBackend for Silent {
+        async fn final_page(&self, _query: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn search() -> Arc<RwLock<SearchEngine>> {
+        Arc::new(RwLock::new(SearchEngine::new(8)))
+    }
+
+    #[test]
+    fn dream_goes_first_but_only_for_a_bounded_time() {
+        assert!(defer_for_dream(true, 0));
+        assert!(defer_for_dream(true, MAX_DREAM_DEFERRALS - 1));
+        assert!(
+            !defer_for_dream(true, MAX_DREAM_DEFERRALS),
+            "a stuck dream cannot starve health"
+        );
+        assert!(
+            !defer_for_dream(false, 0),
+            "with no dream due, health runs when due"
+        );
+    }
+
+    /// The dream cadence reads the process env, so the shared test guard is
+    /// held for the whole test, outside the async body.
+    #[test]
+    fn health_tick_runs_when_due_on_the_shared_permit_and_then_waits_six_hours() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                health_tick_runs_when_due_on_the_shared_permit_and_then_waits_six_hours_body(),
+            );
+    }
+
+    async fn health_tick_runs_when_due_on_the_shared_permit_and_then_waits_six_hours_body() {
+        let storage = Storage::open_memory().unwrap();
+        let heavy = Arc::new(Semaphore::new(1));
+        let shutdown = AtomicBool::new(false);
+        let now = Utc::now();
+        // pretend dreaming already ran, so only health is due
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &now.to_rfc3339(),
+            )
+            .unwrap();
+
+        let first = health_tick(&storage, &search(), &Silent, &heavy, &shutdown, now, 0).await;
+        let Tick::Ran(run) = first else {
+            panic!("expected a run, got {first:?}")
+        };
+        assert_eq!(run.probe.grade, ProbeGrade::Abstain);
+        assert_eq!(run.probe.n, 0);
+        assert_eq!(heavy.available_permits(), 1, "the permit is released");
+        assert!(load_health(&storage).unwrap().state.canary.unwrap().passed);
+
+        let soon = now + Duration::hours(5);
+        assert!(matches!(
+            health_tick(&storage, &search(), &Silent, &heavy, &shutdown, soon, 0).await,
+            Tick::NotDue
+        ));
+        let later = now + Duration::hours(6);
+        // the dream pass is due again by then; it has run, so only health is due
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &later.to_rfc3339(),
+            )
+            .unwrap();
+        assert!(matches!(
+            health_tick(&storage, &search(), &Silent, &heavy, &shutdown, later, 0).await,
+            Tick::Ran(_)
+        ));
+    }
+
+    /// The dream cadence reads the process env, so the shared test guard is
+    /// held for the whole test, outside the async body.
+    #[test]
+    fn health_tick_yields_to_a_due_dream_then_runs_and_respects_shutdown() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(health_tick_yields_to_a_due_dream_then_runs_and_respects_shutdown_body());
+    }
+
+    async fn health_tick_yields_to_a_due_dream_then_runs_and_respects_shutdown_body() {
+        let storage = Storage::open_memory().unwrap();
+        let heavy = Arc::new(Semaphore::new(1));
+        let shutdown = AtomicBool::new(false);
+        let now = Utc::now();
+        // never dreamed: no dream is pending, health is not held back
+        assert!(!dream_pending(&storage, now));
+        // last dreamed seven hours ago: one is due, so health defers, boundedly
+        storage
+            .set_meta(
+                crate::daemon::dream_cadence::META_LAST_RUN_AT,
+                &(now - Duration::hours(7)).to_rfc3339(),
+            )
+            .unwrap();
+        assert!(dream_pending(&storage, now));
+        assert!(matches!(
+            health_tick(&storage, &search(), &Silent, &heavy, &shutdown, now, 0).await,
+            Tick::Deferred
+        ));
+        assert!(matches!(
+            health_tick(
+                &storage,
+                &search(),
+                &Silent,
+                &heavy,
+                &shutdown,
+                now,
+                MAX_DREAM_DEFERRALS
+            )
+            .await,
+            Tick::Ran(_)
+        ));
+
+        // a held permit blocks the run; shutdown while waiting abstains
+        let held = heavy.clone().acquire_owned().await.unwrap();
+        let later = now + Duration::hours(7);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let storage = Arc::new(Storage::open_memory().unwrap());
+            let heavy = heavy.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                health_tick(
+                    &storage,
+                    &search(),
+                    &Silent,
+                    &heavy,
+                    &shutdown,
+                    later,
+                    MAX_DREAM_DEFERRALS,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        shutdown.store(true, Ordering::SeqCst);
+        drop(held);
+        assert!(matches!(waiter.await.unwrap(), Tick::Shutdown));
+        // nothing was written by the abstained tick's store (a separate one),
+        // and the canary-only record path writes just the health key
+        let other = Storage::open_memory().unwrap();
+        record_canary(&other, now).unwrap();
+        assert!(other.get_meta(META_HEALTH).unwrap().is_some());
+        assert!(other.get_meta(META_SAMPLE).unwrap().is_none());
     }
 }

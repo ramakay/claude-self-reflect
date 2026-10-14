@@ -1107,6 +1107,22 @@ impl Daemon {
         };
         tracing::info!("trained re-ranker nightly loop started");
 
+        // Memory health: the canary verdict at start, then the six-hour
+        // known-item recall probe and duplicate-rate measurement, restart-safe
+        // (the schedule is the persisted last attempt). It shares the single
+        // heavy-work permit and yields to a due dream pass for a bounded time.
+        let health_handle = {
+            let storage = self.storage.clone();
+            let embeddings = self.embeddings.clone();
+            let search = self.search.clone();
+            let heavy_work = heavy_work.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                crate::health::health_loop(storage, embeddings, search, heavy_work, shutdown).await;
+            })
+        };
+        tracing::info!("memory health loop started");
+
         // Reaction-judge shadow mode: score new interactive (assistant tail,
         // human turn) pairs with every installed student and log the
         // probabilities. First pass after a minute, then every 15 minutes, under
@@ -1345,6 +1361,10 @@ impl Daemon {
         // transactionally. Await it so shutdown cannot detach a half-harvested
         // training attempt.
         let _ = trained_rerank_handle.await;
+        // A measurement holds the heavy-work permit and only reads the index
+        // and writes three meta keys; the loop abstains at the permit and
+        // between cases on shutdown, so await it fully rather than detach it.
+        let _ = health_handle.await;
         let _ = tokio::time::timeout(timeout, reaction_shadow_handle).await;
         // The loop itself races an in-flight rebuild against the shutdown
         // flag (see the compaction loop above) and returns within one
