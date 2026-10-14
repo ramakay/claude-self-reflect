@@ -498,7 +498,7 @@ impl Storage {
     /// and that can carry CSR text at all: the one question search, hooks and
     /// status ask. A chunk read from the chunks table carries the default
     /// author, so the true author is read from `chunk_provenance` here (one
-    /// pass). Read-only; nothing stored changes.
+    /// batched query). Read-only; nothing stored changes.
     pub fn csr_text_hits(
         &self,
         chunks: &[ConversationChunk],
@@ -521,7 +521,14 @@ impl Storage {
         chunks
             .iter()
             .filter_map(|chunk| {
-                let author = authors.get(&chunk.id).copied().unwrap_or(chunk.author);
+                // A chunk that carries its own author keeps it; one read from the
+                // chunks table carries the default, so its author is the
+                // provenance row's, or unknown when it has none (a legacy chunk).
+                let author = if chunk.author == Speaker::ToolResult {
+                    authors.get(&chunk.id).copied()
+                } else {
+                    Some(chunk.author)
+                };
                 crate::import::contamination::text_hit(
                     &chunk.conversation_id,
                     author,

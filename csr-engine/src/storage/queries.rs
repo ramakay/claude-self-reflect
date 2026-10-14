@@ -912,19 +912,25 @@ pub fn get_chunks_by_ids_with_provenance(
     Ok(chunks)
 }
 
-/// The authors of some chunks, from `chunk_provenance`, in one pass. A chunk
-/// with no row (or an unknown token) is absent from the map.
+/// The authors of some chunks, from `chunk_provenance`, one query per 500
+/// ids. A chunk with no row (or an unknown token) is absent from the map.
 pub fn chunk_authors(
     conn: &Connection,
     ids: &[String],
 ) -> Result<HashMap<String, crate::provenance::Speaker>> {
-    let mut stmt = conn.prepare("SELECT author FROM chunk_provenance WHERE chunk_id = ?1")?;
     let mut authors = HashMap::new();
-    for id in ids {
-        let mut rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
-        if let Some(row) = rows.next() {
-            if let Ok(author) = row?.parse() {
-                authors.insert(id.clone(), author);
+    for batch in ids.chunks(500) {
+        let marks = vec!["?"; batch.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT chunk_id, author FROM chunk_provenance WHERE chunk_id IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, author) = row?;
+            if let Ok(author) = author.parse() {
+                authors.insert(id, author);
             }
         }
     }

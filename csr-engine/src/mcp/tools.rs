@@ -6705,6 +6705,65 @@ mod tests {
         assert!(rendered.contains("[CSR text]"), "{rendered}");
     }
 
+    /// 20% of a real corpus has no chunk_provenance row. Such a conversation
+    /// chunk has an unknown author, not a tool author: it is labeled and sunk
+    /// like any other.
+    #[tokio::test]
+    async fn a_legacy_chunk_with_no_provenance_row_is_labeled_and_sunk() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut search = SearchEngine::new(8);
+        for (id, conversation, content, vector) in [
+            (
+                "legacy-csr",
+                "conv-legacy",
+                "A standing rule from 10-12: “Keep receipts”\nshared recall text".to_string(),
+                [1.0, 0.0, 0.0, 0.0],
+            ),
+            (
+                "legacy-clean",
+                "conv-clean",
+                "shared recall text about ordinary work".to_string(),
+                [0.9, 0.1, 0.0, 0.0],
+            ),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: conversation.into(),
+                project_name: "test".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content,
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            // no insert_chunk_provenance: a legacy row
+            storage.insert_chunk(&chunk, &vector).unwrap();
+            search.insert_chunk(chunk.id, vector.to_vec());
+        }
+        let search = Arc::new(RwLock::new(search));
+        let out = reflect_on_past_with_vec(
+            &storage,
+            &search,
+            &[1.0, 0.0, 0.0, 0.0],
+            "recall",
+            5,
+            0.1,
+            Some("all"),
+            0,
+            true,
+            ConsumptionMode::AnnotateOnly,
+            false,
+        )
+        .await
+        .unwrap();
+        let csr = out.find("<id>legacy-csr</id>").expect("kept");
+        let clean = out.find("<id>legacy-clean</id>").expect("kept");
+        assert!(clean < csr, "clean first\n{out}");
+        assert!(out.contains("[CSR text]"), "{out}");
+    }
+
     #[tokio::test]
     async fn full_fts_window_refills_slots_opened_by_sidechain_dedupe() {
         let storage = Arc::new(Storage::open_memory().unwrap());
@@ -7739,6 +7798,19 @@ mod tests {
         ] {
             let mut enriched = results();
             let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
+            // stored with their authors, as the importer writes them: a chunk
+            // with no provenance row at all would be a legacy chunk of unknown author
+            for chunk in &chunks {
+                let _ = storage.insert_chunk(chunk, &[0.0; 4]);
+                let _ = storage.insert_chunk_provenance(
+                    &chunk.id,
+                    &crate::provenance::ChunkProvenance {
+                        author: chunk.author,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                );
+            }
             let validity = resolve_validity_with(&storage, &chunks, mode);
             apply_validity_partition(&mut enriched, &validity, false);
 

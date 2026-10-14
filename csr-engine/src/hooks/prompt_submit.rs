@@ -1624,6 +1624,9 @@ async fn search_chunks_with_vec_core(
         }
     };
 
+    // The detector's answer for every fetched chunk, in one batched read: a
+    // legacy chunk with no provenance row has an unknown author and is checked.
+    let csr_text = storage.csr_text_hits(&fetched);
     let mut chunk_by_id: std::collections::HashMap<String, _> =
         fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
 
@@ -1658,7 +1661,7 @@ async fn search_chunks_with_vec_core(
                 // CSR text is labeled in search and not handed back as memory:
                 // read the whole chunk, before the preview is cut. Selection
                 // only; the stored chunk is untouched.
-                if crate::import::contamination::chunk_hit(&chunk).is_some() {
+                if csr_text.contains_key(&chunk.id) {
                     continue;
                 }
 
@@ -2588,6 +2591,50 @@ mod tests {
             .filter_map(|r| r.memory_id.as_deref())
             .collect();
         assert_eq!(ids, ["plain"], "the long rule must not be injected");
+    }
+
+    /// A legacy chunk with no chunk_provenance row has an unknown author, not
+    /// a tool author: predictive context does not inject it either.
+    #[tokio::test]
+    async fn a_legacy_csr_text_chunk_without_provenance_is_not_injected() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, content) in [
+            ("legacy-rule", "A standing rule from 10-12: “Keep receipts”"),
+            ("plain", "we moved the index load out of the hook"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(id.to_string(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let results =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 5, 0.0, "project", None, |_| {
+                HashMap::new()
+            })
+            .await;
+        let ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        assert_eq!(ids, ["plain"]);
     }
 
     /// Lineage pickup skips an episode whose text has a detector hit and falls

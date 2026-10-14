@@ -203,19 +203,21 @@ pub fn labelable_chunk(chunk: &crate::import::ConversationChunk) -> bool {
 /// The first hit in a chunk's text, when the chunk is one that can carry CSR
 /// text. This is the one question search, hooks and status ask.
 pub fn chunk_hit(chunk: &crate::import::ConversationChunk) -> Option<Hit> {
-    text_hit(&chunk.conversation_id, chunk.author, &chunk.content)
+    text_hit(&chunk.conversation_id, Some(chunk.author), &chunk.content)
 }
 
 /// [`chunk_hit`] for a chunk whose author is known apart from the chunk (a
 /// chunk read from the chunks table carries the non-authoritative default).
+/// An author of `None` is unknown, as for a legacy chunk with no provenance
+/// row: it can carry CSR text like any conversation chunk, and is labeled.
 pub fn text_hit(
     conversation_id: &str,
-    author: crate::provenance::Speaker,
+    author: Option<crate::provenance::Speaker>,
     content: &str,
 ) -> Option<Hit> {
     if conversation_id.starts_with("codex:")
         || conversation_id.starts_with("plan:")
-        || author == crate::provenance::Speaker::ToolResult
+        || author == Some(crate::provenance::Speaker::ToolResult)
     {
         return None;
     }
