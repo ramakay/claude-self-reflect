@@ -875,6 +875,27 @@ mod tests {
     }
 
     #[test]
+    fn only_failing_results_gate_the_full_eval() {
+        let report = |results: Vec<EvalResult>| EvalReport {
+            results,
+            total_ms: 0.0,
+        };
+        // report-only, abstaining and amber results pass and never gate
+        let quiet = report(vec![
+            EvalResult::pass("a", "c", 0.0, "REPORT ONLY: 29 duplicate rows".into()),
+            EvalResult::pass("b", "c", 0.0, "ABSTAIN: 4 eligible cases".into()),
+            EvalResult::pass("c", "c", 0.0, "AMBER (non-gating): 15/20".into()),
+        ]);
+        assert!(!quiet.has_gating_failure());
+        // a red recall result is a FAIL result, and it gates
+        let red = report(vec![
+            EvalResult::pass("a", "c", 0.0, "ok".into()),
+            EvalResult::fail("Known-Item Recall", "c", 0.0, "RED: 6/20".into()),
+        ]);
+        assert!(red.has_gating_failure());
+    }
+
+    #[test]
     fn search_latency_gate_enforces_sub_millisecond_p95() {
         assert!(search_latency_passes(0.999));
         assert!(!search_latency_passes(1.0));
