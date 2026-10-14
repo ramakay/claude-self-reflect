@@ -283,7 +283,7 @@ pub async fn run_health(
     backend: &dyn probe::ProbeBackend,
     refresh_sample: bool,
     now: DateTime<Utc>,
-) -> Result<HealthSnapshot> {
+) -> Result<HealthRun> {
     let mut snapshot = load_health(storage)?;
     let at = now.to_rfc3339();
 
@@ -322,15 +322,27 @@ pub async fn run_health(
     snapshot.state.last_attempt_at = Some(at);
     snapshot.state.config = Some(config_identity());
     if report.grade == ProbeGrade::Error {
-        snapshot.state.last_probe_error = Some(report);
+        snapshot.state.last_probe_error = Some(report.clone());
     } else {
         let rate = snapshot.state.duplicates.as_ref().and_then(|d| d.rate);
         snapshot.runs.push(RunRecord::from_probe(&report, rate));
-        snapshot.state.probe = Some(report);
+        snapshot.state.probe = Some(report.clone());
         snapshot.state.last_probe_error = None;
     }
     save_health(storage, &snapshot)?;
-    Ok(snapshot)
+    Ok(HealthRun {
+        snapshot,
+        probe: report,
+    })
+}
+
+/// What one `run_health` measured, beside everything now persisted.
+#[derive(Debug, Clone)]
+pub struct HealthRun {
+    pub snapshot: HealthSnapshot,
+    /// This run's probe report, including an `Error` one (which is not
+    /// stored as the latest completed result).
+    pub probe: ProbeReport,
 }
 
 #[cfg(test)]

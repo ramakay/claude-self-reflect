@@ -1,8 +1,9 @@
 //! Evaluation framework for csr-engine.
 //!
 //! Quick mode: 5 core tests plus the persisted trained-reranker gate (<30s)
-//! Full mode: 20 tests plus the persisted trained-reranker gate and the
-//! emitter contamination canary (~2 min)
+//! Full mode: 24 results — 20 tests, the persisted trained-reranker gate, the
+//! emitter contamination canary, the report-only duplicate rate and the
+//! known-item recall probe (~2 min). Any failing result is a nonzero exit.
 //! Continuity mode: the North Star gate — CSR must recall its own vision with
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
@@ -10,6 +11,7 @@ pub mod bench;
 pub mod codegraph;
 pub mod contamination;
 pub mod continuity;
+pub mod health;
 pub mod lessons;
 pub mod provenance;
 pub mod trained_rerank;
@@ -34,6 +36,14 @@ pub struct EvalResult {
 }
 
 impl EvalResult {
+    pub fn format_line(&self) -> String {
+        let status = if self.passed { "PASS" } else { "FAIL" };
+        format!(
+            "  [{status}] {:<30} ({:.0}ms) {}\n",
+            self.name, self.duration_ms, self.detail
+        )
+    }
+
     pub(crate) fn pass(name: &str, category: &str, duration_ms: f64, detail: String) -> Self {
         Self {
             name: name.to_string(),
@@ -70,6 +80,12 @@ impl EvalReport {
         self.results.len()
     }
 
+    /// True when any result failed. Amber, abstain and the report-only
+    /// duplicate rate pass, so only a real failure gates.
+    pub fn has_gating_failure(&self) -> bool {
+        self.results.iter().any(|r| !r.passed)
+    }
+
     pub fn format_text(&self) -> String {
         let mut out = String::new();
         out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -77,11 +93,7 @@ impl EvalReport {
         out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n");
 
         for r in &self.results {
-            let status = if r.passed { "PASS" } else { "FAIL" };
-            out.push_str(&format!(
-                "  [{status}] {:<30} ({:.0}ms) {}\n",
-                r.name, r.duration_ms, r.detail
-            ));
+            out.push_str(&r.format_line());
         }
 
         out.push_str(&format!(
@@ -118,12 +130,25 @@ pub async fn run_quick(
     }
 }
 
-/// Run full evaluation (20 core tests plus the trained-reranker gate).
+/// Run full evaluation (24 results). Equivalent to [`run_full_with`] keeping
+/// the frozen recall sample.
 pub async fn run_full(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
     index_dir: &Path,
+) -> EvalReport {
+    run_full_with(storage, embeddings, search, index_dir, false).await
+}
+
+/// Run full evaluation. `refresh_recall_sample` deliberately starts a new
+/// recall sample (`eval --full --refresh-recall-sample`); history is kept.
+pub async fn run_full_with(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    index_dir: &Path,
+    refresh_recall_sample: bool,
 ) -> EvalReport {
     let start = Instant::now();
     let mut results = Vec::new();
@@ -199,9 +224,26 @@ pub async fn run_full(
     results.push(test_batch_embedding_speed(embeddings));
     results.push(test_search_latency_p95(embeddings, search).await);
 
-    // Contamination: every emitter output removed, every mention kept (no DB).
+    // Contamination: every emitter output detected, every mention kept (no DB).
     results.push(contamination::emitter_canary());
-    results.push(contamination::census_result(storage));
+
+    // Memory health: measured now and persisted, then reported as two results.
+    let backend = crate::health::probe::EngineBackend {
+        storage: storage.clone(),
+        embeddings: embeddings.clone(),
+        search: search.clone(),
+    };
+    let run = crate::health::run_health(
+        storage,
+        search,
+        &backend,
+        refresh_recall_sample,
+        chrono::Utc::now(),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    results.push(health::duplicate_rate(&run));
+    results.push(health::known_item_recall(&run));
 
     EvalReport {
         results,
@@ -784,6 +826,53 @@ fn search_latency_passes(p95_ms: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn full_eval_has_twenty_four_named_results() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(EmbeddingEngine::dimension())));
+        let dir = tempfile::tempdir().unwrap();
+        let report = run_full(&storage, &embeddings, &search, dir.path()).await;
+        let names: Vec<&str> = report.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "DB Connectivity",
+                "Search Accuracy",
+                "Performance Target",
+                "Cache Status",
+                "Tool Count",
+                "Trained Re-ranker Gate",
+                "semantic_docker",
+                "semantic_mcp",
+                "semantic_errors",
+                "semantic_perf",
+                "semantic_auth",
+                "Chunk Data Quality",
+                "Reflection Data Quality",
+                "Embedding Dimensions",
+                "Index Consistency",
+                "DB Integrity",
+                "V3 Extraction",
+                "AST Analysis",
+                "Quality Analysis",
+                "Batch Embed Speed",
+                "Search Latency P95",
+                "Emitter Contamination Canary",
+                "Duplicate Rate (Report Only)",
+                "Known-Item Recall",
+            ]
+        );
+        assert_eq!(report.total(), 24);
+        // a fresh store: nothing to measure, so the probe abstains and no
+        // memory result fails the gate
+        let recall = report.results.last().unwrap();
+        assert!(recall.passed, "{}", recall.detail);
+        assert!(recall.detail.starts_with("ABSTAIN:"), "{}", recall.detail);
+        let duplicates = &report.results[22];
+        assert!(duplicates.passed && duplicates.detail.starts_with("REPORT ONLY:"));
+    }
 
     #[test]
     fn search_latency_gate_enforces_sub_millisecond_p95() {

@@ -211,7 +211,7 @@ enum Commands {
     },
     /// Run evaluation tests
     Eval {
-        /// Run full evaluation (20 tests) instead of quick (5 tests)
+        /// Run full evaluation (24 results) instead of quick (5 tests plus the reranker gate)
         #[arg(long)]
         full: bool,
         /// Run the continuity gate (North Star: recall + provenance beats grep)
@@ -1244,6 +1244,11 @@ async fn run(
         };
         print!("{}", report.format_text());
         if full {
+            // The CSR-text census is information, not one of the 24 results.
+            print!(
+                "{}",
+                csr_engine::eval::contamination::census_result(eng.storage()).format_line()
+            );
             // No-op-killer gate: the reinstatement machinery must genuinely
             // engage. Part of --full so it cannot silently rot as a local
             // opt-in nobody runs.
@@ -1254,7 +1259,9 @@ async fn run(
             )
             .await?;
             print!("{}", prov.text);
-            if prov.regression {
+            // The whole report is printed first; then any gating failure,
+            // like the provenance regression, is a nonzero exit.
+            if report.has_gating_failure() || prov.regression {
                 std::process::exit(1);
             }
         }
