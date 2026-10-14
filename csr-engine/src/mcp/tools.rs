@@ -3825,7 +3825,9 @@ fn resolve_validity_with(
     chunks: &[crate::import::ConversationChunk],
     consumption_mode: ConsumptionMode,
 ) -> HashMap<String, ConvValidity> {
-    resolve_validity_checked(storage, chunks, consumption_mode).unwrap_or_default()
+    // A failed verdict read costs the dream notes, never the CSR-text labels.
+    resolve_validity_checked(storage, chunks, consumption_mode)
+        .unwrap_or_else(|_| csr_text_labels_only(storage, chunks))
 }
 
 /// Reliability-preserving core for consumers that combine validity with a
@@ -6741,6 +6743,53 @@ mod tests {
         let sunk = sink_labeled_evidence(items, &labels);
         let ids: Vec<&str> = sunk.iter().map(|i| i.chunk_id.as_str()).collect();
         assert_eq!(ids, ["a", "b", "csr"]);
+    }
+
+    /// A failed dream-verdict read must not lose the CSR-text labels (recency,
+    /// concept and keyword fallback all use this wrapper).
+    #[test]
+    fn a_failed_verdict_read_keeps_the_csr_text_labels() {
+        use crate::provenance::Speaker;
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut index = SearchEngine::new(8);
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "csr-chunk",
+            "conv-csr",
+            CSR_RULE_TEXT,
+            [1.0, 0.0, 0.0, 0.0],
+        );
+        let chunk = csr_text_result(
+            "csr-chunk",
+            "conv-csr",
+            Speaker::User,
+            CSR_RULE_TEXT,
+            0.9,
+            0,
+        )
+        .chunk;
+        // a real SQLite read failure: the validity resolver starts from code_nodes
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE code_nodes")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(resolve_validity_checked(
+            &storage,
+            std::slice::from_ref(&chunk),
+            ConsumptionMode::AnnotateOnly
+        )
+        .is_err());
+        for mode in [ConsumptionMode::AnnotateOnly, ConsumptionMode::Full] {
+            let validity = resolve_validity_with(&storage, std::slice::from_ref(&chunk), mode);
+            let entry = validity
+                .get("csr-chunk")
+                .unwrap_or_else(|| panic!("{mode:?}: label lost"));
+            assert!(entry.note.starts_with("[CSR text]"), "{}", entry.note);
+            assert!(entry.demote);
+        }
     }
 
     #[test]
