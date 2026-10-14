@@ -1421,7 +1421,9 @@ def session_story_map(session_id):
             receipts = entry.get('receipts')
             if before is None or after is None or not isinstance(receipts, list) or not all(isinstance(r, str) for r in receipts):
                 return None
+            sig = entry.get('sig')
             entries.append(dict(
+                sig=sig.strip() if isinstance(sig, str) and sig.strip() else None,
                 kind=kind.strip(),
                 claim=' '.join(claim.split()),
                 before=before,
@@ -1527,6 +1529,77 @@ def shift_map_rows(smap, messages_now, room=SHIFT_ROOM):
             rows.append('  ' + after)
         rows += ['  ' + fit(line, inner) for line in _shift_source(entry, by, inner)]
     return title, rows
+
+
+def map_open(key):
+    """Whether the Shift Map is open at full size: its own row, or one of its entries (a click on an entry opens it
+    in place, under the picture)."""
+    return key == 'shifts' or str(key).startswith('shiftlike:')
+
+
+def item_open(item, ui):
+    """Whether an item draws opened: its own key is the open one; the map's row also while an entry of it is."""
+    return ui.get('open') == item['key'] or (item['key'] == 'shifts' and map_open(ui.get('open')))
+
+
+def story_cost():
+    """What one story call has cost this person, from their own narrative_usage rows (read-only; a failed call was
+    paid for and counts): dict(calls, usd, tokens) per call, usd None when a model has no price; None when there is
+    no row. Nothing here is a guess."""
+    con = connect()
+    try:
+        rows = con.execute("select model, count(*), sum(input_tokens), sum(output_tokens), sum(cache_read_tokens), "
+                           "sum(cache_creation_tokens) from narrative_usage where call_site = 'story' group by model").fetchall()
+    finally:
+        con.close()
+    calls, tokens, usd = 0, 0, 0.0
+    for model, count, *counts in rows:
+        counts = [int(x or 0) for x in counts]
+        calls += int(count or 0)
+        tokens += sum(counts)
+        cost = cost_of(model, *counts) if any(counts) else 0.0  # a call that spent nothing cost nothing, priced model or not
+        usd = None if usd is None or cost is None else usd + cost
+    return dict(calls=calls, usd=None if usd is None else usd / calls, tokens=tokens // calls) if calls else None
+
+
+def refresh_label(cost):
+    """The refresh control's words: what it costs, from this person's own story calls, else the plain fact."""
+    if not cost:
+        return '↻ refresh the shift map · one Haiku call'
+    n = f"{cost['calls']} story call{'' if cost['calls'] == 1 else 's'}"
+    if cost.get('usd') is not None:
+        cents = cost['usd'] * 100
+        return f"↻ refresh the shift map · about {'<0.1' if cents < 0.1 else format(cents, '.1f')}¢ (avg of your {n})"
+    return f"↻ refresh the shift map · about {cost['tokens']:,} tokens (avg of your {n})"
+
+
+def refresh_news(smap, s):
+    """Whether there is news for a refresh: you typed something after the map's current telling. The engine skips
+    otherwise (skip:nothing_asked_since), so the control is not offered."""
+    at = (smap or {}).get('at')
+    return isinstance(at, (int, float)) and any(isinstance(t, (int, float)) and t > at for t in (s or {}).get('prompts') or ())
+
+
+def engine_binary():
+    return os.environ.get('CSR_ENGINE_BIN') or shutil.which('csr-engine')
+
+
+def refresh_command(binary, transcript, cwd):
+    """The refresh as an argv list: csr-engine tells this conversation's story again (the engine skips it when
+    nothing was asked since). The pane makes no model call itself."""
+    return [binary, 'generate-story', '--transcript', transcript, '--cwd', cwd, '--rewrite']
+
+
+def start_refresh(binary, transcript, cwd):
+    """The refresh, started detached; its Popen, or None when it cannot start."""
+    if not (binary and transcript and cwd):
+        return None
+    try:
+        return subprocess.Popen(refresh_command(binary, transcript, cwd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                env=dict(os.environ, CSR_DISABLE_RECURSIVE_HOOKS='1'))
+    except OSError:
+        return None
 
 
 RETOLD = 'next at compact'  # when csr-engine tells the story again: after a compaction (and at the session's end)
@@ -4381,6 +4454,19 @@ def page_main(data, s, now, ui=None):
             ) if PIXELS else {}
             told.append(dict(key='shifts', title=map_title, lines=1, open_lines=1, body=map_rows, fit_body=True,
                              quiet=True, unrated=True, detail=[], send='', nosend=True, hint=SHIFT_HINT, **drawn))
+            if map_open((ui or {}).get('open')):  # opened: each checked entry takes a like, and a click on it is an expand
+                for entry in story_map['entries'][:4]:
+                    if entry.get('sig') and entry.get('grounded'):
+                        told.append(dict(key=f"shiftlike:{entry['sig']}", like=f"shift:{entry['sig']}", like_source='story_map',
+                                         expand=entry['sig'], title=f"{entry['kind']}: {entry['claim']}", lines=2, open_lines=4,
+                                         detail=_shift_source(entry, story_map.get('by'), 40), send='', nosend=True,
+                                         hint=SHIFT_HINT))
+            if data.get('refreshing'):
+                told.append(dict(key='shiftrefreshing', title='updating the shift map…', lines=1, quiet=True, unrated=True,
+                                 detail=[], send='', nosend=True))
+            elif data.get('can_refresh') and refresh_news(story_map, s):  # only with news: you asked something since
+                told.append(dict(key='shiftrefresh', title=refresh_label(data.get('story_cost')), lines=1, quiet=True,
+                                 unrated=True, detail=[], send='', nosend=True, refresh=True))
     if not data.get('dreams_on'):
         right = 'off'
     elif not fed['left']:
@@ -4880,7 +4966,7 @@ def lay_page(page, width, rows, ui, shrunk):
         blocks = []
         for item in section['items']:
             item = shrink_picture(item, shrunk)
-            is_open = ui.get('open') == item['key']
+            is_open = item_open(item, ui)
             heart = likes.get(like_key(item), False) if likes is not None and likeable(item, section['name']) else None
             rows_ = item_rows(item, section['name'], width, is_open, at, heart)
             if is_open:
@@ -4933,7 +5019,7 @@ def lay_page(page, width, rows, ui, shrunk):
             while j + 1 < len(part) and PIC in part[j + 1]:
                 j += 1
             act = part.acts.get(i) or {}
-            picture = item_picture(act, ui.get('open') == act.get('key'))
+            picture = item_picture(act, item_open(act, ui) if act else False)
             if picture and picture['rows'] == j - i + 1:
                 out.wanted.append((start + i, j - i + 1, picture, shade[i]))
             elif picture and picture.get('kind') == 'shiftmap':  # the room cut the picture: its words, not blank rows
@@ -5445,7 +5531,7 @@ def read_likes():
     """Every item you have liked or unliked: key -> (liked, when), the last line for a key winning."""
     out = {}
     for r in log_lines(LIKES):
-        if isinstance(r.get('key'), str):
+        if isinstance(r.get('key'), str) and r.get('signal', 'explicit_like') == 'explicit_like':  # an expand is no like
             try:
                 out[r['key']] = (bool(r.get('liked')), float(r.get('at') or 0))
             except (TypeError, ValueError):
@@ -5456,6 +5542,13 @@ def read_likes():
 def keep_like(key, source, title, liked, at):
     private.append(LIKES, private.dumps(dict(key=key, source=source, title=one_line(title or '', 200), at=at, liked=liked),
                                         ensure_ascii=False) + '\n', root=KEEP)
+
+
+def keep_shift_signal(sig, signal, title, at):
+    """One implicit signal on a Shift Map entry, as csr-engine's likes.rs reads it: {key: shift:<sig>, source: story_map,
+    signal: expand}. It counts once per entry there. Nothing is ever sent to Claude."""
+    private.append(LIKES, private.dumps(dict(key=f'shift:{sig}', source='story_map', signal=signal,
+                                             title=one_line(title or '', 200), at=at), ensure_ascii=False) + '\n', root=KEEP)
 
 
 def likes_since(likes, start):
@@ -7221,7 +7314,7 @@ def map_key(pane, keys='m'):
     False with no map to open, or on another page."""
     if 'm' not in keys or pane.view != 'main' or not (getattr(pane, 'data', None) or {}).get('story_map'):
         return False
-    if pane.open == 'shifts':
+    if map_open(pane.open):
         pane.open, pane.sent = None, None
     else:
         pane.open, pane.sent, pane.tall = 'shifts', None, True
@@ -7343,6 +7436,7 @@ class Pane:
         self.spend = Spend()  # this machine's spend in the plan's week, read from the transcripts a little at a time
         self.map_motion = MapMotion()  # the Shift Map's arrival, draw-on and fold
         self.map_due, self.animating = None, False  # when it next changes, and whether it is drawing on now
+        self.refresh = None  # the csr-engine process of a refresh the pane started, until it ends
 
     def phone(self, cols, rows, now):
         """Whether herdr shows this pane on a phone now: read from its layout on a new size, else at most every
@@ -7365,12 +7459,16 @@ class Pane:
         try:
             if self.data is None or now - self.loaded >= RELOAD:
                 self.data, self.loaded = load(self.root, self.limit, self.session and self.session.id), now
+                self.data['story_cost'] = fail_open(story_cost, None)  # what a story call has cost you: read once a minute
             self.data['dreams'] = load_dream_log(self.root)  # the mod appends while we watch
             self.data['look'] = last_look(self.root)
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
             self.data['story_map'] = session_story_map(self.session and self.session.id)
+            self.data['refreshing'] = bool(self.refresh and self.refresh.poll() is None)
+            self.refresh = self.refresh if self.data['refreshing'] else None
+            self.data['can_refresh'] = bool(self.session and self.session.path and engine_binary())
             self.data['agents'] = fail_open(agents_of, agents_lib.empty(), self.session and self.session.id)
             self.data['codex'] = fail_open(codex_lib.codex_snapshot, None, HOME, now)  # None: no ~/.codex, no section
             # each of these reads a file of someone else's: one that fails is empty, it never blanks the pane
@@ -7413,7 +7511,7 @@ class Pane:
         motion = getattr(self, 'map_motion', None) or MapMotion()
         self.map_motion = motion
         mstate = fail_open(motion.update, dict(stage=3, rows=MAP_SHUT_ROWS, animating=False, due=None),
-                           self.data.get('story_map'), now, self.open == 'shifts', bool(s and s.get('busy')))
+                           self.data.get('story_map'), now, map_open(self.open), bool(s and s.get('busy')))
         self.data['map_view'] = dict(stage=mstate['stage'], rows=mstate['rows']) if self.data.get('story_map') else None
         self.animating = bool(mstate.get('animating'))
         self.map_due = now + mstate['due'] if mstate.get('due') is not None else None
@@ -7429,7 +7527,8 @@ class Pane:
                           [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.data.get('story_map'), self.data.get('map_view'), self.held, self.data.get('agents'), self.data.get('codex'),
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.data.get('story_map'), self.data.get('map_view'),
+                          self.data.get('refreshing'), self.data.get('can_refresh'), self.data.get('story_cost'), self.held, self.data.get('agents'), self.data.get('codex'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
                           value_pieces(self.data.get('value')),  # what it says: the dollars under it move each step
@@ -7555,7 +7654,8 @@ class Pane:
         """A click on an item's heart: it is liked, or no longer, kept in KEEP/likes.jsonl and on this machine only."""
         likes = (self.data or {}).get('likes') or {}
         key = like_key(act)
-        keep_like(key, act.get('source'), act.get('title'), not likes.get(key, (False, 0))[0], time.time())
+        keep_like(key, act.get('like_source') or act.get('source'), act.get('title'), not likes.get(key, (False, 0))[0],
+                  time.time())
         if self.data is not None:
             self.data['likes'] = read_likes()
 
@@ -7608,11 +7708,16 @@ class Pane:
         elif act.get('back') and getattr(self, 'feed', None):  # a row of Earlier: its section back on top, drawn now
             self.feed.back(act['back'], time.time())
             self.open, self.hold, self.main_top = None, None, 0
+        elif act.get('refresh'):  # the shift map's refresh: csr-engine tells the story again, detached; the pane waits
+            self.refresh = self.refresh or start_refresh(engine_binary(), getattr(self.session, 'path', None),
+                                                         ((getattr(self.session, 'record', None) or {}).get('cwd')) or self.root)
         elif act['key'] != self.open:
             self.open, self.sent = act['key'], None
             self.anchor = (act['key'], row) if self.view == 'main' else None
+            if act.get('expand'):  # opening an entry is the expand signal: kept once, never sent anywhere
+                keep_shift_signal(act['expand'], 'expand', act.get('title'), time.time())
         elif act.get('nosend'):  # an agent's report is its words, not yours: a second click folds the row, it sends nothing
-            self.open, self.sent = None, None
+            self.open, self.sent = ('shifts' if act.get('expand') else None), None
         else:
             agent = agent_pane(self.agent)
             went = send_text(agent, act['send'])

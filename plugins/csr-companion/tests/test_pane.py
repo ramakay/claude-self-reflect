@@ -98,14 +98,14 @@ class Feed(unittest.TestCase):
 
 
 def page(dreams=(), look=None, story=None, remembered=(), chapter=None, infinite=None, lost=(),
-         story_map=None, messages=None, map_view=None):
+         story_map=None, messages=None, map_view=None, ui=None, prompts=(), more=None):
     """page_main over a stand-in CSR: no rules on record, this session's dreams, story and Lost and found as given."""
     con = sqlite3.connect(':memory:')
     con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
                 'byte_start int, project text, kind text)')
     connect, pane.connect = pane.connect, lambda: con
     try:
-        s = dict(id=HERE_NOW, prompts=[], replies=[], compacts=[], remembered=list(remembered),
+        s = dict(id=HERE_NOW, prompts=list(prompts), replies=[], compacts=[], remembered=list(remembered),
                  gave=dict(recalls=[], carried=[], dreams=[]), project='csr-engine', lost=list(lost))
         if messages is not None:
             s['messages'] = messages
@@ -115,7 +115,8 @@ def page(dreams=(), look=None, story=None, remembered=(), chapter=None, infinite
             data['story_map'] = story_map
         if map_view is not None:
             data['map_view'] = map_view
-        return pane.page_main(data, s, 2000.0)
+        data.update(more or {})
+        return pane.page_main(data, s, 2000.0, ui)
     finally:
         pane.connect = connect
 
@@ -4971,3 +4972,175 @@ class ShiftMapFrame(unittest.TestCase):
         self.assertIsNone(box.data['map_view'])
         self.assertEqual(pane.map_wait(box, 1.0), (1.0, False))
         self.assertFalse(pane.map_key(box, 'm'))
+
+
+class ShiftMapRefreshAndLikes(unittest.TestCase):
+    """P3: the refresh control (only with news, says what it costs, starts csr-engine) and the likes and expands that
+    are kept for csr-engine to read. Nothing is ever sent to Claude, and no test starts the real engine."""
+    setUp, tearDown = DefaultView.setUp, DefaultView.tearDown
+    live, write, fresh, facts, thread, intent_db = (DefaultView.live, DefaultView.write, DefaultView.fresh,
+                                                    DefaultView.facts, DefaultView.thread, DefaultView.intent_db)
+    patch, pane_over, frame = Findings.patch, Findings.pane_over, Findings.frame
+
+    def smap(self):
+        return ShiftMapText().shown(ShiftMapText.HAIKU_RAW)  # at 1990, covered 48
+
+    def items(self, smap=None, **kwargs):
+        got = page(story_map=smap or self.smap(), messages=60, **kwargs)
+        return {i['key']: i for i in got['sections'][0]['items']}
+
+    def likes_lines(self):
+        return [json.loads(line) for line in open(pane.LIKES, encoding='utf-8')] if os.path.exists(pane.LIKES) else []
+
+    def test_the_map_keeps_each_entrys_sig(self):
+        self.assertEqual([e['sig'] for e in self.smap()['entries']], ['sig_risk_1', 'sig_dec_2', 'sig_guess_3'])
+
+    def test_opened_the_checked_entries_take_a_like_and_the_closed_map_shows_none(self):
+        closed = self.items()
+        self.assertEqual([k for k in closed if k.startswith('shiftlike:')], [])
+        for opened in ('shifts', 'shiftlike:sig_risk_1'):
+            got = self.items(ui=dict(likes={}, open=opened))
+            keys = [k for k in got if k.startswith('shiftlike:')]
+            self.assertEqual(keys, [f"shiftlike:{e['sig']}" for e in self.smap()['entries'] if e['grounded']], opened)
+            row = got['shiftlike:sig_risk_1']
+            self.assertEqual((row['like'], row['like_source'], row['expand'], row['send'], row['nosend']),
+                             ('shift:sig_risk_1', 'story_map', 'sig_risk_1', '', True))
+            self.assertNotIn('unrated', row)
+            self.assertNotIn('quiet', row)
+        self.assertNotIn('shiftlike:sig_guess_3', self.items(ui=dict(likes={}, open='shifts')))  # a guess takes no like
+
+    def test_the_map_stays_open_at_full_size_while_one_of_its_entries_is(self):
+        with mock.patch.object(pane, 'PIXELS', True):
+            got = page(story_map=self.smap(), messages=60, map_view=dict(stage=3, rows=3), ui=dict(likes={}, open='shiftlike:sig_risk_1'))
+            lines = pane.page_lines(got, 46, 40, dict(likes={}, open='shiftlike:sig_risk_1'))
+        self.assertEqual([run for _, run, _, _ in lines.wanted], [9])
+        self.assertTrue(pane.map_open('shiftlike:x') and pane.map_open('shifts') and not pane.map_open('story') and not pane.map_open(None))
+
+    def test_a_like_is_kept_as_csr_engine_reads_it_and_an_unlike_follows_it(self):
+        row = self.items(ui=dict(likes={}, open='shifts'))['shiftlike:sig_risk_1']
+        box = pane.Pane('/repo', 10, None)
+        box.data = dict(likes={})
+        box.like(dict(row, source='story'))
+        box.like(dict(row, source='story'))
+        first, second = self.likes_lines()
+        for line, liked in ((first, True), (second, False)):
+            self.assertEqual((line['key'], line['source'], line['liked']), ('shift:sig_risk_1', 'story_map', liked))
+            self.assertEqual(line['title'], 'risk: Keep prior shifts on rewrite')
+            self.assertNotIn('signal', line)  # a line without a signal is an explicit like to likes.rs
+        self.assertEqual(pane.read_likes()['shift:sig_risk_1'][0], False)
+
+    def test_opening_an_entry_keeps_one_expand_that_is_no_like_and_a_second_click_folds_to_the_map(self):
+        row = self.items(ui=dict(likes={}, open='shifts'))['shiftlike:sig_risk_1']
+        box = pane.Pane('/repo', 10, None)
+        box.view, box.open, box.acts = 'main', 'shifts', {3: row}
+        with mock.patch.object(pane, 'send_text', side_effect=AssertionError('a shift is never sent to Claude')):
+            box.click(3)
+            self.assertEqual(box.open, 'shiftlike:sig_risk_1')
+            box.click(3)
+            self.assertEqual(box.open, 'shifts')
+        (line,) = self.likes_lines()
+        self.assertEqual((line['key'], line['source'], line['signal']), ('shift:sig_risk_1', 'story_map', 'expand'))
+        self.assertNotIn('liked', line)
+        self.assertEqual(pane.read_likes(), {})  # an expand never reads as a like, nor un-likes one
+        pane.keep_like('shift:sig_risk_1', 'story_map', 'x', True, 5.0)
+        pane.keep_shift_signal('sig_risk_1', 'expand', 'x', 6.0)
+        self.assertEqual(pane.read_likes()['shift:sig_risk_1'], (True, 5.0))
+
+    def test_the_refresh_control_shows_only_with_news_and_says_one_haiku_call_with_no_cost_on_record(self):
+        news = dict(can_refresh=True, story_cost=None)
+        got = self.items(prompts=[1900.0, 1995.0], more=news)
+        self.assertEqual(got['shiftrefresh']['title'], '↻ refresh the shift map · one Haiku call')
+        self.assertTrue(got['shiftrefresh']['refresh'] and got['shiftrefresh']['nosend'] and got['shiftrefresh']['send'] == '')
+        self.assertNotIn('shiftrefresh', self.items(prompts=[1900.0, 1989.0], more=news))  # typed nothing since the telling
+        self.assertNotIn('shiftrefresh', self.items(prompts=[], more=news))
+        self.assertNotIn('shiftrefresh', self.items(prompts=[1995.0], more=dict(news, can_refresh=False)))  # no engine to start
+        busy = self.items(prompts=[1995.0], more=dict(news, refreshing=True))
+        self.assertEqual(busy['shiftrefreshing']['title'], 'updating the shift map…')
+        self.assertNotIn('shiftrefresh', busy)
+
+    def test_the_refresh_control_says_the_cost_from_the_persons_own_story_calls(self):
+        usd = self.items(prompts=[1995.0], more=dict(can_refresh=True, story_cost=dict(calls=7, usd=0.0042, tokens=4000)))
+        self.assertEqual(usd['shiftrefresh']['title'], '↻ refresh the shift map · about 0.4¢ (avg of your 7 story calls)')
+        tiny = pane.refresh_label(dict(calls=1, usd=0.00001, tokens=10))
+        self.assertEqual(tiny, '↻ refresh the shift map · about <0.1¢ (avg of your 1 story call)')
+        unpriced = pane.refresh_label(dict(calls=3, usd=None, tokens=12345))
+        self.assertEqual(unpriced, '↻ refresh the shift map · about 12,345 tokens (avg of your 3 story calls)')
+
+    def usage_db(self, rows):
+        con = sqlite3.connect(':memory:')
+        con.execute('create table narrative_usage (id integer primary key, ts text, call_site text, model text, input_tokens int, '
+                    'output_tokens int, cache_read_tokens int, cache_creation_tokens int, duration_ms int, success int)')
+        for site, model, tin, tout, read, write, ok in rows:
+            con.execute("insert into narrative_usage (ts, call_site, model, input_tokens, output_tokens, cache_read_tokens, "
+                        "cache_creation_tokens, duration_ms, success) values ('2026-10-14T00:00:00Z', ?, ?, ?, ?, ?, ?, 0, ?)",
+                        (site, model, tin, tout, read, write, ok))
+        return con
+
+    def test_story_cost_averages_only_story_calls_failed_ones_included_and_never_invents(self):
+        rows = [('story', 'claude-haiku-4-5-20251001', 1000, 500, 0, 0, 1), ('story', 'claude-haiku-4-5-20251001', 3000, 1500, 0, 0, 0),
+                ('briefing', 'claude-haiku-4-5-20251001', 10 ** 6, 10 ** 6, 0, 0, 1)]
+        with mock.patch.object(pane, 'connect', lambda: self.usage_db(rows)):
+            got = pane.story_cost()
+        self.assertEqual((got['calls'], got['tokens']), (2, 3000))
+        want = pane.cost_of('claude-haiku-4-5-20251001', 4000, 2000, 0, 0) / 2
+        self.assertAlmostEqual(got['usd'], want, places=9)
+        with mock.patch.object(pane, 'connect', lambda: self.usage_db(rows[2:])):
+            self.assertIsNone(pane.story_cost())  # no story row: "one Haiku call", no number
+        with mock.patch.object(pane, 'connect', lambda: self.usage_db([('story', 'mystery-model', 10, 10, 0, 0, 1)])):
+            self.assertEqual(pane.story_cost(), dict(calls=1, usd=None, tokens=20))
+        free = [('story', 'claude-haiku-4-5-20251001', 1000, 500, 0, 0, 1), ('story', 'unknown', 0, 0, 0, 0, 0)]
+        with mock.patch.object(pane, 'connect', lambda: self.usage_db(free)):  # a call that spent nothing needs no price
+            got = pane.story_cost()
+        self.assertAlmostEqual(got['usd'], pane.cost_of('claude-haiku-4-5-20251001', 1000, 500, 0, 0) / 2, places=9)
+
+    def fake_engine(self, folder):
+        path = os.path.join(folder, 'fake-csr-engine')
+        with open(path, 'w') as handle:
+            handle.write('#!/bin/sh\nprintf "%s\\n" "$@" > "$0.argv"\nprintf "%s" "$CSR_DISABLE_RECURSIVE_HOOKS" > "$0.env"\n')
+        os.chmod(path, 0o755)
+        return path
+
+    def test_a_click_on_the_control_starts_the_engines_refresh_once_and_only_a_fake_runs_here(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fake = self.fake_engine(folder)
+            box = pane.Pane('/repo', 10, None)
+            box.session = types.SimpleNamespace(id='sess', path='/t/sess.jsonl', record=dict(cwd='/work/here'))
+            box.acts = {4: dict(key='shiftrefresh', refresh=True, nosend=True, send='')}
+            with mock.patch.object(pane, 'engine_binary', lambda: fake):
+                box.click(4)
+                proc = box.refresh
+                self.assertIsNotNone(proc)
+                box.click(4)  # while it runs, a second click starts nothing
+                self.assertIs(box.refresh, proc)
+            proc.wait(timeout=10)
+            self.assertEqual(open(fake + '.argv').read().split('\n')[:-1],
+                             ['generate-story', '--transcript', '/t/sess.jsonl', '--cwd', '/work/here', '--rewrite'])
+            self.assertEqual(open(fake + '.env').read(), '1')
+            self.assertEqual(box.open, None)  # the click opened no row
+
+    def test_refresh_command_and_a_binary_that_is_missing(self):
+        self.assertEqual(pane.refresh_command('/bin/e', '/t.jsonl', '/w'),
+                         ['/bin/e', 'generate-story', '--transcript', '/t.jsonl', '--cwd', '/w', '--rewrite'])
+        self.assertIsNone(pane.start_refresh(None, '/t.jsonl', '/w'))
+        self.assertIsNone(pane.start_refresh('/nonexistent/csr-engine', '/t.jsonl', '/w'))
+        self.assertIsNone(pane.start_refresh('/bin/e', None, '/w'))
+
+    def test_news_is_a_prompt_after_the_current_telling(self):
+        smap = dict(at=100.0)
+        self.assertTrue(pane.refresh_news(smap, dict(prompts=[50.0, 100.5])))
+        self.assertFalse(pane.refresh_news(smap, dict(prompts=[50.0, 100.0])))
+        self.assertFalse(pane.refresh_news(dict(at=None), dict(prompts=[200.0])))
+        self.assertFalse(pane.refresh_news(None, dict(prompts=[200.0])))
+
+    def test_the_frame_marks_a_running_refresh_and_clears_it_when_it_ends(self):
+        smap = self.smap()
+        box = self.pane_over(self.fresh(), session_story_map=lambda sid: smap)
+        box.session.path = '/t/x.jsonl'
+        proc = types.SimpleNamespace(poll=lambda: None)
+        with mock.patch.object(pane, 'engine_binary', lambda: '/bin/e'):
+            box.refresh = proc
+            self.frame(box)
+            self.assertEqual((box.data['refreshing'], box.data['can_refresh']), (True, True))
+            proc.poll = lambda: 0
+            self.frame(box)
+            self.assertEqual((box.data['refreshing'], box.refresh), (False, None))
