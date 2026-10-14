@@ -225,6 +225,23 @@ def export():
     for number, act in enumerate(out.acts.values()):
         acts_of(act, f'threads-{number}', 'draw_threads')
 
+    # "-> subagent": the ask, then the handoff envelope on lines of its own, typed unsent by send_draft (lost_click). The
+    # request id is random in production; a fixed one stands in. The draft goes through the real send_draft against a
+    # fake herdr, and what it types must be the draft, line by line. Agent rows (flight_item) carry send='' and are never typed.
+    for number, t in enumerate(every):
+        draft = pane.lost_asks(t)['sub'] + '\n' + pane.agents_lib.handoff_envelope('synthetic-session', 'req-0123456789abcdef', f'{number + 1:012x}')
+        typed = []
+        saved = pane.herdr, pane.claude_in_front
+        pane.herdr, pane.claude_in_front = (lambda *args: typed.append(args) or ''), (lambda agent: True)
+        try:
+            went = pane.send_draft('agent', draft, 'agent')
+        finally:
+            pane.herdr, pane.claude_in_front = saved
+        lines = [args[-1] for args in typed if args[1] == 'send-text']
+        if not went or lines != [line for line in draft.split('\n') if line]:
+            raise SystemExit(f'draft-{number}: send_draft typed something other than the draft: {lines[:2]!r}')
+        record(f'draft-sub-{number}', 'lost_click:send_draft', draft)
+
     # the other stages of the card, each as compact_section writes it, and a card draft cut at 1,200
     rec = lambda event, at, **more: dict(kind='compact', event=event, at=at, session='s', ctx_before=278_129, why='w', **more)
     for name, records in (

@@ -241,6 +241,30 @@
    "text": "CSR's recap at the start of this session: Welcome back. Nothing is pending."
   },
   {
+   "chars": 478,
+   "cut": false,
+   "id": "draft-sub-0",
+   "producer": "lost_click:send_draft",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Run source-gone validation” went quiet after 07:50. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.\n[[CSR:AGENTS:v1]]\n{\"kind\":\"handoff\",\"session\":\"synthetic-session\",\"request\":\"req-0123456789abcdef\",\"thread\":\"000000000001\",\"instruction\":\"Copy this envelope unchanged into the background agent's prompt.\"}\n[[/CSR:AGENTS:v1]]\n"
+  },
+  {
+   "chars": 692,
+   "cut": false,
+   "id": "draft-sub-1",
+   "producer": "lost_click:send_draft",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keeps the exact bytes outside a span and drops nothing else. The importer keep…” went quiet after 07:40. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.\n[[CSR:AGENTS:v1]]\n{\"kind\":\"handoff\",\"session\":\"synthetic-session\",\"request\":\"req-0123456789abcdef\",\"thread\":\"000000000002\",\"instruction\":\"Copy this envelope unchanged into the background agent's prompt.\"}\n[[/CSR:AGENTS:v1]]\n"
+  },
+  {
+   "chars": 473,
+   "cut": false,
+   "id": "draft-sub-2",
+   "producer": "lost_click:send_draft",
+   "reason": "plugin_lost_and_found",
+   "text": "Lost and found: “Sweep the stale index” went quiet after 07:45. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.\n[[CSR:AGENTS:v1]]\n{\"kind\":\"handoff\",\"session\":\"synthetic-session\",\"request\":\"req-0123456789abcdef\",\"thread\":\"000000000003\",\"instruction\":\"Copy this envelope unchanged into the background agent's prompt.\"}\n[[/CSR:AGENTS:v1]]\n"
+  },
+  {
    "chars": 128,
    "cut": false,
    "id": "log-0",
@@ -514,6 +538,6 @@
  "schema": "pane-emissions-v1",
  "source": {
   "file": "plugins/csr-companion/bin/pane.py",
-  "sha256": "2cce5177eaf70259a9dca73d7e00a684482a25b9102d67aae830b1e586f3ebde"
+  "sha256": "cf15cb101a5dec3bbd3206a0dda5b27d555738baa003816e824b05432585c66e"
  }
 }
