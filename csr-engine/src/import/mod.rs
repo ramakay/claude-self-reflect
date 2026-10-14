@@ -1396,7 +1396,7 @@ fn sanitize_message_for_search(
 /// Redact credentials from every string in a message's content: prose, tool
 /// inputs and tool results alike. Runs on the whole string, ahead of the
 /// per-field truncation and the chunk budget, so a key is never cut in half
-/// and left half-visible. Object keys stay as they are.
+/// and left half-visible. Object keys are redacted too.
 fn redact_content_secrets(value: &mut serde_json::Value, counts: &mut crate::redact::SecretCounts) {
     match value {
         serde_json::Value::String(text) => {
@@ -1412,8 +1412,27 @@ fn redact_content_secrets(value: &mut serde_json::Value, counts: &mut crate::red
             }
         }
         serde_json::Value::Object(map) => {
-            for item in map.values_mut() {
-                redact_content_secrets(item, counts);
+            // Keys too: a token-to-account map keeps its credential in the key.
+            // Two keys that redact to the same marker stay apart (`#2`).
+            for (key, mut item) in std::mem::take(map) {
+                redact_content_secrets(&mut item, counts);
+                let redacted = match crate::redact::redact_secrets_counted(&key, counts) {
+                    std::borrow::Cow::Owned(redacted) => Some(redacted),
+                    std::borrow::Cow::Borrowed(_) => None,
+                };
+                let key = match redacted {
+                    Some(base) => {
+                        let mut renamed = base.clone();
+                        let mut n = 1;
+                        while map.contains_key(&renamed) {
+                            n += 1;
+                            renamed = format!("{base} #{n}");
+                        }
+                        renamed
+                    }
+                    None => key,
+                };
+                map.insert(key, item);
             }
         }
         _ => {}
@@ -3697,6 +3716,26 @@ mod tests {
             assert_eq!(parsed.suppression.secrets.get(kind), 1, "{kind}");
         }
         assert_eq!(parsed.suppression.secrets.total(), 4);
+    }
+
+    #[test]
+    fn object_keys_are_redacted_like_values() {
+        let token = format!("{}{}", "ghp_", "K".repeat(36));
+        let other = format!("{}{}", "ghp_", "L".repeat(36));
+        let mut value = serde_json::json!({
+            "accounts": {token.clone(): "first", other.clone(): "second", "plain": 1},
+            "list": [{token.clone(): "nested"}],
+        });
+        let mut counts = crate::redact::SecretCounts::default();
+        redact_content_secrets(&mut value, &mut counts);
+        let text = value.to_string();
+        assert!(!text.contains("ghp_"), "{text}");
+        assert_eq!(counts.get("github_token"), 3);
+        let accounts = value["accounts"].as_object().unwrap();
+        // Two keys that redact to the same marker must not overwrite each other.
+        assert_eq!(accounts.len(), 3, "{text}");
+        assert!(accounts.values().any(|v| v == "first"));
+        assert!(accounts.values().any(|v| v == "second"));
     }
 
     #[test]

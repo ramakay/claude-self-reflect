@@ -112,6 +112,19 @@ impl super::Storage {
         self.with_connection(|conn| upsert(conn, row))
     }
 
+    /// Flag one mirror's source as gone, touching nothing else on the row (a
+    /// stale copy of the whole row must never overwrite a newer one). `false`
+    /// when there is no such row or it is already flagged.
+    pub fn mirror_mark_gone(&self, rel_path: &str, when: &str) -> Result<bool> {
+        self.with_connection(|conn| {
+            Ok(conn.execute(
+                "UPDATE transcript_mirror SET source_gone_at = ?2
+                 WHERE rel_path = ?1 AND source_gone_at IS NULL",
+                params![rel_path, when],
+            )? > 0)
+        })
+    }
+
     pub fn mirror_totals(&self) -> Result<MirrorTotals> {
         self.with_connection(|conn| {
             Ok(conn.query_row(

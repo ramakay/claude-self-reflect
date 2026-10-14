@@ -125,12 +125,28 @@ pub fn render_view(
 const MIRROR_SOURCE_NOTE: &str =
     "source: transcript mirror (scrubbed copy; the original JSONL is gone)";
 
+/// Said when the mirror copy stopped decoding early: the views cover only what
+/// came before the damage.
+fn incomplete_note(read_error: &str) -> String {
+    format!(
+        "INCOMPLETE: the mirror copy is damaged or cut off ({read_error}); \
+         everything after the damage is missing from this output"
+    )
+}
+
 /// Tag a list view as coming from the mirror's scrubbed copy.
 fn mark_mirror(parsed: &ParsedTranscript, mut view: ViewData) -> ViewData {
     if parsed.from_mirror {
         view.header_lines.insert(0, MIRROR_SOURCE_NOTE.to_string());
         view.extra_json
             .push(("source".to_string(), json!("mirror")));
+        if let Some(read_error) = &parsed.read_error {
+            view.header_lines.insert(0, incomplete_note(read_error));
+            view.extra_json
+                .push(("incomplete".to_string(), json!(true)));
+            view.extra_json
+                .push(("read_error".to_string(), json!(read_error)));
+        }
     }
     view
 }
@@ -304,7 +320,7 @@ fn render_stats(
     };
 
     if json {
-        let rendered = json!({
+        let mut value = json!({
             "view": "stats",
             "session_path": path.display().to_string(),
             "source": if parsed.from_mirror { "mirror" } else { "jsonl" },
@@ -322,8 +338,12 @@ fn render_stats(
             "tool_calls": tool_calls,
             "tool_errors": tool_errors,
             "tool_result_bytes": tool_result_bytes,
-        })
-        .to_string();
+        });
+        if let Some(read_error) = &parsed.read_error {
+            value["incomplete"] = json!(true);
+            value["read_error"] = json!(read_error);
+        }
+        let rendered = value.to_string();
         // Stats is unbounded in principle (a transcript with many distinct
         // tool names, or an attacker-controlled project/path string) — route
         // it through the same budget path every other view uses instead of
@@ -340,6 +360,12 @@ fn render_stats(
         out.push_str(&format!("  <project>{}</project>\n", xml_escape(project)));
         if parsed.from_mirror {
             out.push_str(&format!("  <note>{MIRROR_SOURCE_NOTE}</note>\n"));
+        }
+        if let Some(read_error) = &parsed.read_error {
+            out.push_str(&format!(
+                "  <warning>{}</warning>\n",
+                xml_escape(&incomplete_note(read_error))
+            ));
         }
         out.push_str(&format!(
             "  <lines total=\"{}\" metadata=\"{}\" unrecognized=\"{}\"/>\n",

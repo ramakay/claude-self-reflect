@@ -2907,8 +2907,14 @@ pub(crate) fn mark_file_imported_with_suppression(
         )
         .optional()?
         .unwrap_or(((Some(0), Some(0)), None));
+    // A stamped row (even `{}`) was chunked from scrubbed text; see
+    // `import_secrets_stamped`.
+    let was_stamped = previous_secrets.is_some();
     let previous_secrets = SecretCounts::from_json(previous_secrets.as_deref());
     let persisted_secrets = previous_secrets.max_with(&suppression.secrets);
+    let stamp = persisted_secrets
+        .to_json()
+        .or_else(|| (was_stamped || !crate::redact::scrub_disabled()).then(|| "{}".to_string()));
     let current_tool = suppression.csr_tool_blocks_suppressed as i64;
     let current_wrappers = suppression.csr_hook_wrappers_scrubbed as i64;
     let (persisted_tool, tool_delta) = previous.0.map_or((current_tool, 0), |previous| {
@@ -2938,7 +2944,7 @@ pub(crate) fn mark_file_imported_with_suppression(
             mtime,
             persisted_tool,
             persisted_wrappers,
-            persisted_secrets.to_json()
+            stamp
         ],
     )?;
     bump_secret_counters(&tx, &previous_secrets, &persisted_secrets)?;
@@ -3392,6 +3398,22 @@ pub fn get_db_size(conn: &Connection) -> Result<u64> {
 
 /// Get the number of chunks previously imported for a file (for incremental import).
 /// Returns 0 if never imported.
+/// Was this file's stored state written by a build that redacts secrets before
+/// chunking? The column holds the per-kind counts, or `{}` when the scrub ran
+/// and found nothing; `NULL` means an older build (or the scrub switched off),
+/// whose chunk boundaries were cut from unredacted text.
+pub fn import_secrets_stamped(conn: &Connection, path: &Path) -> Result<bool> {
+    let path_str = path.to_string_lossy();
+    let stamp: Option<Option<String>> = conn
+        .query_row(
+            "SELECT secrets_redacted FROM import_state WHERE file_path = ?1",
+            params![path_str.as_ref()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(stamp.flatten().is_some())
+}
+
 pub fn get_imported_chunk_count(conn: &Connection, path: &Path) -> Result<usize> {
     let path_str = path.to_string_lossy();
     let result: rusqlite::Result<i64> = conn

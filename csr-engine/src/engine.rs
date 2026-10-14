@@ -485,6 +485,14 @@ impl Engine {
         attribution: &import::ConversationAttribution,
         observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
     ) -> Result<usize> {
+        // Mirror first, ahead of the early return below, so a transcript that is
+        // already imported but never mirrored still gets its copy. Outside the
+        // operation lock and opportunistic: a lock another process holds is not
+        // waited for and a big backlog is left to the daemon pass, so the mirror
+        // never holds up an import or a maintenance run. A no-op (one stat, a 4 KB
+        // read, one indexed lookup) when the mirror is current; errors are counted
+        // inside and never fail the import.
+        self.mirror().sync_file_opportunistic(file_path);
         let _operation = self.storage.operation_lock()?;
         let conversation_id = file_path
             .file_stem()
@@ -498,11 +506,6 @@ impl Engine {
                 parent,
             )?;
         }
-        // Mirror first, ahead of the early return below, so a transcript that is
-        // already imported but never mirrored still gets its copy. A no-op (one
-        // stat, one indexed lookup) when the mirror is current; errors are counted
-        // inside and never fail the import.
-        self.mirror().sync_file(file_path);
         // Check if file is unchanged (mtime match = fully imported, nothing new)
         if observer.is_none() && self.storage.is_file_imported(file_path)? {
             return Ok(0);
@@ -552,6 +555,27 @@ impl Engine {
 
         // Incremental: skip chunks we already embedded
         let prev_count = self.storage.get_imported_chunk_count(file_path)?;
+        // Chunk ids are positions. A conversation stored by a build that did not
+        // redact secrets was cut into chunks from the long text; the redacted
+        // reparse cuts fewer, shifted ones, and "skip the first prev_count" would
+        // then drop new messages. Redaction is the only thing that moves the
+        // boundaries, so when it fired on a conversation that predates the
+        // scrubber, rebuild this one conversation from scratch.
+        if prev_count > 0
+            && !suppression.secrets.is_empty()
+            && !self.storage.import_secrets_stamped(file_path)?
+        {
+            let rebuilt = self
+                .rebuild_conversation(file_path, &conversation_id, attribution, &chunks, &evidence)
+                .await?;
+            self.storage.mark_file_imported_with_suppression(
+                file_path,
+                chunks.len(),
+                suppression,
+            )?;
+            self.storage.relink_conversation(&conversation_id)?;
+            return Ok(rebuilt);
+        }
         if chunks.len() <= prev_count {
             // File parsed to same/fewer chunks — just update mtime
             self.storage.mark_file_imported_with_suppression(
@@ -735,6 +759,68 @@ impl Engine {
         self.flush_index().await;
 
         Ok((backfilled, enriched))
+    }
+
+    /// Replace one conversation's chunks with `chunks`, all embedded before the
+    /// swap so a failure leaves the old rows in place. Returns the chunk count.
+    async fn rebuild_conversation(
+        &self,
+        file_path: &Path,
+        conversation_id: &str,
+        attribution: &import::ConversationAttribution,
+        chunks: &[import::ConversationChunk],
+        evidence: &std::collections::HashMap<String, crate::provenance::ChunkEvidence>,
+    ) -> Result<usize> {
+        const BATCH_SIZE: usize = 10;
+        let mut rows = Vec::with_capacity(chunks.len());
+        for batch in chunks.chunks(BATCH_SIZE) {
+            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+            let emb = self.embeddings.clone();
+            let embeddings = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                emb.embed(&refs)
+            })
+            .await??;
+            for (chunk, embedding) in batch.iter().zip(embeddings) {
+                let provenance = crate::provenance::ChunkProvenance {
+                    author: chunk.author,
+                    source_conv_id: attribution
+                        .parent_conversation_id
+                        .clone()
+                        .unwrap_or_else(|| chunk.conversation_id.clone()),
+                    supersedes: None,
+                };
+                rows.push((
+                    chunk.clone(),
+                    embedding,
+                    provenance,
+                    attribution.source.to_string(),
+                ));
+            }
+        }
+        let old_ids = self
+            .storage
+            .get_chunk_ids_for_conversation(conversation_id)?;
+        self.storage
+            .replace_conversation_chunks_atomic(conversation_id, &rows)?;
+        for (chunk, ..) in &rows {
+            if let Some(chunk_evidence) = evidence.get(&chunk.id) {
+                self.storage.replace_chunk_evidence(chunk_evidence)?;
+            }
+        }
+        let mut idx = self.search.write().await;
+        for id in &old_ids {
+            idx.remove_chunk(id);
+        }
+        for (chunk, embedding, ..) in rows {
+            idx.insert_chunk(chunk.id, embedding);
+        }
+        tracing::info!(
+            file = %file_path.display(),
+            chunks = chunks.len(),
+            "rebuilt a conversation stored before secret redaction existed"
+        );
+        Ok(chunks.len())
     }
 
     // ─── Accessors for hooks ───

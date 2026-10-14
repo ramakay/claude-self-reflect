@@ -43,8 +43,22 @@ const DEFAULT_SEAL_SECS: u64 = 3600;
 /// How long a sync waits for another process holding the same transcript.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
+/// The import path leaves a transcript with more than this unmirrored to the
+/// daemon pass: a backlog is minutes of compression, not a cheap side effect.
+const OPPORTUNISTIC_MAX_PENDING: u64 = 8 << 20;
+/// Mirror-wide lock, beside (not inside) the folder `purge` deletes.
+const MIRROR_LOCK_NAME: &str = ".mirror.lock";
+
 static OPEN_PRIVATE_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)<private>").expect("private tag pattern compiles"));
+
+/// A JSON `\u00XX` escape that decodes to printable ASCII or a line break. A
+/// pattern the scrubs look for can hide behind one (`\u0067hp_...`), so a line
+/// holding one is decoded before the prefilter. Control characters and
+/// non-ASCII escapes cannot spell a pattern; ANSI colour codes stay cheap.
+static ASCII_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\\u00(?:[2-7][0-9a-fA-F]|0[aAdD])").expect("escape pattern compiles")
+});
 
 static ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -74,23 +88,37 @@ pub fn transcripts_dir(data_dir: &Path) -> PathBuf {
     mirror_root(data_dir).join("transcripts")
 }
 
+/// Why a mirrored transcript stopped decoding before its end, if it did.
+pub type ReadFailure = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
 /// A streaming reader over one mirrored transcript. Never holds the whole
 /// decoded file; a decode error ends the stream instead of repeating forever.
 pub fn open_transcript(path: &Path) -> io::Result<impl BufRead> {
+    open_transcript_checked(path).map(|(reader, _)| reader)
+}
+
+/// [`open_transcript`], plus a slot that says why the stream ended early: a
+/// torn or corrupt frame reads as a plain end of file otherwise, and the
+/// caller would present half a transcript as the whole.
+pub fn open_transcript_checked(path: &Path) -> io::Result<(impl BufRead, ReadFailure)> {
     let mut decoder = zstd::stream::read::Decoder::new(File::open(path)?)?;
     decoder.window_log_max(WINDOW_LOG)?;
-    Ok(BufReader::with_capacity(
+    let failure = ReadFailure::default();
+    let reader = BufReader::with_capacity(
         1 << 16,
         StopAtFirstError {
             inner: decoder,
             failed: false,
+            failure: failure.clone(),
         },
-    ))
+    );
+    Ok((reader, failure))
 }
 
 struct StopAtFirstError<R> {
     inner: R,
     failed: bool,
+    failure: ReadFailure,
 }
 
 impl<R: Read> Read for StopAtFirstError<R> {
@@ -98,7 +126,12 @@ impl<R: Read> Read for StopAtFirstError<R> {
         if self.failed {
             return Ok(0);
         }
-        self.inner.read(buf).inspect_err(|_| self.failed = true)
+        self.inner.read(buf).inspect_err(|error| {
+            self.failed = true;
+            if let Ok(mut slot) = self.failure.lock() {
+                slot.get_or_insert_with(|| error.to_string());
+            }
+        })
     }
 }
 
@@ -114,14 +147,18 @@ fn scrub_string(text: &str) -> Cow<'_, str> {
     Cow::Owned(crate::import::strip_private_tags(&redacted))
 }
 
-/// Rewrite the string values of one valid JSON line in place. Keys, numbers,
-/// key order and whitespace are left exactly as written; only a string that
-/// the scrubs change is re-encoded. `None` means nothing changed.
+/// Rewrite the strings of one valid JSON line in place, object keys included
+/// (a token-to-account map keeps its credential in the key). Numbers, key
+/// order and whitespace are left exactly as written; only a string that the
+/// scrubs change is re-encoded. `None` means nothing changed.
 fn rewrite_json_strings(line: &str) -> Result<Option<String>> {
     let bytes = line.as_bytes();
     let mut out = String::new();
     let mut copied = 0usize;
     let mut i = 0usize;
+    // Redacted keys already written: two credentials redact to the same
+    // marker, and a duplicate key would drop one value on the next parse.
+    let mut redacted_keys: HashSet<String> = HashSet::new();
     while i < bytes.len() {
         if bytes[i] != b'"' {
             i += 1;
@@ -142,18 +179,39 @@ fn rewrite_json_strings(line: &str) -> Result<Option<String>> {
         while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
             after += 1;
         }
-        if bytes.get(after) == Some(&b':') {
-            continue; // an object key
-        }
+        let is_key = bytes.get(after) == Some(&b':');
         let inner = &line[start + 1..end];
+        // A string that will not decode (a lone surrogate escape) is scrubbed
+        // as written; the markers are JSON-safe, so it is spliced back as is.
+        let mut as_written = false;
         let decoded: Cow<str> = if inner.contains('\\') {
-            Cow::Owned(serde_json::from_str::<String>(&line[start..=end])?)
+            match serde_json::from_str::<String>(&line[start..=end]) {
+                Ok(text) => Cow::Owned(text),
+                Err(_) => {
+                    as_written = true;
+                    Cow::Borrowed(inner)
+                }
+            }
         } else {
             Cow::Borrowed(inner)
         };
-        if let Cow::Owned(scrubbed) = scrub_string(&decoded) {
+        if let Cow::Owned(mut scrubbed) = scrub_string(&decoded) {
+            if is_key {
+                let base = scrubbed.clone();
+                let mut n = 1;
+                while !redacted_keys.insert(scrubbed.clone()) {
+                    n += 1;
+                    scrubbed = format!("{base} #{n}");
+                }
+            }
             out.push_str(&line[copied..start]);
-            out.push_str(&serde_json::to_string(&scrubbed)?);
+            if as_written {
+                out.push('"');
+                out.push_str(&scrubbed);
+                out.push('"');
+            } else {
+                out.push_str(&serde_json::to_string(&scrubbed)?);
+            }
             copied = end + 1;
         }
     }
@@ -169,7 +227,10 @@ fn rewrite_json_strings(line: &str) -> Result<Option<String>> {
 /// that does not parse is scrubbed as plain text.
 pub fn scrub_line(line: &[u8]) -> Cow<'_, [u8]> {
     let text = String::from_utf8_lossy(line);
-    if !crate::redact::may_hold_secret(&text) && !OPEN_PRIVATE_TAG.is_match(&text) {
+    if !ASCII_ESCAPE.is_match(&text)
+        && !crate::redact::may_hold_secret(&text)
+        && !OPEN_PRIVATE_TAG.is_match(&text)
+    {
         return Cow::Borrowed(line);
     }
     let structured = serde_json::from_str::<serde::de::IgnoredAny>(&text)
@@ -264,20 +325,28 @@ fn append_name(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Exclusive per-transcript lock: daemon, hooks and MCP servers all import.
+/// A cross-process lock on a sidecar file. Per transcript it is exclusive
+/// (daemon, hooks and MCP servers all import); mirror-wide it is shared by
+/// every sync and seal and exclusive for `purge`.
 struct FileLock(File);
 
 impl FileLock {
-    /// `Ok(None)` when another process still holds it after [`LOCK_WAIT`].
-    fn acquire(path: &Path) -> io::Result<Option<Self>> {
+    /// `Ok(None)` when another process still holds it after `wait`
+    /// (`Duration::ZERO` tries once).
+    fn acquire(path: &Path, exclusive: bool, wait: Duration) -> io::Result<Option<Self>> {
         let file = private_file_options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(path)?;
-        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        let deadline = std::time::Instant::now() + wait;
         loop {
-            match file.try_lock_exclusive() {
+            let locked = if exclusive {
+                FileExt::try_lock_exclusive(&file)
+            } else {
+                FileExt::try_lock_shared(&file)
+            };
+            match locked {
                 Ok(()) => return Ok(Some(Self(file))),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
@@ -357,8 +426,11 @@ pub enum SyncOutcome {
     /// The source file is gone; the existing mirror stays.
     SourceGone,
     UpToDate,
-    /// Another process held the transcript's lock; the next pass catches up.
+    /// Another process held the transcript's lock (or `purge` held the whole
+    /// mirror); the next pass catches up.
     Busy,
+    /// Too much is unmirrored for the import path; the daemon pass takes it.
+    Deferred,
     /// New source bytes were compressed and appended.
     Appended {
         source_bytes: u64,
@@ -369,6 +441,14 @@ pub enum SyncOutcome {
     },
     /// An error was counted in `mirror_errors`.
     Failed,
+}
+
+/// How a sync was asked for: how long it waits on locks, and whether a big
+/// backlog is left for later.
+#[derive(Clone, Copy)]
+struct SyncMode {
+    wait: Duration,
+    max_pending: Option<u64>,
 }
 
 /// Totals for one [`Mirror::sync_pass`].
@@ -396,9 +476,13 @@ pub struct Mirror<'a> {
     projects_dir: PathBuf,
     /// Seeded from `CSR_NO_MIRROR`; public so tests need no process env.
     pub disabled: bool,
-    /// A transcript untouched this long is sealed (and flushes a partial last
-    /// line). Seeded from `CSR_MIRROR_SEAL_SECS`.
+    /// A transcript untouched this long is sealed. Seeded from
+    /// `CSR_MIRROR_SEAL_SECS`.
     pub seal_after: Duration,
+    /// Runs inside `sync_pass` right after the state table is read: the window
+    /// in which another process can change a row the pass is holding.
+    #[cfg(test)]
+    after_snapshot: std::cell::RefCell<Option<Box<dyn Fn() + 'a>>>,
 }
 
 impl<'a> Mirror<'a> {
@@ -409,6 +493,8 @@ impl<'a> Mirror<'a> {
             projects_dir: projects_dir.to_path_buf(),
             disabled: mirror_disabled(),
             seal_after: seal_after_from_env(),
+            #[cfg(test)]
+            after_snapshot: std::cell::RefCell::new(None),
         }
     }
 
@@ -461,7 +547,30 @@ impl<'a> Mirror<'a> {
     /// Mirror the new bytes of one transcript. Never returns an error and
     /// never runs inside a DB transaction: a failure is counted and logged.
     pub fn sync_file(&self, source: &Path) -> SyncOutcome {
-        match self.try_sync_file(source) {
+        self.sync_with(
+            source,
+            SyncMode {
+                wait: LOCK_WAIT,
+                max_pending: None,
+            },
+        )
+    }
+
+    /// [`sync_file`](Self::sync_file) for the import path: never waits on a
+    /// lock another process holds, and leaves a large backlog (more than
+    /// [`OPPORTUNISTIC_MAX_PENDING`] unmirrored) to the daemon pass.
+    pub fn sync_file_opportunistic(&self, source: &Path) -> SyncOutcome {
+        self.sync_with(
+            source,
+            SyncMode {
+                wait: Duration::ZERO,
+                max_pending: Some(OPPORTUNISTIC_MAX_PENDING),
+            },
+        )
+    }
+
+    fn sync_with(&self, source: &Path, mode: SyncMode) -> SyncOutcome {
+        match self.try_sync_file(source, mode) {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.note_error(&error);
@@ -470,57 +579,96 @@ impl<'a> Mirror<'a> {
         }
     }
 
-    fn try_sync_file(&self, source: &Path) -> Result<SyncOutcome> {
+    /// The mirror file and the source still match the state row: the `.zst` has
+    /// the recorded length and the source's bytes up to `source_bytes` hash as
+    /// recorded. A row that fails this needs the recovery in `try_sync_file`.
+    fn row_intact(
+        &self,
+        rel: &str,
+        row: &MirrorRow,
+        source_file: &mut File,
+        size: u64,
+    ) -> io::Result<bool> {
+        if size < row.source_bytes {
+            return Ok(false);
+        }
+        let on_disk = match fs::metadata(self.zst_path(rel)) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if on_disk != row.zst_bytes {
+            return Ok(false);
+        }
+        Ok(tail_hash_at(source_file, row.source_bytes)? == row.tail_hash)
+    }
+
+    fn try_sync_file(&self, source: &Path, mode: SyncMode) -> Result<SyncOutcome> {
         if self.disabled {
             return Ok(SyncOutcome::Disabled);
         }
         let Some(rel) = self.rel_path(source) else {
             return Ok(SyncOutcome::NotMirrored);
         };
-        let size = match fs::metadata(source) {
-            Ok(meta) => meta.len(),
+        let mut source_file = match File::open(source) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(SyncOutcome::SourceGone)
             }
             Err(error) => return Err(error.into()),
         };
-        // The common call: nothing new since the last pass. One stat, one lookup.
-        match self.storage.mirror_row(&rel)? {
-            Some(row) if row.source_bytes == size && row.source_gone_at.is_none() => {
+        let size = source_file.metadata()?.len();
+        // The common call: nothing new since the last pass. One stat of the
+        // source and of the mirror file, a 4 KB read, one lookup.
+        let row = self.storage.mirror_row(&rel)?;
+        let intact = match &row {
+            Some(row) => self.row_intact(&rel, row, &mut source_file, size)?,
+            None => false,
+        };
+        match &row {
+            Some(row) if intact && row.source_bytes == size && row.source_gone_at.is_none() => {
                 return Ok(SyncOutcome::UpToDate)
             }
             None if size == 0 => return Ok(SyncOutcome::UpToDate),
             _ => {}
         }
+        if let Some(limit) = mode.max_pending {
+            let pending = match &row {
+                Some(row) if intact => size - row.source_bytes,
+                _ => size,
+            };
+            if pending > limit {
+                return Ok(SyncOutcome::Deferred);
+            }
+        }
         self.check_layout()?;
+        let root = mirror_root(&self.data_dir);
+        ensure_private_dir(&root)?;
+        self.harden_root()?;
+        // Shared with every other sync and seal, exclusive for purge.
+        let Some(_mirror) = FileLock::acquire(&root.join(MIRROR_LOCK_NAME), false, mode.wait)?
+        else {
+            return Ok(SyncOutcome::Busy);
+        };
         let zst = self.zst_path(&rel);
         let dir = zst
             .parent()
             .ok_or_else(|| anyhow!("mirror path has no parent"))?;
         ensure_private_dir(dir)?;
-        self.harden_root()?;
-        let Some(_lock) = FileLock::acquire(&append_name(&zst, ".lock"))? else {
+        let Some(_lock) = FileLock::acquire(&append_name(&zst, ".lock"), true, mode.wait)? else {
             return Ok(SyncOutcome::Busy);
         };
 
         // Everything below sees a stable mirror file and state row.
-        let meta = match fs::metadata(source) {
-            Ok(meta) => meta,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(SyncOutcome::SourceGone)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let size = meta.len();
-        let idle = meta
-            .modified()
-            .ok()
-            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-            .is_some_and(|age| age >= self.seal_after);
-        let mut source_file = File::open(source)?;
-
+        let size = source_file.metadata()?.len();
+        let had_row = self
+            .storage
+            .mirror_row(&rel)?
+            .is_some_and(|row| row.source_bytes > 0);
         let mut row = self.recover(&rel, &zst)?;
-        let mut rewrote = false;
+        // A row that existed but could not be kept (the `.zst` lost bytes) is a
+        // rebuild from scratch too.
+        let mut rewrote = had_row && row.is_none();
         if let Some(existing) = &row {
             let intact = size >= existing.source_bytes
                 && tail_hash_at(&mut source_file, existing.source_bytes)? == existing.tail_hash;
@@ -536,23 +684,24 @@ impl<'a> Mirror<'a> {
         let mut buf: Vec<u8> = Vec::new();
         while row.source_bytes < size {
             let offset = row.source_bytes;
-            // Read a batch; a line longer than the batch keeps extending it.
+            // One batch from a line boundary. A line is never held longer than
+            // the batch: a window with no newline in it is either the unfinished
+            // last line (it waits for its newline, however old the file is: a
+            // credential cut in half would not match yet and could not be
+            // scrubbed once the rest arrives) or a line past the cap.
+            let want = BATCH_MAX_BYTES.min((size - offset) as usize);
             buf.clear();
-            let mut cut = None;
-            while cut.is_none() && offset + (buf.len() as u64) < size {
-                let want = BATCH_MAX_BYTES.min((size - offset) as usize - buf.len());
-                let from = buf.len();
-                buf.resize(from + want, 0);
-                source_file.seek(SeekFrom::Start(offset + from as u64))?;
-                source_file.read_exact(&mut buf[from..])?;
-                cut = buf.iter().rposition(|byte| *byte == b'\n').map(|at| at + 1);
-            }
-            let cut = match cut {
-                Some(cut) => cut,
-                // A last line with no newline waits, unless nothing has written
-                // to the file for a while: then it is all there will be.
-                None if idle && !buf.is_empty() => buf.len(),
-                None => break,
+            buf.resize(want, 0);
+            source_file.seek(SeekFrom::Start(offset))?;
+            source_file.read_exact(&mut buf)?;
+            let Some(cut) = buf.iter().rposition(|byte| *byte == b'\n').map(|at| at + 1) else {
+                if want >= BATCH_MAX_BYTES {
+                    bail!(
+                        "{rel}: a line over {} MiB at byte {offset}; not mirrored past it",
+                        BATCH_MAX_BYTES >> 20
+                    );
+                }
+                break;
             };
             let frame = compress_frame(&scrub_lines(&buf[..cut]))?;
 
@@ -695,6 +844,36 @@ impl<'a> Mirror<'a> {
         Ok(())
     }
 
+    /// Both locks a writer of one transcript holds, mirror-wide (shared) first.
+    /// `None` when either is busy, or when there is no mirror to lock.
+    fn lock_transcript(&self, rel: &str, wait: Duration) -> Result<Option<(FileLock, FileLock)>> {
+        let root = mirror_root(&self.data_dir);
+        if !root.is_dir() {
+            return Ok(None);
+        }
+        let Some(mirror) = FileLock::acquire(&root.join(MIRROR_LOCK_NAME), false, wait)? else {
+            return Ok(None);
+        };
+        let lock = append_name(&self.zst_path(rel), ".lock");
+        if !lock.parent().is_some_and(Path::is_dir) {
+            return Ok(None);
+        }
+        let Some(transcript) = FileLock::acquire(&lock, true, wait)? else {
+            return Ok(None);
+        };
+        Ok(Some((mirror, transcript)))
+    }
+
+    /// The source of a mirrored transcript is gone: say so on the row. Under
+    /// the transcript's locks, and only that one column: a pass's snapshot of
+    /// the row can be older than what another process has since written.
+    fn mark_source_gone(&self, rel: &str) -> Result<bool> {
+        let Some(_guards) = self.lock_transcript(rel, LOCK_WAIT)? else {
+            return Ok(false);
+        };
+        self.storage.mirror_mark_gone(rel, &now_stamp())
+    }
+
     /// Repack a many-frame transcript into one frame. Decodes and re-encodes
     /// as a stream, so the largest transcript never sits in memory. Order:
     /// finished `.part` fsynced, state updated, rename (see `settle_seal`).
@@ -702,10 +881,10 @@ impl<'a> Mirror<'a> {
         if self.disabled {
             return Ok(false);
         }
-        let zst = self.zst_path(rel);
-        let Some(_lock) = FileLock::acquire(&append_name(&zst, ".lock"))? else {
+        let Some(_guards) = self.lock_transcript(rel, LOCK_WAIT)? else {
             return Ok(false);
         };
+        let zst = self.zst_path(rel);
         let Some(row) = self.recover(rel, &zst)? else {
             return Ok(false);
         };
@@ -771,6 +950,10 @@ impl<'a> Mirror<'a> {
                 return stats;
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_snapshot.borrow().as_ref() {
+            hook();
+        }
         let mut sources = Vec::new();
         collect_transcripts(&self.projects_dir, &mut sources);
         let mut seen: HashSet<String> = HashSet::with_capacity(sources.len());
@@ -787,7 +970,11 @@ impl<'a> Mirror<'a> {
             stats.files += 1;
             let row = rows.get(&rel);
             let due = match row {
-                Some(row) => row.source_bytes != meta.len() || row.source_gone_at.is_some(),
+                Some(row) => {
+                    row.source_bytes != meta.len()
+                        || row.source_gone_at.is_some()
+                        || !self.matches_disk(&rel, row, source, meta.len())
+                }
                 None => meta.len() > 0,
             };
             let mut frames = row.map_or(0, |row| row.frames);
@@ -834,12 +1021,9 @@ impl<'a> Mirror<'a> {
                 if self.projects_dir.join(rel).exists() {
                     continue;
                 }
-                let flagged = MirrorRow {
-                    source_gone_at: Some(now_stamp()),
-                    ..row.clone()
-                };
-                match self.storage.mirror_upsert(&flagged) {
-                    Ok(()) => stats.sources_gone += 1,
+                match self.mark_source_gone(rel) {
+                    Ok(true) => stats.sources_gone += 1,
+                    Ok(false) => {}
                     Err(error) => self.note_error(&error),
                 }
                 if row.frames > 1 {
@@ -852,6 +1036,13 @@ impl<'a> Mirror<'a> {
             }
         }
         self.finish_pass(stats, errors_before)
+    }
+
+    /// [`row_intact`](Self::row_intact) for the pass: any error reads as "no".
+    fn matches_disk(&self, rel: &str, row: &MirrorRow, source: &Path, size: u64) -> bool {
+        File::open(source)
+            .and_then(|mut file| self.row_intact(rel, row, &mut file, size))
+            .unwrap_or(false)
     }
 
     fn finish_pass(&self, mut stats: PassStats, errors_before: i64) -> PassStats {
@@ -872,6 +1063,17 @@ impl<'a> Mirror<'a> {
     /// compressed transcripts and the state rows. The legacy one-time copy
     /// beside them is not this module's to delete.
     pub fn purge(&self, yes: bool) -> Result<PurgeReport> {
+        // Writers hold the mirror-wide lock shared; the delete holds it
+        // exclusively, so nothing writes into the folder (or the table) while
+        // it goes. The lock file sits outside the folder that is deleted.
+        let _exclusive = if yes {
+            let root = mirror_root(&self.data_dir);
+            ensure_private_dir(&root)?;
+            let held = FileLock::acquire(&root.join(MIRROR_LOCK_NAME), true, LOCK_WAIT)?;
+            Some(held.ok_or_else(|| anyhow!("the mirror is busy (a sync is running); try again"))?)
+        } else {
+            None
+        };
         let totals = self.storage.mirror_totals()?;
         let mut report = PurgeReport {
             files: totals.files,
@@ -1072,18 +1274,6 @@ mod tests {
             rig.decoded("s4.jsonl"),
             format!("{first}{second}").as_bytes()
         );
-    }
-
-    #[test]
-    fn an_old_file_with_no_final_newline_is_flushed_whole() {
-        let rig = Rig::new();
-        let src = rig.source("s4b.jsonl");
-        let text = format!("{}{}", line(1, "one"), line(2, "two").trim_end());
-        fs::write(&src, &text).unwrap();
-        let mut mirror = rig.mirror();
-        mirror.seal_after = Duration::ZERO;
-        mirror.sync_file(&src);
-        assert_eq!(rig.decoded("s4b.jsonl"), text.as_bytes());
     }
 
     #[test]
@@ -1409,6 +1599,239 @@ mod tests {
         assert!(reader.lines().take(100_000).count() < 100_000);
     }
 
+    // ─── U3: fix round after review ───
+
+    #[test]
+    fn a_stale_pass_snapshot_never_overwrites_a_sealed_mirror_of_a_gone_source() {
+        let rig = Rig::new();
+        let src = rig.source("gone.jsonl");
+        let rel = "-tmp-proj/gone.jsonl";
+        for n in 0..3 {
+            append(&src, line(n, &format!("entry {n}")).as_bytes());
+            rig.mirror().sync_file(&src);
+        }
+        let before = rig.decoded("gone.jsonl");
+        assert_eq!(rig.storage.mirror_row(rel).unwrap().unwrap().frames, 3);
+
+        // The pass reads its snapshot (three frames). Before it gets to the
+        // gone-source step, another process seals the mirror and the source
+        // disappears.
+        let mirror = rig.mirror();
+        {
+            let src = src.clone();
+            let rig = &rig;
+            mirror.after_snapshot.replace(Some(Box::new(move || {
+                assert!(rig.mirror().seal_file(rel).unwrap());
+                fs::remove_file(&src).unwrap();
+            })));
+        }
+        let mut mirror = mirror;
+        mirror.seal_after = Duration::ZERO;
+        let stats = mirror.sync_pass(None);
+
+        assert_eq!(stats.sources_gone, 1);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(rig.decoded("gone.jsonl"), before);
+        let row = rig.storage.mirror_row(rel).unwrap().unwrap();
+        assert!(row.source_gone_at.is_some());
+        assert_eq!((row.frames, row.sealed), (1, true));
+        assert_eq!(
+            row.zst_bytes,
+            fs::metadata(rig.zst("gone.jsonl")).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn a_same_size_rewrite_of_the_source_is_caught_before_up_to_date() {
+        let rig = Rig::new();
+        let src = rig.source("same.jsonl");
+        let first = format!("{}{}", line(1, "alpha alpha"), line(2, "beta beta"));
+        fs::write(&src, &first).unwrap();
+        rig.mirror().sync_file(&src);
+
+        let second = first.replace("alpha", "gamma");
+        assert_eq!(second.len(), first.len());
+        fs::write(&src, &second).unwrap();
+        assert!(matches!(
+            rig.mirror().sync_file(&src),
+            SyncOutcome::Rewritten { .. }
+        ));
+        assert_eq!(rig.decoded("same.jsonl"), second.as_bytes());
+
+        // The daemon pass finds it too.
+        let third = second.replace("beta", "delt");
+        fs::write(&src, &third).unwrap();
+        assert_eq!(rig.mirror().sync_pass(None).synced, 1);
+        assert_eq!(rig.decoded("same.jsonl"), third.as_bytes());
+    }
+
+    #[test]
+    fn a_missing_or_truncated_mirror_file_is_rebuilt_while_the_source_is_unchanged() {
+        let rig = Rig::new();
+        let src = rig.source("dmg.jsonl");
+        let text = format!("{}{}", line(1, "one"), line(2, "two"));
+        fs::write(&src, &text).unwrap();
+        rig.mirror().sync_file(&src);
+
+        let zst = rig.zst("dmg.jsonl");
+        let full = fs::read(&zst).unwrap();
+        fs::write(&zst, &full[..full.len() - 5]).unwrap();
+        assert!(matches!(
+            rig.mirror().sync_file(&src),
+            SyncOutcome::Rewritten { .. }
+        ));
+        assert_eq!(rig.decoded("dmg.jsonl"), text.as_bytes());
+
+        fs::remove_file(&zst).unwrap();
+        assert_eq!(rig.mirror().sync_pass(None).synced, 1);
+        assert_eq!(rig.decoded("dmg.jsonl"), text.as_bytes());
+    }
+
+    #[test]
+    fn a_partial_last_line_is_never_flushed_even_when_the_file_is_idle() {
+        let rig = Rig::new();
+        let src = rig.source("part.jsonl");
+        let first = line(1, "complete");
+        let github = fake_github();
+        // The writer stopped inside a credential: too short to match yet.
+        let whole = line(2, &format!("token {github} end"));
+        let cut = whole.find("ghp_").unwrap() + 10;
+        fs::write(&src, format!("{first}{}", &whole[..cut])).unwrap();
+
+        let mut mirror = rig.mirror();
+        mirror.seal_after = Duration::ZERO;
+        mirror.sync_file(&src);
+        assert_eq!(rig.decoded("part.jsonl"), first.as_bytes());
+        let rel = "-tmp-proj/part.jsonl";
+        let row = rig.storage.mirror_row(rel).unwrap().unwrap();
+        assert_eq!(row.source_bytes, first.len() as u64);
+
+        // The writer resumes: the finished line is scrubbed as a whole.
+        append(&src, &whole.as_bytes()[cut..]);
+        mirror.sync_file(&src);
+        let decoded = String::from_utf8(rig.decoded("part.jsonl")).unwrap();
+        assert!(!decoded.contains("ghp_"));
+        assert!(decoded.contains("[secret redacted: github_token]"));
+        assert_eq!(decoded.lines().count(), 2);
+    }
+
+    #[test]
+    fn json_unicode_escapes_cannot_hide_a_secret_or_a_private_span() {
+        let rig = Rig::new();
+        let src = rig.source("esc.jsonl");
+        let body = "A".repeat(36);
+        let secret_line = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"key \\u0067hp_{body} end\"}}}}\n"
+        );
+        let private_line = "{\"type\":\"user\",\"message\":{\"content\":\"a \\u003cprivate>hush hush\\u003c/private> b\"}}\n";
+        let clean_escape =
+            "{\"type\":\"user\",\"message\":{\"content\":\"caf\\u00e9 \\u001b[0m ok\"}}\n";
+        fs::write(&src, format!("{secret_line}{private_line}{clean_escape}")).unwrap();
+        rig.mirror().sync_file(&src);
+
+        let decoded = String::from_utf8(rig.decoded("esc.jsonl")).unwrap();
+        let mut lines = decoded.split_inclusive('\n');
+        let first = lines.next().unwrap();
+        assert!(!first.contains(&body), "{first}");
+        assert!(first.contains("[secret redacted: github_token]"));
+        let second = lines.next().unwrap();
+        assert!(!second.contains("hush"), "{second}");
+        // An escape that cannot spell a pattern leaves the line byte-identical.
+        assert_eq!(lines.next().unwrap(), clean_escape);
+    }
+
+    #[test]
+    fn object_keys_are_scrubbed_in_the_mirror() {
+        let rig = Rig::new();
+        let src = rig.source("keys.jsonl");
+        let other = format!("{}{}", "ghp_", "B".repeat(36));
+        let text = format!(
+            "{{\"input\":{{\"{}\":\"acct-1\",\"{other}\":\"acct-2\",\"plain\":1}}}}\n",
+            fake_github()
+        );
+        fs::write(&src, &text).unwrap();
+        rig.mirror().sync_file(&src);
+        let decoded = String::from_utf8(rig.decoded("keys.jsonl")).unwrap();
+        assert!(!decoded.contains("ghp_"), "{decoded}");
+        let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        let object = value["input"].as_object().unwrap();
+        // Two secrets collapse to one marker; neither value is lost.
+        assert_eq!(object.len(), 3, "{decoded}");
+        assert!(object.values().any(|v| v == "acct-1"));
+        assert!(object.values().any(|v| v == "acct-2"));
+        assert_eq!(object["plain"], 1);
+    }
+
+    #[test]
+    fn purge_waits_for_a_running_sync_and_a_sync_waits_for_purge() {
+        let rig = Rig::new();
+        let src = rig.source("lk.jsonl");
+        fs::write(&src, line(1, "x")).unwrap();
+        rig.mirror().sync_file(&src);
+
+        let lock_path = mirror_root(&rig.data_dir).join(".mirror.lock");
+        let open = || {
+            private_file_options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .unwrap()
+        };
+        // A sync in flight holds the shared lock: purge must not delete under it.
+        let syncing = open();
+        syncing.lock_shared().unwrap();
+        assert!(rig.mirror().purge(true).is_err());
+        assert!(rig.zst("lk.jsonl").exists());
+        assert_eq!(rig.storage.mirror_totals().unwrap().files, 1);
+        FileExt::unlock(&syncing).unwrap();
+
+        // A purge in flight holds it exclusively: a sync backs off.
+        let purging = open();
+        purging.lock_exclusive().unwrap();
+        append(&src, line(2, "y").as_bytes());
+        assert_eq!(rig.mirror().sync_file(&src), SyncOutcome::Busy);
+        FileExt::unlock(&purging).unwrap();
+        assert!(matches!(
+            rig.mirror().sync_file(&src),
+            SyncOutcome::Appended { .. }
+        ));
+    }
+
+    #[test]
+    fn a_line_over_the_cap_stops_the_file_and_is_never_mirrored() {
+        let rig = Rig::new();
+        let src = rig.source("huge.jsonl");
+        let first = line(1, "small and fine");
+        let github = fake_github();
+        let mut huge = format!("{{\"type\":\"user\",\"message\":{{\"content\":\"{github} ");
+        huge.push_str(&"y".repeat(BATCH_MAX_BYTES));
+        huge.push_str("\"}}\n");
+        let after = line(3, "after the huge line");
+        fs::write(&src, format!("{first}{huge}{after}")).unwrap();
+
+        rig.mirror().sync_file(&src);
+        let decoded = rig.decoded("huge.jsonl");
+        assert!(
+            decoded == first.as_bytes(),
+            "mirror holds {} bytes",
+            decoded.len()
+        );
+        let row = rig
+            .storage
+            .mirror_row("-tmp-proj/huge.jsonl")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.source_bytes, first.len() as u64);
+        assert_eq!(
+            rig.storage
+                .get_meta_counter(MIRROR_ERRORS_KEY)
+                .unwrap()
+                .unwrap(),
+            1
+        );
+    }
+
     fn write_session(path: &Path, secret: &str) {
         let lines = [
             serde_json::json!({
@@ -1534,6 +1957,227 @@ mod tests {
             .mirror_row("-tmp-proj/sess-bbb.jsonl")
             .unwrap()
             .is_none());
+    }
+
+    fn ignorable_line(bytes: usize) -> String {
+        format!(
+            "{{\"type\":\"file-history-snapshot\",\"blob\":\"{}\"}}\n",
+            "x".repeat(bytes)
+        )
+    }
+
+    #[tokio::test]
+    async fn an_import_leaves_a_large_mirror_backlog_to_the_daemon_pass() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-big.jsonl");
+        write_session(&src, &fake_github());
+        let mut body = fs::read_to_string(&src).unwrap();
+        for _ in 0..9 {
+            body.push_str(&ignorable_line(1 << 20));
+        }
+        fs::write(&src, body).unwrap();
+
+        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
+        let rel = "-tmp-proj/sess-big.jsonl";
+        assert!(engine.storage().mirror_row(rel).unwrap().is_none());
+
+        let stats = engine.mirror().sync_pass(None);
+        assert_eq!((stats.synced, stats.errors), (1, 0));
+        assert_eq!(
+            engine
+                .storage()
+                .mirror_row(rel)
+                .unwrap()
+                .unwrap()
+                .source_bytes,
+            fs::metadata(&src).unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_transcript_lock_does_not_stall_the_import() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-busy.jsonl");
+        write_session(&src, &fake_stripe());
+        engine.import_file(&src, "proj").await.unwrap();
+
+        append(&src, line(9, "a later message").as_bytes());
+        let lock = File::create(append_name(&rig.zst("sess-busy.jsonl"), ".lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        let started = std::time::Instant::now();
+        engine.import_file(&src, "proj").await.unwrap();
+        let took = started.elapsed();
+        FileExt::unlock(&lock).unwrap();
+        assert!(took < Duration::from_millis(1500), "import waited {took:?}");
+        // The next pass catches the mirror up.
+        let stats = engine.mirror().sync_pass(None);
+        assert_eq!((stats.synced, stats.errors), (1, 0));
+    }
+
+    fn chunks_like(engine: &crate::engine::Engine, needle: &str) -> i64 {
+        engine
+            .storage()
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM chunks WHERE content LIKE ?1",
+                    [format!("%{needle}%")],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_messages_stay_searchable_when_the_scrub_shortens_earlier_chunks() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-drift.jsonl");
+        let pem = format!(
+            "{}{}\n{}\n{}{}",
+            "-----BEGIN RSA PRIV",
+            "ATE KEY-----",
+            "Zm9vYmFy".repeat(200),
+            "-----END RSA PRIV",
+            "ATE KEY-----"
+        );
+        let message = |n: usize, text: &str| {
+            serde_json::json!({
+                "type": "user", "uuid": format!("d-{n}"),
+                "timestamp": format!("2026-10-14T10:00:{n:02}Z"),
+                "message": {"content": text}
+            })
+            .to_string()
+                + "\n"
+        };
+
+        // Imported by a build without the scrubber: every message is long.
+        {
+            let _off = crate::redact::DisabledForTest::set(true);
+            let mut body = String::new();
+            for n in 0..4 {
+                body.push_str(&message(n, &format!("dump {n}\n{pem}\nend {n}")));
+            }
+            fs::write(&src, body).unwrap();
+            assert!(engine.import_file(&src, "proj").await.unwrap() >= 4);
+            assert!(chunks_like(&engine, "Zm9vYmFy") >= 4);
+        }
+
+        // The scrub is on now, and the conversation grows.
+        append(&src, message(10, "freshly appended alpha").as_bytes());
+        append(&src, message(11, "freshly appended bravo").as_bytes());
+        filetime_touch(&src);
+        engine.import_file(&src, "proj").await.unwrap();
+
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert_eq!(chunks_like(&engine, "freshly appended bravo"), 1);
+        assert_eq!(chunks_like(&engine, "Zm9vYmFy"), 0);
+        assert!(chunks_like(&engine, "[secret redacted: private_key_block]") >= 1);
+
+        // And a plain append afterwards is incremental again.
+        // (Long enough to open a chunk of its own: a short one joins the last
+        // chunk, which an incremental import has never re-read.)
+        let long = format!("freshly appended charlie {}", "lorem ipsum ".repeat(120));
+        append(&src, message(12, &long).as_bytes());
+        filetime_touch(&src);
+        engine.import_file(&src, "proj").await.unwrap();
+        assert_eq!(chunks_like(&engine, "freshly appended charlie"), 1);
+    }
+
+    /// The import-state check compares mtimes; make sure an append inside the
+    /// same clock tick still reads as changed.
+    fn filetime_touch(path: &Path) {
+        let later = SystemTime::now() + Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    #[test]
+    fn archived_subagent_transcripts_are_found_in_the_mirror_by_id() {
+        let rig = Rig::new();
+        let nested = transcripts_dir(&rig.data_dir).join("-tmp-proj/sess-1/subagents");
+        fs::create_dir_all(&nested).unwrap();
+        let mut body = String::new();
+        write_session(&rig.source("scratch.jsonl"), "nothing");
+        body.push_str(&fs::read_to_string(rig.source("scratch.jsonl")).unwrap());
+        fs::write(
+            nested.join("agent-a1b2.jsonl.zst"),
+            compress_frame(body.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let pointer = crate::mcp::tools::get_full_conversation(
+            &rig.projects,
+            Some(&rig.data_dir),
+            "agent-a1b2",
+            None,
+        );
+        assert!(pointer.contains("<mirror_path>"), "got: {pointer}");
+        assert!(pointer.contains("-tmp-proj"), "got: {pointer}");
+        let request = crate::transcript::TranscriptRequest {
+            session: "agent-a1b2".to_string(),
+            view: crate::transcript::ViewKind::Stats,
+            ..Default::default()
+        };
+        let stats =
+            crate::transcript::run_with_mirror(&rig.projects, Some(&rig.data_dir), &request);
+        assert!(stats.contains("<turns total=\"2\""), "got: {stats}");
+
+        // The same id under a second project is still ambiguous.
+        let other = transcripts_dir(&rig.data_dir).join("-tmp-other/sess-2/subagents");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(
+            other.join("agent-a1b2.jsonl.zst"),
+            compress_frame(body.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let pointer = crate::mcp::tools::get_full_conversation(
+            &rig.projects,
+            Some(&rig.data_dir),
+            "agent-a1b2",
+            None,
+        );
+        assert!(pointer.contains("ambiguous"), "got: {pointer}");
+    }
+
+    #[test]
+    fn a_damaged_mirror_frame_is_reported_as_incomplete_not_as_a_clean_read() {
+        let rig = Rig::new();
+        let dir = transcripts_dir(&rig.data_dir).join("-tmp-proj");
+        fs::create_dir_all(&dir).unwrap();
+        let good = [line(1, "first prompt"), line(2, "second prompt")].concat();
+        let torn_source = (3..400)
+            .map(|n| line(n, "a later prompt in a torn frame"))
+            .collect::<String>();
+        let torn = compress_frame(torn_source.as_bytes()).unwrap();
+        let mut bytes = compress_frame(good.as_bytes()).unwrap();
+        bytes.extend_from_slice(&torn[..torn.len() / 2]);
+        fs::write(dir.join("sess-torn.jsonl.zst"), bytes).unwrap();
+
+        let ask = |view, json| {
+            crate::transcript::run_with_mirror(
+                &rig.projects,
+                Some(&rig.data_dir),
+                &crate::transcript::TranscriptRequest {
+                    session: "sess-torn".to_string(),
+                    view,
+                    json,
+                    ..Default::default()
+                },
+            )
+        };
+        let stats = ask(crate::transcript::ViewKind::Stats, false);
+        assert!(stats.contains("INCOMPLETE"), "got: {stats}");
+        let prompts = ask(crate::transcript::ViewKind::Prompts, false);
+        assert!(prompts.contains("INCOMPLETE"), "got: {prompts}");
+        assert!(prompts.contains("first prompt"));
+        let json = ask(crate::transcript::ViewKind::Stats, true);
+        assert!(json.contains("\"incomplete\":true"), "got: {json}");
     }
 
     /// A generated JSONL corpus of about `target` bytes: mostly clean lines,

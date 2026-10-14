@@ -168,6 +168,9 @@ pub struct ParsedTranscript {
     pub(crate) queue_events: Vec<QueueEvent>,
     /// Parsed from the transcript mirror's scrubbed copy, not the original JSONL.
     pub from_mirror: bool,
+    /// Why decoding the mirror copy stopped before its end (a torn or corrupt
+    /// frame). Everything after the damage is missing from this parse.
+    pub read_error: Option<String>,
 }
 
 /// A `queue-operation` line other than `enqueue` — `remove` or `dequeue` —
@@ -213,10 +216,11 @@ pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
 /// [`parse_transcript`] over a transcript mirror file (`*.jsonl.zst`),
 /// decoded as a stream: even the largest transcript is never held decoded.
 pub fn parse_mirrored_transcript(path: &Path) -> Result<ParsedTranscript> {
-    let reader = crate::mirror::open_transcript(path)
+    let (reader, failure) = crate::mirror::open_transcript_checked(path)
         .with_context(|| format!("opening mirrored transcript {}", path.display()))?;
     let mut parsed = parse_transcript_reader(reader);
     parsed.from_mirror = true;
+    parsed.read_error = failure.lock().ok().and_then(|mut slot| slot.take());
     Ok(parsed)
 }
 

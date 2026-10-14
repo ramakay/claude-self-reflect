@@ -1114,6 +1114,12 @@ impl Storage {
         queries::get_imported_chunk_count(&conn, path)
     }
 
+    /// See `queries::import_secrets_stamped`.
+    pub fn import_secrets_stamped(&self, path: &Path) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::import_secrets_stamped(&conn, path)
+    }
+
     pub fn get_chunk_content(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunk_content(&conn, id)

@@ -3382,7 +3382,7 @@ pub(crate) fn find_conversation_file(
     conversation_id: &str,
     project: Option<&str>,
 ) -> ConversationLookup {
-    find_transcript_file(projects_dir, ".jsonl", conversation_id, project)
+    find_transcript_file(projects_dir, ".jsonl", conversation_id, project, false)
 }
 
 /// The same lookup over the transcript mirror's `<project>/<id>.jsonl.zst`
@@ -3397,16 +3397,20 @@ pub(crate) fn find_mirrored_conversation(
         ".jsonl.zst",
         conversation_id,
         project,
+        true,
     )
 }
 
 /// `find_conversation_file`'s one rule, parameterized by the root to search and
-/// the file-name suffix that marks a transcript there.
+/// the file-name suffix that marks a transcript there. `nested` also looks in
+/// `<project>/<session>/subagents/agent-*` (the mirror archives those); a hit
+/// there still reports its top-level project.
 fn find_transcript_file(
     projects_dir: &Path,
     suffix: &str,
     conversation_id: &str,
     project: Option<&str>,
+    nested: bool,
 ) -> ConversationLookup {
     // Validate conversation_id: must be non-empty, alphanumeric + hyphens + underscores only
     if conversation_id.is_empty()
@@ -3449,19 +3453,31 @@ fn find_transcript_file(
     // whether the match is exact.
     let mut candidates: Vec<(PathBuf, String, bool)> = Vec::new(); // (path, project_name, is_exact)
     for dir in &search_dirs {
-        if let Ok(files) = std::fs::read_dir(dir) {
+        let project_name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let mut scan = |files: std::fs::ReadDir| {
             for entry in files.flatten() {
                 let path = entry.path();
                 let file_name = entry.file_name();
                 if let Some(stem) = file_name.to_string_lossy().strip_suffix(suffix) {
                     let is_exact = stem == conversation_id;
                     if is_exact || stem.contains(conversation_id) {
-                        let project_name = dir
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        candidates.push((path.clone(), project_name, is_exact));
+                        candidates.push((path.clone(), project_name.clone(), is_exact));
+                    }
+                }
+            }
+        };
+        if let Ok(files) = std::fs::read_dir(dir) {
+            scan(files);
+        }
+        if nested {
+            if let Ok(sessions) = std::fs::read_dir(dir) {
+                for session in sessions.flatten().filter(|e| e.path().is_dir()) {
+                    if let Ok(agents) = std::fs::read_dir(session.path().join("subagents")) {
+                        scan(agents);
                     }
                 }
             }

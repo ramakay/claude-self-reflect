@@ -172,11 +172,13 @@ static PRIVATE_KEY_END: LazyLock<Regex> = LazyLock::new(|| {
         .expect("private key end compiles")
 });
 
-/// `NAME_WITH_SECRET=value` at the start of a line, optionally `export `-ed,
-/// the value optionally quoted. The name and `=` survive; the value goes.
+/// `NAME_WITH_SECRET=value` at the start of a line, optionally `export `-ed.
+/// A quoted value runs to its closing quote (`PASSWORD="two words"` is one
+/// value); an unquoted one to the next space. The name and `=` survive, the
+/// value goes. A quote that never closes falls back to the first word.
 static ENV_SECRET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?m)^(?P<pre>[ \t]*(?:export[ \t]+)?(?:[A-Z][A-Z0-9_]*)?(?:SECRET|TOKEN|API_KEY|APIKEY|PASSWORD|PASSWD)[A-Z0-9_]*=["']?)(?P<val>[^\s"'\\]{8,})"#,
+        r#"(?m)^(?P<pre>[ \t]*(?:export[ \t]+)?(?:[A-Z][A-Z0-9_]*)?(?:SECRET|TOKEN|API_KEY|APIKEY|PASSWORD|PASSWD)[A-Z0-9_]*=)(?:"(?P<dq>[^"\r\n]*)"|'(?P<sq>[^'\r\n]*)'|(?P<q>["']?)(?P<val>[^\s"'\\]{8,}))"#,
     )
     .expect("env secret pattern compiles")
 });
@@ -311,12 +313,21 @@ fn redact_private_keys(text: &str, counts: &mut SecretCounts) -> Option<String> 
 fn redact_env_secrets(text: &str, counts: &mut SecretCounts) -> Option<String> {
     let mut hits = 0usize;
     let out = ENV_SECRET_RE.replace_all(text, |caps: &Captures| {
-        let value = &caps["val"];
-        if is_placeholder_value(value) {
+        // (quote char, value) of whichever alternative matched.
+        let (quote, value) = if let Some(value) = caps.name("dq") {
+            ("\"", value.as_str())
+        } else if let Some(value) = caps.name("sq") {
+            ("'", value.as_str())
+        } else {
+            (&caps["q"], &caps["val"])
+        };
+        let quoted = caps.name("val").is_none();
+        if (quoted && value.len() < 8) || is_placeholder_value(value) {
             return caps[0].to_string();
         }
         hits += 1;
-        format!("{}{}", &caps["pre"], marker(ENV_SECRET))
+        let closing = if quoted { quote } else { "" };
+        format!("{}{quote}{}{closing}", &caps["pre"], marker(ENV_SECRET))
     });
     if hits == 0 {
         return None;
@@ -443,6 +454,34 @@ mod tests {
             redact_secrets(&text),
             "  AUTH_TOKEN=\"[secret redacted: env_secret]\""
         );
+    }
+
+    #[test]
+    fn quoted_env_values_are_redacted_through_the_closing_quote() {
+        // A passphrase with spaces: the whole value goes, not one word of it.
+        assert_eq!(
+            redact_secrets("PASSWORD=\"correct horse battery staple\""),
+            "PASSWORD=\"[secret redacted: env_secret]\""
+        );
+        assert_eq!(
+            redact_secrets("export DB_PASSWORD='elephants horse battery'\nnext line"),
+            "export DB_PASSWORD='[secret redacted: env_secret]'\nnext line"
+        );
+        // Length and placeholder checks apply to the whole quoted value.
+        for text in [
+            "PASSWORD=\"hunter2\"",
+            "PASSWORD=\"enter your password here\"",
+            "PASSWORD=\"${DB_PASSWORD} and more\"",
+        ] {
+            assert!(matches!(redact_secrets(text), Cow::Borrowed(_)), "{text}");
+        }
+        // An unclosed quote still falls back to the first word.
+        assert_eq!(
+            redact_secrets("PASSWORD=\"elephants and more"),
+            "PASSWORD=\"[secret redacted: env_secret] and more"
+        );
+        let once = redact_secrets("PASSWORD=\"correct horse battery staple\"").into_owned();
+        assert!(matches!(redact_secrets(&once), Cow::Borrowed(_)));
     }
 
     #[test]
