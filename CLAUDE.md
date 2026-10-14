@@ -80,7 +80,7 @@ csr-engine status --compact    # Statusline output
 csr-engine daemon              # Background enrichment + dream cycle; keep it alive with scripts/launchd/com.ramakay.csr-engine.daemon.plist
 csr-engine hook install --apply # Install/update hooks
 csr-engine eval                # Quick eval (5 tests, ~7ms)
-csr-engine eval --full         # Full eval (20 tests, ~200ms)
+csr-engine eval --full         # Full eval (24 results plus a census line)
 csr-engine quality <file>      # AST code quality analysis
 ```
 

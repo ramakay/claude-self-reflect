@@ -80,13 +80,35 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   `☾ due`, `☾ dreaming` (59b2b1a5, 519cafb6). The unread badge counts journal dreams; it had read "12326 unread"
   while the journal listed 6 (1155af00).
 - **Intent channel and lessons.** Corrections, redirects and abandonments land in append-only `intent_events`
-  with byte receipts; new `SubagentStop` hook, `csr-engine backfill intent`, `CSR_NO_INTENT_CAPTURE=1`
-  (e18920ad, 1cffba26, 71f4624b, 05172115). Only typed words count: 1 of 107 recorded corrections passes the
-  new rules (40095521). `csr-engine lessons --project <p>` prints CLAUDE.md candidates with receipts and never
-  writes CLAUDE.md (b719b2bc, 54389e31).
+  with byte receipts; `csr-engine backfill intent`, `CSR_NO_INTENT_CAPTURE=1` (e18920ad, 1cffba26, 71f4624b,
+  05172115). Only typed words count: 1 of 107 recorded corrections passes the new rules (40095521).
+  e18920ad added a `SubagentStop` hook; 4adf32ee dropped it. It captured nothing by design (sidechain transcripts
+  are foreign to `intent_events`) and cost a process spawn per finished subagent. `hook install` no longer
+  registers it, and `merge_hook_config` sweeps CSR entries out of event groups the new config does not register.
+  `hook subagent-stop` stays accepted as a no-op for older settings (06af27e2, 34f5648c). `csr-engine lessons
+  --project <p>` prints CLAUDE.md candidates with receipts and never writes CLAUDE.md (b719b2bc, 54389e31).
 
 ### Provenance and self-contamination guard
 
+- **Self-contamination: label, never delete.** Stored user and assistant text imports byte-identical whatever a CSR
+  grammar says. `contamination.rs` is a read-only detector; a match is a label (12bf1582).
+  - **Search.** A result holding CSR text carries `[CSR text]` and sinks below clean results in every search mode
+    and kill-switch state (4683b8b3, 15380ed4). Every chunk-returning MCP tool labels (dc6fc501). The file-search
+    fallback and `csr_why` sink CSR-text rows too (16a0e34f, 8db3295d). A chunk with no provenance row has an
+    unknown author and is labeled; 48,497 of 246,072 conversation chunks of one real corpus had no row (9040c7aa).
+    A failed dream-verdict read keeps the labels (dd05a223).
+  - **Hook injection skips CSR text:** predictive context (it reads the whole chunk), episodes and lineage pickup,
+    completion claims, compact anchors, recap corrections, continuity titles (f42d6dea, 1458b79a, bf80df99,
+    0784872f, 38b37bc5, 23f2538f). Selection only; no stored row changes.
+  - **Import.** An assistant text block that looks like a tool marker is kept (a74fa974). Detection runs once per
+    line (5c8acc52, 7fba01ea). Detected forms include the companion's agents envelope, as one hit covering marker,
+    JSON line and marker, also stripped from prompt search and derived text (34abe39f, ff479896), and a pasted dream
+    card's judgment spans (51a9ebbb).
+  - **Derived artifacts** (learnings, episodes, narratives) may still strip CSR text; stored conversation never.
+  - **Status** shows `N CSR-text chunks labeled` only when N is above 0. On a clone of the maintainer database
+    (733,388 chunks): 64 CSR-text chunks labeled in 20 of 4,048 conversations.
+  - **Still structural, as before:** CSR MCP tool call and result suppression by tool name, narrator transcripts
+    skipped by first-prompt signature, and a complete hook-labelled system-reminder wrapper in the person's turn.
 - CSR no longer embeds its own MCP tool calls, their results, or hook-injected blocks; one sanitizer serves every
   pipeline (b721a745). Recaps carry a machine sentinel; all 5 call sites reject a recap carrying it, quoted or
   not (43b3bdd5, a1e9cd9b, 19f2ac5d).
@@ -98,50 +120,65 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   transcripts (76834169, e6c37fdd). An `insert_reflection` that took over a minute takes 0 ms (ba4889c2).
 - **`csr_resolve` needs your confirmation:** it elicits the exact payload and its SHA-256; only a matching Accept
   writes `user_confirmed`, and `Settled:`, the rank sink and proposals read only those rows (75f43f30).
-- **`status` contamination count and `csr-engine backfill scrub`.** On a copy of the maintainer DB, contaminated
-  conversations went 674 of 2,077 (32.5%) -> 0; 22,076 chunks rewritten, compact index rebuilt, third run a no-op
-  (d90c2ebc, e10f2fff).
-- **Scrub hardening (`scrub-codex`).** Codex rollout and plan conversations are scrubbed in place, never re-parsed
-  as Claude transcripts; a plan that rebuilds 0 chunks or drops more than half is refused (ab204258, 5a2fff74).
-  Each conversation applies in one IMMEDIATE transaction that re-reads its planned rows; conversations changed in
-  the last 15 minutes wait unless `--include-active` (d4987749). A maintenance-generation fence stops an engine
-  loaded before the scrub from republishing the old graph (560f1bc3). Purges wait for live writers; the first
-  live purge had died after 9,105 of 19,844 conversations (3d5f7bf9). A real scrub refuses while `lsof` shows another
-  process holding the database (`--force` overrides); its longest plan transaction on a full-size clone was 791 ms,
-  where the corpus-wide relink seed query alone had held the write lock 18.4 s (230f11c3). A rebuild a maintenance
-  pass overtook is refused and rerun, up to 3 times (184d8604).
-- **Maintenance lock.** `backfill scrub` holds an OS lock on `<data_dir>/maintenance.lock` exclusively (30 s of
-  non-blocking tries, before preflight). Every writable storage operation, hook, importer, daemon sync batch, index
-  publication and remap holds it shared for the operation; a nested acquire reuses the thread's token (0.07 us vs
-  24 us; a 20,000-row storage bench 4.12 s -> 2.99 s). Hooks exit silently during maintenance, the daemon and
-  watcher skip the cycle, `store_reflection` waits 10 s; `status` probes the lock and renders read-only. A 16-process
-  exclusive acquisition test gets one owner (7303b148, a793857e).
-- **Continuity is proven, never guessed.** Forward cuts are computed on the whole message and mapped back to chunk
-  bytes; chunks join only where provenance and spans prove one message. An unproven cut stays and counts as
-  "unresolved (ambiguous source)" in the report (7303b148, a793857e).
-- **CSR's own headless children purged.** From 2026-09-01 to 09-19, 19,841 entered the corpus: 231,481 of
-  486,936 chunks, 42,159 of 52,541 reflections. Import reads the opening prompt raw;
-  `backfill scrub --agent-transcripts` removes them (9e440d00).
+- **`csr-engine backfill scrub` is a plan.** `--dry-run` reads the stored conversations and reports what a re-parse
+  of their source transcripts would change, and writes nothing. A real run refuses before it takes a lock: "scrub
+  deletes nothing in this release: CSR text is labeled in search instead" (12bf1582). The plan leaves out
+  conversations whose source file or newest chunk changed in the last 15 minutes unless `--include-active`, reports
+  a re-parse that would rebuild no chunks, or lose most of what is stored, as refused (ab204258, 5a2fff74,
+  d4987749), and stops while `lsof` shows another process holding the database unless `--force` (230f11c3).
+- **Maintenance lock.** `backfill scrub --dry-run` holds an OS lock on `<data_dir>/maintenance.lock` exclusively
+  (30 s of non-blocking tries, before preflight); it is the only exclusive holder left. Every writable storage
+  operation, hook, importer, daemon sync batch, index publication and remap holds it shared for the operation; a
+  nested acquire reuses the thread's token (0.07 us vs 24 us; a 20,000-row storage bench 4.12 s -> 2.99 s). Hooks
+  exit silently during maintenance, the daemon and watcher skip the cycle, `store_reflection` waits 10 s; `status`
+  probes the lock and renders read-only. A 16-process exclusive acquisition test gets one owner (7303b148,
+  a793857e).
+- **CSR's own headless children are skipped, not purged.** From 2026-09-01 to 09-19, 19,841 entered the corpus:
+  231,481 of 486,936 chunks, 42,159 of 52,541 reflections. Import reads the opening prompt raw and skips a
+  transcript whose first prompt is a CSR agent prompt (9e440d00). Children already stored stay; `backfill scrub
+  --dry-run --agent-transcripts` lists the conversations a purge would remove, and removes none (12bf1582).
 - **Forward grammar v2** (`.plans/release-10.1/forward-grammar.md`; 93ca27b2). New pane-dream, compaction-card
   and story-draft forwards carry `quoted` and end at their closing quote inside the 700- or 1,200-char limit.
-  Legacy v1 forwards end at the known cut or end of line. Every forward is cut; the words around it stay.
-  Extraction, the import scrub and `strip_csr_emissions` agree. Probe: a 700-char legacy send plus a reply went
-  from dropped to the reply kept. Earlier rounds: 17b9a30c, 26c8e417, f6f65bdf. Story feedback ("CSR's story of
-  this session, rev 3 is wrong; ...") is the person's; only the story forward's grammar cuts it (149e494e).
-- **One prefix rule before a forward**, shared by extraction and scrub. The text before the header splits into prose,
-  then a run of spaces, tabs and `>`, then one ASCII digit touching the header. With no prose, the markers and digit
-  go with the forward; prose keeps any digit ("I vote 2 <card>" keeps "I vote 2"; "42" stays). A 45-case table pins
-  it for compaction cards, stories and dreamer questions (481df725; replaces the rules of 149e494e, 7303b148 and
-  a793857e). Kept prose earlier on the line protects a later forward's digit ("I vote <card> 2<card> Keep..." keeps
-  the 2), and the persisted scrub inserts the same joining space as extraction ("4 <card>2." had persisted as "42.").
-  57 cases; persisted scrub matches extraction on 114 rows, zero ambiguity (43a446ad). Source-backed chunk splits
-  keep the joining space too, whether the chunks match the source as a whole or one by one (fffa3a8e, dc2ca66d).
+  Legacy v1 forwards end at the known cut or end of line. Where a forward is cut (prompt search, derived text) the
+  words around it stay; in stored chunks it is labeled and nothing is cut (12bf1582). Extraction and
+  `strip_csr_emissions` share the grammar. Probe: a 700-char legacy send plus a reply went from dropped to the reply
+  kept. Earlier rounds: 17b9a30c, 26c8e417, f6f65bdf. Story feedback ("CSR's story of this session, rev 3 is
+  wrong; ...") is the person's; only the story forward's grammar cuts it (149e494e).
+- **One prefix rule before a forward**, shared by extraction and `strip_csr_emissions`. The text before the header
+  splits into prose, then a run of spaces, tabs and `>`, then one ASCII digit touching the header. With no prose,
+  the markers and digit go with the forward; prose keeps any digit ("I vote 2 <card>" keeps "I vote 2"; "42"
+  stays). A 45-case table pins it for compaction cards, stories and dreamer questions (481df725; replaces the rules
+  of 149e494e, 7303b148 and a793857e). Kept prose earlier on the line protects a later forward's digit ("I vote
+  <card> 2<card> Keep..." keeps the 2) (43a446ad).
 - Read as CSR's, never the person's: dreamer prompts, "Lost and found" sends, compaction keep lists, forwarded
   notes, pasted `dreams` cards, harness-written user rows (85c0536f, 19e7d467, 7cd81a8e, b1d7de23, 6369e6b9,
-  6daadb83, 044662f3). Chunk evidence uses scrubbed text; ~900 import failures logged 2026-09-17 (82509b74).
+  6daadb83, 044662f3).
 - Headless `claude -p` children run with `--tools ""`, `--setting-sources ""` and `--no-session-persistence`.
   Before, one plugin hook fired 21,116 times in a month, and 19,852 of 20,159 re-ranker harvest sources were
   CSR's own children; a Haiku call fell from 7.1 s to 1.5 s (7ad3514f, bcea4a8a). See Known limitations.
+
+### Memory health
+
+- **`eval --full` adds three results:** Emitter Contamination Canary (compiled-in fixtures: every CSR formatter is
+  generated and detected, a protected corpus stays unlabeled), Duplicate Rate (report only, changes nothing) and
+  Known-Item Recall (55272cc6). The CSR-text census prints as its own line, not as a result. Full eval now has 24
+  results.
+- **Known-item recall.** A frozen sample of the person's own chunks whose query matches exactly one conversation
+  family (86fa9c8f), searched through the production recall pipeline with telemetry off (3220b365). Fewer than 10
+  eligible cases abstains; 85% or more in the top 5 is green, 70% or more amber, else red.
+- **Exit code.** `eval --full` exits nonzero on a gating failure (a red recall, a canary failure, any failed
+  test); abstentions, amber and report-only results never fail it (55272cc6, 9ff730e4).
+- **`status` reads the cached result.** It never runs the probe or loads embeddings. `status --json` is the default
+  output spelled out. `eval --full --refresh-recall-sample` starts a new sample and keeps the history (7fb4e91c).
+- **The `⚠ mem` chip** in `status --compact` shows for two causes only: the canary fails now, or the latest
+  completed recall result is red on at least 10 cases and is under 12 hours old. Amber, abstain, stale and
+  duplicates never raise it (7fb4e91c, 4c50c8c3).
+- **Daemon cadence.** The daemon measures every 6 hours on the shared heavy-work permit, restart-safe, yields to a
+  due dream pass, and stops on shutdown (0463a3c9, 913ced17). A measurement commits against the stored sample in
+  one write transaction (694333fe); only a missing row invalidates a case (4d82446e). `CSR_NO_HEALTH=1` turns the
+  daemon loop off; `eval --full` still measures when you run it (4c50c8c3).
+- **Maintainer database clone:** duplicate rate 24.93% (182,830 duplicate rows of 733,388 chunks), report only.
+  Known-item recall: RECALL_LINE_PLACEHOLDER
 
 ### Search and hooks performance
 
@@ -170,8 +207,8 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   finding within 90 days, weak old items 42 -> 12 (189a6132, e96ea545); duplicates 6 -> 0 (90f235bf); PICKUPs
   18 -> 8, precision 33% -> 62% (49fcb33d). Each line names its session (cd5ee0cf).
 - **Hooks that never search skip the index** (259k chunks): notification 879 -> 10 ms, `continue` 860 -> 13 ms,
-  subagent-stop 869 -> 19 ms (a60ef867). Precompact, session-end, stop, post-tool-use only import; precompact 21 ms
-  vs a 346,570 ms rebuild (a4453aa1, 58953b81, bcad285b). Hooks never dump the index (~1 GB/prompt before; a7dfb889).
+  subagent-stop 869 -> 19 ms (a60ef867; that hook is gone, see Dreaming / witness). Precompact, session-end, stop,
+  post-tool-use only import; precompact 21 ms vs a 346,570 ms rebuild (a4453aa1, 58953b81, bcad285b). Hooks never dump the index (~1 GB/prompt before; a7dfb889).
 - prompt-submit asks the daemon over a private socket within a deadline and fails open (3651e549, 8e473f5e)
   [untraced: empty bodies; from the `src/hooks/prompt_transport.rs` doc]. The daemon index takes rows other
   processes write (a9f252f5, 1414dc1b) [untraced: subject only].
@@ -273,7 +310,8 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 - **`plugins/csr-companion` ships in the repo** (marketplace `claude-self-reflect`, `.claude-plugin/marketplace.json`,
   relative source path). Install with `/plugin marketplace add ramakay/claude-self-reflect` then
-  `/plugin install csr-companion@claude-self-reflect`. `csr-engine setup` and the npm package do not install it.
+  `/plugin install csr-companion@claude-self-reflect`. `csr-engine setup` ends by printing those two lines and
+  installs nothing; the npm package does not install it either (7e697466).
 - **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
   "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
   last told it. It reads the csr-engine database read-only
@@ -290,6 +328,13 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - **Private by default:** the plugin's folder `~/.claude-self-reflect/csr-companion/` is `0700` and its files `0600`
   under any umask (looser ones are tightened on first write), and API keys, bearer tokens, `password=`/`token=`
   values and PEM blocks are redacted from the transcript text it keeps (`bin/private.py`).
+- **Agents, Codex and handoffs** (merge 65d4f56d). The pane tracks a session's agents from typed events and shows
+  them In flight (a1f386fb, 01c1c611). A finished agent with a report gets one look (a644eb87). Subagent tokens are
+  not added to the Claude spend that the dreamer's share is measured against (f53ea3cc). Codex runs and the Codex
+  week show in the pane, read from `~/.codex/sessions` rollout metadata with no model call, and the part is hidden
+  without a `~/.codex` (d4a48448). A Lost-and-found thread handed to a subagent carries a machine envelope
+  (`[[CSR:AGENTS:v1]]`) and returns to the list when that agent fails (5857f922, 3d85b0bd). A multi-line draft is
+  typed only where herdr says Claude is in the foreground (1e9bbfba).
 
 ### Installer
 
@@ -298,7 +343,10 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   min -> 0 in 8 min (e34ac07a, 2c32256f, 8f8278ff). On binary replacement the daemon exits 75 within 43-46 s for
   launchd to restart (8f0ec174, 32730957); SIGTERM now stops it (e793cd6c).
 - `setup` scans the memory registry, restamps Codex timestamps, strips harness text (fd924ec4, 23dd336d,
-  bf7ca8d9); `hook install` adds SubagentStop (e18920ad).
+  bf7ca8d9). `hook install` no longer registers SubagentStop and removes CSR's entry from an older
+  `settings.json`; `csr-engine setup` runs that same install step, so re-running `csr-engine setup` or
+  `csr-engine hook install --apply` after upgrading clears it (4adf32ee, 06af27e2, 34f5648c). Setup ends with the
+  companion plugin's two install lines and installs nothing itself (7e697466).
 - Windows (unpublished until now): hook commands use forward slashes (86afb4a3, #273); three Windows-only
   prompt-submit failures fixed, stdin reads bounded to 2 s (2c9bdb3b, #285).
 - Releases trigger on tags only, and publishing waits for a required reviewer (53afe9b2, 774d1b75).
@@ -326,7 +374,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   before) (fffa3a8e). Several processes creating a brand-new database at the same instant can still see one
   "database is locked"; hooks fail open.
 - **`status --compact` is slow on large databases:** 2.9-12.7 s on an 8.70 GB copy (711,622 chunks; 12.9-26.7 s
-  before this release), nearly all in the provenance failure-count join and coverage scan (43a446ad timings).
+  before this release), nearly all in the provenance failure-count join and coverage scan (43a446ad timings). On a
+  cold clone of the maintainer database on 2026-10-13 it took 45-67 s wall for the installed binary and 45-64 s for
+  the release binary (2.3-3.8 s user). Not a regression, and not fixed in this release.
 - **Fleet memory gate missed.** Target was <= 3 GB for the daemon plus all MCP servers; the median measured
   4,058 MB before an outage and 3,575 MB at the end, the daemon alone 3,210 MB (4ad029d3 build, 9 servers, 30 min,
   daemon stopped 78 s; 2,272 calls, 0 failed). Outage p95 was 20,136 ms: the first call waits out the re-ping
@@ -337,17 +387,27 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - Verdict accuracy is unproven: "482 anchors at 2 HEAD commits" is existence evidence [untraced]; the T4 corpus
   has zero reverts; the demote channel (`full`) is unmeasured; CRLF/Windows stamping is untested; the ledger does
   not record a witness's repo (447994c4). Strategy dreams are below their kill bar [untraced].
-- Contamination figures depend on corpus and date: 58 of 1,330 embedded conversations (4.4%) on 2026-08-08
-  (1f9e4c74); 674 of 2,077 (32.5%) on a 2026-09-01 copy before scrub (d90c2ebc).
-- **`backfill scrub` also cuts text that quotes CSR's markers.** Any paragraph containing a CSR marker goes,
-  including code listings, tool output and written analyses that quote CSR's templates; code and tool output
-  often has no blank lines, so one quoted marker takes the whole chunk. On a clone of the maintainer's database
-  (4753d717, 733,388 chunks) the scrub dropped 552 chunks, at least 322 of them code, tool output or analyses
-  quoting markers, and cut 233,686 characters from 7,300 more. The scrub runs only when invoked; back up first.
+- Contamination figures depend on corpus, date and detector: 58 of 1,330 embedded conversations (4.4%) on
+  2026-08-08 (1f9e4c74) and 674 of 2,077 (32.5%) on a 2026-09-01 copy (d90c2ebc) were counted by earlier detectors
+  that fed a scrub which no longer runs. The label-only count is under Provenance and self-contamination guard.
+- **CSR text is labeled, never removed, and the label is a pattern match.** A person's text that matches a CSR
+  format's grammar is labeled `[CSR text]` and sinks below clean results; it stays stored and searchable. The earlier `backfill scrub`
+  that cut such text (552 chunks dropped and 233,686 characters cut on a clone of the maintainer database, 4753d717)
+  no longer runs: it refuses (12bf1582). Limits of the labeling:
+  Codex rollout, plan and tool-result chunks are not labeled or counted, since they quote CSR formats as code; the
+  middle chunk of an agents-envelope JSON line longer than one chunk is unlabeled; a dream card pasted without its
+  `PROJECT` line is not labeled; `get_recent_work` hides a conversation with no recorded entrypoint whose chunk is
+  an engine emission, until an entrypoint is recorded; a demoted result can fall off a short page; narrator
+  transcripts are identified by a first-prompt signature; a pasted complete hook-labelled system-reminder wrapper is
+  still removed on import; the plain-line recap fallback and a standing rule with a free-text date are not labeled
+  (12bf1582).
+- **Not in this release:** removing CSR text from stored chunks (the "phase B" scrub), and the plugin's send ledger
+  that would prove a pasted text was CSR's. This release labels and never deletes, so neither is needed.
 - `CSR_DREAM_CONSUMPTION=off` does not gate the static report, live journal feeds or badge; `status` has no field
   for `CSR_NO_CODEX_IMPORT` (2c32256f; both still true at rc2 HEAD by code check).
 - hnsw_rs 0.3.5 still calls `process::exit(1)` on load errors (2c32256f; checked in the crate source).
-  `eval --full` fails the re-ranker gate (insufficient data). Search p95 against its 1 ms target depends on load:
+  Since 9ff730e4, `eval --full` prints `ABSTAIN` and passes when the re-ranker gate is `never_run` or
+  `insufficient_data`; a real gate failure still fails it. Search p95 against its 1 ms target depends on load:
   0.82 ms idle, 1.35 ms and 2.27 ms under load (82d9f837). The cache check read `index_manifest.json` and always
   reported cold; it reads `manifest.json` now (fffa3a8e).
 - Codex recall trails Claude, hit@6 12/40 vs 22/40, mostly at the HNSW fetch (9d5ad90a). 1 of 8 fabricated probes
