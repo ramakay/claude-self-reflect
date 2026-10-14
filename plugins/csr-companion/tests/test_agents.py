@@ -699,6 +699,19 @@ SUMMARIES_OF = [(T1, Q), (T1 + 1800, Q), (T1 + 3600, LATER)]  # the thread in tw
 THREAD_TEXT = 'Fix the importer retry limit and ship it.'
 
 
+def process_info(foreground='claude', argv=None, group=47163, pid=47163):
+    """What `herdr pane process-info` prints (the real shape): the foreground process group, and who is in it."""
+    argv = argv if argv is not None else [foreground, '--dangerously-skip-permissions', '-c']
+    return json.dumps(dict(result=dict(process_info=dict(
+        foreground_process_group_id=group, shell_pid=19060, pane_id='w1:p1',
+        foreground_processes=[dict(argv0=foreground, argv=argv, name='2.1.296', pid=pid), dict(argv0='node', argv=['node'], name='node', pid=group + 1)]))))
+
+
+def recording(typed, foreground='claude'):
+    """A herdr that records every call, says `foreground` is what runs in the pane, and accepts anything else."""
+    return lambda *argv: typed.append(argv) or (process_info(foreground) if argv[1] == 'process-info' else '')
+
+
 def threads(handoffs=(), project=None):
     return pane.lost_found(SUMMARIES_OF, (), (), project, handoffs)
 
@@ -842,7 +855,7 @@ class HandedThreads(Folder):
         sub_at = next(start for start, _, answer in act['spans'] if answer == 'sub')
         typed = []
         saved = pane.herdr, pane.agent_pane, pane.focus_back
-        pane.herdr = lambda *argv: typed.append(argv) or ''
+        pane.herdr = recording(typed)
         pane.agent_pane, pane.focus_back = lambda given: 'w1:p1', lambda: None
         shell = types.SimpleNamespace(session=types.SimpleNamespace(id=SESSION, path=None), agent='w1:p1', sent=None)
         try:
@@ -852,7 +865,8 @@ class HandedThreads(Folder):
         texts = [argv[3] for argv in typed if argv[1] == 'send-text']
         keys = [argv[3:] for argv in typed if argv[1] == 'send-keys']
         self.assertEqual(keys, [('ctrl+j',)] * 4)  # a new line is Ctrl+J: after the ask, and after each line of the envelope; no Enter
-        self.assertTrue(all(argv[1] in ('send-text', 'send-keys') for argv in typed))
+        self.assertTrue(all(argv[1] in ('send-text', 'send-keys', 'process-info') for argv in typed))
+        self.assertTrue(all(argv[1] != 'send-text' or argv[2] == 'w1:p1' for argv in typed))
         self.assertTrue(texts[0].startswith('Lost and found: “Fix the importer'))
         self.assertEqual(texts[1:], [agents_lib.OPEN, texts[2], agents_lib.CLOSE])
         (found,) = agents_lib.parse_envelopes('\n'.join(texts[1:]) + '\n')
@@ -866,7 +880,7 @@ class HandedThreads(Folder):
         self.assertTrue(shell.sent[1])
         # a second click is a new request
         typed.clear()
-        pane.herdr, pane.agent_pane, pane.focus_back = (lambda *argv: typed.append(argv) or ''), (lambda given: 'w1:p1'), (lambda: None)
+        pane.herdr, pane.agent_pane, pane.focus_back = recording(typed), (lambda given: 'w1:p1'), (lambda: None)
         try:
             pane.lost_click(shell, act, sub_at)
         finally:
@@ -874,7 +888,7 @@ class HandedThreads(Folder):
         self.assertEqual(len({h['request'] for h in pane.handoffs_of(SESSION)}), 2)
         # the side task is still one line, as it was, and a pane with no session types the old one-line ask
         typed.clear()
-        pane.herdr, pane.agent_pane, pane.focus_back = (lambda *argv: typed.append(argv) or ''), (lambda given: 'w1:p1'), (lambda: None)
+        pane.herdr, pane.agent_pane, pane.focus_back = recording(typed), (lambda given: 'w1:p1'), (lambda: None)
         try:
             side = pane.lost_rows(dict(item, top=True), 46, {}, False)[0][1]
             pane.lost_click(shell, side, next(start for start, _, answer in side['spans'] if answer == 'side'))
@@ -895,6 +909,8 @@ class HandedThreads(Folder):
 
         def herdr(*argv):
             typed.append(argv)
+            if argv[1] == 'process-info':
+                return process_info('claude')
             return json.dumps(dict(result=dict(pane=dict(pane_id='w1:shell')))) if argv[1] == 'neighbor' else ''
 
         saved = pane.herdr, pane.focus_back
@@ -915,6 +931,29 @@ class HandedThreads(Folder):
         self.assertTrue(named.sent[1])
         self.assertEqual({argv[3] for argv in typed if argv[1] == 'send-keys'}, {'ctrl+j'})
         self.assertTrue(all(argv[2] == 'w1:claude' for argv in typed if argv[1] in ('send-keys', 'send-text')))
+
+    def test_the_multi_line_draft_needs_claude_in_the_foreground_of_the_named_pane(self):
+        """The named pane outlives Claude (nothing closes it at session end): where a shell has taken its place, a Ctrl+J runs
+        the first line. herdr says who runs there; anything but Claude, or no answer, types nothing."""
+        saved = pane.herdr
+        try:
+            for foreground, wants in (('zsh', False), ('claude', True), ('/opt/bin/claude', True), ('claude-shell', False), ('node', False)):
+                typed = []
+                pane.herdr = recording(typed, foreground)
+                self.assertEqual(pane.send_draft('w1:p1', 'ask\nline two', 'w1:p1'), wants, foreground)
+                keys = [argv for argv in typed if argv[1] in ('send-text', 'send-keys')]
+                self.assertEqual(bool(keys), wants, foreground)
+            typed = []  # a claude that is in the foreground but not the group's leader does not count
+            pane.herdr = lambda *argv: typed.append(argv) or process_info('claude', group=1) if argv[1] == 'process-info' else typed.append(argv) or ''
+            self.assertFalse(pane.send_draft('w1:p1', 'ask\nline two', 'w1:p1'))
+            for broken in (None, '', 'not json', '{}', json.dumps(dict(result=dict(process_info=dict(foreground_processes=[])))),
+                           json.dumps(dict(result=dict(process_info=dict(foreground_process_group_id=1, foreground_processes=['x']))))):
+                typed = []
+                pane.herdr = lambda *argv, broken=broken: typed.append(argv) or (broken if argv[1] == 'process-info' else '')
+                self.assertFalse(pane.send_draft('w1:p1', 'ask\nline two', 'w1:p1'), repr(broken))
+                self.assertEqual([argv for argv in typed if argv[1] in ('send-text', 'send-keys')], [], repr(broken))
+        finally:
+            pane.herdr = saved
 
     def test_handoff_times_the_hooks_write_in_milliseconds_read_as_seconds(self):
         """The hooks stamp submitted_at and ended_at from $.clock.now(), milliseconds; the pane's drafted_at is seconds. A

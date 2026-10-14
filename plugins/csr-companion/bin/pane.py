@@ -2983,13 +2983,28 @@ ANSWER_WORD = dict(helpful='helpful', ask_claude='asked Claude', thought_of_it="
                    rejected='you said no')
 
 
+def claude_in_front(agent):
+    """Whether Claude is what runs in the foreground of a pane: the process whose pid is the foreground process group's
+    leader, per `herdr pane process-info`, has `claude` as its argv0 (or argv[0]) basename. False on any doubt: herdr
+    missing or refusing, output that is not the shape below, no such leader."""
+    try:
+        info = json.loads(herdr('pane', 'process-info', '--pane', agent) or '')['result']['process_info']
+        leader = next(p for p in info['foreground_processes'] if p['pid'] == info['foreground_process_group_id'])
+        names = [leader.get('argv0'), (leader.get('argv') or [None])[0]]
+        return any(isinstance(name, str) and os.path.basename(name) == 'claude' for name in names)
+    except (ValueError, KeyError, TypeError, StopIteration, AttributeError):
+        return False
+
+
 def send_draft(agent, text, named=None):
     """Words into Claude's prompt, unsent, over more than one line: each line is typed with send-text and a Ctrl+J, Claude Code's
     own new line, between them; an Enter is never sent, so nothing submits. False as soon as one step fails (the pane's herdr
     refusing a key stops it with the lines so far typed, none sent). Fails closed unless `agent` is the pane the mod named
-    (`named`): the left neighbour agent_pane() falls back to may be a shell, and there a Ctrl+J runs the first line."""
+    (`named`) and Claude is what runs in its foreground: the left neighbour agent_pane() falls back to may be a shell, and so
+    may the named pane be, once Claude has exited (nothing closes it), and there a Ctrl+J runs the first line."""
     lines = [CONTROL.sub('', line) for line in str(text).split('\n')]
-    if not agent or agent != named or not lines or any(len(line) > 4000 for line in lines):
+    if not agent or agent != named or not lines or any(len(line) > 4000 for line in lines) \
+            or not claude_in_front(agent):
         return False
     for number, line in enumerate(lines):
         if number and herdr('pane', 'send-keys', agent, 'ctrl+j') is None:
