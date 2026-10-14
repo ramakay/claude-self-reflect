@@ -239,9 +239,11 @@ pub async fn run_full_with(
         &backend,
         refresh_recall_sample,
         chrono::Utc::now(),
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .await
-    .map_err(|error| error.to_string());
+    .map_err(|error| error.to_string())
+    .and_then(|run| run.ok_or_else(|| "the measurement was cancelled".to_string()));
     results.push(health::duplicate_rate(&run));
     results.push(health::known_item_recall(&run));
 

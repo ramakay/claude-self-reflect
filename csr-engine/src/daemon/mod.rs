@@ -1361,9 +1361,10 @@ impl Daemon {
         // transactionally. Await it so shutdown cannot detach a half-harvested
         // training attempt.
         let _ = trained_rerank_handle.await;
-        // A measurement holds the heavy-work permit and only reads the index
-        // and writes three meta keys; the loop abstains at the permit and
-        // between cases on shutdown, so await it fully rather than detach it.
+        // A measurement holds the heavy-work permit, reads the index and writes
+        // three meta keys in one transaction at the end. The loop stops waiting
+        // for the permit on shutdown and the measurement checks the flag before
+        // every probe case, so awaiting it here is bounded by one search.
         let _ = health_handle.await;
         let _ = tokio::time::timeout(timeout, reaction_shadow_handle).await;
         // The loop itself races an in-flight rebuild against the shutdown

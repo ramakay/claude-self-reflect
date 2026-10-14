@@ -8,6 +8,7 @@
 //! are held out.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -428,7 +429,8 @@ fn is_hit(case: &ProbeCase, page: &[String]) -> bool {
 
 /// Run the cases. Deleted or changed chunks are invalidated, never replaced.
 /// A search or embedding failure returns an `Error` report with the full
-/// denominator: it is neither a smaller `n` nor "no data".
+/// denominator: it is neither a smaller `n` nor "no data". `cancel` is checked
+/// before every case; a cancelled probe returns `None`, with no report.
 pub async fn run_probe(
     storage: &Storage,
     search: &Arc<RwLock<SearchEngine>>,
@@ -436,16 +438,20 @@ pub async fn run_probe(
     sample_id: Option<&str>,
     cases: &[ProbeCase],
     now: DateTime<Utc>,
-) -> ProbeReport {
+    cancel: &AtomicBool,
+) -> Option<ProbeReport> {
     let at = now.to_rfc3339();
     let mut valid: Vec<&ProbeCase> = Vec::new();
     let mut invalidated = 0;
     for case in cases {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
         match is_valid(storage, case) {
             Ok(true) => valid.push(case),
             Ok(false) => invalidated += 1,
             Err(error) => {
-                return ProbeReport {
+                return Some(ProbeReport {
                     at,
                     sample_id: sample_id.map(str::to_string),
                     hits: 0,
@@ -454,7 +460,7 @@ pub async fn run_probe(
                     grade: ProbeGrade::Error,
                     misses: Vec::new(),
                     error: Some(format!("revalidation failed: {error}")),
-                };
+                });
             }
         }
     }
@@ -462,10 +468,13 @@ pub async fn run_probe(
     let mut hits = 0;
     let mut misses = Vec::new();
     for case in valid {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
         let page = match backend.final_page(&case.query).await {
             Ok(page) => page,
             Err(error) => {
-                return ProbeReport {
+                return Some(ProbeReport {
                     at,
                     sample_id: sample_id.map(str::to_string),
                     hits,
@@ -474,7 +483,7 @@ pub async fn run_probe(
                     grade: ProbeGrade::Error,
                     misses,
                     error: Some(format!("search failed: {error}")),
-                };
+                });
             }
         };
         if is_hit(case, &page) {
@@ -492,7 +501,7 @@ pub async fn run_probe(
             cause,
         });
     }
-    ProbeReport {
+    Some(ProbeReport {
         at,
         sample_id: sample_id.map(str::to_string),
         hits,
@@ -501,7 +510,7 @@ pub async fn run_probe(
         grade: grade_recall(hits, n),
         misses,
         error: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -509,6 +518,7 @@ mod tests {
     use super::*;
     use crate::health::{HealthSnapshot, ProbeCase};
 
+    static NEVER: AtomicBool = AtomicBool::new(false);
     const NOW: &str = "2026-10-13T12:00:00Z";
     const RECENT: &str = "2026-10-10T00:00:00Z";
 
@@ -934,8 +944,10 @@ mod tests {
             Some("s"),
             &[plain.clone(), side.clone()],
             now(),
+            &NEVER,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!((report.hits, report.n), (1, 2));
         assert_eq!(report.misses.len(), 1);
         assert_eq!(report.misses[0].returned.len(), TOP_K);
@@ -982,12 +994,16 @@ mod tests {
             pages,
             fail_on: None,
         };
-        let report = run_probe(&storage, &engine(), &backend, None, &cases, now()).await;
+        let report = run_probe(&storage, &engine(), &backend, None, &cases, now(), &NEVER)
+            .await
+            .unwrap();
         assert_eq!(
             (report.hits, report.n, report.grade),
             (9, 9, ProbeGrade::Abstain)
         );
-        let empty = run_probe(&storage, &engine(), &backend, None, &[], now()).await;
+        let empty = run_probe(&storage, &engine(), &backend, None, &[], now(), &NEVER)
+            .await
+            .unwrap();
         assert_eq!((empty.n, empty.grade), (0, ProbeGrade::Abstain));
     }
 
@@ -1017,7 +1033,17 @@ mod tests {
             pages,
             fail_on: None,
         };
-        let report = run_probe(&storage, &engine(), &backend, Some("s"), &cases, now()).await;
+        let report = run_probe(
+            &storage,
+            &engine(),
+            &backend,
+            Some("s"),
+            &cases,
+            now(),
+            &NEVER,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.invalidated, 2);
         assert_eq!(
             report.n, 10,
@@ -1040,7 +1066,17 @@ mod tests {
             pages,
             fail_on: Some(cases[3].query.clone()),
         };
-        let report = run_probe(&storage, &engine(), &backend, Some("s"), &cases, now()).await;
+        let report = run_probe(
+            &storage,
+            &engine(),
+            &backend,
+            Some("s"),
+            &cases,
+            now(),
+            &NEVER,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.grade, ProbeGrade::Error);
         assert_eq!(report.n, 12, "the denominator stays whole");
         assert!(report
@@ -1070,7 +1106,17 @@ mod tests {
             pages: HashMap::new(),
             fail_on: None,
         };
-        let report = run_probe(&storage, &search, &backend, Some("s"), &cases, now()).await;
+        let report = run_probe(
+            &storage,
+            &search,
+            &backend,
+            Some("s"),
+            &cases,
+            now(),
+            &NEVER,
+        )
+        .await
+        .unwrap();
         let cause = |id: &str| {
             report
                 .misses
@@ -1082,5 +1128,106 @@ mod tests {
         assert_eq!(cause("u0"), MissCause::EmbeddingMissing);
         assert_eq!(cause("u1"), MissCause::IndexMissing);
         assert_eq!(cause("u2"), MissCause::NotInTop5);
+    }
+    /// Raises the shutdown flag as the k-th search is made, then answers empty.
+    struct Tripwire {
+        flag: Arc<AtomicBool>,
+        after: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProbeBackend for Tripwire {
+        async fn final_page(&self, _query: &str) -> Result<Vec<String>> {
+            let made = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if made == self.after {
+                self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    fn tripwire(after: usize) -> Tripwire {
+        Tripwire {
+            flag: Arc::new(AtomicBool::new(false)),
+            after,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(backend: &Tripwire) -> usize {
+        backend.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_case_k_stops_before_case_k_plus_1_and_leaves_health_meta_unchanged() {
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 12);
+        let cases: Vec<ProbeCase> = (0..12).map(case).collect();
+
+        // the probe alone: stops after case 3, returns nothing to record
+        let backend = tripwire(3);
+        let flag = backend.flag.clone();
+        let stopped = run_probe(
+            &storage,
+            &engine(),
+            &backend,
+            Some("s"),
+            &cases,
+            now(),
+            &flag,
+        )
+        .await;
+        assert!(stopped.is_none(), "a cancelled probe has no report");
+        assert_eq!(
+            calls(&backend),
+            3,
+            "no search was made after the flag was raised"
+        );
+
+        // the whole measurement: a prior red result and a frozen sample stay as they were
+        let snapshot = crate::health::HealthSnapshot {
+            state: crate::health::HealthState {
+                version: 1,
+                last_attempt_at: Some("2026-10-12T00:00:00Z".into()),
+                probe: Some(ProbeReport {
+                    at: "2026-10-12T00:00:00Z".into(),
+                    sample_id: Some("ps-prior".into()),
+                    hits: 5,
+                    n: 12,
+                    invalidated: 0,
+                    grade: ProbeGrade::Red,
+                    misses: Vec::new(),
+                    error: None,
+                }),
+                ..Default::default()
+            },
+            runs: Vec::new(),
+            sample: Some(ProbeSample {
+                version: SAMPLE_VERSION,
+                sample_id: "ps-prior".into(),
+                created_at: NOW.into(),
+                cutoff_at: NOW.into(),
+                cases: cases.clone(),
+            }),
+        };
+        crate::health::save_health(&storage, &snapshot).unwrap();
+        let meta = |storage: &Storage| {
+            [
+                crate::health::META_HEALTH,
+                crate::health::META_RUNS,
+                crate::health::META_SAMPLE,
+            ]
+            .map(|key| storage.get_meta(key).unwrap())
+        };
+        let before = meta(&storage);
+        let backend = tripwire(4);
+        let flag = backend.flag.clone();
+        let outcome = crate::health::run_health(&storage, &engine(), &backend, false, now(), &flag)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "a cancelled measurement reports nothing");
+        assert_eq!(calls(&backend), 4);
+        assert_eq!(meta(&storage), before, "a stopped run saves nothing");
     }
 }

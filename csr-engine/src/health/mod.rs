@@ -284,7 +284,8 @@ pub async fn run_health(
     backend: &dyn probe::ProbeBackend,
     refresh_sample: bool,
     now: DateTime<Utc>,
-) -> Result<HealthRun> {
+    cancel: &AtomicBool,
+) -> Result<Option<HealthRun>> {
     let mut snapshot = load_health(storage)?;
     let at = now.to_rfc3339();
 
@@ -294,6 +295,9 @@ pub async fn run_health(
         passed: canary.passed,
         detail: canary.detail,
     });
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
     match duplicate_report(storage) {
         Ok(mut report) => {
             report.at = at.clone();
@@ -307,15 +311,22 @@ pub async fn run_health(
         tracing::warn!("{note}");
     }
     let sample_id = load.frozen.then(|| load.sample.sample_id.clone());
-    let report = probe::run_probe(
+    let Some(report) = probe::run_probe(
         storage,
         search,
         backend,
         sample_id.as_deref(),
         &load.sample.cases,
         now,
+        cancel,
     )
-    .await;
+    .await
+    else {
+        return Ok(None);
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
     if load.created {
         snapshot.sample = Some(load.sample);
     }
@@ -331,10 +342,10 @@ pub async fn run_health(
         snapshot.state.last_probe_error = None;
     }
     save_health(storage, &snapshot)?;
-    Ok(HealthRun {
+    Ok(Some(HealthRun {
         snapshot,
         probe: report,
-    })
+    }))
 }
 
 /// How many five-minute ticks a due measurement waits for a due dream pass
@@ -406,16 +417,31 @@ pub async fn health_tick(
     if defer_for_dream(dream_pending(storage, now), deferred_ticks) {
         return Tick::Deferred;
     }
-    let Ok(permit) = heavy_work.clone().acquire_owned().await else {
-        return Tick::Shutdown;
+    // Wait for the permit, but never past shutdown: another heavy job can hold
+    // it for a long time, and the daemon awaits this task to finish.
+    let acquire = heavy_work.clone().acquire_owned();
+    tokio::pin!(acquire);
+    let permit = loop {
+        tokio::select! {
+            acquired = &mut acquire => match acquired {
+                Ok(permit) => break permit,
+                Err(_) => return Tick::Shutdown,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if shutdown.load(Ordering::SeqCst) {
+                    return Tick::Shutdown;
+                }
+            }
+        }
     };
     if shutdown.load(Ordering::SeqCst) {
         return Tick::Shutdown;
     }
-    let outcome = run_health(storage, search, backend, false, now).await;
+    let outcome = run_health(storage, search, backend, false, now, shutdown).await;
     drop(permit);
     match outcome {
-        Ok(run) => Tick::Ran(Box::new(run)),
+        Ok(Some(run)) => Tick::Ran(Box::new(run)),
+        Ok(None) => Tick::Shutdown,
         Err(error) => Tick::Failed(error.to_string()),
     }
 }
@@ -804,5 +830,50 @@ mod tests {
         record_canary(&other, now).unwrap();
         assert!(other.get_meta(META_HEALTH).unwrap().is_some());
         assert!(other.get_meta(META_SAMPLE).unwrap().is_none());
+    }
+    #[test]
+    fn shutdown_while_another_holder_keeps_the_permit_returns_promptly() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(shutdown_while_another_holder_keeps_the_permit_body());
+    }
+
+    async fn shutdown_while_another_holder_keeps_the_permit_body() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let heavy = Arc::new(Semaphore::new(1));
+        // another heavy job holds the permit for the whole test
+        let _held = heavy.clone().acquire_owned().await.unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (storage, heavy, shutdown) = (storage.clone(), heavy.clone(), shutdown.clone());
+            tokio::spawn(async move {
+                health_tick(
+                    &storage,
+                    &search(),
+                    &Silent,
+                    &heavy,
+                    &shutdown,
+                    Utc::now(),
+                    MAX_DREAM_DEFERRALS,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown.store(true, Ordering::SeqCst);
+        let tick = tokio::time::timeout(std::time::Duration::from_secs(3), waiter)
+            .await
+            .expect("health_tick must notice shutdown while it waits for the permit")
+            .unwrap();
+        assert!(matches!(tick, Tick::Shutdown), "{tick:?}");
+        assert_eq!(
+            heavy.available_permits(),
+            0,
+            "the other holder still has it"
+        );
+        assert!(storage.get_meta(META_HEALTH).unwrap().is_none());
     }
 }
