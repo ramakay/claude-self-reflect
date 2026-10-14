@@ -9,6 +9,8 @@ import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
 import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, closeTurn, countStep, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
 import type { Chapter, Pace } from './pace'
+import { decide as storyDecide, parseNews, refreshArgv } from './story'
+import type { Why as StoryWhy } from './story'
 import { addTerm, AGAIN_MS, BAND_WINDOW_MS, gitVerdict, isBareDigit, mergeGuards, parseGuard, protectedFromGit, reasonFor, UNRESOLVED } from './coach'
 import type { LeaseStep } from './dreamer'
 import type { GitPush, Guard } from './coach'
@@ -64,7 +66,7 @@ const CHAPTERS_KEPT = 20
 // One store serves every Claude process on the machine: each session's chapter, pace, news and back-off
 // live under its own id, or a second window (or a `claude -p` child) restarts this one's chapter and zeroes
 // its pace. Seen and known dreams, answers and chapter lengths stay shared: they are about you, not a session.
-const PER_SESSION = ['pace', 'chapter', 'briefFacts', 'looksToSkip', 'typedPastInARow', 'asked', 'sentDream', 'agentLedger'] as const
+const PER_SESSION = ['pace', 'chapter', 'briefFacts', 'looksToSkip', 'typedPastInARow', 'asked', 'sentDream', 'agentLedger', 'storyStarts'] as const
 type Mine = (typeof PER_SESSION)[number]
 const SESSIONS_KEPT = 20 // sessions whose keys are kept; older ones are swept at a session's start
 const keyOf = (key: Mine, session: string) => `${key}:${session}`
@@ -1225,6 +1227,36 @@ const seamFields = (seam: Seam) => ({
   },
 })
 
+// The Shift Map's automatic refresh: only with CSR_STORY_REWRITES=1 (one Haiku call each time) and not under the map's
+// kill switch. hooks/story.ts decides from what `pane.py --story-news` reads; this starts csr-engine's own
+// generate-story --rewrite, which skips by itself when nothing was asked since. One at a time, never awaited by the turn.
+let storyRefreshing = false
+async function refreshStory($: EngineInterface): Promise<StoryWhy | 'off' | 'busy'> {
+  if (storyRefreshing) return 'busy'
+  const set = async (name: string) => (await $.env.get(name).catch(() => undefined)) === '1'
+  if (!(await set('CSR_STORY_REWRITES')) || (await set('CSR_NO_STORY_MAP'))) return 'off'
+  storyRefreshing = true
+  let started = false
+  try {
+    const cwd = await $.session.cwd()
+    const news = parseNews(await paneWithin($, ['--repo', cwd, '--story-news', '--sid', await $.session.id()], 10_000))
+    const now = await $.clock.now()
+    const key = await ownKey($, 'storyStarts')
+    const kept = ((await $.store.get(key).catch(() => undefined)) as unknown[] | undefined) ?? []
+    const starts = kept.filter((at): at is number => typeof at === 'number' && Number.isFinite(at) && now - at < CHAPTER_MS)
+    const why = storyDecide(news, starts, now, (await paceOf($)).claude)
+    if (why !== 'go') return why
+    await $.store.set(key, [...starts, now])
+    started = true
+    void $.process.run(refreshArgv(news.transcript!, cwd), { timeoutMs: 180_000 })
+      .catch(() => undefined)
+      .finally(() => { storyRefreshing = false })
+    return 'go'
+  } finally {
+    if (!started) storyRefreshing = false
+  }
+}
+
 // bin/pane.py, within a time limit: a run that overruns it, or fails, reads as no answer.
 async function paneWithin($: EngineInterface, argv: string[], timeoutMs = 20_000): Promise<string | null> {
   const ran = await $.process.run(['python3', '-I', `${$.plugin.root}/bin/pane.py`, ...argv], { timeoutMs }).catch(() => null)
@@ -1816,6 +1848,7 @@ export const register: Register = (on, options) => {
     if (await isPerson($).catch(() => false)) {
       void pollAgents($)
       void armCompletions($, fleet).catch(() => undefined) // reports that came in mid-turn are looked at once the person has the floor
+      if (e.reason === 'answer') void refreshStory($).catch(() => undefined) // the Shift Map's own refresh, opt-in and gated
     }
     if (CS.setting === 'off') return result
     CS.turnRunning = false
@@ -2523,10 +2556,16 @@ export const register: Register = (on, options) => {
           ...(lasting.story ? [{ text: lasting.story, color: PAPER.quiet }] : []),
         ])
       : null
+    // The Shift Map in the pane's own words (bin/pane.py shift_map_json: the text view, no picture).
+    const map = shown.shift_map?.rows.length
+      ? card(CARD.infinite, shown.shift_map.title, '', shown.shift_map.rows.map(text =>
+          text.startsWith('  ') ? { text, color: PAPER.quiet, cut: true } : { text, bold: true, cut: true }))
+      : null
     return (
       <Box flexDirection="column">
         {counts}
         {session}
+        {map}
         {dreams}
         {offer}
         {changed}

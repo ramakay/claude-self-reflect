@@ -43,6 +43,7 @@ export type ShiftsData = {
   shifts_told_7d?: number
   git?: boolean // false: a folder CSR remembers that git does not know
   sample?: DreamSample | null // while dreams are off: the dream you took up last, from any folder
+  shift_map?: { title: string; rows: string[] } | null // the Shift Map as the pane's own words; null without one
 }
 
 // A dream you marked helpful or handed to Claude: the pane's proof of what dreams do.

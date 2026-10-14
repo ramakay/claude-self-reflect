@@ -20,6 +20,7 @@ report, in its own tint beside a pixel isometric icon:
   pane.py --repo PATH --keep JSON             add a dream, or an answer to one, to the dream log
   pane.py --repo PATH --compact-plan --sid ID --ctx N   the payback of compacting now at N tokens, for the mod
   pane.py --repo PATH --compact-usual         how long your own /compact takes, kept for the compaction card
+  pane.py --repo PATH --story-news --sid ID   what is new since the Shift Map's current telling, for the mod's refresh gates
 """
 import argparse
 import base64
@@ -1578,6 +1579,89 @@ def refresh_news(smap, s):
     otherwise (skip:nothing_asked_since), so the control is not offered."""
     at = (smap or {}).get('at')
     return isinstance(at, (int, float)) and any(isinstance(t, (int, float)) and t > at for t in (s or {}).get('prompts') or ())
+
+
+def shift_map_json(sid):
+    """The Shift Map as the pane's own words, dict(title, rows), for the mod's Ink pane; None with no map."""
+    smap = session_story_map(sid)
+    if not smap:
+        return None
+    session = Session(sid)
+    session.read_transcript()
+    title, rows = shift_map_rows(smap, session.messages)
+    return dict(title=title, rows=rows)
+
+
+def utc_stamp(epoch_s):
+    """An epoch in the form csr-engine's tables keep (UTC, 'YYYY-MM-DD HH:MM:SS')."""
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def new_receipts(sid, root, at):
+    """The receipts the code has gathered since the map's telling, one number: 2 for each file this session's edits
+    touched, 1 for each symbol they added or removed, 3 for each commit. Zero model tokens; None when the DB cannot be read."""
+    con = connect()
+    try:
+        rows = con.execute('select file_path, functions_added, functions_removed, types_added, types_removed '
+                           'from code_evolution where session_id = ? and timestamp > ?', (sid, utc_stamp(at))).fetchall()
+    finally:
+        con.close()
+    files, symbols = set(), set()
+    for path, *lists in rows:
+        files.add(path)
+        for text in lists:
+            try:
+                symbols.update((path, str(name)) for name in json.loads(text or '[]'))
+            except (TypeError, ValueError):
+                continue
+    commits = 0
+    if root:
+        done = subprocess.run(['git', '-C', root, 'rev-list', '--count', f'--since={utc_stamp(at).replace(" ", "T")}Z', 'HEAD'],
+                              capture_output=True, text=True, timeout=5)
+        commits = int(done.stdout.strip() or 0) if done.returncode == 0 and done.stdout.strip().isdigit() else 0
+    return 2 * len(files) + len(symbols) + 3 * commits
+
+
+def story_spend(now):
+    """The story calls csr-engine made in the last day and the last two hours, from narrative_usage (read-only):
+    dict(calls_24h, usd_24h (None when a call's model has no price), tokens_2h, last_tokens (None with no row))."""
+    con = connect()
+    try:
+        rows = con.execute("select ts, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens "
+                           "from narrative_usage where call_site = 'story' and ts >= ? order by ts desc",
+                           (datetime.fromtimestamp(now - 86400, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),)).fetchall()
+        last = con.execute("select input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens from narrative_usage "
+                           "where call_site = 'story' order by id desc limit 1").fetchone()
+    finally:
+        con.close()
+    usd, tokens_2h, recent = 0.0, 0, datetime.fromtimestamp(now - 7200, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+    for ts, model, *counts in rows:
+        counts = [int(x or 0) for x in counts]
+        if ts >= recent:
+            tokens_2h += sum(counts)
+        cost = cost_of(model, *counts) if any(counts) else 0.0
+        usd = None if usd is None or cost is None else usd + cost
+    return dict(calls_24h=len(rows), usd_24h=usd, tokens_2h=tokens_2h, last_tokens=int(last[0]) if last else None)
+
+
+def story_news(sid, root, now):
+    """What the mod's refresh gates read (no model call): the map's age, the prompts and messages since it, the
+    receipts since it, the story calls spent, the shift likes in the last two hours, and the transcript to hand the
+    engine. dict(story=False) with no map or when the kill switch is on."""
+    smap = session_story_map(sid)
+    if not smap or smap.get('at') is None:
+        return dict(story=False)
+    session = Session(sid)
+    session.read_transcript()
+    covered = smap.get('covered')
+    likes = fail_open(read_likes, {})
+    return dict(story=True, at=smap['at'], covered=covered, messages=session.messages,
+                messages_since=max(0, session.messages - covered) if covered is not None else session.messages,
+                prompts_since=sum(1 for t in session.prompts if t > smap['at']),
+                receipts=fail_open(new_receipts, 0, sid, root, smap['at']),
+                **fail_open(story_spend, dict(calls_24h=0, usd_24h=0.0, tokens_2h=0, last_tokens=None), now),
+                liked_2h=sum(1 for key, (liked, when) in likes.items() if key.startswith('shift:') and liked and when >= now - 7200),
+                transcript=session.path)
 
 
 def engine_binary():
@@ -8583,6 +8667,7 @@ def main():
     mode.add_argument('--png')
     mode.add_argument('--note', help='a file Claude is reading or editing')
     mode.add_argument('--brief', action='store_true', help="CSR's memory near this session, for the dreamer")
+    mode.add_argument('--story-news', action='store_true', help="what is new since the Shift Map's telling, for the mod's gates")
     mode.add_argument('--lost', action='store_true', help="threads that went quiet or wait on you, from this session's compaction summaries")
     mode.add_argument('--keep', help='a dream or an answer, as JSON, for the dream log')
     mode.add_argument('--coach', action='store_true', help='words you said in 2+ sessions that Claude looked up, as band notes')
@@ -8622,6 +8707,9 @@ def main():
         print(json.dumps(lost_json(args.sid)))
         return
     root = pane_root(args.repo)
+    if args.story_news:
+        print(json.dumps(fail_open(story_news, dict(story=False), args.sid, root, time.time()) if args.sid else dict(story=False)))
+        return
     if args.brief:
         if not root or not args.sid:
             return
@@ -8641,6 +8729,7 @@ def main():
         data['status'] = status_text(data)
         data['git'] = bool(repo_root(root))  # False: remembered, but no commits to show changes from
         data['sample'] = sample_dream()  # the mod shows it while its own options say dreams are off
+        data['shift_map'] = fail_open(shift_map_json, None, args.sid)  # the Ink pane's text Shift Map
         print(json.dumps(public(data)))
     elif args.png:
         now, cell = time.time(), (16, 34)

@@ -5144,3 +5144,125 @@ class ShiftMapRefreshAndLikes(unittest.TestCase):
             proc.poll = lambda: 0
             self.frame(box)
             self.assertEqual((box.data['refreshing'], box.refresh), (False, None))
+
+
+class StoryNews(unittest.TestCase):
+    """What the mod's refresh gates read from pane.py --story-news, and the Ink pane's text map (--json): read-only,
+    no model call."""
+    AT = 1_790_000_000.0
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, 'csr.db')
+        con = sqlite3.connect(self.db)
+        con.execute('create table meta (key text primary key, value text)')
+        con.execute('create table code_evolution (id text, session_id text, file_path text, timestamp text, '
+                    'functions_added text, functions_removed text, types_added text, types_removed text)')
+        con.execute('create table narrative_usage (id integer primary key, ts text, call_site text, model text, input_tokens int, '
+                    'output_tokens int, cache_read_tokens int, cache_creation_tokens int)')
+        raw = dict(ShiftMapText.RECEIPTS_RAW, conv_id='sid-1', current=dict(ShiftMapText.RECEIPTS_RAW['current'], at=self.AT, covered_msgs=10))
+        con.execute("insert into meta values ('story_map:sid-1', ?)", (json.dumps(raw),))
+        con.commit()
+        con.close()
+        patcher = mock.patch.object(pane, 'connect', lambda: sqlite3.connect(self.db))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        keep = mock.patch.multiple(pane, KEEP=self.tmp.name, LIKES=os.path.join(self.tmp.name, 'likes.jsonl'))  # never the real files
+        keep.start()
+        self.addCleanup(keep.stop)
+
+    def sql(self, text, *args):
+        con = sqlite3.connect(self.db)
+        con.execute(text, args)
+        con.commit()
+        con.close()
+
+    def stamp(self, seconds_after):
+        return pane.utc_stamp(self.AT + seconds_after)
+
+    def edit(self, file, added=(), removed=(), types=(), after=100, session='sid-1'):
+        self.sql('insert into code_evolution values (?, ?, ?, ?, ?, ?, ?, ?)', file + str(after), session, file, self.stamp(after),
+                 json.dumps(list(added)), json.dumps(list(removed)), json.dumps(list(types)), '[]')
+
+    def test_receipts_count_files_symbols_and_commits_after_the_telling_for_this_session_only(self):
+        self.edit('a.rs', added=['f', 'g'], removed=['h'], types=['T'])  # 1 file, 4 symbols
+        self.edit('a.rs', added=['f'], after=200)  # the same file and symbol again: counted once
+        self.edit('b.rs', added=['f'])  # another file: a file and a symbol of its own
+        self.edit('c.rs', added=['x'], after=-50)  # before the telling
+        self.edit('d.rs', added=['y'], session='other')  # another session
+        self.edit('e.rs', added=['z'], after=0)  # exactly at the telling is not after it
+        self.assertEqual(pane.new_receipts('sid-1', None, self.AT), 2 * 2 + (4 + 1))
+        self.assertEqual(pane.new_receipts('sid-1', None, self.AT + 1000), 0)
+
+    def test_commits_since_the_telling_count_three_each(self):
+        repo = os.path.join(self.tmp.name, 'repo')
+        os.makedirs(repo)
+        env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@e', GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@e')
+        for n, when in enumerate((self.AT - 3600, self.AT + 60, self.AT + 120)):
+            stamp = pane.datetime.fromtimestamp(when, tz=pane.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            if n == 0:
+                subprocess.run(['git', 'init', '-q', repo], check=True, env=env)
+            subprocess.run(['git', '-C', repo, 'commit', '-q', '--allow-empty', '-m', f'c{n}'], check=True,
+                           env=dict(env, GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp))
+        self.assertEqual(pane.new_receipts('sid-1', repo, self.AT), 6)
+        self.assertEqual(pane.new_receipts('sid-1', self.tmp.name, self.AT), 0)  # not a repository: no commits, no error
+
+    def test_story_spend_is_the_last_days_story_calls_only_and_never_prices_what_it_cannot(self):
+        now = self.AT + 10 * 3600
+        def call(site, model, hours_ago, tokens):
+            when = pane.datetime.fromtimestamp(now - hours_ago * 3600, tz=pane.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+            self.sql('insert into narrative_usage (ts, call_site, model, input_tokens, output_tokens, cache_read_tokens, '
+                     'cache_creation_tokens) values (?, ?, ?, ?, 0, 0, 0)', when, site, model, tokens)
+        call('story', 'claude-haiku-4-5-20251001', 1, 1000)
+        call('story', 'claude-haiku-4-5-20251001', 5, 2000)
+        call('story', 'claude-haiku-4-5-20251001', 30, 9000)  # older than a day
+        call('briefing', 'claude-haiku-4-5-20251001', 1, 50_000)  # not a story call
+        got = pane.story_spend(now)
+        self.assertEqual((got['calls_24h'], got['tokens_2h'], got['last_tokens']), (2, 1000, 9000))  # the newest row by id
+        self.assertAlmostEqual(got['usd_24h'], pane.cost_of('claude-haiku-4-5-20251001', 3000, 0, 0, 0), places=9)
+        call('story', 'mystery-model', 2, 10)
+        self.assertIsNone(pane.story_spend(now)['usd_24h'])
+
+    def stub_session(self, messages=14, prompts=(), path='/t/sid-1.jsonl'):
+        class Stub:
+            def __init__(me, sid):
+                me.messages, me.prompts, me.path = messages, list(prompts), path
+
+            def read_transcript(me):
+                pass
+        return mock.patch.object(pane, 'Session', Stub)
+
+    def test_story_news_says_what_the_gates_need(self):
+        self.edit('a.rs', added=['f'])
+        with self.stub_session(prompts=[self.AT - 5, self.AT + 5, self.AT + 6]), \
+                mock.patch.object(pane.time, 'time', lambda: self.AT + 100), mock.patch.object(pane, 'read_likes',
+                lambda: {'shift:sig-x': (True, self.AT + 10), 'story:sid-1:3': (True, self.AT + 10), 'shift:old': (True, 1.0)}):  # a liked story is no liked shift
+            got = pane.story_news('sid-1', None, self.AT + 100)
+        self.assertEqual((got['story'], got['at'], got['covered'], got['messages'], got['messages_since']), (True, self.AT, 10, 14, 4))
+        self.assertEqual((got['prompts_since'], got['receipts'], got['liked_2h'], got['transcript']), (2, 3, 1, '/t/sid-1.jsonl'))
+        self.assertEqual(got['calls_24h'], 0)
+        json.dumps(got)  # it is what the mod parses
+
+    def test_story_news_without_a_map_or_under_the_kill_switch_is_just_no_story(self):
+        self.assertEqual(pane.story_news('no-such-session', None, self.AT), dict(story=False))
+        with mock.patch.dict(os.environ, {'CSR_NO_STORY_MAP': '1'}):
+            self.assertEqual(pane.story_news('sid-1', None, self.AT), dict(story=False))
+
+    def test_the_json_a_mod_reads_carries_the_map_as_the_panes_own_words(self):
+        with self.stub_session(messages=14):
+            got = pane.shift_map_json('sid-1')
+        title, rows = pane.shift_map_rows(pane.session_story_map('sid-1'), 14)
+        self.assertEqual(got, dict(title=title, rows=rows))
+        self.assertEqual(title, 'Shift Map · as of 4 messages ago')
+        self.assertIsNone(pane.shift_map_json('no-such-session'))
+        with mock.patch.dict(os.environ, {'CSR_NO_STORY_MAP': '1'}):
+            self.assertIsNone(pane.shift_map_json('sid-1'))
+
+    def test_the_command_line_answers_with_json_and_never_a_traceback(self):
+        script = os.path.join(HERE, '..', 'bin', 'pane.py')
+        env = dict(os.environ, HOME=self.tmp.name, CSR_NO_AI_NARRATIVES='1')
+        for argv in (['--story-news', '--sid', 'sid-1'], ['--story-news']):
+            ran = subprocess.run([sys.executable, '-I', script, '--repo', self.tmp.name, *argv], capture_output=True, text=True,
+                                 env=env, timeout=30)
+            self.assertEqual((ran.returncode, json.loads(ran.stdout)), (0, dict(story=False)), ran.stderr)
