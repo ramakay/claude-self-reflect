@@ -25,6 +25,7 @@ pub mod setup;
 pub mod shell;
 pub mod status;
 pub mod storage;
+pub mod story_map;
 pub mod summarizer;
 pub mod system_export;
 pub mod telemetry;
