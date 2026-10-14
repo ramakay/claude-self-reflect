@@ -869,13 +869,12 @@ pub fn agents_failures() -> Vec<String> {
             ));
         }
         let hits = detect(&fixture.text);
-        let marker_lines = hits.len() == 2
-            && hits
-                .iter()
-                .all(|hit| hit.reason == ContaminationReason::PluginAgentsEnvelope);
+        let marker_lines = hits.len() == 1
+            && hits[0].reason == ContaminationReason::PluginAgentsEnvelope
+            && hits[0].end_byte == fixture.text.len();
         if !marker_lines || hits.first().map(|hit| hit.start_byte) != Some(0) {
             failures.push(format!(
-                "agents-{name}: expected the opening and closing marker lines as plugin_agents_v1 hits, got {:?}",
+                "agents-{name}: expected the whole envelope (marker, JSON, marker) as one plugin_agents_v1 hit, got {:?}",
                 hits.iter().map(|hit| (hit.reason, hit.start_byte)).collect::<Vec<_>>()
             ));
         }

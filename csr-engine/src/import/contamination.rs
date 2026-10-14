@@ -546,7 +546,6 @@ re!(
     LEFTOVER_RE,
     r"^Left over from session [^\s:]*: “.+” \(.+\)\.$"
 );
-re!(AGENTS_ENVELOPE_RE, r"^\[\[/?CSR:AGENTS:v1\]\]$");
 re!(
     CODE_SHIFT_RE,
     r"^Since our past sessions, commit \S{1,40} “.+” \([^)\n]+\) changed code we worked on: .*\.$"
@@ -1072,11 +1071,45 @@ fn m_last_session(doc: &Doc<'_>, at: usize) -> Option<usize> {
     one_send(doc, at, &LAST_SESSION_RE, &CUT_LAST_SESSION_RE)
 }
 
-/// An agents-envelope marker line (bin/agents.py writes three lines; the JSON
-/// between the markers carries no marker of its own, so each marker line is the
-/// hit).
+const AGENTS_OPEN: &str = "[[CSR:AGENTS:v1]]";
+const AGENTS_CLOSE: &str = "[[/CSR:AGENTS:v1]]";
+
+/// How many lines of `lines` an agents envelope takes, from the first: three
+/// when an opening marker line is followed by exactly one JSON-object line and
+/// the closing marker line (what bin/agents.py writes), one for a marker line
+/// without that shape, `None` when the first line is not a marker line.
+/// `lenient` ignores surrounding whitespace (the query-side strip); the
+/// detector compares exactly.
+pub(crate) fn agents_envelope_len(lines: &[&str], lenient: bool) -> Option<usize> {
+    let norm = |line: &str| {
+        if lenient {
+            line.trim().to_string()
+        } else {
+            line.to_string()
+        }
+    };
+    let first = norm(lines.first()?);
+    if first == AGENTS_OPEN {
+        if let (Some(json), Some(close)) = (lines.get(1), lines.get(2)) {
+            if norm(close) == AGENTS_CLOSE
+                && serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(json).is_ok()
+            {
+                return Some(3);
+            }
+        }
+        return Some(1);
+    }
+    (first == AGENTS_CLOSE).then_some(1)
+}
+
+/// An agents envelope (bin/agents.py writes three lines: an opening marker
+/// line, one JSON-object line, a closing marker line). The whole envelope is
+/// the hit, so derived text does not keep the JSON the markers wrap; a marker
+/// line without that shape is still a hit on its own.
 fn m_agents_envelope(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    one_line(doc, at, &AGENTS_ENVELOPE_RE)
+    let lines = [doc.line(at), doc.line(at + 1), doc.line(at + 2)];
+    let available = (doc.len() - at).min(3);
+    agents_envelope_len(&lines[..available], false).map(|len| at + len)
 }
 
 fn m_leftover(doc: &Doc<'_>, at: usize) -> Option<usize> {

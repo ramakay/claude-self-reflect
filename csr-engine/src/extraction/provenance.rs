@@ -931,7 +931,31 @@ pub(crate) fn strip_emission_lines(text: &str, reminder_tags: bool) -> String {
     let mut kept: Vec<String> = Vec::new();
     let mut changed = false;
     let mut in_block = false;
-    for raw in text.lines() {
+    let rows: Vec<&str> = text.lines().collect();
+    // The text of a row as the line pass reads it: no leading quote marks.
+    let bare = |row: &str| {
+        row.trim_start()
+            .trim_start_matches('>')
+            .trim_start()
+            .to_string()
+    };
+    let mut next = 0;
+    while next < rows.len() {
+        let raw = rows[next];
+        // The companion's agents envelope (marker, one JSON line, marker) is
+        // CSR's whole: it goes with its JSON, and a lone marker line goes too.
+        let window: Vec<String> = rows[next..rows.len().min(next + 3)]
+            .iter()
+            .map(|r| bare(r))
+            .collect();
+        let window: Vec<&str> = window.iter().map(String::as_str).collect();
+        if let Some(len) = crate::import::contamination::agents_envelope_len(&window, true) {
+            changed = true;
+            in_block = false;
+            next += len;
+            continue;
+        }
+        next += 1;
         let line = raw.trim_start().trim_start_matches('>').trim_start();
         if line.is_empty() {
             in_block = false;
@@ -1978,6 +2002,45 @@ mod tests {
             let note = format!("Here is a note:\n\n> {prose}\n>\n> - second line\n");
             assert_eq!(strip_csr_emissions(&note), note);
         }
+    }
+
+    // --- the agents envelope the pane types into the prompt ---
+
+    const LOST_SUBAGENT_ASK: &str = "Lost and found: “Run source-gone validation” went quiet after 14:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.";
+
+    fn envelopes() -> Vec<String> {
+        let document = crate::eval::contamination::agents_document();
+        document.fixtures.into_values().map(|f| f.text).collect()
+    }
+
+    #[test]
+    fn a_pasted_agents_envelope_is_not_part_of_the_persons_words() {
+        for envelope in envelopes() {
+            // the pane types the ask, then the envelope on lines of its own
+            let prompt = format!("{LOST_SUBAGENT_ASK}\n{envelope}");
+            assert_eq!(
+                strip_csr_emissions(&prompt),
+                "",
+                "the ask and the envelope are both CSR's: nothing is left to search"
+            );
+            // the person's own words around it stay, the envelope does not
+            let typed = format!("please look at the importer first\n{envelope}and be quick");
+            let words = strip_csr_emissions(&typed);
+            assert!(
+                words.contains("please look at the importer first"),
+                "{words}"
+            );
+            assert!(words.contains("and be quick"), "{words}");
+            for leaked in ["[[CSR:AGENTS", "\"kind\"", "synthetic-session"] {
+                assert!(!words.contains(leaked), "{leaked} survived: {words}");
+            }
+        }
+        // a marker line on its own goes too; a JSON line on its own is the person's
+        assert_eq!(
+            strip_csr_emissions("[[CSR:AGENTS:v1]]\nfix the build"),
+            "fix the build"
+        );
+        assert_eq!(strip_csr_emissions("{\"a\":1}"), "{\"a\":1}");
     }
 }
 

@@ -3948,4 +3948,44 @@ mod tests {
             Some("note: What if memory notes included their originating session?")
         );
     }
+    #[test]
+    fn a_handoff_envelope_in_a_prompt_does_not_reach_the_derived_request_or_tasks() {
+        let ask = "Lost and found: “Run source-gone validation” went quiet after 14:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.";
+        let envelope = crate::eval::contamination::agents_document()
+            .fixtures
+            .remove("handoff")
+            .expect("handoff fixture")
+            .text;
+        let row = |text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-10-13T10:00:00Z",
+                "message": {"role": "user", "content": text},
+            })
+        };
+        // the pane's send alone is CSR's, not a task
+        assert!(typed_prompt(&row(&format!("{ask}\n{envelope}"))).is_none());
+        // with the person's words, only the words are the task
+        let typed = typed_prompt(&row(&format!("fix the importer first\n{ask}\n{envelope}")))
+            .expect("the person's words are a prompt");
+        assert_eq!(typed.prose, "fix the importer first");
+        // and the episode built from the transcript carries none of it
+        let lines = [
+            row("fix the importer first").to_string(),
+            row(&format!("{ask}\n{envelope}")).to_string(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let episode = extract_episode(&refs, "sid", "proj");
+        let derived = serde_json::to_string(&episode).unwrap();
+        for leaked in [
+            "\\\"kind\\\":\\\"handoff\\\"",
+            "[[CSR:AGENTS",
+            "req-2026-10-13-0001",
+        ] {
+            assert!(
+                !derived.contains(leaked),
+                "{leaked} reached the episode: {derived}"
+            );
+        }
+    }
 }

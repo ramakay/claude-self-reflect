@@ -262,25 +262,13 @@ fn plugin_agents_context_and_handoff_fixtures_are_detected() {
     for (name, fixture) in &document.fixtures {
         seen.push(name.as_str());
         let hits = detect(&fixture.text);
-        let reasons: Vec<_> = hits.iter().map(|hit| hit.reason).collect();
+        assert_eq!(hits.len(), 1, "{name}: marker, JSON and marker are one hit");
+        assert_eq!(hits[0].reason, ContaminationReason::PluginAgentsEnvelope);
         assert_eq!(
-            reasons,
-            [
-                ContaminationReason::PluginAgentsEnvelope,
-                ContaminationReason::PluginAgentsEnvelope
-            ],
-            "{name}: the opening and closing marker lines, and nothing between them"
+            (hits[0].start_byte, hits[0].end_byte),
+            (0, fixture.text.len()),
+            "{name}"
         );
-        assert_eq!(hits[0].start_byte, 0, "{name}");
-        assert_eq!(
-            &fixture.text[hits[0].start_byte..hits[0].end_byte],
-            "[[CSR:AGENTS:v1]]\n"
-        );
-        assert_eq!(
-            &fixture.text[hits[1].start_byte..hits[1].end_byte],
-            "[[/CSR:AGENTS:v1]]\n"
-        );
-        assert_eq!(hits[1].end_byte, fixture.text.len(), "{name}");
     }
     assert_eq!(seen, ["context", "handoff"]);
     // the canary reports both

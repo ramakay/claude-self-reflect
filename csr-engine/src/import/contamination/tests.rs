@@ -528,33 +528,59 @@ fn a_long_quote_prefix_with_many_candidates_is_linear() {
 }
 
 /// The companion's agents envelope (bin/agents.py): an opening marker line, one
-/// JSON line, a closing marker line. Each marker line is a hit; the JSON between
-/// them carries no marker of its own.
+/// JSON line, a closing marker line. All three lines are one hit; a marker line
+/// without that shape is still a hit on its own.
 #[test]
-fn the_agents_envelope_marker_lines_are_each_a_hit() {
+fn a_complete_agents_envelope_is_one_hit_and_a_lone_marker_line_still_is() {
     let envelope = "[[CSR:AGENTS:v1]]\n{\"kind\":\"handoff\",\"session\":\"synthetic-session\",\"request\":\"req-0123456789abcdef\",\"thread\":\"000000000001\",\"instruction\":\"Copy this envelope unchanged into the background agent's prompt.\"}\n[[/CSR:AGENTS:v1]]\n";
     let hits = detect(envelope);
-    let formatters: Vec<&str> = hits.iter().map(|hit| hit.formatter).collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].formatter, "plugin_agents_v1");
     assert_eq!(
-        formatters,
-        ["plugin_agents_v1", "plugin_agents_v1"],
-        "{hits:?}"
+        (hits[0].start_byte, hits[0].end_byte),
+        (0, envelope.len()),
+        "marker, JSON and marker are one span"
     );
-    assert_eq!(
-        &envelope[hits[0].start_byte..hits[0].end_byte],
-        "[[CSR:AGENTS:v1]]\n"
-    );
-    assert_eq!(
-        &envelope[hits[1].start_byte..hits[1].end_byte],
-        "[[/CSR:AGENTS:v1]]\n"
-    );
-    // a pasted envelope after the person's words is still two hits, CRLF too
+    // after the person's words, and with CRLF line ends
     let pasted = format!("here it is:\n{}", envelope.replace('\n', "\r\n"));
-    assert_eq!(detect(&pasted).len(), 2, "{pasted:?}");
+    let hits = detect(&pasted);
+    assert_eq!(hits.len(), 1, "{pasted:?}");
+    assert_eq!(hits[0].end_byte, pasted.len());
+
+    // not the envelope's shape: each marker line is still a hit, nothing else is
+    fn marker_only(text: &str) -> Vec<&str> {
+        detect(text)
+            .iter()
+            .map(|hit| &text[hit.start_byte..hit.end_byte])
+            .collect()
+    }
+    let open = "[[CSR:AGENTS:v1]]";
+    let close = "[[/CSR:AGENTS:v1]]";
+    for (name, text) in [
+        (
+            "JSON that is not an object",
+            format!("{open}\n[1,2]\n{close}\n"),
+        ),
+        ("prose between", format!("{open}\nsome words\n{close}\n")),
+        (
+            "two lines between",
+            format!("{open}\n{{}}\n{{}}\n{close}\n"),
+        ),
+        ("nothing between", format!("{open}\n{close}\n")),
+    ] {
+        assert_eq!(
+            marker_only(&text),
+            [format!("{open}\n"), format!("{close}\n")],
+            "{name}"
+        );
+    }
+    assert_eq!(marker_only(&format!("{open}\n")), [format!("{open}\n")]);
+    assert_eq!(marker_only(close), [close]);
     // a mention is not one
     assert_unlabeled("the marker [[CSR:AGENTS:v1]] opens it");
     assert_unlabeled("`[[CSR:AGENTS:v1]]`");
     assert_unlabeled("> [[CSR:AGENTS:v1]]");
+    assert_unlabeled(&format!("```\n{envelope}```\n"));
 }
 
 /// A line of n EM SPACES then n cards: classifying the line (indented, quoted,

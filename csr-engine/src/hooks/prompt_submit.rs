@@ -3268,6 +3268,30 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_that_is_only_the_ask_and_the_envelope_has_nothing_to_search() {
+        let ask = "Lost and found: “Run source-gone validation” went quiet after 14:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands.";
+        for fixture in crate::eval::contamination::agents_document()
+            .fixtures
+            .into_values()
+        {
+            let prompt = format!("{ask}\n{}", fixture.text);
+            assert_eq!(early_exit(&prompt), Some(EarlyExit::Silent), "{prompt}");
+            // the envelope alone is CSR's too
+            assert_eq!(early_exit(&fixture.text), Some(EarlyExit::Silent));
+        }
+        // the person's words around it still search, on those words only
+        let typed = format!(
+            "fix the statusline badge count\n{ask}\n{}",
+            crate::eval::contamination::agents_document().fixtures["handoff"].text
+        );
+        assert_eq!(early_exit(&typed), None);
+        assert_eq!(
+            crate::extraction::provenance::strip_csr_emissions(&typed),
+            "fix the statusline badge count"
+        );
+    }
+
+    #[test]
     fn continuation_prompt_boundaries() {
         // Bare and lightly decorated forms fire.
         assert!(is_continuation_prompt("continue"));
