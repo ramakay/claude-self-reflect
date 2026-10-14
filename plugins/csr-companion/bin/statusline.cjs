@@ -113,7 +113,8 @@ process.stdin.on('data', chunk => chunks.push(chunk)).on('end', () => {
   // Claude Code shows the status line only after exit 0 (its docs, "Script errors or hangs"), so a command that
   // printed its line and then failed must not blank it (Codex review #17). With no line, its own status, or 1.
   if (ran && ran.stderr) process.stderr.write(ran.stderr)
-  if (ran && ran.error) process.stderr.write(`statusline: ${ran.error.message}\n`)
+  // EPIPE only means the command exited without reading the session JSON on stdin, which a status line may do.
+  if (ran && ran.error && ran.error.code !== 'EPIPE') process.stderr.write(`statusline: ${ran.error.message}\n`)
   process.exitCode = !ran || line ? 0 : typeof ran.status === 'number' ? ran.status : 1
   if (keep) {
     try {

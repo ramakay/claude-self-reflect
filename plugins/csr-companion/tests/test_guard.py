@@ -3,6 +3,7 @@ that fails to load; the error log rotates.
 python3 -I -m unittest discover -s tests -p 'test_*.py'"""
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -44,6 +45,16 @@ class StatusLineWrapper(unittest.TestCase):
         self.assertEqual((ran.stdout, ran.stderr, ran.returncode), ('line\n', 'oops\n', 0))
         ran = self.line('--sh', 'echo oops >&2; exit 3')  # nothing to show: its own status says it failed
         self.assertEqual((ran.stdout, ran.stderr, ran.returncode), ('', 'oops\n', 3))
+
+    def test_a_command_that_never_reads_stdin_adds_no_error(self):
+        """Gate flake 2026-10-14: the wrapper printed "spawnSync /bin/sh EPIPE" when the wrapped command exited before
+        reading the session JSON. 4 MB of input makes the race certain."""
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home)
+        big = json.dumps({'session_id': 'sess-1', 'pad': 'x' * 4_000_000})
+        ran = subprocess.run(['node', STATUSLINE, '--sh', 'echo line'], input=big, capture_output=True, text=True,
+                             env=dict(os.environ, HOME=home), timeout=30)
+        self.assertEqual((ran.stdout, ran.stderr, ran.returncode), ('line\n', '', 0))
         ran = self.line('sh', '-c', 'echo fine')
         self.assertEqual((ran.stdout, ran.stderr, ran.returncode), ('fine\n', '', 0))
 
