@@ -193,12 +193,14 @@ pub fn latest_gate_result(storage: &Storage) -> EvalResult {
     let started = Instant::now();
     let attempt = match storage.latest_rerank_model_attempt() {
         Ok(Some(attempt)) => attempt,
+        // No training has happened yet: nothing was tried, so nothing failed.
+        // The line is printed; it does not gate the exit.
         Ok(None) => {
-            return EvalResult::fail(
+            return EvalResult::pass(
                 "Trained Re-ranker Gate",
                 "ranking",
                 started.elapsed().as_secs_f64() * 1000.0,
-                "never_run: no persisted training attempt".into(),
+                "ABSTAIN: never_run: no persisted training attempt".into(),
             );
         }
         Err(error) => {
@@ -265,6 +267,17 @@ pub fn latest_gate_result(storage: &Storage) -> EvalResult {
             || attempt.gate_reason.clone(),
             |error| format!("{}; model load failed: {error}", attempt.gate_reason),
         );
+        // Too little labeled data to train or judge a model is an abstention,
+        // like a recall probe with too few cases: printed, not gating. A model
+        // that was tried and lost (`failed`) or broke (`error`) still gates.
+        if attempt.gate_status == "insufficient_data" {
+            return EvalResult::pass(
+                "Trained Re-ranker Gate",
+                "ranking",
+                started.elapsed().as_secs_f64() * 1000.0,
+                format!("ABSTAIN: insufficient_data; {detail}; reason={reason}"),
+            );
+        }
         EvalResult::fail(
             "Trained Re-ranker Gate",
             "ranking",
@@ -277,6 +290,113 @@ pub fn latest_gate_result(storage: &Storage) -> EvalResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the gate's abstentions do not fail the full eval ---
+
+    fn attempt(
+        model_id: &str,
+        status: &str,
+        reason: &str,
+    ) -> crate::storage::trained_rerank::ModelAttempt {
+        crate::storage::trained_rerank::ModelAttempt {
+            model_id: model_id.into(),
+            feature_schema: crate::search::trained_rerank::FEATURE_SCHEMA,
+            classifier_hash: "classifier".into(),
+            seed: 1,
+            cutoff_ts: None,
+            train_start_ts: None,
+            train_end_ts: None,
+            eval_start_ts: None,
+            eval_end_ts: None,
+            train_impressions: 0,
+            train_rows: 0,
+            eval_impressions: 0,
+            eval_rows: 0,
+            eval_clusters: 0,
+            cluster_wins: 0,
+            cluster_losses: 0,
+            cluster_ties: 0,
+            excluded_contaminated: 0,
+            abstained_reactions: 0,
+            acceptance_labels: 0,
+            correction_labels: 0,
+            reask_labels: 0,
+            redirect_labels: 0,
+            near_miss_labels: 0,
+            baseline_ndcg5: None,
+            trained_ndcg5: None,
+            baseline_mrr: None,
+            trained_mrr: None,
+            curated_baseline_score: None,
+            curated_trained_score: None,
+            curated_case_count: 0,
+            curated_veto_epsilon: 0.0,
+            gate_status: status.into(),
+            gate_reason: reason.into(),
+            weights_json: None,
+            normalization_json: None,
+            trained_at: "2026-10-13T00:00:00Z".into(),
+        }
+    }
+
+    fn gate_after(status: Option<(&str, &str)>) -> EvalResult {
+        let storage = Storage::open_memory().unwrap();
+        if let Some((status, reason)) = status {
+            storage
+                .insert_rerank_model_attempt(&attempt("m1", status, reason), &[])
+                .unwrap();
+        }
+        latest_gate_result(&storage)
+    }
+
+    #[test]
+    fn never_run_and_insufficient_data_abstain_without_failing() {
+        let never = gate_after(None);
+        assert!(never.passed, "{}", never.detail);
+        assert!(
+            never.detail.starts_with("ABSTAIN: never_run"),
+            "{}",
+            never.detail
+        );
+
+        let thin = gate_after(Some(("insufficient_data", "only 3 labeled impressions")));
+        assert!(thin.passed, "{}", thin.detail);
+        assert!(
+            thin.detail.starts_with("ABSTAIN: insufficient_data"),
+            "{}",
+            thin.detail
+        );
+        assert!(
+            thin.detail.contains("only 3 labeled impressions"),
+            "the reason stays printed"
+        );
+    }
+
+    #[test]
+    fn a_real_reranker_failure_still_gates() {
+        for (status, reason) in [
+            ("failed", "trained model lost to the baseline"),
+            ("error", "training crashed"),
+        ] {
+            let result = gate_after(Some((status, reason)));
+            assert!(!result.passed, "{status}: {}", result.detail);
+            assert!(result.detail.contains(reason));
+        }
+    }
+
+    #[test]
+    fn has_gating_failure_ignores_the_abstentions_and_catches_a_real_failure() {
+        let report = |gate: EvalResult| crate::eval::EvalReport {
+            results: vec![
+                EvalResult::pass("DB Connectivity", "c", 0.0, "ok".into()),
+                gate,
+            ],
+            total_ms: 0.0,
+        };
+        assert!(!report(gate_after(None)).has_gating_failure());
+        assert!(!report(gate_after(Some(("insufficient_data", "thin")))).has_gating_failure());
+        assert!(report(gate_after(Some(("failed", "lost")))).has_gating_failure());
+    }
 
     #[test]
     fn curated_veto_triggers_when_trained_mrr_regresses_beyond_epsilon() {

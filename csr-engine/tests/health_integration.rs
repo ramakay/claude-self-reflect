@@ -290,6 +290,15 @@ fn full_eval_abstention_is_explicit() {
     );
     assert!(!stdout.contains("100%"), "no data is never 100%\n{stdout}");
     assert!(stdout.contains("/24 passed"), "{stdout}");
+    // a fresh install has never trained a re-ranker: that abstains, it does not fail
+    let gate = stdout
+        .lines()
+        .find(|line| line.contains("Trained Re-ranker Gate"))
+        .unwrap_or_else(|| panic!("no re-ranker gate line\n{stdout}"));
+    assert!(
+        gate.contains("[PASS]") && gate.contains("ABSTAIN: never_run"),
+        "{gate}"
+    );
     assert!(stdout.contains("Contamination Census"), "{stdout}");
     assert!(stdout.contains("REPORT ONLY: no chunks"), "{stdout}");
     assert_exit_mirrors_failures(&output);
