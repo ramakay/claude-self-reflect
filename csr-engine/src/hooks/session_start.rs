@@ -782,6 +782,7 @@ pub(crate) fn recent_project_episodes(
             serde_json::from_str::<Episode>(&content)
                 .ok()
                 .filter(episode_carries_state)
+                .filter(|ep| !episode_is_csr_text(ep))
                 .map(|ep| (ep, ts))
         })
         .collect();
@@ -862,6 +863,23 @@ fn display_outcome<'a>(ep: &'a Episode, last: &str) -> &'a str {
     } else {
         ep.outcome.as_str()
     }
+}
+
+/// Whether any text an episode would render is CSR text (the detector search
+/// and status use). Selection only: the stored episode is untouched.
+pub(crate) fn episode_is_csr_text(ep: &Episode) -> bool {
+    use crate::import::contamination::has_csr_text;
+    [
+        Some(ep.request.as_str()),
+        ep.anchor_request.as_deref(),
+        Some(ep.completed.as_str()),
+        ep.next_steps.as_deref(),
+        ep.blockers.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(ep.todos.iter().map(|todo| todo.content.as_str()))
+    .any(has_csr_text)
 }
 
 /// Whether an episode is a usable Tier-0 anchor. A substantive, declarative
@@ -1072,14 +1090,20 @@ pub(crate) fn format_tier0_block_with_recap(
     // may carry CSR's own output in any field — clean again at display time,
     // and compact to one line so a long `completed` can't dump paragraphs.
     use crate::extraction::provenance::extractable;
-    let request = episode_intent_label(ep);
+    // Text the detector labels is skipped like text the provenance guard filters.
+    use crate::import::contamination::has_csr_text;
+    let request = Some(episode_intent_label(ep))
+        .filter(|label| !has_csr_text(label))
+        .unwrap_or_else(|| "(filtered: CSR meta)".into());
     let last = extractable(&ep.completed)
+        .filter(|s| !has_csr_text(s))
         .map(|s| conclusion_preview(&s, 120))
         .unwrap_or_else(|| "(filtered: CSR meta)".into());
     let next = ep
         .next_steps
         .as_deref()
         .and_then(extractable)
+        .filter(|n| !has_csr_text(n))
         .map(|n| compact_preview(strip_next_prefix(&n), 80))
         .filter(|n| !n.is_empty());
 
@@ -1483,8 +1507,16 @@ const NOISE_SUMMARIES: &[&str] = &[
 /// the session is meta and must not surface as CONTINUED FROM or RECENT SESSIONS.
 /// A session with no summary is left to the other display gates (can't classify).
 fn is_meta_session(session: &SessionInfo) -> bool {
+    // CSR text the detector labels is not real work either: neither the
+    // summary nor the title that would be shown may be one.
+    if crate::import::contamination::has_csr_text(&session_title(session)) {
+        return true;
+    }
     match session.summary.as_deref() {
-        Some(s) if !s.trim().is_empty() => crate::extraction::provenance::extractable(s).is_none(),
+        Some(s) if !s.trim().is_empty() => {
+            crate::extraction::provenance::extractable(s).is_none()
+                || crate::import::contamination::has_csr_text(s)
+        }
         _ => false,
     }
 }
@@ -2865,6 +2897,97 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         sessions.sort();
         // An unrecorded entrypoint is unknown, not headless: it stays.
         assert_eq!(sessions, ["human", "unrecorded"]);
+    }
+
+    const RULE_TEXT: &str = "A standing rule from 10-12: “Keep receipts”";
+
+    /// SessionStart episode selection skips an episode whose text has a
+    /// detector hit (selection only; the stored reflection is untouched).
+    #[test]
+    fn episode_selection_skips_an_episode_whose_text_is_csr_text() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        for (session, request, completed) in [
+            ("csr", RULE_TEXT, "Fixed the auth middleware regression"),
+            (
+                "clean",
+                "Fix the auth middleware regression",
+                "Fixed the token check",
+            ),
+            (
+                "csr-completed",
+                "Fix the auth middleware regression",
+                RULE_TEXT,
+            ),
+        ] {
+            let mut ep = minimal_episode(request, completed, None);
+            ep.session_id = session.into();
+            ep.project = "proj".into();
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &serde_json::to_string(&ep).unwrap(),
+                    &crate::hooks::stop::episode_tags(&ep),
+                    &[0.0; 4],
+                )
+                .unwrap();
+        }
+        let sessions: Vec<String> = recent_project_episodes(&storage, "proj", 10)
+            .into_iter()
+            .map(|(ep, _)| ep.session_id)
+            .collect();
+        assert_eq!(sessions, ["clean"]);
+    }
+
+    /// The fragment block (what `CSR_NO_RECAP=1` forces) never renders a line
+    /// that is CSR text.
+    #[test]
+    fn fragments_do_not_render_csr_text() {
+        let ep = minimal_episode(
+            "Fix the auth middleware regression",
+            RULE_TEXT,
+            Some(RULE_TEXT),
+        );
+        let block = format_tier0_block_with_recap(
+            &ep,
+            &[],
+            "2h ago",
+            None,
+            crate::provenance::TrustTier::UserHistory,
+        );
+        assert!(!block.contains("Keep receipts"), "{block}");
+        let request = minimal_episode(RULE_TEXT, "Fixed the token check", None);
+        let block = format_tier0_block_with_recap(
+            &request,
+            &[],
+            "2h ago",
+            None,
+            crate::provenance::TrustTier::UserHistory,
+        );
+        assert!(!block.contains("Keep receipts"), "{block}");
+    }
+
+    /// Continuity (CONTINUED FROM, RECENT SESSIONS) never anchors on a session
+    /// whose summary or rendered title is CSR text.
+    #[test]
+    fn continuity_skips_a_session_whose_title_is_csr_text() {
+        let session = |summary: Option<&str>, enrichment: Option<&str>| SessionInfo {
+            conversation_id: "s".to_string(),
+            project_name: "test".to_string(),
+            timestamp: "2026-06-10T10:00:00Z".to_string(),
+            total_messages: 30,
+            chunk_count: 5,
+            summary: summary.map(String::from),
+            enrichment: enrichment.map(String::from),
+        };
+        assert!(is_meta_session(&session(Some(RULE_TEXT), None)));
+        assert!(is_meta_session(&session(
+            Some("fix the briefing staleness bug"),
+            Some(&format!("## User Request\n{RULE_TEXT}\n"))
+        )));
+        assert!(!is_meta_session(&session(
+            Some("fix the briefing staleness bug"),
+            None
+        )));
     }
 
     #[test]

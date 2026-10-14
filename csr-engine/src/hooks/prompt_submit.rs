@@ -2590,6 +2590,81 @@ mod tests {
         assert_eq!(ids, ["plain"], "the long rule must not be injected");
     }
 
+    /// Lineage pickup skips an episode whose text has a detector hit and falls
+    /// through to the next candidate.
+    #[tokio::test]
+    async fn lineage_pickup_skips_an_episode_whose_text_is_csr_text() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        for (session, request, completed, stamp) in [
+            (
+                "clean",
+                "Fix the auth middleware regression",
+                "Fixed the token check in the middleware",
+                "2026-10-12T12:00:00Z",
+            ),
+            (
+                "csr",
+                "A standing rule from 10-12: “Keep receipts”",
+                "Fixed the token check in the middleware",
+                "2026-10-13T12:00:00Z",
+            ),
+        ] {
+            let ep = crate::hooks::stop::Episode {
+                schema: "v2".into(),
+                session_id: session.into(),
+                project: "proj".into(),
+                timestamp: stamp.into(),
+                request: request.into(),
+                investigated: vec![],
+                completed: completed.into(),
+                next_steps: None,
+                blockers: None,
+                outcome: "success".into(),
+                error_signatures: vec![],
+                tools_used: vec![],
+                files_modified: vec![],
+                message_count: 10,
+                duration_minutes: 5,
+                todos: vec![],
+                approved_plan: None,
+                prev_episode_id: None,
+                error_count: None,
+                top_errors: vec![],
+                steer_count: None,
+                steers: vec![],
+                instrumentation_version: None,
+                correction_count: None,
+                recap_evidence_version: None,
+                anchor_request: None,
+                completions: vec![],
+                completions_untied: false,
+                compact_anchor: None,
+                anchors: vec![],
+            };
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &serde_json::to_string(&ep).unwrap(),
+                    &crate::hooks::stop::episode_tags(&ep),
+                    &[0.0; 4],
+                )
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                8,
+            ))),
+            root.path().to_path_buf(),
+        );
+        let (picked, _) = pick_lineage_episode(&engine, &cwd, "continue please").unwrap();
+        assert_eq!(picked.session_id, "clean");
+    }
+
     #[tokio::test]
     async fn chunk_search_never_echoes_the_asking_session_or_a_harness_block() {
         let root = tempfile::tempdir().unwrap();

@@ -116,6 +116,7 @@ pub fn compose_recap_with_deliveries(
     const MAX_CHARS: usize = 700;
 
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
+    use crate::import::contamination::has_csr_text;
 
     let intent = recap_intent(ep);
     let completed = recap_completed(ep);
@@ -152,6 +153,7 @@ pub fn compose_recap_with_deliveries(
         .filter(|fact| fact.status == "resolved")
         .filter(|fact| fact.source == "user_confirmed")
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
+        .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
         .take(3)
         .map(format_fact)
         .collect();
@@ -162,7 +164,7 @@ pub fn compose_recap_with_deliveries(
         .as_deref()
         .and_then(extractable)
         .map(|text| compact_preview(&text, 120))
-        .filter(|text| has_substance(text))
+        .filter(|text| has_substance(text) && !has_csr_text(text))
     {
         now_parts.push(blocker);
     }
@@ -173,6 +175,7 @@ pub fn compose_recap_with_deliveries(
             .filter(|fact| fact.status != "resolved")
             .filter(|fact| fact.source == "user_confirmed")
             .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
+            .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
             .take(STILL_OPEN_LIMIT)
             .map(format_fact),
     );
@@ -190,17 +193,23 @@ pub fn compose_recap_with_deliveries(
     let todo_entry = (open_todos > 0).then(|| format!("{open_todos} todos open"));
     let priority_now_entries = usize::from(!now_parts.is_empty());
     now_parts.extend(todo_entry);
-    let next = ep.next_steps.as_deref().and_then(next_preview).or_else(|| {
-        ep.todos
-            .iter()
-            .filter(|todo| todo.status != "completed")
-            .find_map(|todo| next_preview(&todo.content))
-    });
+    let next = ep
+        .next_steps
+        .as_deref()
+        .and_then(next_preview)
+        .filter(|next| !has_csr_text(next))
+        .or_else(|| {
+            ep.todos
+                .iter()
+                .filter(|todo| todo.status != "completed")
+                .find_map(|todo| next_preview(&todo.content))
+        });
 
     let retired_entries: Vec<String> = feeds
         .retired_while_away
         .iter()
         .filter(|line| !normalize_feed_text(&line.receipt_oid).is_empty())
+        .filter(|line| !has_csr_text(&normalize_feed_text(&line.label)))
         .take(2)
         .map(|line| {
             format!(
@@ -216,6 +225,7 @@ pub fn compose_recap_with_deliveries(
     let correction_entries: Vec<String> = feeds
         .corrections
         .iter()
+        .filter(|line| !has_csr_text(&line.quote))
         .take(2)
         .map(|line| {
             format!(
@@ -236,6 +246,7 @@ pub fn compose_recap_with_deliveries(
         .iter()
         .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
         .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
+        .filter(|dream| !has_csr_text(&normalize_feed_text(&dream.verdict)))
         .map(|dream| {
             format!(
                 "{} {} ({}, {})",
@@ -799,6 +810,34 @@ mod tests {
             compact_anchor: None,
             anchors: vec![],
         }
+    }
+
+    #[test]
+    fn recap_claims_that_are_csr_text_are_skipped() {
+        let rule = "A standing rule from 10-12: “Keep receipts”";
+        let mut feeds = full_feeds();
+        feeds.settled.insert(
+            0,
+            SettledFact {
+                claim: rule.into(),
+                receipt: "abc1234".into(),
+                status: "resolved".into(),
+                source: "user_confirmed".into(),
+            },
+        );
+        feeds.still_open.insert(
+            0,
+            SettledFact {
+                claim: rule.into(),
+                receipt: "abc1234".into(),
+                status: "still_open".into(),
+                source: "user_confirmed".into(),
+            },
+        );
+        let recap = compose_recap(&episode(), &feeds, "2h ago").unwrap();
+        assert!(!recap.contains("Keep receipts"), "{recap}");
+        // the other claims still stand
+        assert!(recap.contains("schema is stable"), "{recap}");
     }
 
     fn full_feeds() -> RecapFeeds {
