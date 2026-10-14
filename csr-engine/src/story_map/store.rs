@@ -22,7 +22,9 @@ const LEDGER_MAX_BYTES: usize = 32_768;
 const MAX_RECEIPTS: usize = 6;
 
 const STORY_MAP_VERSION: u32 = 1;
-const STORY_MAP_MAX_BYTES: usize = 4_096;
+// A full map is four entries of ~800 bytes with two-endpoint sides and a was/now pair
+// (about 3.6 KB), plus the previous telling's ~0.4 KB: 4 KiB dropped entries. 6 KiB holds it.
+const STORY_MAP_MAX_BYTES: usize = 6_144;
 const STORY_MAP_MAX_PREV_ENDPOINTS: usize = 12;
 const STORY_MAP_MAX_SESSIONS: usize = 50;
 
@@ -32,6 +34,10 @@ pub struct LedgerEntry {
     pub sig: String,
     pub kind: String,
     pub claim: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub was: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
     pub before: String,
     pub after: String,
     pub receipts: Vec<String>,
@@ -170,6 +176,10 @@ impl<'de> Deserialize<'de> for GroundedShift {
             moved: bool,
             liked: bool,
             claim: String,
+            #[serde(default)]
+            was: Option<String>,
+            #[serde(default)]
+            now: Option<String>,
             receipts: Vec<String>,
             before: Vec<Part>,
             after: Vec<Part>,
@@ -182,6 +192,8 @@ impl<'de> Deserialize<'de> for GroundedShift {
             moved: raw.moved,
             liked: raw.liked,
             claim: raw.claim,
+            was: raw.was,
+            now: raw.now,
             receipts: raw.receipts,
             before: raw.before,
             after: raw.after,
@@ -232,6 +244,9 @@ pub fn render_parts(parts: &[Part]) -> String {
     out
 }
 
+/// The reflection text of one shift: `[header] before => after - <what changed>`. A shift
+/// with a `now` sentence says it as `Before: <was> After: <now>` (`New: <now>` when there
+/// was no before), the way the pane does; an older one keeps its claim.
 fn format_ledger_content(
     by: &str,
     kind: &str,
@@ -239,10 +254,15 @@ fn format_ledger_content(
     receipts: &[String],
     before: &str,
     after: &str,
-    claim: &str,
+    shift: &GroundedShift,
 ) -> String {
+    let said = match (&shift.was, &shift.now) {
+        (Some(was), Some(now)) => format!("Before: {was} After: {now}"),
+        (None, Some(now)) => format!("New: {now}"),
+        _ => shift.claim.clone(),
+    };
     format!(
-        "[shift: {}, kind={kind}, rev={rev}, receipts={}] {before} => {after} - {claim}",
+        "[shift: {}, kind={kind}, rev={rev}, receipts={}] {before} => {after} - {said}",
         if by == RECEIPTS_BY {
             "from receipts"
         } else {
@@ -365,20 +385,15 @@ pub fn plan_ledger(
         let before = render_parts(&shift.before);
         let after = render_parts(&shift.after);
         let receipts = union_receipts(&[], &shift.receipts);
-        let content = format_ledger_content(
-            by,
-            &shift.kind,
-            rev,
-            &receipts,
-            &before,
-            &after,
-            &shift.claim,
-        );
+        let content =
+            format_ledger_content(by, &shift.kind, rev, &receipts, &before, &after, shift);
         let tags = format_ledger_tags(by, project, conv_id, rev, &shift.kind, &shift.sig);
         let entry = LedgerEntry {
             sig: shift.sig.clone(),
             kind: shift.kind.clone(),
             claim: shift.claim.clone(),
+            was: shift.was.clone(),
+            now: shift.now.clone(),
             before,
             after,
             receipts,
@@ -723,6 +738,8 @@ mod tests {
             moved: false,
             liked: false,
             claim: entry.claim.clone(),
+            was: entry.was.clone(),
+            now: entry.now.clone(),
             receipts: receipts.iter().map(|s| s.to_string()).collect(),
             before: to_parts(&entry.before),
             after: to_parts(&entry.after),
@@ -778,6 +795,8 @@ mod tests {
                 sig: format!("{i:016x}"),
                 kind: "shift".into(),
                 claim: "X".repeat(120),
+                was: None,
+                now: None,
                 before: format!("src/module_{i}/very_long_file_name_{i}.rs:func_before_{i}~"),
                 after: format!("src/module_{i}/very_long_file_name_{i}.rs:func_after_{i}+"),
                 receipts: vec![
@@ -1133,10 +1152,10 @@ mod tests {
     }
 
     #[test]
-    fn story_map_over_4kb_drops_model_only_entries_first() {
+    fn story_map_over_the_cap_drops_model_only_entries_first() {
         let storage = Storage::open_memory().unwrap();
         let mut entries = Vec::new();
-        for i in 0..8usize {
+        for i in 0..16usize {
             let line = format!(
                 "shift|src/very_long_path_{i}/mod_{i}.rs:func_before_{i}~ -> src/other_{i}/peer_{i}.rs:callee_{i}~|src/very_long_path_{i}/mod_{i}.rs:func_after_{i}+ -> src/other_{i}/peer_{i}.rs:callee_{i}+|{} {i}",
                 "Detailed architectural shift claim text ".repeat(2)
@@ -1166,15 +1185,180 @@ mod tests {
         save_story_map(&storage, &map).unwrap();
 
         let raw = storage.get_meta("story_map:c-big").unwrap().unwrap();
-        assert!(raw.len() <= 4_096);
+        assert!(raw.len() <= STORY_MAP_MAX_BYTES);
         let loaded = load_story_map(&storage, "c-big").unwrap();
         assert!(!loaded.current.entries.is_empty());
         // Trimmed, and model-only entries went before any grounded one did.
-        assert!(loaded.current.entries.len() < 8);
-        assert_eq!(
-            loaded.current.entries.iter().filter(|e| e.grounded).count(),
-            4
+        assert!(loaded.current.entries.len() < 16);
+        let grounded = loaded.current.entries.iter().filter(|e| e.grounded).count();
+        assert!(
+            grounded == loaded.current.entries.len() || grounded == 8,
+            "a model-only entry stayed while a grounded one went: {grounded} grounded of {}",
+            loaded.current.entries.len()
         );
+    }
+
+    #[test]
+    fn was_and_now_reach_the_reflection_text_and_the_stored_map() {
+        let storage = Storage::open_memory().unwrap();
+        let both = sample_grounded(
+            "csr",
+            "shift|pane.py:draw_story_map-|pane.py:shift_map_rows~|The map drew its labels at 9 to 10 px.|The map writes Before and After as text.",
+            true,
+            &["evo:1"],
+        );
+        let fresh = sample_grounded(
+            "csr",
+            "decision|-|summarizer.rs:ground_shifts+|-|ground_shifts checks each shift against AST rows.",
+            true,
+            &["evo:2"],
+        );
+        let old = sample_grounded(
+            "csr",
+            "risk|a.rs:f~|a.rs:g!|Old four-field claim",
+            true,
+            &["evo:3"],
+        );
+        let plan = plan_ledger(
+            &storage,
+            "csr",
+            "c1",
+            1,
+            1000,
+            "Haiku",
+            &[both.clone(), fresh.clone(), old.clone()],
+        );
+        let said: Vec<&str> = plan.new_rows.iter().map(|r| r.content.as_str()).collect();
+        assert!(
+            said[0].ends_with(
+                "- Before: The map drew its labels at 9 to 10 px. After: The map writes Before and After as text."
+            ),
+            "{}",
+            said[0]
+        );
+        assert!(
+            said[1].ends_with("- New: ground_shifts checks each shift against AST rows."),
+            "{}",
+            said[1]
+        );
+        assert!(said[2].ends_with("- Old four-field claim"), "{}", said[2]);
+        assert_eq!(plan.new_rows[0].entry.was, both.was);
+        assert_eq!(plan.new_rows[1].entry.was, None);
+        assert_eq!(plan.new_rows[1].entry.now, fresh.now);
+
+        let map = build_story_map(
+            None,
+            "csr",
+            "c1",
+            1,
+            1000,
+            "Haiku",
+            10,
+            &HashSet::new(),
+            vec![both, fresh, old],
+        );
+        save_story_map(&storage, &map).unwrap();
+        let raw = storage.get_meta("story_map:c1").unwrap().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entries = json["current"]["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["was"], "The map drew its labels at 9 to 10 px.");
+        assert_eq!(
+            entries[0]["now"],
+            "The map writes Before and After as text."
+        );
+        assert!(entries[1].get("was").is_none(), "a new thing has no was");
+        assert!(entries[1]["now"].is_string());
+        assert!(entries[2].get("was").is_none() && entries[2].get("now").is_none());
+        assert_eq!(load_story_map(&storage, "c1").unwrap(), map);
+    }
+
+    #[test]
+    fn a_map_stored_before_was_and_now_still_loads() {
+        let storage = Storage::open_memory().unwrap();
+        let old = json!({
+            "v": 1, "project": "csr", "conv_id": "c-old",
+            "current": {"rev": 2, "at": 1000, "by": "Haiku", "covered_msgs": 10, "entries": [{
+                "sig": "0123456789abcdef", "kind": "shift", "grounded": true, "moved": false, "liked": false,
+                "claim": "Keep prior shift reflections", "receipts": ["evo:1"],
+                "before": [{"scope": "a.rs", "sym": "f", "mark": "~", "tier": "verified"}],
+                "after": [{"scope": "a.rs", "sym": "g", "mark": "+", "tier": "verified"}]
+            }]},
+            "previous": null
+        });
+        storage
+            .set_meta("story_map:c-old", &old.to_string())
+            .unwrap();
+        let loaded = load_story_map(&storage, "c-old").expect("an old map loads");
+        assert_eq!(
+            loaded.current.entries[0].claim,
+            "Keep prior shift reflections"
+        );
+        assert_eq!(
+            (
+                loaded.current.entries[0].was.clone(),
+                loaded.current.entries[0].now.clone()
+            ),
+            (None, None)
+        );
+        let again = serde_json::to_string(&loaded).unwrap();
+        assert!(!again.contains("\"was\"") && !again.contains("\"now\""));
+    }
+
+    #[test]
+    fn four_full_five_field_entries_fit_the_story_map_cap() {
+        let storage = Storage::open_memory().unwrap();
+        let sentence = "The map writes Before and After as plain text rows.";
+        let mut entries = Vec::new();
+        for i in 0..4usize {
+            let line = format!(
+                "shift|src/very_long_path_{i}/mod_{i}.rs:func_before_{i}~ -> src/other_{i}/peer_{i}.rs:callee_{i}~|src/very_long_path_{i}/mod_{i}.rs:func_after_{i}+ -> src/other_{i}/peer_{i}.rs:callee_{i}+|{sentence}|{sentence}"
+            );
+            entries.push(sample_grounded(
+                "csr",
+                &line,
+                true,
+                &[
+                    "oid:abcdef1234567",
+                    "edge:12345678",
+                    "node:87654321",
+                    "evo:11111111",
+                ],
+            ));
+        }
+        let prev = build_story_map(
+            None,
+            "csr",
+            "c-full",
+            1,
+            900,
+            "Haiku",
+            40,
+            &HashSet::new(),
+            entries.clone(),
+        );
+        let map = build_story_map(
+            Some(&prev),
+            "csr",
+            "c-full",
+            2,
+            1000,
+            "Haiku",
+            50,
+            &HashSet::new(),
+            entries,
+        );
+        save_story_map(&storage, &map).unwrap();
+        let raw = storage.get_meta("story_map:c-full").unwrap().unwrap();
+        assert!(raw.len() <= STORY_MAP_MAX_BYTES, "{} bytes", raw.len());
+        let loaded = load_story_map(&storage, "c-full").unwrap();
+        assert_eq!(
+            loaded.current.entries.len(),
+            4,
+            "no entry dropped at {} bytes",
+            raw.len()
+        );
+        assert_eq!(loaded.current.entries[0].now.as_deref(), Some(sentence));
+        assert_eq!(loaded.current.entries[0].was.as_deref(), Some(sentence));
     }
 
     #[test]

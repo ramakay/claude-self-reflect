@@ -334,6 +334,8 @@ mod tests {
                 sig: (*sig).to_string(),
                 kind: (*kind).to_string(),
                 claim: format!("Claim {i}"),
+                was: None,
+                now: None,
                 before: "-".into(),
                 after: format!("a.rs:f{i}+"),
                 receipts: vec!["evo:1".into()],

@@ -1423,10 +1423,15 @@ def session_story_map(session_id):
             if before is None or after is None or not isinstance(receipts, list) or not all(isinstance(r, str) for r in receipts):
                 return None
             sig = entry.get('sig')
+            now_said, was_said = entry.get('now'), entry.get('was')  # csr-engine's 5-field maps; an older map has neither
+            now_said = ' '.join(now_said.split()) if isinstance(now_said, str) and now_said.strip() else None
+            was_said = ' '.join(was_said.split()) if now_said and isinstance(was_said, str) and was_said.strip() not in ('', '-') else None
             entries.append(dict(
                 sig=sig.strip() if isinstance(sig, str) and sig.strip() else None,
                 kind=kind.strip(),
                 claim=' '.join(claim.split()),
+                was=was_said,
+                now=now_said,
                 before=before,
                 after=after,
                 receipts=[r.strip() for r in receipts if r.strip()],
@@ -1504,10 +1509,84 @@ def _shift_source(entry, by, room):
     return [f'{reading} · {found}'] if len(reading) + 3 + len(found) <= room else [reading, found]
 
 
-def shift_map_rows(smap, messages_now, room=SHIFT_ROOM):
-    """The Shift Map as plain words, (title, rows): per shift its claim, then what changed ('was' and 'now' when
-    both sides do not fit one row), then where the evidence comes from. No ANSI and no badges; every row is at
-    most `room` characters. The title carries how far behind the map is, counted in transcript messages."""
+BEFORE_LABEL, AFTER_LABEL, NEW_LABEL = 'Before: ', 'After:  ', 'New:    '  # one width: the sentences start in one column
+SHIFT_LABEL = len(BEFORE_LABEL)  # a sentence's second row hangs under the first row's text
+
+
+def _wrap_words(text, width):
+    """text in rows of at most width characters, broken between words; a word wider than a row is cut from the left."""
+    lines, line = [], ''
+    for word in text.split():
+        word = _shift_tail(word, width)
+        if line and len(line) + 1 + len(word) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = f'{line} {word}' if line else word
+    return lines + [line] if line else lines
+
+
+def _shift_sentence(label, text, room):
+    """label and text as at most two rows of at most room characters: wrapped at word boundaries, the second row
+    hanging under the first row's text. Words that would need a third row end the second with an ellipsis; no word
+    is cut in half."""
+    width = max(SHIFT_LABEL, room - len(label))
+    lines = _wrap_words(text, width)
+    if len(lines) > 2:
+        last = lines[1].split(' ')
+        while last and len(' '.join(last)) + 1 > width:
+            last.pop()
+        lines = [lines[0], ' '.join(last) + '…']
+    return [label + lines[0]] + [' ' * len(label) + line for line in lines[1:]]
+
+
+def _shift_where(entry):
+    """The file:symbol a shift is about, from its after side, else its before side; '' when it names none."""
+    for side in (entry['after'], entry['before']):
+        for part in side:
+            if 'op' not in part:
+                scope, sym = part.get('scope') or '', part.get('sym')
+                return f'{scope}:{sym}' if sym else scope
+    return ''
+
+
+def _shift_group(entry, smap, room):
+    """One shift as (row, loud) pairs. A 5-field entry: `kind · file:symbol`, then Before and After sentences (New
+    when there was no before), then where the evidence comes from. An entry without was/now (an older map) keeps the
+    claim, the sides and the evidence of its day."""
+    by = smap.get('by') or 'Haiku'
+    new = 'new ' if entry.get('moved') and smap.get('has_previous') else ''
+    if not entry.get('now'):
+        inner, rows = room - 2, [(fit(f"{new}{entry['kind']}: {entry['claim']}", room), False)]
+        before = _shift_side(entry['before'], inner - 4) if entry['before'] else ''
+        after = _shift_side(entry['after'], inner if not before else inner - 4) if entry['after'] else ''
+        if before and after:
+            both = f'{before} > {after}'
+            rows += [('  ' + both, False)] if len(both) <= inner else [(f'  was {before}', False), (f'  now {after}', False)]
+        elif before:
+            rows.append((f'  was {before}', False))
+        elif after:
+            rows.append(('  ' + after, False))
+        return rows + [('  ' + fit(line, inner), False) for line in _shift_source(entry, by, inner)]
+    head = f"{new}{entry['kind']}"
+    where = _shift_where(entry)
+    if where:
+        head = f"{head} · {_shift_tail(where, max(6, room - len(head) - 3))}"
+    rows = [(fit(head, room), False)]
+    if entry.get('was'):
+        rows += [(row, True) for row in _shift_sentence(BEFORE_LABEL, entry['was'], room)]
+        rows += [(row, True) for row in _shift_sentence(AFTER_LABEL, entry['now'], room)]
+    else:
+        rows += [(row, True) for row in _shift_sentence(NEW_LABEL, entry['now'], room)]
+    return rows + [(fit(line, room), False) for line in _shift_source(entry, by, room)]
+
+
+def shift_map_marked(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=None):
+    """The Shift Map as plain words, (title, rows) with rows as (text, loud): per shift its rows (_shift_group), the
+    Before, After and New sentences loud, the rest quiet. shut shows the first shift; budget caps the rows the
+    shifts take (at least one whole shift is shown). Shifts left out are said in a last row. No ANSI and no badges;
+    every row is at most `room` characters. The title carries how far behind the map is, counted in transcript
+    messages."""
     covered = smap.get('covered')
     if isinstance(messages_now, int) and not isinstance(messages_now, bool) and isinstance(covered, int):
         behind = max(0, messages_now - covered)
@@ -1515,21 +1594,24 @@ def shift_map_rows(smap, messages_now, room=SHIFT_ROOM):
     else:
         stale = ''
     title = 'Shift Map' + (f' · {stale}' if stale else '')
-    by, rows, inner = smap.get('by') or 'Haiku', [], room - 2
-    for entry in smap['entries'][:4]:
-        new = 'new ' if entry.get('moved') and smap.get('has_previous') else ''
-        rows.append(fit(f"{new}{entry['kind']}: {entry['claim']}", room))
-        before = _shift_side(entry['before'], inner - 4) if entry['before'] else ''
-        after = _shift_side(entry['after'], inner if not before else inner - 4) if entry['after'] else ''
-        if before and after:
-            both = f'{before} > {after}'
-            rows += ['  ' + both] if len(both) <= inner else [f'  was {before}', f'  now {after}']
-        elif before:
-            rows.append(f'  was {before}')
-        elif after:
-            rows.append('  ' + after)
-        rows += ['  ' + fit(line, inner) for line in _shift_source(entry, by, inner)]
+    groups = [_shift_group(entry, smap, room) for entry in smap['entries'][:4]]
+    keep, used = 0, 0
+    for group in groups[:1 if shut else len(groups)]:
+        if keep and budget and used + len(group) > budget:
+            break
+        keep, used = keep + 1, used + len(group)
+    rows = [row for group in groups[:keep] for row in group]
+    left = len(groups) - keep
+    if left:
+        more = f"+{left} more shift{'' if left == 1 else 's'}" + (' · click or m to expand' if shut else '')
+        rows.append((fit(more, room), False))
     return title, rows
+
+
+def shift_map_rows(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=None):
+    """The Shift Map as plain words, (title, rows of text): shift_map_marked without which rows are loud."""
+    title, rows = shift_map_marked(smap, messages_now, room, shut, budget)
+    return title, [text for text, _ in rows]
 
 
 def map_open(key):
@@ -2468,24 +2550,18 @@ def draw_payback(facts, cols, rows, cell, ground):
     return shrink(image)
 
 
-_MAP_PNG = {}  # (rev, entries_hash, stage, cols, rows, cell, ground) -> PNG bytes or None; the newest 24
-MAP_OPEN_ROWS = 9
-MAP_SHUT_ROWS = 3
-MAP_STEP_S = 0.18  # the draw-on's three steps, this far apart
-MAP_HOLD_S = 12.0  # the open map holds this long, then folds to MAP_SHUT_ROWS
+MAP_HOLD_S = 12.0  # a map that has just landed is open this long, then folds to its first shift
 MAP_FRESH_S = 30.0  # a map first seen younger than this is a new revision landing: it opens
-_KIND_RANK = {'regression': 0, 'risk': 1, 'shift': 2, 'decision': 3}
 
 
 class MapMotion:
-    """The Shift Map's arrival: it opens at MAP_OPEN_ROWS when a new revision lands, draws on in stages 1, 2 and 3
-    MAP_STEP_S apart, holds MAP_HOLD_S, then folds to MAP_SHUT_ROWS. Pure: the clock is the caller's `now`, nothing
-    here reads a file or the time. A map open by a click or the m key (pinned) or Claude mid-turn (busy) is never
-    folded under the reader; it folds on the first update after they let go."""
+    """The Shift Map's arrival: it opens when a new revision lands, holds MAP_HOLD_S, then folds to its first shift.
+    Pure: the clock is the caller's `now`, nothing here reads a file or the time. A map open by a click or the m key
+    (pinned) or Claude mid-turn (busy) is never folded under the reader; it folds on the first update after they let go."""
 
     def __init__(self):
         self.seen = None  # (rev, at) of the map last seen
-        self.arrival = None  # when that map's draw-on began; None once it has folded
+        self.arrival = None  # when that map landed; None once it has folded
 
     @staticmethod
     def hold_seconds():
@@ -2496,17 +2572,12 @@ class MapMotion:
             return MAP_HOLD_S
         return max(0.0, val) if val == val and val != float('inf') else MAP_HOLD_S
 
-    @staticmethod
-    def reduced_motion():
-        return (os.environ.get('CSR_REDUCED_MOTION', '').strip().lower() in ('1', 'true')
-                or bool(os.environ.get('NO_COLOR', '').strip()))
-
     def update(self, smap, now, pinned=False, busy=False):
-        """dict(stage 1-3, rows, animating, due): what to draw at `now`, and in how many seconds the state next
-        changes (None: not by itself). No map: rows 0."""
+        """dict(open, due): whether the map is open at `now`, and in how many seconds that next changes (None: not by
+        itself). No map: closed."""
         if not isinstance(smap, dict) or not smap.get('entries'):
             self.seen = self.arrival = None
-            return dict(stage=3, rows=0, animating=False, due=None)
+            return dict(open=False, due=None)
         now = float(now)
         at = smap.get('at')
         ident = (smap.get('rev'), at)
@@ -2518,458 +2589,14 @@ class MapMotion:
         hold = self.hold_seconds()
         if self.arrival is None or hold <= 0.0:
             self.arrival = None
-            return dict(stage=3, rows=MAP_OPEN_ROWS if pinned else MAP_SHUT_ROWS, animating=False, due=None)
+            return dict(open=bool(pinned), due=None)
         elapsed = max(0.0, now - self.arrival) + 1e-6  # a wake on the due time lands on it, not a float's width short
-        if self.reduced_motion() or elapsed >= 2 * MAP_STEP_S:
-            stage, step_due = 3, None
-        elif elapsed < MAP_STEP_S:
-            stage, step_due = 1, self.arrival + MAP_STEP_S
-        else:
-            stage, step_due = 2, self.arrival + 2 * MAP_STEP_S
-        end = self.arrival + hold
         if elapsed < hold:
-            nxt = step_due if step_due is not None and step_due < end else end
-            return dict(stage=stage, rows=MAP_OPEN_ROWS, animating=step_due is not None, due=max(0.0, nxt - now))
+            return dict(open=True, due=max(0.0, self.arrival + hold - now))
         if pinned or busy:
-            return dict(stage=3, rows=MAP_OPEN_ROWS, animating=False, due=None)
+            return dict(open=True, due=None)
         self.arrival = None
-        return dict(stage=3, rows=MAP_SHUT_ROWS, animating=False, due=None)
-
-
-def _elide_mid(text, max_chars):
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    left = (max_chars - 1) // 2
-    right = max_chars - 1 - left
-    return text[:left] + '…' + text[-right:]
-
-
-def _elide_tail(text, max_chars):
-    if len(text) <= max_chars:
-        return text
-    return text[:max(1, max_chars - 1)] + '…' if max_chars > 1 else text[:max_chars]
-
-
-def _part_key(part):
-    if not part or 'op' in part:
-        return None
-    return (part.get('scope') or '', part.get('sym') or '', part.get('mark') or '', part.get('tier') or 'model')
-
-
-def _shift_map_sig(smap):
-    entries = smap.get('entries')
-    if not isinstance(entries, list) or not entries:
-        return None
-    raw = json.dumps([
-        (
-            e.get('sig') or '',
-            e.get('kind') or '',
-            e.get('claim') or '',
-            bool(e.get('grounded')),
-            bool(e.get('moved')),
-            e.get('receipts') or [],
-            e.get('before') or [],
-            e.get('after') or [],
-        )
-        for e in entries[:4] if isinstance(e, dict)
-    ], sort_keys=True)
-    return (
-        int(smap.get('rev') or 1),
-        bool(smap.get('has_previous')),
-        str(smap.get('by') or 'Haiku'),
-        hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16],
-    )
-
-
-def story_map_png(smap, stage, cols, rows, cell, ground):
-    """The Shift Map in one figure (draw_story_map), cached across its three draw-on stages; None without Pillow,
-    when entries are empty or malformed, or on any exception."""
-    if not HAS_PIL or not isinstance(smap, dict):
-        return None
-    try:
-        sig = _shift_map_sig(smap)
-        if not sig or cols <= 0 or rows <= 0:
-            return None
-        stage = 1 if stage <= 1 else 2 if stage == 2 else 3
-        key = (sig[0], sig[1], sig[2], sig[3], stage, int(cols), int(rows), tuple(cell), tuple(ground[:3]))
-        if key not in _MAP_PNG:
-            try:
-                _MAP_PNG[key] = draw_story_map(smap, stage, cols, rows, cell, ground)
-            except Exception:
-                _MAP_PNG[key] = None
-            while len(_MAP_PNG) > 24:
-                _MAP_PNG.pop(next(iter(_MAP_PNG)))
-        return _MAP_PNG[key]
-    except Exception:
-        return None
-
-
-def draw_story_map(smap, stage, cols, rows, cell, ground):
-    from PIL import Image, ImageDraw
-    raw_entries = [e for e in (smap.get('entries') or ())[:4] if isinstance(e, dict)]
-    if not raw_entries:
-        return None
-    has_prev = bool(smap.get('has_previous'))
-    by = smap.get('by') or 'Haiku'
-    ordered = [
-        e for _, e in sorted(
-            enumerate(raw_entries),
-            key=lambda pair: (
-                not bool(pair[1].get('grounded')),
-                not (has_prev and bool(pair[1].get('moved'))),
-                _KIND_RANK.get(pair[1].get('kind'), 2),
-                pair[0],
-            ),
-        )
-    ]
-    shut = rows <= MAP_SHUT_ROWS
-    shown = ordered[:1] if shut else ordered[:4]
-    extra = max(0, len(ordered) - len(shown))
-    L = len(shown)
-
-    any_before = any(
-        any('op' not in p for p in (e.get('before') or ()))
-        for e in ordered
-    )
-
-    width, height = cols * cell[0] * SS, rows * cell[1] * SS
-    paper = tuple(ground[:3])
-    image = Image.new('RGB', (width, height), paper)
-    draw = ImageDraw.Draw(image, 'RGBA')
-
-    f_small = label_font(9 * SS)
-    f_sym = label_font(10 * SS, bold=True)
-    f_reg = label_font(10 * SS, bold=False)
-
-    head_h = (18 if shut else 22) * SS
-    foot_h = (16 * SS) if (shut and (any_before or extra > 0)) else 0
-    body_top = head_h
-    body_h = max(L * 16 * SS, height - head_h - foot_h)
-    lane_h = body_h // L
-    has_moved_any = has_prev and any(e.get('moved') for e in shown)
-
-    x_b0 = 8 * SS
-    x_a1 = width - 8 * SS
-    if any_before:
-        x_b1 = round(width * 0.44)
-        x_a0 = round(width * 0.50)
-        x_mid = (x_b1 + x_a0) // 2
-    else:
-        # After-only / receipts mode: one wide column. The card's own label says the kind ("changed"), so no KIND
-        # column repeats it and the claim gets the width.
-        x_b1 = x_b0
-        x_a0 = 4 * SS
-        x_mid = x_a0
-
-    def faded(rgb, entry):
-        if has_moved_any and not entry.get('moved'):
-            return blend(rgb[:3], paper, 0.25)
-        return rgb[:3]
-
-    def node_palette(part, entry):
-        grounded = bool(entry.get('grounded')) and part.get('tier') == 'verified'
-        mark = part.get('mark') or ''
-        kind = entry.get('kind') or 'shift'
-        if not grounded:
-            return faded(PIGMENT['pencil'], entry), paper, False
-        if mark == '+':
-            border, fill = INK['learn'], tint('memory', HEAD)
-        elif mark == '~':
-            border, fill = INK['ctx'], tint('story', HEAD)
-        elif mark in ('-', '!') or kind in ('risk', 'regression'):
-            border, fill = INK['turn'], tint('risk', HEAD)
-        elif kind == 'decision':
-            border, fill = INK['dream'], tint('dreams', ROW)
-        else:
-            border, fill = PIGMENT['pencil'], PIGMENT['rule']
-        return faded(border, entry), faded(fill, entry), True
-
-    def lane_ink(entry):
-        if not entry.get('grounded'):
-            return faded(PIGMENT['pencil'], entry)
-        after_ends = [p for p in (entry.get('after') or ()) if 'op' not in p]
-        before_ends = [p for p in (entry.get('before') or ()) if 'op' not in p]
-        marks = [p.get('mark') for p in after_ends + before_ends]
-        kind = entry.get('kind') or 'shift'
-        if '-' in marks or '!' in marks or kind in ('risk', 'regression'):
-            return faded(INK['turn'], entry)
-        if '+' in marks:
-            return faded(INK['learn'], entry)
-        if '~' in marks:
-            return faded(INK['ctx'], entry)
-        if kind == 'decision':
-            return faded(INK['dream'], entry)
-        return faded(INK['ctx'], entry)
-
-    def draw_card(box, part, entry, side_name, show_meta=False, ghost=False):
-        x0, y0, x1, y1 = box
-        if x1 - x0 < 12 * SS or y1 - y0 < 10 * SS:
-            return
-        border, fill, verified = node_palette(part, entry)
-        if ghost:
-            border = blend(border, paper, 0.55)
-            fill = paper
-        if verified:
-            draw.rectangle([x0, y0, x1, y1], fill=fill, outline=border, width=(SS if ghost else 2 * SS))
-        else:
-            c = min(6 * SS, (x1 - x0) // 5, (y1 - y0) // 4)
-            pts = [
-                (x0 + c, y0), (x1 - c, y0), (x1, y0 + c), (x1, y1 - c),
-                (x1 - c, y1), (x0 + c, y1), (x0, y1 - c), (x0, y0 + c), (x0 + c, y0),
-            ]
-            draw.polygon(pts[:-1], fill=fill)
-            dashed(draw, pts, border, SS, 4 * SS, 3 * SS)
-        if side_name == 'before' and part.get('mark') == '-':
-            draw.line([(x0 + 3 * SS, y1 - 3 * SS), (x1 - 3 * SS, y0 + 3 * SS)],
-                      fill=faded(PIGMENT['vermilion'], entry), width=SS)
-        if f_small is None:
-            return
-        avail_px = max(16 * SS, (x1 - x0) - 14 * SS)
-        max_chars = max(4, int(avail_px // (6 * SS)))
-        scope = part.get('scope') or ''
-        sym = part.get('sym')
-        mark = part.get('mark') or ''
-        word = SHIFT_WORDS.get(mark, '')
-        prefix = '' if verified else '? '
-        card_h = y1 - y0
-        ym = (y0 + y1) // 2
-
-        claim = (entry.get('claim') or '').strip() if (show_meta and stage >= 3 and not (shut and foot_h > 0)) else ''
-        ev_txt = ''
-        if show_meta and stage >= 3:
-            ev_budget = max(12, max_chars - 12)
-            ev_txt = _elide_tail(' · '.join(_shift_source(entry, by, ev_budget)), ev_budget)
-
-        kind_word = SHIFT_WORDS.get(entry.get('kind') or '', entry.get('kind') or '')
-        verb = word or (kind_word if (entry.get('kind') or '') in ('risk', 'regression', 'decision') else '')
-
-        def format_top_label(budget):
-            if not sym:
-                return _elide_tail(prefix + (verb or 'shift'), budget)
-            if not verb:
-                return _elide_mid(prefix + scope, budget)
-            head = prefix + verb
-            if (x1 - x0) < 130 * SS or budget < len(head) + 7:
-                return _elide_tail(head, budget)
-            full = f'{head} · {scope}'
-            if len(full) <= budget:
-                return full
-            stem = scope.rsplit('/', 1)[-1]
-            short = f'{head} · {stem}'
-            if len(short) <= budget:
-                return short
-            rem = budget - len(head) - 4
-            if rem >= 5:
-                return f'{head} · …{stem[-rem:]}'
-            return _elide_tail(head, budget)
-
-        main_raw = sym if sym else (prefix + scope if not verified else scope)
-
-        # 3-line rich card when tall enough (>= 44*SS) and showing inline claim
-        if card_h >= 44 * SS and claim:
-            y_top = y0 + 11 * SS
-            y_mid = (y0 + y1) // 2
-            y_bot = y1 - 11 * SS
-            left_budget = max(6, max_chars - len(ev_txt) - 2) if ev_txt else max_chars
-            top_left = format_top_label(left_budget)
-            top_col = faded(PIGMENT['graphite'] if sym else border, entry) if verified else faded(PIGMENT['pencil'], entry)
-            if ev_txt:
-                draw.text((x1 - 7 * SS, y_top), ev_txt, font=f_small,
-                          fill=faded(PIGMENT['payne'] if verified else PIGMENT['pencil'], entry), anchor='rm')
-            draw.text((x0 + 7 * SS, y_top), top_left, font=f_small, fill=top_col, anchor='lm')
-
-            main_txt = _elide_tail(main_raw, max_chars) if sym else _elide_mid(main_raw, max_chars)
-            main_font = (f_sym if (verified and f_sym and not ghost) else (f_reg or f_small))
-            main_col = faded(PIGMENT['lamp'] if (verified and not ghost) else PIGMENT['graphite'], entry)
-            draw.text((x0 + 7 * SS, y_mid), main_txt, font=main_font, fill=main_col, anchor='lm')
-
-            draw.text((x0 + 7 * SS, y_bot), _elide_tail(claim, max_chars),
-                      font=f_small, fill=faded(PIGMENT['graphite'] if verified else PIGMENT['pencil'], entry), anchor='lm')
-            return
-
-        # 2-line card (>= 26*SS): top = verb/scope (+ optional ev_txt), bottom = bold sym or file
-        if card_h >= 26 * SS:
-            y_top = ym - 6 * SS
-            y_bot = ym + 6 * SS
-            left_budget = max(6, max_chars - len(ev_txt) - 2) if ev_txt else max_chars
-            top_left = format_top_label(left_budget)
-            bot_txt = _elide_tail(main_raw, max_chars) if sym else _elide_mid(main_raw, max_chars)
-            top_col = (faded(PIGMENT['graphite'], entry) if (sym and f'·' in top_left) else border) if verified else faded(PIGMENT['pencil'], entry)
-            if ev_txt:
-                draw.text((x1 - 7 * SS, y_top), ev_txt, font=f_small,
-                          fill=faded(PIGMENT['payne'] if verified else PIGMENT['pencil'], entry), anchor='rm')
-            draw.text((x0 + 7 * SS, y_top), top_left, font=f_small, fill=top_col, anchor='lm')
-            draw.text((x0 + 7 * SS, y_bot), bot_txt,
-                      font=f_sym if (verified and f_sym and not ghost) else (f_reg or f_small),
-                      fill=faded(PIGMENT['lamp'] if (verified and not ghost) else PIGMENT['pencil'], entry), anchor='lm')
-            return
-
-        # Single-line compact fallback
-        s_txt = _elide_tail(prefix + (sym or scope), max_chars)
-        draw.text((x0 + 6 * SS, ym), s_txt,
-                  font=f_sym if (verified and f_sym and not ghost) else f_small,
-                  fill=faded(PIGMENT['lamp'] if verified else PIGMENT['pencil'], entry), anchor='lm')
-
-    def draw_connector(x0, x1, ym, op_part, entry):
-        op = (op_part or {}).get('op') or '->'
-        verified = bool(entry.get('grounded')) and (op_part or {}).get('tier') == 'verified'
-        col = lane_ink(entry) if verified else faded(PIGMENT['pencil'], entry)
-        if verified:
-            draw.line([(x0, ym), (x1 - 5 * SS, ym)], fill=col, width=2 * SS)
-            draw.polygon([(x1, ym), (x1 - 6 * SS, ym - 4 * SS), (x1 - 6 * SS, ym + 4 * SS)], fill=col)
-        else:
-            dashed(draw, [(x0, ym), (x1 - 4 * SS, ym)], col, max(SS, round(1.5 * SS)), 3 * SS, 4 * SS)
-            draw.line([(x1 - 5 * SS, ym - 3 * SS), (x1, ym), (x1 - 5 * SS, ym + 3 * SS)], fill=col, width=SS)
-        if op == '-x->':
-            mx = (x0 + x1) // 2
-            vcol = faded(PIGMENT['vermilion'], entry)
-            draw.line([(mx - 3 * SS, ym - 3 * SS), (mx + 3 * SS, ym + 3 * SS)], fill=vcol, width=2 * SS)
-            draw.line([(mx - 3 * SS, ym + 3 * SS), (mx + 3 * SS, ym - 3 * SS)], fill=vcol, width=2 * SS)
-
-    # Header strip & vertical spine
-    if f_small is not None:
-        hy = head_h // 2
-        if any_before:
-            draw.text((x_b0 + 4 * SS, hy), 'BEFORE', font=f_small, fill=PIGMENT['graphite'], anchor='lm')
-            if stage >= 2:
-                draw.text((x_mid, hy), '>', font=f_small, fill=PIGMENT['graphite'], anchor='mm')
-                draw.text((x_a0 + 4 * SS, hy), 'AFTER', font=f_small, fill=PIGMENT['graphite'], anchor='lm')
-        else:
-            draw.text((x_a0 + 6 * SS, hy), 'SHIFTED IN THIS SESSION', font=f_small, fill=PIGMENT['graphite'], anchor='lm')
-    draw.line([(x_b0, head_h - SS), (x_a1, head_h - SS)], fill=PIGMENT['rule'], width=SS)
-    if any_before:
-        draw.line([(x_mid, body_top), (x_mid, body_top + body_h)], fill=PIGMENT['rule'], width=SS)
-
-    def side_slots(side_list, zx0, zx1):
-        ends = [p for p in (side_list or ()) if 'op' not in p][:2]
-        ops = [p for p in (side_list or ()) if 'op' in p]
-        zw = zx1 - zx0
-        if not ends:
-            return [], None
-        if len(ends) == 1:
-            return [(zx0 + 6 * SS, zx1 - 6 * SS, ends[0])], None
-        arrow_w = 24 * SS
-        cw = (zw - 12 * SS - arrow_w) // 2
-        c0_x0, c0_x1 = zx0 + 6 * SS, zx0 + 6 * SS + cw
-        c1_x0, c1_x1 = c0_x1 + arrow_w, zx1 - 6 * SS
-        op_part = ops[0] if ops else dict(op='->', tier=ends[0].get('tier', 'model'))
-        return [(c0_x0, c0_x1, ends[0]), (c1_x0, c1_x1, ends[1])], (c0_x1 + 2 * SS, c1_x0 - 2 * SS, op_part)
-
-    lanes_b = [side_slots(e.get('before'), x_b0, x_b1) for e in shown]
-    lanes_a = [side_slots(e.get('after'), x_a0, x_a1) for e in shown]
-
-    cap_pad = (16 * SS) if (any_before and not shut) else (4 * SS)
-
-    def draw_side_column(lanes_slots, side_name, ghost=False):
-        skip = set()
-        for i, entry in enumerate(shown):
-            cards, conn = lanes_slots[i]
-            ly0 = body_top + i * lane_h
-            ly1 = ly0 + lane_h
-            cy0, cy1 = ly0 + 4 * SS, max(ly0 + 16 * SS, ly1 - cap_pad)
-            ym = (cy0 + cy1) // 2
-            if not cards:
-                if side_name == 'before' and not any_before:
-                    continue
-                else:
-                    zx0, zx1 = (x_b0, x_b1) if side_name == 'before' else (x_a0, x_a1)
-                    mx = (zx0 + zx1) // 2
-                    draw.line([(zx0 + 12 * SS, ym), (zx1 - 12 * SS, ym)], fill=PIGMENT['rule'], width=SS)
-                    if f_small is not None and side_name == 'before':
-                        lbl = 'no prior link'
-                        lw = int(draw.textlength(lbl, font=f_small)) + 12 * SS
-                        draw.rectangle([mx - lw // 2, ym - 7 * SS, mx + lw // 2, ym + 7 * SS], fill=paper)
-                        draw.text((mx, ym), lbl, font=f_small, fill=faded(PIGMENT['pencil'], entry), anchor='mm')
-                continue
-            for s_idx, (cx0, cx1, part) in enumerate(cards):
-                if (i, s_idx) in skip:
-                    continue
-                k = i
-                pkey = _part_key(part)
-                while k + 1 < L:
-                    nxt_cards = lanes_slots[k + 1][0]
-                    if len(nxt_cards) == len(cards) and s_idx < len(nxt_cards):
-                        n_cx0, n_cx1, n_part = nxt_cards[s_idx]
-                        if (n_cx0, n_cx1) == (cx0, cx1) and _part_key(n_part) == pkey and pkey is not None:
-                            skip.add((k + 1, s_idx))
-                            k += 1
-                            continue
-                    break
-                end_ly1 = body_top + (k + 1) * lane_h
-                end_cy1 = max(cy0 + 12 * SS, end_ly1 - cap_pad)
-                inline_meta = (not any_before and side_name == 'after' and len(cards) == 1 and k == i)
-                draw_card((cx0, cy0, cx1, end_cy1), part, entry, side_name, show_meta=inline_meta, ghost=ghost)
-            if conn is not None and stage >= 3:
-                ax0, ax1, op_part = conn
-                draw_connector(ax0, ax1, ym, op_part, entry)
-
-    # Stage 1: BEFORE column (or the ghosted AFTER outlines when after-only)
-    if any_before:
-        draw_side_column(lanes_b, 'before')
-    elif stage == 1:
-        draw_side_column(lanes_a, 'after', ghost=True)
-
-    # Stage 2: centre chevrons + full AFTER column
-    if stage >= 2:
-        for i, entry in enumerate(shown if any_before else ()):
-            ly0 = body_top + i * lane_h
-            cy0 = ly0 + 4 * SS
-            cy1 = max(ly0 + 16 * SS, ly0 + lane_h - cap_pad)
-            ym = (cy0 + cy1) // 2
-            draw.rectangle([x_mid - 8 * SS, ym - 7 * SS, x_mid + 8 * SS, ym + 7 * SS], fill=paper)
-            c_ink = lane_ink(entry)
-            ch = 5 * SS
-            draw.line([(x_mid - 3 * SS, ym - ch), (x_mid + 3 * SS, ym), (x_mid - 3 * SS, ym + ch)],
-                      fill=c_ink, width=2 * SS)
-        draw_side_column(lanes_a, 'after')
-
-    # Stage 3: ochre moved bars + full-lane captions (when any_before) + shut footer summary
-    if stage >= 3:
-        for i, entry in enumerate(shown):
-            ly0 = body_top + i * lane_h
-            ly1 = ly0 + lane_h
-            if has_prev and entry.get('moved'):
-                draw.rectangle([2 * SS, ly0 + 4 * SS, 5 * SS, ly1 - 4 * SS], fill=PIGMENT['ochre'])
-            if any_before and not shut and f_small is not None:
-                cap_y = ly1 - 8 * SS
-                draw.rectangle([x_mid - 6 * SS, cap_y - 6 * SS, x_mid + 6 * SS, cap_y + 6 * SS], fill=paper)
-                avail_cap_px = (x_a1 - 6 * SS) - (x_b0 + 6 * SS)
-                total_chars = max(24, int(avail_cap_px // (6 * SS)))
-                ev_parts = _shift_source(entry, by, 64)
-                ev_txt = ' · '.join(ev_parts)
-                if len(ev_txt) > total_chars - 14 and len(ev_parts) > 1:
-                    ev_txt = ev_parts[-1]
-                ev_col = faded(PIGMENT['payne'] if entry.get('grounded') else PIGMENT['pencil'], entry)
-                ev_px = int(draw.textlength(ev_txt, font=f_small)) if ev_txt else 0
-                if ev_txt:
-                    draw.text((x_a1 - 6 * SS, cap_y), ev_txt, font=f_small, fill=ev_col, anchor='rm')
-                claim = (entry.get('claim') or '').strip()
-                if claim:
-                    c_px = max(60 * SS, avail_cap_px - ev_px - 14 * SS)
-                    c_budget = max(10, int(c_px // (6 * SS)))
-                    draw.text((x_b0 + 6 * SS, cap_y), _elide_tail(claim, c_budget),
-                              font=f_small, fill=faded(PIGMENT['graphite'] if entry.get('grounded') else PIGMENT['pencil'], entry), anchor='lm')
-        if shut and foot_h > 0 and f_small is not None:
-            e0 = shown[0]
-            claim0 = (e0.get('claim') or '').strip()
-            more_txt = f'+{extra} more shift' + ('' if extra == 1 else 's') + ' · click or m to expand' if extra > 0 else ''
-            fy = height - foot_h // 2
-            lx = (x_b0 + 6 * SS) if any_before else (x_a0 + 6 * SS)
-            if more_txt:
-                draw.text((x_a1 - 6 * SS, fy), more_txt, font=f_small, fill=PIGMENT['graphite'], anchor='rm')
-            elif any_before:
-                ev_s = _elide_tail(' · '.join(_shift_source(e0, by, 28)), 28)
-                draw.text((x_a1 - 6 * SS, fy), ev_s, font=f_small,
-                          fill=PIGMENT['payne'] if e0.get('grounded') else PIGMENT['pencil'], anchor='rm')
-            if claim0:
-                right_used = (len(more_txt) + 3) if more_txt else (30 if any_before else 0)
-                c_room = max(16, int(((x_a1 - lx) // (6 * SS)) - right_used))
-                draw.text((lx, fy), _elide_tail(claim0, c_room),
-                          font=f_small, fill=PIGMENT['graphite'], anchor='lm')
-
-    return shrink(image)
+        return dict(open=False, due=None)
 
 
 _CONTEXT_PNG = {}  # the i page's context figure: its key -> PNG bytes or None; the newest 2
@@ -4546,18 +4173,17 @@ def page_main(data, s, now, ui=None):
         told.append(dict(key='story', like=f"story:{s.get('id')}:{story['rev']}", title=story['now'], open_title=story['text'], lines=6 * more, open_lines=30, detail=[],
                          send=closed_send(f"CSR's story of this session, rev {story['rev']}, quoted:", story['text'], STORY_SEND_MOST)))
     if story_map:
-        built_shifts = fail_open(shift_map_rows, None, story_map, (s or {}).get('messages'))
+        cols, tall = (ui or {}).get('cols'), (ui or {}).get('rows')
+        room = max(24, cols - 1) - gutter(ui) if isinstance(cols, int) else SHIFT_ROOM  # the width the rows are laid in
+        shut = (data.get('map_view') or {}).get('open') is False and not map_open((ui or {}).get('open'))  # MapMotion folded it, and no click holds it open
+        budget = max(8, tall // 2) if isinstance(tall, int) else None  # the open map never takes more than half the pane
+        built_shifts = fail_open(shift_map_marked, None, story_map, (s or {}).get('messages'), room, shut, budget)
         if built_shifts and built_shifts[1]:
-            map_title, map_rows = built_shifts
-            view = data.get('map_view') or {}  # the pane's MapMotion: which draw-on stage, and how many rows
-            stage = view.get('stage') if view.get('stage') in (1, 2, 3) else 3
-            rows_now = view.get('rows') if isinstance(view.get('rows'), int) and view['rows'] > 0 else MAP_SHUT_ROWS
-            drawn = dict(
-                picture=dict(kind='shiftmap', rows=rows_now, facts=(story_map, stage), fallback=map_rows),
-                open_picture=dict(kind='shiftmap', rows=MAP_OPEN_ROWS, facts=(story_map, 3), fallback=map_rows),
-            ) if PIXELS else {}
+            map_title, marked = built_shifts
+            map_rows = [text for text, _ in marked]
             told.append(dict(key='shifts', title=map_title, lines=1, open_lines=1, body=map_rows, fit_body=True,
-                             quiet=True, unrated=True, detail=[], send='', nosend=True, hint=SHIFT_HINT, **drawn))
+                             body_loud=[k for k, (_, loud) in enumerate(marked) if loud],
+                             quiet=True, unrated=True, detail=[], send='', nosend=True, hint=SHIFT_HINT))
             if map_open((ui or {}).get('open')):  # opened: each checked entry takes a like, and a click on it is an expand
                 for entry in story_map['entries'][:4]:
                     if entry.get('sig') and entry.get('grounded'):
@@ -4972,9 +4598,9 @@ def item_rows(item, name, width, is_open, at=ITEM, heart=None):
         rows += [' ' * at + PIC] * picture['rows']
     elif picture and room >= 8 and picture.get('kind', 'last') == 'last':  # the last session's series in block
         rows.append(' ' * at + ink('ctx') + last_sparkline(picture['facts'], room) + OFF)  # characters; a payback, its text rows alone
-    for k, text in enumerate(() if drawn and picture.get('kind') == 'shiftmap' else item.get('body') or ()):  # the map's picture says its words
+    for k, text in enumerate(item.get('body') or ()):
         if item.get('fit_body'):
-            rows.append(' ' * at + ink('quiet') + fit_pieces(text, room) + OFF)
+            rows.append(' ' * at + ink('you' if k in item.get('body_loud', ()) else 'quiet') + fit_pieces(text, room) + OFF)
             continue
         voice = ink('you' if k < item.get('loud', 0) else 'quiet') + (BOLD if k == 0 and not item.get('plain_body') else '')
         rows += [' ' * at + voice + line + OFF for line in wrap(text, room, 1 if k == 0 else 2)]
@@ -5015,33 +4641,10 @@ def answer_rows(item, width, ui):
     return rows
 
 
-def shrink_picture(item, shrunk):
-    """The item with its pictures no taller than shrunk says for its key (the Shift Map on a short pane)."""
-    cap = shrunk.get(item['key'])
-    if not cap:
-        return item
-    fit = {name: dict(item[name], rows=min(item[name]['rows'], cap)) for name in ('picture', 'open_picture') if item.get(name)}
-    return dict(item, **fit)
-
-
 def page_lines(page, width, rows, ui):
     """The page in the terminal's type on paper: its facts and the session's gauges, then each section
     with something to report, its rows in its own tint (every other one a shade deeper), a strip of paper
-    between. Every section keeps its heading and first row; the room left goes to the earlier ones first.
-    The Shift Map's picture is laid at the largest height the pane has room for, from its own down to
-    MAP_SHUT_ROWS: it is never dropped, and never cut, while a row fewer would fit."""
-    shrunk = {}
-    while True:
-        out = lay_page(page, width, rows, ui, shrunk)
-        cut = {key: tall for key, tall in out.short.items() if tall > MAP_SHUT_ROWS}
-        if not cut:
-            return out
-        shrunk.update({key: tall - 1 for key, tall in cut.items()})
-
-
-def lay_page(page, width, rows, ui, shrunk):
-    """page_lines at the picture heights in shrunk; out.short names the Shift Map pictures that did not fit,
-    key -> the rows they were laid at."""
+    between. Every section keeps its heading and first row; the room left goes to the earlier ones first."""
     head, s = page['head'], page['head'].get('session')
     label = '\x1b[38;2;%d;%d;%dm' % ON_DARK['label']
     lanes = None
@@ -5064,7 +4667,6 @@ def lay_page(page, width, rows, ui, shrunk):
     out = Lines([on_dark(line, ground) for line, ground in zip(top, grounds)])
     out.acts.update({row: dict(key='view:info') for row in range(min(MASTHEAD_CLICK, len(top)))})
     out.grounds = grounds  # the vertical tape takes them beside the masthead
-    out.short = {}  # a Shift Map picture the room dropped or cut: its key -> the rows it was laid at
     out.heads, out.wanted = [], []  # wanted: (first row, rows, picture, ground) of each picture to lay over blank rows
     out.lanes = None if lanes is None else (lanes, grounds[lanes:lanes + 3])  # the gauges' row, their grounds
     built = []
@@ -5072,7 +4674,6 @@ def lay_page(page, width, rows, ui, shrunk):
     for section in page['sections']:
         blocks = []
         for item in section['items']:
-            item = shrink_picture(item, shrunk)
             is_open = item_open(item, ui)
             heart = likes.get(like_key(item), False) if likes is not None and likeable(item, section['name']) else None
             rows_ = item_rows(item, section['name'], width, is_open, at, heart)
@@ -5097,11 +4698,6 @@ def lay_page(page, width, rows, ui, shrunk):
         part = Lines([heading(name, section['title'], [section['right']] + list(section.get('rights') or ()), width, at,
                               section.get('life'))])
         fit_blocks(part, blocks, room - 1, ui, tail=False)
-        laid = {act.get('key') for act in part.acts.values() if act}
-        for _, item in blocks:
-            tall = (item_picture(item, ui.get('open') == item['key']) or {})
-            if tall.get('kind') == 'shiftmap' and item['key'] not in laid:
-                out.short[item['key']] = tall['rows']
         for i, line in enumerate(part):  # the heart's row: a click on its last cells likes the item
             if HEART_MARK in line and part.acts.get(i):
                 part.acts[i] = dict(part.acts[i], heart=(width - 3, width + 1), source=name)
@@ -5129,19 +4725,8 @@ def lay_page(page, width, rows, ui, shrunk):
             picture = item_picture(act, item_open(act, ui) if act else False)
             if picture and picture['rows'] == j - i + 1:
                 out.wanted.append((start + i, j - i + 1, picture, shade[i]))
-            elif picture and picture.get('kind') == 'shiftmap':  # the room cut the picture: its words, not blank rows
-                out.short[act['key']] = picture['rows']
-                for k, text in enumerate(shift_text_rows(picture, j - i + 1, width, at, shade[i])):
-                    out[start + i + k] = text
             i = j + 1
     return out
-
-
-def shift_text_rows(picture, run, width, at, ground):
-    """The Shift Map as the P1 words on `run` rows, for where its picture cannot be drawn."""
-    back = '\x1b[48;2;%d;%d;%dm' % tuple(ground[:3])
-    return [tinted(' ' * at + ink('quiet') + fit_pieces(text, width - at) + OFF, back)
-            for text in (picture.get('fallback') or ())[:run]]
 
 
 def draw_page(page, cols, rows, ui):
@@ -5167,19 +4752,8 @@ def draw_page(page, cols, rows, ui):
             pictures += [(row, 0, ICON[0], ICON[1], iso_png(name, cell, backs))
                          for row, name, backs in lines.heads if row + ICON[1] <= rows - 1]
         for row, run, picture, ground in getattr(lines, 'wanted', ()):
-            kind = picture.get('kind')
-            if kind == 'shiftmap':
-                smap, stage = picture['facts']
-                for frame in (1, 2, 3):  # every draw-on step is made before the first is shown: later ones are lookups
-                    story_map_png(smap, frame, width - at, run, cell, ground)
-                story_map_png(smap, 3, width - at, MAP_SHUT_ROWS, cell, ground)  # and the fold's
-                png = story_map_png(smap, stage, width - at, run, cell, ground)
-                if not png:  # no picture is better than blank rows: the words take the rows
-                    for k, text in enumerate(shift_text_rows(picture, run, width, at, ground)):
-                        lines[row + k] = text
-            else:
-                draw = payback_png if kind == 'payback' else last_png
-                png = draw(picture['facts'], width - at, run, cell, ground)
+            draw = payback_png if picture.get('kind') == 'payback' else last_png
+            png = draw(picture['facts'], width - at, run, cell, ground)
             if png:
                 pictures.append((row, at, width - at, run, png))
     return lines, pictures
@@ -5192,7 +4766,7 @@ def draw_main(data, s, cols, rows, now, ui=None, hold=None, hold_quiet=None, fee
     if s is None:
         s = dict(id=None, title=None, prompts=[], replies=[], compacts=[], gave=dict(recalls=[], carried=[], dreams=[]),
                  remembered=[], sessions=0, project=None, files={}, edited=[], shell={}, last={})
-    page = with_compacting(page_main(data, s, now, ui), data)
+    page = with_compacting(page_main(data, s, now, dict(ui or {}, cols=cols)), data)
     if default_view(page, s):
         page = page_default(page, data, s, now, (ui or {}).get('rows', rows))
     if feed is not None and hold is None:
@@ -7429,14 +7003,12 @@ def map_key(pane, keys='m'):
 
 
 def map_wait(pane, now):
-    """(seconds for watch()'s select to wait, whether to draw a frame now): MAP_STEP_S and a frame while the Shift
-    Map draws on; the time left to its next change (at most a second) otherwise; a second when it is at rest."""
-    if getattr(pane, 'animating', False):
-        return MAP_STEP_S, True
+    """(seconds for watch()'s select to wait, whether to draw a frame now): a frame once the Shift Map's hold is up
+    and it folds; the time left to that (at most a second) before; a second when the map is at rest."""
     due = getattr(pane, 'map_due', None)
     if isinstance(due, (int, float)) and not isinstance(due, bool):
         if due <= now:
-            return MAP_STEP_S, True
+            return 0.05, True
         return max(0.05, min(1.0, due - now)), False
     return 1.0, False
 
@@ -7541,8 +7113,8 @@ class Pane:
         self.foot = None  # (on a phone, in column mode): what the legend row was last drawn for
         self.feed = Feed(session_id) if session_id else None  # the main page's order, Earlier, what is new
         self.spend = Spend()  # this machine's spend in the plan's week, read from the transcripts a little at a time
-        self.map_motion = MapMotion()  # the Shift Map's arrival, draw-on and fold
-        self.map_due, self.animating = None, False  # when it next changes, and whether it is drawing on now
+        self.map_motion = MapMotion()  # the Shift Map's arrival and fold
+        self.map_due = None  # when the Shift Map next folds
         self.refresh = None  # the csr-engine process of a refresh the pane started, until it ends
         self.refresh_from = None  # the map_stamp of the Shift Map when that refresh started
         self.refresh_note = None  # (words, until): what a refresh that ended with nothing new says, for a while
@@ -7623,10 +7195,9 @@ class Pane:
             self.answered = None
         motion = getattr(self, 'map_motion', None) or MapMotion()
         self.map_motion = motion
-        mstate = fail_open(motion.update, dict(stage=3, rows=MAP_SHUT_ROWS, animating=False, due=None),
+        mstate = fail_open(motion.update, dict(open=False, due=None),
                            self.data.get('story_map'), now, map_open(self.open), bool(s and s.get('busy')))
-        self.data['map_view'] = dict(stage=mstate['stage'], rows=mstate['rows']) if self.data.get('story_map') else None
-        self.animating = bool(mstate.get('animating'))
+        self.data['map_view'] = dict(open=mstate['open']) if self.data.get('story_map') else None
         self.map_due = now + mstate['due'] if mstate.get('due') is not None else None
         ui = dict(open=self.open, sent=self.sent, answered=self.answered, folds=self.folds, rows=rows, phone=phone,
                   column=column, likes={key: liked for key, (liked, _) in self.data['likes'].items()})
@@ -8619,7 +8190,7 @@ def watch(root, limit, session_id, agent=None):
                 redraw['now'] = True
             seen = now_seen
             redraw['now'] = redraw['now'] or bool(fail_open(compaction_gone, False, pane))  # a compaction ended: draw it now
-            redraw['now'] = redraw['now'] or fail_open(map_wait, (1.0, False), pane, time.time())[1]  # the map draws on or folds
+            redraw['now'] = redraw['now'] or fail_open(map_wait, (1.0, False), pane, time.time())[1]  # the map folds
             failing = boundary.failures > 0  # then a frame is tried when its retry is due, or at a key
             if (boundary.ready() or pressed) if failing else (redraw['now'] or time.time() - last > 2):
                 if not boundary.run(pane.frame, redraw['now'] or failing):
@@ -8779,17 +8350,6 @@ def main():
             open(os.path.join(args.png, 'session.png'), 'wb').write(session_png(s, 40, cell, now))
             lines, pictures = draw_main(data, s, 46, 30, now)
             open(os.path.join(args.png, 'screen.txt'), 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
-            if data.get('story_map'):
-                smap_ground = tint('story', ROW)
-                for fname, stg, rws in (
-                    ('story_map_open.png', 3, MAP_OPEN_ROWS),
-                    ('story_map_shut.png', 3, MAP_SHUT_ROWS),
-                    ('story_map_stage1.png', 1, MAP_OPEN_ROWS),
-                    ('story_map_stage2.png', 2, MAP_OPEN_ROWS),
-                ):
-                    mpng = story_map_png(data['story_map'], stg, 40, rws, cell, smap_ground)
-                    if mpng:
-                        open(os.path.join(args.png, fname), 'wb').write(mpng)
             if s.get('last_session'):
                 png = last_png(s['last_session'], 43, 3, cell, tint('last', ROW))
                 if png:

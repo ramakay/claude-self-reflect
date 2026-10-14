@@ -27,6 +27,12 @@ pub struct GroundedShift {
     pub moved: bool,
     pub liked: bool,
     pub claim: String,
+    /// How it worked before / works now, one plain sentence each (5-field lines only).
+    /// Absent from the JSON of a map written from a 4-field line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub was: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
     pub receipts: Vec<String>,
     pub before: Vec<Part>,
     pub after: Vec<Part>,
@@ -104,6 +110,8 @@ fn ungrounded_fallback(project: &str, entry: &ShiftEntry) -> GroundedShift {
         moved: false,
         liked: false,
         claim: entry.claim.clone(),
+        was: entry.was.clone(),
+        now: entry.now.clone(),
         receipts: Vec::new(),
         before: side_to_unverified_parts(&entry.before),
         after: side_to_unverified_parts(&entry.after),
@@ -167,6 +175,8 @@ fn ground_with_conn(
             moved: false,
             liked: false,
             claim: entry.claim.clone(),
+            was: entry.was.clone(),
+            now: entry.now.clone(),
             receipts,
             before: before_eval.parts,
             after: after_eval.parts,
@@ -707,6 +717,33 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn was_and_now_ride_through_grounding_with_the_shift() {
+        let storage = Storage::open_memory().unwrap();
+        seed_evo(
+            &storage,
+            "evo_abcd1234_1760400",
+            "c1",
+            "/repo/docs/architecture.md",
+            "text",
+            "[]",
+            "[]",
+        );
+        let five =
+            parse1("shift|-|docs/architecture.md~|The old way was slow.|The new way is fast.");
+        let four = parse1("risk|-|docs/architecture.md~|A four-field claim");
+        let got = ground_shifts(&storage, "csr", "c1", &[five.clone(), four.clone()]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].was.as_deref(), Some("The old way was slow."));
+        assert_eq!(got[0].now.as_deref(), Some("The new way is fast."));
+        assert_eq!(got[0].claim, "The new way is fast.");
+        assert_eq!((got[1].was.clone(), got[1].now.clone()), (None, None));
+        // The fail-open path keeps them too.
+        let fallback = ungrounded_fallback("csr", &five);
+        assert_eq!(fallback.was, five.was);
+        assert_eq!(fallback.now, five.now);
     }
 
     fn seed_node(

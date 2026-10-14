@@ -7,12 +7,21 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-const MAX_BLOCK_BYTES: usize = 900;
-const MAX_LINE_BYTES: usize = 300;
+// Sized for four full 5-field lines (`kind|before|after|was|now`). A line is at most
+// 10 (kind) + 138 (two sides at the longest measured, 69 each) + 160 (was and now at 80
+// chars) + 4 pipes = 312 bytes, 313 with its newline; four of them are 1252, so the block
+// cap is 1280. The line cap keeps the old 4-field line's headroom over its sides (300 held
+// a 72-char claim, so sides could be 215) and swaps the claim for two sentences:
+// 300 - 72 + 80 + 80 + 1 = 389, rounded to 400.
+const MAX_BLOCK_BYTES: usize = 1280;
+const MAX_LINE_BYTES: usize = 400;
 const MAX_ENTRIES: usize = 4;
 const MAX_SCOPE_CHARS: usize = 48;
 const MAX_SYM_CHARS: usize = 40;
 const MAX_CLAIM_CHARS: usize = 72;
+/// A `was` or `now` sentence: at most this many characters and words.
+const MAX_SENTENCE_CHARS: usize = 80;
+const MAX_SENTENCE_WORDS: usize = 12;
 
 pub mod derive;
 pub mod ground;
@@ -131,13 +140,21 @@ impl Side {
     }
 }
 
-/// A parsed `@shifts` line: `kind|before|after|claim`.
+/// A parsed `@shifts` line: `kind|before|after|was|now`, or the older
+/// `kind|before|after|claim`.
+///
+/// `was` is how the thing worked before the change (`None` when the line said `-`, the
+/// thing is new, and for every 4-field line); `now` is how it works now (`None` only for
+/// a 4-field line). `claim` is `now` for a 5-field line and the line's own claim for a
+/// 4-field one, so everything that reads `claim` keeps working.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShiftEntry {
     pub kind: ShiftKind,
     pub before: Option<Side>,
     pub after: Option<Side>,
     pub claim: String,
+    pub was: Option<String>,
+    pub now: Option<String>,
 }
 
 impl ShiftEntry {
@@ -229,30 +246,87 @@ fn parse_side(raw: &str) -> Result<Option<Side>, ()> {
     }
 }
 
-/// Parses a single pipe-delimited shift line (`kind|before|after|claim`).
+/// Words a cut sentence must not end on: a sentence that stops after one reads as broken.
+const DANGLING_WORDS: [&str; 17] = [
+    "a", "an", "the", "of", "to", "in", "on", "at", "and", "or", "with", "by", "for", "from", "as",
+    "that", "is",
+];
+
+/// One `was`/`now` sentence: plain printable ASCII, whitespace collapsed, cut at a word
+/// boundary to `MAX_SENTENCE_WORDS` words and `MAX_SENTENCE_CHARS` characters (never
+/// mid-word, never ending on a dangling article or preposition). `None` when it is empty,
+/// not printable ASCII, or the model's `-` placeholder.
+fn parse_sentence(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "-" || !raw.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return None;
+    }
+    let mut words: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for word in raw.split_whitespace() {
+        let next = used + word.len() + usize::from(!words.is_empty());
+        if words.len() >= MAX_SENTENCE_WORDS || next > MAX_SENTENCE_CHARS {
+            while let Some(last) = words.last() {
+                let bare = last.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                if DANGLING_WORDS.contains(&bare.to_ascii_lowercase().as_str()) {
+                    words.pop();
+                } else {
+                    break;
+                }
+            }
+            break;
+        }
+        words.push(word);
+        used = next;
+    }
+    let sentence = words.join(" ");
+    let sentence = sentence.trim_end_matches([',', ';', ':']).to_string();
+    (!sentence.is_empty()).then_some(sentence)
+}
+
+/// Parses a single pipe-delimited shift line: `kind|before|after|was|now`, or the older
+/// `kind|before|after|claim`.
 ///
-/// Extra `|` characters inside `claim` make the line invalid and return `None`.
+/// `was` is `-` for a thing that is new. A sentence over 80 characters or 12 words is cut
+/// at a word boundary. A pipe inside a 4-field claim makes it a 5-field line; a sixth
+/// field makes the line invalid.
 pub fn parse_shift_line(line: &str) -> Option<ShiftEntry> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.len() > MAX_LINE_BYTES {
         return None;
     }
-    let mut parts = trimmed.splitn(4, '|');
+    let mut parts = trimmed.splitn(5, '|');
     let kind = ShiftKind::parse(parts.next()?)?;
     let before = parse_side(parts.next()?).ok()?;
     let after = parse_side(parts.next()?).ok()?;
-    let raw_claim = parts.next()?.trim();
+    let fourth = parts.next()?.trim();
+    let fifth = parts.next().map(str::trim);
 
     if before.is_none() && after.is_none() {
         return None;
     }
-    if raw_claim.is_empty()
-        || raw_claim.contains('|')
-        || !raw_claim.bytes().all(|b| (0x20..=0x7E).contains(&b))
-    {
+    if let Some(now_raw) = fifth {
+        if fourth.is_empty() || now_raw.contains('|') {
+            return None;
+        }
+        let was = parse_sentence(fourth);
+        if was.is_none() && fourth != "-" {
+            return None;
+        }
+        let now = parse_sentence(now_raw)?;
+        return Some(ShiftEntry {
+            kind,
+            before,
+            after,
+            claim: now.clone(),
+            was,
+            now: Some(now),
+        });
+    }
+    if fourth.is_empty() || !fourth.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
         return None;
     }
-    let claim_cut: String = raw_claim.chars().take(MAX_CLAIM_CHARS).collect();
+    let claim_cut: String = fourth.chars().take(MAX_CLAIM_CHARS).collect();
     let claim = claim_cut.trim_end().to_string();
     if claim.is_empty() {
         return None;
@@ -262,6 +336,8 @@ pub fn parse_shift_line(line: &str) -> Option<ShiftEntry> {
         before,
         after,
         claim,
+        was: None,
+        now: None,
     })
 }
 
@@ -278,7 +354,7 @@ fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
 
 /// Parses the lines following an `@shifts` sentinel.
 ///
-/// When `cut_off` is true or the 900-byte block cap cuts a non-whitespace tail,
+/// When `cut_off` is true or the block cap (`MAX_BLOCK_BYTES`) cuts a non-whitespace tail,
 /// the last non-empty line is dropped. Keeps at most 4 unique `(kind, before, after)` entries.
 pub fn parse_shifts_block(block: &str, cut_off: bool) -> Vec<ShiftEntry> {
     let cap = floor_char_boundary(block, MAX_BLOCK_BYTES);
@@ -360,22 +436,28 @@ pub fn sig(project: &str, entry: &ShiftEntry) -> String {
     s
 }
 
-pub const RAW_CAP_WITH_MAP: usize = 1600;
+/// The story prose is at most 800 characters (the compaction prompt asks for under 800), then
+/// the `@shifts` line and a block of four full 5-field lines (`MAX_BLOCK_BYTES`, 1280):
+/// 800 + 9 + 1280 = 2089, rounded to 2100. Was 1600, which held the 900-byte block only
+/// after a prose of 700.
+pub const RAW_CAP_WITH_MAP: usize = 2100;
 pub const STORY_PROSE_CAP: usize = 1000;
 
 /// Prompt continuation appended after the story prose instruction when the
 /// Shift Map is enabled (`!story_map_disabled()`).
 pub fn shifts_instruction() -> &'static str {
-    "After the prose, if the session changed code, add a newline, the line `@shifts`, and 1 to 4 lines in this exact 4-field pipe format:\n\
-kind|before|after|claim\n\
+    "After the prose, if the session changed code, add a newline, the line `@shifts`, and 1 to 4 lines in this exact 5-field pipe format:\n\
+kind|before|after|was|now\n\
 - kind: shift | risk | decision | regression\n\
 - before, after: `-` if empty, or `file[:symbol][mark]` optionally joined to a second endpoint by ` -> `, ` ~> `, or ` -x-> ` (marks: `+` added, `~` changed, `-` removed, `!` risk). Use only real file or symbol names from the session.\n\
-- claim: plain ASCII summary <= 72 chars, no `|`.\n\
+- was: one sentence on how it worked before the change, or `-` if the thing is new.\n\
+- now: one sentence on how it works now.\n\
+Write was and now in Simplified Technical English: plain ASCII, no `|`, at most 80 characters and 12 words each, present tense, active voice, one fact per sentence, short common words. Name only real files or symbols from the session. Never write \"it\" or \"this\" for the thing: name it.\n\
 Put `@shifts` last. Write no `@shifts` block if no code changed.\n\
 Example:\n\
 @shifts\n\
-shift|summarizer.rs:store_story~ -> reflections-|summarizer.rs:store_story~ -> reflections:narrative_shift+|Keep prior shift reflections on story rewrite\n\
-decision|-|summarizer.rs:ground_shifts+ -> code_evolution|Check shift endpoints against AST evolution rows"
+shift|pane.py:draw_story_map-|pane.py:shift_map_rows~|The map drew its labels at 9 to 10 px.|The map writes Before and After as text.\n\
+decision|-|summarizer.rs:ground_shifts+ -> code_evolution|-|ground_shifts checks each shift against AST evolution rows."
 }
 
 /// Applies the capture cap, splits the optional `@shifts` block when `map_on`
@@ -525,9 +607,12 @@ mod tests {
     }
 
     #[test]
-    fn extra_pipes_in_claim_make_the_line_invalid_or_are_handled_as_you_documented() {
-        // Documented choice: extra '|' in claim makes the line invalid.
-        assert!(parse_shift_line("shift|a.rs|b.rs|claim with | extra pipe").is_none());
+    fn a_pipe_in_a_four_field_claim_makes_a_five_field_line_and_a_sixth_field_is_invalid() {
+        // `claim with | extra pipe` is, by the grammar, was `claim with` and now `extra pipe`.
+        let five = parse_shift_line("shift|a.rs|b.rs|claim with | extra pipe").expect("5 fields");
+        assert_eq!(five.was.as_deref(), Some("claim with"));
+        assert_eq!(five.now.as_deref(), Some("extra pipe"));
+        assert!(parse_shift_line("shift|a.rs|b.rs|one|two|three").is_none());
     }
 
     #[test]
@@ -563,7 +648,7 @@ mod tests {
 
     #[test]
     fn oversize_line_dropped() {
-        let huge = format!("shift|a.rs|b.rs|{}", "x".repeat(310));
+        let huge = format!("shift|a.rs|b.rs|{}", "x".repeat(MAX_LINE_BYTES));
         assert!(parse_shift_line(&huge).is_none());
     }
 
@@ -635,9 +720,10 @@ mod tests {
         let prose = "p".repeat(1500);
         let block =
             "\n@shifts\nshift|a.rs:f1~|b.rs:f2+|First complete claim\nshift|c.rs:g1~|d.rs:g2+|";
-        let tail = "x".repeat(1700 - prose.len() - block.len());
+        let total = RAW_CAP_WITH_MAP + 100;
+        let tail = "x".repeat(total - prose.len() - block.len());
         let raw_full = format!("{prose}{block}{tail}");
-        assert_eq!(raw_full.chars().count(), 1700);
+        assert_eq!(raw_full.chars().count(), total);
 
         let (out_prose, entries) = finish_story_output(&raw_full, true);
         assert_eq!(out_prose.chars().count(), 1000);
@@ -672,6 +758,182 @@ mod tests {
         assert_eq!(prose.len(), 2000);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].claim, "Ascii claim");
+    }
+
+    const SAMPLE_WAS: &str = "The map drew its labels at 9 to 10 px.";
+    const SAMPLE_NOW: &str = "The map writes Before and After as text.";
+
+    fn five(was: &str, now: &str) -> String {
+        format!("shift|pane.py:draw_story_map-|pane.py:shift_map_rows~|{was}|{now}")
+    }
+
+    #[test]
+    fn five_field_line_carries_was_and_now_and_claim_is_now() {
+        let e = parse_shift_line(&five(SAMPLE_WAS, SAMPLE_NOW)).expect("valid");
+        assert_eq!(e.was.as_deref(), Some(SAMPLE_WAS));
+        assert_eq!(e.now.as_deref(), Some(SAMPLE_NOW));
+        assert_eq!(e.claim, SAMPLE_NOW);
+        assert_eq!(e.kind, ShiftKind::Shift);
+    }
+
+    #[test]
+    fn a_dash_was_means_the_thing_is_new() {
+        let e = parse_shift_line(&five("-", SAMPLE_NOW)).expect("valid");
+        assert_eq!(e.was, None);
+        assert_eq!(e.now.as_deref(), Some(SAMPLE_NOW));
+        assert_eq!(e.claim, SAMPLE_NOW);
+    }
+
+    #[test]
+    fn the_four_field_line_still_parses_without_was_and_now() {
+        let e = parse_shift_line("shift|a.rs:f~|a.rs:g+|Keep the map").expect("valid");
+        assert_eq!((e.was, e.now), (None, None));
+        assert_eq!(e.claim, "Keep the map");
+    }
+
+    #[test]
+    fn five_field_lines_reject_junk_in_either_sentence() {
+        for (was, now) in [
+            ("", SAMPLE_NOW),
+            (SAMPLE_WAS, ""),
+            (SAMPLE_WAS, "-"),
+            ("Dropped the arrow \u{2192} here.", SAMPLE_NOW),
+            (SAMPLE_WAS, "Tab\there is not printable."),
+        ] {
+            assert!(
+                parse_shift_line(&five(was, now)).is_none(),
+                "{was:?} {now:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_long_sentence_is_cut_at_a_word_boundary_within_80_chars_and_12_words() {
+        let long_chars = "The summarizer writes the story prose and then the shift lines for every compaction it sees today.";
+        assert!(long_chars.len() > MAX_SENTENCE_CHARS);
+        let e = parse_shift_line(&five(SAMPLE_WAS, long_chars)).expect("kept, cut");
+        let now = e.now.expect("now");
+        assert!(now.len() <= MAX_SENTENCE_CHARS, "{now}");
+        assert!(
+            now.split_whitespace().count() <= MAX_SENTENCE_WORDS,
+            "{now}"
+        );
+        assert!(long_chars.starts_with(&now), "{now}");
+        assert_eq!(e.claim, now);
+        // 14 words, short: the word cap binds, and the cut does not end on "the".
+        let long_words =
+            "It reads one two three four five six seven eight nine ten eleven twelve words.";
+        let e = parse_shift_line(&five(long_words, SAMPLE_NOW)).expect("kept, cut");
+        assert_eq!(
+            e.was.as_deref().map(|w| w.split_whitespace().count()),
+            Some(12)
+        );
+        let dangling =
+            "Each shift line is checked against all of the code edits in the new rows now";
+        let e = parse_shift_line(&five(dangling, SAMPLE_NOW)).expect("kept, cut");
+        assert_eq!(
+            e.was.as_deref(),
+            Some("Each shift line is checked against all of the code edits")
+        );
+    }
+
+    #[test]
+    fn sig_ignores_was_and_now_so_a_rewording_does_not_churn_the_map() {
+        let four = parse_shift_line("shift|a.rs:f~|a.rs:g+|old claim").expect("4");
+        let five1 = parse_shift_line("shift|a.rs:f~|a.rs:g+|It was slow.|It is fast.").expect("5");
+        let five2 =
+            parse_shift_line("shift|a.rs:f~|a.rs:g+|It lagged.|It runs quickly.").expect("5");
+        assert_eq!(sig("csr", &four), sig("csr", &five1));
+        assert_eq!(sig("csr", &five1), sig("csr", &five2));
+        let block = "shift|a.rs:f~|a.rs:g+|It was slow.|It is fast.\nshift|a.rs:f~|a.rs:g+|It lagged.|It runs quickly.\n";
+        assert_eq!(parse_shifts_block(block, false).len(), 1);
+    }
+
+    #[test]
+    fn a_story_with_four_full_five_field_lines_is_kept_whole() {
+        // The longest sides measured on stored maps are 69 characters; sentences at the cap.
+        let side_b = format!(
+            "{}:{}~",
+            "csr-engine/src/story_map/store.rs", "record_story_map"
+        );
+        let side_a = format!(
+            "{} -> {}",
+            "csr-engine/src/story_map.rs:parse_shifts_block", "ledger.rs:plan+"
+        );
+        assert!(
+            side_b.len() <= 69 && side_a.len() <= 69,
+            "{} {}",
+            side_b.len(),
+            side_a.len()
+        );
+        let sentence =
+            "Summarizer keeps four shifts, each with two plain sentences about code changes.";
+        assert!(sentence.len() <= MAX_SENTENCE_CHARS);
+        let words: Vec<&str> = sentence.split_whitespace().collect();
+        assert!(words.len() <= MAX_SENTENCE_WORDS, "{}", words.len());
+        let line = |kind: &str| format!("{kind}|{side_b}|{side_a}|{sentence}|{sentence}");
+        let lines = ["shift", "decision", "regression", "risk"].map(line);
+        assert!(lines.iter().all(|l| l.len() <= MAX_LINE_BYTES));
+        let block = lines.join("\n") + "\n";
+        assert!(block.len() <= MAX_BLOCK_BYTES, "{} bytes", block.len());
+        let prose = "p".repeat(800);
+        let raw = format!("{prose}\n@shifts\n{block}");
+        assert!(
+            raw.chars().count() <= RAW_CAP_WITH_MAP,
+            "{}",
+            raw.chars().count()
+        );
+        // Same four lines, distinguished so the dedupe keeps them all.
+        let distinct = ["shift", "decision", "regression", "risk"]
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                let side_a = side_a.replace("plan", &format!("plan{i}"));
+                format!("{kind}|{side_b}|{side_a}|{sentence}|{sentence}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw = format!("{prose}\n@shifts\n{distinct}\n");
+        let (out_prose, entries) = finish_story_output(&raw, true);
+        assert_eq!(out_prose.len(), 800);
+        assert_eq!(entries.len(), 4, "all four lines survive the caps");
+    }
+
+    #[test]
+    fn the_prompts_own_example_parses_and_asks_for_five_fields() {
+        let prompt = shifts_instruction();
+        assert!(prompt.contains("kind|before|after|was|now"));
+        let from = prompt.find("@shifts\n").expect("example sentinel");
+        let example = &prompt[from..];
+        let (prose, entries) = split_story_output(&format!("Story.\n{example}"), false);
+        assert_eq!(prose, "Story.");
+        assert_eq!(entries.len(), 2, "both example lines parse");
+        assert_eq!(entries[0].was.as_deref(), Some(SAMPLE_WAS));
+        assert_eq!(entries[0].now.as_deref(), Some(SAMPLE_NOW));
+        assert_eq!(entries[1].was, None);
+        assert!(entries[1].now.is_some());
+    }
+
+    #[test]
+    fn a_canned_model_reply_mixing_five_four_and_slipped_lines_keeps_what_parses() {
+        let reply = format!(
+            "We moved the shift map to text.\n@shifts\n{}\nrisk|a.rs:f!|-|Old four-field claim\nshift|-|b.rs:g+|-|{}\nnot|a|valid\ndecision|c.rs:h~|c.rs:h~|{}|{}|extra\n",
+            five(SAMPLE_WAS, SAMPLE_NOW),
+            "Over-long sentence that goes on and on about nothing in particular for far too many words",
+            SAMPLE_WAS,
+            SAMPLE_NOW
+        );
+        let (prose, entries) = finish_story_output(&reply, true);
+        assert_eq!(prose, "We moved the shift map to text.");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].now.as_deref(), Some(SAMPLE_NOW));
+        assert_eq!(
+            (entries[1].was.clone(), entries[1].now.clone()),
+            (None, None)
+        );
+        assert_eq!(entries[1].claim, "Old four-field claim");
+        assert_eq!(entries[2].was, None);
+        assert!(entries[2].now.as_deref().unwrap().len() <= MAX_SENTENCE_CHARS);
     }
 
     #[test]

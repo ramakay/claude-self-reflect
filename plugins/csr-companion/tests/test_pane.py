@@ -4431,6 +4431,75 @@ class ShiftMapText(unittest.TestCase):
         ),
     )
 
+    NEW_RAW = dict(
+        v=1,
+        project='csr',
+        conv_id=HERE_NOW,
+        previous=dict(rev=3, at=1900, sigs=['old_sig_1'], endpoints=[]),
+        current=dict(
+            rev=4,
+            at=1990,
+            by='Haiku',
+            covered_msgs=48,
+            entries=[
+                dict(
+                    sig='sig_new_1',
+                    kind='shift',
+                    grounded=True,
+                    moved=True,
+                    liked=False,
+                    claim='The map writes Before and After as text.',
+                    was='The map drew its labels at 9 to 10 px.',
+                    now='The map writes Before and After as text.',
+                    receipts=['evo:9f12a0c1', 'oid:3f2a1b0'],
+                    before=[dict(scope='plugins/csr-companion/bin/pane.py', sym='draw_story_map', mark='-', tier='verified')],
+                    after=[dict(scope='plugins/csr-companion/bin/pane.py', sym='shift_map_rows', mark='~', tier='verified')],
+                ),
+                dict(
+                    sig='sig_new_2',
+                    kind='decision',
+                    grounded=True,
+                    moved=False,
+                    liked=False,
+                    claim='ground_shifts checks each shift against AST evolution rows.',
+                    was=None,
+                    now='ground_shifts checks each shift against AST evolution rows.',
+                    receipts=['edge:44b18e20'],
+                    before=[],
+                    after=[
+                        dict(scope='summarizer.rs', sym='ground_shifts', mark='+', tier='verified'),
+                        dict(op='->', tier='verified'),
+                        dict(scope='code_evolution', sym=None, mark='', tier='verified'),
+                    ],
+                ),
+                dict(
+                    sig='sig_new_3',
+                    kind='risk',
+                    grounded=False,
+                    moved=True,
+                    liked=False,
+                    claim='session_story_map reads the was and now fields.',
+                    was='session_story_map ignores the was and now fields.',
+                    now='session_story_map reads the was and now fields.',
+                    receipts=[],
+                    before=[],
+                    after=[dict(scope='pane.py', sym='session_story_map', mark='~', tier='model')],
+                ),
+                dict(
+                    sig='sig_old_4',
+                    kind='regression',
+                    grounded=True,
+                    moved=False,
+                    liked=False,
+                    claim='Keep the old four-field line',
+                    receipts=['evo:00000004'],
+                    before=[],
+                    after=[dict(scope='store.rs', sym='load', mark='~', tier='verified')],
+                ),
+            ],
+        ),
+    )
+
     def _with_meta_db(self, value=None, broken=False):
         con = sqlite3.connect(':memory:')
         if not broken:
@@ -4485,6 +4554,127 @@ class ShiftMapText(unittest.TestCase):
                     self.assertLessEqual(len(line), max(room, len(title)), line)
                     for badge in ('✓ast', '⌗', 'model'):
                         self.assertNotIn(badge, line)
+
+    def test_new_format_rows_say_before_and_after_in_one_sentence_each(self):
+        title, rows = pane.shift_map_rows(self.shown(self.NEW_RAW), 60, 70)
+        self.assertEqual(title, 'Shift Map · as of 12 messages ago')
+        self.assertEqual(rows[:11], [
+            'new shift · plugins/csr-companion/bin/pane.py:shift_map_rows',
+            'Before: The map drew its labels at 9 to 10 px.',
+            'After:  The map writes Before and After as text.',
+            "Haiku's reading, checked · commit 3f2a1b0 and your edits",
+            'decision · summarizer.rs:ground_shifts',
+            # no before: "New:" in the place of Before and After
+            'New:    ground_shifts checks each shift against AST evolution rows.',
+            "Haiku's reading, checked · call graph",
+            'new risk · pane.py:session_story_map',
+            'Before: session_story_map ignores the was and now fields.',
+            'After:  session_story_map reads the was and now fields.',
+            "Haiku's guess, not checked",
+        ])
+
+    def test_an_old_entry_in_a_new_map_renders_as_before(self):
+        smap = self.shown(self.NEW_RAW)
+        self.assertEqual([(e['was'], e['now']) for e in smap['entries']][3], (None, None))
+        self.assertIsNone(smap['entries'][1]['was'])  # a null was: the thing is new
+        self.assertEqual(smap['entries'][0]['now'], 'The map writes Before and After as text.')
+        rows = pane.shift_map_rows(smap, 60, 40)[1]
+        at = rows.index('regression: Keep the old four-field line')
+        self.assertEqual(rows[at:], [
+            'regression: Keep the old four-field line',
+            '  changed store.rs:load',
+            "  Haiku's reading, checked · your edits",
+        ])
+
+    def test_a_sentence_wraps_at_word_boundaries_on_a_46_column_pane_and_hangs_under_its_text(self):
+        # a 46 column pane: the text starts at column 6, so a row has 40
+        rows = pane.shift_map_rows(self.shown(self.NEW_RAW), 60, 40)[1]
+        self.assertEqual(rows[:10], [
+            'new shift · …/bin/pane.py:shift_map_rows',
+            'Before: The map drew its labels at 9 to',
+            '        10 px.',
+            'After:  The map writes Before and After',
+            '        as text.',
+            "Haiku's reading, checked",
+            'commit 3f2a1b0 and your edits',
+            'decision · summarizer.rs:ground_shifts',
+            'New:    ground_shifts checks each shift',
+            '        against AST evolution rows.',
+        ])
+        lines = pane.page_lines(page(story_map=self.shown(self.NEW_RAW), messages=60), 46, 40, dict(likes={}))
+        seen = [flat(line) for line in lines]
+        for want in ('Before: The map drew its labels at 9 to', '        10 px.'):
+            self.assertTrue(any(line.endswith(want) for line in seen), want)
+        self.assertTrue(all(len(line) <= 46 for line in seen), [line for line in seen if len(line) > 46])
+
+    def test_a_wider_pane_wraps_wider_because_draw_main_hands_page_main_its_columns(self):
+        data = dict(repo='/tmp/csr-engine', dreams=[], chapter=dict(at=1000.0, of=5), dreams_on=True, look=None, story=None,
+                    infinite=None, story_map=self.shown(self.NEW_RAW), map_view=dict(open=True))
+        s = dict(id=HERE_NOW, prompts=[], replies=[], compacts=[], remembered=[], gave=dict(recalls=[], carried=[], dreams=[]),
+                 project='csr-engine', lost=[], messages=60, turn_end=1990.0)  # a turn has ended: not the default view
+        def memory():
+            con = sqlite3.connect(':memory:')
+            con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
+                        'byte_start int, project text, kind text)')
+            return con
+
+        connect, pane.connect = pane.connect, memory
+        try:
+            seen = {}
+            for cols in (46, 72):
+                lines, _ = pane.draw_main(data, s, cols, 50, 2000.0, dict(likes={}))
+                seen[cols] = [flat(line) for line in lines]
+                self.assertTrue(all(len(line) <= cols for line in seen[cols]), cols)
+        finally:
+            pane.connect = connect
+        self.assertTrue(any(line.endswith('Before: The map drew its labels at 9 to') for line in seen[46]))
+        self.assertTrue(any(line.endswith('Before: The map drew its labels at 9 to 10 px.') for line in seen[72]))
+        self.assertFalse(any(line.strip() == '10 px.' for line in seen[72]))
+
+    def test_no_new_format_row_is_wider_than_the_room_and_no_word_is_cut(self):
+        words = set()
+        for entry in self.NEW_RAW['current']['entries']:
+            for key in ('was', 'now'):
+                words.update((entry.get(key) or '').split())
+        longest = max(len(word) for word in words)
+        for room in (pane.SHIFT_LABEL + longest, 30, 40, 66, 100):
+            title, rows = pane.shift_map_rows(self.shown(self.NEW_RAW), 60, room)
+            for row in rows:
+                self.assertLessEqual(len(row), room, (room, row))
+                if row.startswith(('Before:', 'After:', 'New:', ' ' * pane.SHIFT_LABEL)):
+                    for word in row[pane.SHIFT_LABEL:].rstrip('…').split():
+                        self.assertIn(word, words, (room, row))  # whole words only
+        # a pane too narrow for a single word still never draws a row wider than itself
+        for row in pane.shift_map_rows(self.shown(self.NEW_RAW), 60, 24)[1]:
+            self.assertLessEqual(len(row), 24, row)
+
+    def test_a_sentence_longer_than_two_rows_ends_its_second_row_with_an_ellipsis_at_a_word_boundary(self):
+        smap = self.shown(self.NEW_RAW)
+        smap['entries'][0]['now'] = 'The map writes Before and After as plain text rows that wrap to two rows at most.'
+        rows = pane.shift_map_rows(smap, 60, 40)[1]
+        self.assertEqual(rows[3:6], [
+            'After:  The map writes Before and After',
+            '        as plain text rows that wrap to…',
+            "Haiku's reading, checked",  # two rows, not three: the evidence follows
+        ])
+
+    def test_the_path_is_cut_from_the_left_and_the_symbol_stays(self):
+        rows = pane.shift_map_rows(self.shown(self.NEW_RAW), 60, 40)[1]
+        self.assertEqual(rows[0], 'new shift · …/bin/pane.py:shift_map_rows')
+
+    def test_the_header_names_the_before_side_when_there_is_no_after(self):
+        smap = self.shown(self.NEW_RAW)
+        smap['entries'][0]['after'] = []
+        self.assertEqual(pane.shift_map_rows(smap, 60, 66)[1][0], 'new shift · plugins/csr-companion/bin/pane.py:draw_story_map')
+
+    def test_session_story_map_reads_was_and_now_and_treats_a_dash_as_new(self):
+        raw = json.loads(json.dumps(self.NEW_RAW))
+        raw['current']['entries'][1]['was'] = '-'
+        raw['current']['entries'][2]['now'] = '   '
+        smap = self.shown(raw)
+        self.assertIsNone(smap['entries'][1]['was'])
+        self.assertEqual(smap['entries'][1]['now'], 'ground_shifts checks each shift against AST evolution rows.')
+        self.assertEqual((smap['entries'][2]['was'], smap['entries'][2]['now']), (None, None))  # no now: an old entry
 
     def test_staleness_variants_current_behind_and_unknown(self):
         smap = dict(rev=1, at=100.0, by='Haiku', covered=20, entries=[
@@ -4597,116 +4787,10 @@ class ShiftMapText(unittest.TestCase):
             self.assertEqual(sess.messages, 4)
 
 
-@unittest.skipUnless(pane.HAS_PIL, 'Pillow required for ShiftMapPicture')
-class ShiftMapPicture(unittest.TestCase):
-    CELL = (16, 34)
-    COLS = 40
-
-    def setUp(self):
-        pane._MAP_PNG.clear()
-
-    def _smap_from(self, raw):
-        helper = ShiftMapText()
-        return helper.shown(raw)
-
-    def test_open_and_shut_dimensions_determinism_and_size_cap(self):
-        from PIL import Image
-        smap = self._smap_from(ShiftMapText.HAIKU_RAW)
-        ground = pane.tint('story', pane.ROW)
-        open_png = pane.story_map_png(smap, 3, self.COLS, 9, self.CELL, ground)
-        shut_png = pane.story_map_png(smap, 3, self.COLS, 3, self.CELL, ground)
-        self.assertIsNotNone(open_png)
-        self.assertIsNotNone(shut_png)
-        self.assertLess(len(open_png), 96 * 1024)
-        self.assertLess(len(shut_png), 96 * 1024)
-
-        img_open = Image.open(io.BytesIO(open_png))
-        img_shut = Image.open(io.BytesIO(shut_png))
-        self.assertEqual(img_open.size, (self.COLS * self.CELL[0], 9 * self.CELL[1]))
-        self.assertEqual(img_shut.size, (self.COLS * self.CELL[0], 3 * self.CELL[1]))
-
-        pane._MAP_PNG.clear()
-        open_png_2 = pane.story_map_png(smap, 3, self.COLS, 9, self.CELL, ground)
-        self.assertEqual(open_png, open_png_2)
-
-        # Receipts-only map also renders cleanly within size cap
-        rec_smap = self._smap_from(ShiftMapText.RECEIPTS_RAW)
-        rec_png = pane.story_map_png(rec_smap, 3, self.COLS, 9, self.CELL, ground)
-        self.assertIsNotNone(rec_png)
-        self.assertLess(len(rec_png), 96 * 1024)
-
-    def test_stages_differ_and_populate_cache(self):
-        smap = self._smap_from(ShiftMapText.HAIKU_RAW)
-        ground = pane.tint('story', pane.ROW)
-        stages = [pane.story_map_png(smap, stg, self.COLS, 9, self.CELL, ground) for stg in (1, 2, 3)]
-        self.assertTrue(all(stages))
-        self.assertNotEqual(stages[0], stages[1])
-        self.assertNotEqual(stages[1], stages[2])
-        self.assertNotEqual(stages[0], stages[2])
-        self.assertEqual(len(pane._MAP_PNG), 3)
-
-    def test_grounded_changed_entry_draws_ctx_indigo_and_ungrounded_does_not(self):
-        from PIL import Image
-        ground = pane.GROUND
-        grounded_smap = dict(
-            rev=1, at=100.0, by='Haiku', covered=10, previous_sigs=[], has_previous=False,
-            entries=[dict(
-                kind='shift', claim='Grounded change', grounded=True, moved=True, receipts=['evo:1'],
-                before=[dict(scope='a.rs', sym='foo', mark='~', tier='verified')],
-                after=[dict(scope='a.rs', sym='foo', mark='~', tier='verified')],
-            )],
-        )
-        ungrounded_smap = dict(
-            rev=1, at=100.0, by='Haiku', covered=10, previous_sigs=[], has_previous=False,
-            entries=[dict(
-                kind='shift', claim='Guessed change', grounded=False, moved=True, receipts=[],
-                before=[dict(scope='a.rs', sym='foo', mark='~', tier='model')],
-                after=[dict(scope='a.rs', sym='foo', mark='~', tier='model')],
-            )],
-        )
-        png_g = pane.story_map_png(grounded_smap, 2, self.COLS, 3, self.CELL, ground)
-        png_u = pane.story_map_png(ungrounded_smap, 2, self.COLS, 3, self.CELL, ground)
-        img_g = Image.open(io.BytesIO(png_g)).convert('RGB')
-        img_u = Image.open(io.BytesIO(png_u)).convert('RGB')
-
-        target = pane.INK['ctx'][:3]
-        def count_near(img, rgb, tol=25):
-            return sum(
-                1 for r, g, b in img.getdata()
-                if abs(r - rgb[0]) <= tol and abs(g - rgb[1]) <= tol and abs(b - rgb[2]) <= tol
-            )
-
-        self.assertGreater(count_near(img_g, target), 50)
-        self.assertEqual(count_near(img_u, target), 0)
-
-    def test_fail_open_without_pillow_or_on_bad_input_and_env_independent(self):
-        smap = self._smap_from(ShiftMapText.HAIKU_RAW)
-        ground = pane.GROUND
-        saved_pil = pane.HAS_PIL
-        try:
-            pane.HAS_PIL = False
-            self.assertIsNone(pane.story_map_png(smap, 3, self.COLS, 9, self.CELL, ground))
-        finally:
-            pane.HAS_PIL = saved_pil
-
-        for bad in (None, {}, 'bad', dict(rev=1, entries=[]), dict(rev=1, entries=['not-a-dict'])):
-            self.assertIsNone(pane.story_map_png(bad, 3, self.COLS, 9, self.CELL, ground))
-        self.assertIsNone(pane.story_map_png(smap, 3, 0, 9, self.CELL, ground))
-
-        old_env = os.environ.get('CSR_NO_STORY_MAP')
-        os.environ['CSR_NO_STORY_MAP'] = '1'
-        try:
-            self.assertIsNotNone(pane.story_map_png(smap, 3, self.COLS, 9, self.CELL, ground))
-        finally:
-            if old_env is None:
-                os.environ.pop('CSR_NO_STORY_MAP', None)
-            else:
-                os.environ['CSR_NO_STORY_MAP'] = old_env
-
-
 class ShiftMapMotion(unittest.TestCase):
-    """P2b: the map's arrival as a state machine on an injected clock, and its wiring into the page and the keys."""
-    CALM = {'CSR_REDUCED_MOTION': '', 'NO_COLOR': '', 'CSR_MAP_HOLD_S': ''}
+    """The map's arrival as a state machine on an injected clock (open for a while, then folded to its first shift),
+    and its wiring into the page and the keys. The map is words only: no stage, no picture."""
+    CALM = {'CSR_MAP_HOLD_S': ''}
 
     @staticmethod
     def smap(rev=4, at=1000.0):
@@ -4716,28 +4800,24 @@ class ShiftMapMotion(unittest.TestCase):
         with mock.patch.dict(os.environ, self.CALM):
             return [motion.update(smap, t, **kwargs) for t in times]
 
-    def test_arrival_draws_on_in_three_steps_180ms_apart_then_holds_12s_then_folds(self):
+    def test_arrival_opens_holds_12s_then_folds(self):
         smap, motion = self.smap(at=1000.0), pane.MapMotion()
-        frames = self.run_at(motion, smap, [1000.0, 1000.17, 1000.18, 1000.35, 1000.36, 1005.0, 1011.99, 1012.0, 1020.0])
-        self.assertEqual([(f['stage'], f['rows']) for f in frames], [
-            (1, 9), (1, 9), (2, 9), (2, 9), (3, 9), (3, 9), (3, 9), (3, 3), (3, 3)])
-        self.assertEqual([f['animating'] for f in frames], [True, True, True, True, False, False, False, False, False])
-        self.assertAlmostEqual(frames[0]['due'], 0.18, places=6)  # the next frame is a step away
-        self.assertAlmostEqual(frames[2]['due'], 0.18, places=6)
-        self.assertAlmostEqual(frames[4]['due'], 12.0 - 0.36, places=6)  # at rest: the fold is the next change
-        self.assertAlmostEqual(frames[6]['due'], 0.01, places=6)
-        self.assertIsNone(frames[7]['due'])  # folded: nothing more by itself, and it stays folded
-        self.assertIsNone(frames[8]['due'])
+        frames = self.run_at(motion, smap, [1000.0, 1000.36, 1005.0, 1011.99, 1012.0, 1020.0])
+        self.assertEqual([f['open'] for f in frames], [True, True, True, True, False, False])
+        self.assertAlmostEqual(frames[0]['due'], 12.0, places=6)  # the fold is the one change to wake for
+        self.assertAlmostEqual(frames[2]['due'], 7.0, places=6)
+        self.assertAlmostEqual(frames[3]['due'], 0.01, places=6)
+        self.assertIsNone(frames[4]['due'])  # folded: nothing more by itself, and it stays folded
+        self.assertIsNone(frames[5]['due'])
+        self.assertEqual(set(frames[0]), {'open', 'due'})  # no draw-on stage, no animating flag
 
-    def test_reopen_by_pinning_holds_nine_rows_until_released(self):
+    def test_reopen_by_pinning_holds_it_open_until_released(self):
         smap, motion = self.smap(at=1000.0), pane.MapMotion()
         self.run_at(motion, smap, [1000.0, 1013.0])
-        shut = self.run_at(motion, smap, [1014.0])[0]
-        self.assertEqual((shut['stage'], shut['rows'], shut['animating']), (3, 3, False))
-        opened = self.run_at(motion, smap, [1015.0, 1500.0], pinned=True)  # m or a click: full size, at rest, however long
-        self.assertEqual([(f['stage'], f['rows'], f['animating'], f['due']) for f in opened], [(3, 9, False, None)] * 2)
-        folded = self.run_at(motion, smap, [1501.0])[0]  # m again: back to the strip
-        self.assertEqual((folded['stage'], folded['rows']), (3, 3))
+        self.assertFalse(self.run_at(motion, smap, [1014.0])[0]['open'])
+        opened = self.run_at(motion, smap, [1015.0, 1500.0], pinned=True)  # m or a click: open, however long
+        self.assertEqual([(f['open'], f['due']) for f in opened], [(True, None)] * 2)
+        self.assertFalse(self.run_at(motion, smap, [1501.0])[0]['open'])  # m again: back to the first shift
 
     def test_a_pinned_or_busy_map_is_not_folded_under_the_reader_and_folds_when_they_let_go(self):
         smap = self.smap(at=1000.0)
@@ -4745,57 +4825,44 @@ class ShiftMapMotion(unittest.TestCase):
             motion = pane.MapMotion()
             self.run_at(motion, smap, [1000.0])
             held = self.run_at(motion, smap, [1030.0, 1090.0], **hold)
-            self.assertEqual([(f['rows'], f['due']) for f in held], [(9, None)] * 2)
-            self.assertEqual(self.run_at(motion, smap, [1091.0])[0]['rows'], 3)
+            self.assertEqual([(f['open'], f['due']) for f in held], [(True, None)] * 2)
+            self.assertFalse(self.run_at(motion, smap, [1091.0])[0]['open'])
 
     def test_a_map_first_seen_old_starts_folded_and_a_new_revision_opens_it(self):
         motion = pane.MapMotion()
         old = self.run_at(motion, self.smap(rev=2, at=900.0), [1000.0, 1001.0])
-        self.assertEqual([(f['stage'], f['rows'], f['animating']) for f in old], [(3, 3, False)] * 2)
+        self.assertEqual([f['open'] for f in old], [False, False])
         news = self.run_at(motion, self.smap(rev=3, at=1010.0), [1010.5])[0]  # a revision lands while the pane watches
-        self.assertEqual((news['stage'], news['rows'], news['animating']), (1, 9, True))
-        replayed = self.run_at(motion, self.smap(rev=3, at=1010.0), [1010.5 + 0.2])[0]  # the clock is the arrival's, not the frame's
-        self.assertEqual(replayed['stage'], 2)
+        self.assertTrue(news['open'])
+        replayed = self.run_at(motion, self.smap(rev=3, at=1010.0), [1010.7])[0]  # the clock is the arrival's, not the frame's
+        self.assertAlmostEqual(replayed['due'], 12.0 - 0.2, places=6)
 
     def test_a_map_first_seen_fresh_opens_on_sight(self):
-        first = self.run_at(pane.MapMotion(), self.smap(at=995.0), [1000.0])[0]  # 5 s old
-        self.assertEqual((first['stage'], first['rows'], first['animating']), (1, 9, True))
-
-    def test_reduced_motion_lands_on_the_rest_pose_and_still_holds_then_folds(self):
-        for env in ({'CSR_REDUCED_MOTION': '1'}, {'CSR_REDUCED_MOTION': 'true'}, {'NO_COLOR': '1'}):
-            motion = pane.MapMotion()
-            with mock.patch.dict(os.environ, dict(self.CALM, **env)):
-                frames = [motion.update(self.smap(at=1000.0), t) for t in (1000.0, 1000.05, 1011.0, 1012.0)]
-            self.assertEqual([(f['stage'], f['rows'], f['animating']) for f in frames],
-                             [(3, 9, False), (3, 9, False), (3, 9, False), (3, 3, False)], env)
-            self.assertAlmostEqual(frames[0]['due'], 12.0, places=6)
+        self.assertTrue(self.run_at(pane.MapMotion(), self.smap(at=995.0), [1000.0])[0]['open'])  # 5 s old
 
     def test_hold_override_and_zero_hold_opens_nothing(self):
         smap = self.smap(at=1000.0)
         with mock.patch.dict(os.environ, dict(self.CALM, CSR_MAP_HOLD_S='2')):
             motion = pane.MapMotion()
-            self.assertEqual([motion.update(smap, t)['rows'] for t in (1000.0, 1001.9, 1002.0)], [9, 9, 3])
-        for bad, rows in (('0', 3), ('junk', 9), ('-4', 3), ('nan', 9), ('inf', 9)):
+            self.assertEqual([motion.update(smap, t)['open'] for t in (1000.0, 1001.9, 1002.0)], [True, True, False])
+        for bad, opened in (('0', False), ('junk', True), ('-4', False), ('nan', True), ('inf', True)):
             with mock.patch.dict(os.environ, dict(self.CALM, CSR_MAP_HOLD_S=bad)):
-                self.assertEqual(pane.MapMotion().update(smap, 1000.0)['rows'], rows, bad)
+                self.assertEqual(pane.MapMotion().update(smap, 1000.0)['open'], opened, bad)
 
-    def test_no_map_has_no_rows_and_forgets_the_last_one(self):
+    def test_no_map_is_closed_and_forgets_the_last_one(self):
         motion = pane.MapMotion()
         self.run_at(motion, self.smap(at=1000.0), [1000.0])
         for gone in (None, {}, dict(entries=[]), 'bad'):
-            self.assertEqual(self.run_at(motion, gone, [1001.0])[0], dict(stage=3, rows=0, animating=False, due=None))
-        again = self.run_at(motion, self.smap(at=1001.5), [1002.0])[0]  # the same map back counts as news
-        self.assertEqual((again['stage'], again['rows']), (1, 9))
+            self.assertEqual(self.run_at(motion, gone, [1001.0])[0], dict(open=False, due=None))
+        self.assertTrue(self.run_at(motion, self.smap(at=1001.5), [1002.0])[0]['open'])  # the same map back counts as news
 
-    def test_the_draw_on_waits_are_a_step_while_moving_and_the_time_left_at_rest(self):
-        shell = types.SimpleNamespace(animating=True, map_due=1005.0)
-        self.assertEqual(pane.map_wait(shell, 1000.0), (pane.MAP_STEP_S, True))
-        for due, want in ((1005.0, (1.0, False)), (None, (1.0, False)), (True, (1.0, False)), (999.0, (pane.MAP_STEP_S, True)),
-                          (1000.0, (pane.MAP_STEP_S, True)), (1000.01, (0.05, False))):
-            shell = types.SimpleNamespace(animating=False, map_due=due)
+    def test_the_waits_are_the_time_left_to_the_fold_and_a_second_at_rest(self):
+        for due, want in ((1005.0, (1.0, False)), (None, (1.0, False)), (True, (1.0, False)), (999.0, (0.05, True)),
+                          (1000.0, (0.05, True)), (1000.01, (0.05, False))):
+            shell = types.SimpleNamespace(map_due=due)
             self.assertEqual(pane.map_wait(shell, 1000.0), want, due)
         self.assertEqual(pane.map_wait(types.SimpleNamespace(), 1000.0), (1.0, False))
-        shell = types.SimpleNamespace(animating=False, map_due=1000.4)
+        shell = types.SimpleNamespace(map_due=1000.4)
         self.assertAlmostEqual(pane.map_wait(shell, 1000.0)[0], 0.4, places=6)
 
     def test_m_opens_and_folds_the_map_on_the_main_page_only_and_only_with_a_map(self):
@@ -4818,154 +4885,87 @@ class ShiftMapMotion(unittest.TestCase):
         pane.press(shell, 'm')
         self.assertEqual(shell.open, 'shifts')
 
-    def test_pixels_put_the_picture_on_the_item_and_the_words_leave_with_it(self):
+    def test_pixels_or_not_the_map_is_the_same_text_rows_and_no_picture(self):
         smap = self.smap()
-        with mock.patch.object(pane, 'PIXELS', True):
-            got = page(story_map=smap, messages=60, map_view=dict(stage=2, rows=9))
-            item = next(i for i in got['sections'][0]['items'] if i['key'] == 'shifts')
-            self.assertEqual((item['picture']['kind'], item['picture']['rows'], item['picture']['facts']), ('shiftmap', 9, (smap, 2)))
-            self.assertEqual((item['open_picture']['rows'], item['open_picture']['facts']), (9, (smap, 3)))
-            shut = page(story_map=smap, messages=60, map_view=dict(stage=3, rows=3))
-            lines = pane.page_lines(shut, 46, 30, dict(likes={}))
-            self.assertEqual([(run, pic['facts'][1]) for _, run, pic, _ in lines.wanted], [(3, 3)])
-            seen = [flat(line) for line in lines]
-            self.assertTrue(any('Shift Map · as of 12 messages ago' in line for line in seen))
-            self.assertFalse(any('Keep prior shifts' in line for line in seen))  # the picture says it
-            opened = pane.page_lines(shut, 46, 30, dict(likes={}, open='shifts'))
-            self.assertEqual([run for _, run, _, _ in opened.wanted], [9])  # a click: full size, whatever the pane's own rows
-            self.assertEqual(opened.wanted[0][2]['facts'], (smap, 3))
+        seen = {}
+        for pixels in (True, False):
+            with mock.patch.object(pane, 'PIXELS', pixels):
+                got = page(story_map=smap, messages=60, map_view=dict(open=True))
+                item = next(i for i in got['sections'][0]['items'] if i['key'] == 'shifts')
+                self.assertNotIn('picture', item)
+                self.assertNotIn('open_picture', item)
+                seen[pixels] = pane.item_rows(item, 'story', 46, False, 6)
+                lines = pane.page_lines(got, 46, 30, dict(likes={}))
+                self.assertEqual(lines.wanted, [])
+                self.assertTrue(any('Keep prior shifts' in flat(line) for line in lines))
+        self.assertEqual(seen[True], seen[False])
 
-    def test_without_pixels_the_page_is_the_text_map_of_p1_and_no_picture(self):
+    def test_the_folded_map_shows_its_first_shift_and_how_to_open_the_rest(self):
         smap = self.smap()
-        with mock.patch.object(pane, 'PIXELS', False):
-            got = page(story_map=smap, messages=60, map_view=dict(stage=2, rows=9))
-            item = next(i for i in got['sections'][0]['items'] if i['key'] == 'shifts')
-            self.assertNotIn('picture', item)
-            lines = pane.page_lines(got, 46, 30, dict(likes={}))
-            self.assertEqual(lines.wanted, [])
-            self.assertTrue(any('Keep prior shifts' in flat(line) for line in lines))
+        shut = page(story_map=smap, messages=60, map_view=dict(open=False))
+        lines = [flat(line) for line in pane.page_lines(shut, 46, 30, dict(likes={}))]
+        self.assertTrue(any('Keep prior shifts' in line for line in lines))
+        self.assertFalse(any('Check endpoints' in line for line in lines))
+        self.assertIn('+2 more shifts · click or m to expand', [line.strip() for line in lines])
+        for opened in (None, 'shifts', 'shiftlike:sig_risk_1'):  # open by the clock's view, or held open by a click
+            view = dict(open=True) if opened is None else dict(open=False)
+            full = page(story_map=smap, messages=60, map_view=view, ui=dict(likes={}, open=opened))
+            seen = [flat(line) for line in pane.page_lines(full, 46, 40, dict(likes={}, open=opened))]
+            self.assertTrue(any('Check endpoints' in line for line in seen), opened)
+            self.assertFalse(any('more shift' in line for line in seen), opened)
 
     def test_no_map_or_kill_switch_leaves_the_page_byte_identical_with_pixels_on(self):
         story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=3, by='Haiku', at=1990.0)
         with mock.patch.object(pane, 'PIXELS', True):
             base = list(pane.page_lines(page([dream(1400, 'ask_claude')], story=story), 46, 30, dict(likes={})))
-            nomap = page([dream(1400, 'ask_claude')], story=story, story_map=None, map_view=dict(stage=1, rows=9))
+            nomap = page([dream(1400, 'ask_claude')], story=story, story_map=None, map_view=dict(open=True))
             self.assertEqual(list(pane.page_lines(nomap, 46, 30, dict(likes={}))), base)
 
-    def test_on_a_short_pane_the_picture_takes_the_largest_height_that_fits_down_to_the_fold(self):
-        story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=3, by='Haiku', at=1990.0)
-        with mock.patch.object(pane, 'PIXELS', True):
-            got = page(story=story, story_map=self.smap(), messages=60, map_view=dict(stage=3, rows=9))
-            for opened in (None, 'shifts'):
-                ui = dict(likes={}, open=opened)
-                heights = {}
-                for rows in range(10, 20):
-                    lines = pane.page_lines(got, 46, rows, ui)
-                    heights[rows] = [run for _, run, _, _ in lines.wanted]
-                    self.assertEqual(len(heights[rows]), 1, (opened, rows))  # never dropped, never the words instead
-                    self.assertEqual(len(lines), min(rows - 1, 15), (opened, rows))  # and it fills the room, no more
-                    self.assertFalse(any('new risk' in flat(line) for line in lines), (opened, rows))
-                self.assertEqual([heights[r][0] for r in range(10, 20)], [3, 4, 5, 6, 7, 8, 9, 9, 9, 9], opened)
-
-    def test_a_map_even_the_fold_does_not_fit_beside_an_opened_row_is_the_words_not_blank_rows(self):
-        story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=3, by='Haiku', at=1990.0)
-        with mock.patch.object(pane, 'PIXELS', True):
-            got = page(story=story, story_map=self.smap(), messages=60, map_view=dict(stage=3, rows=9))
-            for rows in (8, 9):  # an opened row is cut to its room, never dropped
-                cut = pane.page_lines(got, 46, rows, dict(likes={}, open='shifts'))
-                self.assertEqual(cut.wanted, [], rows)
-                self.assertTrue(any('new risk' in flat(line) for line in cut), rows)
-                self.assertFalse(any(not flat(line).strip() for line in cut[1:]), rows)
-
-    @unittest.skipUnless(pane.HAS_PIL, 'Pillow is not installed')
-    def test_draw_page_makes_every_step_and_the_fold_before_the_first_is_shown(self):
-        smap = self.smap()
-        pane._MAP_PNG.clear()
-        with mock.patch.object(pane, 'PIXELS', True), mock.patch.object(pane, 'cell_size', lambda: (16, 34)):
-            got = page(story_map=smap, messages=60, map_view=dict(stage=1, rows=9))
-            _, pictures = pane.draw_page(got, 46, 40, dict(likes={}))
-        self.assertEqual(sorted({(key[4], key[6]) for key in pane._MAP_PNG}), [(1, 9), (2, 9), (3, 3), (3, 9)])
-        shown = [png for _, _, _, h, png in pictures if h == 9]
-        self.assertEqual(len(shown), 1)
-        self.assertEqual(shown[0], pane._MAP_PNG[next(k for k in pane._MAP_PNG if k[4] == 1 and k[6] == 9)])
-
-    @unittest.skipUnless(pane.HAS_PIL, 'Pillow is not installed')
-    def test_a_picture_that_cannot_be_made_is_the_words(self):
-        smap = self.smap()
-        with mock.patch.object(pane, 'PIXELS', True), mock.patch.object(pane, 'cell_size', lambda: (16, 34)), \
-                mock.patch.object(pane, 'story_map_png', lambda *a: None):
-            got = page(story_map=smap, messages=60, map_view=dict(stage=3, rows=9))
-            lines, pictures = pane.draw_page(got, 46, 40, dict(likes={}))
-        self.assertFalse([p for p in pictures if p[3] == 9])
-        self.assertTrue(any('new risk' in flat(line) for line in lines))
-
-    @unittest.skipUnless(pane.HAS_PIL, 'Pillow is not installed')
-    def test_receipts_only_picture_says_the_kind_once_per_row_and_keeps_no_kind_column(self):
-        from PIL import ImageDraw
-        smap = ShiftMapText().shown(ShiftMapText.RECEIPTS_RAW)
-        said = []
-        real = ImageDraw.ImageDraw.text
-
-        def spy(self, xy, text, *args, **kwargs):
-            said.append((text, xy[0]))
-            return real(self, xy, text, *args, **kwargs)
-
-        with mock.patch.object(ImageDraw.ImageDraw, 'text', spy):
-            self.assertTrue(pane.draw_story_map(smap, 3, 40, 9, (16, 34), pane.tint('story', pane.ROW)))
-        words = [text for text, _ in said]
-        self.assertNotIn('KIND', words)
-        self.assertIn('SHIFTED IN THIS SESSION', words)
-        self.assertEqual(sum(1 for word in words if word.startswith(('changed', 'added'))), len(smap['entries']), words)
-        self.assertGreater(min(x for text, x in said if text == 'SHIFTED IN THIS SESSION'), 0)
-        self.assertLess(min(x for _, x in said), 40 * pane.SS)  # the claim starts at the left edge, where the KIND column was
-
-    @unittest.skipUnless(pane.HAS_PIL, 'Pillow is not installed')
-    def test_the_fold_says_how_to_open_it(self):
-        from PIL import ImageDraw
-        smap = ShiftMapText().shown(ShiftMapText.RECEIPTS_RAW)
-        said, real = [], ImageDraw.ImageDraw.text
-
-        def spy(self, xy, text, *args, **kwargs):
-            said.append(text)
-            return real(self, xy, text, *args, **kwargs)
-
-        with mock.patch.object(ImageDraw.ImageDraw, 'text', spy):
-            pane.draw_story_map(smap, 3, 40, pane.MAP_SHUT_ROWS, (16, 34), pane.tint('story', pane.ROW))
-        self.assertIn('+1 more shift · click or m to expand', said)
+    def test_the_open_map_never_takes_more_than_half_the_pane(self):
+        smap = ShiftMapText().shown(ShiftMapText.NEW_RAW)
+        for tall, room_rows in ((20, 10), (30, 15), (60, 30)):
+            got = page(story_map=smap, messages=60, map_view=dict(open=True), ui=dict(likes={}, rows=tall))
+            item = next(i for i in got['sections'][0]['items'] if i['key'] == 'shifts')
+            budget = max(8, tall // 2)
+            shifts = [row for row in item['body'] if not row.startswith('+')]
+            self.assertLessEqual(len(shifts), budget, tall)
+            self.assertGreaterEqual(len(shifts), 1)
+            self.assertEqual(room_rows, budget if budget > 8 else room_rows)
+            if len(shifts) < len(item['body']):
+                self.assertRegex(item['body'][-1], r'^\+\d+ more shifts?$')
 
 
 class ShiftMapFrame(unittest.TestCase):
-    """The Pane's own frames drive the map's motion off the clock and wake the loop for it."""
+    """The Pane's own frames drive the map's open and fold off the clock and wake the loop for the fold."""
     setUp, tearDown = DefaultView.setUp, DefaultView.tearDown
     live, write, fresh, facts, thread, intent_db = (DefaultView.live, DefaultView.write, DefaultView.fresh,
                                                     DefaultView.facts, DefaultView.thread, DefaultView.intent_db)
     patch, pane_over, frame = Findings.patch, Findings.pane_over, Findings.frame
 
-    def test_frames_walk_the_map_through_its_stages_hold_and_fold_and_m_reopens_it(self):
+    def test_frames_hold_the_map_open_then_fold_it_and_m_reopens_it(self):
         clock = [5_000.0]
         smap = dict(ShiftMapMotion.smap(at=5_000.0))
         with mock.patch.dict(os.environ, ShiftMapMotion.CALM), mock.patch.object(pane.time, 'time', lambda: clock[0]):
             box = self.pane_over(self.fresh(), session_story_map=lambda sid: smap)
             seen = []
-            for at in (0.0, 0.18, 0.36, 6.0, 12.5):
+            for at in (0.0, 6.0, 12.5):
                 clock[0] = 5_000.0 + at
                 self.frame(box, force=False)
-                seen.append((box.data['map_view'], box.animating, box.map_due is not None))
+                seen.append((box.data['map_view'], box.map_due is not None))
             self.assertEqual(seen, [
-                (dict(stage=1, rows=9), True, True),
-                (dict(stage=2, rows=9), True, True),
-                (dict(stage=3, rows=9), False, True),  # at rest, the fold is due
-                (dict(stage=3, rows=9), False, True),
-                (dict(stage=3, rows=3), False, False)])  # folded: the loop has nothing to wake for
+                (dict(open=True), True),  # the fold is due
+                (dict(open=True), True),
+                (dict(open=False), False)])  # folded: the loop has nothing to wake for
+            self.assertFalse(hasattr(box, 'animating'))
             self.assertEqual(pane.map_wait(box, clock[0]), (1.0, False))
-            self.assertTrue(pane.map_key(box, 'm'))  # m: open again, at the rest pose
+            self.assertTrue(pane.map_key(box, 'm'))  # m: open again
             clock[0] += 1.0
             self.frame(box, force=False)
-            self.assertEqual((box.open, box.data['map_view']), ('shifts', dict(stage=3, rows=9)))
+            self.assertEqual((box.open, box.data['map_view']), ('shifts', dict(open=True)))
             self.assertTrue(pane.map_key(box, 'm'))
             clock[0] += 1.0
             self.frame(box, force=False)
-            self.assertEqual((box.open, box.data['map_view']), (None, dict(stage=3, rows=3)))
+            self.assertEqual((box.open, box.data['map_view']), (None, dict(open=False)))
 
     def test_no_map_draws_the_pane_without_a_map_view_and_the_loop_sleeps_a_second(self):
         box = self.pane_over(self.fresh(), session_story_map=lambda sid: None)
@@ -5010,11 +5010,13 @@ class ShiftMapRefreshAndLikes(unittest.TestCase):
             self.assertNotIn('quiet', row)
         self.assertNotIn('shiftlike:sig_guess_3', self.items(ui=dict(likes={}, open='shifts')))  # a guess takes no like
 
-    def test_the_map_stays_open_at_full_size_while_one_of_its_entries_is(self):
-        with mock.patch.object(pane, 'PIXELS', True):
-            got = page(story_map=self.smap(), messages=60, map_view=dict(stage=3, rows=3), ui=dict(likes={}, open='shiftlike:sig_risk_1'))
-            lines = pane.page_lines(got, 46, 40, dict(likes={}, open='shiftlike:sig_risk_1'))
-        self.assertEqual([run for _, run, _, _ in lines.wanted], [9])
+    def test_the_map_stays_open_in_full_while_one_of_its_entries_is(self):
+        ui = dict(likes={}, open='shiftlike:sig_risk_1')
+        got = page(story_map=self.smap(), messages=60, map_view=dict(open=False), ui=ui)
+        lines = pane.page_lines(got, 46, 40, ui)
+        seen = [flat(line) for line in lines]
+        self.assertTrue(any('Check endpoints' in line for line in seen))  # the second shift shows: not folded to the first
+        self.assertEqual(lines.wanted, [])
         self.assertTrue(pane.map_open('shiftlike:x') and pane.map_open('shifts') and not pane.map_open('story') and not pane.map_open(None))
 
     def test_a_like_is_kept_as_csr_engine_reads_it_and_an_unlike_follows_it(self):

@@ -1672,6 +1672,96 @@ Summary:
         });
     }
 
+    /// A canned model reply, no `claude -p`: the prompt asks for five fields, the reply is
+    /// parsed, grounded and stored, and the stored map and the shift reflection carry the
+    /// Before and After sentences. A 4-field line in the same reply still lands.
+    #[test]
+    fn a_canned_five_field_reply_is_stored_with_before_and_after() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let prompt = build_prompt(&StoryContext {
+            current_session_excerpt: String::new(),
+            current_v3_enrichment: None,
+            related_sessions: Vec::new(),
+            project_name: "csr".into(),
+        });
+        assert!(prompt.contains("kind|before|after|was|now"), "{prompt}");
+        assert!(summary_story_prompt("s", "t").contains("kind|before|after|was|now"));
+
+        let storage = std::sync::Arc::new(Storage::open_memory().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                100,
+            ))),
+            std::path::PathBuf::from("/tmp"),
+        );
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO code_evolution (
+                        id, session_id, project_name, file_path, language, timestamp,
+                        functions_added, functions_removed, types_added, types_removed
+                    ) VALUES
+                    ('evo_1', 'conv-canned', 'csr', '/repo/src/a.rs', 'rust', '2026-10-14T00:00:01Z', '[\"f1\"]', '[]', '[]', '[]'),
+                    ('evo_2', 'conv-canned', 'csr', '/repo/src/b.rs', 'rust', '2026-10-14T00:00:02Z', '[\"f2\"]', '[]', '[]', '[]')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let reply = "The session moved the map to text.\n@shifts\n\
+                     shift|-|a.rs:f1+|-|The map writes Before and After as text.\n\
+                     shift|-|b.rs:f2+|The map drew its labels at 9 px.|The map writes labels as text rows.\n";
+        let (prose, shifts) = crate::story_map::finish_story_output(reply, true);
+        assert_eq!(prose, "The session moved the map to text.");
+        assert_eq!(shifts.len(), 2);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(crate::story_map::store::record_story_map(
+            &engine,
+            "csr",
+            "conv-canned",
+            1,
+            10,
+            "Haiku",
+            shifts,
+        ));
+
+        let map = crate::story_map::store::load_story_map(&storage, "conv-canned").expect("map");
+        let entries = &map.current.entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].was, None);
+        assert_eq!(
+            entries[0].now.as_deref(),
+            Some("The map writes Before and After as text.")
+        );
+        assert_eq!(
+            entries[1].was.as_deref(),
+            Some("The map drew its labels at 9 px.")
+        );
+        let said: Vec<String> = storage
+            .get_ledger_reflections_by_tag("narrative_shift", 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, content, _, _)| content)
+            .collect();
+        assert!(said
+            .iter()
+            .any(|c| c.ends_with("- New: The map writes Before and After as text.")));
+        assert!(said.iter().any(|c| c.ends_with(
+            "- Before: The map drew its labels at 9 px. After: The map writes labels as text rows."
+        )));
+    }
+
     #[test]
     fn the_v3_lookup_never_takes_a_shift_ledger_row_for_an_analysis() {
         let storage = Arc::new(Storage::open_memory().unwrap());
