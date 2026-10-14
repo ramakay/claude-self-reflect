@@ -777,6 +777,7 @@ pub(crate) async fn keyword_fallback(
                 })
                 .collect();
             let labels = why_csr_text_labels(storage, &items);
+            let items = sink_labeled_evidence(items, &labels);
             let mut rendered = format_why_labeled(
                 query,
                 &items,
@@ -2452,6 +2453,11 @@ pub async fn search_by_file(
         .map(|(chunk, _, _)| chunk)
         .collect();
     let notes = csr_text_notes(storage, &chunks);
+    // CSR-text rows after the clean ones, order kept inside each group
+    let (clean, csr): (Vec<_>, Vec<_>) = chunks
+        .into_iter()
+        .partition(|chunk| !notes.contains_key(&chunk.id));
+    let chunks: Vec<_> = clean.into_iter().chain(csr).collect();
     Ok(format::format_file_results(
         &chunks,
         file_path,
@@ -2732,15 +2738,16 @@ pub async fn why(
     }
 
     let labels = why_csr_text_labels(storage, &ranking.items);
+    let items = sink_labeled_evidence(ranking.items, &labels);
     let mut rendered = format_why_labeled(
         query,
-        &ranking.items,
+        &items,
         &ranking.hoisted_chunk_ids,
         &reinstatement.trace,
         &labels,
     );
 
-    append_memory_provenance_hop(storage, &ranking.items, &mut rendered)?;
+    append_memory_provenance_hop(storage, &items, &mut rendered)?;
 
     Ok(rendered)
 }
@@ -2812,6 +2819,18 @@ fn sanitize_memory_description(s: &str) -> String {
 
 /// Format evidence items as: header, grouped-by-conversation body (in the
 /// ranked order `items` already carries), footer summary.
+/// Stable sink: evidence from a chunk holding CSR text after the clean evidence,
+/// order kept inside each group, nothing dropped.
+fn sink_labeled_evidence(
+    items: Vec<crate::search::reinstatement::EvidenceItem>,
+    labels: &HashMap<String, String>,
+) -> Vec<crate::search::reinstatement::EvidenceItem> {
+    let (clean, csr): (Vec<_>, Vec<_>) = items
+        .into_iter()
+        .partition(|item| !labels.contains_key(&item.chunk_id));
+    clean.into_iter().chain(csr).collect()
+}
+
 /// `[CSR text]` notes for the evidence chunks that hold CSR text, by chunk id.
 /// The excerpt shown is a cut of the chunk; the detector reads the whole chunk.
 fn why_csr_text_labels(
@@ -6666,6 +6685,62 @@ mod tests {
         let by_file = search_by_file(&storage, "libfile", 5, None).await.unwrap();
         assert!(by_file.contains("conv-csr"), "the row is kept: {by_file}");
         assert!(by_file.contains("[CSR text]"), "file search: {by_file}");
+    }
+
+    /// The file search fallback sinks a CSR-text row below the clean rows, order
+    /// kept inside each group, nothing dropped.
+    #[tokio::test]
+    async fn file_search_sinks_a_csr_text_row_below_the_clean_ones() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut index = SearchEngine::new(8);
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "csr-chunk",
+            "conv-csr",
+            "A standing rule from 10-12: “Keep receipts”\nlibfile libfile libfile libfile",
+            [1.0, 0.0, 0.0, 0.0],
+        );
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "clean-chunk",
+            "conv-clean",
+            "notes about the tree, see libfile once among much other unrelated text here",
+            [0.0, 1.0, 0.0, 0.0],
+        );
+        let rows = storage.fts5_search("libfile", 5, None).unwrap();
+        assert_eq!(
+            rows[0].0.id, "csr-chunk",
+            "the CSR row ranks first before the sink"
+        );
+        let out = search_by_file(&storage, "libfile", 5, None).await.unwrap();
+        let csr = out.find("conv-csr").expect("kept");
+        let clean = out.find("conv-clean").expect("kept");
+        assert!(clean < csr, "clean first\n{out}");
+    }
+
+    #[test]
+    fn why_evidence_sinks_a_csr_text_chunk_below_the_clean_ones() {
+        use crate::search::reinstatement::{EvidenceItem, Via};
+        let item = |id: &str, score: f32| EvidenceItem {
+            chunk_id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            score,
+            best_route: Via::Keyword,
+            routes: [Via::Keyword].into_iter().collect(),
+            route_scores: [(Via::Keyword, score)].into_iter().collect(),
+            timestamp: "2026-10-13T00:00:00Z".into(),
+            excerpt: "x".into(),
+            ratification: None,
+            trust: crate::provenance::TrustTier::Unknown,
+        };
+        let items = vec![item("csr", 0.9), item("a", 0.8), item("b", 0.7)];
+        let labels: HashMap<String, String> =
+            [("csr".to_string(), "[CSR text] x".to_string())].into();
+        let sunk = sink_labeled_evidence(items, &labels);
+        let ids: Vec<&str> = sunk.iter().map(|i| i.chunk_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "csr"]);
     }
 
     #[test]
