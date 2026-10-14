@@ -758,6 +758,148 @@ mod tests {
         assert_eq!(all_text(&storage), before);
     }
 
+    /// More than one transcript recorded for one id: no re-parse is trusted to
+    /// say what the rest held, so the plan says so and the text stays.
+    #[test]
+    fn a_conversation_with_several_registered_sources_gets_no_reparse() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "twice", 0, RECAP);
+        for name in ["twice-a.jsonl", "twice-b.jsonl"] {
+            let source = temp.path().join(name);
+            std::fs::write(&source, user_line(RECAP)).unwrap();
+            register_source(&storage, &source, "twice");
+        }
+        let before = all_text(&storage);
+        let report = dry_run_scrub(&storage, None, false, true).unwrap();
+        assert_eq!(
+            (report.source_unavailable, report.conversations_planned),
+            (1, 0)
+        );
+        assert!(
+            report.actions[0].contains("2 source paths registered"),
+            "{:?}",
+            report.actions
+        );
+        assert_eq!(all_text(&storage), before);
+    }
+
+    /// A conversation whose chunks include another adapter's source (a plan, a
+    /// Codex rollout) is never re-parsed as a Claude transcript, even with a
+    /// readable file registered; the conversation beside it is planned as usual.
+    #[test]
+    fn another_sources_chunks_are_never_reparsed_as_a_claude_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Storage::open_memory().unwrap();
+        let text = format!("Keep this fact.\n\n{RECAP}");
+
+        let claude = temp.path().join("claude.jsonl");
+        std::fs::write(&claude, user_line(&text)).unwrap();
+        seed(&storage, "claude", 0, &text);
+        register_source(&storage, &claude, "claude");
+
+        let mixed = temp.path().join("mixed.jsonl");
+        std::fs::write(&mixed, user_line(&text)).unwrap();
+        seed(&storage, "mixed", 0, &text);
+        storage
+            .insert_chunk_with_source(
+                &ConversationChunk {
+                    id: super::super::generate_chunk_id("mixed", 1),
+                    conversation_id: "mixed".into(),
+                    project_name: "project".into(),
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                    content: "a plan document".into(),
+                    message_count: 1,
+                    summary: None,
+                    author: Speaker::User,
+                    seq: 1,
+                    is_sidechain: false,
+                },
+                &[0.1; 384],
+                "plan",
+            )
+            .unwrap();
+        register_source(&storage, &mixed, "mixed");
+
+        let before = all_text(&storage);
+        let report = dry_run_scrub(&storage, None, false, true).unwrap();
+        assert_eq!(
+            (report.conversations_planned, report.source_unavailable),
+            (1, 1),
+            "{:?}",
+            report.actions
+        );
+        let mixed_line = report
+            .actions
+            .iter()
+            .find(|line| line.starts_with("mixed:"))
+            .expect("the mixed conversation is reported");
+        assert!(
+            mixed_line.contains("not a Claude transcript"),
+            "{mixed_line}"
+        );
+        assert!(report
+            .actions
+            .iter()
+            .any(|line| line.starts_with("claude:") && line.contains("writes 0 chunks")));
+        assert_eq!(all_text(&storage), before);
+    }
+
+    /// Only reflections that belong to the agent transcripts alone are counted:
+    /// one shared with a real conversation, and one a kept conversation's
+    /// enrichment cites, are not.
+    #[test]
+    fn agent_reflections_shared_with_or_cited_by_a_kept_conversation_are_not_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("agent-a.jsonl");
+        std::fs::write(
+            &source,
+            user_line("-\n# Ratification Dialog-Act Extraction\n\nUSER: keep the daemon"),
+        )
+        .unwrap();
+        let storage = Storage::open_memory().unwrap();
+        seed(&storage, "agent-a", 0, "agent residue");
+        register_source(&storage, &source, "agent-a");
+        let reflect = |id: &str, tags: &[&str]| {
+            let tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
+            storage
+                .insert_reflection(id, &format!("reflection {id}"), &tags, &[0.1; 384])
+                .unwrap();
+        };
+        reflect("own", &["conv_agent-a"]);
+        reflect("shared", &["conv_agent-a", "conv_real-session"]);
+        reflect("cited", &["conv_agent-a"]);
+        // a kept conversation's enrichment cites "cited"
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO enrichment_state (conversation_id, enrichment_type, status, reflection_id)
+                     VALUES ('real-session', 'heuristic', 'done', 'cited')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let before = all_text(&storage);
+
+        let report = dry_run_scrub(&storage, None, true, true).unwrap();
+        assert_eq!(
+            (
+                report.agent_transcripts,
+                report.agent_chunks,
+                report.agent_reflections
+            ),
+            (1, 1, 1),
+            "{:?}",
+            report.actions
+        );
+        assert_eq!(all_text(&storage), before);
+        // the reflections themselves are all still there
+        for id in ["own", "shared", "cited"] {
+            assert!(storage.get_reflection_by_id(id).unwrap().is_some(), "{id}");
+        }
+    }
+
     #[test]
     fn busy_database_errors_are_recognised_and_other_errors_are_not() {
         let busy = anyhow::Error::from(rusqlite::Error::SqliteFailure(
