@@ -1599,11 +1599,13 @@ def utc_stamp(epoch_s):
 
 def new_receipts(sid, root, at):
     """The receipts the code has gathered since the map's telling, one number: 2 for each file this session's edits
-    touched, 1 for each symbol they added or removed, 3 for each commit. Zero model tokens; None when the DB cannot be read."""
+    touched, 1 for each symbol they added or removed, 3 for each commit. Zero model tokens; None when the DB cannot be read.
+    The rows keep their time in two forms ('2026-10-13T11:45:22.195666+00:00' and '2026-10-13 11:45:22'); datetime()
+    reads both to one UTC form, because as text 'T' sorts after ' ' and every same-day edit would look new."""
     con = connect()
     try:
         rows = con.execute('select file_path, functions_added, functions_removed, types_added, types_removed '
-                           'from code_evolution where session_id = ? and timestamp > ?', (sid, utc_stamp(at))).fetchall()
+                           'from code_evolution where session_id = ? and datetime(timestamp) > ?', (sid, utc_stamp(at))).fetchall()
     finally:
         con.close()
     files, symbols = set(), set()

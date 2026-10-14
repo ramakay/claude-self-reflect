@@ -5195,6 +5195,25 @@ class StoryNews(unittest.TestCase):
         self.assertEqual(pane.new_receipts('sid-1', None, self.AT), 2 * 2 + (4 + 1))
         self.assertEqual(pane.new_receipts('sid-1', None, self.AT + 1000), 0)
 
+    def test_receipts_compare_times_not_text_across_both_stored_forms(self):
+        # code_evolution keeps 'YYYY-MM-DDTHH:MM:SS.ffffff+00:00' on some rows and 'YYYY-MM-DD HH:MM:SS' on others;
+        # as text 'T' sorts after ' ', so every same-day edit before the map used to count as news.
+        def at(seconds_after, form):
+            when = pane.datetime.fromtimestamp(self.AT + seconds_after, tz=pane.timezone.utc)
+            return when.isoformat() if form == 'T' else when.strftime('%Y-%m-%d %H:%M:%S')
+        def row(file, seconds_after, form):
+            self.sql('insert into code_evolution values (?, ?, ?, ?, ?, ?, ?, ?)', file, 'sid-1', file, at(seconds_after, form),
+                     '[]', '[]', '[]', '[]')
+        row('t-before.rs', -3600, 'T')  # the same day, an hour before the telling
+        row('s-before.rs', -3600, ' ')
+        row('t-edge.rs', 0, 'T')  # exactly at the telling is not after it
+        row('s-edge.rs', 0, ' ')
+        row('t-after.rs', 600, 'T')
+        row('s-after.rs', 600, ' ')
+        self.assertEqual(pane.new_receipts('sid-1', None, self.AT), 2 * 2)  # the two after-edits, one file each
+        self.assertEqual(pane.new_receipts('sid-1', None, self.AT - 7200), 2 * 6)
+        self.assertEqual(pane.new_receipts('sid-1', None, self.AT + 3600), 0)
+
     def test_commits_since_the_telling_count_three_each(self):
         repo = os.path.join(self.tmp.name, 'repo')
         os.makedirs(repo)
