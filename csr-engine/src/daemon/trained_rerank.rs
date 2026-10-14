@@ -126,6 +126,13 @@ fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
     pairs
 }
 
+/// Whether the transcript entry holds text a CSR formatter's grammar matches
+/// (the detector search and status use). A mention of a header is not one.
+fn entry_carries_csr_emission(entry: &Entry) -> bool {
+    matches!(entry.role, Role::User | Role::Assistant)
+        && crate::import::contamination::has_csr_text(&entry.text)
+}
+
 fn conversation_is_contaminated(
     entries: &[Entry],
     csr_tool_blocks_suppressed: i64,
@@ -133,9 +140,7 @@ fn conversation_is_contaminated(
 ) -> bool {
     csr_tool_blocks_suppressed > 0
         || csr_hook_wrappers_scrubbed > 0
-        || entries
-            .iter()
-            .any(|entry| crate::import::contamination_reason(&entry.text).is_some())
+        || entries.iter().any(entry_carries_csr_emission)
 }
 
 fn transcript_mtime(path: &Path) -> Result<i64> {
@@ -1126,12 +1131,26 @@ mod tests {
         let clean = vec![entry(1, Role::User, "normal request")];
         assert!(!conversation_is_contaminated(&clean, 0, 0));
         assert!(conversation_is_contaminated(&clean, 1, 0));
+        // A complete emission in a channel CSR writes into is contamination;
+        // a mention of the same header is not.
         let emitted = vec![entry(
             1,
             Role::Assistant,
-            "CSR ENDLESS MEMORY ACTIVE — prior context",
+            "CSR engine ready (degraded mode).",
         )];
         assert!(conversation_is_contaminated(&emitted, 0, 0));
+        let user_emitted = vec![entry(
+            1,
+            Role::User,
+            "recap [2m ago]: Fixed the importer. [[CSR:RECAP]]",
+        )];
+        assert!(conversation_is_contaminated(&user_emitted, 0, 0));
+        let mention = vec![entry(
+            1,
+            Role::User,
+            "CSR ENDLESS MEMORY ACTIVE — prior context",
+        )];
+        assert!(!conversation_is_contaminated(&mention, 0, 0));
     }
 
     #[test]

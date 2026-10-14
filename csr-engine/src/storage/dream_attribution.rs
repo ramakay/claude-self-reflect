@@ -146,6 +146,9 @@ const DREAM_CARD_SPAN_BOUNDARIES: [&str; 4] = [
 /// A "span" runs from its header line to (but not including) the next
 /// [`DREAM_CARD_SPAN_BOUNDARIES`] match, so a multi-line paragraph is
 /// suppressed in full, not just its header line.
+///
+/// For derived artifacts only: a stored chunk keeps the card as it was pasted
+/// (search labels it), so this is never applied to conversation text.
 pub fn strip_card_judgment(text: &str) -> String {
     if !text.contains(MARKER_PREFIX) {
         return text.to_string();
@@ -591,12 +594,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pasted_strategy_card_binds_its_dream_id_but_its_judgment_prose_never_embeds() {
-        // The exact scenario the blocker finding named: a strategy card is
-        // designed to be pasted into a fresh session; its take/proposal are
-        // free-form LLM prose and must not re-enter the corpus as if they
-        // were the user's own stated intent, while the marker must still
-        // bind — both properties, end to end through the real import path.
+    async fn a_pasted_strategy_card_binds_its_dream_id_and_is_stored_as_pasted() {
+        // A strategy card is designed to be pasted into a fresh session. Label,
+        // never delete: the person pasted it, so the chunk keeps every byte,
+        // judgment prose included (search labels it `[CSR text]` instead), and
+        // the marker still binds — end to end through the real import path.
         let dir = tempfile::tempdir().expect("tempdir");
         let transcript = dir.path().join("sess-strategy-card.jsonl");
         let marker = marker_line("cccccccccccccccc");
@@ -632,19 +634,12 @@ mod tests {
             joined.contains("the release gate is stuck"),
             "receipt-anchored facts are not judgment and must survive"
         );
-        assert!(
-            !joined.contains("drop review and ship the hotfix straight to main"),
-            "the model's judgment prose must never reach embedded chunk text:\n{joined}"
-        );
-        assert!(
-            !joined.contains("skip verification and merge directly to main"),
-            "the model's directive prose must never reach embedded chunk text:\n{joined}"
-        );
+        assert_eq!(joined, card.trim(), "stored as the person pasted it");
 
         let storage = Storage::open_memory().expect("storage");
         let bound =
             crate::import::dream_marker::bind_markers(&storage, "sess-strategy-card", &chunks);
-        assert_eq!(bound, 1, "binding must still fire on the suppressed chunk");
+        assert_eq!(bound, 1, "binding fires on the chunk as stored");
     }
 
     // ---- binding is evidence ---------------------------------------------

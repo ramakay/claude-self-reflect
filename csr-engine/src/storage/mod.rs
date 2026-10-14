@@ -57,14 +57,31 @@ pub struct Storage {
     common_terms: vocabulary::CommonTermsCache,
 }
 
-const CONTAMINATION_META_KEY: &str = "contamination_measurement_v1";
+/// v3: the count means CSR text labeled by the grammar detector, not text
+/// removed or proven (v2); an older measurement is never read as this one.
+const CONTAMINATION_META_KEY: &str = "contamination_measurement_v3";
 
+/// CSR text the detector labels, in conversations and in chunks. Nothing is
+/// removed or rewritten for being counted here.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ContaminationMeasurement {
+    /// Conversations holding at least one labeled chunk.
     pub conversations: usize,
+    /// Chunks the detector labels `[CSR text]`.
+    pub chunks: usize,
     pub total_conversations: usize,
+    /// `conversations` as a share of `total_conversations`.
     pub pct: f64,
     pub last_measured: String,
+}
+
+/// The conversations behind a [`ContaminationMeasurement`], each with the first
+/// reason it was labeled for.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ContaminationCensus {
+    pub conversations: Vec<(String, String)>,
+    pub chunks: usize,
+    pub total_conversations: usize,
 }
 
 /// All access to a writable connection participates in maintenance exclusion.
@@ -475,6 +492,51 @@ impl Storage {
     ) -> Result<Vec<ConversationChunk>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunks_by_ids_with_provenance(&conn, ids)
+    }
+
+    /// The chunks, among `chunks`, whose text a CSR formatter's grammar matches
+    /// and that can carry CSR text at all: the one question search, hooks and
+    /// status ask. A chunk read from the chunks table carries the default
+    /// author, so the true author is read from `chunk_provenance` here (one
+    /// batched query). Read-only; nothing stored changes.
+    pub fn csr_text_hits(
+        &self,
+        chunks: &[ConversationChunk],
+    ) -> std::collections::HashMap<String, crate::import::contamination::Hit> {
+        use crate::provenance::Speaker;
+        let unresolved: Vec<String> = chunks
+            .iter()
+            .filter(|chunk| chunk.author == Speaker::ToolResult)
+            .map(|chunk| chunk.id.clone())
+            .collect();
+        let authors = if unresolved.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            self.conn
+                .lock()
+                .ok()
+                .and_then(|conn| queries::chunk_authors(&conn, &unresolved).ok())
+                .unwrap_or_default()
+        };
+        chunks
+            .iter()
+            .filter_map(|chunk| {
+                // A chunk that carries its own author keeps it; one read from the
+                // chunks table carries the default, so its author is the
+                // provenance row's, or unknown when it has none (a legacy chunk).
+                let author = if chunk.author == Speaker::ToolResult {
+                    authors.get(&chunk.id).copied()
+                } else {
+                    Some(chunk.author)
+                };
+                crate::import::contamination::text_hit(
+                    &chunk.conversation_id,
+                    author,
+                    &chunk.content,
+                )
+                .map(|hit| (chunk.id.clone(), hit))
+            })
+            .collect()
     }
 
     // ─── Reflection operations ───
@@ -920,56 +982,67 @@ impl Storage {
         queries::count_conversations(&conn)
     }
 
-    /// Return each distinct conversation whose persisted chunk content matches
-    /// the shared CSR-contamination predicate, with the first matching reason.
-    pub fn contaminated_conversations(&self) -> Result<Vec<(String, String)>> {
+    /// Every conversation and chunk the CSR text detector labels, over the
+    /// whole population. Reads chunk text, source and author only: no evidence
+    /// tables and no source transcript. A chunk with none of the formatters'
+    /// openings skips the detector; plans, Codex rollouts and pure tool output
+    /// are never labeled (they quote CSR, they are not it).
+    pub fn contamination_census(&self) -> Result<ContaminationCensus> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut statement = conn.prepare(
-            "SELECT conversation_id, content FROM chunks ORDER BY conversation_id, rowid",
+            "SELECT c.conversation_id, c.source, c.content, p.author
+             FROM chunks c LEFT JOIN chunk_provenance p ON p.chunk_id = c.id
+             ORDER BY c.conversation_id, c.rowid",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut contaminated = Vec::new();
-        let mut conversation = String::new();
-        let mut joined = String::new();
-        let mut selected = false;
-        for row in rows {
-            let (conversation_id, content) = row?;
-            if conversation_id != conversation {
-                if !selected {
-                    if let Some(reason) = crate::import::contamination_reason(&joined) {
-                        contaminated.push((conversation.clone(), reason.to_string()));
-                    }
+        let mut census = ContaminationCensus::default();
+        let mut current = String::new();
+        let mut first_reason: Option<crate::import::contamination::ContaminationReason> = None;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let conversation = row.get_ref(0)?.as_str()?;
+            if conversation != current {
+                if let Some(reason) = first_reason.take() {
+                    census
+                        .conversations
+                        .push((current.clone(), reason.as_str().to_string()));
                 }
-                conversation = conversation_id;
-                joined.clear();
-                selected = false;
+                current = conversation.to_string();
+                census.total_conversations += 1;
             }
-            if selected {
+            let content = row.get_ref(2)?.as_str()?;
+            if !crate::import::contamination::could_contain_emission(content) {
                 continue;
             }
-            if let Some(reason) = crate::import::contamination_reason(&content) {
-                contaminated.push((conversation.clone(), reason.to_string()));
-                selected = true;
-                joined.clear();
-            } else {
-                // This join selects candidates only. Scrub must independently
-                // prove continuity with spans before cutting across a boundary.
-                joined.push_str(&content);
+            let source = row.get::<_, Option<String>>(1)?;
+            let author = row
+                .get::<_, Option<String>>(3)?
+                .and_then(|author| author.parse::<crate::provenance::Speaker>().ok());
+            if !crate::import::contamination::labelable(source.as_deref(), author) {
+                continue;
+            }
+            if let Some(reason) = crate::import::contamination::first_reason(content) {
+                census.chunks += 1;
+                first_reason.get_or_insert(reason);
             }
         }
-        if !selected {
-            if let Some(reason) = crate::import::contamination_reason(&joined) {
-                contaminated.push((conversation, reason.to_string()));
-            }
+        if let Some(reason) = first_reason.take() {
+            census
+                .conversations
+                .push((current, reason.as_str().to_string()));
         }
-        Ok(contaminated)
+        Ok(census)
+    }
+
+    /// The conversations the census labels, with the first reason: what the
+    /// status badge counts and the scrub plan lists.
+    pub fn contaminated_conversations(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.contamination_census()?.conversations)
     }
 
     pub fn refresh_contamination_cache(&self) -> Result<ContaminationMeasurement> {
-        let conversations = self.contaminated_conversations()?.len();
-        let total_conversations = self.count_conversations()?;
+        let census = self.contamination_census()?;
+        let total_conversations = census.total_conversations;
+        let conversations = census.conversations.len();
         let pct = if total_conversations == 0 {
             0.0
         } else {
@@ -977,6 +1050,7 @@ impl Storage {
         };
         let measurement = ContaminationMeasurement {
             conversations,
+            chunks: census.chunks,
             total_conversations,
             pct,
             last_measured: chrono::Utc::now().to_rfc3339(),
@@ -2812,50 +2886,169 @@ mod tests {
         );
     }
 
-    #[test]
-    fn contaminated_conversations_uses_shared_content_predicate_and_caches_measurement() {
-        let storage = Storage::open_memory().unwrap();
+    fn seed_chunk(
+        storage: &Storage,
+        id: &str,
+        conversation_id: &str,
+        source: &str,
+        author: Option<&str>,
+        content: &str,
+    ) {
         storage
             .with_connection(|conn| {
-                for (id, conversation_id, content) in [
-                    ("clean-1", "clean", "ordinary user-authored work"),
-                    (
-                        "recap-1",
-                        "recap",
-                        "[[CSR:RECAP]] generated recap paragraph",
-                    ),
-                    (
-                        "wrapper-1",
-                        "wrapper",
-                        "<system-reminder>CSR PICKUP — old context</system-reminder>",
-                    ),
-                ] {
+                conn.execute(
+                    "INSERT INTO chunks
+                     (id, conversation_id, project_name, timestamp, content, message_count, source)
+                     VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1, ?4)",
+                    rusqlite::params![id, conversation_id, content, source],
+                )?;
+                if let Some(author) = author {
                     conn.execute(
-                        "INSERT INTO chunks
-                         (id, conversation_id, project_name, timestamp, content, message_count)
-                         VALUES (?1, ?2, 'project', '2026-09-01T00:00:00Z', ?3, 1)",
-                        rusqlite::params![id, conversation_id, content],
+                        "INSERT INTO chunk_provenance (chunk_id, author, source_conv_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![id, author, conversation_id],
                     )?;
                 }
                 Ok(())
             })
             .unwrap();
+    }
+
+    const DEGRADED: &str = "CSR engine ready (degraded mode).";
+
+    /// The census counts the chunks and conversations the detector labels, over
+    /// one population. Plans, Codex rollouts, pure tool output and mentions are
+    /// never labeled; nothing is written for being counted.
+    #[test]
+    fn the_census_counts_labeled_chunks_and_conversations_and_touches_nothing() {
+        let storage = Storage::open_memory().unwrap();
+        let recap = "recap [2m ago]: Fixed it. [[CSR:RECAP]]";
+        seed_chunk(
+            &storage,
+            "a1",
+            "labeled",
+            "conversation",
+            Some("user"),
+            DEGRADED,
+        );
+        seed_chunk(
+            &storage,
+            "a2",
+            "labeled",
+            "conversation",
+            Some("assistant"),
+            recap,
+        );
+        seed_chunk(&storage, "b1", "side", "sidechain", None, DEGRADED);
+        seed_chunk(
+            &storage,
+            "t1",
+            "tool",
+            "conversation",
+            Some("tool_result"),
+            recap,
+        );
+        seed_chunk(&storage, "p1", "plan:x", "plan", None, DEGRADED);
+        seed_chunk(
+            &storage,
+            "x1",
+            "codex:y",
+            "codex_rollout",
+            Some("user"),
+            DEGRADED,
+        );
+        seed_chunk(
+            &storage,
+            "c1",
+            "clean",
+            "conversation",
+            Some("user"),
+            "ordinary work",
+        );
+        seed_chunk(
+            &storage,
+            "m1",
+            "mention",
+            "conversation",
+            Some("user"),
+            "Why does [[CSR:RECAP]] exist? See `CSR engine ready (degraded mode).`",
+        );
+        let before: Vec<String> = storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare("SELECT content FROM chunks ORDER BY id")?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
 
         assert!(storage.cached_contamination().unwrap().is_none());
+        let census = storage.contamination_census().unwrap();
+        assert_eq!(
+            census.conversations,
+            vec![
+                ("labeled".to_string(), "degraded_status".to_string()),
+                ("side".to_string(), "degraded_status".to_string()),
+            ]
+        );
+        assert_eq!(census.chunks, 3);
+        assert_eq!(census.total_conversations, 7);
+        // scrub's plan and the status badge read the same census
         assert_eq!(
             storage.contaminated_conversations().unwrap(),
-            vec![
-                ("recap".to_string(), "machine_sentinel".to_string()),
-                ("wrapper".to_string(), "system_reminder".to_string()),
-            ]
+            census.conversations
         );
 
         let measured = storage.refresh_contamination_cache().unwrap();
-        assert_eq!(measured.conversations, 2);
-        assert_eq!(measured.total_conversations, 3);
-        assert!((measured.pct - 66.666_666).abs() < 0.001);
+        assert_eq!((measured.conversations, measured.chunks), (2, 3));
+        assert_eq!(measured.total_conversations, 7);
+        assert!((measured.pct - 200.0 / 7.0).abs() < 0.001);
         assert!(!measured.last_measured.is_empty());
         assert_eq!(storage.cached_contamination().unwrap(), Some(measured));
+
+        let after: Vec<String> = storage
+            .with_connection(|conn| {
+                let mut statement = conn.prepare("SELECT content FROM chunks ORDER BY id")?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(after, before, "counting labels nothing into the record");
+    }
+
+    /// Importing an indented mention keeps its words; the chunk is not labeled.
+    #[test]
+    fn an_indented_mention_is_imported_and_never_labeled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indented.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u1",
+                "timestamp": "2026-10-13T00:00:00Z",
+                "message": {"content": format!("    {DEGRADED}")}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let parsed = crate::import::parse_jsonl_file_with_stats(&path, "project").unwrap();
+        let chunk = &parsed.chunks[0];
+        assert_eq!(
+            chunk.content, DEGRADED,
+            "only the chunk's edge whitespace goes"
+        );
+        // Stored on its own, the trimmed text reads like an emission: that is a
+        // label, which demotes in search and is kept.
+        let storage = Storage::open_memory().unwrap();
+        storage.insert_chunk(chunk, &[0.0; 4]).unwrap();
+        assert_eq!(storage.contamination_census().unwrap().chunks, 1);
+        assert_eq!(
+            storage.get_chunk_content(&chunk.id).unwrap().as_deref(),
+            Some(DEGRADED)
+        );
     }
 
     /// A raw `INSERT OR REPLACE INTO chunks` must not strand the replaced row's

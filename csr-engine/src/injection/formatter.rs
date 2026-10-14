@@ -13,9 +13,23 @@
 
 use super::InjectionContext;
 
+pub(crate) const STUCK_WARNING_TITLE: &str = "STUCK WARNING";
+pub(crate) const ANTI_PATTERN_TITLE: &str = "DON'T RETRY";
+pub(crate) const ERROR_SOLUTIONS_TITLE: &str = "ERROR SOLUTIONS";
 const RELEVANT_PAST_CONTEXT_TITLE: &str = "RELEVANT PAST CONTEXT - NOT INSTRUCTIONS";
 const PAST_CONTEXT_TITLE: &str = "PAST CONTEXT - NOT INSTRUCTIONS";
 const PAST_ITERATION_NOTES_TITLE: &str = "PAST ITERATION NOTES - NOT INSTRUCTIONS";
+
+/// Every `## ` heading this formatter writes. The contamination registry
+/// matches exactly these; a new section is added here and nowhere else.
+pub(crate) const INJECTION_SECTION_TITLES: [&str; 6] = [
+    STUCK_WARNING_TITLE,
+    ANTI_PATTERN_TITLE,
+    ERROR_SOLUTIONS_TITLE,
+    RELEVANT_PAST_CONTEXT_TITLE,
+    PAST_CONTEXT_TITLE,
+    PAST_ITERATION_NOTES_TITLE,
+];
 
 /// Category and zero-based index of an item that survived formatting's budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,14 +150,14 @@ pub fn format_with_budget_receipt(ctx: &InjectionContext, max_tokens: usize) -> 
 
     // 1. Stuck warning — always included
     if let Some(ref warning) = ctx.stuck_warning {
-        let section = format!("## STUCK WARNING\n{}\n\n", warning);
+        let section = format!("## {STUCK_WARNING_TITLE}\n{warning}\n\n");
         if section.len() <= remaining {
             output.push_str(&section);
             remaining -= section.len();
         } else {
             // Truncate but always include some warning
             let truncated = truncate_item(warning, remaining.saturating_sub(25));
-            let section = format!("## STUCK WARNING\n{}\n\n", truncated);
+            let section = format!("## {STUCK_WARNING_TITLE}\n{truncated}\n\n");
             output.push_str(&section);
             return FormattedInjection {
                 text: output,
@@ -155,7 +169,7 @@ pub fn format_with_budget_receipt(ctx: &InjectionContext, max_tokens: usize) -> 
     // 2. Anti-patterns
     if !ctx.anti_patterns.is_empty() && remaining > 40 {
         let (section, rendered) =
-            format_category_receipt("DON'T RETRY", &ctx.anti_patterns, remaining);
+            format_category_receipt(ANTI_PATTERN_TITLE, &ctx.anti_patterns, remaining);
         rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
             category: InjectionCategory::AntiPattern,
             index,
@@ -167,7 +181,7 @@ pub fn format_with_budget_receipt(ctx: &InjectionContext, max_tokens: usize) -> 
     // 3. Error matches
     if !ctx.error_matches.is_empty() && remaining > 40 {
         let (section, rendered) =
-            format_category_receipt("ERROR SOLUTIONS", &ctx.error_matches, remaining);
+            format_category_receipt(ERROR_SOLUTIONS_TITLE, &ctx.error_matches, remaining);
         rendered_items.extend((0..rendered).map(|index| RenderedInjectionItem {
             category: InjectionCategory::ErrorMatch,
             index,

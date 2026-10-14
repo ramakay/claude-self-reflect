@@ -1,12 +1,14 @@
 //! Evaluation framework for csr-engine.
 //!
 //! Quick mode: 5 core tests plus the persisted trained-reranker gate (<30s)
-//! Full mode: 20 tests plus the persisted trained-reranker gate (~2 min)
+//! Full mode: 20 tests plus the persisted trained-reranker gate and the
+//! emitter contamination canary (~2 min)
 //! Continuity mode: the North Star gate — CSR must recall its own vision with
 //! provenance, beating a grep baseline (`csr-engine eval --continuity`).
 
 pub mod bench;
 pub mod codegraph;
+pub mod contamination;
 pub mod continuity;
 pub mod lessons;
 pub mod provenance;
@@ -196,6 +198,10 @@ pub async fn run_full(
     // Performance deep tests (2)
     results.push(test_batch_embedding_speed(embeddings));
     results.push(test_search_latency_p95(embeddings, search).await);
+
+    // Contamination: every emitter output removed, every mention kept (no DB).
+    results.push(contamination::emitter_canary());
+    results.push(contamination::census_result(storage));
 
     EvalReport {
         results,

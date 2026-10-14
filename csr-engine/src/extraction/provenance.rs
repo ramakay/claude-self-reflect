@@ -26,7 +26,15 @@
 //!    emitted grammar wherever it sits, the person's words around it kept.
 //!
 //! RULE: any new injected block format MUST register its header (and any
-//! distinctive field tokens) here, in the same commit that adds the formatter.
+//! distinctive field tokens) here, in the same commit that adds the formatter,
+//! and its exact grammar in `import::contamination::REGISTRY`. The header
+//! strings below are the registry's own constants: one place to rename them.
+//! This module judges what to *extract*; the registry decides what to *remove*
+//! from the corpus, and only by span, owner and channel. The two must not be
+//! confused: a mention that extraction declines to learn from is still the
+//! person's words.
+
+use crate::import::contamination;
 
 /// Prompt signatures of CSR's own agent subprocesses (briefing analyst,
 /// compaction summarizer, ratification extractor). A transcript *starting*
@@ -66,20 +74,22 @@ pub const AGENT_PROMPT_SIGNATURES: [&str; 4] = [
 /// substring match took for the emission (Codex review r2, #6 and #7). They are matched by
 /// their emitted grammar instead: [`strip_csr_forwards`].
 const EMISSION_HEADERS: [&str; 16] = [
-    "CSR ENDLESS MEMORY ACTIVE",
-    "CSR CONTINUUM [",
-    "CSR PICKUP —",
-    "EPISODE INDEX —",
-    "## Session Intelligence",
-    "## CSR Memory Feedback",
-    "CSR Memory Feedback Probe",
-    "SESSION CONTINUITY DETECTED",
-    "RECENT SESSIONS - PAST CONTEXT",
-    "RELEVANT PAST CONTEXT",
-    "PAST CONTEXT - NOT INSTRUCTIONS",
+    contamination::MEMORY_MANIFEST_HEADER,
+    contamination::CONTINUUM_HEADER,
+    contamination::PICKUP_HEADER,
+    contamination::EPISODE_INDEX_HEADER_PREFIX,
+    contamination::SESSION_INTELLIGENCE_HEADER,
+    contamination::MEMORY_FEEDBACK_REPORT_HEADER,
+    contamination::MEMORY_FEEDBACK_PROBE_HEADER,
+    contamination::CONTINUITY_HEADER_PREFIX,
+    contamination::RECENT_SESSIONS_HEADER_PREFIX,
+    contamination::RELEVANT_CONTEXT_HEADER_PREFIX,
+    contamination::PAST_CONTEXT_HEADER_PREFIX,
     "You are CSR Episode Analyst",
     "You are summarizing a coding session",
     "# Ratification Dialog-Act Extraction",
+    // The companion's keep list and notice (hooks/compact.ts KEEP_HEADER, NOTICE_HEADER): the plugin's
+    // test_compact.py reads these two as literals, so they stay literals.
     "CSR COMPACT KEEP —",
     "CSR compacted at",
 ];
@@ -414,7 +424,6 @@ struct Forwards {
     own: String,
     /// Byte offset of the first forward in the CRLF-normalised, trimmed text.
     first: usize,
-    spans: Vec<ForwardSpan>,
 }
 
 /// Byte offset just past the `…` pane.py's `one_line(text, chars)` appends when it cut a send that starts at
@@ -551,23 +560,12 @@ fn forward_prefix_start(piece: &str, earlier_prose: bool) -> usize {
     }
 }
 
-/// A forward's byte range, and whether its end relies on the message ending.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ForwardSpan {
-    pub start: usize,
-    pub end: usize,
-    pub needs_message_end: bool,
-    /// Insert the same joining space extraction places between kept pieces.
-    pub join: bool,
-}
-
-/// Cut one-line forwards using the same prefix and span grammar as scrub.
-fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize, Vec<ForwardSpan>)> {
+/// Cut one-line forwards: what the person wrote around them, and where the first starts.
+fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize)> {
     let mut pieces = Vec::new();
-    let mut spans = Vec::new();
     let mut cursor = 0;
     let mut first = None;
-    while let Some((start, end, bounded)) = next_one_line_forward(line, cursor, others) {
+    while let Some((start, end, _bounded)) = next_one_line_forward(line, cursor, others) {
         first.get_or_insert(start);
         let from = cursor
             + forward_prefix_start(
@@ -575,63 +573,22 @@ fn strip_one_line_forwards(line: &str, others: bool) -> Option<(String, usize, V
                 pieces.iter().any(|piece: &&str| !piece.trim().is_empty()),
             );
         pieces.push(&line[cursor..from]);
-        spans.push(ForwardSpan {
-            start: from,
-            end,
-            needs_message_end: end == line.len() && !bounded,
-            join: false,
-        });
         cursor = end.max(start + 1);
     }
     let first = first?;
     pieces.push(&line[cursor..]);
     let mut own = String::new();
-    for (index, piece) in pieces.into_iter().enumerate() {
-        let trimmed = piece.trim_start();
-        if index > 0 {
-            // Include whitespace removed from the next kept piece in the
-            // mapped cut, so persistence uses precisely this same join rule.
-            spans[index - 1].end += piece.len() - trimmed.len();
-        }
-        let piece = trimmed;
+    for piece in pieces {
+        let piece = piece.trim_start();
         if piece.is_empty() {
             continue;
         }
         if !own.is_empty() && !own.ends_with(char::is_whitespace) {
             own.push(' ');
-            spans[index - 1].join = true;
         }
         own.push_str(piece);
     }
-    Some((own.trim_end().to_string(), first, spans))
-}
-
-/// All forward cuts in original byte coordinates, including band forwards.
-/// Extraction and scrub obtain their cuts from the same complete-message parser.
-pub(crate) fn forward_spans(text: &str) -> Vec<ForwardSpan> {
-    let Some(found) = scan_forwards(text, true) else {
-        return Vec::new();
-    };
-    let normalized = text.replace("\r\n", "\n");
-    let leading = normalized.len() - normalized.trim_start().len();
-    let bytes = text.as_bytes();
-    let mut offsets = (0..bytes.len())
-        .filter(|&at| bytes[at] != b'\r' || bytes.get(at + 1) != Some(&b'\n'))
-        .collect::<Vec<_>>();
-    offsets.push(text.len());
-    found
-        .spans
-        .into_iter()
-        .map(|span| ForwardSpan {
-            start: offsets[leading + span.start],
-            join: span.join,
-            end: offsets[leading + span.end],
-            // A newline present in the stored text supplies the line's end even
-            // when trimming removed it before parsing.
-            needs_message_end: span.needs_message_end
-                && !normalized[leading + span.end..].contains('\n'),
-        })
-        .collect()
+    Some((own.trim_end().to_string(), first))
 }
 
 /// Read `text` by line for the forwards [`strip_csr_forwards`] names (the card and the story only when `others`).
@@ -657,7 +614,6 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
     // `None`: the line is cut whole; `Some(text)`: what is left of it.
     let mut kept: Vec<Option<&str>> = lines.iter().map(|line| Some(*line)).collect();
     let mut first: Option<usize> = None;
-    let mut spans = Vec::new();
     let mark = |at: usize, first: &mut Option<usize>| {
         *first = Some(first.map_or(at, |seen| seen.min(at)));
     };
@@ -702,18 +658,6 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
             continue;
         }
         let to = if reasoning { end } else { at + 1 };
-        let span_start = question.map_or(starts[at], |(line, open)| starts[line] + open);
-        let span_end = if to < lines.len() {
-            starts[to]
-        } else {
-            body.len()
-        };
-        spans.push(ForwardSpan {
-            start: span_start,
-            join: false,
-            end: span_end,
-            needs_message_end: to == lines.len(),
-        });
         let from = match question {
             Some((line, open)) => {
                 let before = lines[line][..open].trim_end();
@@ -732,13 +676,7 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
     for (index, line) in kept.iter().enumerate() {
         let Some(line) = line else { continue };
         match strip_one_line_forwards(line, others) {
-            Some((own, at, cuts)) => {
-                spans.extend(cuts.into_iter().map(|cut| ForwardSpan {
-                    start: starts[index] + cut.start,
-                    join: cut.join,
-                    end: starts[index] + cut.end,
-                    needs_message_end: cut.needs_message_end && index + 1 == lines.len(),
-                }));
+            Some((own, at)) => {
                 mark(starts[index] + at, &mut first);
                 if !own.is_empty() {
                     left.push(own);
@@ -762,7 +700,6 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
     Some(Forwards {
         own: paragraphs.join("\n\n"),
         first,
-        spans,
     })
 }
 
@@ -839,18 +776,18 @@ const PANE_SEND_WIDTH: usize = 699;
 /// the formatter). Lines under one of them that continue the block (`- [`
 /// items) go with it.
 const INJECTED_BLOCK_OPENINGS: [&str; 12] = [
-    "CSR PICKUP —",
-    "EPISODE INDEX —",
+    contamination::PICKUP_HEADER,
+    contamination::EPISODE_INDEX_HEADER_PREFIX,
     "## PAST CONTEXT - NOT INSTRUCTIONS",
     "## RELEVANT PAST CONTEXT - NOT INSTRUCTIONS",
-    "PAST CONTEXT - NOT INSTRUCTIONS",
+    contamination::PAST_CONTEXT_HEADER_PREFIX,
     "RELEVANT PAST CONTEXT - NOT INSTRUCTIONS",
-    "CSR CONTINUUM [",
-    "CSR ENDLESS MEMORY ACTIVE",
+    contamination::CONTINUUM_HEADER,
+    contamination::MEMORY_MANIFEST_HEADER,
     "Resume from LAST/NEXT above",
     "CSR: `",
-    "RECENT SESSIONS - PAST CONTEXT",
-    "SESSION CONTINUITY DETECTED",
+    contamination::RECENT_SESSIONS_HEADER_PREFIX,
+    contamination::CONTINUITY_HEADER_PREFIX,
 ];
 
 /// Where a hand-off item came from, as pane.py's `from_when` + project +
@@ -1179,20 +1116,55 @@ mod tests {
         );
     }
 
-    /// Every reader of the person's words agrees on `input`: extraction, the
-    /// import scrub, and the query-side emission stripper.
+    fn labeled(text: &str) -> bool {
+        crate::import::contamination::has_csr_text(text)
+    }
+
+    /// The readers that make derived artifacts agree on `input`: extraction and
+    /// the query-side emission stripper. (The stored conversation is not one of
+    /// them: import keeps every byte, and the detector only labels.)
     fn own_words_agree(input: &str, mine: Option<&str>) {
         assert_eq!(extractable(input).as_deref(), mine, "extractable: {input}");
-        assert_eq!(
-            crate::import::scrub_contaminated_text(input).as_deref(),
-            mine,
-            "scrub: {input}"
-        );
         assert_eq!(
             strip_csr_emissions(input),
             mine.unwrap_or(""),
             "strip_csr_emissions: {input}"
         );
+    }
+
+    /// Extraction and import must not diverge silently on a mention: where
+    /// the text only quotes an emission, extraction learns nothing from it and
+    /// the import remover leaves every byte alone.
+    #[test]
+    fn protected_mentions_are_ignored_by_extraction_and_untouched_by_import() {
+        let emissions = [
+            "recap [2m ago]: Fixed the importer. [[CSR:RECAP]]\nSettled: a (abc1234).",
+            "CSR engine ready (degraded mode).",
+            "CSR CONTINUUM [4m ago]: Fix the importer\nLAST: Added checks (outcome=success, trust=user_history)\nFull state: csr_reflect_on_past(\"conv_abc123\")\n",
+            "CSR's compaction card (compacting soon), quoted: \u{201c}Keep the plan.\u{201d}",
+        ];
+        for emission in emissions {
+            let fenced = format!("```text\n{emission}\n```");
+            let quoted: String = emission.lines().map(|line| format!("> {line}\n")).collect();
+            let inline = format!("the hook wrote `{}` once", emission.lines().next().unwrap());
+            for mention in [&fenced, &quoted, &inline] {
+                // Import: a mention, every byte stays.
+                assert!(
+                    !labeled(mention),
+                    "the detector labeled a mention: {mention:?}"
+                );
+                // Extraction: nothing of the quoted emission survives as content.
+                if let Some(own) = extractable(mention) {
+                    assert!(
+                        !own.contains("[[CSR:RECAP]]")
+                            && !own.contains("degraded mode")
+                            && !own.contains("CONTINUUM")
+                            && !own.contains("compaction card"),
+                        "extraction re-learned a quoted emission from {mention:?}: {own:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1206,13 +1178,11 @@ mod tests {
             "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “One.”",
         ] {
             let quoted = format!("> I vote 2 {forward} Keep the deployment frozen.");
-            // Extraction excludes quoted personal lines, as before. Import
-            // scrub keeps quoted personal text while removing the CSR forward.
+            // Extraction excludes quoted personal lines, as before. The import
+            // remover treats a blockquote line as a mention of the forward, not
+            // an emission of it: every byte stays.
             assert_eq!(extractable(&quoted), None);
-            assert_eq!(
-                crate::import::scrub_contaminated_text(&quoted).as_deref(),
-                Some("> I vote 2 Keep the deployment frozen.")
-            );
+            assert!(!labeled(&quoted), "a quoted line is a mention");
             // A kept whitespace suffix supplies the join itself.
             own_words_agree(
                 &format!("I vote\t2{forward} Keep the deployment frozen."),
@@ -1353,7 +1323,12 @@ mod tests {
                 Some("Before I send this: and after it, my reply."),
             );
             own_words_agree(&format!("2{send}\nmy reply"), Some("my reply"));
-            own_words_agree(&format!("> {send} Keep it."), Some("Keep it."));
+            // A quoted line is a mention to the import remover (every byte
+            // stays); extraction and the query side still cut the forward.
+            let quoted = format!("> {send} Keep it.");
+            assert_eq!(extractable(&quoted).as_deref(), Some("Keep it."));
+            assert_eq!(strip_csr_emissions(&quoted), "Keep it.");
+            assert!(!labeled(&quoted), "a quoted line is a mention");
         }
         // The cut ones end on `…”` inside their limit.
         assert_eq!(sends[1].chars().count(), 700);
@@ -1484,17 +1459,17 @@ mod tests {
     #[test]
     fn astra_5_a_sentinel_line_goes_and_the_line_beside_it_stays() {
         let input = "Keep the deployment frozen.\n[[CSR:RECAP]] generated recap";
-        assert_eq!(
-            crate::import::scrub_contaminated_text(input).as_deref(),
-            Some("Keep the deployment frozen.")
-        );
+        // Extraction and the query side treat a sentinel line as the machine's.
         assert_eq!(strip_csr_emissions(input), "Keep the deployment frozen.");
-        // A recap line inside the person's paragraph, without its sentinel.
+        // The detector labels a sentinel only as the end of a valid recap line,
+        // so a line that merely carries the token is the person's.
+        assert!(!labeled(input));
+        // A recap line without its sentinel is no complete recap either.
         let recap = "Keep the deployment frozen.\nrecap [2h ago]: shipped the cap. Next: tag it.";
-        assert_eq!(
-            crate::import::scrub_contaminated_text(recap).as_deref(),
-            Some("Keep the deployment frozen.")
-        );
+        assert!(!labeled(recap));
+        // With its sentinel it is found (and kept: nothing is cut from the record).
+        let valid = "Keep the deployment frozen.\nrecap [2h ago]: shipped the cap. [[CSR:RECAP]]\n";
+        assert!(labeled(valid));
     }
 
     #[test]
@@ -1504,7 +1479,7 @@ mod tests {
             "Keep this user requirement. ".repeat(16)
         );
         assert!(input.find("CSR's compaction card").unwrap() > HEADER_WINDOW);
-        assert!(crate::import::contamination_reason(&input).is_some());
+        assert!(crate::import::contamination::has_csr_text(&input));
     }
 
     #[test]
@@ -1646,10 +1621,7 @@ mod tests {
         assert_eq!(strip_dreamer_prompt(&reply).as_deref(), mine);
         assert_eq!(extractable(&reply).as_deref(), mine);
         assert_eq!(Some(strip_csr_emissions(&reply).trim()), mine);
-        assert_eq!(
-            crate::import::scrub_contaminated_text(&reply).as_deref(),
-            mine
-        );
+        assert!(labeled(&reply));
         assert_eq!(strip_dreamer_prompt(&forward).as_deref(), Some(""));
         assert!(extractable(&forward).is_none());
         assert_eq!(strip_csr_emissions(&forward), "");
@@ -1703,11 +1675,7 @@ mod tests {
             );
             assert!(is_dreamer_prompt(&sent), "{question}");
             assert!(is_csr_emission(&sent), "{question}");
-            assert_eq!(
-                crate::import::scrub_contaminated_text(&sent),
-                None,
-                "{question}"
-            );
+            assert!(labeled(&sent), "{question}");
         }
         // The person's own non-English question is still theirs.
         assert!(!is_csr_emission(hindi));

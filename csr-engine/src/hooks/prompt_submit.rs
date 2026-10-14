@@ -511,10 +511,7 @@ async fn handle_inner(
             let names: Vec<(String, String)> =
                 rows.into_iter().map(|(sid, a)| (sid, a.name)).collect();
             if let Some((sid, name)) = symbol_overlap(prompt, &names) {
-                writeln!(output,
-                    "CSR: `{}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{}\")",
-                    name, sid
-                )?;
+                writeln!(output, "{}", format_anchor_notice(&name, &sid))?;
                 effects.record_impression(
                     input.session_id.as_deref(),
                     &project,
@@ -1146,20 +1143,35 @@ fn is_continuation_prompt(prompt: &str) -> bool {
         .any(|ph| p == *ph || p.starts_with(&format!("{ph} ")))
 }
 
+/// The last line of a CSR PICKUP block.
+pub(crate) const PICKUP_RESUME_LINE: &str =
+    "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.";
+
 /// Emit the CSR PICKUP block: reason line, Tier-0 episode state, resume
 /// imperative. Used only by Route A lineage pickup (is_continuation_prompt /
 /// Continue / StateRecall) — the CONTINUUM banner is reserved for the active
 /// conversation lineage, never for a Route-B topic match.
-fn emit_pickup(output: &mut String, ep: &crate::hooks::stop::Episode, age: &str, reason: &str) {
+pub(crate) fn emit_pickup(
+    output: &mut String,
+    ep: &crate::hooks::stop::Episode,
+    age: &str,
+    reason: &str,
+) {
     output.push_str(&format!("CSR PICKUP — {}\n", reason));
     output.push_str(&crate::hooks::session_start::format_tier0_block(
         ep,
         &[],
         age,
     ));
-    output.push_str(
-        "Resume from LAST/NEXT above; run the Full state lookup before re-deriving anything.\n",
-    );
+    output.push_str(PICKUP_RESUME_LINE);
+    output.push('\n');
+}
+
+/// The one-line pointer for a prompt that names an anchored function.
+pub(crate) fn format_anchor_notice(symbol: &str, session_id: &str) -> String {
+    format!(
+        "CSR: `{symbol}` was modified in a recent session — episode: csr_reflect_on_past(\"conv_{session_id}\")"
+    )
 }
 
 /// What an episode asked: its first prompt, plus its latest task when that
@@ -1230,7 +1242,11 @@ fn pick_lineage_episode(
 /// conversation lineage (Route A / SessionStart), so a topic match can
 /// never be mistaken for "this is the session you're resuming". Renders
 /// as a PICKUP reason line + a single EPISODE-INDEX-style line.
-fn format_semantic_pickup(ep: &crate::hooks::stop::Episode, age: &str, score: f32) -> String {
+pub(crate) fn format_semantic_pickup(
+    ep: &crate::hooks::stop::Episode,
+    age: &str,
+    score: f32,
+) -> String {
     let reason = format!(
         "CSR PICKUP — this prompt matches a past episode (similarity {:.2}); \
          the work may already exist — verify against it before re-deriving.\n",
@@ -1608,6 +1624,9 @@ async fn search_chunks_with_vec_core(
         }
     };
 
+    // The detector's answer for every fetched chunk, in one batched read: a
+    // legacy chunk with no provenance row has an unknown author and is checked.
+    let csr_text = storage.csr_text_hits(&fetched);
     let mut chunk_by_id: std::collections::HashMap<String, _> =
         fetched.into_iter().map(|c| (c.id.clone(), c)).collect();
 
@@ -1636,6 +1655,13 @@ async fn search_chunks_with_vec_core(
                         .flatten()
                         .map(|provenance| provenance.source_conv_id)
                 }) {
+                    continue;
+                }
+
+                // CSR text is labeled in search and not handed back as memory:
+                // read the whole chunk, before the preview is cut. Selection
+                // only; the stored chunk is untouched.
+                if csr_text.contains_key(&chunk.id) {
                     continue;
                 }
 
@@ -2243,6 +2269,11 @@ fn is_self_referential_noise(content: &str) -> bool {
     if crate::extraction::provenance::is_csr_emission(content) {
         return true;
     }
+    // CSR text the detector labels in search is skipped here, when context is
+    // chosen: selection, not deletion. The chunk itself is untouched.
+    if crate::import::contamination::has_csr_text(content) {
+        return true;
+    }
     // A row that is mostly a pasted CSR emission (another session quoting a
     // pane hand-off list or an injected block back) is CSR's words, not memory.
     let own = crate::extraction::provenance::strip_csr_emissions(content);
@@ -2505,6 +2536,180 @@ mod tests {
             results[0].min_trust,
             crate::provenance::TrustTier::UserHistory
         );
+    }
+
+    /// The detector reads the whole chunk, before the 300-byte preview is cut:
+    /// a standing rule whose closing quote lies past the cut is still CSR text.
+    #[tokio::test]
+    async fn a_long_csr_text_chunk_is_not_injected_though_its_preview_would_not_match() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let long_rule = format!("A standing rule from 10-12: “{}”", "x".repeat(400));
+        for (id, content) in [
+            ("long-rule", long_rule.as_str()),
+            ("plain", "we moved the index load out of the hook"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::User,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+            search.insert_chunk(id.to_string(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let results =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 5, 0.0, "project", None, |_| {
+                HashMap::new()
+            })
+            .await;
+        let ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        assert_eq!(ids, ["plain"], "the long rule must not be injected");
+    }
+
+    /// A legacy chunk with no chunk_provenance row has an unknown author, not
+    /// a tool author: predictive context does not inject it either.
+    #[tokio::test]
+    async fn a_legacy_csr_text_chunk_without_provenance_is_not_injected() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        for (id, content) in [
+            ("legacy-rule", "A standing rule from 10-12: “Keep receipts”"),
+            ("plain", "we moved the index load out of the hook"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            search.insert_chunk(id.to_string(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let results =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 5, 0.0, "project", None, |_| {
+                HashMap::new()
+            })
+            .await;
+        let ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        assert_eq!(ids, ["plain"]);
+    }
+
+    /// Lineage pickup skips an episode whose text has a detector hit and falls
+    /// through to the next candidate.
+    #[tokio::test]
+    async fn lineage_pickup_skips_an_episode_whose_text_is_csr_text() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        for (session, request, completed, stamp) in [
+            (
+                "clean",
+                "Fix the auth middleware regression",
+                "Fixed the token check in the middleware",
+                "2026-10-12T12:00:00Z",
+            ),
+            (
+                "csr",
+                "A standing rule from 10-12: “Keep receipts”",
+                "Fixed the token check in the middleware",
+                "2026-10-13T12:00:00Z",
+            ),
+        ] {
+            let ep = crate::hooks::stop::Episode {
+                schema: "v2".into(),
+                session_id: session.into(),
+                project: "proj".into(),
+                timestamp: stamp.into(),
+                request: request.into(),
+                investigated: vec![],
+                completed: completed.into(),
+                next_steps: None,
+                blockers: None,
+                outcome: "success".into(),
+                error_signatures: vec![],
+                tools_used: vec![],
+                files_modified: vec![],
+                message_count: 10,
+                duration_minutes: 5,
+                todos: vec![],
+                approved_plan: None,
+                prev_episode_id: None,
+                error_count: None,
+                top_errors: vec![],
+                steer_count: None,
+                steers: vec![],
+                instrumentation_version: None,
+                correction_count: None,
+                recap_evidence_version: None,
+                anchor_request: None,
+                completions: vec![],
+                completions_untied: false,
+                compact_anchor: None,
+                anchors: vec![],
+            };
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &serde_json::to_string(&ep).unwrap(),
+                    &crate::hooks::stop::episode_tags(&ep),
+                    &[0.0; 4],
+                )
+                .unwrap();
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                8,
+            ))),
+            root.path().to_path_buf(),
+        );
+        let (picked, _) = pick_lineage_episode(&engine, &cwd, "continue please").unwrap();
+        assert_eq!(picked.session_id, "clean");
     }
 
     #[tokio::test]
@@ -2814,6 +3019,7 @@ mod tests {
             crate::mcp::tools::ConvValidity {
                 demote: true,
                 note: "stale".into(),
+                csr_only_demote: false,
             },
         )]
         .into_iter()
@@ -2973,6 +3179,21 @@ mod tests {
         let tags_same = ["project_csr".to_string(), "session_story".to_string()];
         let has_project_tags_same = tags_same.iter().any(|t| t.starts_with("project_"));
         assert!(has_project_tags_same && tags_same.contains(&project_tag));
+    }
+
+    /// Context selection skips a chunk the detector labels (CSR's own pane
+    /// sends); a person's sentence that only mentions the words stays eligible.
+    #[test]
+    fn predictive_context_skips_chunks_with_a_detector_hit() {
+        assert!(is_self_referential_noise(
+            "A standing rule from 10-12: “Keep receipts”"
+        ));
+        assert!(is_self_referential_noise(
+            "CSR remembered: “Use component ownership”."
+        ));
+        assert!(!is_self_referential_noise(
+            "My mother said it best: `A standing rule from 10-12: “Keep receipts”` is worth keeping in the docs."
+        ));
     }
 
     #[test]

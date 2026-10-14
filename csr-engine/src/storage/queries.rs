@@ -118,30 +118,6 @@ pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Re
     Ok(())
 }
 
-/// Replace the evidence of chunks in one conversation inside a transaction the
-/// caller already holds, then relink once, seeded by that conversation and the
-/// conversations its events name: its family, never the whole corpus. The
-/// corpus-wide relink held a maintenance transaction past every hook's 5 s busy
-/// timeout on the full database (astra r2 #1: 18.4 s for its seed query alone).
-pub(crate) fn replace_conversation_evidence_in(
-    conn: &Connection,
-    conversation_id: &str,
-    evidence: &[ChunkEvidence],
-) -> Result<()> {
-    let mut seeds = vec![conversation_id.to_string()];
-    for row in evidence {
-        replace_chunk_evidence_inner(conn, row)
-            .with_context(|| format!("persisting provenance for chunk {}", row.chunk_id))?;
-        for event in &row.events {
-            if !seeds.contains(&event.conversation_id) {
-                seeds.push(event.conversation_id.clone());
-            }
-        }
-    }
-    super::sidechain_provenance::relink_conversations(conn, &seeds)?;
-    Ok(())
-}
-
 fn evidence_needs_relink(conn: &Connection, evidence: &ChunkEvidence) -> Result<bool> {
     for event in &evidence.events {
         if event.parent_event_id.is_some() {
@@ -934,6 +910,31 @@ pub fn get_chunks_by_ids_with_provenance(
         }
     }
     Ok(chunks)
+}
+
+/// The authors of some chunks, from `chunk_provenance`, one query per 500
+/// ids. A chunk with no row (or an unknown token) is absent from the map.
+pub fn chunk_authors(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<HashMap<String, crate::provenance::Speaker>> {
+    let mut authors = HashMap::new();
+    for batch in ids.chunks(500) {
+        let marks = vec!["?"; batch.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT chunk_id, author FROM chunk_provenance WHERE chunk_id IN ({marks})"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, author) = row?;
+            if let Ok(author) = author.parse() {
+                authors.insert(id, author);
+            }
+        }
+    }
+    Ok(authors)
 }
 
 pub fn insert_reflection(

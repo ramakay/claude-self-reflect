@@ -76,3 +76,7 @@ tower = { version = "0.5", features = ["util"] }
 [[bench]]
 name = "spike_bench"
 harness = false
+
+[[bench]]
+name = "contamination_bench"
+harness = false

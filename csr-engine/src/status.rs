@@ -235,7 +235,11 @@ pub struct DreamVerdictTotals {
 
 #[derive(Serialize, Debug, Default, PartialEq)]
 pub struct ContaminationStatus {
+    /// Conversations holding CSR text the detector labels.
     pub conversations: usize,
+    /// Chunks labeled `[CSR text]` in search and skipped by hook injection.
+    /// They are kept as they were written; nothing is removed.
+    pub chunks: usize,
     pub total_conversations: usize,
     pub pct: f64,
     pub last_measured: Option<String>,
@@ -245,6 +249,7 @@ impl From<crate::storage::ContaminationMeasurement> for ContaminationStatus {
     fn from(measurement: crate::storage::ContaminationMeasurement) -> Self {
         Self {
             conversations: measurement.conversations,
+            chunks: measurement.chunks,
             total_conversations: measurement.total_conversations,
             pct: measurement.pct,
             last_measured: Some(measurement.last_measured),
@@ -1988,10 +1993,12 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             format_dreaming_elapsed(dreaming.elapsed_secs)
         ));
     }
-    if report.contamination.conversations > 0 {
+    // CSR's own text found in the conversation record: labeled in search and
+    // skipped by hook injection, never removed.
+    if report.contamination.chunks > 0 {
         out.push_str(&format!(
-            " | ⚠ {} contaminated",
-            report.contamination.conversations
+            " | {} CSR-text chunks labeled",
+            report.contamination.chunks
         ));
     }
     if let Some(holder) = &report.maintenance {
@@ -2251,6 +2258,7 @@ mod tests {
 
     #[test]
     fn r5_status_uncached_is_unknown_and_deep_persists_verdict() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         let storage = Storage::open(&db).unwrap();
@@ -2295,6 +2303,7 @@ mod tests {
 
     #[test]
     fn round4_status_reads_during_maintenance() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         drop(Storage::open(&db).unwrap());
@@ -2329,6 +2338,7 @@ mod tests {
         let mut report = base_report();
         report.contamination = ContaminationStatus {
             conversations: 2,
+            chunks: 5,
             total_conversations: 10,
             pct: 20.0,
             last_measured: Some("2026-09-01T12:00:00Z".into()),
@@ -2344,6 +2354,7 @@ mod tests {
 
         let value = serde_json::to_value(report).unwrap();
         assert_eq!(value["contamination"]["conversations"], 2);
+        assert_eq!(value["contamination"]["chunks"], 5);
         assert_eq!(value["contamination"]["total_conversations"], 10);
         assert_eq!(value["contamination"]["pct"], 20.0);
         assert_eq!(value["dream"]["dreams"]["unfinished"], 3);
@@ -2354,21 +2365,42 @@ mod tests {
         assert_eq!(value["dream"]["events_total"], 99);
     }
 
-    #[test]
-    fn compact_contamination_badge_only_appears_for_a_measured_nonzero_count() {
-        let mut report = base_report();
-        assert!(!format_compact(&report, 0).contains("contaminated"));
-
-        report.contamination = ContaminationStatus {
-            conversations: 7,
+    fn labeled(conversations: usize, chunks: usize) -> ContaminationStatus {
+        ContaminationStatus {
+            conversations,
+            chunks,
             total_conversations: 100,
-            pct: 7.0,
+            pct: conversations as f64,
             last_measured: Some("2026-09-01T12:00:00Z".into()),
-        };
-        assert!(format_compact(&report, 0).contains("⚠ 7 contaminated"));
+        }
+    }
 
-        report.contamination.conversations = 0;
-        assert!(!format_compact(&report, 0).contains("contaminated"));
+    /// The compact line states what is labeled, once, and only when there is
+    /// something: CSR text in the record is kept and labeled, not an alarm.
+    #[test]
+    fn compact_line_counts_labeled_csr_text_chunks_only_when_there_are_any() {
+        let mut report = base_report();
+        assert!(!format_compact(&report, 0).contains("CSR-text"));
+
+        report.contamination = labeled(3, 7);
+        let line = format_compact(&report, 0);
+        assert!(line.contains(" | 7 CSR-text chunks labeled"), "{line}");
+        assert!(!line.contains("contaminated"), "{line}");
+        assert!(!line.contains("unjudged"), "{line}");
+
+        report.contamination.chunks = 0;
+        assert!(!format_compact(&report, 0).contains("CSR-text"));
+    }
+
+    #[test]
+    fn the_full_status_reports_labeled_conversations_and_chunks() {
+        let mut report = base_report();
+        report.contamination = labeled(4, 9);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["contamination"]["conversations"], 4);
+        assert_eq!(value["contamination"]["chunks"], 9);
+        assert!(value["contamination"].get("unjudged").is_none());
+        assert!(value["contamination"].get("clean").is_none());
     }
 
     #[test]
@@ -3016,6 +3048,7 @@ mod tests {
 
     #[test]
     fn status_backfill_block_defaults_to_empty_on_fresh_db() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -3034,6 +3067,7 @@ mod tests {
 
     #[test]
     fn status_backfill_block_surfaces_stage_cursor_spend_discard_rate_and_canary() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");

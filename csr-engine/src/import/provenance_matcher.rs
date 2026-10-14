@@ -60,7 +60,7 @@ impl MessageIndex {
                 None,
             );
         } else {
-            let mut sanitizer = super::CsrMessageSanitizer::default();
+            let mut sanitizer = super::CsrMessageSanitizer::for_chunks();
             let mut names = HashMap::new();
             let mut floor = parent.map(|p| p.floor);
             let mut seq = 0;
@@ -83,14 +83,14 @@ impl MessageIndex {
                     parent,
                 );
                 let marker = |parts: &[(String, String)]| {
-                    raw.get("type").and_then(|v| v.as_str()) == Some("assistant")
-                        && super::is_marker_only_text(
-                            &parts
-                                .iter()
-                                .map(|(_, s)| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )
+                    super::drops_as_marker_only(
+                        &raw,
+                        &parts
+                            .iter()
+                            .map(|(_, s)| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
                 };
                 if !marker(&raw_components) {
                     documents[1].push(
@@ -188,97 +188,6 @@ impl MessageIndex {
 
     /// Map complete-message forward cuts onto an exact stored slice.
     /// Repeated source text is usable only when every occurrence agrees.
-    fn forward_cuts(&self, content: &str) -> Option<Vec<(usize, usize, bool)>> {
-        if content.is_empty() {
-            return None;
-        }
-        let mut agreed: Option<Vec<(usize, usize, bool)>> = None;
-        for document in &self.documents {
-            for &start in document
-                .anchors
-                .get(&anchor(content.as_bytes()))
-                .into_iter()
-                .flatten()
-            {
-                let end = start + content.len();
-                if document.text.get(start..end) != Some(content) {
-                    continue;
-                }
-                let mut cuts = Vec::new();
-                let first = document.pieces.partition_point(|piece| piece.end <= start);
-                for piece in document.pieces[first..]
-                    .iter()
-                    .take_while(|piece| piece.start < end)
-                {
-                    for span in crate::extraction::provenance::forward_spans(
-                        &document.text[piece.start..piece.end],
-                    ) {
-                        let lo = start.max(piece.start + span.start);
-                        let hi = end.min(piece.start + span.end);
-                        if lo < hi {
-                            cuts.push((lo - start, hi - start, false));
-                        }
-                        // As in mapped chunk cuts, the next kept text's slice
-                        // owns the joining space (including an exact boundary).
-                        let join = piece.start + span.end;
-                        if span.join && join >= start && join < end {
-                            cuts.push((join - start, join - start, true));
-                        }
-                    }
-                }
-                cuts.sort_unstable();
-                cuts.dedup();
-                if agreed.as_ref().is_some_and(|prior| prior != &cuts) {
-                    return None;
-                }
-                agreed = Some(cuts);
-            }
-        }
-        agreed
-    }
-
-    pub(super) fn without_forwards(&self, content: &str) -> Option<String> {
-        self.without_forwards_in_chunks(&[content])
-            .map(|mut own| own.remove(0))
-    }
-
-    /// Match the complete stored sequence before splitting its edits back into
-    /// chunks. A short suffix can also occur in a sanitized representation;
-    /// matching it alone cannot prove whether a preceding cut needs a space.
-    pub(super) fn without_forwards_in_chunks(&self, contents: &[&str]) -> Option<Vec<String>> {
-        let joined = contents.concat();
-        let cuts = self.forward_cuts(&joined)?;
-        let mut offset = 0;
-        let mut offsets = contents
-            .iter()
-            .map(|text| {
-                let start = offset;
-                offset += text.len();
-                start
-            })
-            .collect::<Vec<_>>();
-        offsets.push(offset);
-        let mut own = contents
-            .iter()
-            .map(|text| text.to_string())
-            .collect::<Vec<_>>();
-        for (start, end, join) in cuts.into_iter().rev() {
-            if join {
-                let owner = offsets.partition_point(|&offset| offset <= start) - 1;
-                own[owner].insert(start - offsets[owner], ' ');
-            } else {
-                for (index, text) in own.iter_mut().enumerate() {
-                    let lo = start.max(offsets[index]);
-                    let hi = end.min(offsets[index + 1]);
-                    if lo < hi {
-                        text.replace_range(lo - offsets[index]..hi - offsets[index], "");
-                    }
-                }
-            }
-        }
-        Some(own)
-    }
-
     pub(super) fn locate(&self, chunk_id: &str, content: &str) -> Option<ChunkEvidence> {
         if content.is_empty() {
             return None;

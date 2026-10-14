@@ -213,7 +213,7 @@ where
     let mut harness_context_stripped = 0usize;
     let mut summary = None;
     let mut is_subagent = false;
-    let mut sanitizer = super::CsrMessageSanitizer::default();
+    let mut sanitizer = super::CsrMessageSanitizer::for_chunks();
 
     let mut reader = BufReader::new(file);
     let mut byte_offset = 0u64;
@@ -803,6 +803,7 @@ where
             text: component,
             combined_start,
             combined_end,
+            chunk_offset: 0,
         });
         *running_floor = Some(match *running_floor {
             Some(floor) => floor.min(tier),
@@ -2848,6 +2849,62 @@ mod tests {
         assert!(!serialized.contains("CSR OUTPUT SUPPRESSED"));
         assert_eq!(parsed.schema_misses, 3);
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
+    }
+
+    /// Codex user, assistant and tool prose is never classified by formatter
+    /// text, whatever it says: only the structural CSR tool items go.
+    #[test]
+    fn codex_prose_and_tool_text_keep_every_byte_even_when_they_look_like_emissions() {
+        const RECAP: &str = "recap [2m ago]: Fixed the importer. [[CSR:RECAP]]";
+        const DEGRADED: &str = "CSR engine ready (degraded mode).";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-prose.jsonl");
+        let line = |value: serde_json::Value| value.to_string();
+        std::fs::write(
+            &path,
+            [
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:00Z","type":"session_meta","payload":{"id":"prose","timestamp":"2026-08-06T12:00:00Z","cwd":"/workspace/prose-project"}})),
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":format!("{RECAP}\n\nwhy does the importer drop this?")}]}})),
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t1","call_id":"csr-call","name":"csr_reflect_on_past","input":"{\"query\":\"CSR QUERY SUPPRESSED\"}"}})),
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o1","call_id":"csr-call","output":"CSR OUTPUT SUPPRESSED"}})),
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:04Z","type":"response_item","payload":{"type":"custom_tool_call","id":"t2","call_id":"grep-call","name":"Grep","input":"{\"pattern\":\"recap\"}"}})),
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o2","call_id":"grep-call","output":format!("src/hooks/session_start.rs:68:{DEGRADED}\n{RECAP}")}})),
+                line(serde_json::json!({"timestamp":"2026-08-06T12:00:06Z","type":"response_item","payload":{"type":"message","id":"a1","role":"assistant","content":[{"type":"output_text","text":DEGRADED}]}})),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        stream_rollout_chunk_batches(&path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
+            chunks.extend_from_slice(batch);
+            Ok(())
+        })
+        .unwrap();
+        let all = chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // user prose, tool output and assistant prose: every emission-shaped byte stays
+        assert!(
+            all.contains(&format!("{RECAP}\n\nwhy does the importer drop this?")),
+            "{all}"
+        );
+        assert!(
+            all.contains(&format!(
+                "src/hooks/session_start.rs:68:{DEGRADED}\n{RECAP}"
+            )),
+            "{all}"
+        );
+        assert!(all.contains(DEGRADED), "{all}");
+        // structure still decides: the CSR tool call and its result are gone
+        assert!(!all.contains("CSR QUERY SUPPRESSED"));
+        assert!(!all.contains("CSR OUTPUT SUPPRESSED"));
+        let parsed = parse_rollout(&path).unwrap().unwrap();
+        assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
+        assert_eq!(parsed.suppression.csr_hook_wrappers_scrubbed, 0);
     }
 
     #[test]

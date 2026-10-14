@@ -116,6 +116,7 @@ pub fn compose_recap_with_deliveries(
     const MAX_CHARS: usize = 700;
 
     use crate::extraction::provenance::{extractable, RECAP_SENTINEL};
+    use crate::import::contamination::has_csr_text;
 
     let intent = recap_intent(ep);
     let completed = recap_completed(ep);
@@ -152,6 +153,7 @@ pub fn compose_recap_with_deliveries(
         .filter(|fact| fact.status == "resolved")
         .filter(|fact| fact.source == "user_confirmed")
         .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
+        .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
         .take(3)
         .map(format_fact)
         .collect();
@@ -162,7 +164,7 @@ pub fn compose_recap_with_deliveries(
         .as_deref()
         .and_then(extractable)
         .map(|text| compact_preview(&text, 120))
-        .filter(|text| has_substance(text))
+        .filter(|text| has_substance(text) && !has_csr_text(text))
     {
         now_parts.push(blocker);
     }
@@ -173,6 +175,7 @@ pub fn compose_recap_with_deliveries(
             .filter(|fact| fact.status != "resolved")
             .filter(|fact| fact.source == "user_confirmed")
             .filter(|fact| !normalize_feed_text(&fact.receipt).is_empty())
+            .filter(|fact| !has_csr_text(&normalize_feed_text(&fact.claim)))
             .take(STILL_OPEN_LIMIT)
             .map(format_fact),
     );
@@ -190,17 +193,23 @@ pub fn compose_recap_with_deliveries(
     let todo_entry = (open_todos > 0).then(|| format!("{open_todos} todos open"));
     let priority_now_entries = usize::from(!now_parts.is_empty());
     now_parts.extend(todo_entry);
-    let next = ep.next_steps.as_deref().and_then(next_preview).or_else(|| {
-        ep.todos
-            .iter()
-            .filter(|todo| todo.status != "completed")
-            .find_map(|todo| next_preview(&todo.content))
-    });
+    let next = ep
+        .next_steps
+        .as_deref()
+        .and_then(next_preview)
+        .filter(|next| !has_csr_text(next))
+        .or_else(|| {
+            ep.todos
+                .iter()
+                .filter(|todo| todo.status != "completed")
+                .find_map(|todo| next_preview(&todo.content))
+        });
 
     let retired_entries: Vec<String> = feeds
         .retired_while_away
         .iter()
         .filter(|line| !normalize_feed_text(&line.receipt_oid).is_empty())
+        .filter(|line| !has_csr_text(&normalize_feed_text(&line.label)))
         .take(2)
         .map(|line| {
             format!(
@@ -213,10 +222,15 @@ pub fn compose_recap_with_deliveries(
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
 
-    let correction_entries: Vec<String> = feeds
+    // One list serves what is shown and what is recorded as delivered.
+    let shown_corrections: Vec<&CorrectionLine> = feeds
         .corrections
         .iter()
+        .filter(|line| !has_csr_text(&line.quote))
         .take(2)
+        .collect();
+    let correction_entries: Vec<String> = shown_corrections
+        .iter()
         .map(|line| {
             format!(
                 "{} ({}:{}, {})",
@@ -236,6 +250,7 @@ pub fn compose_recap_with_deliveries(
         .iter()
         .filter(|dream| !normalize_feed_text(&dream.receipt).is_empty())
         .filter(|dream| has_substance(&normalize_feed_text(&dream.label)))
+        .filter(|dream| !has_csr_text(&normalize_feed_text(&dream.verdict)))
         .map(|dream| {
             format!(
                 "{} {} ({}, {})",
@@ -280,11 +295,10 @@ pub fn compose_recap_with_deliveries(
     while clauses[DREAMT].add_one_within(&mut remaining) {}
     while clauses[NOW].add_one_within(&mut remaining) {}
 
-    let rendered_corrections = feeds
-        .corrections
+    let rendered_corrections = shown_corrections
         .iter()
         .take(clauses[CORRECTED].selected)
-        .map(CorrectionIdentity::from)
+        .map(|line| CorrectionIdentity::from(*line))
         .collect();
 
     for line in clauses
@@ -467,6 +481,11 @@ pub(crate) fn displayed_receipts(
     const MAX_CLAIM_CHARS: usize = 100;
     let render = |done: &crate::hooks::stop::CompletionReceipt| {
         let receipt = normalize_feed_text(&done.receipt);
+        // The detector reads the claim as stored, before extraction trims it:
+        // an indented claim is code the detector leaves alone.
+        if crate::import::contamination::has_csr_text(&done.claim) {
+            return None;
+        }
         let claim = extractable(&done.claim).map(|claim| sanitize_preview(&claim))?;
         (!receipt.is_empty() && has_substance(&claim) && claim.chars().count() <= MAX_CLAIM_CHARS)
             .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
@@ -799,6 +818,34 @@ mod tests {
             compact_anchor: None,
             anchors: vec![],
         }
+    }
+
+    #[test]
+    fn recap_claims_that_are_csr_text_are_skipped() {
+        let rule = "A standing rule from 10-12: “Keep receipts”";
+        let mut feeds = full_feeds();
+        feeds.settled.insert(
+            0,
+            SettledFact {
+                claim: rule.into(),
+                receipt: "abc1234".into(),
+                status: "resolved".into(),
+                source: "user_confirmed".into(),
+            },
+        );
+        feeds.still_open.insert(
+            0,
+            SettledFact {
+                claim: rule.into(),
+                receipt: "abc1234".into(),
+                status: "still_open".into(),
+                source: "user_confirmed".into(),
+            },
+        );
+        let recap = compose_recap(&episode(), &feeds, "2h ago").unwrap();
+        assert!(!recap.contains("Keep receipts"), "{recap}");
+        // the other claims still stand
+        assert!(recap.contains("schema is stable"), "{recap}");
     }
 
     fn full_feeds() -> RecapFeeds {
@@ -1478,6 +1525,81 @@ mod tests {
             .contains("Corrected: note (abcdef12:9, 2026-09-01)"));
         assert!(!composed.text.contains("\nCorrected: "));
         assert!(composed.corrections.is_empty());
+    }
+
+    /// What is recorded as delivered is what was shown: a correction that is CSR
+    /// text is skipped in both.
+    #[test]
+    fn the_delivered_correction_is_the_one_displayed_when_another_is_csr_text() {
+        let correction = |quote: &str, turn: u32| CorrectionLine {
+            quote: quote.into(),
+            session8: "abcdef12".into(),
+            turn,
+            date: "2026-09-01".into(),
+        };
+        let feeds = RecapFeeds {
+            corrections: vec![
+                correction("A standing rule from 10-12: “Keep receipts”", 1),
+                correction("Use the staging endpoint", 2),
+            ],
+            ..RecapFeeds::empty()
+        };
+        let composed = compose_recap_with_deliveries(&episode(), &feeds, "now").unwrap();
+        assert!(
+            composed.text.contains("Use the staging endpoint"),
+            "{}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("Keep receipts"),
+            "{}",
+            composed.text
+        );
+        let recorded: Vec<u32> = composed.corrections.iter().map(|c| c.turn).collect();
+        assert_eq!(recorded, [2], "the identity recorded is the one shown");
+    }
+
+    /// A completion claim that is CSR text is not rendered; a clean one beside
+    /// it is.
+    #[test]
+    fn a_completion_claim_that_is_csr_text_is_not_injected() {
+        let mut ep = episode();
+        ep.completions = vec![
+            CompletionReceipt {
+                claim: "Implemented deterministic recap output".into(),
+                receipt: "abc1234".into(),
+            },
+            CompletionReceipt {
+                claim: "A standing rule from 10-12: “Keep receipts”".into(),
+                receipt: "def5678".into(),
+            },
+        ];
+        let recap = compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap();
+        assert!(!recap.contains("Keep receipts"), "{recap}");
+        assert!(
+            recap.contains("Implemented deterministic recap output"),
+            "{recap}"
+        );
+    }
+
+    /// The detector reads the claim as it was stored, before extraction trims
+    /// it: an indented claim is code the detector leaves alone and still renders;
+    /// the same claim unindented is CSR text and does not.
+    #[test]
+    fn an_indented_claim_still_renders_and_the_unindented_one_does_not() {
+        let rule = "A standing rule from 10-12: “Keep receipts”";
+        let recap_with = |claim: String| {
+            let mut ep = episode();
+            ep.completions = vec![CompletionReceipt {
+                claim,
+                receipt: "abc1234".into(),
+            }];
+            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap()
+        };
+        let indented = recap_with(format!("    {rule}"));
+        assert!(indented.contains("Keep receipts"), "{indented}");
+        let plain = recap_with(rule.to_string());
+        assert!(!plain.contains("Keep receipts"), "{plain}");
     }
 
     #[test]
