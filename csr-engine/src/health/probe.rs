@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::RwLock;
 
 use super::{
@@ -395,7 +395,8 @@ pub fn diagnose_miss(
                 params![chunk_id],
                 |_| Ok(()),
             )
-            .is_ok())
+            .optional()?
+            .is_some())
     })?;
     Ok(if !has_embedding {
         MissCause::EmbeddingMissing
@@ -407,6 +408,9 @@ pub fn diagnose_miss(
 }
 
 /// A case is valid while its chunk exists with the content that was sampled.
+/// Only "no such row" means the chunk is gone; any other read error is an
+/// error, never an invalidation (it would shrink the denominator and could turn
+/// a red sample into an abstention).
 fn is_valid(storage: &Storage, case: &ProbeCase) -> Result<bool> {
     let content: Option<String> = storage.with_connection(|conn| {
         Ok(conn
@@ -415,7 +419,7 @@ fn is_valid(storage: &Storage, case: &ProbeCase) -> Result<bool> {
                 params![case.chunk_id],
                 |row| row.get(0),
             )
-            .ok())
+            .optional()?)
     })?;
     Ok(content.is_some_and(|content| content_hash(&content) == case.content_hash))
 }
@@ -1369,5 +1373,60 @@ mod tests {
             .runs
             .iter()
             .all(|r| r.sample_id.as_deref() == Some(other_id.as_str())));
+    }
+    #[tokio::test]
+    async fn a_read_error_on_chunks_keeps_the_previous_red_result_and_its_chip() {
+        use crate::health::{load_health, run_health};
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 12);
+        let (search, backend) = (engine(), silent());
+        let chip = |storage: &Storage| {
+            let snapshot = load_health(storage).unwrap();
+            crate::status::MemoryHealthStatus::from_cache(&snapshot, true, String::new(), now())
+                .warning
+        };
+
+        // a completed red result, with its chip
+        let red = run_health(&storage, &search, &backend, false, now(), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((red.probe.grade, red.probe.n), (ProbeGrade::Red, 12));
+        assert_eq!(chip(&storage).as_deref(), Some("⚠ mem: recall 0/12"));
+
+        // the next measurement cannot read `chunks` (not "the chunk is gone")
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch(
+                    "ALTER TABLE chunks RENAME COLUMN content TO content_unreadable",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let later = run_health(&storage, &search, &backend, false, now() + hours(7), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later.probe.grade, ProbeGrade::Error, "{:?}", later.probe);
+        assert_eq!(later.probe.n, 12, "the denominator is not shrunk to zero");
+        assert_eq!(
+            later.probe.invalidated, 0,
+            "an unreadable chunk is not an invalidated one"
+        );
+
+        let stored = load_health(&storage).unwrap();
+        let kept = stored.state.probe.unwrap();
+        assert_eq!((kept.grade, kept.hits, kept.n), (ProbeGrade::Red, 0, 12));
+        assert!(stored.state.last_probe_error.is_some());
+        assert_eq!(
+            stored.runs.len(),
+            1,
+            "an errored attempt is not a completed run"
+        );
+        assert_eq!(
+            chip(&storage).as_deref(),
+            Some("⚠ mem: recall 0/12"),
+            "the chip stays"
+        );
     }
 }
