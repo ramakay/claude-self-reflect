@@ -159,7 +159,7 @@ class RedactionRound2(Umask022):
         with open(os.path.join(HERE, '..', 'hooks', 'register.tsx'), encoding='utf-8') as handle:
             source = handle.read()
         calls = re.findall(r"keepWrite\(\$, [^\n]*?, '(text|json)'\)", source)
-        self.assertEqual(sorted(calls), ['json', 'text'])  # the plan is JSON, the guard log is text
+        self.assertEqual(sorted(calls), ['json', 'json', 'json', 'text'])  # the plan, the agents file and the handoffs are JSON, the guard log is text
         self.assertNotIn(', true)', ''.join(re.findall(r'keepWrite\([^\n]*', source)))
 
     def test_the_coach_cache_keeps_no_credential_from_what_you_said(self):

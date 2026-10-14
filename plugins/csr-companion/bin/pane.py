@@ -33,6 +33,7 @@ import math
 import os
 import plistlib
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -60,6 +61,8 @@ def sibling(name):
 
 
 private = sibling('private')  # every write below goes through it: folders 0700, files 0600, credentials redacted
+agents_lib = sibling('agents')  # the agents of a session, as the hooks keep them (hooks/agents.ts writes, this reads)
+codex_lib = sibling('codex_runs')  # Codex runs and its week, read from its rollout files; starts no process
 DB = os.path.join(HOME, '.claude-self-reflect', 'csr-engine.db')
 VERB = {'superseded_by': 'changed', 'anchor_obsolete': 'removed', 'anchor_reinstated': 'came back'}
 NESTED = ('/.claude/worktrees/', '/.worktrees/')
@@ -80,6 +83,8 @@ FORMER_DREAM_LOG = os.path.join(HOME, '.claude-self-reflect', 'csr-shifts', 'dre
 DREAMER_SAID = "CSR's dreamer asked this while you worked"
 PANES = os.path.join(KEEP, 'panes')  # <session>.json: the pid of the pane open beside that session
 STATUS_LINES = os.path.join(KEEP, 'statusline')  # <session>.json: Claude's status line, moved into the pane
+AGENTS = os.path.join(KEEP, 'agents')  # <session>.json: the session's agents, written by hooks/agents.ts
+HANDOFFS = os.path.join(KEEP, 'handoffs')  # <session>.json (the hooks') and <session>.drafts.jsonl (the pane's): Lost and found handoffs
 
 
 def epoch(ts):
@@ -1180,7 +1185,15 @@ def brief(con, root, session_id):
             owner = repo_root(folder) if os.path.isdir(folder) else None
             roots[folder] = owner and os.path.realpath(owner)
         return roots[folder]
-    tracked = [path for path in sorted(session.files, key=lambda p: session.last.get(p, 0), reverse=True) if root_of(path)]
+    # The files Claude handled, and those its agents wrote (the agents file, hooks/agents.ts): one union, newest first. An
+    # agent's files count from when it last acted; its notes come from the same CSR memory as Claude's own.
+    agents = agents_of(session_id)
+    heard = {path: session.last.get(path, 0) for path in session.files}
+    for row in agents['agents']:
+        for path in row['edits']:
+            if os.path.isabs(path):
+                heard[path] = max(heard.get(path, 0), row['last_at'] / 1000)
+    tracked = [path for path in sorted(heard, key=lambda p: heard[p], reverse=True) if root_of(path)]
     compacted = [at for at in session.compacts if at]
     before = max(compacted) if compacted else None  # this session's work before it counts as past
     for path in tracked[:6]:
@@ -1217,6 +1230,9 @@ def brief(con, root, session_id):
                 for ts, quote, sid in corrections]
     out += past_rows(voice_and_lines(con, session_id)[1], time.time())
     out += dream_rows(load_dream_log(root)[:8])
+    envelope = agents_lib.context_envelope(agents, session_id)  # the agents, as a machine envelope: context, not a "* " fact
+    if envelope:
+        out += ['', envelope]
     return '\n'.join(out).strip()
 
 
@@ -1665,7 +1681,7 @@ class Session:
                     summary_sizes=self.summary_sizes, asked=sorted(self.asked), tools=self.tools, learned=learned,
                     summaries=self.summaries[-2:],  # the newest, for the compaction card's Learnt
                     lost=lost_found(self.summaries, self.typed, self.carried or (),
-                                    project_of(self.path or self.guess())),
+                                    project_of(self.path or self.guess()), handoffs_of(self.id)),
                     gave=gave, remembered=remembered, sessions=sessions, project=here[0][0] if here else None,
                     files=dict(self.files), edited=sorted(self.edited), shell=dict(self.shell), last=dict(self.last),
                     main=list(self.main), turn_end=self.turn_end, model=self.model, told=self.told,
@@ -1782,6 +1798,7 @@ SECTION['told'], GLYPH['told'] = 'recall', '↑'  # what CSR told Claude at the 
 SECTION['last'], GLYPH['last'] = 'ctx', '§'  # the session before this one
 SECTION['todos'], GLYPH['todos'] = 'sepia', '◆'  # its leftover todos
 SECTION['compacted'], GLYPH['compacted'] = 'ctx', '§'  # CSR's own compaction: what it kept and learnt
+SECTION['flight'], GLYPH['flight'] = 'ctx', '»'  # In flight: the session's agents, and the Codex runs beside it
 DARK = (PIGMENT['payne'], PIGMENT['night'])  # the masthead's ground, each row a step darker in CIELAB from
 # payne, which sits clear of a dark terminal's own ground (herdr's is 40) so the masthead keeps its edge, down to
 # night; the cockpit's inks lie on top. The vertical tape runs on down the pane's edge in the last step.
@@ -2937,11 +2954,13 @@ def card_edge(rows, name, indent):
     return [tinted(line, band(name)) for line in lines[:-1]] + lines[-1:]
 
 
-def opened(rows, name, detail, width, ui, key, indent=None, whole=False):
+def opened(rows, name, detail, width, ui, key, indent=None, whole=False, hint=None):
     """A row a click opened: its whole text, what more CSR knows (four rows of it, each in two; whole: all of
-    it, never cut), and what a second click does."""
+    it, never cut), and what a second click does (hint, when the row says something else than "→ Claude's prompt")."""
     sent = ui.get('sent')
-    if sent and sent[0] == key:
+    if hint:
+        pass
+    elif sent and sent[0] == key:
         hint = "✓ now in Claude's prompt" if sent[1] else "✗ couldn't reach Claude's pane"
     else:
         hint = "↳ click again → Claude's prompt"
@@ -2962,6 +2981,37 @@ ANSWER_WORD = dict(helpful='helpful', ask_claude='asked Claude', thought_of_it="
                    not_relevant='not relevant', got_it='read', dismiss='dismissed', ignored='passed',
                    turn_off='turned dreams off', expired='folded at a compaction', sent='sent to Claude',
                    rejected='you said no')
+
+
+def claude_in_front(agent):
+    """Whether Claude is what runs in the foreground of a pane: the process whose pid is the foreground process group's
+    leader, per `herdr pane process-info`, has `claude` as its argv0 (or argv[0]) basename. False on any doubt: herdr
+    missing or refusing, output that is not the shape below, no such leader."""
+    try:
+        info = json.loads(herdr('pane', 'process-info', '--pane', agent) or '')['result']['process_info']
+        leader = next(p for p in info['foreground_processes'] if p['pid'] == info['foreground_process_group_id'])
+        names = [leader.get('argv0'), (leader.get('argv') or [None])[0]]
+        return any(isinstance(name, str) and os.path.basename(name) == 'claude' for name in names)
+    except (ValueError, KeyError, TypeError, StopIteration, AttributeError):
+        return False
+
+
+def send_draft(agent, text, named=None):
+    """Words into Claude's prompt, unsent, over more than one line: each line is typed with send-text and a Ctrl+J, Claude Code's
+    own new line, between them; an Enter is never sent, so nothing submits. False as soon as one step fails (the pane's herdr
+    refusing a key stops it with the lines so far typed, none sent). Fails closed unless `agent` is the pane the mod named
+    (`named`) and Claude is what runs in its foreground: the left neighbour agent_pane() falls back to may be a shell, and so
+    may the named pane be, once Claude has exited (nothing closes it), and there a Ctrl+J runs the first line."""
+    lines = [CONTROL.sub('', line) for line in str(text).split('\n')]
+    if not agent or agent != named or not lines or any(len(line) > 4000 for line in lines) \
+            or not claude_in_front(agent):
+        return False
+    for number, line in enumerate(lines):
+        if number and herdr('pane', 'send-keys', agent, 'ctrl+j') is None:
+            return False
+        if line and herdr('pane', 'send-text', agent, line) is None:
+            return False
+    return True
 
 
 def fit(text, width):
@@ -3230,7 +3280,9 @@ def cut_sends(line):
 
 def strip_forwards(text):
     """The text with every forward cut and your paragraphs kept (trimmed, joined by a blank line); the text as it
-    was when it carries none."""
+    was when it carries none. A complete CSR agents envelope (bin/agents.py) is the plugin's words, never yours: it
+    goes first, with its final newline, and every other character stays."""
+    text = agents_lib.strip_envelopes(text)
     lines = text.replace('\r\n', '\n').strip().split('\n')
     blank = lambda line: not line.strip()
     quoted = lambda line: line.lstrip().startswith('>')
@@ -3663,15 +3715,162 @@ def page_main(data, s, now, ui=None):
         dict(name='rules', title='Your rules', right='', items=rules, empty='', at=latest(rules_at),
              brief=counted(len(rules), 'rule')),
     ]
-    sections[2:2] = lost_sections(s, now, 3 * more)
+    names = [section['name'] for section in sections]
+    after_dreams = names.index('dreams') + 1  # by name: the sections above it are not counted by position
+    sections[after_dreams:after_dreams] = lost_sections(s, now, 3 * more)
+    flight = flight_section(data.get('agents'), now, ui, data.get('codex'))
+    if flight:  # after the story, before What if…
+        sections.insert(names.index('story') + 1, flight)
     card = compact_section((data.get('infinite') or {}).get('card'), data.get('compacting'), lost_waiting(s.get('lost')))
     if card:  # CSR's own compaction: under the story, which is pinned on top (the feed keeps it there)
-        sections.insert(1, card)
+        sections.insert(names.index('story') + 1, card)
     head = dict(gauges=gauges(data.get('claude_fields'), data.get('claude_at'), s, now, data.get('limits'),
                               data.get('sts'), data.get('compacting')),
                 session=s if s.get('learned') else None, status=data.get('claude_line'))
     return dict(head=head, quiet='Nothing to report yet. A section shows here once CSR has something for it.',
                 sections=sections)
+
+
+# ---------------------------------------------------------------- In flight: the session's agents
+
+FLIGHT_SHOWN = 4  # agents drawn before "and N more"
+FLIGHT_HINT = "the agent's words, not yours: click again to fold"
+
+
+def agents_of(session_id, folder=None):
+    """The session's agents as hooks/agents.ts last wrote them, checked: a file of another session or version, malformed,
+    over its size, a link or unreadable reads as no agents (bin/agents.py, read_agents)."""
+    if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)):
+        return agents_lib.empty()
+    return agents_lib.read_agents(os.path.join(folder or AGENTS, f'{session_id}.json'), str(session_id))
+
+
+def handoffs_of(session_id, folder=None):
+    """The handoffs of a session's Lost and found, as the hooks and this pane left them: [] for none, or for files that are
+    not this session's or are malformed (bin/agents.py, read_handoffs)."""
+    if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)):
+        return []
+    base = os.path.join(folder or HANDOFFS, str(session_id))
+    return agents_lib.read_handoffs(base + '.json', base + '.drafts.jsonl', str(session_id))
+
+
+def new_handoff(session_id, thread, folder=None):
+    """A click on "-> subagent": a new request id (a retry is always a new one), kept as a draft, and the envelope that carries
+    it into the unsent prompt. (request, envelope), or (None, None) where there is no session to tie it to."""
+    if not session_id or not agents_lib.SESSION.fullmatch(str(session_id)) or not agents_lib.THREAD.fullmatch(str(thread)):
+        return None, None
+    request = 'req-' + secrets.token_hex(8)
+    private.append(os.path.join(folder or HANDOFFS, f'{session_id}.drafts.jsonl'),
+                   private.dumps(dict(request=request, thread=thread, drafted_at=time.time())) + '\n', root=KEEP)
+    return request, agents_lib.handoff_envelope(str(session_id), request, thread)
+
+
+def flight_minutes(row, now):
+    """Minutes an agent has worked: from its start (else when it was first seen) to now while it runs, else to its last event."""
+    begun = (row['started'] or row['first_seen']) / 1000
+    end = now if agents_lib.is_active(row) else row['last_at'] / 1000
+    return max(0, int((end - begun) // 60))
+
+
+def flight_item(row, depth, unknown, now):
+    """One agent as a row: type and model (and "done" once it ended) on the title, which a minute passing never changes;
+    minutes, tools and its last words under it; a flag when it stalled, failed, was killed, said nothing, or wrote a file
+    Claude also wrote. A finished one opens to its report, the agent's words, which is never put in Claude's prompt."""
+    status = row['status']
+    base = ' · '.join(x for x in (row['type'] or 'agent', row['model'], {'completed': 'done', 'failed': 'failed', 'killed': 'killed'}.get(status)) if x)
+    last = row['last'] or (f"using {row['last_tool']}" if row['last_tool'] else '')
+    body = ' · '.join(x for x in (f"{flight_minutes(row, now)}m", counted(row['tools'], 'tool'), one_line(last, 200)) if x)
+    report = agents_lib.reported(row)
+    overlap = ('also edited by Claude this session' + (f": {short_path(row['overlaps'][0], 2)}" if row['overlaps'] else '')
+               + (f" (+{len(row['overlaps']) - 1 + row['overlaps_omitted']})" if len(row['overlaps']) - 1 + row['overlaps_omitted'] > 0 else ''))
+    if agents_lib.stalled(row, now):
+        flag = f"stalled {int((now - row['last_at'] / 1000) // 60)}m"
+    elif status in ('failed', 'killed'):
+        flag = status
+    elif agents_lib.no_report(row):
+        flag = 'no report'
+    else:
+        flag = ''
+    flags = [x for x in (flag, overlap if row['overlaps'] or row['overlaps_omitted'] else '') if x]
+    detail = []
+    if report:
+        detail = ['What it found — the agent’s words', one_line(report, 700)]
+    if row['edits'] or row['edits_omitted']:
+        shown = ', '.join(short_path(path, 2) for path in row['edits'][:4])
+        detail.append('Wrote: ' + shown + (f" (+{len(row['edits']) - 4 + row['edits_omitted']} more)" if len(row['edits']) > 4 or row['edits_omitted'] else ''))
+    if unknown:
+        detail.append('Its parent is not in this list.')
+    guide = '│ ' * (depth - 1) + '└ ' if depth else ''  # a title is wrapped by words, so a tree is drawn in marks, not spaces
+    return dict(key='flight:' + row['id'], title=guide + base, lines=1, body=[' ' * (2 * depth) + body] if body else [],
+                fit_body=True, flag=flags[0] if flags else '', meta=flags[1] if len(flags) > 1 else '', detail=detail,
+                whole_detail=True, send='', nosend=True, hint=FLIGHT_HINT, unrated=True)
+
+
+def codex_items(codex, now):
+    """The Codex part of In flight: the week's line (amber from 75%, red from 90%), then a row per live run. Hidden
+    (nothing) when there is no ~/.codex, which codex_snapshot reports as None."""
+    if codex is None:
+        return []
+    week = codex.get('week')
+    line = codex_lib.week_line(week, codex.get('live') or 0)
+    items = [dict(key='codex:week', title=line, lines=1, tone=(week or {}).get('level'), quiet=not (week or {}).get('level'),
+                  detail=[], send='', nosend=True, unrated=True)]
+    for row in codex.get('rows') or []:
+        model, effort = row.get('model'), row.get('effort')
+        minutes = row.get('minutes')
+        body = ' · '.join((f'{minutes}m' if minutes is not None else 'time unknown',
+                           short_path(row['cwd'], 2) if row.get('cwd') else 'folder unknown',
+                           f"{short(row['tokens'])} tokens" if row.get('tokens') is not None else 'tokens unknown'))
+        items.append(dict(key='codex:' + str(row.get('identity') or row.get('started')),
+                          title=' · '.join(('Codex', one_line(model, 40) if model else 'model unknown', one_line(effort, 12) if effort else 'effort unknown')),
+                          lines=1, body=[body], fit_body=True, detail=[], send='', nosend=True, unrated=True))
+    return items
+
+
+def flight_section(agents, now, ui=None, codex=None):
+    """In flight: the session's agents depth-first, four by default and "and N more" after them, then Codex (its week and
+    its live runs). Open while any agent is pending, running or waiting, or a report came in the last 30 minutes; else one
+    folded row. None without agents and without a ~/.codex."""
+    rows = (agents or {}).get('agents') or []
+    elsewhere = codex_items(codex, now)
+    if not rows and not elsewhere:
+        return None
+    folds = (ui or {}).get('folds') or ()
+    tree = agents_lib.tree(rows)
+    live = sum(1 for row in rows if agents_lib.is_active(row))
+    recent = agents_lib.recent_completion(rows, now)
+    is_open = bool(live or recent is not None)
+    times = [row['last_at'] / 1000 for row in rows]
+    left = (agents or {}).get('omitted_agents') or 0
+    if not rows:
+        right = ''
+    elif is_open:
+        right = ' · '.join(x for x in (f'{live} running' if live else 'all finished', f'+{left} not shown' if left else '') if x)
+    else:
+        right = f'{len(rows)} finished'
+    items = []
+    unfolded = 'flight' in folds
+    if rows and not is_open and not unfolded:
+        ago_text = age_of(now - max(times))
+        items.append(dict(key='fold:flight', quiet=True, lines=1, title=f"› {counted(len(rows), 'agent')} finished · {ago_text} ago",
+                          detail=[], send=''))
+    elif rows:
+        if not is_open:
+            items.append(dict(key='fold:flight', quiet=True, lines=1, title='⌄ ' + f"{counted(len(rows), 'agent')} finished", detail=[], send=''))
+        more = 'flight-more' in folds or not is_open
+        shown = tree if more else tree[:FLIGHT_SHOWN]
+        items += [flight_item(row, depth, unknown, now) for row, depth, unknown in shown]
+        if is_open and len(tree) > FLIGHT_SHOWN:
+            hidden = len(tree) - FLIGHT_SHOWN
+            items.append(dict(key='fold:flight-more', quiet=True, lines=1, detail=[], send='',
+                              title=('⌄ fewer' if more else f'› and {hidden} more'), unsigned=True))
+    items += elsewhere
+    running = (codex or {}).get('live') or 0
+    if codex is not None and not rows:
+        right = f'{running} live' if running else ''
+    return dict(name='flight', title='In flight', right=right, items=items, empty='', count=live + running or len(rows), live=True,
+                active=is_open or bool(running), at=max(times) if times else None,
+                brief=f"{live} running" if live else counted(len(rows), 'agent') or f'{running} live')
 
 
 # ---------------------------------------------------------------- the default view
@@ -3874,6 +4073,8 @@ def item_rows(item, name, width, is_open, at=ITEM, heart=None):
     title = wrap(title.replace('`', ''), room - (0 if flag or meta else spare),
                  item.get('open_lines', 6) if is_open else item.get('lines', 2))
     voice = ink('quiet') if item.get('quiet') else ink('you')  # lamp black: the page's own type
+    if item.get('tone') in ('amber', 'red'):  # a figure that nears its limit: ochre, then vermilion
+        voice = ink('dream' if item['tone'] == 'amber' else 'turn') + BOLD
     rows = [' ' * at + voice + line + OFF for line in title]
     rows += [' ' * at + voice + fit(line, room) + OFF for line in item.get('lede') or ()]  # whole rows, before a picture
     picture = item.get('picture')
@@ -3962,7 +4163,7 @@ def page_lines(page, width, rows, ui):
             rows_ = item_rows(item, section['name'], width, is_open, at, heart)
             if is_open:
                 rows_ = opened(rows_, section['name'], item.get('detail') or [], width, ui, item['key'], indent=at,
-                               whole=item.get('whole_detail', False))
+                               whole=item.get('whole_detail', False), hint=item.get('hint'))
             blocks.append((rows_, item))
             blocks += answer_rows(item, width, ui) + lost_rows(item, width, ui, is_open)
         if blocks:
@@ -4054,7 +4255,10 @@ def draw_main(data, s, cols, rows, now, ui=None, hold=None, hold_quiet=None, fee
     if feed is not None and hold is None:
         page = feed.page(page, now)
     if hold is not None:  # held still while Claude works, but a notice whose time is up leaves all the same
-        page['sections'] = living(hold, now)
+        fresh = [section for section in page['sections'] if section['name'] == 'flight' and section['items']]
+        kept = [section for section in living(hold, now) if section['name'] != 'flight']  # In flight is never held
+        at = 1 if kept and kept[0]['name'] in PINNED else 0
+        page['sections'] = kept[:at] + fresh + kept[at:]
         page['quiet'] = hold_quiet if hold_quiet is not None else page.get('quiet')
     lines, pictures = draw_page(page, cols, rows, ui or {})
     lines.sections, lines.quiet = page['sections'], page.get('quiet')
@@ -4201,7 +4405,7 @@ class Feed:
             # a notice's clock starts at its own event; with none, when the pane first saw this content. born may
             # be set to None on purpose (the default view's cards): their news is this session's start
             born = section['born'] if 'born' in section else section.get('at')
-            entry['born'], entry['timed'] = born or entry['since'], timed(section)
+            entry['born'], entry['timed'], entry['active'] = born or entry['since'], timed(section), bool(section.get('active'))
         self.primed = True
 
     def when(self, name):
@@ -4218,7 +4422,7 @@ class Feed:
         back waits out SEEN_MIN on screen again, however old. The story never sinks (it is pinned), nor does a
         notice: it leaves on its clock instead."""
         entry = self.entries.get(name)
-        if not entry or entry['seen'] is None or name in PINNED or entry.get('timed'):
+        if not entry or entry['seen'] is None or name in PINNED or entry.get('timed') or entry.get('active'):
             return False
         return now - entry['seen'] >= SEEN_MIN or (not entry['back'] and now - self.when(name) > STALE)
 
@@ -6387,6 +6591,8 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
+            self.data['agents'] = fail_open(agents_of, agents_lib.empty(), self.session and self.session.id)
+            self.data['codex'] = fail_open(codex_lib.codex_snapshot, None, HOME, now)  # None: no ~/.codex, no section
             # each of these reads a file of someone else's: one that fails is empty, it never blanks the pane
             self.data['claude_fields'], self.data['claude_at'] = fail_open(
                 kept_status, ({}, None), self.session and self.session.id, now)
@@ -6436,7 +6642,7 @@ class Pane:
                           [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held,
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held, self.data.get('agents'), self.data.get('codex'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
                           value_pieces(self.data.get('value')),  # what it says: the dollars under it move each step
@@ -6618,6 +6824,8 @@ class Pane:
         elif act['key'] != self.open:
             self.open, self.sent = act['key'], None
             self.anchor = (act['key'], row) if self.view == 'main' else None
+        elif act.get('nosend'):  # an agent's report is its words, not yours: a second click folds the row, it sends nothing
+            self.open, self.sent = None, None
         else:
             agent = agent_pane(self.agent)
             went = send_text(agent, act['send'])
@@ -6837,7 +7045,7 @@ def keep_lost(key, answer, at, project=None, **more):
     private.append(LOST_LOG, private.dumps(dict(key=key, answer=answer, at=at, project=project, **more)) + '\n', root=KEEP)
 
 
-def lost_found(summaries, typed=(), carried=(), project=None):
+def lost_found(summaries, typed=(), carried=(), project=None, handoffs=()):
     """The threads, each marked hidden: "drop" for good, "handed" once a prompt sent its hand-off (lost_asks'
     words, typed and submitted after the thread first showed), "later" until the next compaction. A thread set
     aside for later is also the one thing prep-compact hands the summary, as a reminder. The session
@@ -6852,6 +7060,9 @@ def lost_found(summaries, typed=(), carried=(), project=None):
         elif c['key'] in said and match['key'] not in said:
             said[match['key']] = said[c['key']]
     threads.sort(key=lambda t: (t['rank'], -t['last_seen']))
+    by_thread = {}
+    for h in handoffs or ():  # requests to hand a thread to a background agent, by the thread's key
+        by_thread.setdefault(h['thread'], []).append(h)
     handed = {}
     for when, quoted, how in lost_handoffs(typed):  # each names one thread: the one its quote matches best
         tied = [(len(quoted & words) / len(quoted | words), t) for t in threads if t['first_seen'] < when
@@ -6863,7 +7074,19 @@ def lost_found(summaries, typed=(), carried=(), project=None):
         answer, at = said.get(t['key'], (None, 0))
         t['hidden'] = answer if answer == 'drop' or (answer == 'later' and at > newest) else None
         t['later'] = answer == 'later'
-        if id(t) in handed and answer != 'drop':
+        decided = agents_lib.decide(by_thread.get(t['key'], ()))
+        if decided and answer != 'drop':  # a handoff tied to an agent decides, not the words typed: those prove nothing of it
+            word, h = decided
+            at = h['submitted_at'] or h['drafted_at']
+            if word == 'handed':
+                done = ' · it reported' if h['outcome'] == 'succeeded' else ''
+                t.update(hidden='handed', state='handed', why=handed_why(at, 'sub') + done)
+            elif word == 'failed':  # the agent it went to failed, was killed, or said nothing: the thread is back
+                t.update(hidden=None, later=False, state='lost', rank=0 if t['waiting'] else 1, handed_at=at, failed_at=h['ended_at'],
+                         why=f"{handed_why(at, 'sub')}, which failed {hhmm(h['ended_at'])}: {h['reason'] or 'no reason'}")
+            else:  # sent, and tied to no agent (no Agent call carried it, it was denied, or two requests were in one prompt)
+                t.update(unlinked=True, why='handoff not linked' + (f" ({h['reason']})" if h['reason'] else ''))
+        elif id(t) in handed and answer != 'drop' and t['key'] not in by_thread:
             t.update(hidden='handed', state='handed', why=handed_why(*handed[id(t)]))
     return threads
 
@@ -6963,7 +7186,7 @@ def carried_threads(path, started, prev=None):
     said = lost_log(project_of(before))
     out = []
     # what that session itself carried in and nobody dropped: a second restart loses nothing either
-    for t in lost_found(prev.summaries, prev.typed, read_carried(prev.id) or (), project_of(before)):
+    for t in lost_found(prev.summaries, prev.typed, read_carried(prev.id) or (), project_of(before), handoffs_of(prev.id)):
         if t['hidden'] in ('drop', 'handed') or t['key'] in said and said[t['key']][0] == 'drop':
             continue
         if t['state'] in ('open', 'lost'):
@@ -7125,7 +7348,7 @@ def lost_json(session_id):
         session.read_transcript()
     carried = (read_carried(session_id) or []) if session else []
     return [t for t in lost_found(session.summaries if session else [], session.typed if session else [], carried,
-                                  project_of(session and session.path)) if t['hidden'] not in ('drop', 'handed')]
+                                  project_of(session and session.path), handoffs_of(session_id)) if t['hidden'] not in ('drop', 'handed')]
 
 
 def lost_asks(thread):
@@ -7151,7 +7374,8 @@ def lost_sections(s, now, most=3):
             'quiet ' + stamp(t['last_seen'], now)[0] if t['state'] == 'lost' else 'open',
             f"{t['times']}×" if t['times'] else '') if x)
         items.append(dict(key='lost:' + t['key'], title=t['text'], lines=2, meta=meta, lost=t['key'], top=k == 0,
-                          flag='waiting on you' if t['waiting'] else '', asks=asks, send=asks['side'],
+                          flag='handoff not linked' if t.get('unlinked') else 'its subagent failed' if t.get('failed_at') else 'waiting on you' if t['waiting'] else '',
+                          asks=asks, send=asks['side'],
                           detail=[t.get('why') or f"First appeared {when(t['first_seen'])}, last {when(t['last_seen'])}, "
                                   f"carried through {t['times']} {'compaction' if t['times'] == 1 else 'compactions'}."]
                           + t['detail'][:3]))
@@ -7196,10 +7420,12 @@ def lost_click(pane, act, col):
         keep_lost(act['lost'], pick, time.time(), project)
     elif pick:
         agent = agent_pane(pane.agent)
-        went = send_text(agent, act['asks'][pick])
+        request, envelope = new_handoff(getattr(getattr(pane, 'session', None), 'id', None), act['lost']) if pick == 'sub' else (None, None)
+        # The subagent ask carries its request: the ask, then the envelope on lines of its own, both unsent.
+        went = send_draft(agent, act['asks'][pick] + '\n' + envelope, pane.agent) if envelope else send_text(agent, act['asks'][pick])
         pane.sent = (act['item'], went, time.time())
         if went:
-            keep_lost(act['lost'], 'sent', time.time(), project, how=pick)
+            keep_lost(act['lost'], 'sent', time.time(), project, how=pick, **({'request': request} if request else {}))
         focus_back()  # it is in Claude's prompt now: the next keys belong there
 
 
