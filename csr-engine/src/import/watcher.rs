@@ -678,14 +678,22 @@ pub(crate) async fn import_file_content_diff(
         suppression,
         evidence,
         entrypoint,
+        queued,
     } = parsed;
     if let Some(ep) = entrypoint.as_deref() {
         storage.set_conversation_entrypoint(&conv_id, ep)?;
     }
+    let target = import::queued_prompts::Target {
+        conversation_id: &conv_id,
+        project_name: &attribution.project_name,
+        source: attribution.source,
+        parent_conversation_id: attribution.parent_conversation_id.as_deref(),
+    };
     if chunks.is_empty() {
         // Record the skip so this file isn't re-parsed every watcher pass
         // and import_percent counts it as processed.
         storage.mark_file_imported_with_suppression(file_path, stored_chunks, suppression)?;
+        index_queued_prompts(storage, embeddings, search, &target, &queued).await;
         return Ok(());
     }
 
@@ -763,6 +771,7 @@ pub(crate) async fn import_file_content_diff(
 
     storage.mark_file_imported_with_suppression(file_path, chunk_count, suppression)?;
     storage.relink_conversation(&conv_id)?;
+    index_queued_prompts(storage, embeddings, search, &target, &queued).await;
 
     // Layer 1: Heuristic enrichment (inline, instant, free)
     if !storage
@@ -798,6 +807,23 @@ pub(crate) async fn import_file_content_diff(
     );
 
     Ok(())
+}
+
+/// Index the prompts typed while Claude was busy that this import found, once
+/// each (see `import::queued_prompts`). Never fatal: a failure leaves the
+/// conversation unscanned, and the daemon's backfill reads its transcript again.
+async fn index_queued_prompts(
+    storage: &Storage,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    target: &import::queued_prompts::Target<'_>,
+    queued: &[import::queued_prompts::QueuedRow],
+) {
+    if let Err(error) =
+        import::queued_prompts::index(storage, embeddings, search, target, queued).await
+    {
+        tracing::warn!(conv = %target.conversation_id, %error, "queued-prompt indexing failed (non-fatal)");
+    }
 }
 
 /// Does this freshly parsed chunk need to be embedded and written again?

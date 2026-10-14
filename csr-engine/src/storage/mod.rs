@@ -14,6 +14,7 @@ pub mod intent_events;
 pub mod legacy_frontier;
 pub mod migrations;
 pub mod queries;
+pub mod queued_prompts;
 pub mod recap_feeds;
 pub mod sidechain_provenance;
 pub mod trained_rerank;

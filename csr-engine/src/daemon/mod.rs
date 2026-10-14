@@ -807,6 +807,71 @@ impl Daemon {
             })
         };
 
+        // Prompts typed while Claude was busy exist in a transcript only as a
+        // `queued_command` attachment. New imports index them as they go; this
+        // loop reads the transcripts imported before, a few per pass under the
+        // heavy-work permit, and records each conversation it has read. A pass
+        // that finds nothing pending sleeps for the long interval; one that
+        // could not read some transcript starts over from the head next time.
+        const QUEUED_BACKFILL_BATCH_SIZE: usize = 20;
+        let queued_prompt_backfill_handle = {
+            let storage = self.storage.clone();
+            let embeddings = self.embeddings.clone();
+            let search = self.search.clone();
+            let projects_dir = self.projects_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                let mut cursor = String::new();
+                loop {
+                    for _ in 0..if cursor.is_empty() { 30 } else { 1 } {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let result = crate::import::queued_prompts::backfill_batch(
+                        &storage,
+                        &embeddings,
+                        &search,
+                        &projects_dir,
+                        &cursor,
+                        QUEUED_BACKFILL_BATCH_SIZE,
+                    )
+                    .await;
+                    drop(permit);
+                    match result {
+                        Ok(stats) => {
+                            if stats.scanned + stats.failed > 0 {
+                                tracing::info!(
+                                    scanned = stats.scanned,
+                                    added = stats.added,
+                                    failed = stats.failed,
+                                    done = stats.done,
+                                    "queued-prompt backfill batch completed"
+                                );
+                            }
+                            cursor = if stats.done {
+                                String::new()
+                            } else {
+                                stats.last_path
+                            };
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "queued-prompt backfill failed");
+                            cursor = String::new();
+                        }
+                    }
+                }
+            })
+        };
+
         // Optional Codex rollout loop. It runs once immediately and then every
         // 30 minutes. Missing ~/.codex/sessions is deliberately silent, and the
         // directory is re-checked each cycle so a later installation is detected.
@@ -1403,6 +1468,10 @@ impl Daemon {
         // Same shape as the provenance backfill above: single-statement
         // upserts into `conversation_entrypoint`, no HNSW mutation.
         let _ = tokio::time::timeout(timeout, entrypoint_backfill_handle).await;
+        // A batch writes whole prompts in single transactions and an in-memory
+        // index insert; an abrupt stop between prompts loses only the rest,
+        // which the next start reads again.
+        let _ = tokio::time::timeout(timeout, queued_prompt_backfill_handle).await;
         let _ = tokio::time::timeout(timeout, ratification_handle).await;
         // The dream loop's tick awaits its `spawn_blocking` cycle directly
         // (see `dream_cadence::tick`) and checks the shutdown flag between

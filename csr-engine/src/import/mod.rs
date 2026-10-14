@@ -10,6 +10,7 @@ pub mod memory_registry;
 pub mod plans;
 pub mod provenance_backfill;
 mod provenance_matcher;
+pub(crate) mod queued_prompts;
 pub mod registry;
 pub mod scrub;
 pub mod watcher;
@@ -77,6 +78,9 @@ pub(crate) struct ParsedConversation {
     /// "unknown", never as a headless signal. See
     /// `storage::queries::is_headless_entrypoint`.
     pub entrypoint: Option<String>,
+    /// Prompts the person typed while Claude was busy, each with no user row of
+    /// its own to carry its text, in transcript order. Never part of `chunks`.
+    pub queued: Vec<queued_prompts::QueuedRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,6 +645,7 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
     let mut agent_prompt_checked = false;
     let mut csr_sanitizer = CsrMessageSanitizer::for_chunks();
     let mut entrypoint: Option<String> = None;
+    let mut queued = queued_prompts::Collector::default();
 
     loop {
         let line_start = byte_offset;
@@ -699,6 +704,22 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
             continue;
         }
 
+        // A prompt typed while Claude was busy: no user row, only this attachment.
+        // Collected on the side; the messages and their numbering are unchanged.
+        if msg_type == "attachment" {
+            queued.see_attachment(
+                &parsed,
+                &conversation_id,
+                path,
+                line_start,
+                message_seq,
+                running_floor,
+                parent,
+                &mut csr_sanitizer,
+            );
+            continue;
+        }
+
         // Include human/user/assistant messages (Claude Code uses "user", not "human")
         if msg_type != "human" && msg_type != "user" && msg_type != "assistant" {
             continue;
@@ -720,6 +741,7 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
                         suppression: csr_sanitizer.stats,
                         evidence: HashMap::new(),
                         entrypoint,
+                        queued: Vec::new(),
                     });
                 }
             }
@@ -735,6 +757,7 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
             csr_sanitizer.stats.secrets = before;
         }
         register_tool_uses(&parsed, &mut tool_names);
+        queued.see_message(seq, &parsed);
 
         // Capture first and last timestamps
         if let Some(ts) = parsed.get("timestamp").and_then(|v| v.as_str()) {
@@ -867,6 +890,7 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
             suppression: csr_sanitizer.stats,
             evidence: HashMap::new(),
             entrypoint,
+            queued: queued.finish(),
         });
     }
 
@@ -912,6 +936,7 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
         suppression: csr_sanitizer.stats,
         evidence,
         entrypoint,
+        queued: queued.finish(),
     })
 }
 

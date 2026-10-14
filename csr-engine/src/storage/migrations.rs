@@ -2241,6 +2241,34 @@ pub fn run(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // Prompts the person typed while Claude was busy (src/storage/queued_prompts.rs):
+    // one row per chunk written for such a prompt, keyed by the transcript line it came
+    // from, so a prompt is indexed once however many passes see it. The chunk rows
+    // are ordinary `chunks` rows; this table is how they are told apart from the
+    // conversation's own.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queued_prompt_chunks (
+            chunk_id        TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            line_offset     INTEGER NOT NULL,
+            part            INTEGER NOT NULL,
+            indexed_at      TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_queued_prompt_chunks_prompt
+            ON queued_prompt_chunks(conversation_id, line_offset);",
+    )?;
+
+    // Conversations whose transcript the queued-prompt pass has read: the one-time
+    // backfill's record that it ran, and what it found.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS queued_prompt_scan (
+            conversation_id TEXT PRIMARY KEY,
+            scanned_at      TEXT NOT NULL,
+            found           INTEGER NOT NULL,
+            added           INTEGER NOT NULL
+        );",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

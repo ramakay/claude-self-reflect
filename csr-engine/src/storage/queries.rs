@@ -101,11 +101,18 @@ pub(crate) fn parent_provenance_context(
 /// transaction. Re-importing a growing final chunk cannot leave stale spans.
 pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    let relink = evidence_needs_relink(&tx, evidence)?;
-    replace_chunk_evidence_inner(&tx, evidence)?;
+    replace_chunk_evidence_in(&tx, evidence)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// [`replace_chunk_evidence`] inside a transaction the caller already holds.
+pub(super) fn replace_chunk_evidence_in(conn: &Connection, evidence: &ChunkEvidence) -> Result<()> {
+    let relink = evidence_needs_relink(conn, evidence)?;
+    replace_chunk_evidence_inner(conn, evidence)?;
     if relink {
         super::sidechain_provenance::relink_conversations(
-            &tx,
+            conn,
             &evidence
                 .events
                 .iter()
@@ -113,9 +120,8 @@ pub fn replace_chunk_evidence(conn: &Connection, evidence: &ChunkEvidence) -> Re
                 .collect::<Vec<_>>(),
         )?;
     } else {
-        super::artifact_provenance::lower_from(&tx, &[("chunk", &evidence.chunk_id)], &[])?;
+        super::artifact_provenance::lower_from(conn, &[("chunk", &evidence.chunk_id)], &[])?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -541,7 +547,7 @@ pub struct SessionInfo {
 }
 
 /// Serialize a f32 vector to bytes (little-endian).
-fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
+pub(super) fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
@@ -746,6 +752,16 @@ pub fn delete_chunks_for_conversation(conn: &Connection, conversation_id: &str) 
     }
     conn.execute(
         "DELETE FROM chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    // The queued prompts' rows went with the rest; their ledger goes too, so a
+    // later import indexes them again, once.
+    conn.execute(
+        "DELETE FROM queued_prompt_chunks WHERE conversation_id = ?1",
+        params![conversation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM queued_prompt_scan WHERE conversation_id = ?1",
         params![conversation_id],
     )?;
     Ok(())

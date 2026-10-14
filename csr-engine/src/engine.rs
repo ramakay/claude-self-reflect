@@ -553,6 +553,7 @@ impl Engine {
             suppression,
             evidence,
             entrypoint,
+            queued,
         } = parsed;
         if let Some(ep) = entrypoint.as_deref() {
             self.storage
@@ -568,6 +569,8 @@ impl Engine {
                 suppression,
                 parsed_mtime,
             )?;
+            self.index_queued_prompts(&conversation_id, attribution, &queued)
+                .await;
             return Ok(0);
         }
 
@@ -612,6 +615,8 @@ impl Engine {
                 parsed_mtime,
             )?;
             self.storage.relink_conversation(&conversation_id)?;
+            self.index_queued_prompts(&conversation_id, attribution, &queued)
+                .await;
             return Ok(0);
         }
 
@@ -660,6 +665,8 @@ impl Engine {
             parsed_mtime,
         )?;
         self.storage.relink_conversation(&conversation_id)?;
+        self.index_queued_prompts(&conversation_id, attribution, &queued)
+            .await;
 
         // Layer 1: Heuristic enrichment only on first import (not incremental updates)
         if prev_count == 0 {
@@ -693,6 +700,35 @@ impl Engine {
         }
 
         Ok(new_chunks.len())
+    }
+
+    /// Index the prompts typed while Claude was busy that this conversation's
+    /// import found. Each is indexed once (see `import::queued_prompts`). Never
+    /// fatal: a failure leaves the conversation unscanned, and the backfill reads
+    /// its transcript again.
+    async fn index_queued_prompts(
+        &self,
+        conversation_id: &str,
+        attribution: &import::ConversationAttribution,
+        queued: &[import::queued_prompts::QueuedRow],
+    ) {
+        let target = import::queued_prompts::Target {
+            conversation_id,
+            project_name: &attribution.project_name,
+            source: attribution.source,
+            parent_conversation_id: attribution.parent_conversation_id.as_deref(),
+        };
+        if let Err(error) = import::queued_prompts::index(
+            &self.storage,
+            &self.embeddings,
+            &self.search,
+            &target,
+            queued,
+        )
+        .await
+        {
+            tracing::warn!(conv = %conversation_id, %error, "queued-prompt indexing failed (non-fatal)");
+        }
     }
 
     /// Backfill missing import_state rows and run heuristic enrichment for all unenriched conversations.

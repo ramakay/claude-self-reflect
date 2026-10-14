@@ -80,6 +80,7 @@ impl super::Storage {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, content FROM chunks WHERE conversation_id = ?1
+                   AND id NOT IN (SELECT chunk_id FROM queued_prompt_chunks)
                  ORDER BY seq, rowid",
             )?;
             let rows = stmt
@@ -255,7 +256,8 @@ fn legacy_rows(
                 SUM(EXISTS (SELECT 1 FROM chunk_spans s
                             JOIN provenance_events e ON e.event_id = s.event_id
                             WHERE s.chunk_id = chunks.id AND e.receipt_kind = 'jsonl'))
-         FROM chunks WHERE conversation_id = ?1",
+         FROM chunks WHERE conversation_id = ?1
+            AND id NOT IN (SELECT chunk_id FROM queued_prompt_chunks)",
             params![conversation_id],
             |row| {
                 Ok((
@@ -274,7 +276,8 @@ fn legacy_rows(
             "SELECT MAX(e.seq) FROM chunks c
              JOIN chunk_spans s ON s.chunk_id = c.id
              JOIN provenance_events e ON e.event_id = s.event_id
-             WHERE c.conversation_id = ?1 AND e.receipt_kind = 'jsonl'",
+             WHERE c.conversation_id = ?1 AND e.receipt_kind = 'jsonl'
+           AND c.id NOT IN (SELECT chunk_id FROM queued_prompt_chunks)",
             params![conversation_id],
             |row| row.get::<_, Option<i64>>(0),
         )?
@@ -284,6 +287,7 @@ fn legacy_rows(
     };
     let last_chunk = conn.query_row(
         "SELECT id, content FROM chunks WHERE conversation_id = ?1
+           AND id NOT IN (SELECT chunk_id FROM queued_prompt_chunks)
          ORDER BY seq DESC, rowid DESC LIMIT 1",
         params![conversation_id],
         |row| Ok((row.get(0)?, row.get(1)?)),

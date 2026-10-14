@@ -278,7 +278,7 @@ pub fn sample_transcript(messages: &[serde_json::Value], n: usize, char_cap: usi
 }
 
 /// The person's own words in `typed`, whitespace collapsed; None when nothing in it was typed.
-fn typed_words(typed: &str) -> Option<String> {
+pub(crate) fn typed_words(typed: &str) -> Option<String> {
     let words = crate::extraction::provenance::extractable(typed)?;
     Some(words.split_whitespace().collect::<Vec<_>>().join(" "))
 }
@@ -421,26 +421,25 @@ fn asked_since(
             rows_by_text.entry(text).or_default().push(at);
         }
     }
-    let mut taken: HashSet<usize> = HashSet::new();
     // User rows that are the twin of a prompt queued inside the covered part.
     let mut told: HashSet<usize> = HashSet::new();
     let mut from_queue = 0;
-    for prompt in queued {
-        let Some(text) = typed_words(&prompt.text) else {
+    let keyed: Vec<(usize, Option<String>)> = queued
+        .iter()
+        .map(|prompt| (prompt.place, typed_words(&prompt.text)))
+        .collect();
+    let twins = crate::import::queued_prompts::pair_with_rows(&keyed, &rows_by_text);
+    for ((place, key), twin) in keyed.iter().zip(twins) {
+        if key.is_none() {
             continue;
-        };
-        let twin = rows_by_text.get(&text).and_then(|rows| {
-            rows.iter()
-                .find(|at| **at >= prompt.place && !taken.contains(at))
-        });
+        }
         match twin {
             Some(at) => {
-                taken.insert(*at);
-                if prompt.place < covered {
-                    told.insert(*at);
+                if *place < covered {
+                    told.insert(at);
                 }
             }
-            None if prompt.place >= covered => from_queue += 1,
+            None if *place >= covered => from_queue += 1,
             None => {}
         }
     }
@@ -1391,6 +1390,73 @@ mod tests {
         // and a queued prompt before the story's coverage is not new
         let before = prior_covering_all(&messages);
         assert_eq!(asked_since(&messages, &queued, Some(&before)), 0);
+    }
+
+    /// Indexing queued prompts adds chunk rows of their own; it must not move what the
+    /// story reads. The messages the summarizer gets carry no queued prompt, so a stored
+    /// `covered` count still indexes into them, and `asked_since` counts as it did.
+    #[test]
+    fn queued_prompts_leave_the_storys_messages_and_counts_alone() {
+        let row = |n: usize| {
+            if n.is_multiple_of(2) {
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": format!("ask {n}")}})
+            } else {
+                serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": "done"}})
+            }
+        };
+        let write = |name: &str, rows: &[serde_json::Value]| {
+            let dir = tempfile::tempdir().unwrap();
+            let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            std::fs::write(dir.path().join(name), body).unwrap();
+            dir
+        };
+        let alpha = queued_row(
+            serde_json::json!("alpha while busy"),
+            true,
+            "2026-10-14T20:00:00Z",
+        );
+        let beta = queued_row(
+            serde_json::json!("beta while busy"),
+            true,
+            "2026-10-14T20:01:00Z",
+        );
+        let plain = [row(0), row(1), row(2), row(3), row(4), row(5)];
+        let with_queued = [
+            row(0),
+            row(1),
+            row(2),
+            alpha.clone(),
+            row(3),
+            row(4),
+            row(5),
+            beta.clone(),
+        ];
+        let parse = |dir: &tempfile::TempDir| {
+            crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+                .unwrap()
+        };
+        let without = write("s.jsonl", &plain);
+        let with = write("s.jsonl", &with_queued);
+        let (plain_messages, plain_queued) = parse(&without);
+        let (messages, queued) = parse(&with);
+        assert_eq!(messages.len(), 6);
+        assert_eq!(
+            messages, plain_messages,
+            "no queued prompt inside the messages"
+        );
+        assert!(plain_queued.is_empty());
+        assert_eq!(
+            queued
+                .iter()
+                .map(|q| (q.place, q.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "alpha while busy"), (6, "beta while busy")]
+        );
+        // A story told over the first four messages: one user row after it, the
+        // prompt queued inside its coverage was told, the one after the end is new.
+        let told = prior(1, Some(4));
+        assert_eq!(asked_since(&plain_messages, &[], Some(&told)), 1);
+        assert_eq!(asked_since(&messages, &queued, Some(&told)), 2);
     }
 
     /// Is a rewrite due for a story that covers every message the transcript has?

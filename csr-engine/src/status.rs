@@ -73,6 +73,9 @@ pub struct StatusReport {
     pub mirror: MirrorStatus,
     /// Conversations stored before the secret scrubber: placed, or waiting to be.
     pub legacy_frontier: LegacyFrontierStatus,
+    /// Prompts typed while Claude was busy, which a transcript holds only as an
+    /// attachment: how many are indexed.
+    pub queued_prompts: QueuedPromptsStatus,
     pub contamination: ContaminationStatus,
     /// Cached memory-health measurements and the current binary's canary.
     /// See [`MemoryHealthStatus`].
@@ -278,6 +281,32 @@ impl LegacyFrontierStatus {
     pub fn read(storage: &Storage) -> Self {
         let (placed, waiting) = storage.legacy_frontier_counts().unwrap_or_default();
         Self { placed, waiting }
+    }
+}
+
+/// Prompts the person typed while Claude was busy. A transcript holds each only
+/// as a `queued_command` attachment; import indexes the human ones as chunk rows
+/// of their own, and a backfill reads the transcripts imported before.
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+pub struct QueuedPromptsStatus {
+    /// Prompts with chunk rows. On 2026-10-14 the corpus held about 531 human
+    /// ones in 397 transcripts, so a finished backfill lands near that number
+    /// (a prompt whose text also has a user row is not counted).
+    pub indexed: i64,
+    /// Conversations whose transcript has been read.
+    pub scanned: i64,
+    /// Imported conversations the backfill has not read yet.
+    pub pending: i64,
+}
+
+impl QueuedPromptsStatus {
+    pub fn read(storage: &Storage) -> Self {
+        let counts = storage.queued_prompt_counts().unwrap_or_default();
+        Self {
+            indexed: counts.indexed,
+            scanned: counts.scanned,
+            pending: counts.pending,
+        }
     }
 }
 
@@ -1100,6 +1129,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
             legacy_frontier: LegacyFrontierStatus::default(),
+            queued_prompts: QueuedPromptsStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: gather_memory_health(None),
             provenance_coverage: ProvenanceCoverageStatus::default(),
@@ -1142,6 +1172,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let secrets_redacted = SecretsRedactedStatus::read(&storage);
     let mirror = MirrorStatus::read(&storage);
     let legacy_frontier = LegacyFrontierStatus::read(&storage);
+    let queued_prompts = QueuedPromptsStatus::read(&storage);
     let contamination = if deep {
         storage.refresh_contamination_cache().ok()
     } else {
@@ -1249,6 +1280,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         secrets_redacted,
         mirror,
         legacy_frontier,
+        queued_prompts,
         contamination,
         memory_health,
         provenance_coverage,
@@ -2378,6 +2410,7 @@ mod tests {
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
             legacy_frontier: LegacyFrontierStatus::default(),
+            queued_prompts: QueuedPromptsStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: MemoryHealthStatus::from_cache(
                 &crate::health::HealthSnapshot::default(),
@@ -3409,6 +3442,51 @@ mod tests {
         assert_eq!(
             value["legacy_frontier"],
             serde_json::json!({"placed": 2, "waiting": 0})
+        );
+    }
+
+    #[test]
+    fn status_queued_prompts_block_counts_prompts_not_chunks() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        let none =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(
+            none["queued_prompts"],
+            serde_json::json!({"indexed": 0, "scanned": 0, "pending": 0})
+        );
+
+        // Two prompts, the first cut into two chunks; one conversation read, one not.
+        storage
+            .with_connection(|conn| {
+                for (chunk, conv, offset, part) in [
+                    ("c1", "conv-a", 10, 0),
+                    ("c2", "conv-a", 10, 1),
+                    ("c3", "conv-a", 99, 0),
+                ] {
+                    conn.execute(
+                        "INSERT INTO queued_prompt_chunks
+                            (chunk_id, conversation_id, line_offset, part, indexed_at)
+                         VALUES (?1, ?2, ?3, ?4, 'now')",
+                        rusqlite::params![chunk, conv, offset, part],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        storage.record_queued_scan("conv-a", 2, 2).unwrap();
+        storage
+            .mark_file_imported(std::path::Path::new("/p/conv-b.jsonl"), 1)
+            .unwrap();
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(
+            value["queued_prompts"],
+            serde_json::json!({"indexed": 2, "scanned": 1, "pending": 1})
         );
     }
 
