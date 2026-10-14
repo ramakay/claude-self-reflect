@@ -73,10 +73,47 @@ pub fn same_project_family(current: &str, candidate: &str) -> bool {
     if current == candidate {
         return true;
     }
-    let Some(projects_root) = dirs::home_dir().map(|home| home.join("projects")) else {
+    let Some(projects_root) = projects_root() else {
         return false;
     };
     same_project_family_at_cached_root(current, candidate, &projects_root)
+}
+
+/// `~/projects`, the directory alias resolution looks under.
+fn projects_root() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(root) = TEST_PROJECTS_ROOT.with(|slot| slot.borrow().clone()) {
+        return Some(root);
+    }
+    dirs::home_dir().map(|home| home.join("projects"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROJECTS_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: point `same_project_family` at a tempdir's projects root for the
+/// calling thread until the guard drops, so a test never depends on whether the
+/// real `$HOME/projects/<base>` exists. Thread-local, so parallel tests keep
+/// the real root; use it only in `#[tokio::test]` (current-thread) bodies.
+#[cfg(test)]
+pub(crate) struct ProjectsRootGuard;
+
+#[cfg(test)]
+impl ProjectsRootGuard {
+    pub(crate) fn set(root: &Path) -> Self {
+        TEST_PROJECTS_ROOT.with(|slot| *slot.borrow_mut() = Some(root.to_path_buf()));
+        ProjectsRootGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProjectsRootGuard {
+    fn drop(&mut self) {
+        TEST_PROJECTS_ROOT.with(|slot| *slot.borrow_mut() = None);
+    }
 }
 
 /// Encode a path the way Claude Code names its `~/.claude/projects` folders.

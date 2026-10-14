@@ -10159,6 +10159,11 @@ mod tests {
 
     #[tokio::test]
     async fn why_rendered_receipt_resolves_family_symbol_and_preserves_all_routes() {
+        // Only the base project directory exists, so the `-csr-engine` namespace is an
+        // alias of it; the real `$HOME/projects` plays no part.
+        let projects = tempfile::tempdir().unwrap();
+        std::fs::create_dir(projects.path().join("claude-self-reflect")).unwrap();
+        let _root = crate::search::cross_project::ProjectsRootGuard::set(projects.path());
         let storage = Arc::new(Storage::open_memory().unwrap());
         let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
         let query = "why does `retire_missing_nodes` preserve attribution";
