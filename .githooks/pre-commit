@@ -113,14 +113,20 @@ export CARGO_BUILD_JOBS="$jobs"
 run cargo fmt -- --check
 run cargo clippy --all-targets -- -D warnings
 
+# The tests run under a throwaway HOME, as the plugin's do, so none can read or write the person's real
+# ~/.claude-self-reflect or ~/.claude. Cargo and rustup keep their own homes.
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+test_home=$(mktemp -d /private/tmp/precommit-cargo-home.XXXXXX)
+trap 'rm -rf "$test_home"' EXIT
+
 if [ "$full" = 1 ]; then
-  run cargo test --lib -- --test-threads="$jobs"
+  run env HOME="$test_home" cargo test --lib -- --test-threads="$jobs"
 elif [ -n "$mods" ]; then
   filters=$(printf '%s\n' $mods | sort -u | sed 's/$/::/')
   # shellcheck disable=SC2086
-  run cargo test --lib -- --test-threads="$jobs" $filters
+  run env HOME="$test_home" cargo test --lib -- --test-threads="$jobs" $filters
 fi
 
 for t in $(printf '%s\n' $targets | sort -u); do
-  run cargo test --test "$t" -- --test-threads="$jobs"
+  run env HOME="$test_home" cargo test --test "$t" -- --test-threads="$jobs"
 done
