@@ -21,7 +21,7 @@ use super::{
 use crate::import::ConversationChunk;
 use crate::provenance::Speaker;
 use crate::search::SearchEngine;
-use crate::storage::Storage;
+use crate::storage::{queries, Storage};
 use std::sync::Arc;
 
 /// Cases kept in a frozen sample.
@@ -32,8 +32,9 @@ pub const SAMPLE_MIN: usize = 10;
 pub const QUERY_MAX_WORDS: usize = 12;
 /// Result positions that count toward a hit.
 pub const TOP_K: usize = 5;
-/// Sample format version.
-pub const SAMPLE_VERSION: u32 = 1;
+/// Sample format version. 2: a known item is unique, its query found in one
+/// conversation family only. A version-1 sample is replaced once.
+pub const SAMPLE_VERSION: u32 = 2;
 
 const STOPWORDS: &[&str] = &[
     "the", "and", "for", "with", "that", "this", "from", "have", "has", "had", "are", "was",
@@ -184,6 +185,60 @@ fn query_with_conn(conn: &Connection, content: &str, total_docs: u64) -> Result<
         .filter(|query| !query.is_empty()))
 }
 
+/// Whether `query`, run with AND semantics through the same FTS (and the same
+/// word sanitizing) the keyword route uses, matches chunks of one conversation
+/// family only: the case's conversation, its sidechain parent, and its sidechain
+/// children (from `chunk_provenance.source_conv_id`). A query a skill body or
+/// pasted document makes true in many conversations has no single right answer,
+/// so it is not a known item. Checked when a sample is made; a frozen sample is
+/// not re-checked.
+fn query_is_unique(
+    storage: &Storage,
+    conversation_id: &str,
+    parent: Option<&str>,
+    query: &str,
+) -> Result<bool> {
+    let Some(or_expr) = queries::fts5_match_expr(query) else {
+        return Ok(false);
+    };
+    // the sanitizer quotes every word, so " OR " only ever joins words
+    let and_expr = or_expr.replace(" OR ", " AND ");
+    storage.with_connection(|conn| {
+        let mut family: HashSet<String> = HashSet::new();
+        family.insert(conversation_id.to_string());
+        family.extend(parent.map(str::to_string));
+        let mut children = conn.prepare(
+            "SELECT DISTINCT c.conversation_id
+             FROM chunk_provenance p JOIN chunks c ON c.id = p.chunk_id
+             WHERE p.source_conv_id = ?1 AND c.is_sidechain = 1 AND c.conversation_id <> ?1",
+        )?;
+        for child in children.query_map(params![conversation_id], |row| row.get::<_, String>(0))? {
+            family.insert(child?);
+        }
+        // a few more rows than the family has is enough to know it is not one
+        let mut matches = conn.prepare(
+            "SELECT DISTINCT c.conversation_id
+             FROM chunks_fts f JOIN chunks c ON c.rowid = f.rowid
+             WHERE chunks_fts MATCH ?1
+             LIMIT ?2",
+        )?;
+        let limit = (family.len() + 1) as i64;
+        let mut found_own = false;
+        for conversation in
+            matches.query_map(params![and_expr, limit], |row| row.get::<_, String>(0))?
+        {
+            let conversation = conversation?;
+            if !family.contains(&conversation) {
+                return Ok(false);
+            }
+            found_own |= conversation == conversation_id;
+        }
+        // a query the keyword route cannot even find in its own conversation
+        // cannot be checked
+        Ok(found_own)
+    })
+}
+
 struct Candidate {
     chunk: ConversationChunk,
     is_sidechain: bool,
@@ -277,6 +332,9 @@ pub fn select_sample(storage: &Storage, cutoff_at: &str) -> Result<Vec<ProbeCase
             let Some(query) = query_for_chunk(storage, &chunk.content, total_docs)? else {
                 continue;
             };
+            if !query_is_unique(storage, &chunk.conversation_id, parent.as_deref(), &query)? {
+                continue;
+            }
             families.insert(family);
             hashes.insert(hash.clone());
             cases.push(ProbeCase {
@@ -322,10 +380,23 @@ pub fn load_or_create_sample(
     refresh: bool,
     now: DateTime<Utc>,
 ) -> Result<SampleLoad> {
-    let stored = snapshot
+    let stored_any = snapshot
         .sample
         .clone()
         .filter(|sample| sample.cases.len() >= SAMPLE_MIN);
+    // A sample made under an older rule is set aside, once.
+    let outdated = stored_any
+        .as_ref()
+        .filter(|sample| sample.version != SAMPLE_VERSION)
+        .map(|sample| {
+            format!(
+                "replaced sample {} (format v{}): its queries could match many conversations, so \
+                 it did not measure known-item recall; the new sample uses queries found in one \
+                 conversation family only",
+                sample.sample_id, sample.version
+            )
+        });
+    let stored = stored_any.filter(|_| outdated.is_none());
     if let (Some(sample), false) = (&stored, refresh) {
         return Ok(SampleLoad {
             sample: sample.clone(),
@@ -336,21 +407,21 @@ pub fn load_or_create_sample(
     }
     let cutoff_at = now.to_rfc3339();
     let cases = select_sample(storage, &cutoff_at)?;
-    let usable = cases.len() >= SAMPLE_MIN;
+    let found = cases.len();
+    let usable = found >= SAMPLE_MIN;
     match (stored, usable) {
         (_, true) => Ok(SampleLoad {
             sample: new_sample(&cutoff_at, cases),
             frozen: true,
             created: true,
-            note: None,
+            note: outdated,
         }),
         (Some(sample), false) => Ok(SampleLoad {
             sample,
             frozen: true,
             created: false,
             note: Some(format!(
-                "refresh found {} eligible cases, fewer than {SAMPLE_MIN}; kept the existing sample",
-                cases.len()
+                "refresh found {found} eligible cases, fewer than {SAMPLE_MIN}; kept the existing sample"
             )),
         }),
         (None, false) => Ok(SampleLoad {
@@ -363,7 +434,9 @@ pub fn load_or_create_sample(
             },
             frozen: false,
             created: false,
-            note: None,
+            note: outdated.map(|note| {
+                format!("{note}; only {found} unique cases exist so far, so recall abstains")
+            }),
         }),
     }
 }
@@ -1428,5 +1501,203 @@ mod tests {
             Some("⚠ mem: recall 0/12"),
             "the chip stays"
         );
+    }
+    // --- a known item is unique: its query is found in one conversation family ---
+
+    /// One sentence of twelve distinct words, so its query is the whole sentence.
+    fn sentence(tag: &str) -> String {
+        (0..12)
+            .map(|i| format!("{tag}{}w{i}", ["alpha", "bravo", "charlie"][i % 3]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn text_with(sentence: &str, i: usize) -> String {
+        format!(
+            "{sentence}. Separately, the planner note number {i} keeps describing how the nightly \
+             schedule drifts after every deployment window closes, which is a long enough tail to \
+             satisfy the minimum length for enrollment into the sample under test here."
+        )
+    }
+
+    #[test]
+    fn a_chunk_whose_query_words_also_appear_in_an_unrelated_conversation_is_not_eligible() {
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 10);
+        // X: its sentence is also in a different conversation (a skill body loaded there)
+        let shared = sentence("shared");
+        seed(
+            &storage,
+            "x",
+            "conv-x",
+            &text_with(&shared, 1),
+            "user",
+            Some(0.0),
+            "conversation",
+            RECENT,
+        );
+        seed(
+            &storage,
+            "elsewhere",
+            "conv-elsewhere",
+            &text_with(&shared, 2),
+            "user",
+            Some(0.0),
+            "conversation",
+            RECENT,
+        );
+        // U: a sentence found nowhere else
+        seed(
+            &storage,
+            "u",
+            "conv-u",
+            &text_with(&sentence("unique"), 3),
+            "user",
+            Some(0.0),
+            "conversation",
+            RECENT,
+        );
+        let cases = select_sample(&storage, NOW).unwrap();
+        let ids: Vec<&str> = cases.iter().map(|c| c.chunk_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"x") && !ids.contains(&"elsewhere"),
+            "{ids:?}"
+        );
+        assert!(ids.contains(&"u"), "a unique query is eligible: {ids:?}");
+        assert_eq!(cases.len(), 11);
+    }
+
+    #[test]
+    fn a_parent_and_sidechain_pair_counts_as_one_family() {
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 10);
+        let pair = sentence("pair");
+        // the child's text also sits in its parent's conversation: still one family
+        seed(
+            &storage,
+            "child",
+            "agent-1",
+            &text_with(&pair, 1),
+            "user",
+            Some(0.0),
+            "sidechain",
+            RECENT,
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute("UPDATE chunk_provenance SET source_conv_id = 'parent-session' WHERE chunk_id = 'child'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        seed(
+            &storage,
+            "parent",
+            "parent-session",
+            &text_with(&pair, 2),
+            "assistant",
+            Some(0.0),
+            "conversation",
+            RECENT,
+        );
+        let cases = select_sample(&storage, NOW).unwrap();
+        let child = cases
+            .iter()
+            .find(|c| c.chunk_id == "child")
+            .expect("child eligible");
+        assert_eq!(
+            child.parent_conversation_id.as_deref(),
+            Some("parent-session")
+        );
+
+        // a third conversation with the same words makes it ambiguous again
+        seed(
+            &storage,
+            "stranger",
+            "conv-stranger",
+            &text_with(&pair, 3),
+            "assistant",
+            Some(0.0),
+            "conversation",
+            RECENT,
+        );
+        let cases = select_sample(&storage, NOW).unwrap();
+        assert!(cases.iter().all(|c| c.chunk_id != "child"));
+
+        // the same holds from the parent's side: its sidechain child is its family
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 10);
+        seed(
+            &storage,
+            "main",
+            "main-session",
+            &text_with(&pair, 4),
+            "user",
+            Some(0.0),
+            "conversation",
+            RECENT,
+        );
+        seed(
+            &storage,
+            "kid",
+            "agent-9",
+            &text_with(&pair, 5),
+            "assistant",
+            Some(0.0),
+            "sidechain",
+            RECENT,
+        );
+        storage
+            .with_connection(|conn| {
+                conn.execute("UPDATE chunk_provenance SET source_conv_id = 'main-session' WHERE chunk_id = 'kid'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let cases = select_sample(&storage, NOW).unwrap();
+        assert!(cases.iter().any(|c| c.chunk_id == "main"), "{cases:?}");
+    }
+
+    #[tokio::test]
+    async fn an_old_version_sample_is_replaced_once_and_then_stays_frozen() {
+        use crate::health::{load_health, run_health};
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 12);
+        // a sample made under the old rule (version 1), with ten cases
+        let old = ProbeSample {
+            version: 1,
+            sample_id: "ps-old".into(),
+            created_at: NOW.into(),
+            cutoff_at: NOW.into(),
+            cases: (0..10).map(case).collect(),
+        };
+        crate::health::save_health(
+            &storage,
+            &HealthSnapshot {
+                sample: Some(old.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (search, backend) = (engine(), silent());
+
+        let replaced = run_health(&storage, &search, &backend, false, now() + hours(1), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = load_health(&storage).unwrap().sample.unwrap();
+        assert_eq!(stored.version, SAMPLE_VERSION);
+        assert_ne!(stored.sample_id, "ps-old");
+        let note = replaced.note.expect("the replacement says why");
+        assert!(
+            note.contains("ps-old") && note.contains("one conversation family"),
+            "{note}"
+        );
+
+        // the next run keeps it, with no note and no new sample
+        let again = run_health(&storage, &search, &backend, false, now() + hours(8), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(again.note.is_none());
+        assert_eq!(load_health(&storage).unwrap().sample.unwrap(), stored);
     }
 }

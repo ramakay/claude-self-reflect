@@ -59,6 +59,11 @@ pub fn known_item_recall(run: &Result<HealthRun, String>) -> EvalResult {
     };
     let report = &run.probe;
     let sample = report.sample_id.as_deref().unwrap_or("none");
+    let note = run
+        .note
+        .as_deref()
+        .map(|note| format!("; note: {note}"))
+        .unwrap_or_default();
     let invalidated = if report.invalidated > 0 {
         format!(", {} invalidated", report.invalidated)
     } else {
@@ -70,7 +75,7 @@ pub fn known_item_recall(run: &Result<HealthRun, String>) -> EvalResult {
             CATEGORY,
             ms(start),
             format!(
-                "ABSTAIN: {} eligible cases (needs {}); no recall claim made{invalidated}",
+                "ABSTAIN: {} eligible cases (needs {}); no recall claim made{invalidated}{note}",
                 report.n,
                 crate::health::probe::SAMPLE_MIN
             ),
@@ -80,7 +85,7 @@ pub fn known_item_recall(run: &Result<HealthRun, String>) -> EvalResult {
             CATEGORY,
             ms(start),
             format!(
-                "GREEN: {}/{} found in the top {} (sample {sample}{invalidated})",
+                "GREEN: {}/{} found in the top {} (sample {sample}{invalidated}){note}",
                 report.hits,
                 report.n,
                 crate::health::probe::TOP_K
@@ -91,7 +96,7 @@ pub fn known_item_recall(run: &Result<HealthRun, String>) -> EvalResult {
             CATEGORY,
             ms(start),
             format!(
-                "AMBER (non-gating): {}/{} found in the top {} (sample {sample}{invalidated}); {}",
+                "AMBER (non-gating): {}/{} found in the top {} (sample {sample}{invalidated}); {}{note}",
                 report.hits,
                 report.n,
                 crate::health::probe::TOP_K,
@@ -103,7 +108,7 @@ pub fn known_item_recall(run: &Result<HealthRun, String>) -> EvalResult {
             CATEGORY,
             ms(start),
             format!(
-                "RED: {}/{} found in the top {} (sample {sample}{invalidated}); {}",
+                "RED: {}/{} found in the top {} (sample {sample}{invalidated}); {}{note}",
                 report.hits,
                 report.n,
                 crate::health::probe::TOP_K,
@@ -115,7 +120,7 @@ pub fn known_item_recall(run: &Result<HealthRun, String>) -> EvalResult {
             CATEGORY,
             ms(start),
             format!(
-                "ERROR: {} (denominator {}, sample {sample})",
+                "ERROR: {} (denominator {}, sample {sample}){note}",
                 report.error.as_deref().unwrap_or("probe failed"),
                 report.n
             ),
@@ -159,6 +164,7 @@ mod tests {
                 }],
                 error: (grade == ProbeGrade::Error).then(|| "embedding unavailable".to_string()),
             },
+            note: None,
         })
     }
 

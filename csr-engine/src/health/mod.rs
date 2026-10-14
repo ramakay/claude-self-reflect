@@ -320,6 +320,9 @@ pub(crate) struct Measured {
     base_sample: Option<String>,
     /// A sample this run created and means to store.
     new_sample: Option<ProbeSample>,
+    /// Why the sample is not the stored one, when that is worth saying (an
+    /// old-format sample was replaced).
+    note: Option<String>,
 }
 
 /// Measure: the canary for this binary, the duplicate rate and the recall
@@ -383,6 +386,7 @@ pub(crate) async fn measure_health(
         probe,
         base_sample: frozen_id(snapshot.sample.as_ref()),
         new_sample: load.created.then_some(load.sample),
+        note: load.note,
     }))
 }
 
@@ -419,6 +423,7 @@ pub(crate) fn commit_measured(storage: &Storage, measured: &Measured) -> Result<
         Some(HealthRun {
             snapshot: snapshot.clone(),
             probe: report,
+            note: measured.note.clone(),
         })
     })
 }
@@ -626,6 +631,8 @@ pub struct HealthRun {
     /// This run's probe report, including an `Error` one (which is not
     /// stored as the latest completed result).
     pub probe: ProbeReport,
+    /// Set when this run replaced an old-format sample, and why.
+    pub note: Option<String>,
 }
 
 #[cfg(test)]

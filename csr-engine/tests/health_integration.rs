@@ -219,7 +219,7 @@ fn full_eval_red_probe_exits_nonzero() {
         // five-result page: 12 cases cannot reach 70%.
         let snapshot = health::HealthSnapshot {
             sample: Some(ProbeSample {
-                version: 1,
+                version: health::probe::SAMPLE_VERSION,
                 sample_id: "ps-integration".into(),
                 created_at: recent(),
                 cutoff_at: recent(),
