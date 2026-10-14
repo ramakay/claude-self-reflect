@@ -1377,9 +1377,29 @@ fn extract_tool_results(msg: &serde_json::Value) -> String {
 /// Parse a JSONL file into raw serde_json::Value messages (for extraction module).
 /// Returns all messages with their original structure intact.
 pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
+    Ok(parse_jsonl_messages_with_queued(path)?.0)
+}
+
+/// A prompt the person typed while Claude was busy. The transcript holds it only as
+/// a `queued_command` attachment, not as a user row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedPrompt {
+    /// How many messages precede it: where it sits among them.
+    pub place: usize,
+    pub text: String,
+}
+
+/// [`parse_jsonl_messages`] plus the human-typed `queued_command` attachments, in
+/// order, each with its place among the messages. The messages themselves are
+/// unchanged, so message counts stored against them stay valid.
+pub(crate) fn parse_jsonl_messages_with_queued(
+    path: &Path,
+) -> Result<(Vec<serde_json::Value>, Vec<QueuedPrompt>)> {
     let file = fs::File::open(path).context("opening JSONL file for extraction")?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut queued = Vec::new();
+    let mut seen = HashSet::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -1397,10 +1417,29 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
         let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if msg_type == "human" || msg_type == "user" || msg_type == "assistant" {
             messages.push(parsed);
+        } else if msg_type == "attachment" {
+            let Some(command) = parsed
+                .get("attachment")
+                .and_then(crate::transcript::queued_command)
+            else {
+                continue;
+            };
+            // The same enqueue can be written twice; one prompt, one count.
+            let stamp = parsed
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if command.human_turn && seen.insert((stamp, command.prompt.clone())) {
+                queued.push(QueuedPrompt {
+                    place: messages.len(),
+                    text: command.prompt,
+                });
+            }
         }
     }
 
-    Ok(messages)
+    Ok((messages, queued))
 }
 
 /// Parse messages for any pipeline that creates searchable reflections.
@@ -1409,6 +1448,14 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
 pub(crate) fn parse_jsonl_messages_for_search(path: &Path) -> Result<Vec<serde_json::Value>> {
     let messages = parse_jsonl_messages(path)?;
     Ok(sanitize_messages_for_search(&messages).0)
+}
+
+/// [`parse_jsonl_messages_for_search`] plus the prompts typed while Claude was busy.
+pub(crate) fn parse_jsonl_messages_for_search_with_queued(
+    path: &Path,
+) -> Result<(Vec<serde_json::Value>, Vec<QueuedPrompt>)> {
+    let (messages, queued) = parse_jsonl_messages_with_queued(path)?;
+    Ok((sanitize_messages_for_search(&messages).0, queued))
 }
 
 /// Remove CSR's own tool payloads and exact hook-wrapper blocks while preserving

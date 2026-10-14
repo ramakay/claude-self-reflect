@@ -3,6 +3,7 @@
 //! Flow: SQLite retrieves context → Haiku formats it into a 2-3 sentence story → stored as reflection.
 //! Graceful degradation: returns None if claude CLI unavailable or times out.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
@@ -276,6 +277,12 @@ pub fn sample_transcript(messages: &[serde_json::Value], n: usize, char_cap: usi
     result
 }
 
+/// The person's own words in `typed`, whitespace collapsed; None when nothing in it was typed.
+fn typed_words(typed: &str) -> Option<String> {
+    let words = crate::extraction::provenance::extractable(typed)?;
+    Some(words.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 /// What the person typed in these messages, oldest first: their own words, never tool
 /// results, compaction summaries, harness rows or CSR's emissions. The last `n`, each cut to
 /// `chars`.
@@ -311,12 +318,9 @@ pub fn typed_prompts(messages: &[serde_json::Value], n: usize, chars: usize) -> 
                 }
                 _ => return None,
             };
-            let words = crate::extraction::provenance::extractable(&typed)?;
+            let words = typed_words(&typed)?;
             Some(
                 words
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
                     .chars()
                     .take(chars)
                     .collect::<String>()
@@ -393,13 +397,44 @@ pub fn story_due(
     }
 }
 
-/// What the person typed after the story covering the first `covered` messages.
-fn asked_since(messages: &[serde_json::Value], prior: Option<&PriorStory>) -> usize {
+/// What the person typed after the story covering the first `covered` messages. A prompt typed
+/// while Claude was busy has no user row, only a `queued_command` attachment; `queued` holds
+/// those, each with its place among the messages. One whose text also arrives as a user row at
+/// or after its place is that same prompt, counted once.
+fn asked_since(
+    messages: &[serde_json::Value],
+    queued: &[crate::import::QueuedPrompt],
+    prior: Option<&PriorStory>,
+) -> usize {
     let covered = prior
         .and_then(|p| p.covered)
         .unwrap_or(0)
         .min(messages.len());
-    typed_prompts(&messages[covered..], usize::MAX, 1).len()
+    let rows = typed_prompts(&messages[covered..], usize::MAX, usize::MAX).len();
+    let mut rows_by_text: std::collections::HashMap<String, Vec<usize>> = Default::default();
+    for (at, message) in messages.iter().enumerate() {
+        for text in typed_prompts(std::slice::from_ref(message), 1, usize::MAX) {
+            rows_by_text.entry(text).or_default().push(at);
+        }
+    }
+    let mut taken: HashSet<usize> = HashSet::new();
+    let mut from_queue = 0;
+    for prompt in queued.iter().filter(|q| q.place >= covered) {
+        let Some(text) = typed_words(&prompt.text) else {
+            continue;
+        };
+        let twin = rows_by_text.get(&text).and_then(|rows| {
+            rows.iter()
+                .find(|at| **at >= prompt.place && !taken.contains(at))
+        });
+        match twin {
+            Some(at) => {
+                taken.insert(*at);
+            }
+            None => from_queue += 1,
+        }
+    }
+    rows + from_queue
 }
 
 /// Claude Code's own summary at the session's newest compaction: where it sits among the
@@ -619,7 +654,8 @@ pub async fn generate_story_cli(
         return Ok(());
     }
 
-    let mut messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
+    let (mut messages, mut queued) =
+        crate::import::parse_jsonl_messages_for_search_with_queued(transcript)?;
     if messages.len() < 5 {
         log_story_event(
             &project,
@@ -634,19 +670,20 @@ pub async fn generate_story_cli(
         prior.as_ref(),
         messages.len(),
         newest_compaction_summary(&messages).map(|(at, _)| at),
-        asked_since(&messages, prior.as_ref()),
+        asked_since(&messages, &queued, prior.as_ref()),
     );
     if mode == StoryMode::FromCompaction && due.is_err() {
         // SessionStart can run a moment before the summary reaches the transcript: read it again once
         tokio::time::sleep(Duration::from_secs(5)).await;
-        messages = crate::import::parse_jsonl_messages_for_search(transcript)?;
+        (messages, queued) =
+            crate::import::parse_jsonl_messages_for_search_with_queued(transcript)?;
         prior = prior_story(engine.storage(), &conv_id);
         due = story_due(
             mode,
             prior.as_ref(),
             messages.len(),
             newest_compaction_summary(&messages).map(|(at, _)| at),
-            asked_since(&messages, prior.as_ref()),
+            asked_since(&messages, &queued, prior.as_ref()),
         );
     }
     if let Err(skip) = due {
@@ -681,7 +718,7 @@ pub async fn generate_story_cli(
         prior.as_ref(),
         messages.len(),
         summary.as_ref().map(|(at, _)| *at),
-        asked_since(&messages, prior.as_ref()),
+        asked_since(&messages, &queued, prior.as_ref()),
     ) {
         log_story_event(&project, &conv_id, &skip);
         return Ok(());
@@ -1225,9 +1262,119 @@ mod tests {
     fn asked_since_counts_only_what_came_after_the_story() {
         let user = |text: &str| serde_json::json!({"type": "user", "message": {"role": "user", "content": text}});
         let messages = vec![user("old ask"), user("told ask"), user("new ask")];
-        assert_eq!(asked_since(&messages, None), 3);
-        assert_eq!(asked_since(&messages, Some(&prior(1, Some(2)))), 1);
-        assert_eq!(asked_since(&messages, Some(&prior(1, Some(9)))), 0);
+        assert_eq!(asked_since(&messages, &[], None), 3);
+        assert_eq!(asked_since(&messages, &[], Some(&prior(1, Some(2)))), 1);
+        assert_eq!(asked_since(&messages, &[], Some(&prior(1, Some(9)))), 0);
+    }
+
+    /// A transcript with `told` user/assistant rows, then `tail` raw lines.
+    fn transcript_with(told: usize, tail: &[serde_json::Value]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        for n in 0..told {
+            let row = if n % 2 == 0 {
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": format!("ask {n}")}})
+            } else {
+                serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": "done"}})
+            };
+            body.push_str(&format!("{row}\n"));
+        }
+        for row in tail {
+            body.push_str(&format!("{row}\n"));
+        }
+        std::fs::write(dir.path().join("s.jsonl"), body).unwrap();
+        dir
+    }
+
+    /// Is a rewrite due for a story told when the last assistant row had not come yet?
+    fn rewrite_due(dir: &tempfile::TempDir, told: usize) -> Result<(), String> {
+        let (messages, queued) =
+            crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+                .unwrap();
+        let prior = prior(1, Some(told - 1));
+        story_due(
+            StoryMode::Rewrite,
+            Some(&prior),
+            messages.len(),
+            None,
+            asked_since(&messages, &queued, Some(&prior)),
+        )
+    }
+
+    fn queued_row(prompt: serde_json::Value, human: bool, at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "attachment", "timestamp": at,
+            "attachment": {"type": "queued_command", "prompt": prompt, "humanTurn": human}
+        })
+    }
+
+    #[test]
+    fn a_prompt_typed_while_claude_was_busy_makes_a_rewrite_due() {
+        let dir = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!("also fix the pane"),
+                true,
+                "2026-10-14T20:59:56Z",
+            )],
+        );
+        assert_eq!(rewrite_due(&dir, 6), Ok(()));
+        // The same prompt as text blocks.
+        let dir = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!([{"type": "text", "text": "also fix the pane"}]),
+                true,
+                "2026-10-14T20:59:56Z",
+            )],
+        );
+        assert_eq!(rewrite_due(&dir, 6), Ok(()));
+    }
+
+    #[test]
+    fn a_queued_command_nobody_typed_still_skips() {
+        let dir = transcript_with(
+            6,
+            &[
+                queued_row(
+                    serde_json::json!("<task-notification>build finished</task-notification>"),
+                    false,
+                    "2026-10-14T20:59:56Z",
+                ),
+                queued_row(
+                    serde_json::json!("not flagged"),
+                    false,
+                    "2026-10-14T21:00:00Z",
+                ),
+            ],
+        );
+        assert_eq!(
+            rewrite_due(&dir, 6),
+            Err("skip:nothing_asked_since(5/6)".to_string())
+        );
+    }
+
+    #[test]
+    fn a_queued_prompt_that_also_arrives_as_a_user_row_counts_once() {
+        let typed = "also fix the pane";
+        let queued = queued_row(serde_json::json!(typed), true, "2026-10-14T20:59:56Z");
+        let twice = queued_row(serde_json::json!(typed), true, "2026-10-14T20:59:56Z");
+        let row =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": typed}});
+        let dir = transcript_with(6, &[queued, twice, row]);
+        let (messages, queued) =
+            crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+                .unwrap();
+        assert_eq!(queued.len(), 1, "one enqueue written twice");
+        let prior = prior(1, Some(6));
+        assert_eq!(asked_since(&messages, &queued, Some(&prior)), 1);
+        // and a queued prompt before the story's coverage is not new
+        let before = prior_covering_all(&messages);
+        assert_eq!(asked_since(&messages, &queued, Some(&before)), 0);
+    }
+
+    fn prior_covering_all(messages: &[serde_json::Value]) -> PriorStory {
+        prior(1, Some(messages.len()))
     }
 
     #[test]

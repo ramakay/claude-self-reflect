@@ -479,6 +479,41 @@ fn classify_queue_operation(
     })
 }
 
+/// A `queued_command` attachment: a prompt typed (or injected by the harness)
+/// while Claude was busy. The one parse rule for every reader of these rows.
+pub(crate) struct QueuedCommand {
+    /// The prompt text; a string, or the text blocks of an array joined.
+    pub prompt: String,
+    /// `humanTurn`: the person typed it. False for task notifications and other
+    /// harness-queued text.
+    pub human_turn: bool,
+}
+
+/// `attachment` is the row's `attachment` object. `None` for any other
+/// attachment kind and for an empty prompt.
+pub(crate) fn queued_command(attachment: &serde_json::Value) -> Option<QueuedCommand> {
+    if attachment.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
+        return None;
+    }
+    let prompt = match attachment.get("prompt")? {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    Some(QueuedCommand {
+        prompt,
+        human_turn: attachment.get("humanTurn").and_then(|v| v.as_bool()) == Some(true),
+    })
+}
+
 /// `{"type":"attachment","attachment":{"type":"queued_command","prompt":...}}`
 /// is a second on-disk representation of the same enqueue event
 /// `queue-operation` records (verified: 145/147 real `queued_command`
@@ -494,15 +529,10 @@ fn classify_attachment(
     let Some(attachment) = value.get("attachment") else {
         return LineOutcome::Metadata;
     };
-    if attachment.get("type").and_then(|v| v.as_str()) != Some("queued_command") {
-        return LineOutcome::Metadata;
-    }
-    let Some(prompt) = attachment.get("prompt").and_then(|v| v.as_str()) else {
+    let Some(queued) = queued_command(attachment) else {
         return LineOutcome::Metadata;
     };
-    if prompt.trim().is_empty() {
-        return LineOutcome::Metadata;
-    }
+    let prompt = queued.prompt.as_str();
     let timestamp = attachment
         .get("timestamp")
         .and_then(|v| v.as_str())
