@@ -3762,17 +3762,57 @@ fn resolve_validity_checked(
     chunks: &[crate::import::ConversationChunk],
     consumption_mode: ConsumptionMode,
 ) -> Result<HashMap<String, ConvValidity>> {
-    if consumption_mode == ConsumptionMode::Off || chunks.is_empty() {
+    if chunks.is_empty() {
         return Ok(HashMap::new());
     }
-    let identities: Vec<(String, String)> = chunks
-        .iter()
-        .map(|chunk| (chunk.id.clone(), chunk.conversation_id.clone()))
-        .collect();
-    let hits = storage.witness_verdicts_for_chunks(&identities)?;
-    let mut validity = reduce_validity_hits(hits, chunks);
+    // The dream switch turns the dream's own verdict notes off; labeling CSR's
+    // text is a separate feature and does not depend on it.
+    let mut validity = if consumption_mode == ConsumptionMode::Off {
+        HashMap::new()
+    } else {
+        let identities: Vec<(String, String)> = chunks
+            .iter()
+            .map(|chunk| (chunk.id.clone(), chunk.conversation_id.clone()))
+            .collect();
+        let hits = storage.witness_verdicts_for_chunks(&identities)?;
+        reduce_validity_hits(hits, chunks)
+    };
+    add_csr_text_labels(&mut validity, chunks);
     normalize_validity_for_mode(&mut validity, consumption_mode);
     Ok(validity)
+}
+
+/// Start of the annotation a result carries when its chunk holds CSR's own
+/// output. Same style as `[stale anchor]` / `[evolved]`.
+const CSR_TEXT_LABEL: &str = "[CSR text]";
+
+/// Label the results whose chunk text matches a CSR formatter's grammar, the
+/// way a dream verdict labels a stale anchor: a `[CSR text]` note, and the same
+/// rank sink wherever the dream consumption mode already sinks (`full`), never
+/// a drop. Only the result set is looked at, never the corpus. The chunk is not
+/// touched: CSR text is kept as it was written.
+fn add_csr_text_labels(
+    validity: &mut HashMap<String, ConvValidity>,
+    chunks: &[crate::import::ConversationChunk],
+) {
+    for chunk in chunks {
+        let Some(hit) = crate::import::contamination::chunk_hit(chunk) else {
+            continue;
+        };
+        let note = format!(
+            "{CSR_TEXT_LABEL} this chunk holds CSR's own output ({})",
+            hit.formatter
+        );
+        match validity.get_mut(&chunk.id) {
+            Some(existing) => {
+                existing.note = format!("{}; {note}", existing.note);
+                existing.demote = true;
+            }
+            None => {
+                validity.insert(chunk.id.clone(), ConvValidity { demote: true, note });
+            }
+        }
+    }
 }
 
 /// Prompt-submit needs the same Demote predicate before applying release
@@ -3807,7 +3847,7 @@ fn normalize_validity_for_mode(
     validity: &mut HashMap<String, ConvValidity>,
     consumption_mode: ConsumptionMode,
 ) {
-    if consumption_mode == ConsumptionMode::AnnotateOnly {
+    if consumption_mode != ConsumptionMode::Full {
         for verdict in validity.values_mut() {
             verdict.demote = false;
         }
@@ -4086,8 +4126,11 @@ fn apply_validity_partition(
             // dream-verdict footer counts it (never a substring of the
             // resolution note), so with the kill switch on (empty map, early
             // return above) the flag stays false everywhere and output is
-            // byte-identical to pre-partition behavior.
-            e.validity_demoted = true;
+            // byte-identical to pre-partition behavior. A chunk sunk only for
+            // holding CSR text is not a dream verdict and is not counted there.
+            e.validity_demoted = !validity
+                .get(&e.chunk.id)
+                .is_some_and(|v| v.note.starts_with(CSR_TEXT_LABEL));
             demoted.push(e);
         } else {
             kept.push(e);
@@ -7343,6 +7386,96 @@ mod tests {
             enriched[1].resolution.as_deref(),
             Some("[stale anchor] old_fn no longer in current code (receipt cafebab)")
         );
+    }
+
+    fn csr_text_result(
+        id: &str,
+        conversation: &str,
+        author: crate::provenance::Speaker,
+        content: &str,
+        score: f32,
+        seq: usize,
+    ) -> EnrichedResult {
+        let mut result = enriched_result_conv(id, conversation, score, seq);
+        result.chunk.author = author;
+        result.chunk.content = content.into();
+        result
+    }
+
+    const CSR_RECAP_TEXT: &str = "recap [2m ago]: Fixed the importer. [[CSR:RECAP]]";
+
+    /// Label, never delete: a result whose chunk holds CSR's own output carries
+    /// a `[CSR text]` note in every mode (the dream switch does not turn it
+    /// off), is kept whole, and sinks only where a dream verdict would sink.
+    #[test]
+    fn a_result_holding_csr_text_is_labeled_kept_and_sunk_only_in_full_mode() {
+        use crate::provenance::Speaker;
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let results = || {
+            vec![
+                csr_text_result("csr", "conv-a", Speaker::User, CSR_RECAP_TEXT, 0.95, 0),
+                csr_text_result("clean", "conv-b", Speaker::User, "ordinary work", 0.90, 1),
+                csr_text_result(
+                    "tool",
+                    "conv-c",
+                    Speaker::ToolResult,
+                    CSR_RECAP_TEXT,
+                    0.85,
+                    2,
+                ),
+                csr_text_result("plan", "plan:x", Speaker::User, CSR_RECAP_TEXT, 0.80, 3),
+            ]
+        };
+        for (mode, order) in [
+            (ConsumptionMode::Full, ["clean", "tool", "plan", "csr"]),
+            (
+                ConsumptionMode::AnnotateOnly,
+                ["csr", "clean", "tool", "plan"],
+            ),
+            (ConsumptionMode::Off, ["csr", "clean", "tool", "plan"]),
+        ] {
+            let mut enriched = results();
+            let chunks: Vec<_> = enriched.iter().map(|e| e.chunk.clone()).collect();
+            let validity = resolve_validity_with(&storage, &chunks, mode);
+            apply_validity_partition(&mut enriched, &validity, false);
+
+            let ids: Vec<&str> = enriched.iter().map(|e| e.chunk.id.as_str()).collect();
+            assert_eq!(ids, order, "{mode:?}");
+            for e in &enriched {
+                let labeled = e
+                    .resolution
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("[CSR text]"));
+                assert_eq!(labeled, e.chunk.id == "csr", "{mode:?} {}", e.chunk.id);
+                // never counted as a dream verdict, never edited
+                assert!(!e.validity_demoted);
+            }
+            assert_eq!(
+                enriched
+                    .iter()
+                    .find(|e| e.chunk.id == "csr")
+                    .unwrap()
+                    .chunk
+                    .content,
+                CSR_RECAP_TEXT
+            );
+        }
+    }
+
+    #[test]
+    fn a_csr_text_label_joins_a_dream_note_instead_of_replacing_it() {
+        use crate::provenance::Speaker;
+        let chunk = csr_text_result("c", "conv", Speaker::Assistant, CSR_RECAP_TEXT, 0.9, 0).chunk;
+        let mut validity: HashMap<String, ConvValidity> = [(
+            "c".to_string(),
+            demote_validity("[stale anchor] foo no longer in current code (receipt abc1234)"),
+        )]
+        .into_iter()
+        .collect();
+        add_csr_text_labels(&mut validity, &[chunk]);
+        let note = &validity["c"].note;
+        assert!(note.starts_with("[stale anchor]"), "{note}");
+        assert!(note.contains("[CSR text]"), "{note}");
     }
 
     #[test]
