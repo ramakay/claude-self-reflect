@@ -366,11 +366,15 @@ impl MemoryHealthStatus {
     }
 
     /// The only two causes of a memory chip: the current canary fails, or the
-    /// latest completed probe is red on at least ten cases. Amber, abstain,
-    /// unavailable, stale-only and duplicates never raise it.
+    /// latest completed probe is red on at least ten cases and is not stale.
+    /// Amber, abstain, unavailable, duplicates and a result older than
+    /// [`MEMORY_HEALTH_STALE_HOURS`] never raise it: a red nobody has
+    /// re-measured (the daemon loop is off, or stopped) must not warn forever.
+    /// The JSON still reports it, as `stale`.
     fn chip_text(&self) -> Option<String> {
         let canary = (!self.canary.passed).then(|| "canary".to_string());
         let recall = (self.probe.state == "red"
+            && !self.probe.stale
             && self
                 .probe
                 .n
@@ -2671,6 +2675,49 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_red_result_does_not_raise_the_chip() {
+        use crate::health::ProbeGrade::*;
+        let red = health_snapshot(Some(probe_report(Red, 6, 20))); // measured 2026-10-13T10:00Z
+        let at = |now: &str| {
+            MemoryHealthStatus::from_cache(
+                &red,
+                true,
+                String::new(),
+                crate::temporal::parse_timestamp(now).unwrap(),
+            )
+        };
+        // fresh: the chip is up
+        let fresh = at("2026-10-13T12:00:00Z");
+        assert!(!fresh.probe.stale);
+        assert_eq!(fresh.warning.as_deref(), Some("⚠ mem: recall 6/20"));
+        // just under MEMORY_HEALTH_STALE_HOURS (12h): still up
+        assert_eq!(
+            at("2026-10-13T21:59:00Z").warning.as_deref(),
+            Some("⚠ mem: recall 6/20")
+        );
+        // twelve hours on with nothing re-measuring it (the daemon loop is off):
+        // the result is shown, as stale, and no longer raises the chip
+        let old = at("2026-10-13T22:00:00Z");
+        assert!(old.probe.stale);
+        assert_eq!(
+            old.probe.state, "red",
+            "the stored result is still reported"
+        );
+        assert_eq!(old.warning, None);
+        let mut report = base_report();
+        report.memory_health = old;
+        assert!(!format_compact(&report, 0).contains("mem"));
+        // the canary is evaluated now, so its chip has no age
+        let canary_old = MemoryHealthStatus::from_cache(
+            &red,
+            false,
+            String::new(),
+            crate::temporal::parse_timestamp("2026-10-20T00:00:00Z").unwrap(),
+        );
+        assert_eq!(canary_old.warning.as_deref(), Some("⚠ mem: canary"));
+    }
+
+    #[test]
     fn fresh_install_memory_health_is_not_claimed_green() {
         let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
@@ -2738,7 +2785,10 @@ mod tests {
             };
             storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
         }
-        let snapshot = health_snapshot(Some(probe_report(crate::health::ProbeGrade::Red, 6, 20)));
+        // measured just now: a red result older than the stale window raises no chip
+        let mut fresh_red = probe_report(crate::health::ProbeGrade::Red, 6, 20);
+        fresh_red.at = chrono::Utc::now().to_rfc3339();
+        let snapshot = health_snapshot(Some(fresh_red));
         crate::health::save_health(&storage, &snapshot).unwrap();
         let before = (
             storage.get_meta(crate::health::META_HEALTH).unwrap(),

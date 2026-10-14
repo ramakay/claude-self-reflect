@@ -567,9 +567,23 @@ async fn pause(seconds: u64, shutdown: &AtomicBool) -> bool {
     !shutdown.load(Ordering::SeqCst)
 }
 
+/// Whether `CSR_NO_HEALTH` switches the daemon's health loop off: `1` or
+/// `true`, any case, as for `CSR_NO_DREAMING`. A pure function of the value so
+/// no test sets process env.
+pub fn health_disabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 /// The daemon's health cadence: canary at start, then the six-hour
 /// measurement on the shared heavy-work permit. Restart-safe: the schedule is
 /// the persisted last attempt, not process memory.
+///
+/// `CSR_NO_HEALTH=1` turns the loop off, read once when the daemon spawns it:
+/// no canary record, no duplicate scan, no recall probe, one log line saying so.
+/// It is the daemon's switch only. `csr-engine eval --full` still measures when
+/// the person runs it, and `status` still shows whatever was last measured (an
+/// old red result stops raising the chip after twelve hours, so with the loop
+/// off it clears by itself).
 pub async fn health_loop(
     storage: Arc<Storage>,
     embeddings: Arc<crate::embeddings::EmbeddingEngine>,
@@ -577,6 +591,23 @@ pub async fn health_loop(
     heavy_work: Arc<Semaphore>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let off = health_disabled_from(std::env::var("CSR_NO_HEALTH").ok().as_deref());
+    health_loop_unless(off, storage, embeddings, search, heavy_work, shutdown).await
+}
+
+/// [`health_loop`] with the switch decided by the caller.
+pub async fn health_loop_unless(
+    off: bool,
+    storage: Arc<Storage>,
+    embeddings: Arc<crate::embeddings::EmbeddingEngine>,
+    search: Arc<RwLock<SearchEngine>>,
+    heavy_work: Arc<Semaphore>,
+    shutdown: Arc<AtomicBool>,
+) {
+    if off {
+        tracing::info!("memory health loop off via CSR_NO_HEALTH");
+        return;
+    }
     if let Err(error) = record_canary(&storage, Utc::now()) {
         tracing::warn!(%error, "could not record the canary verdict");
     }
@@ -988,5 +1019,53 @@ mod tests {
             "the other holder still has it"
         );
         assert!(storage.get_meta(META_HEALTH).unwrap().is_none());
+    }
+    #[test]
+    fn csr_no_health_is_decided_from_the_env_value() {
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(health_disabled_from(Some(on)), "{on}");
+        }
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("yes"),
+            Some("2"),
+        ] {
+            assert!(!health_disabled_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_health_loop_measures_nothing_and_an_enabled_one_starts_with_the_canary() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let embeddings = Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+                let heavy = Arc::new(Semaphore::new(1));
+                // shutdown is already raised, so the enabled loop returns after
+                // its first step instead of waiting out its start delay
+                let shutdown = Arc::new(AtomicBool::new(true));
+                for (off, recorded) in [(true, false), (false, true)] {
+                    let storage = Arc::new(Storage::open_memory().unwrap());
+                    health_loop_unless(
+                        off,
+                        storage.clone(),
+                        embeddings.clone(),
+                        search(),
+                        heavy.clone(),
+                        shutdown.clone(),
+                    )
+                    .await;
+                    let snapshot = load_health(&storage).unwrap();
+                    assert_eq!(snapshot.state.canary.is_some(), recorded, "off={off}");
+                    assert!(snapshot.state.duplicates.is_none() && snapshot.state.probe.is_none());
+                    assert!(snapshot.sample.is_none(), "off={off}");
+                    assert_eq!(heavy.available_permits(), 1);
+                }
+            });
     }
 }
