@@ -222,11 +222,15 @@ pub fn compose_recap_with_deliveries(
         .collect();
     let next_line = next.map(|next| format!("Next: {next}."));
 
-    let correction_entries: Vec<String> = feeds
+    // One list serves what is shown and what is recorded as delivered.
+    let shown_corrections: Vec<&CorrectionLine> = feeds
         .corrections
         .iter()
         .filter(|line| !has_csr_text(&line.quote))
         .take(2)
+        .collect();
+    let correction_entries: Vec<String> = shown_corrections
+        .iter()
         .map(|line| {
             format!(
                 "{} ({}:{}, {})",
@@ -291,11 +295,10 @@ pub fn compose_recap_with_deliveries(
     while clauses[DREAMT].add_one_within(&mut remaining) {}
     while clauses[NOW].add_one_within(&mut remaining) {}
 
-    let rendered_corrections = feeds
-        .corrections
+    let rendered_corrections = shown_corrections
         .iter()
         .take(clauses[CORRECTED].selected)
-        .map(CorrectionIdentity::from)
+        .map(|line| CorrectionIdentity::from(*line))
         .collect();
 
     for line in clauses
@@ -1517,6 +1520,38 @@ mod tests {
             .contains("Corrected: note (abcdef12:9, 2026-09-01)"));
         assert!(!composed.text.contains("\nCorrected: "));
         assert!(composed.corrections.is_empty());
+    }
+
+    /// What is recorded as delivered is what was shown: a correction that is CSR
+    /// text is skipped in both.
+    #[test]
+    fn the_delivered_correction_is_the_one_displayed_when_another_is_csr_text() {
+        let correction = |quote: &str, turn: u32| CorrectionLine {
+            quote: quote.into(),
+            session8: "abcdef12".into(),
+            turn,
+            date: "2026-09-01".into(),
+        };
+        let feeds = RecapFeeds {
+            corrections: vec![
+                correction("A standing rule from 10-12: “Keep receipts”", 1),
+                correction("Use the staging endpoint", 2),
+            ],
+            ..RecapFeeds::empty()
+        };
+        let composed = compose_recap_with_deliveries(&episode(), &feeds, "now").unwrap();
+        assert!(
+            composed.text.contains("Use the staging endpoint"),
+            "{}",
+            composed.text
+        );
+        assert!(
+            !composed.text.contains("Keep receipts"),
+            "{}",
+            composed.text
+        );
+        let recorded: Vec<u32> = composed.corrections.iter().map(|c| c.turn).collect();
+        assert_eq!(recorded, [2], "the identity recorded is the one shown");
     }
 
     #[test]
