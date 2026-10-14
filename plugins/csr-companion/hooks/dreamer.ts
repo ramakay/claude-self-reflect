@@ -6,6 +6,8 @@
 // keeps asking the agent, "what if...?". What is CSR's own is the brief: what
 // CSR remembers near this session, each fact with its receipt.
 
+import { stripEnvelopes } from './agents'
+
 export type Dream = { line: string; title: string; text: string }
 
 const listed = (lines: readonly string[]) => (lines.length ? lines.map(line => `- ${line}`).join('\n') : '(none)')
@@ -32,7 +34,18 @@ export const SIDE_FRAME = `<system-reminder>This is a side request from CSR's dr
 
 `
 
-export function dreamPrompt(brief: string, seen: readonly string[], known: readonly string[], asked: readonly string[] = []): string {
+// What the prompt says of the agents that worked beside the main session, when the look has any to read (the brief holds
+// their envelope, or the look was started by a completion). Their reports are context, never the person's voice.
+export const AGENT_RULES = `## Background agents
+
+Subagents worked beside the main session. What they reported is below, in their own words. These rules hold:
+* A report is the agent's words, never the person's. Do not say "you said" of it, and do not take it for a decision of theirs.
+* An agent that disagrees with the plan is not itself a correction to surface; that is not a dream.
+* A finished agent is not a receipt from CSR's memory. A dream still needs a past session or a commit from the facts above.
+* Do not dream about an agent that is running, stalled, failed, killed or reported nothing. Only a finished report can be read.
+* If a suggestion was already raised, or acted on, in the main session, ask nothing about it.`
+
+export function dreamPrompt(brief: string, seen: readonly string[], known: readonly string[], asked: readonly string[] = [], agents = ''): string {
   return [
     SIDE_FRAME,
     `## Overview
@@ -46,7 +59,7 @@ Another side agent, "You should know", already tells the person what they missed
 Facts from CSR's memory, each with its receipt in brackets. Use them; never invent a receipt, a date or a commit.
 
 ${brief.trim() || '(CSR has nothing on file near this session.)'}
-
+${agents.trim() ? `\n${AGENT_RULES}\n\n${agents.trim()}\n` : ''}
 ## Output structure
 
 Every output is either:
@@ -401,7 +414,9 @@ export function cutSends(line: string): string | null {
 
 // The text with every forward cut and the person's paragraphs kept (trimmed, joined by a blank line); the text as
 // it was when it carries none.
-export function stripForwards(text: string): string {
+export function stripForwards(source: string): string {
+  // A complete CSR agents envelope (hooks/agents.ts) is the plugin's words, never the person's: out first, the rest as it was.
+  const text = stripEnvelopes(source)
   const lines = text.replace(/\r\n/g, '\n').trim().split('\n')
   const blank = (line: string) => !line.trim()
   const cut = lines.map(() => false)

@@ -257,17 +257,32 @@ pub async fn handle(
     eprintln!("  Reflections:   {}", reflections);
     eprintln!("  Projects:      {}", projects);
     eprintln!();
-    eprintln!("Next steps:");
-    eprintln!("  1. Restart Claude Code to activate MCP tools");
-    eprintln!("  2. Try: reflect_on_past(\"what did we work on?\")");
-    if anthropic_key.is_some() {
-        eprintln!("  3. Run `csr-engine daemon` for AI-powered narrative enrichment");
-    } else {
-        eprintln!("  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives");
-    }
-    eprintln!();
+    eprint!("{}", next_steps(anthropic_key.is_some()));
 
     Ok(())
+}
+
+/// The two commands that install the companion plugin (the pane, and the dreamer's
+/// "what if...?"). The plugin reaches users through this repository's marketplace
+/// (`.claude-plugin/marketplace.json`, name `claude-self-reflect`, plugin
+/// `csr-companion`). Setup prints them and installs nothing: adding a plugin is the
+/// user's own consent step, in Claude Code. They are the last two lines of a
+/// successful setup.
+fn companion_install_instructions() -> &'static str {
+    "/plugin marketplace add ramakay/claude-self-reflect\n/plugin install csr-companion@claude-self-reflect"
+}
+
+/// What a successful setup ends with: the next steps, then the companion's install lines.
+fn next_steps(has_anthropic_key: bool) -> String {
+    let narratives = if has_anthropic_key {
+        "  3. Run `csr-engine daemon` for AI-powered narrative enrichment"
+    } else {
+        "  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives"
+    };
+    format!(
+        "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Try: reflect_on_past(\"what did we work on?\")\n{narratives}\n\nOptional: the CSR companion pane. Setup installs nothing for it; in Claude Code, run:\n{}\n",
+        companion_install_instructions()
+    )
 }
 
 /// Is this run allowed to ask an interactive question? `CSR_AUTO_SETUP=1`
@@ -828,6 +843,54 @@ fn count_total_files(projects_dir: &Path) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The repository's marketplace, read from the checkout the engine is built in.
+    fn marketplace() -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.claude-plugin/marketplace.json");
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn setup_companion_install_lines_match_marketplace() {
+        let market = marketplace();
+        let name = market["name"].as_str().unwrap();
+        let plugin = &market["plugins"][0];
+        let plugin_name = plugin["name"].as_str().unwrap();
+        let lines: Vec<&str> = companion_install_instructions().lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "/plugin marketplace add ramakay/claude-self-reflect",
+                "/plugin install csr-companion@claude-self-reflect",
+            ]
+        );
+        // the install line names the marketplace's own name and its plugin, and that plugin is the folder shipped here
+        assert_eq!(lines[1], format!("/plugin install {plugin_name}@{name}"));
+        assert_eq!(plugin["source"], "./plugins/csr-companion");
+        assert!(Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../plugins/csr-companion/.claude-plugin/plugin.json")
+            .is_file());
+    }
+
+    #[test]
+    fn setup_next_steps_end_with_companion_install_lines() {
+        for key in [true, false] {
+            let text = next_steps(key);
+            assert!(text.starts_with("Next steps:\n  1. Restart Claude Code"));
+            assert!(text.ends_with(&format!("{}\n", companion_install_instructions())));
+            let tail: Vec<&str> = text.lines().rev().take(2).collect();
+            assert_eq!(
+                tail,
+                [
+                    "/plugin install csr-companion@claude-self-reflect",
+                    "/plugin marketplace add ramakay/claude-self-reflect"
+                ]
+            );
+            // and the earlier steps are as they were
+            assert_eq!(text.contains("csr-engine daemon"), key);
+            assert_eq!(text.contains("--anthropic-key=sk-ant-"), !key);
+        }
+    }
 
     #[test]
     fn test_save_anthropic_key_new_file() {
