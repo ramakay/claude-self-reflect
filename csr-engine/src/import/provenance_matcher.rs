@@ -83,14 +83,14 @@ impl MessageIndex {
                     parent,
                 );
                 let marker = |parts: &[(String, String)]| {
-                    raw.get("type").and_then(|v| v.as_str()) == Some("assistant")
-                        && super::is_marker_only_text(
-                            &parts
-                                .iter()
-                                .map(|(_, s)| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )
+                    super::drops_as_marker_only(
+                        &raw,
+                        &parts
+                            .iter()
+                            .map(|(_, s)| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
                 };
                 if !marker(&raw_components) {
                     documents[1].push(

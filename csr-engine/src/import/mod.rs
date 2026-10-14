@@ -738,8 +738,7 @@ pub(crate) fn parse_jsonl_file_observing(
         // recall loss on genuine user content, which is strictly worse than
         // keeping one content-free assistant marker.
         let author = classify_message_author(&parsed);
-        let drop_as_marker = matches!(author, crate::provenance::Speaker::Assistant)
-            && is_marker_only_text(&combined_text);
+        let drop_as_marker = drops_as_marker_only(&parsed, &combined_text);
         if !combined_text.is_empty() && !drop_as_marker {
             let message_key = parsed
                 .get("uuid")
@@ -1684,6 +1683,18 @@ fn is_marker_only_text(text: &str) -> bool {
     // Strip every marker token; pure tool-call noise leaves only whitespace.
     let remainder = TOOL_MARKER_RE.replace_all(trimmed, "");
     remainder.chars().all(|c| c.is_whitespace())
+}
+
+/// Whether an assistant message is only CSR's rendering of tool calls, and so
+/// is not embedded as a chunk. A real text block is never dropped, whatever it
+/// looks like (`[TODO]` is words); only a message with no text block at all,
+/// nothing but rendered tool markers, is. Import and reparse both decide here.
+pub(crate) fn drops_as_marker_only(msg: &serde_json::Value, combined_text: &str) -> bool {
+    matches!(
+        classify_message_author(msg),
+        crate::provenance::Speaker::Assistant
+    ) && extract_message_text(msg).trim().is_empty()
+        && is_marker_only_text(combined_text)
 }
 
 pub(crate) fn is_csr_tool_use(item: &serde_json::Value, name: &str) -> bool {
@@ -3110,6 +3121,41 @@ mod tests {
         ));
         assert!(!is_marker_only_text("Fixed the parser bug."));
         assert!(!is_marker_only_text(""));
+    }
+
+    /// A real text block is never dropped, whatever its text looks like. Only a
+    /// message with no text block at all (nothing but rendered tool markers) is.
+    #[test]
+    fn an_assistant_text_block_that_looks_like_a_tool_marker_is_imported_byte_identical() {
+        for text in ["[TODO]", "[csr_reflect_on_past: Preserve my rollback plan]"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("looks-like-a-marker.jsonl");
+            let message = serde_json::json!({
+                "type": "assistant",
+                "uuid": "a1",
+                "timestamp": "2026-10-13T00:00:00Z",
+                "message": {"content": [{"type": "text", "text": text}]}
+            });
+            std::fs::write(&path, message.to_string()).unwrap();
+            let parsed = parse_jsonl_file_with_stats(&path, "project").unwrap();
+            let stored: Vec<&str> = parsed.chunks.iter().map(|c| c.content.as_str()).collect();
+            assert_eq!(stored, [text], "{text} was dropped at import");
+            // the reparse decision is the same one
+            assert!(
+                !drops_as_marker_only(&message, text),
+                "{text} dropped at reparse"
+            );
+        }
+        // a tool_use-only message is dropped as before
+        let tool_only = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "e", "name": "Edit",
+                                      "input": {"file_path": "/repo/a.md"}}]}
+        });
+        assert!(drops_as_marker_only(&tool_only, "[Edit: a.md]"));
+        // the same text from the person is never a marker
+        let user = serde_json::json!({"type": "user", "message": {"content": "[TODO]"}});
+        assert!(!drops_as_marker_only(&user, "[TODO]"));
     }
 
     #[test]
