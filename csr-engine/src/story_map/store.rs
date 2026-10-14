@@ -191,7 +191,7 @@ pub fn is_ledger_row(tags: &[String]) -> bool {
     tags.iter().any(|t| t == "narrative_shift")
 }
 
-fn ledger_meta_key(project: &str) -> String {
+pub(super) fn ledger_meta_key(project: &str) -> String {
     format!("shift_ledger:{project}")
 }
 
@@ -305,7 +305,7 @@ pub fn load_ledger(storage: &Storage, project: &str) -> Ledger {
     ledger
 }
 
-fn cap_and_serialize_ledger(mut ledger: Ledger) -> anyhow::Result<String> {
+pub(super) fn cap_and_serialize_ledger(mut ledger: Ledger) -> anyhow::Result<String> {
     ledger.v = LEDGER_VERSION;
     if ledger.entries.len() > LEDGER_MAX_ENTRIES {
         ledger.entries.truncate(LEDGER_MAX_ENTRIES);
@@ -601,7 +601,13 @@ pub async fn record_story_map(
     by: &str,
     shifts: Vec<ShiftEntry>,
 ) {
-    if story_map_disabled() || shifts.is_empty() {
+    if story_map_disabled() {
+        return;
+    }
+    if let Some(path) = super::likes::likes_path() {
+        super::likes::sync_likes(engine.storage(), project, &path);
+    }
+    if shifts.is_empty() {
         return;
     }
     let _op = match engine.storage().operation_lock() {
@@ -1331,5 +1337,225 @@ mod tests {
             "conv_123".to_string()
         ]));
         assert!(!is_ledger_row(&[]));
+    }
+
+    fn test_engine() -> (crate::engine::Engine, std::sync::Arc<Storage>) {
+        let storage = std::sync::Arc::new(Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = crate::engine::Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+        (engine, storage)
+    }
+
+    fn seed_evo_row(storage: &Storage, conv_id: &str, file_path: &str, sym: &str) {
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO code_evolution (
+                        id, session_id, project_name, file_path, language, timestamp,
+                        functions_added, functions_removed, types_added, types_removed
+                    ) VALUES ('evo_9f12a0c1_1', ?1, 'csr', ?2, 'rust', '2026-10-14T00:00:01Z', ?3, '[]', '[]', '[]')",
+                    params![conv_id, file_path, format!("[\"{sym}\"]")],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn record_story_map_writes_rows_ledger_and_map() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let (engine, storage) = test_engine();
+        seed_evo_row(
+            &storage,
+            "conv-e2e",
+            "/repo/src/summarizer.rs",
+            "ground_shifts",
+        );
+        let entry = parse_shift_line(
+            "decision|-|summarizer.rs:ground_shifts+|Check shift endpoints against AST rows",
+        )
+        .unwrap();
+        let expected_sig = sig("csr", &entry);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(record_story_map(
+            &engine,
+            "csr",
+            "conv-e2e",
+            1,
+            24,
+            "Haiku",
+            vec![entry],
+        ));
+
+        let rows = storage
+            .get_reflections_by_tag("narrative_shift", 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let (refl_id, _, _, _) = &rows[0];
+
+        let ledger = load_ledger(&storage, "csr");
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].sig, expected_sig);
+        assert_eq!(
+            ledger.entries[0].reflection_id.as_deref(),
+            Some(refl_id.as_str())
+        );
+
+        let map = load_story_map(&storage, "conv-e2e").expect("story_map stored");
+        assert_eq!(map.current.by, "Haiku");
+        assert_eq!(map.current.entries.len(), 1);
+        assert_eq!(map.current.entries[0].sig, expected_sig);
+        assert!(map.current.entries[0].grounded);
+    }
+
+    #[test]
+    fn record_story_map_twice_adds_no_second_row() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let (engine, storage) = test_engine();
+        seed_evo_row(
+            &storage,
+            "conv-dup",
+            "/repo/src/summarizer.rs",
+            "ground_shifts",
+        );
+        let entry = parse_shift_line(
+            "decision|-|summarizer.rs:ground_shifts+|Check shift endpoints against AST rows",
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            record_story_map(
+                &engine,
+                "csr",
+                "conv-dup",
+                1,
+                20,
+                "Haiku",
+                vec![entry.clone()],
+            )
+            .await;
+            record_story_map(&engine, "csr", "conv-dup", 2, 40, "Haiku", vec![entry]).await;
+        });
+
+        let rows = storage
+            .get_reflections_by_tag("narrative_shift", 10)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let ledger = load_ledger(&storage, "csr");
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].rev, 2);
+    }
+
+    #[test]
+    fn record_story_map_with_the_kill_switch_writes_nothing() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (engine, storage) = test_engine();
+        seed_evo_row(
+            &storage,
+            "conv-kill",
+            "/repo/src/summarizer.rs",
+            "ground_shifts",
+        );
+        let entry = parse_shift_line(
+            "decision|-|summarizer.rs:ground_shifts+|Check shift endpoints against AST rows",
+        )
+        .unwrap();
+
+        std::env::set_var("CSR_NO_STORY_MAP", "1");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(record_story_map(
+            &engine,
+            "csr",
+            "conv-kill",
+            1,
+            20,
+            "Haiku",
+            vec![entry],
+        ));
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let rows = storage
+            .get_reflections_by_tag("narrative_shift", 10)
+            .unwrap();
+        assert!(rows.is_empty());
+        assert!(storage.get_meta("story_map:conv-kill").unwrap().is_none());
+        assert!(storage.get_meta("shift_ledger:csr").unwrap().is_none());
+        assert!(storage.get_meta("story_kind_prefs:csr").unwrap().is_none());
+    }
+
+    #[test]
+    fn record_story_map_with_no_shifts_leaves_the_old_map() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let (engine, storage) = test_engine();
+        seed_evo_row(
+            &storage,
+            "conv-keep",
+            "/repo/src/summarizer.rs",
+            "ground_shifts",
+        );
+        let entry = parse_shift_line(
+            "decision|-|summarizer.rs:ground_shifts+|Check shift endpoints against AST rows",
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(record_story_map(
+            &engine,
+            "csr",
+            "conv-keep",
+            1,
+            20,
+            "Haiku",
+            vec![entry],
+        ));
+        let before = storage.get_meta("story_map:conv-keep").unwrap().unwrap();
+
+        rt.block_on(record_story_map(
+            &engine,
+            "csr",
+            "conv-keep",
+            2,
+            35,
+            "Haiku",
+            Vec::new(),
+        ));
+        let after = storage.get_meta("story_map:conv-keep").unwrap().unwrap();
+        assert_eq!(before, after);
     }
 }

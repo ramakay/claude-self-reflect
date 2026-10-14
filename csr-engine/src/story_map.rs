@@ -16,6 +16,7 @@ const MAX_CLAIM_CHARS: usize = 72;
 
 pub mod derive;
 pub mod ground;
+pub mod likes;
 pub mod store;
 
 /// Kill switch (`CSR_NO_STORY_MAP=1`): disables `@shifts` prompt requests,

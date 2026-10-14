@@ -1422,6 +1422,110 @@ Summary:
     }
 
     #[test]
+    fn a_story_rewrite_replaces_the_story_row_and_keeps_every_ledger_row() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let storage = std::sync::Arc::new(Storage::open_memory().unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            std::path::PathBuf::from("/tmp"),
+        );
+
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO code_evolution (
+                        id, session_id, project_name, file_path, language, timestamp,
+                        functions_added, functions_removed, types_added, types_removed
+                    ) VALUES
+                    ('evo_1', 'conv-keep-ledger', 'csr', '/repo/src/a.rs', 'rust', '2026-10-14T00:00:01Z', '[\"f1\"]', '[]', '[]', '[]'),
+                    ('evo_2', 'conv-keep-ledger', 'csr', '/repo/src/b.rs', 'rust', '2026-10-14T00:00:02Z', '[\"f2\"]', '[]', '[]', '[]')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let s1 = crate::story_map::parse_shift_line("shift|-|a.rs:f1+|Added f1").unwrap();
+        let s2 = crate::story_map::parse_shift_line("shift|-|b.rs:f2+|Added f2").unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            store_story(
+                &engine,
+                "/repo/csr",
+                "conv-keep-ledger",
+                "csr",
+                "First session story.",
+                None,
+                10,
+                vec!["story_by_haiku".to_string()],
+            )
+            .await
+            .unwrap();
+            crate::story_map::store::record_story_map(
+                &engine,
+                "csr",
+                "conv-keep-ledger",
+                1,
+                10,
+                "Haiku",
+                vec![s1, s2],
+            )
+            .await;
+
+            let ledger_before: Vec<String> = storage
+                .get_reflections_by_tag("narrative_shift", 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _, _, _)| id)
+                .collect();
+            assert_eq!(ledger_before.len(), 2);
+
+            let prior = prior_story(&storage, "conv-keep-ledger");
+            assert!(prior.is_some());
+            store_story(
+                &engine,
+                "/repo/csr",
+                "conv-keep-ledger",
+                "csr",
+                "Second rewritten session story.",
+                prior.as_ref(),
+                25,
+                vec!["story_by_haiku".to_string()],
+            )
+            .await
+            .unwrap();
+
+            let stories = storage
+                .get_reflections_by_two_tags("session_story", "conv_conv-keep-ledger", 10)
+                .unwrap();
+            assert_eq!(stories.len(), 1);
+            assert_eq!(stories[0].1, "Second rewritten session story.");
+
+            let ledger_after: Vec<String> = storage
+                .get_reflections_by_tag("narrative_shift", 10)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _, _, _)| id)
+                .collect();
+            assert_eq!(ledger_after, ledger_before);
+        });
+    }
+
+    #[test]
     fn the_v3_lookup_never_takes_a_shift_ledger_row_for_an_analysis() {
         let storage = Arc::new(Storage::open_memory().unwrap());
         let tag = |t: &str| t.to_string();
