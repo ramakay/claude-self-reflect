@@ -24,6 +24,107 @@ async fn searching_hook_startup_cannot_publish_a_rebuilt_index() {
     assert_eq!(std::fs::read_dir(index).unwrap().count(), 1);
 }
 
+/// F2.6: a subagent's own compaction must not inject the parent's recap or respin the
+/// parent's story. Runs the real binary against a temp db/HOME, never live data.
+#[cfg(unix)]
+mod subagent_compaction {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    struct Run {
+        stdout: String,
+        timing: String,
+    }
+
+    fn session_start_compact(extra: serde_json::Value) -> Run {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let timing = dir.path().join("timing.log");
+        let transcript = dir.path().join("projects/proj/parent-session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let mut payload = serde_json::json!({
+            "session_id": "parent-session",
+            "transcript_path": transcript,
+            "cwd": dir.path(),
+            "source": "compact",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            payload[k] = v.clone();
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "session-start", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", &home)
+            .env("CSR_TIMING_LOG", &timing)
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        Run {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            timing: std::fs::read_to_string(&timing).unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn main_session_compact_still_injects_and_spawns_the_story() {
+        let run = session_start_compact(serde_json::json!({}));
+        assert!(
+            run.stdout.contains("CSR ENDLESS MEMORY ACTIVE"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.timing.contains("spawned:FromCompaction"),
+            "{}",
+            run.timing
+        );
+        assert!(!run.timing.contains("skip:subagent"), "{}", run.timing);
+    }
+
+    #[test]
+    fn agent_id_compact_injects_nothing_and_spawns_no_story() {
+        let run = session_start_compact(
+            serde_json::json!({"agent_id": "ae3f6f60949bd62e0", "agent_type": "general-purpose"}),
+        );
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.timing.contains("skip:subagent(general-purpose)"),
+            "{}",
+            run.timing
+        );
+        assert!(!run.timing.contains("spawned:"), "{}", run.timing);
+    }
+
+    #[test]
+    fn subagents_transcript_path_alone_marks_a_subagent() {
+        let run = session_start_compact(serde_json::json!({
+            "transcript_path": "/tmp/csr-f26/projects/proj/parent-session/subagents/agent-a1.jsonl"
+        }));
+        assert_eq!(run.stdout, "");
+        assert!(
+            run.timing.contains("skip:subagent(unknown)"),
+            "{}",
+            run.timing
+        );
+        assert!(!run.timing.contains("spawned:"), "{}", run.timing);
+    }
+}
+
 #[cfg(unix)]
 mod prompt_process {
     use std::io::{Read, Write};

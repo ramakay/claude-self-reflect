@@ -53,6 +53,49 @@ pub struct HookInput {
     pub prompt: Option<String>,
     /// Hook event source (e.g. "startup", "resume", "compact", "clear") for SessionStart
     pub source: Option<String>,
+    /// Present only when the hook fires inside a subagent (Claude Code "Common input
+    /// fields"). The session id such a hook carries is the PARENT's.
+    #[serde(alias = "agentId")]
+    pub agent_id: Option<String>,
+    #[serde(alias = "agentType")]
+    pub agent_type: Option<String>,
+}
+
+impl HookInput {
+    /// `Some(agent type)` when this hook fired inside a subagent, `None` for a main
+    /// session. A non-empty `agent_id` decides; a `transcript_path` under
+    /// `/subagents/` is the fallback for a Claude Code that omits it. The label is
+    /// `unknown` when the type is missing.
+    pub fn subagent(&self) -> Option<String> {
+        let by_id = self
+            .agent_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty());
+        let by_path = self
+            .transcript_path
+            .as_deref()
+            .is_some_and(|p| p.replace('\\', "/").contains("/subagents/"));
+        if !(by_id || by_path) {
+            return None;
+        }
+        Some(
+            self.agent_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+        )
+    }
+}
+
+/// Log that a hook stood down because it fired inside a subagent.
+pub(crate) fn log_subagent_skip(hook_name: &str, cwd: &Path, agent_type: &str) {
+    let project =
+        resolve_project_from_cwd(&cwd.to_string_lossy()).unwrap_or_else(|| "unknown".to_string());
+    crate::telemetry::append_timing_line(&format!(
+        "CSR hook {hook_name} [{project}]: skip:subagent({agent_type})"
+    ));
 }
 
 /// How long the hook waits for the piped JSON before giving up.
@@ -710,6 +753,30 @@ pub async fn dispatch_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_is_decided_by_agent_id_then_by_transcript_path() {
+        let parse =
+            |json: serde_json::Value| -> HookInput { serde_json::from_value(json).unwrap() };
+        let main = parse(serde_json::json!({
+            "session_id": "s", "transcript_path": "/p/proj/s.jsonl", "source": "compact"
+        }));
+        assert_eq!(main.subagent(), None);
+        // An empty id is the main session, not a subagent.
+        let empty =
+            parse(serde_json::json!({"agent_id": "  ", "transcript_path": "/p/proj/s.jsonl"}));
+        assert_eq!(empty.subagent(), None);
+        let by_id = parse(serde_json::json!({"agent_id": "a1", "agent_type": "Explore"}));
+        assert_eq!(by_id.subagent().as_deref(), Some("Explore"));
+        let camel = parse(serde_json::json!({"agentId": "a1", "agentType": "Plan"}));
+        assert_eq!(camel.subagent().as_deref(), Some("Plan"));
+        let no_type = parse(serde_json::json!({"agent_id": "a1"}));
+        assert_eq!(no_type.subagent().as_deref(), Some("unknown"));
+        let by_path = parse(serde_json::json!({
+            "transcript_path": "/p/proj/s/subagents/agent-a1.jsonl"
+        }));
+        assert_eq!(by_path.subagent().as_deref(), Some("unknown"));
+    }
 
     /// The guard must divert writes while held and hand the descriptor back
     /// intact afterwards. Run on a pair of pipes so the test process's own

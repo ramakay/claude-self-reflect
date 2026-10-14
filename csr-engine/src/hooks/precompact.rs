@@ -41,7 +41,13 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         }
     };
     super::import_current_transcript_observing(input, engine, cwd, Some(&mut observe)).await;
-    if let Some(session_id) = input.session_id.as_deref() {
+    // A subagent's PreCompact carries the PARENT's session id: the snapshot below would
+    // be filed under the parent and feed its next compact recap with the subagent's rows.
+    let subagent = input.subagent();
+    if let Some(agent_type) = subagent.as_deref() {
+        super::log_subagent_skip("precompact", cwd, agent_type);
+    }
+    if let Some(session_id) = input.session_id.as_deref().filter(|_| subagent.is_none()) {
         if !rows.is_empty() {
             let (sanitized, _) = crate::import::sanitize_messages_for_search(&rows);
             let episode =
@@ -160,6 +166,53 @@ mod tests {
             assert!(block.contains(FIRST), "{block}");
         }
         (block, elapsed, std::fs::metadata(path).unwrap().len())
+    }
+
+    /// Run `handle` on a two-row transcript with the given hook input extras and
+    /// return the stored compact snapshot for session `s-parent`.
+    fn snapshot_after_precompact(agent: Option<(&str, &str)>) -> Option<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let engine = Engine::from_parts(
+            storage.clone(),
+            Arc::new(EmbeddingEngine::disabled()),
+            Arc::new(RwLock::new(SearchEngine::new(16))),
+            temp.path().to_path_buf(),
+        );
+        let path = temp.path().join("s-parent.jsonl");
+        let user = serde_json::json!({"type":"user","message":{"content":LATEST}}).to_string();
+        let done = serde_json::json!({"type":"assistant","message":{"content":"Done.","stop_reason":"end_turn"}}).to_string();
+        std::fs::write(&path, format!("{user}\n{done}\n")).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let input = HookInput {
+            session_id: Some("s-parent".into()),
+            transcript_path: Some(canonical.to_string_lossy().into()),
+            agent_id: agent.map(|(id, _)| id.to_string()),
+            agent_type: agent.map(|(_, kind)| kind.to_string()),
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(handle(&input, &engine, temp.path()))
+            .unwrap();
+        storage.get_meta("compact_anchor:s-parent").unwrap()
+    }
+
+    #[test]
+    fn f26_subagent_precompact_files_nothing_under_the_parent_session() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::set_var("CSR_NO_DREAM_ON_COMPACT", "1");
+        let main = snapshot_after_precompact(None);
+        let sub = snapshot_after_precompact(Some(("agent-1", "general-purpose")));
+        std::env::remove_var("CSR_NO_DREAM_ON_COMPACT");
+        assert!(
+            main.is_some(),
+            "a main-session precompact still files its snapshot"
+        );
+        assert!(sub.is_none(), "a subagent precompact must not: {sub:?}");
     }
 
     #[test]

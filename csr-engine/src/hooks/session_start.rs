@@ -76,6 +76,15 @@ const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 /// Handle the session-start hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    // A subagent's own compaction fires this hook with the PARENT's session id. Injecting
+    // the parent's recap into the subagent, or respinning the parent's story, is wrong
+    // both ways: the subagent works on a different task and the parent did not compact.
+    if input.source.as_deref() == Some("compact") {
+        if let Some(agent_type) = input.subagent() {
+            super::log_subagent_skip("session-start", cwd, &agent_type);
+            return Ok(());
+        }
+    }
     // After a compaction, the session's story is rewritten from the summary Claude Code just
     // wrote: detached, and with no model call
     if input.source.as_deref() == Some("compact") {
