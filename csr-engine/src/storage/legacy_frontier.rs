@@ -7,6 +7,10 @@
 //! From then on only the messages after the frontier are chunked, scrubbed,
 //! under ids that continue the sequence. A conversation first imported by a
 //! scrub-aware build has no frontier row and imports as it always did.
+//!
+//! A legacy conversation whose place cannot be found is left alone, new
+//! messages and all, until it can be placed. `legacy_import_unplaced` keeps a
+//! row per such conversation so `status` can say how many wait.
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -42,6 +46,7 @@ impl super::Storage {
     }
 
     /// Record the frontier of a legacy conversation. The first record stands.
+    /// A conversation that was waiting to be placed waits no more.
     pub fn record_legacy_frontier(
         &self,
         conversation_id: &str,
@@ -60,7 +65,47 @@ impl super::Storage {
                     chrono::Utc::now().to_rfc3339()
                 ],
             )?;
+            conn.execute(
+                "DELETE FROM legacy_import_unplaced WHERE conversation_id = ?1",
+                params![conversation_id],
+            )?;
             Ok(())
+        })
+    }
+
+    /// Note that import tried to place a legacy conversation and could not.
+    /// Touches no chunk row and no frontier; each retry only bumps the count.
+    pub fn record_legacy_unplaced(&self, conversation_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO legacy_import_unplaced
+                 (conversation_id, first_tried_at, last_tried_at, tries)
+                 VALUES (?1, ?2, ?2, 1)
+                 ON CONFLICT(conversation_id) DO UPDATE
+                 SET last_tried_at = excluded.last_tried_at, tries = tries + 1",
+                params![conversation_id, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// `(placed, waiting)`: legacy conversations with a recorded frontier, and
+    /// those import tried to place and could not. Two primary-key table counts.
+    pub fn legacy_frontier_counts(&self) -> Result<(i64, i64)> {
+        self.with_connection(|conn| {
+            let placed =
+                conn.query_row("SELECT COUNT(*) FROM legacy_import_frontier", [], |r| {
+                    r.get(0)
+                })?;
+            let waiting = conn.query_row(
+                "SELECT COUNT(*) FROM legacy_import_unplaced u
+                 WHERE NOT EXISTS (SELECT 1 FROM legacy_import_frontier f
+                                   WHERE f.conversation_id = u.conversation_id)",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((placed, waiting))
         })
     }
 }

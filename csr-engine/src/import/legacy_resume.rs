@@ -17,8 +17,9 @@ pub(crate) enum Resume {
     /// Chunk only what follows the stored rows.
     At(ResumePoint),
     /// Stored rows exist but the transcript position they end at cannot be
-    /// found. Nothing is written and nothing is recorded, so the next pass tries
-    /// again; an import that guessed could rewrite stored rows or skip messages.
+    /// found. No chunk is written and no frontier is recorded, so the next pass
+    /// tries again; an import that guessed could rewrite stored rows or skip
+    /// messages. Only a note that the conversation waits is kept, for `status`.
     Unplaced,
 }
 
@@ -68,6 +69,7 @@ pub(crate) fn resolve(
             "stored chunks predate the secret scrub and their place in the transcript is unknown; \
              import leaves them alone and retries on the next change"
         );
+        storage.record_legacy_unplaced(conversation_id)?;
         return Ok(Resume::Unplaced);
     };
     storage.record_legacy_frontier(conversation_id, after_seq, rows.first_chunk)?;

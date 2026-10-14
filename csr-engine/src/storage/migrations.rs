@@ -2229,6 +2229,18 @@ pub fn run(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // Legacy conversations import tried to place and could not (the same file): a
+    // row per conversation, dropped when its frontier is recorded. `status` counts
+    // them as waiting.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS legacy_import_unplaced (
+            conversation_id TEXT PRIMARY KEY,
+            first_tried_at  TEXT NOT NULL,
+            last_tried_at   TEXT NOT NULL,
+            tries           INTEGER NOT NULL DEFAULT 1
+        );",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

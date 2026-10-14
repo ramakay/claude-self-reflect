@@ -71,6 +71,8 @@ pub struct StatusReport {
     pub secrets_redacted: SecretsRedactedStatus,
     /// The transcript mirror, read from its state table (no directory walk).
     pub mirror: MirrorStatus,
+    /// Conversations stored before the secret scrubber: placed, or waiting to be.
+    pub legacy_frontier: LegacyFrontierStatus,
     pub contamination: ContaminationStatus,
     /// Cached memory-health measurements and the current binary's canary.
     /// See [`MemoryHealthStatus`].
@@ -258,6 +260,24 @@ impl SecretsRedactedStatus {
             by_kind: by_kind.into_iter().collect(),
             disabled: crate::redact::scrub_disabled(),
         }
+    }
+}
+
+/// Conversations whose chunk rows predate the secret scrubber. Import never
+/// rewrites those rows: it resumes after the last message they cover.
+#[derive(Serialize, Debug, Default, PartialEq, Eq)]
+pub struct LegacyFrontierStatus {
+    /// A frontier is recorded: new messages import, scrubbed, after the stored rows.
+    pub placed: i64,
+    /// Import could not find where the stored rows end in the transcript, so it
+    /// left the conversation alone (its new messages stay out) until it can.
+    pub waiting: i64,
+}
+
+impl LegacyFrontierStatus {
+    pub fn read(storage: &Storage) -> Self {
+        let (placed, waiting) = storage.legacy_frontier_counts().unwrap_or_default();
+        Self { placed, waiting }
     }
 }
 
@@ -1079,6 +1099,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_hook_wrappers_scrubbed: 0,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
+            legacy_frontier: LegacyFrontierStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: gather_memory_health(None),
             provenance_coverage: ProvenanceCoverageStatus::default(),
@@ -1120,6 +1141,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
     let secrets_redacted = SecretsRedactedStatus::read(&storage);
     let mirror = MirrorStatus::read(&storage);
+    let legacy_frontier = LegacyFrontierStatus::read(&storage);
     let contamination = if deep {
         storage.refresh_contamination_cache().ok()
     } else {
@@ -1226,6 +1248,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_hook_wrappers_scrubbed,
         secrets_redacted,
         mirror,
+        legacy_frontier,
         contamination,
         memory_health,
         provenance_coverage,
@@ -2354,6 +2377,7 @@ mod tests {
             csr_hook_wrappers_scrubbed: 0,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
+            legacy_frontier: LegacyFrontierStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: MemoryHealthStatus::from_cache(
                 &crate::health::HealthSnapshot::default(),
@@ -3351,6 +3375,41 @@ mod tests {
         assert_eq!(mirror["errors"], 3);
         assert_eq!(mirror["last_sync"], "2026-10-14T12:00:00Z");
         assert_eq!(mirror["disabled"], false);
+    }
+
+    #[test]
+    fn status_legacy_frontier_block_counts_placed_and_waiting() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        let none =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(
+            none["legacy_frontier"],
+            serde_json::json!({"placed": 0, "waiting": 0})
+        );
+
+        storage.record_legacy_frontier("conv-placed", 7, 3).unwrap();
+        storage.record_legacy_unplaced("conv-lost").unwrap();
+        storage.record_legacy_unplaced("conv-lost").unwrap(); // a retry is still one conversation
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(
+            value["legacy_frontier"],
+            serde_json::json!({"placed": 1, "waiting": 1})
+        );
+
+        // Placed at last: it moves from waiting to placed.
+        storage.record_legacy_frontier("conv-lost", 2, 1).unwrap();
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(
+            value["legacy_frontier"],
+            serde_json::json!({"placed": 2, "waiting": 0})
+        );
     }
 
     #[test]

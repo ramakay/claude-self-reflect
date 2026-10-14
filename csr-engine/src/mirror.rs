@@ -2447,6 +2447,83 @@ mod tests {
         assert_eq!(chunks_like(&engine, "freshly appended bravo"), 1);
     }
 
+    /// `status` reports how many legacy conversations import placed and how many
+    /// it left alone because it could not: one of each here, and the waiting one
+    /// moves to placed once its place can be found.
+    #[tokio::test]
+    async fn status_counts_one_placed_and_one_waiting_legacy_conversation() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let counts = || crate::status::LegacyFrontierStatus::read(engine.storage());
+        assert_eq!(counts(), Default::default());
+
+        // One that can be placed: its stored rows carry transcript receipts.
+        let placed = rig.source("sess-placed.jsonl");
+        legacy_conversation(&engine, &placed).await;
+        // One that cannot: no receipts, and its newest chunk is text the transcript lacks.
+        let lost = rig.source("sess-lost-count.jsonl");
+        let lost_conv = legacy_conversation(&engine, &lost).await;
+        let (tail_id, tail_text): (String, String) = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM chunk_spans WHERE chunk_id IN
+                     (SELECT id FROM chunks WHERE conversation_id = ?1)",
+                    [&lost_conv],
+                )?;
+                Ok(conn.query_row(
+                    "SELECT id, content FROM chunks WHERE conversation_id = ?1
+                     ORDER BY seq DESC, rowid DESC LIMIT 1",
+                    [&lost_conv],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        let set_tail = |content: &str| {
+            engine
+                .storage()
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET content = ?2 WHERE id = ?1",
+                        [&tail_id, content],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        set_tail("text that is nowhere in the transcript");
+
+        // Nothing has tried to place either yet: nothing is waiting.
+        assert_eq!(counts(), Default::default());
+        for src in [&placed, &lost] {
+            append(
+                src,
+                session_message(10, "freshly appended alpha").as_bytes(),
+            );
+            filetime_touch(src);
+            import_via(&engine, &rig, src, Via::Engine).await;
+        }
+        assert_eq!(
+            (counts().placed, counts().waiting),
+            (1, 1),
+            "one placed, one left alone"
+        );
+
+        // The watcher retrying the same lost conversation is still one waiting.
+        import_via(&engine, &rig, &lost, Via::Watcher).await;
+        assert_eq!((counts().placed, counts().waiting), (1, 1));
+
+        // Its place can be found again: it is placed, and no longer waiting.
+        set_tail(&tail_text);
+        append(
+            &lost,
+            session_message(11, "freshly appended bravo").as_bytes(),
+        );
+        filetime_touch(&lost);
+        import_via(&engine, &rig, &lost, Via::Engine).await;
+        assert_eq!((counts().placed, counts().waiting), (2, 0));
+    }
+
     /// The import-state check compares mtimes; make sure an append inside the
     /// same clock tick still reads as changed.
     fn filetime_touch(path: &Path) {
