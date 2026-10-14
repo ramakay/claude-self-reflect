@@ -106,16 +106,36 @@ pub(crate) fn resolve_with(
 
 /// The highest message sequence the stored rows cover, or `None` when it cannot
 /// be said for certain.
+///
+/// A receipt-derived sequence is a candidate, never a fact. Legacy receipts were
+/// backfilled by `provenance_matcher`, which picks among repeated copies of a
+/// text by trust, so one can sit at a later copy than the stored chunk came
+/// from; a frontier taken from it would skip the messages in between. The
+/// candidate is accepted only when the newest stored chunk's text, placed in the
+/// transcript by position (`place_by_text`: unanimous, or the one place the
+/// earlier stored chunks lead up to), ends at that very message. When the
+/// position says otherwise the position wins, and when it cannot say, nothing
+/// is placed: a receipt that points at one of several equally likely copies
+/// does not break the tie.
 fn place(
     storage: &Storage,
     file_path: &Path,
     conversation_id: &str,
     rows: &LegacyRows,
 ) -> Option<usize> {
-    // A chunk stored before receipts existed, or whose backfill found no match:
-    // find the stored text in the transcript itself.
-    rows.receipt_seq
-        .or_else(|| place_by_text(storage, file_path, conversation_id, rows))
+    let by_position = place_by_text(storage, file_path, conversation_id, rows);
+    if let Some(receipt) = rows.receipt_seq {
+        if by_position != Some(receipt) {
+            tracing::warn!(
+                file = %file_path.display(),
+                receipt,
+                by_position = ?by_position,
+                "a stored chunk's transcript receipt does not match where its text sits; \
+                 the receipt is not used"
+            );
+        }
+    }
+    by_position
 }
 
 fn place_by_text(

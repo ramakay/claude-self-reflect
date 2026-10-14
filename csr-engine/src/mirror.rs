@@ -2752,6 +2752,116 @@ mod tests {
         assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
     }
 
+    /// Point the receipts of the newest stored chunk of `conv` at message
+    /// `seq`, as a trust-picked backfill does when the text repeats.
+    fn point_newest_receipt_at(engine: &crate::engine::Engine, conv: &str, seq: i64) {
+        engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE provenance_events SET seq = ?2 WHERE event_id IN
+                     (SELECT s.event_id FROM chunk_spans s WHERE s.chunk_id =
+                        (SELECT id FROM chunks WHERE conversation_id = ?1
+                         ORDER BY seq DESC, rowid DESC LIMIT 1))",
+                    rusqlite::params![conv, seq],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Every stored chunk has a receipt, so the receipt branch used to decide.
+    /// The newest chunk's text also occurs later in the transcript, and the
+    /// backfill put its receipt at that later copy. The frontier must land where
+    /// the stored rows end, not at the receipt: the message in between is new.
+    async fn a_receipt_at_a_later_copy_does_not_move_the_frontier(via: Via) {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-late-receipt.jsonl");
+        let (p, q) = (repeated("alphaword"), repeated("bravoword"));
+        let conv = legacy_conversation_of(&engine, &src, &[p.clone(), q.clone(), p.clone()]).await;
+        let before = stored_rows(&engine, &conv);
+        assert_eq!(before.len(), 3);
+
+        // Messages 3 and 4 arrive: something new, then another copy of P.
+        append(
+            &src,
+            session_message(10, "freshly appended alpha").as_bytes(),
+        );
+        append(&src, session_message(11, &p).as_bytes());
+        point_newest_receipt_at(&engine, &conv, 4);
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, via).await;
+
+        assert_eq!(
+            engine.storage().legacy_frontier(&conv).unwrap(),
+            Some((2, 3)),
+            "placed where the stored rows end, not at the receipt's later copy"
+        );
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        // Both new messages are short enough to share one new chunk: the one
+        // after the receipt's copy was not skipped.
+        assert_eq!(after.len(), 4, "the new messages land once, as one chunk");
+        assert_eq!(chunks_like(&engine, "alphaword"), 3, "P, P, and the new P");
+    }
+
+    #[tokio::test]
+    async fn a_receipt_at_a_later_copy_does_not_move_the_frontier_in_the_engine_path() {
+        a_receipt_at_a_later_copy_does_not_move_the_frontier(Via::Engine).await;
+    }
+
+    #[tokio::test]
+    async fn a_receipt_at_a_later_copy_does_not_move_the_frontier_in_the_watcher_path() {
+        a_receipt_at_a_later_copy_does_not_move_the_frontier(Via::Watcher).await;
+    }
+
+    /// A receipt that names one of several equally likely copies does not break
+    /// the tie: with the stored rows unable to say, the conversation waits.
+    #[tokio::test]
+    async fn a_receipt_does_not_break_a_tie_the_stored_rows_cannot() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-tie.jsonl");
+        let p = repeated("alphaword");
+        let conv = legacy_conversation_of(&engine, &src, &[p.clone(), p.clone()]).await;
+        // The head of the conversation is gone; the surviving chunk keeps its
+        // receipt, which says message 1.
+        engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+                conn.execute(
+                    "DELETE FROM chunks WHERE conversation_id = ?1 AND seq = 0",
+                    [&conv],
+                )?;
+                conn.execute_batch("PRAGMA foreign_keys=ON")?;
+                Ok(())
+            })
+            .unwrap();
+        let before = stored_rows(&engine, &conv);
+        assert_eq!(before.len(), 1);
+
+        append(&src, session_message(2, &p).as_bytes());
+        append(
+            &src,
+            session_message(3, "freshly appended alpha").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Watcher).await;
+
+        assert_eq!(stored_rows(&engine, &conv), before);
+        assert_eq!(engine.storage().legacy_frontier(&conv).unwrap(), None);
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 0);
+        assert_eq!(
+            crate::status::LegacyFrontierStatus::read(engine.storage()).waiting,
+            1
+        );
+    }
+
     /// A run of identical messages is told apart by walking back through every
     /// stored chunk to the head of the transcript.
     #[tokio::test]
