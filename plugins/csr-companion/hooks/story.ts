@@ -9,7 +9,8 @@
 //  3. A share of the work. What story calls spent in the chapter, plus the guess for the next (the last one, else
 //     1600 tokens), stays within 2 tokens for every 100 Claude spends. Where the mod has not counted Claude's
 //     tokens (dreams off), this gate has nothing to compare and the caps below stand alone.
-//  4. Caps. 60 seconds between tellings, 40 calls and $0.10 in a day.
+//  4. Caps. 60 seconds between tellings, 40 calls and $0.10 in a day. A day's spend that is unknown (a model
+//     with no price, or a ledger that could not be read) stops the refresh; the person's own button is unchanged.
 // The first reason a gate fails is the answer, so a test (and a person asking why) can read it.
 
 export const NEWS_RECEIPTS = 4
@@ -41,7 +42,7 @@ export type StoryNews = {
   transcript?: string | null
 }
 
-export type Why = 'go' | 'no-story' | 'no-transcript' | 'no-news' | 'cooldown' | 'chapter-cap' | 'spacing' | 'share' | 'day-cap'
+export type Why = 'go' | 'no-story' | 'no-transcript' | 'no-news' | 'cooldown' | 'chapter-cap' | 'spacing' | 'share' | 'spend-unknown' | 'day-cap'
 
 export const parseNews = (text: string | null): StoryNews => {
   try {
@@ -79,7 +80,9 @@ export function decide(news: StoryNews, starts: readonly number[], now: number, 
     const next = count(news.last_tokens) || FIRST_GUESS
     if (spent + next > STORY_SHARE * claude) return 'share'
   }
-  if (count(news.calls_24h) >= DAY_CALLS || (news.usd_24h ?? 0) >= DAY_USD) return 'day-cap'
+  // Spend that cannot be known is not free: an unpriced model, or a ledger pane.py could not read, holds the refresh back.
+  if (typeof news.usd_24h !== 'number' || !Number.isFinite(news.usd_24h)) return 'spend-unknown'
+  if (count(news.calls_24h) >= DAY_CALLS || news.usd_24h >= DAY_USD) return 'day-cap'
   return 'go'
 }
 

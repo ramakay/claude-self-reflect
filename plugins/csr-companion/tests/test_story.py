@@ -91,7 +91,11 @@ function gatesTest() {
   assert.equal(decide({ ...NEWS, calls_24h: 40 }, [], NOW, 0), 'day-cap')
   assert.equal(decide({ ...NEWS, calls_24h: 39 }, [], NOW, 0), 'go')
   assert.equal(decide({ ...NEWS, usd_24h: 0.1 }, [], NOW, 0), 'day-cap')
-  assert.equal(decide({ ...NEWS, usd_24h: null }, [], NOW, 0), 'go', 'an unpriced model: the call cap alone')
+  // Spend that cannot be known blocks the automatic refresh: an unpriced model and an unread ledger are not free
+  assert.equal(decide({ ...NEWS, usd_24h: null }, [], NOW, 0), 'spend-unknown', 'an unpriced model')
+  assert.equal(decide({ ...NEWS, usd_24h: undefined }, [], NOW, 0), 'spend-unknown', 'a spend pane.py did not say')
+  assert.equal(decide({ ...NEWS, usd_24h: 0 }, [], NOW, 0), 'go', 'a priced day with nothing spent is known')
+  assert.equal(decide({ ...NEWS, usd_24h: null, calls_24h: 40 }, [], NOW, 0), 'spend-unknown', 'unknown spend is named before the caps')
   // What pane.py says is checked, not trusted
   assert.deepEqual(parseNews(null), { story: false })
   assert.deepEqual(parseNews('not json'), { story: false })
@@ -151,6 +155,10 @@ async function refreshTest() {
   w.advance(5 * 60 * 1000)
   assert.equal(await mod.probe.refreshStory(w.$), 'go', 'the busy mark was cleared')
   await new Promise(resolve => setImmediate(resolve))
+  // Spend pane.py could not read (usd_24h null): nothing starts, nothing is kept
+  w = shifted(world(), ON, { ...NEWS, usd_24h: null })
+  assert.equal(await mod.probe.refreshStory(w.$), 'spend-unknown')
+  assert.deepEqual([w.engineRuns.length, w.stored.get('storyStarts:s1')], [0, undefined])
   // Claude's counted tokens bound the share: 2 tokens in 100 of 1,000,000 is 20,000
   w = shifted(world(), ON, { ...NEWS, tokens_2h: 19_000, last_tokens: 1500 })
   assert.equal(await mod.probe.refreshStory(w.$), 'share')

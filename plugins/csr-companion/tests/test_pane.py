@@ -5244,6 +5244,13 @@ class StoryNews(unittest.TestCase):
         self.assertEqual(got['calls_24h'], 0)
         json.dumps(got)  # it is what the mod parses
 
+    def test_story_news_never_reads_a_failed_spend_read_as_zero_dollars(self):
+        with self.stub_session(prompts=[self.AT + 5]), mock.patch.object(pane, 'story_spend', side_effect=sqlite3.OperationalError('locked')):
+            got = pane.story_news('sid-1', None, self.AT + 100)
+        self.assertIsNone(got['usd_24h'])  # unknown, so the mod's refresh holds back
+        self.assertEqual((got['calls_24h'], got['tokens_2h'], got['last_tokens']), (0, 0, None))
+        self.assertEqual(json.loads(json.dumps(got))['usd_24h'], None)
+
     def test_story_news_without_a_map_or_under_the_kill_switch_is_just_no_story(self):
         self.assertEqual(pane.story_news('no-such-session', None, self.AT), dict(story=False))
         with mock.patch.dict(os.environ, {'CSR_NO_STORY_MAP': '1'}):

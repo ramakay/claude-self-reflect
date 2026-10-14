@@ -1659,7 +1659,7 @@ def story_news(sid, root, now):
                 messages_since=max(0, session.messages - covered) if covered is not None else session.messages,
                 prompts_since=sum(1 for t in session.prompts if t > smap['at']),
                 receipts=fail_open(new_receipts, 0, sid, root, smap['at']),
-                **fail_open(story_spend, dict(calls_24h=0, usd_24h=0.0, tokens_2h=0, last_tokens=None), now),
+                **fail_open(story_spend, dict(calls_24h=0, usd_24h=None, tokens_2h=0, last_tokens=None), now),  # a failed read is unknown spend, not zero
                 liked_2h=sum(1 for key, (liked, when) in likes.items() if key.startswith('shift:') and liked and when >= now - 7200),
                 transcript=session.path)
 
