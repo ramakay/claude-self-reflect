@@ -178,7 +178,9 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   one write transaction (694333fe); only a missing row invalidates a case (4d82446e). `CSR_NO_HEALTH=1` turns the
   daemon loop off; `eval --full` still measures when you run it (4c50c8c3).
 - **Maintainer database clone:** duplicate rate 24.93% (182,830 duplicate rows of 733,388 chunks), report only.
-  Known-item recall: RECALL_LINE_PLACEHOLDER
+  Known-item recall: amber, 13 of 18 sampled chunks found in the top 5 (72%), the same on two runs; no chip.
+  One miss returned that conversation's own narrative summary at rank 1; the probe counts chunk hits only.
+  An empty database abstains and `eval --full` passes 24 of 24.
 
 ### Search and hooks performance
 
