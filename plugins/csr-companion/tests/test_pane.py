@@ -97,7 +97,8 @@ class Feed(unittest.TestCase):
         self.assertEqual([d['at'] for d in fed['folded']], [800, 700, 600, 500, 400])
 
 
-def page(dreams=(), look=None, story=None, remembered=(), chapter=None, infinite=None, lost=()):
+def page(dreams=(), look=None, story=None, remembered=(), chapter=None, infinite=None, lost=(),
+         story_map=None, messages=None):
     """page_main over a stand-in CSR: no rules on record, this session's dreams, story and Lost and found as given."""
     con = sqlite3.connect(':memory:')
     con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
@@ -106,8 +107,12 @@ def page(dreams=(), look=None, story=None, remembered=(), chapter=None, infinite
     try:
         s = dict(id=HERE_NOW, prompts=[], replies=[], compacts=[], remembered=list(remembered),
                  gave=dict(recalls=[], carried=[], dreams=[]), project='csr-engine', lost=list(lost))
+        if messages is not None:
+            s['messages'] = messages
         data = dict(repo='/tmp/csr-engine', dreams=list(dreams), chapter=chapter or dict(at=1000.0, of=5),
                     dreams_on=True, look=look, story=story, infinite=infinite)
+        if story_map is not None:
+            data['story_map'] = story_map
         return pane.page_main(data, s, 2000.0)
     finally:
         pane.connect = connect
@@ -4322,3 +4327,267 @@ class PlanShare(unittest.TestCase):
         self.assertIsNone(pane.week_figure(dict(self.PLAN, used=None), narrative, priced, spend)['share'])  # a meter not read
         api = pane.week_figure(dict(mode='api', start=0, used=None), narrative, priced, None)
         self.assertEqual((round(api['usd'], 3), api['share']), (0.415, None))  # an API key: dollars, no share
+
+
+class ShiftMapText(unittest.TestCase):
+    HAIKU_RAW = dict(
+        v=1,
+        project='csr',
+        conv_id=HERE_NOW,
+        previous=dict(rev=3, at=1900, sigs=['old_sig_1'], endpoints=['pane.py:session_story~']),
+        current=dict(
+            rev=4,
+            at=1990,
+            by='Haiku',
+            covered_msgs=48,
+            entries=[
+                dict(
+                    sig='sig_risk_1',
+                    kind='risk',
+                    grounded=True,
+                    moved=True,
+                    liked=False,
+                    claim='Keep prior shifts on rewrite',
+                    receipts=['evo:9f12a0c1', 'oid:3f2a1b0'],
+                    before=[
+                        dict(scope='summarizer.rs', sym='store_story', mark='~', tier='verified'),
+                        dict(op='->', tier='verified'),
+                        dict(scope='reflections', sym=None, mark='-', tier='verified'),
+                    ],
+                    after=[
+                        dict(scope='summarizer.rs', sym='store_story', mark='~', tier='verified'),
+                        dict(op='->', tier='verified'),
+                        dict(scope='reflections', sym='narrative_shift', mark='+', tier='verified'),
+                    ],
+                ),
+                dict(
+                    sig='sig_dec_2',
+                    kind='decision',
+                    grounded=True,
+                    moved=False,
+                    liked=False,
+                    claim='Check endpoints against AST evolution rows',
+                    receipts=['edge:44b1_8e20'],
+                    before=[],
+                    after=[
+                        dict(scope='summarizer.rs', sym='ground_shifts', mark='+', tier='verified'),
+                        dict(op='->', tier='verified'),
+                        dict(scope='code_evolution', sym=None, mark='', tier='verified'),
+                    ],
+                ),
+                dict(
+                    sig='sig_guess_3',
+                    kind='risk',
+                    grounded=False,
+                    moved=True,
+                    liked=False,
+                    claim='Fail open when story_map meta key is absent',
+                    receipts=[],
+                    before=[dict(scope='pane.py', sym='session_story', mark='', tier='model')],
+                    after=[dict(scope='meta', sym='story_map', mark='+', tier='model')],
+                ),
+            ],
+        ),
+    )
+
+    RECEIPTS_RAW = dict(
+        v=1,
+        project='csr',
+        conv_id=HERE_NOW,
+        previous=None,
+        current=dict(
+            rev=2,
+            at=1980,
+            by='receipts',
+            covered_msgs=30,
+            entries=[
+                dict(
+                    sig='sig_rec_1',
+                    kind='shift',
+                    grounded=True,
+                    moved=True,
+                    liked=False,
+                    claim='Changed 5, added 35 symbols in queries.rs',
+                    receipts=['evo:011efce5', 'oid:03541ba'],
+                    before=[],
+                    after=[dict(scope='storage/queries.rs', sym=None, mark='~', tier='verified')],
+                ),
+                dict(
+                    sig='sig_rec_2',
+                    kind='shift',
+                    grounded=True,
+                    moved=False,
+                    liked=False,
+                    claim='Added session_story_map in pane.py',
+                    receipts=['evo:88a12b00'],
+                    before=[],
+                    after=[dict(scope='plugins/csr-companion/bin/pane.py', sym='session_story_map', mark='+', tier='verified')],
+                ),
+            ],
+        ),
+    )
+
+    def _with_meta_db(self, value=None, broken=False):
+        con = sqlite3.connect(':memory:')
+        if not broken:
+            con.execute('create table meta (key text primary key, value text not null)')
+            if value is not None:
+                con.execute('insert into meta values (?, ?)', (f'story_map:{HERE_NOW}', value))
+        return con
+
+    def shown(self, raw):
+        con = self._with_meta_db(json.dumps(raw))
+        saved, pane.connect = pane.connect, lambda: con
+        try:
+            return pane.session_story_map(HERE_NOW)
+        finally:
+            pane.connect = saved
+
+    def test_text_snapshot_of_a_haiku_map(self):
+        title, rows = pane.shift_map_rows(self.shown(self.HAIKU_RAW), 60)
+        self.assertEqual(title, 'Shift Map · as of 12 messages ago')
+        self.assertEqual(rows, [
+            'new risk: Keep prior shifts on rewrite',
+            '  was store_story -> reflections',
+            '  now store_story -> narrative_shift',
+            "  Haiku's reading, checked",
+            '  commit 3f2a1b0 and your edits',
+            'decision: Check endpoints against AST e…',
+            '  added ground_shifts -> code_evolution',
+            "  Haiku's reading, checked · call graph",
+            'new risk: Fail open when story_map meta…',
+            '  was pane.py:session_story',
+            '  now added meta:story_map',
+            "  Haiku's guess, not checked",
+        ])
+
+    def test_text_snapshot_of_a_receipts_only_map(self):
+        title, rows = pane.shift_map_rows(self.shown(self.RECEIPTS_RAW), 30)
+        self.assertEqual(title, 'Shift Map · current')
+        self.assertEqual(rows, [
+            'shift: Changed 5, added 35 symbols in q…',
+            '  changed storage/queries.rs',
+            '  from commit 03541ba and your edits',
+            'shift: Added session_story_map in pane.…',
+            '  added session_story_map',
+            '  from your edits',
+        ])
+
+    def test_no_row_is_wider_than_the_room_and_no_badge_shows(self):
+        for raw, now in ((self.HAIKU_RAW, 60), (self.RECEIPTS_RAW, 30)):
+            for room in (24, 40, 80):
+                title, rows = pane.shift_map_rows(self.shown(raw), now, room)
+                for line in [title] + rows:
+                    self.assertLessEqual(len(line), max(room, len(title)), line)
+                    for badge in ('✓ast', '⌗', 'model'):
+                        self.assertNotIn(badge, line)
+
+    def test_staleness_variants_current_behind_and_unknown(self):
+        smap = dict(rev=1, at=100.0, by='Haiku', covered=20, entries=[
+            dict(kind='shift', claim='One shift', before=[], after=[dict(scope='a.rs', sym=None, mark='~', tier='verified')],
+                 receipts=['node:12345678'], grounded=True, moved=False)
+        ])
+        self.assertEqual(pane.shift_map_rows(smap, 20)[0], 'Shift Map · current')
+        self.assertEqual(pane.shift_map_rows(smap, 18)[0], 'Shift Map · current')
+        self.assertEqual(pane.shift_map_rows(smap, 21)[0], 'Shift Map · as of 1 message ago')
+        self.assertEqual(pane.shift_map_rows(smap, 32)[0], 'Shift Map · as of 12 messages ago')
+        self.assertEqual(pane.shift_map_rows(smap, None)[0], 'Shift Map')
+        self.assertIn('code index', pane.shift_map_rows(smap, 20)[1][2])
+
+    def test_byte_identical_story_section_when_map_is_none_or_killed(self):
+        story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=3, by='Haiku', at=1990.0)
+        base_page = page([dream(1400, 'ask_claude')], story=story)
+        none_page = page([dream(1400, 'ask_claude')], story=story, story_map=None, messages=50)
+        self.assertEqual(base_page['sections'][0], none_page['sections'][0])
+        base_lines = list(pane.page_lines(base_page, 46, 30, dict(likes={})))
+        none_lines = list(pane.page_lines(none_page, 46, 30, dict(likes={})))
+        self.assertEqual(base_lines, none_lines)
+
+        con = self._with_meta_db(json.dumps(self.HAIKU_RAW))
+        saved_con, pane.connect = pane.connect, lambda: con
+        old_env = os.environ.get('CSR_NO_STORY_MAP')
+        os.environ['CSR_NO_STORY_MAP'] = '1'
+        try:
+            killed_map = pane.session_story_map(HERE_NOW)
+            self.assertIsNone(killed_map)
+            killed_page = page([dream(1400, 'ask_claude')], story=story, story_map=killed_map, messages=60)
+            self.assertEqual(list(pane.page_lines(killed_page, 46, 30, dict(likes={}))), base_lines)
+        finally:
+            pane.connect = saved_con
+            if old_env is None:
+                os.environ.pop('CSR_NO_STORY_MAP', None)
+            else:
+                os.environ['CSR_NO_STORY_MAP'] = old_env
+
+    def test_defensive_validation_and_sqlite_errors_return_none(self):
+        cases = [
+            None,
+            '',
+            '{bad json',
+            json.dumps(['not', 'a', 'dict']),
+            json.dumps(dict(v='1', current=dict(entries=[]))),
+            json.dumps(dict(v=1, current=dict(entries=[]))),
+            json.dumps(dict(v=1, current=dict(entries=[dict(kind='', claim='x', before=[], after=[], receipts=[])]))),
+            json.dumps(dict(v=1, current=dict(entries=[dict(kind='shift', claim='x', before='bad', after=[], receipts=[])]))),
+            json.dumps(dict(v=1, current=dict(entries=[dict(kind='shift', claim='x', before=[dict(bad=1)], after=[], receipts=[])]))),
+        ]
+        for raw in cases:
+            con = self._with_meta_db(raw)
+            saved, pane.connect = pane.connect, lambda: con
+            try:
+                self.assertIsNone(pane.session_story_map(HERE_NOW), raw)
+            finally:
+                pane.connect = saved
+        broken_con = self._with_meta_db(broken=True)
+        saved, pane.connect = pane.connect, lambda: broken_con
+        try:
+            self.assertIsNone(pane.session_story_map(HERE_NOW))
+        finally:
+            pane.connect = saved
+        self.assertIsNone(pane.session_story_map(''))
+        self.assertIsNone(pane.session_story_map(None))
+
+    def test_shifts_item_has_nosend_and_no_heart_in_page_lines(self):
+        con = self._with_meta_db(json.dumps(self.RECEIPTS_RAW))
+        saved, pane.connect = pane.connect, lambda: con
+        try:
+            smap = pane.session_story_map(HERE_NOW)
+        finally:
+            pane.connect = saved
+        story = dict(text=STORY, now=pane.where_it_stands(STORY), rev=2, by='extract', at=1980.0)
+        got = page(story=story, story_map=smap, messages=35)
+        items = got['sections'][0]['items']
+        self.assertEqual([i['key'] for i in items], ['story', 'shifts'])
+        shifts_item = items[1]
+        self.assertTrue(shifts_item['nosend'])
+        self.assertTrue(shifts_item['unrated'])
+        self.assertTrue(shifts_item['quiet'])
+        self.assertEqual(shifts_item['send'], '')
+        lines = pane.page_lines(got, 60, 40, dict(likes={'story:sess-now:2': True, 'shifts': True}))
+        shift_acts = [act for act in lines.acts.values() if act and act.get('key') == 'shifts']
+        self.assertTrue(shift_acts)
+        for act in shift_acts:
+            self.assertTrue(act.get('nosend'))
+            self.assertIsNone(act.get('heart'))
+
+    def test_transcript_message_counter_matches_covered_msgs_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, f'{HERE_NOW}.jsonl')
+            rows = [
+                dict(type='user', timestamp='2026-10-14T10:00:00Z', message=dict(content='hello')),
+                dict(type='assistant', timestamp='2026-10-14T10:00:05Z', message=dict(id='m1', content=[dict(type='text', text='hi')])),
+                dict(type='system', subtype='compact_boundary', timestamp='2026-10-14T10:01:00Z'),
+                dict(type='attachment', timestamp='2026-10-14T10:01:01Z', attachment=dict(type='queued_command')),
+                dict(type='human', timestamp='2026-10-14T10:02:00Z', message=dict(content='next')),
+                dict(type='ai-title', aiTitle='Test'),
+            ]
+            with open(path, 'w', encoding='utf-8') as handle:
+                for r in rows:
+                    handle.write(json.dumps(r) + '\n')
+            sess = pane.Session(HERE_NOW, path=path)
+            sess.read_transcript()
+            self.assertEqual(sess.messages, 3)  # user + assistant + human; system, attachment, ai-title excluded
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps(dict(type='assistant', timestamp='2026-10-14T10:02:05Z', message=dict(id='m2', content=[]))) + '\n')
+            sess.read_transcript()
+            self.assertEqual(sess.messages, 4)

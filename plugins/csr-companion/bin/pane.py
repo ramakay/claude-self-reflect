@@ -1358,6 +1358,176 @@ def session_story(session_id):
     return dict(text=text, now=where_it_stands(text), rev=rev, by=by, at=epoch(row[2]))
 
 
+def _norm_shift_side(raw):
+    """Validate and normalize a before/after side list of endpoint and op dicts."""
+    if not isinstance(raw, list):
+        return None
+    parts = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        tier = item.get('tier') if item.get('tier') in ('verified', 'model') else 'model'
+        if isinstance(item.get('op'), str) and item['op'].strip():
+            parts.append(dict(op=item['op'].strip(), tier=tier))
+        elif isinstance(item.get('scope'), str) and item['scope'].strip():
+            sym = item.get('sym')
+            mark = item.get('mark')
+            parts.append(dict(
+                scope=item['scope'].strip(),
+                sym=sym.strip() if isinstance(sym, str) and sym.strip() else None,
+                mark=mark if mark in ('+', '~', '-', '!') else '',
+                tier=tier,
+            ))
+        else:
+            return None
+    return parts
+
+
+def session_story_map(session_id):
+    """This session's Shift Map as csr-engine stored it in meta['story_map:<id>']; None when disabled,
+    absent, malformed, or empty."""
+    if not session_id or os.environ.get('CSR_NO_STORY_MAP', '').strip().lower() in ('1', 'true'):
+        return None
+    try:
+        con = connect()
+        try:
+            row = con.execute('select value from meta where key = ?', (f'story_map:{session_id}',)).fetchone()
+        finally:
+            con.close()
+        if not row or not isinstance(row[0], str) or not row[0].strip():
+            return None
+        raw = json.loads(row[0])
+        if not isinstance(raw, dict):
+            return None
+        v = raw.get('v')
+        if not isinstance(v, int) or isinstance(v, bool):
+            return None
+        cur = raw.get('current')
+        if not isinstance(cur, dict):
+            return None
+        raw_entries = cur.get('entries')
+        if not isinstance(raw_entries, list) or not raw_entries:
+            return None
+        entries = []
+        for entry in raw_entries[:4]:
+            if not isinstance(entry, dict):
+                return None
+            kind, claim = entry.get('kind'), entry.get('claim')
+            if not isinstance(kind, str) or not kind.strip() or not isinstance(claim, str) or not claim.strip():
+                return None
+            before = _norm_shift_side(entry.get('before'))
+            after = _norm_shift_side(entry.get('after'))
+            receipts = entry.get('receipts')
+            if before is None or after is None or not isinstance(receipts, list) or not all(isinstance(r, str) for r in receipts):
+                return None
+            entries.append(dict(
+                kind=kind.strip(),
+                claim=' '.join(claim.split()),
+                before=before,
+                after=after,
+                receipts=[r.strip() for r in receipts if r.strip()],
+                grounded=bool(entry.get('grounded')),
+                moved=bool(entry.get('moved')),
+            ))
+        if not entries:
+            return None
+        rev = cur.get('rev')
+        rev = rev if isinstance(rev, int) and not isinstance(rev, bool) and rev >= 1 else 1
+        at = cur.get('at')
+        at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+        by = cur.get('by') if isinstance(cur.get('by'), str) and cur.get('by') else 'Haiku'
+        cov = cur.get('covered_msgs')
+        covered = cov if isinstance(cov, int) and not isinstance(cov, bool) and cov >= 0 else None
+        prev = raw.get('previous')
+        prev_sigs = ([s for s in prev.get('sigs') if isinstance(s, str)]
+                     if isinstance(prev, dict) and isinstance(prev.get('sigs'), list) else [])
+        return dict(rev=rev, at=at, by=by, covered=covered, previous_sigs=prev_sigs,
+                    has_previous=isinstance(prev, dict), entries=entries)
+    except Exception:
+        return None
+
+
+SHIFT_HINT = 'click again to fold'
+SHIFT_WORDS = {'+': 'added', '~': 'changed', '-': 'removed', '!': 'at risk'}
+SHIFT_ROOM = 40  # the demo pane is 46 columns and a section's text starts at GUTTER (6)
+
+
+def _shift_tail(text, room):
+    """text, or its last room characters (a path's end says most) behind an ellipsis."""
+    return text if len(text) <= room else '…' + text[-(room - 1):]
+
+
+def _shift_part(part, level):
+    """One end of a shift in plain words, shorter by level: 'changed summarizer.rs:store_story', then
+    'changed store_story', then 'store_story'."""
+    if 'op' in part:
+        return part['op']
+    word = SHIFT_WORDS.get(part.get('mark'), '') if level < 2 else ''
+    scope, sym = part.get('scope') or '', part.get('sym')
+    text = sym if sym and level else f'{scope}:{sym}' if sym else scope
+    return f'{word} {text}' if word else text
+
+
+def _shift_side(parts, room):
+    """One side of a shift on one row: whole, else symbols without their files, else without the marks' words,
+    else each end cut from the left."""
+    for level in (0, 1, 2):
+        text = ' '.join(_shift_part(p, level) for p in parts)
+        if len(text) <= room:
+            return text
+    ends = sum(1 for p in parts if 'op' not in p) or 1
+    each = max(6, (room - sum(len(p['op']) + 2 for p in parts if 'op' in p)) // ends)
+    return fit(' '.join(p['op'] if 'op' in p else _shift_tail(_shift_part(p, 2), each) for p in parts), room)
+
+
+def _shift_source(entry, by, room):
+    """Where a shift's evidence comes from, in words a new user knows: one row, or two when the reading and
+    its evidence do not fit side by side."""
+    if not entry.get('grounded'):
+        return ["Haiku's guess, not checked"]
+    receipts = entry.get('receipts') or []
+    commit = next((r.split(':', 1)[1][:7] for r in receipts if r.startswith('oid:') and len(r) > 4), None)
+    edits = any(r.startswith('evo:') for r in receipts)
+    graph = 'call graph' if any(r.startswith('edge:') for r in receipts) else 'code index' \
+        if any(r.startswith('node:') for r in receipts) else ''
+    found = ' and '.join(([f'commit {commit}'] if commit else []) + (['your edits'] if edits else [])
+                         + ([graph] if graph and not (commit or edits) else []))
+    if by == 'receipts':
+        return ['from ' + found if found else 'checked']
+    reading = "Haiku's reading, checked"
+    if not found:
+        return [reading]
+    return [f'{reading} · {found}'] if len(reading) + 3 + len(found) <= room else [reading, found]
+
+
+def shift_map_rows(smap, messages_now, room=SHIFT_ROOM):
+    """The Shift Map as plain words, (title, rows): per shift its claim, then what changed ('was' and 'now' when
+    both sides do not fit one row), then where the evidence comes from. No ANSI and no badges; every row is at
+    most `room` characters. The title carries how far behind the map is, counted in transcript messages."""
+    covered = smap.get('covered')
+    if isinstance(messages_now, int) and not isinstance(messages_now, bool) and isinstance(covered, int):
+        behind = max(0, messages_now - covered)
+        stale = 'current' if not behind else f"as of {behind} message{'' if behind == 1 else 's'} ago"
+    else:
+        stale = ''
+    title = 'Shift Map' + (f' · {stale}' if stale else '')
+    by, rows, inner = smap.get('by') or 'Haiku', [], room - 2
+    for entry in smap['entries'][:4]:
+        new = 'new ' if entry.get('moved') and smap.get('has_previous') else ''
+        rows.append(fit(f"{new}{entry['kind']}: {entry['claim']}", room))
+        before = _shift_side(entry['before'], inner - 4) if entry['before'] else ''
+        after = _shift_side(entry['after'], inner if not before else inner - 4) if entry['after'] else ''
+        if before and after:
+            both = f'{before} > {after}'
+            rows += ['  ' + both] if len(both) <= inner else [f'  was {before}', f'  now {after}']
+        elif before:
+            rows.append(f'  was {before}')
+        elif after:
+            rows.append('  ' + after)
+        rows += ['  ' + fit(line, inner) for line in _shift_source(entry, by, inner)]
+    return title, rows
+
+
 RETOLD = 'next at compact'  # when csr-engine tells the story again: after a compaction (and at the session's end)
 
 
@@ -1520,6 +1690,7 @@ class Session:
         self.said = None  # (time, text) of Claude's last words to the person
         self.turn_end = 0.0  # when Claude last finished a turn (stop_reason end_turn)
         self.carried = None  # the session before this one's threads, once read (see carried_threads)
+        self.messages = 0  # transcript rows whose type is human, user or assistant (matches covered_msgs)
 
     def guess(self):
         """Where the transcript of a live session will be, from its record: the folder for its working directory."""
@@ -1560,6 +1731,8 @@ class Session:
                 continue
             kind, when = entry.get('type'), epoch(entry.get('timestamp'))
             self.started = self.started or when or 0.0
+            if kind in ('human', 'user', 'assistant'):
+                self.messages += 1
             if kind == 'assistant':
                 message = entry.get('message') or {}
                 if message.get('stop_reason') == 'end_turn' and when and not entry.get('isSidechain'):
@@ -1687,7 +1860,7 @@ class Session:
                     main=list(self.main), turn_end=self.turn_end, model=self.model, told=self.told,
                     last_session=self.previous, todos=(self.previous or {}).get('todos') or [],
                     busy=bool(self.record and self.record['busy']), cwd=(self.record or {}).get('cwd'),
-                    transcript=bool(self.path))
+                    transcript=bool(self.path), messages=self.messages)
 
 
 class Clock:
@@ -3686,10 +3859,16 @@ def page_main(data, s, now, ui=None):
             gist = re.sub(r'\*\*|(?:^|\s)#+\s*', ' ', item['text']).strip()  # a note's markdown, as words
             handed.append(dict(recall_act(item, now), title=gist, meta='opened · ' + where))
 
-    story, told = data.get('story'), []
+    story, story_map, told = data.get('story'), data.get('story_map'), []
     if story:
         told.append(dict(key='story', like=f"story:{s.get('id')}:{story['rev']}", title=story['now'], open_title=story['text'], lines=6 * more, open_lines=30, detail=[],
                          send=closed_send(f"CSR's story of this session, rev {story['rev']}, quoted:", story['text'], STORY_SEND_MOST)))
+    if story_map:
+        built_shifts = fail_open(shift_map_rows, None, story_map, (s or {}).get('messages'))
+        if built_shifts and built_shifts[1]:
+            map_title, map_rows = built_shifts
+            told.append(dict(key='shifts', title=map_title, lines=1, open_lines=1, body=map_rows, fit_body=True,
+                             quiet=True, unrated=True, detail=[], send='', nosend=True, hint=SHIFT_HINT))
     if not data.get('dreams_on'):
         right = 'off'
     elif not fed['left']:
@@ -6591,6 +6770,7 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
+            self.data['story_map'] = session_story_map(self.session and self.session.id)
             self.data['agents'] = fail_open(agents_of, agents_lib.empty(), self.session and self.session.id)
             self.data['codex'] = fail_open(codex_lib.codex_snapshot, None, HOME, now)  # None: no ~/.codex, no section
             # each of these reads a file of someone else's: one that fails is empty, it never blanks the pane
@@ -6642,7 +6822,7 @@ class Pane:
                           [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.held, self.data.get('agents'), self.data.get('codex'),
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.data.get('story_map'), self.held, self.data.get('agents'), self.data.get('codex'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
                           value_pieces(self.data.get('value')),  # what it says: the dollars under it move each step
@@ -7750,7 +7930,8 @@ def main():
         now, cell = time.time(), (16, 34)
         data = load(root, args.limit, args.sid)
         data.update(look=last_look(root), chapter=last_chapter(root, args.sid), story=session_story(args.sid),
-                    readings=how_claude_read(args.sid), limits=account_limits(now), sts=csr_status(now))
+                    story_map=session_story_map(args.sid), readings=how_claude_read(args.sid),
+                    limits=account_limits(now), sts=csr_status(now))
         data['claude_fields'], data['claude_at'] = kept_status(args.sid, now)
         data['claude_line'] = claude_status(args.sid, now)
         os.makedirs(args.png, exist_ok=True)
