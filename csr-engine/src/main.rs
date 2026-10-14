@@ -65,6 +65,9 @@ enum Commands {
     },
     /// Show system status (JSON by default, --compact for statusline, --swiftbar for menu bar)
     Status {
+        /// Explicit JSON output (the default); identical to plain `status`
+        #[arg(long, conflicts_with_all = ["compact", "swiftbar", "stale"])]
+        json: bool,
         /// One-line output for statusline integration
         #[arg(long)]
         compact: bool,
@@ -214,6 +217,10 @@ enum Commands {
         /// Run full evaluation (24 results) instead of quick (5 tests plus the reranker gate)
         #[arg(long)]
         full: bool,
+        /// With --full: start a new known-item recall sample instead of reusing
+        /// the frozen one. Prior history is kept; the selection ignores scores.
+        #[arg(long = "refresh-recall-sample", requires = "full")]
+        refresh_recall_sample: bool,
         /// Run the continuity gate (North Star: recall + provenance beats grep)
         #[arg(long)]
         continuity: bool,
@@ -749,6 +756,7 @@ async fn run(
     }
 
     if let Some(Commands::Status {
+        json: _,
         compact,
         swiftbar,
         deep,
@@ -1166,6 +1174,7 @@ async fn run(
 
     if let Some(Commands::Eval {
         full,
+        refresh_recall_sample,
         continuity,
         continuity_live,
         provenance,
@@ -1226,11 +1235,12 @@ async fn run(
             return Ok(());
         }
         let report = if full {
-            csr_engine::eval::run_full(
+            csr_engine::eval::run_full_with(
                 eng.storage(),
                 eng.embeddings(),
                 eng.search(),
                 eng.index_dir(),
+                refresh_recall_sample,
             )
             .await
         } else {

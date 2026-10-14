@@ -68,6 +68,9 @@ pub struct StatusReport {
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
     pub contamination: ContaminationStatus,
+    /// Cached memory-health measurements and the current binary's canary.
+    /// See [`MemoryHealthStatus`].
+    pub memory_health: MemoryHealthStatus,
     pub provenance_coverage: ProvenanceCoverageStatus,
     pub enrichment: EnrichmentBreakdown,
     pub narratives: NarrativeStatus,
@@ -255,6 +258,143 @@ impl From<crate::storage::ContaminationMeasurement> for ContaminationStatus {
             last_measured: Some(measurement.last_measured),
         }
     }
+}
+
+/// A measurement older than this is reported `stale` in the JSON. It never
+/// raises the chip and never turns a stored result green.
+const MEMORY_HEALTH_STALE_HOURS: i64 = 2 * crate::health::HEALTH_INTERVAL_HOURS;
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct MemoryCanaryStatus {
+    /// Evaluated now, for the running binary: pure and database-free.
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct MemoryProbeStatus {
+    /// `not_run`, `green`, `amber`, `red` or `abstain`: the latest COMPLETED
+    /// probe. An errored attempt is `last_error`, never a state here.
+    pub state: String,
+    pub hits: Option<usize>,
+    pub n: Option<usize>,
+    pub invalidated: Option<usize>,
+    pub sample_id: Option<String>,
+    pub at: Option<String>,
+    /// The last completed measurement is older than twelve hours.
+    pub stale: bool,
+    pub misses: Vec<crate::health::ProbeMiss>,
+    pub last_error: Option<crate::health::ProbeReport>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct MemoryDuplicateStatus {
+    /// `unavailable` until a measurement has run, then `measured`.
+    pub state: String,
+    /// Report only: never a warning.
+    pub report: Option<crate::health::DuplicateReport>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct MemoryHealthStatus {
+    pub canary: MemoryCanaryStatus,
+    pub probe: MemoryProbeStatus,
+    pub duplicates: MemoryDuplicateStatus,
+    pub last_attempt_at: Option<String>,
+    pub config: Option<String>,
+    /// The compact-chip text when a memory warning is raised, else null.
+    pub warning: Option<String>,
+}
+
+impl MemoryHealthStatus {
+    /// Build the view from cached health meta and a canary verdict. Reads
+    /// nothing else: no search, no embedding, no scan.
+    pub fn from_cache(
+        snapshot: &crate::health::HealthSnapshot,
+        canary_passed: bool,
+        canary_detail: String,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let state = &snapshot.state;
+        let probe = state.probe.as_ref();
+        let stale = probe
+            .and_then(|p| chrono::DateTime::parse_from_rfc3339(&p.at).ok())
+            .is_some_and(|at| {
+                now - at.with_timezone(&chrono::Utc)
+                    >= chrono::Duration::hours(MEMORY_HEALTH_STALE_HOURS)
+            });
+        let probe_status = MemoryProbeStatus {
+            state: probe.map_or("not_run", |p| p.grade.as_str()).to_string(),
+            hits: probe.map(|p| p.hits),
+            n: probe.map(|p| p.n),
+            invalidated: probe.map(|p| p.invalidated),
+            sample_id: probe.and_then(|p| p.sample_id.clone()),
+            at: probe.map(|p| p.at.clone()),
+            stale,
+            misses: probe
+                .map(|p| {
+                    p.misses
+                        .iter()
+                        .take(crate::health::MISSES_PER_RUN)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            last_error: state.last_probe_error.clone(),
+        };
+        let mut status = Self {
+            canary: MemoryCanaryStatus {
+                passed: canary_passed,
+                detail: canary_detail,
+            },
+            probe: probe_status,
+            duplicates: MemoryDuplicateStatus {
+                state: if state.duplicates.is_some() {
+                    "measured"
+                } else {
+                    "unavailable"
+                }
+                .to_string(),
+                report: state.duplicates.clone(),
+            },
+            last_attempt_at: state.last_attempt_at.clone(),
+            config: state.config.clone(),
+            warning: None,
+        };
+        status.warning = status.chip_text();
+        status
+    }
+
+    /// The only two causes of a memory chip: the current canary fails, or the
+    /// latest completed probe is red on at least ten cases. Amber, abstain,
+    /// unavailable, stale-only and duplicates never raise it.
+    fn chip_text(&self) -> Option<String> {
+        let canary = (!self.canary.passed).then(|| "canary".to_string());
+        let recall = (self.probe.state == "red"
+            && self
+                .probe
+                .n
+                .is_some_and(|n| n >= crate::health::probe::SAMPLE_MIN))
+        .then(|| {
+            format!(
+                "recall {}/{}",
+                self.probe.hits.unwrap_or(0),
+                self.probe.n.unwrap_or(0)
+            )
+        });
+        let parts: Vec<String> = canary.into_iter().chain(recall).collect();
+        (!parts.is_empty()).then(|| format!("⚠ mem: {}", parts.join(" · ")))
+    }
+}
+
+/// The cached view for a database that exists. A read failure is an empty
+/// cache (not measured), never a healthy-looking one.
+fn gather_memory_health(storage: Option<&Storage>) -> MemoryHealthStatus {
+    let canary = crate::eval::contamination::emitter_canary();
+    let snapshot = storage
+        .and_then(|storage| crate::health::load_health(storage).ok())
+        .unwrap_or_default();
+    MemoryHealthStatus::from_cache(&snapshot, canary.passed, canary.detail, chrono::Utc::now())
 }
 
 #[derive(Serialize, Debug, Default, PartialEq, Eq)]
@@ -858,6 +998,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
             contamination: ContaminationStatus::default(),
+            memory_health: gather_memory_health(None),
             provenance_coverage: ProvenanceCoverageStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus {
@@ -902,6 +1043,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     }
     .map(ContaminationStatus::from)
     .unwrap_or_default();
+    let memory_health = gather_memory_health(Some(&storage));
     let [source_missing, source_unparsed, source_unmatched] =
         storage.provenance_failure_counts().unwrap_or_default();
     let artifacts: Vec<ArtifactTierCounts> = storage
@@ -999,6 +1141,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
         contamination,
+        memory_health,
         provenance_coverage,
         enrichment,
         narratives,
@@ -1993,6 +2136,10 @@ fn format_compact(report: &StatusReport, now_ms: u128) -> String {
             format_dreaming_elapsed(dreaming.elapsed_secs)
         ));
     }
+    // Memory health: only a failing canary or a red probe (n >= 10) speaks up.
+    if let Some(warning) = &report.memory_health.warning {
+        out.push_str(&format!(" | {warning}"));
+    }
     // CSR's own text found in the conversation record: labeled in search and
     // skipped by hook injection, never removed.
     if report.contamination.chunks > 0 {
@@ -2120,6 +2267,12 @@ mod tests {
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
             contamination: ContaminationStatus::default(),
+            memory_health: MemoryHealthStatus::from_cache(
+                &crate::health::HealthSnapshot::default(),
+                true,
+                String::new(),
+                chrono::Utc::now(),
+            ),
             provenance_coverage: ProvenanceCoverageStatus::default(),
             enrichment: EnrichmentBreakdown::default(),
             narratives: NarrativeStatus::default(),
@@ -2401,6 +2554,223 @@ mod tests {
         assert_eq!(value["contamination"]["chunks"], 9);
         assert!(value["contamination"].get("unjudged").is_none());
         assert!(value["contamination"].get("clean").is_none());
+    }
+
+    // --- memory health: cached measurements, the chip, no embedding ---
+
+    fn probe_report(
+        grade: crate::health::ProbeGrade,
+        hits: usize,
+        n: usize,
+    ) -> crate::health::ProbeReport {
+        crate::health::ProbeReport {
+            at: "2026-10-13T10:00:00Z".into(),
+            sample_id: Some("ps-test".into()),
+            hits,
+            n,
+            invalidated: 0,
+            grade,
+            misses: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn health_snapshot(probe: Option<crate::health::ProbeReport>) -> crate::health::HealthSnapshot {
+        let mut snapshot = crate::health::HealthSnapshot::default();
+        snapshot.state.version = 1;
+        snapshot.state.last_attempt_at = Some("2026-10-13T10:00:00Z".into());
+        snapshot.state.probe = probe;
+        snapshot
+    }
+
+    fn memory(snapshot: &crate::health::HealthSnapshot, canary_passed: bool) -> MemoryHealthStatus {
+        let now = crate::temporal::parse_timestamp("2026-10-13T12:00:00Z").unwrap();
+        MemoryHealthStatus::from_cache(snapshot, canary_passed, "detail".into(), now)
+    }
+
+    fn chip_line(memory_health: MemoryHealthStatus) -> String {
+        let mut report = base_report();
+        report.memory_health = memory_health;
+        format_compact(&report, 0)
+    }
+
+    #[test]
+    fn memory_chip_only_canary_or_red_probe() {
+        use crate::health::ProbeGrade::*;
+        let green = health_snapshot(Some(probe_report(Green, 19, 20)));
+        assert_eq!(memory(&green, true).warning, None);
+        assert!(!chip_line(memory(&green, true)).contains("mem"));
+
+        let canary = memory(&green, false);
+        assert_eq!(canary.warning.as_deref(), Some("⚠ mem: canary"));
+        assert!(chip_line(canary).contains(" | ⚠ mem: canary"));
+
+        let red = health_snapshot(Some(probe_report(Red, 6, 20)));
+        let red_status = memory(&red, true);
+        assert_eq!(red_status.warning.as_deref(), Some("⚠ mem: recall 6/20"));
+        assert!(chip_line(red_status).contains(" | ⚠ mem: recall 6/20"));
+    }
+
+    #[test]
+    fn memory_chip_shows_both_failures() {
+        use crate::health::ProbeGrade::*;
+        let red = health_snapshot(Some(probe_report(Red, 6, 20)));
+        let both = memory(&red, false);
+        assert_eq!(both.warning.as_deref(), Some("⚠ mem: canary · recall 6/20"));
+        assert!(chip_line(both).contains(" | ⚠ mem: canary · recall 6/20"));
+    }
+
+    #[test]
+    fn duplicate_amber_and_abstain_do_not_raise_memory_chip() {
+        use crate::health::ProbeGrade::*;
+        let mut amber = health_snapshot(Some(probe_report(Amber, 15, 20)));
+        amber.state.duplicates = Some(crate::health::DuplicateReport {
+            at: "2026-10-13T10:00:00Z".into(),
+            total: 100,
+            distinct: 40,
+            duplicate_rows: 60,
+            rate: Some(0.6),
+        });
+        let amber_status = memory(&amber, true);
+        assert_eq!(
+            amber_status.warning, None,
+            "amber and a 60% duplicate rate are not chips"
+        );
+        assert_eq!(amber_status.duplicates.state, "measured");
+        assert!(!chip_line(amber_status).contains("mem"));
+
+        let abstain = memory(&health_snapshot(Some(probe_report(Abstain, 0, 4))), true);
+        assert_eq!(abstain.warning, None);
+        assert_eq!(abstain.probe.state, "abstain");
+
+        // a red probe on fewer than ten cases is not a red the chip may act on
+        let thin = memory(&health_snapshot(Some(probe_report(Red, 1, 9))), true);
+        assert_eq!(thin.warning, None);
+
+        // an old measurement is stale in the JSON and nothing else
+        let stale_now = crate::temporal::parse_timestamp("2026-10-20T12:00:00Z").unwrap();
+        let stale = MemoryHealthStatus::from_cache(
+            &health_snapshot(Some(probe_report(Green, 19, 20))),
+            true,
+            String::new(),
+            stale_now,
+        );
+        assert!(stale.probe.stale);
+        assert_eq!(stale.warning, None);
+
+        // an errored attempt never replaces the last completed result
+        let mut errored = health_snapshot(Some(probe_report(Red, 6, 20)));
+        errored.state.last_probe_error = Some(probe_report(Error, 0, 20));
+        let errored_status = memory(&errored, true);
+        assert_eq!(errored_status.probe.state, "red");
+        assert!(errored_status.probe.last_error.is_some());
+        assert_eq!(
+            errored_status.warning.as_deref(),
+            Some("⚠ mem: recall 6/20")
+        );
+    }
+
+    #[test]
+    fn fresh_install_memory_health_is_not_claimed_green() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        // no database at all
+        let missing = gather_status(&db, dir.path(), false).unwrap().memory_health;
+        assert_eq!(missing.probe.state, "not_run");
+        // an opened, empty database that never measured
+        drop(Storage::open(&db).unwrap());
+        let report = gather_status(&db, dir.path(), false).unwrap();
+        let fresh = &report.memory_health;
+        assert_eq!(fresh.probe.state, "not_run");
+        assert_eq!(fresh.duplicates.state, "unavailable");
+        assert!(fresh.canary.passed, "{}", fresh.canary.detail);
+        assert_eq!(fresh.warning, None);
+        let json = serde_json::to_string(&report.memory_health).unwrap();
+        assert!(!json.contains("green"), "{json}");
+        assert!(!format_compact(&report, 0).contains("mem"));
+
+        // after an empty-database measurement: abstain with n=0, never 100%
+        let storage = Storage::open(&db).unwrap();
+        let mut snapshot =
+            health_snapshot(Some(probe_report(crate::health::ProbeGrade::Abstain, 0, 0)));
+        snapshot.state.duplicates = Some(crate::health::DuplicateReport {
+            at: "2026-10-13T10:00:00Z".into(),
+            total: 0,
+            distinct: 0,
+            duplicate_rows: 0,
+            rate: None,
+        });
+        crate::health::save_health(&storage, &snapshot).unwrap();
+        let after = gather_status(&db, dir.path(), false).unwrap();
+        assert_eq!(after.memory_health.probe.state, "abstain");
+        assert_eq!(after.memory_health.probe.n, Some(0));
+        assert!(after
+            .memory_health
+            .duplicates
+            .report
+            .as_ref()
+            .unwrap()
+            .rate
+            .is_none());
+        assert_eq!(after.memory_health.warning, None);
+    }
+
+    #[test]
+    fn status_reads_cached_probe_without_embedding() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = Storage::open(&db).unwrap();
+        // eligible-looking chunks exist; status must not enroll a sample from them
+        for i in 0..12 {
+            let chunk = import::ConversationChunk {
+                id: format!("c{i}"),
+                conversation_id: format!("conv-{i}"),
+                project_name: "p".into(),
+                timestamp: "2026-10-12T00:00:00Z".into(),
+                content: "x".repeat(300),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+        }
+        let snapshot = health_snapshot(Some(probe_report(crate::health::ProbeGrade::Red, 6, 20)));
+        crate::health::save_health(&storage, &snapshot).unwrap();
+        let before = (
+            storage.get_meta(crate::health::META_HEALTH).unwrap(),
+            storage.get_meta(crate::health::META_RUNS).unwrap(),
+            storage.get_meta(crate::health::META_SAMPLE).unwrap(),
+        );
+        assert!(before.2.is_none());
+
+        let report = gather_status(&db, dir.path(), false).unwrap();
+        assert_eq!(report.memory_health.probe.state, "red");
+        assert_eq!(
+            (
+                report.memory_health.probe.hits,
+                report.memory_health.probe.n
+            ),
+            (Some(6), Some(20))
+        );
+        assert_eq!(
+            report.memory_health.warning.as_deref(),
+            Some("⚠ mem: recall 6/20")
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["memory_health"]["probe"]["state"], "red");
+        assert_eq!(value["memory_health"]["duplicates"]["state"], "unavailable");
+
+        // reading changed nothing and built no sample
+        let after = (
+            storage.get_meta(crate::health::META_HEALTH).unwrap(),
+            storage.get_meta(crate::health::META_RUNS).unwrap(),
+            storage.get_meta(crate::health::META_SAMPLE).unwrap(),
+        );
+        assert_eq!(before, after);
     }
 
     #[test]
