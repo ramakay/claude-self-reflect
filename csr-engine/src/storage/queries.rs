@@ -2932,8 +2932,8 @@ pub(crate) fn mark_imported_in(
         )
         .optional()?
         .unwrap_or(((Some(0), Some(0)), None));
-    // A stamped row (even `{}`) was chunked from scrubbed text; see
-    // `import_secrets_stamped`.
+    // A stamped row (even `{}`) was written by a build that scrubs; an unstamped
+    // one marks a conversation whose chunk rows predate it (`legacy_frontier`).
     let was_stamped = previous_secrets.is_some();
     let previous_secrets = SecretCounts::from_json(previous_secrets.as_deref());
     let persisted_secrets = previous_secrets.max_with(&suppression.secrets);
@@ -3420,63 +3420,6 @@ pub fn get_db_size(conn: &Connection) -> Result<u64> {
 
 /// Get the number of chunks previously imported for a file (for incremental import).
 /// Returns 0 if never imported.
-/// Was this file's stored state written by a build that redacts secrets before
-/// chunking? The column holds the per-kind counts, or `{}` when the scrub ran
-/// and found nothing; `NULL` means an older build (or the scrub switched off),
-/// whose chunk boundaries were cut from unredacted text.
-pub fn import_secrets_stamped(conn: &Connection, path: &Path) -> Result<bool> {
-    let path_str = path.to_string_lossy();
-    let stamp: Option<Option<String>> = conn
-        .query_row(
-            "SELECT secrets_redacted FROM import_state WHERE file_path = ?1",
-            params![path_str.as_ref()],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(stamp.flatten().is_some())
-}
-
-/// What a conversation's stored import state looked like at one moment: the
-/// `import_state` row and how many chunk rows the conversation has. A rebuild
-/// that embeds for a long time swaps its rows in only if this is still true.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportRowState {
-    pub row: Option<(i64, String, Option<String>)>,
-    pub chunk_rows: i64,
-}
-
-/// [`ImportRowState`] plus the source revision a parse of the file now sees.
-#[derive(Debug, Clone)]
-pub struct ImportSnapshot {
-    pub state: ImportRowState,
-    /// The file's mtime sampled before it is read: what a checkpoint records
-    /// for the revision actually parsed. A file that grows after this reads as
-    /// changed on the next pass.
-    pub source_mtime: String,
-}
-
-pub fn import_row_state(
-    conn: &Connection,
-    path: &Path,
-    conversation_id: &str,
-) -> Result<ImportRowState> {
-    let path_str = path.to_string_lossy();
-    let row = conn
-        .query_row(
-            "SELECT chunks_imported, file_mtime, secrets_redacted
-             FROM import_state WHERE file_path = ?1",
-            params![path_str.as_ref()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let chunk_rows = conn.query_row(
-        "SELECT COUNT(*) FROM chunks WHERE conversation_id = ?1",
-        params![conversation_id],
-        |row| row.get(0),
-    )?;
-    Ok(ImportRowState { row, chunk_rows })
-}
-
 pub fn get_imported_chunk_count(conn: &Connection, path: &Path) -> Result<usize> {
     let path_str = path.to_string_lossy();
     let result: rusqlite::Result<i64> = conn

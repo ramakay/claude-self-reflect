@@ -344,6 +344,7 @@ fn push_plan_chunks(
             end = content.len();
         }
         super::push_chunk(
+            0,
             chunks,
             conversation_id,
             project_name,

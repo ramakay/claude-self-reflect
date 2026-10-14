@@ -655,10 +655,28 @@ pub(crate) async fn import_file_content_diff(
             storage.parent_provenance_context(parent_id, message_key.as_deref())
         })
         .transpose()?;
-    let parsed = import::parse_jsonl_file_with_stats_and_parent(
+    // Chunk rows stored before the scrubber are never rewritten: a legacy
+    // conversation is picked up after the last message they cover.
+    let resume = match import::legacy_resume::resolve(
+        storage,
+        file_path,
+        &conv_id,
+        parent_context.as_ref(),
+    )? {
+        import::legacy_resume::Resume::Fresh => None,
+        import::legacy_resume::Resume::At(point) => Some(point),
+        import::legacy_resume::Resume::Unplaced => {
+            storage.mark_file_imported(file_path, storage.get_imported_chunk_count(file_path)?)?;
+            return Ok(());
+        }
+    };
+    let stored_chunks = resume.map_or(0, |point| point.first_chunk);
+    let parsed = import::parse_jsonl_file_resuming(
         file_path,
         &attribution.project_name,
         parent_context.as_ref(),
+        None,
+        resume,
     )?;
     let import::ParsedConversation {
         chunks,
@@ -672,11 +690,11 @@ pub(crate) async fn import_file_content_diff(
     if chunks.is_empty() {
         // Record the skip so this file isn't re-parsed every watcher pass
         // and import_percent counts it as processed.
-        storage.mark_file_imported_with_suppression(file_path, 0, suppression)?;
+        storage.mark_file_imported_with_suppression(file_path, stored_chunks, suppression)?;
         return Ok(());
     }
 
-    let chunk_count = chunks.len();
+    let chunk_count = stored_chunks + chunks.len();
 
     // Journal v4 P4b: bind any pasted dream prompt to the dream that
     // produced it (same contract as `engine::import_file_with_attribution`
@@ -797,7 +815,10 @@ pub(crate) async fn import_file_content_diff(
 /// storage write is an upsert keyed on that same id: re-running it with
 /// identical values produces a byte-identical row, an identical embedding, and
 /// an identical FTS document.
-fn needs_reindex(parsed: &ConversationChunk, stored: Option<&ConversationChunk>) -> bool {
+pub(crate) fn needs_reindex(
+    parsed: &ConversationChunk,
+    stored: Option<&ConversationChunk>,
+) -> bool {
     match stored {
         None => true,
         Some(stored) => {

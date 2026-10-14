@@ -2217,6 +2217,18 @@ pub fn run(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // Conversations whose chunk rows predate the secret scrubber (src/storage/
+    // legacy_frontier.rs): those rows stay as stored, and import resumes after
+    // the last message they cover.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS legacy_import_frontier (
+            conversation_id TEXT PRIMARY KEY,
+            after_seq       INTEGER NOT NULL,
+            first_chunk     INTEGER NOT NULL,
+            recorded_at     TEXT NOT NULL
+        );",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

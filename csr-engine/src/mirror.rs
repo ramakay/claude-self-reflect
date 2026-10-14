@@ -2171,64 +2171,8 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn new_messages_stay_searchable_when_the_scrub_shortens_earlier_chunks() {
-        let rig = Rig::new();
-        let engine = engine_for(&rig).await;
-        let src = rig.source("sess-drift.jsonl");
-        let pem = format!(
-            "{}{}\n{}\n{}{}",
-            "-----BEGIN RSA PRIV",
-            "ATE KEY-----",
-            "Zm9vYmFy".repeat(200),
-            "-----END RSA PRIV",
-            "ATE KEY-----"
-        );
-        let message = |n: usize, text: &str| {
-            serde_json::json!({
-                "type": "user", "uuid": format!("d-{n}"),
-                "timestamp": format!("2026-10-14T10:00:{n:02}Z"),
-                "message": {"content": text}
-            })
-            .to_string()
-                + "\n"
-        };
-
-        // Imported by a build without the scrubber: every message is long.
-        {
-            let _off = crate::redact::DisabledForTest::set(true);
-            let mut body = String::new();
-            for n in 0..4 {
-                body.push_str(&message(n, &format!("dump {n}\n{pem}\nend {n}")));
-            }
-            fs::write(&src, body).unwrap();
-            assert!(engine.import_file(&src, "proj").await.unwrap() >= 4);
-            assert!(chunks_like(&engine, "Zm9vYmFy") >= 4);
-        }
-
-        // The scrub is on now, and the conversation grows.
-        append(&src, message(10, "freshly appended alpha").as_bytes());
-        append(&src, message(11, "freshly appended bravo").as_bytes());
-        filetime_touch(&src);
-        engine.import_file(&src, "proj").await.unwrap();
-
-        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
-        assert_eq!(chunks_like(&engine, "freshly appended bravo"), 1);
-        assert_eq!(chunks_like(&engine, "Zm9vYmFy"), 0);
-        assert!(chunks_like(&engine, "[secret redacted: private_key_block]") >= 1);
-
-        // And a plain append afterwards is incremental again.
-        // (Long enough to open a chunk of its own: a short one joins the last
-        // chunk, which an incremental import has never re-read.)
-        let long = format!("freshly appended charlie {}", "lorem ipsum ".repeat(120));
-        append(&src, message(12, &long).as_bytes());
-        filetime_touch(&src);
-        engine.import_file(&src, "proj").await.unwrap();
-        assert_eq!(chunks_like(&engine, "freshly appended charlie"), 1);
-    }
-
-    /// A conversation stored by a build without the scrubber, so the next import
-    /// with the scrub on takes the rebuild path. Returns the conversation id.
+    /// A conversation stored by a build without the scrubber: its first four
+    /// messages each hold a private key block. Returns the conversation id.
     async fn legacy_conversation(engine: &crate::engine::Engine, src: &Path) -> String {
         let pem = format!(
             "{}{}\n{}\n{}{}",
@@ -2259,101 +2203,33 @@ mod tests {
             + "\n"
     }
 
-    #[tokio::test]
-    async fn a_rebuild_that_lost_the_race_leaves_the_newer_import_alone() {
-        let rig = Rig::new();
-        let engine = engine_for(&rig).await;
-        let src = rig.source("sess-race.jsonl");
-        let conv = legacy_conversation(&engine, &src).await;
-
-        // While this import embeds its replacement, another import adds a chunk
-        // and checkpoints the conversation.
-        {
-            let storage = engine.storage().clone();
-            let conv = conv.clone();
-            *engine.before_rebuild_swap.lock().unwrap() = Some(Box::new(move || {
-                storage
-                    .with_connection(|conn| {
-                        conn.execute(
-                            "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
-                             VALUES ('newer-tail', ?1, 'proj', '2026-10-14T11:00:00Z', 'the newer import', 1)",
-                            [&conv],
-                        )?;
-                        conn.execute(
-                            "UPDATE import_state SET chunks_imported = chunks_imported + 1, file_mtime = 'newer'",
-                            [],
-                        )?;
-                        Ok(())
-                    })
-                    .unwrap();
-            }));
-        }
-        filetime_touch(&src);
-        assert_eq!(engine.import_file(&src, "proj").await.unwrap(), 0);
-
-        // Nothing was replaced and the checkpoint is the newer import's.
-        assert_eq!(chunks_like(&engine, "the newer import"), 1);
-        assert!(chunks_like(&engine, "Zm9vYmFy") >= 4);
-        let mtime: String = engine
-            .storage()
-            .with_connection(|conn| {
-                Ok(conn.query_row("SELECT file_mtime FROM import_state", [], |r| r.get(0))?)
-            })
-            .unwrap();
-        assert_eq!(mtime, "newer");
-
-        // The next import, with nobody racing, completes the rebuild.
-        *engine.before_rebuild_swap.lock().unwrap() = None;
+    /// Every column of every chunk row of `conv`, and its embedding, as text.
+    fn stored_rows(engine: &crate::engine::Engine, conv: &str) -> Vec<String> {
         engine
             .storage()
             .with_connection(|conn| {
-                conn.execute("DELETE FROM chunks WHERE id = 'newer-tail'", [])?;
-                conn.execute(
-                    "UPDATE import_state SET chunks_imported = chunks_imported - 1",
-                    [],
+                let mut stmt = conn.prepare(
+                    "SELECT c.id, c.project_name, c.timestamp, c.content, c.message_count,
+                            c.summary, c.seq, c.is_sidechain, c.source, e.embedding
+                     FROM chunks c LEFT JOIN chunk_embeddings e ON e.chunk_id = c.id
+                     WHERE c.conversation_id = ?1 ORDER BY c.id",
                 )?;
-                Ok(())
+                let rows = stmt
+                    .query_map([conv], |row| {
+                        let mut cells = Vec::new();
+                        for i in 0..10 {
+                            cells.push(format!("{:?}", row.get::<_, rusqlite::types::Value>(i)?));
+                        }
+                        Ok(cells.join("|"))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
             })
-            .unwrap();
-        filetime_touch(&src);
-        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
-        assert_eq!(chunks_like(&engine, "Zm9vYmFy"), 0);
+            .unwrap()
     }
 
-    #[tokio::test]
-    async fn a_rebuild_checkpoints_the_revision_it_parsed_not_the_files_mtime_now() {
-        let rig = Rig::new();
-        let engine = engine_for(&rig).await;
-        let src = rig.source("sess-grow.jsonl");
-        legacy_conversation(&engine, &src).await;
-
-        // The transcript grows after the rebuild parsed it, before it checkpoints.
-        {
-            let src = src.clone();
-            *engine.before_rebuild_swap.lock().unwrap() = Some(Box::new(move || {
-                // Long enough to open a chunk of its own (see the drift test).
-                let long = format!("grown while rebuilding {}", "lorem ipsum ".repeat(120));
-                append(&src, session_message(20, &long).as_bytes());
-                filetime_touch(&src);
-            }));
-        }
-        filetime_touch(&src);
-        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
-        *engine.before_rebuild_swap.lock().unwrap() = None;
-
-        // The checkpoint must not claim the grown file as imported.
-        engine.import_file(&src, "proj").await.unwrap();
-        assert_eq!(chunks_like(&engine, "grown while rebuilding"), 1);
-    }
-
-    #[tokio::test]
-    async fn a_rebuild_drops_witness_bindings_of_the_chunk_ids_it_reuses() {
-        let rig = Rig::new();
-        let engine = engine_for(&rig).await;
-        let src = rig.source("sess-wit.jsonl");
-        let conv = legacy_conversation(&engine, &src).await;
-
-        let (bound, other_bound) = engine
+    fn bind_first_chunk_to_a_witness(engine: &crate::engine::Engine, conv: &str) -> Vec<String> {
+        engine
             .storage()
             .with_connection(|conn| {
                 conn.execute(
@@ -2363,30 +2239,19 @@ mod tests {
                 )?;
                 let witness: i64 =
                     conn.query_row("SELECT id FROM witness_ledger", [], |r| r.get(0))?;
-                let chunk: String = conn.query_row(
-                    "SELECT id FROM chunks WHERE conversation_id = ?1 ORDER BY id LIMIT 1",
-                    [&conv],
-                    |r| r.get(0),
-                )?;
                 conn.execute(
-                    "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
-                     VALUES ('elsewhere-0', 'other-conv', 'proj', '2026-10-14T11:00:00Z', 'unrelated', 1)",
-                    [],
+                    "INSERT INTO witness_chunk_bindings (witness_id, chunk_id)
+                     SELECT ?1, id FROM chunks WHERE conversation_id = ?2",
+                    rusqlite::params![witness, conv],
                 )?;
-                for chunk_id in [chunk.as_str(), "elsewhere-0"] {
-                    conn.execute(
-                        "INSERT INTO witness_chunk_bindings (witness_id, chunk_id) VALUES (?1, ?2)",
-                        rusqlite::params![witness, chunk_id],
-                    )?;
-                }
-                Ok((chunk, "elsewhere-0".to_string()))
+                Ok(())
             })
             .unwrap();
+        witness_bindings(engine)
+    }
 
-        filetime_touch(&src);
-        assert!(engine.import_file(&src, "proj").await.unwrap() > 0);
-
-        let (bindings, ledger): (Vec<String>, i64) = engine
+    fn witness_bindings(engine: &crate::engine::Engine) -> Vec<String> {
+        engine
             .storage()
             .with_connection(|conn| {
                 let mut stmt =
@@ -2394,18 +2259,192 @@ mod tests {
                 let ids = stmt
                     .query_map([], |r| r.get::<_, String>(0))?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                let ledger =
-                    conn.query_row("SELECT COUNT(*) FROM witness_ledger", [], |r| r.get(0))?;
-                Ok((ids, ledger))
+                Ok(ids)
+            })
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum Via {
+        /// `Engine::import_file`.
+        Engine,
+        /// The watcher's content-diff import.
+        Watcher,
+    }
+
+    async fn import_via(engine: &crate::engine::Engine, rig: &Rig, src: &Path, via: Via) {
+        match via {
+            Via::Engine => {
+                engine.import_file(src, "proj").await.unwrap();
+            }
+            Via::Watcher => {
+                crate::import::watcher::import_file_content_diff(
+                    engine.storage(),
+                    engine.embeddings(),
+                    engine.search(),
+                    &rig.projects,
+                    src,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    /// Rows stored before the scrubber are never touched; everything after them
+    /// is imported scrubbed and found by search. Includes the original review
+    /// finding: the scrub would cut the earlier private-key chunks short, and a
+    /// count-based resume would then skip the new messages.
+    async fn legacy_rows_survive_and_new_messages_land(via: Via) {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-legacy.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        let before = stored_rows(&engine, &conv);
+        let old_secret_rows = chunks_like(&engine, "Zm9vYmFy");
+        let bindings = bind_first_chunk_to_a_witness(&engine, &conv);
+        assert_eq!(bindings.len(), before.len());
+
+        let token = format!("{}{}", "ghp_", "Q".repeat(36));
+        append(
+            &src,
+            session_message(10, &format!("freshly appended alpha {token}")).as_bytes(),
+        );
+        append(
+            &src,
+            session_message(11, "freshly appended bravo").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, via).await;
+
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert!(after.len() > before.len());
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert_eq!(chunks_like(&engine, "freshly appended bravo"), 1);
+        assert_eq!(chunks_like(&engine, "ghp_"), 0);
+        assert_eq!(chunks_like(&engine, "[secret redacted: github_token]"), 1);
+        assert_eq!(chunks_like(&engine, "Zm9vYmFy"), old_secret_rows);
+        assert_eq!(witness_bindings(&engine), bindings);
+        assert!(engine.storage().legacy_frontier(&conv).unwrap().is_some());
+        // Only what the scrub did to the new message is counted, not the
+        // secrets the stored rows still hold.
+        assert_eq!(engine.storage().get_secrets_redacted().unwrap().0, 1);
+
+        // The next appends land too, and the stored rows stay as they were.
+        let long = format!("freshly appended charlie {}", "lorem ipsum ".repeat(120));
+        append(&src, session_message(12, &long).as_bytes());
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, via).await;
+        import_via(&engine, &rig, &src, via).await;
+        let later = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(later.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(chunks_like(&engine, "freshly appended charlie"), 1);
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert_eq!(witness_bindings(&engine), bindings);
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_stay_byte_identical_and_new_messages_land_scrubbed() {
+        legacy_rows_survive_and_new_messages_land(Via::Engine).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_stay_byte_identical_through_the_watcher_path() {
+        legacy_rows_survive_and_new_messages_land(Via::Watcher).await;
+    }
+
+    #[tokio::test]
+    async fn a_legacy_conversation_without_receipts_is_placed_by_its_text() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-bare.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM chunk_spans", [])?;
+                Ok(())
             })
             .unwrap();
-        assert!(!bindings.contains(&bound), "{bindings:?}");
-        assert_eq!(
-            bindings,
-            vec![other_bound],
-            "other conversations keep theirs"
+        let before = stored_rows(&engine, &conv);
+        let old_tail = chunks_like(&engine, "end 3");
+
+        append(
+            &src,
+            session_message(10, "freshly appended alpha").as_bytes(),
         );
-        assert_eq!(ledger, 1, "the witness ledger is append-only and stays");
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Engine).await;
+
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        // The messages the stored rows hold are not chunked a second time.
+        assert_eq!(chunks_like(&engine, "end 3"), old_tail);
+    }
+
+    #[tokio::test]
+    async fn a_legacy_conversation_that_cannot_be_placed_is_left_alone_until_it_can() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-lost.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        let original: (String, String) = engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM chunk_spans", [])?;
+                Ok(conn.query_row(
+                    "SELECT id, content FROM chunks WHERE conversation_id = ?1
+                     ORDER BY seq DESC, rowid DESC LIMIT 1",
+                    [&conv],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        let set_tail = |content: &str| {
+            engine
+                .storage()
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE chunks SET content = ?2 WHERE id = ?1",
+                        [&original.0, content],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        set_tail("text that is nowhere in the transcript");
+        let before = stored_rows(&engine, &conv);
+
+        append(
+            &src,
+            session_message(10, "freshly appended alpha").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Engine).await;
+        import_via(&engine, &rig, &src, Via::Watcher).await;
+
+        assert_eq!(stored_rows(&engine, &conv), before);
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 0);
+        assert!(engine.storage().legacy_frontier(&conv).unwrap().is_none());
+
+        // Once the place can be found, the pending message lands.
+        set_tail(&original.1);
+        append(
+            &src,
+            session_message(11, "freshly appended bravo").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Engine).await;
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert_eq!(chunks_like(&engine, "freshly appended bravo"), 1);
     }
 
     /// The import-state check compares mtimes; make sure an append inside the

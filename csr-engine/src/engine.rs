@@ -21,10 +21,6 @@ fn log_timing(line: &str) {
 /// hold one session's worth of new chunks without reallocation.
 const IMPORT_ONLY_INDEX_CAPACITY: usize = 4096;
 
-/// A test-only callback fired at a chosen point inside the engine.
-#[cfg(test)]
-pub(crate) type TestHook = Box<dyn Fn() + Send + Sync>;
-
 /// Orchestrates all subsystems: storage, embeddings, search, import, and MCP.
 #[derive(Clone)]
 pub struct Engine {
@@ -62,10 +58,6 @@ pub struct Engine {
     /// An MCP server that found the daemon live: vector search and query
     /// embedding go to the daemon (see [`Self::new_proxied`]).
     proxied: bool,
-    /// Runs in a conversation rebuild after its rows are embedded, just before
-    /// they are swapped in: the window in which another import can win.
-    #[cfg(test)]
-    pub(crate) before_rebuild_swap: Arc<std::sync::Mutex<Option<TestHook>>>,
 }
 
 impl Engine {
@@ -114,8 +106,6 @@ impl Engine {
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
             proxied: false,
-            #[cfg(test)]
-            before_rebuild_swap: Default::default(),
         }
     }
 
@@ -352,8 +342,6 @@ impl Engine {
             index_freshly_rebuilt,
             startup_backfill,
             proxied: false,
-            #[cfg(test)]
-            before_rebuild_swap: Default::default(),
         })
     }
 
@@ -393,8 +381,6 @@ impl Engine {
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
             proxied: true,
-            #[cfg(test)]
-            before_rebuild_swap: Default::default(),
         }))
     }
 
@@ -429,8 +415,6 @@ impl Engine {
             index_freshly_rebuilt: false,
             startup_backfill: (0, 0),
             proxied: false,
-            #[cfg(test)]
-            before_rebuild_swap: Default::default(),
         })
     }
 
@@ -527,12 +511,11 @@ impl Engine {
             return Ok(0);
         }
 
-        // The stored state and the source revision this import is about to read.
-        // A rebuild swaps its rows in only if the stored state is still this, and
-        // every checkpoint below records this revision's mtime, not the file's
-        // mtime at the moment of writing: a file that grew meanwhile stays changed.
-        let snapshot = self.storage.import_snapshot(file_path, &conversation_id)?;
-        let parsed_mtime = snapshot.source_mtime.as_str();
+        // The source revision this import is about to read. Every checkpoint below
+        // records this mtime, not the file's mtime at the moment of writing: a file
+        // that grew meanwhile stays changed.
+        let parsed_mtime_owned = crate::storage::queries::file_mtime_str(file_path);
+        let parsed_mtime = parsed_mtime_owned.as_str();
 
         let parent_context = attribution
             .parent_conversation_id
@@ -543,11 +526,31 @@ impl Engine {
                     .parent_provenance_context(parent_id, message_key.as_deref())
             })
             .transpose()?;
-        let parsed = import::parse_jsonl_file_observing(
+        // Chunk rows stored before the scrubber are never rewritten: a legacy
+        // conversation is picked up after the last message they cover.
+        let resume = match import::legacy_resume::resolve(
+            &self.storage,
+            file_path,
+            &conversation_id,
+            parent_context.as_ref(),
+        )? {
+            import::legacy_resume::Resume::Fresh => None,
+            import::legacy_resume::Resume::At(point) => Some(point),
+            import::legacy_resume::Resume::Unplaced => {
+                self.storage.mark_file_imported(
+                    file_path,
+                    self.storage.get_imported_chunk_count(file_path)?,
+                )?;
+                return Ok(0);
+            }
+        };
+        let stored_chunks = resume.map_or(0, |point| point.first_chunk);
+        let parsed = import::parse_jsonl_file_resuming(
             file_path,
             &attribution.project_name,
             parent_context.as_ref(),
             observer,
+            resume,
         )?;
         let import::ParsedConversation {
             chunks,
@@ -565,7 +568,7 @@ impl Engine {
             // counts it as processed instead of silently under-reporting.
             self.storage.mark_file_imported_with_suppression_at(
                 file_path,
-                0,
+                stored_chunks,
                 suppression,
                 parsed_mtime,
             )?;
@@ -582,40 +585,33 @@ impl Engine {
 
         // Incremental: skip chunks we already embedded
         let prev_count = self.storage.get_imported_chunk_count(file_path)?;
-        // Chunk ids are positions. A conversation stored by a build that did not
-        // redact secrets was cut into chunks from the long text; the redacted
-        // reparse cuts fewer, shifted ones, and "skip the first prev_count" would
-        // then drop new messages. Redaction is the only thing that moves the
-        // boundaries, so when it fired on a conversation that predates the
-        // scrubber, rebuild this one conversation from scratch.
-        if prev_count > 0
-            && !suppression.secrets.is_empty()
-            && !self.storage.import_secrets_stamped(file_path)?
-        {
-            let Some(rebuilt) = self
-                .rebuild_conversation(
-                    file_path,
-                    &conversation_id,
-                    attribution,
-                    &chunks,
-                    &evidence,
-                    &snapshot,
-                    suppression,
-                )
-                .await?
-            else {
-                // Another import changed this conversation while this one was
-                // embedding: its rows stand and the next import tries again.
-                return Ok(0);
+        let new_chunks: Vec<&import::ConversationChunk> =
+            if resume.is_some() {
+                // Every parsed chunk is past the stored rows; write those that are
+                // new or grew, the way the watcher does.
+                let mut pending = Vec::new();
+                for batch in chunks.chunks(10) {
+                    let ids: Vec<String> = batch.iter().map(|c| c.id.clone()).collect();
+                    let stored: std::collections::HashMap<String, import::ConversationChunk> = self
+                        .storage
+                        .get_chunks_by_ids(&ids)?
+                        .into_iter()
+                        .map(|chunk| (chunk.id.clone(), chunk))
+                        .collect();
+                    pending.extend(batch.iter().filter(|chunk| {
+                        import::watcher::needs_reindex(chunk, stored.get(&chunk.id))
+                    }));
+                }
+                pending
+            } else {
+                chunks.iter().skip(prev_count).collect()
             };
-            self.storage.relink_conversation(&conversation_id)?;
-            return Ok(rebuilt);
-        }
-        if chunks.len() <= prev_count {
-            // File parsed to same/fewer chunks — just update mtime
+        let recorded = stored_chunks + chunks.len();
+        if new_chunks.is_empty() {
+            // Nothing new — just update mtime
             self.storage.mark_file_imported_with_suppression_at(
                 file_path,
-                chunks.len(),
+                recorded,
                 suppression,
                 parsed_mtime,
             )?;
@@ -623,7 +619,6 @@ impl Engine {
             return Ok(0);
         }
 
-        let new_chunks = &chunks[prev_count..];
         const BATCH_SIZE: usize = 10;
 
         for batch in new_chunks.chunks(BATCH_SIZE) {
@@ -664,7 +659,7 @@ impl Engine {
 
         self.storage.mark_file_imported_with_suppression_at(
             file_path,
-            chunks.len(),
+            recorded,
             suppression,
             parsed_mtime,
         )?;
@@ -799,89 +794,6 @@ impl Engine {
         self.flush_index().await;
 
         Ok((backfilled, enriched))
-    }
-
-    /// Replace one conversation's chunks with `chunks`, all embedded before the
-    /// swap so a failure leaves the old rows in place. Returns the chunk count,
-    /// or `None` when the conversation's stored state changed since `snapshot`
-    /// (a concurrent import won) and nothing was touched.
-    #[allow(clippy::too_many_arguments)]
-    async fn rebuild_conversation(
-        &self,
-        file_path: &Path,
-        conversation_id: &str,
-        attribution: &import::ConversationAttribution,
-        chunks: &[import::ConversationChunk],
-        evidence: &std::collections::HashMap<String, crate::provenance::ChunkEvidence>,
-        snapshot: &crate::storage::queries::ImportSnapshot,
-        suppression: import::CsrSuppressionStats,
-    ) -> Result<Option<usize>> {
-        const BATCH_SIZE: usize = 10;
-        let mut rows = Vec::with_capacity(chunks.len());
-        for batch in chunks.chunks(BATCH_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
-            let emb = self.embeddings.clone();
-            let embeddings = tokio::task::spawn_blocking(move || {
-                let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-                emb.embed(&refs)
-            })
-            .await??;
-            for (chunk, embedding) in batch.iter().zip(embeddings) {
-                let provenance = crate::provenance::ChunkProvenance {
-                    author: chunk.author,
-                    source_conv_id: attribution
-                        .parent_conversation_id
-                        .clone()
-                        .unwrap_or_else(|| chunk.conversation_id.clone()),
-                    supersedes: None,
-                };
-                rows.push((
-                    chunk.clone(),
-                    embedding,
-                    provenance,
-                    attribution.source.to_string(),
-                ));
-            }
-        }
-        #[cfg(test)]
-        if let Some(hook) = self.before_rebuild_swap.lock().unwrap().as_ref() {
-            hook();
-        }
-        let old_ids = self
-            .storage
-            .get_chunk_ids_for_conversation(conversation_id)?;
-        if !self.storage.replace_conversation_if_unchanged(
-            file_path,
-            conversation_id,
-            &snapshot.state,
-            &rows,
-            suppression,
-            &snapshot.source_mtime,
-        )? {
-            tracing::info!(
-                file = %file_path.display(),
-                "conversation changed during a rebuild; left for the next import"
-            );
-            return Ok(None);
-        }
-        for (chunk, ..) in &rows {
-            if let Some(chunk_evidence) = evidence.get(&chunk.id) {
-                self.storage.replace_chunk_evidence(chunk_evidence)?;
-            }
-        }
-        let mut idx = self.search.write().await;
-        for id in &old_ids {
-            idx.remove_chunk(id);
-        }
-        for (chunk, embedding, ..) in rows {
-            idx.insert_chunk(chunk.id, embedding);
-        }
-        tracing::info!(
-            file = %file_path.display(),
-            chunks = chunks.len(),
-            "rebuilt a conversation stored before secret redaction existed"
-        );
-        Ok(Some(chunks.len()))
     }
 
     // ─── Accessors for hooks ───

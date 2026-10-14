@@ -5,6 +5,7 @@ pub mod coedit_backfill;
 pub mod contamination;
 pub mod dream_marker;
 pub mod entrypoint_backfill;
+pub(crate) mod legacy_resume;
 pub mod memory_registry;
 pub mod plans;
 pub mod provenance_backfill;
@@ -565,18 +566,58 @@ pub(crate) fn parse_jsonl_file_observing(
     parent: Option<&ParentContext>,
     observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
 ) -> Result<ParsedConversation> {
+    parse_jsonl_file_resuming(path, project_name, parent, observer, None)
+}
+
+/// Where a conversation stored before the scrubber is picked up again: its
+/// stored chunk rows are never rewritten, so only the messages after the last
+/// one they cover are chunked, and the new chunks continue the id sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResumePoint {
+    /// Highest message sequence number the stored chunks cover.
+    pub after_seq: usize,
+    /// Index of the first chunk this import may write.
+    pub first_chunk: usize,
+}
+
+/// [`parse_jsonl_file_observing`] for a conversation that resumes at `resume`.
+pub(crate) fn parse_jsonl_file_resuming(
+    path: &Path,
+    project_name: &str,
+    parent: Option<&ParentContext>,
+    observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+    resume: Option<ResumePoint>,
+) -> Result<ParsedConversation> {
     let file = fs::File::open(path).context("opening JSONL file")?;
-    parse_jsonl_reader(path, BufReader::new(file), project_name, parent, observer)
+    parse_jsonl_reader_resuming(
+        path,
+        BufReader::new(file),
+        project_name,
+        parent,
+        observer,
+        resume,
+    )
 }
 
 /// The same parser over any reader; `path` names the transcript (its stem is
 /// the conversation id, and receipts point at it).
 pub(crate) fn parse_jsonl_reader<R: BufRead>(
     path: &Path,
+    reader: R,
+    project_name: &str,
+    parent: Option<&ParentContext>,
+    observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+) -> Result<ParsedConversation> {
+    parse_jsonl_reader_resuming(path, reader, project_name, parent, observer, None)
+}
+
+fn parse_jsonl_reader_resuming<R: BufRead>(
+    path: &Path,
     mut reader: R,
     project_name: &str,
     parent: Option<&ParentContext>,
     mut observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+    resume: Option<ResumePoint>,
 ) -> Result<ParsedConversation> {
     let conversation_id = path
         .file_stem()
@@ -684,7 +725,15 @@ pub(crate) fn parse_jsonl_reader<R: BufRead>(
             }
         }
 
+        // A message the stored chunks already cover is read for everything that
+        // carries forward (trust floor, tool names, summary) but is not chunked,
+        // and the secrets in it are not counted: the stored rows still hold them.
+        let stored = resume.is_some_and(|point| seq <= point.after_seq);
+        let secrets_before = stored.then_some(csr_sanitizer.stats.secrets);
         sanitize_message_for_search(&mut parsed, &mut csr_sanitizer);
+        if let Some(before) = secrets_before {
+            csr_sanitizer.stats.secrets = before;
+        }
         register_tool_uses(&parsed, &mut tool_names);
 
         // Capture first and last timestamps
@@ -803,10 +852,12 @@ pub(crate) fn parse_jsonl_reader<R: BufRead>(
                 });
                 combined_start = combined_end + 1;
             }
-            messages.push(combined_text);
-            authors.push(author);
-            sidechains.push(is_sidechain_msg);
-            message_evidence.push(MessageEvidence { parts });
+            if !stored {
+                messages.push(combined_text);
+                authors.push(author);
+                sidechains.push(is_sidechain_msg);
+                message_evidence.push(MessageEvidence { parts });
+            }
         }
     }
 
@@ -837,6 +888,7 @@ pub(crate) fn parse_jsonl_reader<R: BufRead>(
         &sidechains,
         &chunk_summary,
         Some(&message_evidence),
+        resume.map_or(0, |point| point.first_chunk),
     );
     // Contamination left at the components, before they were joined; nothing
     // is cut from a finished chunk. The spans and the tool-result share are
@@ -916,6 +968,7 @@ fn chunk_message_core(
         message_sidechains,
         summary,
         None,
+        0,
     )
     .0
 }
@@ -930,6 +983,7 @@ fn chunk_message_core_with_evidence(
     message_sidechains: &[bool],
     summary: &Option<String>,
     message_evidence: Option<&[MessageEvidence]>,
+    first_chunk: usize,
 ) -> (Vec<ConversationChunk>, HashMap<String, Vec<EventPart>>) {
     debug_assert_eq!(messages.len(), message_authors.len());
     debug_assert_eq!(messages.len(), message_sidechains.len());
@@ -954,6 +1008,7 @@ fn chunk_message_core_with_evidence(
         if message.len() > CHUNK_CHAR_BUDGET {
             if !buffer.is_empty() {
                 push_chunk(
+                    first_chunk,
                     &mut chunks,
                     conversation_id,
                     project_name,
@@ -981,6 +1036,7 @@ fn chunk_message_core_with_evidence(
                     end = message.len();
                 }
                 push_chunk(
+                    first_chunk,
                     &mut chunks,
                     conversation_id,
                     project_name,
@@ -1005,6 +1061,7 @@ fn chunk_message_core_with_evidence(
 
         if !buffer.is_empty() && buffer.len() + message.len() + 2 > CHUNK_CHAR_BUDGET {
             push_chunk(
+                first_chunk,
                 &mut chunks,
                 conversation_id,
                 project_name,
@@ -1043,6 +1100,7 @@ fn chunk_message_core_with_evidence(
     }
     if !buffer.is_empty() {
         push_chunk(
+            first_chunk,
             &mut chunks,
             conversation_id,
             project_name,
@@ -1278,6 +1336,7 @@ fn extract_tool_result_parts(
 /// Push one finished chunk, assigning a deterministic sequential id.
 #[allow(clippy::too_many_arguments)]
 fn push_chunk(
+    first_chunk: usize,
     chunks: &mut Vec<ConversationChunk>,
     conversation_id: &str,
     project_name: &str,
@@ -1288,7 +1347,7 @@ fn push_chunk(
     author: crate::provenance::Speaker,
     is_sidechain: bool,
 ) {
-    let i = chunks.len();
+    let i = first_chunk + chunks.len();
     chunks.push(ConversationChunk {
         id: generate_chunk_id(conversation_id, i),
         conversation_id: conversation_id.to_string(),
