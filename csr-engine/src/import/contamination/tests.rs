@@ -557,6 +557,26 @@ fn the_agents_envelope_marker_lines_are_each_a_hit() {
     assert_unlabeled("> [[CSR:AGENTS:v1]]");
 }
 
+/// A line of n EM SPACES then n cards: classifying the line (indented, quoted,
+/// plain) must happen once per line, not after every accepted card.
+#[test]
+fn a_long_unicode_whitespace_prefix_with_many_cards_is_linear() {
+    let n = 40_000;
+    let text = format!(
+        "{}{}",
+        "\u{2003}".repeat(n),
+        "CSR's compaction card (compacting), quoted: “x” ".repeat(n)
+    );
+    within_the_bound("em-space prefix, many cards", &text);
+    // the round 3 input stays linear too
+    let quoted = format!(
+        "{}2{}",
+        ">".repeat(n),
+        "CSR's compaction card (compacting), quoted: “x” ".repeat(n)
+    );
+    within_the_bound("quote prefix, many cards", &quoted);
+}
+
 #[test]
 fn which_chunks_can_carry_csr_text() {
     assert!(labelable(Some("conversation"), Some(Speaker::User)));

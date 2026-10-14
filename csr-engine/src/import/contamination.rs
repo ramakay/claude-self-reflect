@@ -1437,6 +1437,7 @@ fn scan(text: &str) -> Vec<Hit> {
     // candidates the line holds.
     let mut line_marks: Option<(usize, LineMarks<'_>)> = None;
     let mut hotkey_cache: Option<(usize, Option<usize>)> = None;
+    let mut kind_cache: Option<(usize, LineKind)> = None;
 
     'scan: while pos < text.len() {
         let index = doc.line_of(pos);
@@ -1465,7 +1466,15 @@ fn scan(text: &str) -> Vec<Hit> {
                 continue;
             }
         }
-        let kind = line_kind(content);
+        // Classified once per line, however many cards the line restarts after.
+        let kind = match kind_cache {
+            Some((at, kind)) if at == index => kind,
+            _ => {
+                let kind = line_kind(content);
+                kind_cache = Some((index, kind));
+                kind
+            }
+        };
 
         if at_line_start && kind == LineKind::Normal {
             for formatter in REGISTRY {
