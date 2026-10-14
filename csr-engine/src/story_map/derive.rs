@@ -20,6 +20,7 @@ const MAX_ENTRIES: usize = 4;
 const MAX_SCOPE_CHARS: usize = 48;
 const MAX_SYM_CHARS: usize = 40;
 const MAX_CLAIM_CHARS: usize = 72;
+const MAX_IMPORT_SWAPS: usize = 2;
 
 #[derive(Debug, Clone)]
 struct SwapPair {
@@ -42,6 +43,9 @@ struct FileAccum {
 #[derive(Debug)]
 struct RankedCandidate {
     tier: u8,
+    /// Import swaps beyond `MAX_IMPORT_SWAPS` drop behind the function swaps.
+    is_import: bool,
+    demoted: bool,
     has_symbol_change: bool,
     distinct_symbols: usize,
     touches: usize,
@@ -235,6 +239,8 @@ fn derive_with_conn(conn: &Connection, conv_id: &str) -> Vec<ShiftEntry> {
 
         candidates.push(RankedCandidate {
             tier: 2,
+            is_import: false,
+            demoted: false,
             has_symbol_change,
             distinct_symbols,
             touches: file.touches,
@@ -243,20 +249,34 @@ fn derive_with_conn(conn: &Connection, conv_id: &str) -> Vec<ShiftEntry> {
         });
     }
 
-    candidates.sort_by(|a, b| {
-        a.tier
-            .cmp(&b.tier)
-            .then_with(|| b.has_symbol_change.cmp(&a.has_symbol_change))
-            .then_with(|| b.distinct_symbols.cmp(&a.distinct_symbols))
-            .then_with(|| b.touches.cmp(&a.touches))
-            .then_with(|| a.scope.cmp(&b.scope))
-    });
+    candidates.sort_by(rank_order);
+    // A few import tweaks read as architecture; a fourth `use` line must not crowd out a real
+    // function swap, so imports past the cap fall in behind the function swaps.
+    let mut imports_kept = 0;
+    for cand in candidates.iter_mut().filter(|c| c.is_import && c.tier == 0) {
+        imports_kept += 1;
+        if imports_kept > MAX_IMPORT_SWAPS {
+            cand.tier = 1;
+            cand.demoted = true;
+        }
+    }
+    candidates.sort_by(rank_order);
 
     candidates
         .into_iter()
         .take(MAX_ENTRIES)
         .map(|c| c.entry)
         .collect()
+}
+
+fn rank_order(a: &RankedCandidate, b: &RankedCandidate) -> std::cmp::Ordering {
+    a.tier
+        .cmp(&b.tier)
+        .then_with(|| a.demoted.cmp(&b.demoted))
+        .then_with(|| b.has_symbol_change.cmp(&a.has_symbol_change))
+        .then_with(|| b.distinct_symbols.cmp(&a.distinct_symbols))
+        .then_with(|| b.touches.cmp(&a.touches))
+        .then_with(|| a.scope.cmp(&b.scope))
 }
 
 fn parse_json_str_list(raw: &str) -> Vec<String> {
@@ -392,6 +412,8 @@ fn build_sym_swap_candidate(
 
     Some(RankedCandidate {
         tier,
+        is_import: false,
+        demoted: false,
         has_symbol_change: true,
         distinct_symbols: removed.len() + added.len(),
         touches,
@@ -523,22 +545,7 @@ fn build_import_swap_candidate(
     let (before, after, raw_claim) = if let Some((rp, added_items, dropped_items)) = same_mod {
         let m_disp = shorten_module_display(&rp.module);
         let mod_sym = sanitize_endpoint_sym(&rp.module)?;
-        let claim = match (!added_items.is_empty(), !dropped_items.is_empty()) {
-            (true, false) => {
-                let a_str = format_item_list(&added_items);
-                format!("Swapped the {m_disp} import for one that adds {a_str}")
-            }
-            (false, true) => {
-                let d_str = format_item_list(&dropped_items);
-                format!("Swapped the {m_disp} import for one that drops {d_str}")
-            }
-            (true, true) => {
-                let a_str = format_item_list(&added_items);
-                let d_str = format_item_list(&dropped_items);
-                format!("Swapped the {m_disp} import for one that adds {a_str} and drops {d_str}")
-            }
-            (false, false) => return None,
-        };
+        let claim = same_module_claim(&m_disp, &added_items, &dropped_items);
         let (b_ep, a_ep) = if let Some(first_added) = added_items.first() {
             let item_sym = sanitize_endpoint_sym(first_added)?;
             (
@@ -578,12 +585,38 @@ fn build_import_swap_candidate(
 
     Some(RankedCandidate {
         tier: if in_tests_dir { 3 } else { 0 },
+        is_import: true,
+        demoted: false,
         has_symbol_change: true,
         distinct_symbols: swap.removed.len() + swap.added.len(),
         touches,
         scope: scope.to_string(),
         entry,
     })
+}
+
+/// `Swapped the m import for one that adds A and drops D`, shortened by counting names when the
+/// list does not fit the claim cap (never cut mid-word).
+fn same_module_claim(m: &str, added: &[String], dropped: &[String]) -> String {
+    let head = format!("Swapped the {m} import for one that");
+    let names = |n: usize| if n == 1 { "name" } else { "names" };
+    let phrase = |a: String, d: String| match (added.is_empty(), dropped.is_empty()) {
+        (false, true) => format!("adds {a}"),
+        (true, false) => format!("drops {d}"),
+        _ => format!("adds {a} and drops {d}"),
+    };
+    let tries = [
+        phrase(format_item_list(added), format_item_list(dropped)),
+        phrase(
+            format!("{} {}", added.len(), names(added.len())),
+            format!("{} {}", dropped.len(), names(dropped.len())),
+        ),
+    ];
+    tries
+        .iter()
+        .map(|t| format!("{head} {t}"))
+        .find(|c| c.chars().count() <= MAX_CLAIM_CHARS)
+        .unwrap_or_else(|| format!("Changed the {m} import"))
 }
 
 fn format_item_list(items: &[String]) -> String {
@@ -697,7 +730,10 @@ fn parse_rust_use(rest: &str) -> Option<ParsedImport> {
             return None;
         }
         let inner = &rest[brace_idx + 1..close_idx];
-        let items: Vec<String> = inner.split(',').filter_map(clean_import_item).collect();
+        let items: Vec<String> = split_top_level(inner)
+            .into_iter()
+            .filter_map(clean_import_item)
+            .collect();
         if prefix.is_empty() {
             return None;
         }
@@ -722,6 +758,24 @@ fn parse_rust_use(rest: &str) -> Option<ParsedImport> {
         module: module.clone(),
         items: vec![module],
     })
+}
+
+/// Splits on commas that are not inside `{...}`.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0usize, 0usize);
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
 }
 
 fn strip_quotes(s: &str) -> &str {
@@ -1681,6 +1735,79 @@ mod tests {
             ShiftEntry::render_side(&dropped.after),
             "installer/cli.js:path~"
         );
+    }
+
+    #[test]
+    fn long_import_lists_fall_back_to_counts_instead_of_a_cut_word() {
+        let storage = Storage::open_memory().unwrap();
+        seed_evo_swap(
+            &storage,
+            "evo_bb000005_1",
+            "/repo/installer/lib.js",
+            NONE,
+            NONE,
+            (
+                "[\"import { accessSync, closeSync, constants, fchmodSync, fstatSync, writeSync } from 'fs';\"]",
+                "[\"import { accessSync, chmodSync, closeSync, constants, copyFileSync } from 'fs';\"]",
+            ),
+        );
+        let entries = derive_receipt_shifts(&storage, "conv_1");
+        assert_eq!(
+            entries[0].claim,
+            "Swapped the fs import for one that adds 3 names and drops 2 names"
+        );
+        assert!(entries[0].claim.len() <= 72);
+    }
+
+    #[test]
+    fn nested_rust_use_groups_compare_by_their_top_level_items() {
+        let storage = Storage::open_memory().unwrap();
+        seed_evo_swap(
+            &storage,
+            "evo_bb000006_1",
+            "/repo/csr-engine/src/io.rs",
+            NONE,
+            NONE,
+            (
+                r#"["use std::{io::{self, Read}, fs, path::Path};"]"#,
+                r#"["use std::{io::{self, Read}, fs};"]"#,
+            ),
+        );
+        let entries = derive_receipt_shifts(&storage, "conv_1");
+        assert_eq!(
+            entries[0].claim,
+            "Swapped the std import for one that adds path::Path"
+        );
+    }
+
+    #[test]
+    fn a_fourth_import_tweak_does_not_crowd_out_a_function_swap() {
+        let storage = Storage::open_memory().unwrap();
+        for (i, f) in ["a", "b", "c"].iter().enumerate() {
+            seed_evo_swap(
+                &storage,
+                &format!("evo_bb00001{i}_1"),
+                &format!("/repo/csr-engine/src/{f}_use.rs"),
+                NONE,
+                NONE,
+                (r#"["use x::{One, Two};"]"#, r#"["use x::{One};"]"#),
+            );
+        }
+        seed_evo_swap(
+            &storage,
+            "evo_bb000019_1",
+            "/repo/csr-engine/src/real.rs",
+            (r#"["new_fn"]"#, r#"["old_fn"]"#),
+            NONE,
+            NONE,
+        );
+        let entries = derive_receipt_shifts(&storage, "conv_1");
+        let claims: Vec<&str> = entries.iter().map(|e| e.claim.as_str()).collect();
+        assert_eq!(entries.len(), 4);
+        assert!(claims[0].starts_with("Swapped the x import"), "{claims:?}");
+        assert!(claims[1].starts_with("Swapped the x import"), "{claims:?}");
+        assert_eq!(claims[2], "Replaced old_fn with new_fn in real.rs");
+        assert!(claims[3].starts_with("Swapped the x import"), "{claims:?}");
     }
 
     #[test]
