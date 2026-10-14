@@ -126,23 +126,11 @@ fn reaction_turn_pairs(entries: &[Entry]) -> Vec<ReactionTurnPair> {
     pairs
 }
 
-/// Whether the transcript entry holds a span a CSR formatter wrote into the
-/// channel its speaker owns (the same remover the importer uses).
+/// Whether the transcript entry holds text a CSR formatter's grammar matches
+/// (the detector search and status use). A mention of a header is not one.
 fn entry_carries_csr_emission(entry: &Entry) -> bool {
-    use crate::import::contamination::{
-        classify_csr_contamination, ContentChannel, OwnedText, SourceKind,
-    };
-    let channel = match entry.role {
-        Role::User => ContentChannel::UserText,
-        Role::Assistant => ContentChannel::AssistantText,
-        Role::System => return false,
-    };
-    classify_csr_contamination(OwnedText {
-        source: SourceKind::Conversation,
-        channel,
-        text: &entry.text,
-    })
-    .is_some()
+    matches!(entry.role, Role::User | Role::Assistant)
+        && crate::import::contamination::has_csr_text(&entry.text)
 }
 
 fn conversation_is_contaminated(

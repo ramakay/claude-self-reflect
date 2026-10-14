@@ -2259,6 +2259,11 @@ fn is_self_referential_noise(content: &str) -> bool {
     if crate::extraction::provenance::is_csr_emission(content) {
         return true;
     }
+    // CSR text the detector labels in search is skipped here, when context is
+    // chosen: selection, not deletion. The chunk itself is untouched.
+    if crate::import::contamination::has_csr_text(content) {
+        return true;
+    }
     // A row that is mostly a pasted CSR emission (another session quoting a
     // pane hand-off list or an injected block back) is CSR's words, not memory.
     let own = crate::extraction::provenance::strip_csr_emissions(content);
@@ -2989,6 +2994,21 @@ mod tests {
         let tags_same = ["project_csr".to_string(), "session_story".to_string()];
         let has_project_tags_same = tags_same.iter().any(|t| t.starts_with("project_"));
         assert!(has_project_tags_same && tags_same.contains(&project_tag));
+    }
+
+    /// Context selection skips a chunk the detector labels (CSR's own pane
+    /// sends); a person's sentence that only mentions the words stays eligible.
+    #[test]
+    fn predictive_context_skips_chunks_with_a_detector_hit() {
+        assert!(is_self_referential_noise(
+            "A standing rule from 10-12: “Keep receipts”"
+        ));
+        assert!(is_self_referential_noise(
+            "CSR remembered: “Use component ownership”."
+        ));
+        assert!(!is_self_referential_noise(
+            "My mother said it best: `A standing rule from 10-12: “Keep receipts”` is worth keeping in the docs."
+        ));
     }
 
     #[test]

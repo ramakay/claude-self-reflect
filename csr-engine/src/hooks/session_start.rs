@@ -246,7 +246,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             })
             // Drop stories synthesized from CSR self-sessions (probe runs) stored
             // before the session_end meta gate landed — they echo our own output.
-            .filter(|(_, content, _, _)| !crate::extraction::provenance::is_csr_emission(content))
+            .filter(|(_, content, _, _)| !story_is_csr_text(content))
             // Drop stories that lead with a bare question instead of narrating work
             // ("what were we discussing recently?", "typng...why? csr-engine"). A
             // work story is declarative; a question-led one is a mis-anchored
@@ -1808,9 +1808,30 @@ fn infer_next_action(content: &str) -> String {
     "Continue where you left off — ask what's next".to_string()
 }
 
+/// Whether a stored session story is CSR's own output, by the emission check
+/// or the detector search labels with. Selection only: the story stays stored.
+fn story_is_csr_text(content: &str) -> bool {
+    crate::extraction::provenance::is_csr_emission(content)
+        || crate::import::contamination::has_csr_text(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_story_that_is_csr_text_is_skipped_and_a_mention_is_not() {
+        assert!(story_is_csr_text(
+            "CSR remembered: “Use component ownership”."
+        ));
+        assert!(story_is_csr_text(
+            "A standing rule from 10-12: “Keep receipts”"
+        ));
+        assert!(!story_is_csr_text(
+            "Fixed the importer; the recall line `CSR remembered: “x”` is documented in the README."
+        ));
+        assert!(!story_is_csr_text("Fixed the importer span ownership."));
+    }
 
     #[test]
     fn tier0_block_formats_episode_state() {
