@@ -2258,6 +2258,7 @@ mod tests {
 
     #[test]
     fn r5_status_uncached_is_unknown_and_deep_persists_verdict() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         let storage = Storage::open(&db).unwrap();
@@ -2302,6 +2303,7 @@ mod tests {
 
     #[test]
     fn round4_status_reads_during_maintenance() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db");
         drop(Storage::open(&db).unwrap());
@@ -3046,6 +3048,7 @@ mod tests {
 
     #[test]
     fn status_backfill_block_defaults_to_empty_on_fresh_db() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");
@@ -3064,6 +3067,7 @@ mod tests {
 
     #[test]
     fn status_backfill_block_surfaces_stage_cursor_spend_discard_rate_and_canary() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let projects_dir = dir.path().join("projects");

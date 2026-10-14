@@ -185,6 +185,7 @@ mod tests {
 
     #[test]
     fn a_named_symbol_injects_one_receipted_line() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = storage_with_dream();
         let line = injection_for_prompt(
             &storage,
@@ -200,6 +201,7 @@ mod tests {
 
     #[test]
     fn plain_english_words_never_match() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = storage_with_dream();
         for prompt in [
             "can you check the policy again",
@@ -217,6 +219,7 @@ mod tests {
 
     #[test]
     fn a_path_shaped_token_matches_the_file() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = storage_with_dream();
         let line = injection_for_prompt(&storage, "proj", "look at dream/policy.rs please", None)
             .expect("a path token must match the witnessed file");
@@ -225,6 +228,7 @@ mod tests {
 
     #[test]
     fn a_conclusion_without_a_receipt_is_never_injected() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = Storage::open_memory().unwrap();
         storage
             .with_connection(|conn| {
@@ -266,6 +270,7 @@ mod tests {
 
     #[test]
     fn the_same_dream_is_never_injected_twice() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = storage_with_dream();
         assert!(
             injection_for_prompt(&storage, "proj", "run_thread_extraction?", Some("s1")).is_some()
@@ -279,6 +284,7 @@ mod tests {
 
     #[test]
     fn a_second_unseen_dream_still_reaches_the_user() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = storage_with_dream();
         seed(
             &storage,
@@ -331,6 +337,7 @@ mod tests {
 
     #[test]
     fn the_injected_line_can_never_be_re_imported_as_user_content() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = storage_with_dream();
         let line = injection_for_prompt(&storage, "proj", "run_thread_extraction?", None).unwrap();
         assert!(line.contains(DREAM_SENTINEL));
@@ -354,6 +361,7 @@ mod tests {
 
     #[test]
     fn a_project_with_no_dreams_costs_nothing_and_returns_nothing() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
         let storage = Storage::open_memory().unwrap();
         assert_eq!(
             injection_for_prompt(&storage, "proj", "run_thread_extraction?", None),
