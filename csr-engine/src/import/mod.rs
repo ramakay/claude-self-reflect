@@ -561,6 +561,19 @@ pub(crate) fn parse_jsonl_file_observing(
     path: &Path,
     project_name: &str,
     parent: Option<&ParentContext>,
+    observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
+) -> Result<ParsedConversation> {
+    let file = fs::File::open(path).context("opening JSONL file")?;
+    parse_jsonl_reader(path, BufReader::new(file), project_name, parent, observer)
+}
+
+/// The same parser over any reader; `path` names the transcript (its stem is
+/// the conversation id, and receipts point at it).
+pub(crate) fn parse_jsonl_reader<R: BufRead>(
+    path: &Path,
+    mut reader: R,
+    project_name: &str,
+    parent: Option<&ParentContext>,
     mut observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
 ) -> Result<ParsedConversation> {
     let conversation_id = path
@@ -569,8 +582,6 @@ pub(crate) fn parse_jsonl_file_observing(
         .to_string_lossy()
         .to_string();
 
-    let file = fs::File::open(path).context("opening JSONL file")?;
-    let mut reader = BufReader::new(file);
     let mut messages: Vec<String> = Vec::new();
     let mut authors: Vec<crate::provenance::Speaker> = Vec::new();
     let mut sidechains: Vec<bool> = Vec::new();

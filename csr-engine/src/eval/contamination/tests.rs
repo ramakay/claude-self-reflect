@@ -13,8 +13,15 @@ fn cases_jsonl_expected_bytes_and_reasons_hold() {
     assert_eq!(report.passed, report.total);
     assert!(report.total >= 62, "the Appendix C rows are all present");
     assert_eq!(report.labeled_rows + report.unlabeled_rows, report.total);
-    // Label, never delete: no row expects the text back different.
-    assert!(cases().iter().all(|case| case.expected == case.input));
+    // Label, never delete: no row expects the text back different, except the
+    // one structural cut (a complete hook-labelled wrapper in the person's turn).
+    assert!(cases()
+        .iter()
+        .all(|case| case.expected == expected_stored(&case.channel, &case.input)));
+    assert!(cases()
+        .iter()
+        .filter(|case| case.channel != "user_text")
+        .all(|case| case.expected == case.input));
 }
 
 #[test]

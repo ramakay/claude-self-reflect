@@ -81,12 +81,53 @@ fn row_is_labelable(case: &Case) -> bool {
     labelable(Some(&case.source), Some(author))
 }
 
+/// The text a row is expected to be stored as: the input itself, except that a
+/// complete hook-labelled `<system-reminder>` wrapper in the person's turn is
+/// the one structural cut the importer has always made.
+pub fn expected_stored(channel: &str, input: &str) -> String {
+    if channel == "user_text" {
+        crate::import::contamination::remove_hook_wrappers(input, &mut 0)
+    } else {
+        input.to_string()
+    }
+}
+
+/// What the real import parser stores for a user or assistant row of text. The
+/// row goes through the same parser a transcript does; its chunks concatenated
+/// are the stored text. `None` for a channel that is not the person's or
+/// Claude's own text.
+fn stored_by_import(case: &Case) -> Option<String> {
+    let role = match case.channel.as_str() {
+        "user_text" => "user",
+        "assistant_text" => "assistant",
+        _ => return None,
+    };
+    let line = serde_json::json!({
+        "type": role,
+        "uuid": "fixture-row",
+        "timestamp": "2026-10-13T00:00:00Z",
+        "message": {"content": case.input},
+    })
+    .to_string();
+    let parsed = crate::import::parse_jsonl_reader(
+        std::path::Path::new("fixture-row.jsonl"),
+        std::io::Cursor::new(line.into_bytes()),
+        "fixture",
+        None,
+        None,
+    )
+    .ok()?;
+    Some(parsed.chunks.iter().map(|c| c.content.as_str()).collect())
+}
+
 /// Run one fixture row; `Err` names how it failed. A detection never edits, so
-/// the row's `expected` is the input itself.
+/// the row's `expected` is the input itself, and the real import parser must
+/// store it byte for byte (a chunk is stored without edge whitespace, and a
+/// text longer than a chunk is split where whitespace falls).
 pub fn run_case(case: &Case) -> std::result::Result<(), String> {
-    if case.expected != case.input {
+    if case.expected != expected_stored(&case.channel, &case.input) {
         return Err(format!(
-            "{}: a detection keeps the text, expected differs",
+            "{}: a detection keeps the text; only a complete hook-labelled wrapper in the person's turn is cut",
             case.id
         ));
     }
@@ -100,6 +141,15 @@ pub fn run_case(case: &Case) -> std::result::Result<(), String> {
             "{}: reason {:?}, expected {:?}",
             case.id, reason, case.reason
         ));
+    }
+    if let Some(stored) = stored_by_import(case) {
+        let squeeze = |text: &str| text.split_whitespace().collect::<String>();
+        if stored != case.expected.trim() && squeeze(&stored) != squeeze(&case.expected) {
+            return Err(format!(
+                "{}: the import parser stored different text than the row's expected text",
+                case.id
+            ));
+        }
     }
     Ok(())
 }
@@ -137,6 +187,13 @@ pub struct Output {
     pub assistant_relay: bool,
     /// What prose in front of the output does to it.
     pub mixed: Mixed,
+    /// Whether the canary expects the raw output to be found from its first
+    /// byte. False for an output that is only a matrix row: a wrapper around a
+    /// bare injection section (found inside it), and the sends that read like a
+    /// person's sentence.
+    pub canary: bool,
+    /// Whether the detector labels the raw output at all.
+    pub detected: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +215,8 @@ fn output(id: &str, formatter: &'static str, reason: ContaminationReason, text: 
         text,
         assistant_relay: true,
         mixed: Mixed::Detected,
+        canary: true,
+        detected: true,
     }
 }
 
@@ -626,6 +685,10 @@ pub fn engine_outputs() -> Vec<Output> {
     ));
     for (id, payload) in [
         (
+            "wrapped-injection",
+            formatter::format_with_budget(&everything, 2000),
+        ),
+        (
             "wrapped-manifest",
             session_start::MEMORY_MANIFEST.to_string(),
         ),
@@ -639,12 +702,24 @@ pub fn engine_outputs() -> Vec<Output> {
         // Only a wrapper that opens with a CSR header is the importer's cut; an
         // envelope around a bare injection section is the section's, and its
         // raw form is already an output above.
+        let bare_injection = id == "wrapped-injection";
         let mut wrapped = output(
             id,
-            "system_reminder",
-            R::SystemReminder,
+            if bare_injection {
+                "injection_section"
+            } else {
+                "system_reminder"
+            },
+            if bare_injection {
+                R::InjectionSection
+            } else {
+                R::SystemReminder
+            },
             format!("<system-reminder>\n{payload}</system-reminder>"),
         );
+        // A wrapper that does not open with a CSR header is not the importer's
+        // cut; the injection section inside it is found, not from byte 0.
+        wrapped.canary = !bare_injection;
         // An assistant relay of a harness envelope is not a thing CSR writes.
         wrapped.assistant_relay = false;
         out.push(wrapped);
@@ -710,14 +785,18 @@ pub fn pane_outputs() -> Vec<Output> {
     pane_document()
         .cases
         .into_iter()
-        .filter(|case| !PANE_SENDS_READ_AS_PROSE.contains(&case.id.as_str()))
-        .map(|case| Output {
-            id: format!("pane-{}", case.id),
-            formatter: pane_formatter(case.reason),
-            reason: case.reason,
-            text: case.text,
-            assistant_relay: true,
-            mixed: Mixed::Detected,
+        .map(|case| {
+            let prose = PANE_SENDS_READ_AS_PROSE.contains(&case.id.as_str());
+            Output {
+                id: format!("pane-{}", case.id),
+                formatter: pane_formatter(case.reason),
+                reason: case.reason,
+                text: case.text,
+                assistant_relay: true,
+                mixed: Mixed::Detected,
+                canary: !prose,
+                detected: !prose,
+            }
         })
         .collect()
 }
@@ -881,7 +960,7 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
                 id,
                 source: "conversation".to_string(),
                 channel: channel.to_string(),
-                expected: input.clone(),
+                expected: expected_stored(channel, &input),
                 input,
                 reason,
             });
@@ -889,12 +968,8 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
     for output in outputs {
         let id = format!("{MATRIX_PREFIX}{}", output.id);
         let text = &output.text;
-        push(
-            format!("{id}-raw"),
-            "user_text",
-            text.clone(),
-            Some(output.reason),
-        );
+        let raw_reason = output.detected.then_some(output.reason);
+        push(format!("{id}-raw"), "user_text", text.clone(), raw_reason);
         for (form, input) in protected_forms(text) {
             push(format!("{id}-{form}"), "user_text", input, None);
         }
@@ -902,12 +977,7 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
         let line_end = if text.ends_with('\n') { "" } else { "\n" };
         let mixed = format!("Please look at this.\n\n{text}{line_end}Now answer.");
         match output.mixed {
-            Mixed::Detected => push(
-                format!("{id}-mixed"),
-                "user_text",
-                mixed,
-                Some(output.reason),
-            ),
+            Mixed::Detected => push(format!("{id}-mixed"), "user_text", mixed, raw_reason),
             Mixed::Kept => push(format!("{id}-mixed"), "user_text", mixed, None),
             Mixed::Skipped => {}
         }
@@ -916,7 +986,7 @@ pub fn matrix_rows(outputs: &[Output]) -> Vec<Case> {
                 format!("{id}-assistant-relay"),
                 "assistant_text",
                 text.clone(),
-                Some(output.reason),
+                raw_reason,
             );
         }
         let analysis = protected_forms(text)
@@ -952,10 +1022,11 @@ pub fn expected_matrix() -> Vec<Case> {
 /// `cases.jsonl`, then the matrix.
 pub fn render_fixture() -> String {
     let mut text = String::new();
-    for case in cases()
+    for mut case in cases()
         .into_iter()
         .filter(|c| !c.id.starts_with(MATRIX_PREFIX))
     {
+        case.expected = expected_stored(&case.channel, &case.input);
         text.push_str(&serde_json::to_string(&case).expect("case serializes"));
         text.push('\n');
     }
@@ -983,7 +1054,11 @@ pub struct CanaryReport {
 
 pub fn run_canary() -> CanaryReport {
     let mut report = CanaryReport::default();
-    for output in engine_outputs().into_iter().chain(pane_outputs()) {
+    for output in engine_outputs()
+        .into_iter()
+        .chain(pane_outputs())
+        .filter(|output| output.canary)
+    {
         report.generated += 1;
         match detect(&output.text).first() {
             Some(hit) if hit.reason == output.reason && hit.start_byte == 0 => {
