@@ -1695,6 +1695,7 @@ async function completions($: EngineInterface, fleet: Fleet): Promise<void> {
   } catch {
   } finally {
     fleet.dreaming = false
+    void armCompletions($, fleet).catch(() => undefined) // reports that came in during this look: offered once the loop is idle
   }
 }
 
@@ -1702,7 +1703,7 @@ async function completions($: EngineInterface, fleet: Fleet): Promise<void> {
 // (the turn's end arms the timer again). One that fires just after a step waits out the idle time it lacked, and one that
 // finds a look running tries once more after the wait: otherwise the reports would sit until the next prompt.
 async function armCompletions($: EngineInterface, fleet: Fleet, wait = COMPLETION_WAIT_MS, retried = false): Promise<void> {
-  if (!fleet.dreamsOn || fleet.timer || !(await hasPending($).catch(() => false))) return
+  if (!fleet.dreamsOn || fleet.timer || fleet.active || !(await hasPending($).catch(() => false))) return
   fleet.timer = true
   $.clock.after(wait, () => {
     fleet.timer = false
@@ -1899,6 +1900,7 @@ export const register: Register = (on, options) => {
         .catch(() => undefined)
         .finally(() => {
           fleet.dreaming = false
+          void armCompletions($, fleet).catch(() => undefined) // a report that came in during this look would otherwise wait for an event
         })
     } else void completions($, fleet).catch(() => undefined) // the next step of the main session: a finished agent's turn
     return result

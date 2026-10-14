@@ -2556,6 +2556,28 @@ test('a timer that finds a look already running tries once more after it', { opt
   expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('looked')
 })
 
+test('a report stranded behind a long look is offered once the look ends, without another event', { options: { dreams: true } }, async ($, on) => {
+  let open!: () => void
+  const seen = host(on, { herdr: false, repo: true, mockClock: true, replies: ['dream: none', DREAM_REPLY], forkGate: new Promise<void>(done => (open = done)),
+    brief: briefWith({ id: 'a1', answer: REPORT }) })
+  roomy(seen)
+  seen.store.set(`chapter:${SID}`, { ...freshChapter(SID, NOW), due: 1, gen: 1 })
+  void steps($, 1) // the main session's own look starts; its fork waits on the gate
+  await settle(() => seen.forks.length >= 1)
+  await reported($, 'a1', 'turn-1') // the report comes in while that look runs
+  await seen.clock!.advance(25_000) // its timer fires with the look still running, and so does the one-time retry
+  await seen.clock!.advance(25_000)
+  expect(seen.forks.length).toBe(1)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('pending')
+  open() // the look ends: no step, no turn, no new report follows
+  await settle(() => seen.kept.some(record => record.kind === 'look' || record.kind === 'dream'))
+  await seen.clock!.advance(25_000)
+  await settle(() => seen.forks.length >= 2)
+  await settle(() => ledgerOf(seen)[keyOfRun('a1', 'turn-1')] === 'looked')
+  expect(seen.forks.length).toBe(2)
+  expect(ledgerOf(seen)[keyOfRun('a1', 'turn-1')]).toBe('looked')
+})
+
 test('completion_claim_survives_reload_and_fork_failure', { options: { dreams: true } }, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, mockClock: true, forkFails: true, brief: briefWith({ id: 'a1', answer: REPORT }) })
   roomy(seen)
