@@ -1455,6 +1455,24 @@ pub(crate) fn parse_jsonl_messages_for_search_with_queued(
     path: &Path,
 ) -> Result<(Vec<serde_json::Value>, Vec<QueuedPrompt>)> {
     let (messages, queued) = parse_jsonl_messages_with_queued(path)?;
+    // A queued prompt is compared with the user row it later becomes, which is
+    // sanitized and scrubbed: sanitize the queued text the same way, or a prompt
+    // holding a secret would never match its own row.
+    let mut sanitizer = CsrMessageSanitizer::for_derived();
+    let queued = queued
+        .into_iter()
+        .map(|prompt| {
+            let mut row = serde_json::json!({"type": "user", "message": {"content": prompt.text}});
+            sanitize_message_for_search(&mut row, &mut sanitizer);
+            QueuedPrompt {
+                place: prompt.place,
+                text: row["message"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        })
+        .collect();
     Ok((sanitize_messages_for_search(&messages).0, queued))
 }
 

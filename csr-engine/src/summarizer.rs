@@ -389,7 +389,10 @@ pub fn story_due(
         (_, None) => Ok(()),
         (StoryMode::First, Some(_)) => Err("skip:story_exists".into()),
         (StoryMode::Rewrite, Some(prior)) => match prior.covered {
-            Some(covered) if covered >= messages || asked_since == 0 => {
+            // Whether anything new was asked decides, not whether more messages exist:
+            // a prompt typed while Claude was busy can be the only thing after the
+            // last message.
+            Some(covered) if asked_since == 0 => {
                 Err(format!("skip:nothing_asked_since({covered}/{messages})"))
             }
             _ => Ok(()),
@@ -400,7 +403,9 @@ pub fn story_due(
 /// What the person typed after the story covering the first `covered` messages. A prompt typed
 /// while Claude was busy has no user row, only a `queued_command` attachment; `queued` holds
 /// those, each with its place among the messages. One whose text also arrives as a user row at
-/// or after its place is that same prompt, counted once.
+/// or after its place is that same prompt, counted once. That holds across the story's edge: a
+/// prompt queued inside the covered part was told by the story, so its user row landing after
+/// the edge is not a new ask.
 fn asked_since(
     messages: &[serde_json::Value],
     queued: &[crate::import::QueuedPrompt],
@@ -410,7 +415,6 @@ fn asked_since(
         .and_then(|p| p.covered)
         .unwrap_or(0)
         .min(messages.len());
-    let rows = typed_prompts(&messages[covered..], usize::MAX, usize::MAX).len();
     let mut rows_by_text: std::collections::HashMap<String, Vec<usize>> = Default::default();
     for (at, message) in messages.iter().enumerate() {
         for text in typed_prompts(std::slice::from_ref(message), 1, usize::MAX) {
@@ -418,8 +422,10 @@ fn asked_since(
         }
     }
     let mut taken: HashSet<usize> = HashSet::new();
+    // User rows that are the twin of a prompt queued inside the covered part.
+    let mut told: HashSet<usize> = HashSet::new();
     let mut from_queue = 0;
-    for prompt in queued.iter().filter(|q| q.place >= covered) {
+    for prompt in queued {
         let Some(text) = typed_words(&prompt.text) else {
             continue;
         };
@@ -430,10 +436,19 @@ fn asked_since(
         match twin {
             Some(at) => {
                 taken.insert(*at);
+                if prompt.place < covered {
+                    told.insert(*at);
+                }
             }
-            None => from_queue += 1,
+            None if prompt.place >= covered => from_queue += 1,
+            None => {}
         }
     }
+    let rows = rows_by_text
+        .values()
+        .flatten()
+        .filter(|at| **at >= covered && !told.contains(at))
+        .count();
     rows + from_queue
 }
 
@@ -1248,8 +1263,13 @@ mod tests {
             story_due(mode, Some(&prior(12, Some(4736))), 4800, None, 0),
             Err("skip:nothing_asked_since(4736/4800)".into())
         );
+        // nothing after the last message, but something asked: due all the same
         assert_eq!(
             story_due(mode, Some(&prior(3, Some(4800))), 4800, None, 2),
+            Ok(())
+        );
+        assert_eq!(
+            story_due(mode, Some(&prior(3, Some(4800))), 4800, None, 0),
             Err("skip:nothing_asked_since(4800/4800)".into())
         );
         assert_eq!(
@@ -1371,6 +1391,100 @@ mod tests {
         // and a queued prompt before the story's coverage is not new
         let before = prior_covering_all(&messages);
         assert_eq!(asked_since(&messages, &queued, Some(&before)), 0);
+    }
+
+    /// Is a rewrite due for a story that covers every message the transcript has?
+    fn rewrite_due_covering_all(dir: &tempfile::TempDir) -> Result<(), String> {
+        let (messages, queued) =
+            crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+                .unwrap();
+        let prior = prior_covering_all(&messages);
+        story_due(
+            StoryMode::Rewrite,
+            Some(&prior),
+            messages.len(),
+            None,
+            asked_since(&messages, &queued, Some(&prior)),
+        )
+    }
+
+    #[test]
+    fn a_prompt_queued_after_the_last_message_makes_a_story_covering_everything_due() {
+        let human = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!("also fix the pane"),
+                true,
+                "2026-10-14T20:59:56Z",
+            )],
+        );
+        assert_eq!(rewrite_due_covering_all(&human), Ok(()));
+        // and nothing typed still skips
+        let robot = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!("<task-notification>done</task-notification>"),
+                false,
+                "2026-10-14T20:59:56Z",
+            )],
+        );
+        assert_eq!(
+            rewrite_due_covering_all(&robot),
+            Err("skip:nothing_asked_since(6/6)".to_string())
+        );
+    }
+
+    #[test]
+    fn a_queued_prompt_holding_a_secret_counts_once_with_its_scrubbed_user_row() {
+        let typed = format!("rotate this key {}{}", "ghp_", "Q".repeat(36));
+        let queued = queued_row(serde_json::json!(typed), true, "2026-10-14T20:59:56Z");
+        let row =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": typed}});
+        let dir = transcript_with(6, &[queued, row]);
+        let (messages, queued) =
+            crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+                .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(
+            !queued[0].text.contains("ghp_"),
+            "the queued text is scrubbed like the row: {}",
+            queued[0].text
+        );
+        let prior = prior(1, Some(6));
+        assert_eq!(asked_since(&messages, &queued, Some(&prior)), 1);
+    }
+
+    #[test]
+    fn a_prompt_queued_inside_the_story_is_not_asked_again_when_its_user_row_lands_after_it() {
+        let typed = "also fix the pane";
+        let assistant = |text: &str| serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": text}});
+        // Queued after four messages; two assistant rows follow; the story covers six;
+        // only then does the prompt arrive as a user row.
+        let dir = transcript_with(
+            4,
+            &[
+                queued_row(serde_json::json!(typed), true, "2026-10-14T20:59:56Z"),
+                assistant("one"),
+                assistant("two"),
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": typed}}),
+            ],
+        );
+        let (messages, queued) =
+            crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+                .unwrap();
+        assert_eq!((messages.len(), queued[0].place), (7, 4));
+        let told = prior(1, Some(6));
+        assert_eq!(asked_since(&messages, &queued, Some(&told)), 0);
+        // The same text typed again, with no queued twin, is a new ask.
+        let again =
+            serde_json::json!({"type": "user", "message": {"role": "user", "content": typed}});
+        let mut more = messages.clone();
+        more.push(again);
+        assert_eq!(asked_since(&more, &queued, Some(&told)), 1);
+        // And a queued prompt whose row came before the edge leaves a later copy new.
+        let early = prior(1, Some(7));
+        assert_eq!(asked_since(&messages, &queued, Some(&early)), 0);
+        assert_eq!(asked_since(&more, &queued, Some(&early)), 1);
     }
 
     fn prior_covering_all(messages: &[serde_json::Value]) -> PriorStory {
