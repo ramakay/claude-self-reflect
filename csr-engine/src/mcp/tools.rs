@@ -519,6 +519,27 @@ fn lookup_by_conv_tag(
     )))
 }
 
+/// The trained re-ranker's intent for an embedded query, or "other" when the
+/// trained re-ranker is not requested. The single place `reflect_on_past` and
+/// the health probe resolve it, so the probe cannot drift from production.
+async fn resolve_rerank_intent(
+    embeddings: &Arc<EmbeddingEngine>,
+    query_vec: &[f32],
+) -> &'static str {
+    if crate::search::trained_rerank::trained_rerank_requested() {
+        crate::hooks::intent::ProbeSet::load_or_build(embeddings)
+            .await
+            .and_then(|probes| probes.classify(query_vec))
+            .map_or("other", |(intent, _)| match intent {
+                crate::hooks::intent::Intent::Continue => "continue",
+                crate::hooks::intent::Intent::StateRecall => "state_recall",
+                crate::hooks::intent::Intent::Explore => "explore",
+            })
+    } else {
+        "other"
+    }
+}
+
 /// Full semantic search with rich XML results.
 pub async fn reflect_on_past(
     storage: &Arc<Storage>,
@@ -560,18 +581,7 @@ pub async fn reflect_on_past(
     let embed_start = Instant::now();
     let query_vec = embed_query(embeddings, query).await?;
     let embed_ms = embed_start.elapsed().as_millis() as u64;
-    let rerank_intent = if crate::search::trained_rerank::trained_rerank_requested() {
-        crate::hooks::intent::ProbeSet::load_or_build(embeddings)
-            .await
-            .and_then(|probes| probes.classify(&query_vec))
-            .map_or("other", |(intent, _)| match intent {
-                crate::hooks::intent::Intent::Continue => "continue",
-                crate::hooks::intent::Intent::StateRecall => "state_recall",
-                crate::hooks::intent::Intent::Explore => "explore",
-            })
-    } else {
-        "other"
-    };
+    let rerank_intent = resolve_rerank_intent(embeddings, &query_vec).await;
 
     reflect_on_past_with_vec_intent(
         storage,
@@ -1076,6 +1086,73 @@ pub(crate) async fn reflect_for_curated_eval_with_vec(
     .await
 }
 
+/// The probe's scope: explicit all-project, with no current-project boost and
+/// no client-directory default, so nothing in the process environment (cwd,
+/// `MCP_CLIENT_CWD`, `CLAUDE_PROJECT_DIR`) reaches the measurement.
+fn health_probe_scope(storage: &Storage) -> Result<SearchProjectScope> {
+    SearchProjectScope::resolve_with(storage, Some("all"), None, None, None)
+}
+
+/// The health probe's production search: limit 5, minimum score 0.3, explicit
+/// all-project scope built without the ambient cwd or client-project boost (so
+/// the daemon's cwd cannot move the measurement), the runtime reranker and the
+/// production validity, forgetting and search-mode settings. Retrieval
+/// telemetry is suppressed through the same `record_retrievals=false` seam the
+/// curated eval uses. Returns the conversation ids of the actual final page, in
+/// result order.
+pub(crate) async fn reflect_for_health_probe_with_vec(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    rerank_intent: &str,
+) -> Result<Vec<String>> {
+    const LIMIT: usize = 5;
+    const MIN_SCORE: f32 = 0.3;
+
+    let scope = health_probe_scope(storage)?;
+    let search_mode = search_mode_from(std::env::var("CSR_SEARCH_MODE").ok().as_deref());
+    let partition_enabled = validity_partition_enabled();
+    let consumption_mode = consumption_mode_for_partition(partition_enabled);
+    let active_forgetting = active_forgetting_enabled();
+    let page = reflect_final_page(
+        storage,
+        search,
+        query_vec,
+        query,
+        LIMIT,
+        MIN_SCORE,
+        &scope,
+        partition_enabled,
+        consumption_mode,
+        active_forgetting,
+        rerank_intent,
+        search_mode,
+        RecallRerankMode::Runtime,
+        false,
+    )
+    .await?;
+    Ok(page
+        .enriched
+        .into_iter()
+        .take(LIMIT)
+        .map(|result| result.chunk.conversation_id)
+        .collect())
+}
+
+/// [`reflect_for_health_probe_with_vec`] after local query embedding and the
+/// shared intent resolution. No MCP client, subprocess or model call.
+pub(crate) async fn reflect_for_health_probe(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+) -> Result<Vec<String>> {
+    let query_vec = embed_query(embeddings, query).await?;
+    let rerank_intent = resolve_rerank_intent(embeddings, &query_vec).await;
+    reflect_for_health_probe_with_vec(storage, search, &query_vec, query, rerank_intent).await
+}
+
 /// One conversation-level hit from the production recall pipeline for an
 /// offline benchmark. Chunk candidates are collapsed after production fusion
 /// and reranking, so a long session cannot occupy multiple result slots.
@@ -1203,6 +1280,58 @@ async fn reflect_on_past_with_vec_in_scope_mode(
     rerank_mode: RecallRerankMode<'_>,
     record_retrievals: bool,
 ) -> Result<String> {
+    let page = reflect_final_page(
+        storage,
+        search,
+        query_vec,
+        query,
+        limit,
+        min_score,
+        scope,
+        partition_enabled,
+        consumption_mode,
+        active_forgetting,
+        rerank_intent,
+        search_mode,
+        rerank_mode,
+        record_retrievals,
+    )
+    .await?;
+    Ok(format::format_search_results_with_rank_scores(
+        &page.enriched,
+        query,
+        &scope.scope_label,
+        page.search_ms,
+        embed_ms,
+        &page.display_rank_scores,
+    ))
+}
+
+/// The final result page of the production recall pipeline, before it is
+/// formatted: what `reflect_on_past` returns and what the health probe reads.
+struct FinalPage {
+    enriched: Vec<EnrichedResult>,
+    display_rank_scores: Vec<DisplayRankScore>,
+    search_ms: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reflect_final_page(
+    storage: &Arc<Storage>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query_vec: &[f32],
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    scope: &SearchProjectScope,
+    partition_enabled: bool,
+    consumption_mode: ConsumptionMode,
+    active_forgetting: bool,
+    rerank_intent: &str,
+    search_mode: SearchMode,
+    rerank_mode: RecallRerankMode<'_>,
+    record_retrievals: bool,
+) -> Result<FinalPage> {
     // OVERFETCH (validity partition, issue 2): fetching exactly `limit`
     // candidates lets one demoted top-N hit permanently displace the valid
     // N+1 candidate — it was never fetched, so the sink has nothing to
@@ -1291,14 +1420,11 @@ async fn reflect_on_past_with_vec_in_scope_mode(
         }
     }
 
-    Ok(format::format_search_results_with_rank_scores(
-        &enriched,
-        query,
-        &scope.scope_label,
+    Ok(FinalPage {
+        enriched,
+        display_rank_scores,
         search_ms,
-        embed_ms,
-        &display_rank_scores,
-    ))
+    })
 }
 
 /// Output of one [`reflect_gather_pass`]: candidates fully enriched,
@@ -11139,5 +11265,200 @@ mod why_marker_tests {
         assert_eq!(ranking.items[0].chunk_id, "higher");
         assert!(ranking.hoisted_chunk_ids.is_empty());
         assert!(!rendered.contains(WHY_RECENCY_HOIST_MARKER));
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use crate::import::ConversationChunk;
+    use crate::provenance::Speaker;
+
+    fn chunk(id: &str, conversation: &str, project: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: conversation.into(),
+            project_name: project.into(),
+            timestamp: "2026-10-10T00:00:00Z".into(),
+            content: format!("deploy notes for {project} {id}"),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    fn vector(cosine: f32) -> Vec<f32> {
+        vec![cosine, (1.0 - cosine * cosine).sqrt(), 0.0, 0.0]
+    }
+
+    fn fixture(rows: &[(&str, &str, &str, f32)]) -> (Arc<Storage>, Arc<RwLock<SearchEngine>>) {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut engine = SearchEngine::new(8);
+        for (id, conversation, project, cosine) in rows {
+            let c = chunk(id, conversation, project);
+            storage.insert_chunk(&c, &vector(*cosine)).unwrap();
+            engine.insert_chunk(c.id.clone(), vector(*cosine));
+        }
+        (storage, Arc::new(RwLock::new(engine)))
+    }
+
+    /// Every row of every table the probe must leave alone, as text.
+    fn snapshot(storage: &Storage) -> Vec<(String, Vec<String>)> {
+        const TABLES: &[&str] = &[
+            "retrieval_events",
+            "retrieval_stats",
+            "rerank_exposure_impressions",
+            "rerank_exposure_items",
+            "rerank_reaction_labels",
+            "chunks",
+            "reflections",
+            "chunk_embeddings",
+        ];
+        TABLES
+            .iter()
+            .map(|table| {
+                let rows = storage
+                    .with_connection(|conn| {
+                        let mut stmt =
+                            conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
+                        let width = stmt.column_count();
+                        let rows = stmt.query_map([], |row| {
+                            let mut cells = Vec::new();
+                            for i in 0..width {
+                                cells.push(format!(
+                                    "{:?}",
+                                    row.get::<_, rusqlite::types::Value>(i)?
+                                ));
+                            }
+                            Ok(cells.join("|"))
+                        })?;
+                        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                    })
+                    .unwrap();
+                (table.to_string(), rows)
+            })
+            .collect()
+    }
+
+    fn cids(output: &str) -> Vec<String> {
+        output
+            .split("<cid>")
+            .skip(1)
+            .map(|part| part.split("</cid>").next().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn health_probe_uses_runtime_pipeline_without_telemetry_or_reinforcement() {
+        let rows: Vec<(String, String, String)> = (0..7)
+            .map(|i| (format!("c{i}"), format!("conv-{i}"), "alpha".to_string()))
+            .collect();
+        let spec: Vec<(&str, &str, &str, f32)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (id, conv, project))| {
+                (
+                    id.as_str(),
+                    conv.as_str(),
+                    project.as_str(),
+                    0.95 - 0.05 * i as f32,
+                )
+            })
+            .collect();
+        let (storage, search) = fixture(&spec);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        let before = snapshot(&storage);
+        let page =
+            reflect_for_health_probe_with_vec(&storage, &search, &query, "deploy notes", "other")
+                .await
+                .unwrap();
+        let after = snapshot(&storage);
+        assert_eq!(
+            before, after,
+            "the probe wrote to a table it must leave alone"
+        );
+        assert_eq!(page.len(), 5, "limit five");
+        assert_eq!(page[0], "conv-0");
+
+        // the same call through the production pipeline with the probe's
+        // parameters returns the same page, so the probe measures production
+        let production = reflect_on_past_with_vec_mode(
+            &storage,
+            &search,
+            &query,
+            "deploy notes",
+            5,
+            0.3,
+            Some("all"),
+            0,
+            validity_partition_enabled(),
+            consumption_mode_for_partition(validity_partition_enabled()),
+            active_forgetting_enabled(),
+            "other",
+            search_mode_from(std::env::var("CSR_SEARCH_MODE").ok().as_deref()),
+            RecallRerankMode::Runtime,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cids(&production), page);
+        // control: the production call with telemetry on does write, so the
+        // snapshot above is capable of seeing a write
+        assert_ne!(snapshot(&storage), before);
+    }
+
+    #[tokio::test]
+    async fn health_probe_scope_does_not_depend_on_process_cwd() {
+        // "home" is the ambient current project; "elsewhere" scores a little higher
+        let (storage, search) = fixture(&[
+            ("home-chunk", "conv-home", "proj-home", 0.80),
+            ("far-chunk", "conv-far", "proj-far", 0.86),
+        ]);
+        let query = [1.0_f32, 0.0, 0.0, 0.0];
+
+        let scope = health_probe_scope(&storage).unwrap();
+        assert_eq!(scope.scope_label, "all");
+        assert!(scope.effective_project.is_none());
+        assert!(scope.current_project_for_all_scope.is_none());
+        assert!(scope.family_anchor.is_none());
+
+        let probe =
+            reflect_for_health_probe_with_vec(&storage, &search, &query, "deploy notes", "other")
+                .await
+                .unwrap();
+        assert_eq!(probe, ["conv-far", "conv-home"]);
+
+        // control: a process whose cwd resolves to proj-home boosts it 1.15x
+        // (0.80 * 1.15 beats 0.86), so an ambient scope would reorder the page
+        let ambient =
+            resolve_search_scope_with(&storage, Some("all"), Some("proj-home"), None, None)
+                .unwrap();
+        let ambient_out = reflect_on_past_with_vec_in_scope_mode(
+            &storage,
+            &search,
+            &query,
+            "deploy notes",
+            5,
+            0.3,
+            &ambient,
+            0,
+            false,
+            ConsumptionMode::Off,
+            false,
+            "other",
+            SearchMode::Hybrid,
+            RecallRerankMode::Runtime,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cids(&ambient_out)[0],
+            "conv-home",
+            "the control must see the boost: {ambient_out}"
+        );
     }
 }

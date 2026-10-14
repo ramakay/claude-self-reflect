@@ -48,6 +48,27 @@ pub trait ProbeBackend: Send + Sync {
     async fn final_page(&self, query: &str) -> Result<Vec<String>>;
 }
 
+/// The production backend: local query embedding, the shared intent
+/// resolution, then the production recall pipeline with telemetry off.
+pub struct EngineBackend {
+    pub storage: Arc<Storage>,
+    pub embeddings: Arc<crate::embeddings::EmbeddingEngine>,
+    pub search: Arc<RwLock<SearchEngine>>,
+}
+
+#[async_trait::async_trait]
+impl ProbeBackend for EngineBackend {
+    async fn final_page(&self, query: &str) -> Result<Vec<String>> {
+        crate::mcp::tools::reflect_for_health_probe(
+            &self.storage,
+            &self.embeddings,
+            &self.search,
+            query,
+        )
+        .await
+    }
+}
+
 /// What `load_or_create_sample` decided.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleLoad {
