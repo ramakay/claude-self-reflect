@@ -1059,6 +1059,7 @@ fn import_rollout(engine: &Engine, file: &RolloutFile) -> Result<Option<RolloutS
         outcome.chunks,
         &file.mtime,
     )?;
+    storage.record_secrets_redacted(&key, &outcome.suppression.secrets)?;
     Ok(Some(outcome))
 }
 
@@ -2849,6 +2850,41 @@ mod tests {
         assert!(!serialized.contains("CSR OUTPUT SUPPRESSED"));
         assert_eq!(parsed.schema_misses, 3);
         assert_eq!(parsed.suppression.csr_tool_blocks_suppressed, 2);
+    }
+
+    #[test]
+    fn codex_rollout_chunks_redact_secrets_and_report_counts() {
+        let secret = format!("{}{}", "ghp_", "D".repeat(36));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-secret.jsonl");
+        let line = |value: serde_json::Value| value.to_string();
+        std::fs::write(
+            &path,
+            [
+                line(serde_json::json!({"timestamp":"2026-10-14T12:00:00Z","type":"session_meta","payload":{"id":"secret","timestamp":"2026-10-14T12:00:00Z","cwd":"/workspace/secret-project"}})),
+                line(serde_json::json!({"timestamp":"2026-10-14T12:00:01Z","type":"response_item","payload":{"type":"message","id":"u1","role":"user","content":[{"type":"input_text","text":format!("deploy with {secret} now")}]}})),
+                line(serde_json::json!({"timestamp":"2026-10-14T12:00:02Z","type":"response_item","payload":{"type":"custom_tool_call_output","id":"o1","call_id":"c1","output":format!("token={secret} printed")}})),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let metadata = scan_rollout_metadata(&path).unwrap().unwrap();
+        let mut chunks = Vec::new();
+        let outcome =
+            stream_rollout_chunk_batches(&path, &metadata, ROLLOUT_EMBED_BATCH_SIZE, |batch, _| {
+                chunks.extend_from_slice(batch);
+                Ok(())
+            })
+            .unwrap();
+        let all = chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains(&secret), "{all}");
+        assert!(all.contains("[secret redacted: github_token]"), "{all}");
+        assert_eq!(outcome.suppression.secrets.get("github_token"), 2);
     }
 
     /// Codex user, assistant and tool prose is never classified by formatter

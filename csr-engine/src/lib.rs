@@ -19,6 +19,7 @@ pub mod mcp;
 pub mod narrative;
 pub mod provenance;
 pub mod reaction_shadow;
+pub mod redact;
 pub mod runtime;
 pub mod search;
 pub mod setup;

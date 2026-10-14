@@ -413,6 +413,24 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     let _operation = storage.operation_lock()?;
     let conv_id = format!("plan:{}", plan.slug);
 
+    // Plans are prose people paste into; no credential becomes chunk text.
+    // Redacting here, ahead of chunking and the evidence offsets, keeps the
+    // chunk spans consistent with the text they were cut from.
+    let mut secrets = crate::redact::SecretCounts::default();
+    let redacted_plan;
+    let plan = match crate::redact::redact_secrets_counted(&plan.content, &mut secrets) {
+        std::borrow::Cow::Borrowed(_) => plan,
+        std::borrow::Cow::Owned(content) => {
+            redacted_plan = PlanDoc {
+                slug: plan.slug.clone(),
+                path: plan.path.clone(),
+                mtime: plan.mtime.clone(),
+                content,
+            };
+            &redacted_plan
+        }
+    };
+
     // Content can shrink between reimports; deterministic chunk ids would only
     // overwrite the chunks that still exist, leaving a stale tail behind. Wipe first,
     // rebuild from scratch, so reimport is a true replace rather than a merge.
@@ -445,6 +463,7 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
 
     if new_chunks.is_empty() {
         storage.upsert_import_state_explicit(&conv_id, &conv_id, 0, &plan.mtime)?;
+        storage.record_secrets_redacted(&conv_id, &secrets)?;
         return Ok(0);
     }
 
@@ -484,6 +503,7 @@ pub fn import_plan(engine: &Engine, plan: &PlanDoc) -> Result<usize> {
     }
 
     storage.upsert_import_state_explicit(&conv_id, &conv_id, new_chunks.len(), &plan.mtime)?;
+    storage.record_secrets_redacted(&conv_id, &secrets)?;
 
     Ok(new_chunks.len())
 }
@@ -739,6 +759,40 @@ mod tests {
             let content = storage.get_chunk_content(id).unwrap().unwrap();
             assert!(content.contains("Short revised plan"));
         }
+    }
+
+    #[test]
+    fn plan_import_redacts_secrets_and_counts_them_once() {
+        let storage = Storage::open_memory().unwrap();
+        let engine = test_engine(Arc::new(storage));
+        let secret = format!("{}{}", "ghp_", "C".repeat(36));
+        let plan = PlanDoc {
+            slug: "secret-plan".into(),
+            path: PathBuf::from("/dev/null"),
+            mtime: "2026-07-20T12:00:00Z".into(),
+            content: format!(
+                "{}\n\nDeploy with token {secret} today.",
+                distinctive_body("vault")
+            ),
+        };
+
+        import_plan(&engine, &plan).unwrap();
+        import_plan(&engine, &plan).unwrap();
+
+        let storage = engine.storage();
+        let ids = storage
+            .get_chunk_ids_for_conversation("plan:secret-plan")
+            .unwrap();
+        let stored = storage
+            .get_chunks_by_ids(&ids)
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!stored.contains(&secret));
+        assert!(stored.contains("[secret redacted: github_token]"));
+        assert_eq!(storage.get_secrets_redacted().unwrap().0, 1);
     }
 
     #[test]

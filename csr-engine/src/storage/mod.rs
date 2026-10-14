@@ -1686,6 +1686,37 @@ impl Storage {
         queries::mark_file_imported_with_suppression(&mut conn, path, chunks, suppression)
     }
 
+    /// Record credential redactions for an aux-adapter `import_state` row. See
+    /// `queries::record_secrets_redacted`.
+    pub(crate) fn record_secrets_redacted(
+        &self,
+        file_key: &str,
+        counts: &crate::redact::SecretCounts,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::record_secrets_redacted(&mut conn, file_key, counts)
+    }
+
+    /// Total credentials redacted from imported text, and the split per kind
+    /// (non-zero kinds only). Counts, never values.
+    pub fn get_secrets_redacted(&self) -> Result<(i64, Vec<(String, i64)>)> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let read = |key: &str| -> Result<i64> {
+            Ok(queries::get_meta(&conn, key)?
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0))
+        };
+        let total = read(queries::SECRETS_REDACTED_KEY)?;
+        let mut by_kind = Vec::new();
+        for kind in crate::redact::KINDS {
+            let count = read(&format!("{}:{kind}", queries::SECRETS_REDACTED_KEY))?;
+            if count > 0 {
+                by_kind.push((kind.to_string(), count));
+            }
+        }
+        Ok((total, by_kind))
+    }
+
     /// Transcript files recorded per conversation id. See
     /// `queries::import_paths_for_conversations`.
     pub fn import_paths_for_conversations(

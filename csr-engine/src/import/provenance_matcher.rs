@@ -49,6 +49,20 @@ impl MessageIndex {
             let mtime: chrono::DateTime<chrono::Utc> = std::fs::metadata(path)?.modified()?.into();
             let message =
                 serde_json::json!({"uuid":content_hash(&text),"timestamp":mtime.to_rfc3339()});
+            // Plan chunks are cut from the credential-redacted text; a chunk
+            // stored before that existed matches the raw document instead.
+            if let std::borrow::Cow::Owned(redacted) = crate::redact::redact_secrets(&text) {
+                documents[3].push(
+                    &message,
+                    vec![("plan_file".into(), redacted)],
+                    conversation_id,
+                    0,
+                    path,
+                    0,
+                    None,
+                    None,
+                );
+            }
             documents[0].push(
                 &message,
                 vec![("plan_file".into(), text)],

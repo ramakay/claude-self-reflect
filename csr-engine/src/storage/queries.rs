@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::import::{ConversationChunk, CsrSuppressionStats};
 use crate::provenance::{ChunkEvidence, ChunkProvenance, ProvenanceEvent, Speaker, TrustTier};
+use crate::redact::SecretCounts;
 
 /// Upsert provenance for a chunk (who authored it, source conv, supersession).
 pub fn insert_chunk_provenance(
@@ -2892,15 +2893,22 @@ pub(crate) fn mark_file_imported_with_suppression(
 ) -> Result<()> {
     let tx = conn.transaction()?;
     let path_str = path.to_string_lossy().to_string();
-    let previous = tx
+    let (previous, previous_secrets) = tx
         .query_row(
-            "SELECT csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed
+            "SELECT csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, secrets_redacted
              FROM import_state WHERE file_path = ?1",
             params![path_str],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            |row| {
+                Ok((
+                    (row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?),
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?
-        .unwrap_or((Some(0), Some(0)));
+        .unwrap_or(((Some(0), Some(0)), None));
+    let previous_secrets = SecretCounts::from_json(previous_secrets.as_deref());
+    let persisted_secrets = previous_secrets.max_with(&suppression.secrets);
     let current_tool = suppression.csr_tool_blocks_suppressed as i64;
     let current_wrappers = suppression.csr_hook_wrappers_scrubbed as i64;
     let (persisted_tool, tool_delta) = previous.0.map_or((current_tool, 0), |previous| {
@@ -2921,17 +2929,19 @@ pub(crate) fn mark_file_imported_with_suppression(
     tx.execute(
         "INSERT OR REPLACE INTO import_state
          (file_path, conversation_id, chunks_imported, file_mtime,
-          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+          csr_tool_blocks_suppressed, csr_hook_wrappers_scrubbed, secrets_redacted)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             path_str,
             conv_id,
             chunks as i64,
             mtime,
             persisted_tool,
-            persisted_wrappers
+            persisted_wrappers,
+            persisted_secrets.to_json()
         ],
     )?;
+    bump_secret_counters(&tx, &previous_secrets, &persisted_secrets)?;
 
     if tool_delta > 0 {
         let split_value = get_meta(&tx, "csr_tool_blocks_suppressed")?;
@@ -2958,6 +2968,69 @@ pub(crate) fn mark_file_imported_with_suppression(
         )?;
     }
 
+    tx.commit()?;
+    Ok(())
+}
+
+/// Meta key for the all-kinds redaction total; per-kind totals sit under
+/// `secrets_redacted:<kind>`.
+pub(crate) const SECRETS_REDACTED_KEY: &str = "secrets_redacted";
+
+/// Add the growth from `before` to `after` to the global redaction counters.
+fn bump_secret_counters(
+    conn: &Connection,
+    before: &SecretCounts,
+    after: &SecretCounts,
+) -> Result<()> {
+    let mut total = 0i64;
+    for (kind, count) in after.nonzero() {
+        let delta = count as i64 - before.get(kind) as i64;
+        if delta <= 0 {
+            continue;
+        }
+        total += delta;
+        let key = format!("{SECRETS_REDACTED_KEY}:{kind}");
+        let current = get_meta(conn, &key)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        set_meta(conn, &key, &(current + delta).to_string())?;
+    }
+    if total > 0 {
+        let current = get_meta(conn, SECRETS_REDACTED_KEY)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        set_meta(conn, SECRETS_REDACTED_KEY, &(current + total).to_string())?;
+    }
+    Ok(())
+}
+
+/// Record redactions for an `import_state` row an aux adapter (Codex rollouts,
+/// plans) has already stamped. Same per-file high-water rule as the transcript
+/// path, so a rebuild of the same file never counts its secrets twice.
+pub(crate) fn record_secrets_redacted(
+    conn: &mut Connection,
+    file_key: &str,
+    counts: &SecretCounts,
+) -> Result<()> {
+    if counts.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    let previous = tx
+        .query_row(
+            "SELECT secrets_redacted FROM import_state WHERE file_path = ?1",
+            params![file_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let previous = SecretCounts::from_json(previous.as_deref());
+    let persisted = previous.max_with(counts);
+    tx.execute(
+        "UPDATE import_state SET secrets_redacted = ?2 WHERE file_path = ?1",
+        params![file_key, persisted.to_json()],
+    )?;
+    bump_secret_counters(&tx, &previous, &persisted)?;
     tx.commit()?;
     Ok(())
 }
@@ -3024,7 +3097,10 @@ pub fn upsert_import_state_explicit(
     mtime: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO import_state (file_path, conversation_id, chunks_imported, file_mtime) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO import_state
+         (file_path, conversation_id, chunks_imported, file_mtime, secrets_redacted)
+         VALUES (?1, ?2, ?3, ?4,
+                 (SELECT secrets_redacted FROM import_state WHERE file_path = ?1))",
         params![file_path, conversation_id, chunks as i64, mtime],
     )?;
     Ok(())

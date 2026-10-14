@@ -67,6 +67,8 @@ pub struct StatusReport {
     pub csr_self_suppressed: i64,
     pub csr_tool_blocks_suppressed: i64,
     pub csr_hook_wrappers_scrubbed: i64,
+    /// Credentials redacted from imported text before chunking. Counts only.
+    pub secrets_redacted: SecretsRedactedStatus,
     pub contamination: ContaminationStatus,
     /// Cached memory-health measurements and the current binary's canary.
     /// See [`MemoryHealthStatus`].
@@ -234,6 +236,27 @@ pub struct DreamVerdictTotals {
     pub obsolete: i64,
     pub superseded: i64,
     pub reinstated: i64,
+}
+
+/// What the shared secret scrubber has redacted from imported text.
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct SecretsRedactedStatus {
+    pub total: i64,
+    /// Non-zero kinds only, e.g. `{"github_token": 3}`.
+    pub by_kind: std::collections::BTreeMap<String, i64>,
+    /// `CSR_NO_SECRET_SCRUB=1` is set in the reporting process.
+    pub disabled: bool,
+}
+
+impl SecretsRedactedStatus {
+    fn read(storage: &Storage) -> Self {
+        let (total, by_kind) = storage.get_secrets_redacted().unwrap_or_default();
+        Self {
+            total,
+            by_kind: by_kind.into_iter().collect(),
+            disabled: crate::redact::scrub_disabled(),
+        }
+    }
 }
 
 #[derive(Serialize, Debug, Default, PartialEq)]
@@ -1001,6 +1024,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            secrets_redacted: SecretsRedactedStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: gather_memory_health(None),
             provenance_coverage: ProvenanceCoverageStatus::default(),
@@ -1040,6 +1064,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let csr_self_suppressed = storage.get_csr_self_suppressed().unwrap_or(0);
     let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
+    let secrets_redacted = SecretsRedactedStatus::read(&storage);
     let contamination = if deep {
         storage.refresh_contamination_cache().ok()
     } else {
@@ -1144,6 +1169,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_self_suppressed,
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
+        secrets_redacted,
         contamination,
         memory_health,
         provenance_coverage,
@@ -2270,6 +2296,7 @@ mod tests {
             csr_self_suppressed: 0,
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
+            secrets_redacted: SecretsRedactedStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: MemoryHealthStatus::from_cache(
                 &crate::health::HealthSnapshot::default(),
@@ -3199,6 +3226,30 @@ mod tests {
         assert_eq!(value["csr_tool_blocks_suppressed"], 4);
         assert_eq!(value["csr_hook_wrappers_scrubbed"], 2);
         assert_eq!(value["csr_self_suppressed"], 6);
+    }
+
+    #[test]
+    fn status_surfaces_secret_redaction_counts_without_values() {
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage.set_meta("secrets_redacted", "5").unwrap();
+        storage
+            .set_meta("secrets_redacted:github_token", "3")
+            .unwrap();
+        storage.set_meta("secrets_redacted:jwt", "2").unwrap();
+
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        assert_eq!(value["secrets_redacted"]["total"], 5);
+        assert_eq!(value["secrets_redacted"]["by_kind"]["github_token"], 3);
+        assert_eq!(value["secrets_redacted"]["by_kind"]["jwt"], 2);
+        assert!(value["secrets_redacted"]["by_kind"]
+            .get("aws_access_key")
+            .is_none());
     }
 
     #[test]

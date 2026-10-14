@@ -104,6 +104,8 @@ struct MessageEvidence {
 pub(crate) struct CsrSuppressionStats {
     pub csr_tool_blocks_suppressed: usize,
     pub csr_hook_wrappers_scrubbed: usize,
+    /// Credentials redacted from the text, per kind. Counts only, never values.
+    pub secrets: crate::redact::SecretCounts,
 }
 
 struct CsrMessageSanitizer {
@@ -647,7 +649,10 @@ pub(crate) fn parse_jsonl_reader<R: BufRead>(
         if msg_type == "summary" {
             if let Some(s) = parsed.get("summary").and_then(|v| v.as_str()) {
                 if !s.is_empty() {
-                    summary = Some(s.to_string());
+                    summary = Some(
+                        crate::redact::redact_secrets_counted(s, &mut csr_sanitizer.stats.secrets)
+                            .into_owned(),
+                    );
                 }
             }
             continue;
@@ -1381,8 +1386,37 @@ fn sanitize_message_for_search(
         .and_then(|value| value.get_mut("content"))
     {
         sanitize_content(content, text, sanitizer);
+        redact_content_secrets(content, &mut sanitizer.stats.secrets);
     } else if let Some(content) = message.get_mut("content") {
         sanitize_content(content, text, sanitizer);
+        redact_content_secrets(content, &mut sanitizer.stats.secrets);
+    }
+}
+
+/// Redact credentials from every string in a message's content: prose, tool
+/// inputs and tool results alike. Runs on the whole string, ahead of the
+/// per-field truncation and the chunk budget, so a key is never cut in half
+/// and left half-visible. Object keys stay as they are.
+fn redact_content_secrets(value: &mut serde_json::Value, counts: &mut crate::redact::SecretCounts) {
+    match value {
+        serde_json::Value::String(text) => {
+            if let std::borrow::Cow::Owned(redacted) =
+                crate::redact::redact_secrets_counted(text, counts)
+            {
+                *text = redacted;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_content_secrets(item, counts);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_content_secrets(item, counts);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3568,5 +3602,206 @@ mod tests {
         let text = extract_message_text(&msg);
         assert!(!text.contains("sk-abc123"));
         assert!(text.contains("[private]"));
+    }
+
+    // Fixture secrets are assembled at runtime; no credential-shaped literal
+    // sits in the source tree.
+    struct FakeSecrets {
+        github: String,
+        anthropic: String,
+        aws: String,
+        stripe: String,
+    }
+
+    impl FakeSecrets {
+        fn new() -> Self {
+            Self {
+                github: format!("{}{}", "ghp_", "A".repeat(36)),
+                anthropic: format!("{}{}", "sk-ant-", "aB3dE5gH7jK9mN1pQ3rS5tU7".repeat(2)),
+                aws: format!("{}{}", "AKIA", "Q".repeat(16)),
+                stripe: format!("{}{}", "sk_live_", "Z".repeat(24)),
+            }
+        }
+
+        fn all(&self) -> [&str; 4] {
+            [&self.github, &self.anthropic, &self.aws, &self.stripe]
+        }
+    }
+
+    fn write_secret_transcript(path: &Path, secrets: &FakeSecrets) {
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u-1",
+                "timestamp": "2026-10-14T10:00:00Z",
+                "message": {"content": format!("please use my token {} for the deploy", secrets.github)}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": "a-1",
+                "timestamp": "2026-10-14T10:00:05Z",
+                "message": {"content": [
+                    {"type":"text","text": format!("Stored the key {} as asked.", secrets.anthropic)},
+                    {"type":"tool_use","id":"t-1","name":"Bash","input":{
+                        "command": format!("AWS_ACCESS_KEY_ID={} aws s3 ls", secrets.aws)}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u-2",
+                "timestamp": "2026-10-14T10:00:09Z",
+                "message": {"content": [
+                    {"type":"tool_result","tool_use_id":"t-1",
+                     "content": format!("billing key is {} in this listing", secrets.stripe)}
+                ]}
+            }),
+        ];
+        std::fs::write(
+            path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn import_redacts_secrets_from_every_chunk_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret-session.jsonl");
+        let secrets = FakeSecrets::new();
+        write_secret_transcript(&path, &secrets);
+
+        let parsed = parse_jsonl_file_with_stats(&path, "proj").unwrap();
+        let stored = parsed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for secret in secrets.all() {
+            assert!(!stored.contains(secret), "a secret reached a chunk");
+        }
+        for kind in [
+            "github_token",
+            "anthropic_key",
+            "aws_access_key",
+            "stripe_key",
+        ] {
+            assert!(
+                stored.contains(&format!("[secret redacted: {kind}]")),
+                "missing marker for {kind}: {stored}"
+            );
+            assert_eq!(parsed.suppression.secrets.get(kind), 1, "{kind}");
+        }
+        assert_eq!(parsed.suppression.secrets.total(), 4);
+    }
+
+    #[test]
+    fn kill_switch_restores_unredacted_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret-session.jsonl");
+        let secrets = FakeSecrets::new();
+        write_secret_transcript(&path, &secrets);
+
+        let _off = crate::redact::DisabledForTest::set(true);
+        let parsed = parse_jsonl_file_with_stats(&path, "proj").unwrap();
+        let stored = parsed
+            .chunks
+            .iter()
+            .map(|chunk| chunk.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for secret in secrets.all() {
+            assert!(stored.contains(secret), "kill switch should keep the text");
+        }
+        assert!(parsed.suppression.secrets.is_empty());
+        assert!(!stored.contains("[secret redacted"));
+    }
+
+    #[test]
+    fn secret_inside_and_outside_a_private_span_never_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private-session.jsonl");
+        let secret = format!("{}{}", "ghp_", "B".repeat(36));
+        let line = serde_json::json!({
+            "type": "user",
+            "uuid": "u-1",
+            "timestamp": "2026-10-14T10:00:00Z",
+            "message": {"content": format!(
+                "open <private>hush {secret}</private> and also {secret} here")}
+        });
+        std::fs::write(&path, line.to_string()).unwrap();
+
+        let parsed = parse_jsonl_file_with_stats(&path, "proj").unwrap();
+        let stored = parsed.chunks[0].content.clone();
+        assert!(!stored.contains(&secret));
+        assert!(!stored.contains("hush"));
+        assert!(stored.contains("[private]"));
+        assert!(stored.contains("[secret redacted: github_token]"));
+    }
+
+    #[test]
+    fn per_file_secret_counts_do_not_double_on_reparse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret-session.jsonl");
+        write_secret_transcript(&path, &FakeSecrets::new());
+        let storage = crate::storage::Storage::open(&dir.path().join("test.db")).unwrap();
+
+        for _ in 0..3 {
+            let parsed = parse_jsonl_file_with_stats(&path, "proj").unwrap();
+            storage
+                .mark_file_imported_with_suppression(&path, parsed.chunks.len(), parsed.suppression)
+                .unwrap();
+        }
+        let (total, by_kind) = storage.get_secrets_redacted().unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(by_kind.len(), 4);
+        assert!(by_kind.iter().all(|(_, count)| *count == 1));
+    }
+
+    #[tokio::test]
+    async fn engine_import_stores_markers_and_counts_them() {
+        use crate::embeddings::EmbeddingEngine;
+        use crate::search::SearchEngine;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        let project_dir = projects.join("-tmp-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("secret-session.jsonl");
+        let secrets = FakeSecrets::new();
+        write_secret_transcript(&path, &secrets);
+
+        let storage = Arc::new(crate::storage::Storage::open(&dir.path().join("test.db")).unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let search = Arc::new(RwLock::new(SearchEngine::new(64)));
+        let engine =
+            crate::engine::Engine::from_parts(storage.clone(), embeddings, search, projects);
+
+        let imported = engine.import_file(&path, "proj").await.unwrap();
+        assert!(imported > 0);
+
+        let ids = storage
+            .get_chunk_ids_for_conversation("secret-session")
+            .unwrap();
+        let stored = storage
+            .get_chunks_by_ids(&ids)
+            .unwrap()
+            .into_iter()
+            .map(|chunk| chunk.content)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for secret in secrets.all() {
+            assert!(!stored.contains(secret), "a secret reached the database");
+        }
+        assert!(stored.contains("[secret redacted: github_token]"));
+        let (total, by_kind) = storage.get_secrets_redacted().unwrap();
+        assert_eq!(total, 4);
+        assert!(by_kind.contains(&("stripe_key".to_string(), 1)));
     }
 }
