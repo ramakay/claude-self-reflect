@@ -1655,6 +1655,13 @@ async fn search_chunks_with_vec_core(
                     continue;
                 }
 
+                // CSR text is labeled in search and not handed back as memory:
+                // read the whole chunk, before the preview is cut. Selection
+                // only; the stored chunk is untouched.
+                if crate::import::contamination::chunk_hit(&chunk).is_some() {
+                    continue;
+                }
+
                 // Hard age gate: skip chunks older than MAX_CHUNK_AGE_DAYS
                 // Prevents stale conversations from winning on semantic similarity alone
                 if let Some(ts) = crate::temporal::parse_timestamp(&chunk.timestamp) {
@@ -2526,6 +2533,61 @@ mod tests {
             results[0].min_trust,
             crate::provenance::TrustTier::UserHistory
         );
+    }
+
+    /// The detector reads the whole chunk, before the 300-byte preview is cut:
+    /// a standing rule whose closing quote lies past the cut is still CSR text.
+    #[tokio::test]
+    async fn a_long_csr_text_chunk_is_not_injected_though_its_preview_would_not_match() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let long_rule = format!("A standing rule from 10-12: “{}”", "x".repeat(400));
+        for (id, content) in [
+            ("long-rule", long_rule.as_str()),
+            ("plain", "we moved the index load out of the hook"),
+        ] {
+            let chunk = crate::import::ConversationChunk {
+                id: id.into(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                content: content.into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq: 0,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, &[1.0, 0.0]).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::User,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+            search.insert_chunk(id.to_string(), vec![1.0, 0.0]);
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        let results =
+            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 5, 0.0, "project", None, |_| {
+                HashMap::new()
+            })
+            .await;
+        let ids: Vec<_> = results
+            .iter()
+            .filter_map(|r| r.memory_id.as_deref())
+            .collect();
+        assert_eq!(ids, ["plain"], "the long rule must not be injected");
     }
 
     #[tokio::test]
