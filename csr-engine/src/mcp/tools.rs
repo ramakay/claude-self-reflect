@@ -776,17 +776,13 @@ pub(crate) async fn keyword_fallback(
                     trust: r.trust,
                 })
                 .collect();
-            let labels = why_csr_text_labels(storage, &items);
-            let items = sink_labeled_evidence(items, &labels);
-            let mut rendered = format_why_labeled(
+            render_why_evidence(
+                storage,
                 query,
-                &items,
+                items,
                 &HashSet::new(),
                 &ReinstateTrace::default(),
-                &labels,
-            );
-            append_memory_provenance_hop(storage, &items, &mut rendered)?;
-            Ok(rendered)
+            )
         }
     }
 }
@@ -2737,18 +2733,29 @@ pub async fn why(
         let _ = storage.log_retrieval_event(&item.chunk_id, "chunk", "mcp_search", "mcp");
     }
 
-    let labels = why_csr_text_labels(storage, &ranking.items);
-    let items = sink_labeled_evidence(ranking.items, &labels);
-    let mut rendered = format_why_labeled(
+    render_why_evidence(
+        storage,
         query,
-        &items,
+        ranking.items,
         &ranking.hoisted_chunk_ids,
         &reinstatement.trace,
-        &labels,
-    );
+    )
+}
 
+/// The one rendering of csr_why evidence, ranked or keyword: label the chunks
+/// that hold CSR text, sink their evidence below the clean evidence, print, and
+/// add the memory hop. Nothing is dropped.
+fn render_why_evidence(
+    storage: &Arc<Storage>,
+    query: &str,
+    items: Vec<crate::search::reinstatement::EvidenceItem>,
+    hoisted_chunk_ids: &HashSet<String>,
+    trace: &crate::search::reinstatement::ReinstateTrace,
+) -> Result<String> {
+    let labels = why_csr_text_labels(storage, &items);
+    let items = sink_labeled_evidence(items, &labels);
+    let mut rendered = format_why_labeled(query, &items, hoisted_chunk_ids, trace, &labels);
     append_memory_provenance_hop(storage, &items, &mut rendered)?;
-
     Ok(rendered)
 }
 
@@ -2866,24 +2873,30 @@ pub(crate) fn format_why_labeled(
     if items.is_empty() {
         out.push_str("No evidence chain found.\n");
     } else {
-        // Group by conversation, preserving first-seen (= highest-relevance) order.
-        let mut order: Vec<String> = Vec::new();
-        let mut groups: HashMap<String, Vec<&crate::search::reinstatement::EvidenceItem>> =
+        // Group by conversation, preserving first-seen (= highest-relevance)
+        // order. Evidence from a chunk holding CSR text is its own group: a
+        // conversation's clean rows and its CSR-text rows are not merged, so the
+        // sink (clean evidence before CSR-text evidence) survives the grouping.
+        type Key = (String, bool);
+        let mut order: Vec<Key> = Vec::new();
+        let mut groups: HashMap<Key, Vec<&crate::search::reinstatement::EvidenceItem>> =
             HashMap::new();
         for item in items {
-            if !groups.contains_key(&item.conversation_id) {
-                order.push(item.conversation_id.clone());
+            let key = (
+                item.conversation_id.clone(),
+                labels.contains_key(&item.chunk_id),
+            );
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
             }
-            groups
-                .entry(item.conversation_id.clone())
-                .or_default()
-                .push(item);
+            groups.entry(key).or_default().push(item);
         }
 
-        for conv in &order {
+        for key in &order {
+            let conv = &key.0;
             // Render in the order `items` already carries: score-descending, with
             // the D2 same-anchor recency tie-break applied.
-            let group = groups.remove(conv).unwrap_or_default();
+            let group = groups.remove(key).unwrap_or_default();
             out.push_str(&format!("conv_{conv}:\n"));
             for it in &group {
                 let score_marker = if hoisted_chunk_ids.contains(&it.chunk_id) {
@@ -6720,6 +6733,65 @@ mod tests {
         let csr = out.find("conv-csr").expect("kept");
         let clean = out.find("conv-clean").expect("kept");
         assert!(clean < csr, "clean first\n{out}");
+    }
+
+    /// The printed csr_why output keeps every clean row above every CSR-text
+    /// row even when they share a conversation: the formatter's grouping by
+    /// conversation must not lift the CSR row back up.
+    #[test]
+    fn printed_why_output_keeps_clean_evidence_above_csr_text_evidence() {
+        use crate::search::reinstatement::{EvidenceItem, ReinstateTrace, Via};
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut index = SearchEngine::new(8);
+        for (id, conversation, content) in [
+            ("c", "A", CSR_RULE_TEXT),
+            ("a1", "A", "we moved the index load out of the hook"),
+            ("b1", "B", "we capped the retry loop"),
+        ] {
+            store_csr_text_chunk(
+                &storage,
+                &mut index,
+                id,
+                conversation,
+                content,
+                [1.0, 0.0, 0.0, 0.0],
+            );
+        }
+        let item = |id: &str, conversation: &str, score: f32| EvidenceItem {
+            chunk_id: id.into(),
+            conversation_id: conversation.into(),
+            score,
+            best_route: Via::Keyword,
+            routes: [Via::Keyword].into_iter().collect(),
+            route_scores: [(Via::Keyword, score)].into_iter().collect(),
+            timestamp: "2026-10-13T00:00:00Z".into(),
+            excerpt: format!("EXCERPT-{id}"),
+            ratification: None,
+            trust: crate::provenance::TrustTier::Unknown,
+        };
+        // ranked: C (0.95) in A, then A1 (0.90) in A, then B1 (0.85) in B
+        let rendered = render_why_evidence(
+            &storage,
+            "q",
+            vec![
+                item("c", "A", 0.95),
+                item("a1", "A", 0.90),
+                item("b1", "B", 0.85),
+            ],
+            &HashSet::new(),
+            &ReinstateTrace::default(),
+        )
+        .unwrap();
+        let at = |needle: &str| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} dropped\n{rendered}"))
+        };
+        assert!(
+            at("EXCERPT-a1") < at("EXCERPT-b1") && at("EXCERPT-b1") < at("EXCERPT-c"),
+            "printed order must be A1, B1, C\n{rendered}"
+        );
+        assert!(rendered.contains("[CSR text]"), "{rendered}");
     }
 
     #[test]
