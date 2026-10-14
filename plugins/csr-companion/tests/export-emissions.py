@@ -74,13 +74,38 @@ def record(case_id, producer, send):
         send.rstrip().endswith(('…', '…”')))
 
 
+def forwarded(case_id, producer, text):
+    """A send an action hands on. The text is the item's own, so it must already be a recorded send; if it is
+    not, it is recorded now. Then it goes through the pane's transport, which must not change it."""
+    if not text:
+        return
+    if text not in {case['text'] for case in cases.values()}:
+        record(case_id, producer, text)
+    sent = []
+    saved = pane.herdr
+    pane.herdr = lambda *args: sent.append(args) or ''
+    try:
+        pane.send_text('agent', text)
+    finally:
+        pane.herdr = saved
+    if not sent or sent[0][-1] != text:
+        raise SystemExit(f'{case_id}: the transport changed a send: {text[:60]!r} -> {sent[:1]!r}')
+
+
+def acts_of(act, case_id, producer):
+    """Every send one click target can type: its own, and each of its asks."""
+    forwarded(case_id, producer, act.get('send'))
+    for ask, text in (act.get('asks') or {}).items():
+        forwarded(f'{case_id}-{ask}', producer + ':asks', text)
+
+
 def items_of(page):
     for section in page['sections']:
         for item in section['items']:
             yield section['name'], item
 
 
-def page(data_more=None, s_more=None, rules=(), dreams=(), story=None, infinite=None):
+def page(data_more=None, s_more=None, rules=(), dreams=(), story=None, infinite=None, ui=None):
     """pane.page_main over a stand-in CSR: the rules, dreams, story and card as given."""
     con = sqlite3.connect(':memory:')
     con.execute('create table intent_events (ts text, quote text, session_id text, transcript_path text, '
@@ -97,7 +122,7 @@ def page(data_more=None, s_more=None, rules=(), dreams=(), story=None, infinite=
         data = dict(repo='/tmp/csr-engine', dreams=list(dreams), chapter=dict(at=1000.0, of=5), dreams_on=True,
                     look=None, story=story, infinite=infinite, readings=[])
         data.update(data_more or {})
-        return pane.page_main(data, s, NOW), data, s
+        return pane.page_main(data, s, NOW, ui), data, s
     finally:
         pane.connect, pane.typed_by_you = saved
 
@@ -165,6 +190,41 @@ def export():
             for ask, send in (item.get('asks') or {}).items():
                 record(f'{case}-{section}-{number}-{ask}', producer + ':asks', send)
 
+    # the sites the first pass left out: the earlier dreams a click unfolds (ui folds), a hand-off Claude opened,
+    # the populated readings section, and a standing rule whose date is empty
+    readings = [dict(words='keep it', read='delete it', line='x', when=NOW - 100, source='compaction'),
+                dict(words='', read='', line=long, when=NOW - 200, source='reply')]
+    remembered = [dict(kind='recall', opened=True, at=NOW - 50, key='reflection:abc', text='Use **component** ownership',
+                       when=NOW - 3 * 86400, project='csr-engine', times=2),
+                  dict(kind='recall', opened=True, at=NOW - 60, key=PAST, text=long, when=NOW - 86400, project=None, times=1)]
+    unfolded, data, s = page(rules=rules, dreams=dreams, story=story,
+                             data_more=dict(readings=readings), s_more=dict(remembered=remembered, lost=lost),
+                             ui=dict(folds={'passed'}))
+    for number, (section, item) in enumerate(items_of(unfolded)):
+        producer = f'page_main:{section}'
+        recorded = {case['text'] for case in cases.values()}
+        if item.get('send') and item['send'] not in recorded:
+            record(f'unfolded-{section}-{number}', producer, item['send'])
+        for ask, send in (item.get('asks') or {}).items():
+            if send not in recorded:
+                record(f'unfolded-{section}-{number}-{ask}', producer + ':asks', send)
+        # the click targets under the page: dream answers, lost answers
+        for rows_, act in pane.answer_rows(item, 60, {}):
+            acts_of(act, f'answers-{section}-{number}', 'answer_rows')
+        for rows_, act in pane.lost_rows(item, 60, {}, True):
+            acts_of(act, f'lost-rows-{number}', 'lost_rows')
+
+    nodate, _, _ = page(rules=[('', 'Keep a rule with no date')])
+    for number, (section, item) in enumerate(items_of(nodate)):
+        record(f'rule-nodate-{section}-{number}', f'page_main:{section}', item.get('send'))
+
+    # the f page: every thread, one opened, the click targets it draws
+    every = [thread('Run source-gone validation', NOW - 600), thread(long, NOW - 1200),
+             dict(thread('Sweep the stale index', NOW - 900), state='open', waiting=True, key='sweep-')]
+    out, _, _ = pane.draw_threads(data, dict(s, lost=every), 80, 80, dict(open='lost:' + every[1]['key']))
+    for number, act in enumerate(out.acts.values()):
+        acts_of(act, f'threads-{number}', 'draw_threads')
+
     # the other stages of the card, each as compact_section writes it, and a card draft cut at 1,200
     rec = lambda event, at, **more: dict(kind='compact', event=event, at=at, session='s', ctx_before=278_129, why='w', **more)
     for name, records in (
@@ -197,7 +257,8 @@ def export():
         s.update(id='sess-live', title=None, compact_sizes=[], main=[], turn_end=0.0, busy=False, asked=[],
                  told=dict(at=NOW - 3600, source='startup', text=text), last_session=dict(facts, title=title),
                  todos=[dict(subject='Run the clone replay', status='pending'),
-                        dict(subject='Write “the” report', status='in_progress')],
+                        dict(subject='Write “the” report', status='in_progress'),
+                        dict(subject='x' * 800, status='pending')],
                  learned=dict(chunks=[], anchors=[], symbols=0, turns=[], memories=[]))
         default = pane.page_default(built, data, s, NOW, 24)
         for number, (section, item) in enumerate(items_of(default)):
