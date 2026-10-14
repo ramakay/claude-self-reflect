@@ -91,13 +91,23 @@ pub fn render_view(
 ) -> String {
     match req.view {
         ViewKind::Stats => render_stats(parsed, path, project, req.json, req.budget_chars),
-        ViewKind::Prompts => render_prompts(parsed, req).render(req.budget_chars, req.json),
-        ViewKind::Tools => render_tools(parsed, req).render(req.budget_chars, req.json),
-        ViewKind::Files => render_files(parsed, req).render(req.budget_chars, req.json),
-        ViewKind::Errors => render_errors(parsed, req).render(req.budget_chars, req.json),
-        ViewKind::Slice => render_slice(parsed, req).render(req.budget_chars, req.json),
+        ViewKind::Prompts => {
+            mark_mirror(parsed, render_prompts(parsed, req)).render(req.budget_chars, req.json)
+        }
+        ViewKind::Tools => {
+            mark_mirror(parsed, render_tools(parsed, req)).render(req.budget_chars, req.json)
+        }
+        ViewKind::Files => {
+            mark_mirror(parsed, render_files(parsed, req)).render(req.budget_chars, req.json)
+        }
+        ViewKind::Errors => {
+            mark_mirror(parsed, render_errors(parsed, req)).render(req.budget_chars, req.json)
+        }
+        ViewKind::Slice => {
+            mark_mirror(parsed, render_slice(parsed, req)).render(req.budget_chars, req.json)
+        }
         ViewKind::Grep => match render_grep(parsed, req) {
-            Ok(view) => view.render(req.budget_chars, req.json),
+            Ok(view) => mark_mirror(parsed, view).render(req.budget_chars, req.json),
             Err(e) => {
                 if req.json {
                     json!({ "error": e }).to_string()
@@ -110,6 +120,20 @@ pub fn render_view(
 }
 
 // ─── Generic list-view renderer (prompts/tools/files/errors/slice/grep) ───
+
+/// Said in every view of a transcript read from the mirror.
+const MIRROR_SOURCE_NOTE: &str =
+    "source: transcript mirror (scrubbed copy; the original JSONL is gone)";
+
+/// Tag a list view as coming from the mirror's scrubbed copy.
+fn mark_mirror(parsed: &ParsedTranscript, mut view: ViewData) -> ViewData {
+    if parsed.from_mirror {
+        view.header_lines.insert(0, MIRROR_SOURCE_NOTE.to_string());
+        view.extra_json
+            .push(("source".to_string(), json!("mirror")));
+    }
+    view
+}
 
 /// One renderable unit: a compact text line plus its full-fidelity JSON
 /// twin. `turn` drives both budget-cut bookkeeping and the resume hint.
@@ -283,6 +307,7 @@ fn render_stats(
         let rendered = json!({
             "view": "stats",
             "session_path": path.display().to_string(),
+            "source": if parsed.from_mirror { "mirror" } else { "jsonl" },
             "project": project,
             "total_lines": parsed.total_lines,
             "turn_count": parsed.entries.len(),
@@ -313,6 +338,9 @@ fn render_stats(
             xml_escape(&path.display().to_string())
         ));
         out.push_str(&format!("  <project>{}</project>\n", xml_escape(project)));
+        if parsed.from_mirror {
+            out.push_str(&format!("  <note>{MIRROR_SOURCE_NOTE}</note>\n"));
+        }
         out.push_str(&format!(
             "  <lines total=\"{}\" metadata=\"{}\" unrecognized=\"{}\"/>\n",
             parsed.total_lines, parsed.metadata_entries, parsed.unrecognized_entries
@@ -2453,6 +2481,7 @@ mod tests {
         let path = write_hostile_fixture(dir.path());
         let result = crate::mcp::tools::transcript(
             dir.path(),
+            None,
             &path.to_string_lossy(),
             "slice",
             None,

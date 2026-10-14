@@ -498,6 +498,11 @@ impl Engine {
                 parent,
             )?;
         }
+        // Mirror first, ahead of the early return below, so a transcript that is
+        // already imported but never mirrored still gets its copy. A no-op (one
+        // stat, one indexed lookup) when the mirror is current; errors are counted
+        // inside and never fail the import.
+        self.mirror().sync_file(file_path);
         // Check if file is unchanged (mtime match = fully imported, nothing new)
         if observer.is_none() && self.storage.is_file_imported(file_path)? {
             return Ok(0);
@@ -748,6 +753,11 @@ impl Engine {
 
     pub fn projects_dir(&self) -> &Path {
         &self.projects_dir
+    }
+
+    /// The transcript mirror for this engine's data directory.
+    pub fn mirror(&self) -> crate::mirror::Mirror<'_> {
+        crate::mirror::Mirror::new(&self.storage, self.data_dir(), &self.projects_dir)
     }
 
     pub fn index_dir(&self) -> &Path {

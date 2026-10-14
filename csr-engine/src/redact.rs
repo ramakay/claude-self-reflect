@@ -220,6 +220,13 @@ pub fn scrub_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Cheap test: could `text` hold a credential? False when the scrub is off.
+/// A hit is not a finding, only a reason to run the full scrub: the mirror
+/// uses it to leave clean transcript lines byte-identical without parsing them.
+pub fn may_hold_secret(text: &str) -> bool {
+    !scrub_disabled() && PREFILTER.is_match(text)
+}
+
 /// Redact secrets in `text`. Borrowed, with no allocation, when nothing matches.
 pub fn redact_secrets(text: &str) -> Cow<'_, str> {
     redact_secrets_counted(text, &mut SecretCounts::default())

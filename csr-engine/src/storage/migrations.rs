@@ -2202,6 +2202,21 @@ pub fn run(conn: &Connection) -> Result<()> {
             ON reaction_shadow_scores(ts);",
     )?;
 
+    // Transcript mirror (src/mirror.rs): how much of each source transcript the
+    // scrubbed, zstd-compressed copy under <data_dir>/mirror/ already covers.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS transcript_mirror (
+            rel_path       TEXT PRIMARY KEY,
+            source_bytes   INTEGER NOT NULL,
+            tail_hash      TEXT NOT NULL,
+            zst_bytes      INTEGER NOT NULL,
+            frames         INTEGER NOT NULL,
+            sealed         INTEGER NOT NULL DEFAULT 0,
+            updated_at     TEXT NOT NULL,
+            source_gone_at TEXT
+        );",
+    )?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())

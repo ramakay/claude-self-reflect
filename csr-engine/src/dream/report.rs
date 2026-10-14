@@ -2929,6 +2929,8 @@ fn backfill_instrumentation(storage: &Storage, projects_dir: &Path, cards: &mut 
 
         let lookup = crate::transcript::resolve_session_path(
             projects_dir,
+            // Live transcripts only: the stat below is the JSONL's.
+            None,
             &card.session_id,
             Some(&card.project),
         );

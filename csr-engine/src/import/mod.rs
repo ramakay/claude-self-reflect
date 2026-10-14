@@ -1637,7 +1637,7 @@ fn extract_message_text_raw(msg: &serde_json::Value) -> String {
 
 /// Strip `<private>...</private>` tagged content from text (case-insensitive).
 /// S-3 fix: also handles unclosed `<private>` tags by redacting to end of input.
-fn strip_private_tags(text: &str) -> String {
+pub(crate) fn strip_private_tags(text: &str) -> String {
     // Case-insensitive fast-path check to avoid regex overhead
     let lower = text.to_ascii_lowercase();
     if !lower.contains("<private>") {

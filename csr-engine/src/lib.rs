@@ -16,6 +16,7 @@ pub mod journal;
 pub mod ledger;
 pub mod maintenance;
 pub mod mcp;
+pub mod mirror;
 pub mod narrative;
 pub mod provenance;
 pub mod reaction_shadow;

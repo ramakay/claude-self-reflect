@@ -69,6 +69,8 @@ pub struct StatusReport {
     pub csr_hook_wrappers_scrubbed: i64,
     /// Credentials redacted from imported text before chunking. Counts only.
     pub secrets_redacted: SecretsRedactedStatus,
+    /// The transcript mirror, read from its state table (no directory walk).
+    pub mirror: MirrorStatus,
     pub contamination: ContaminationStatus,
     /// Cached memory-health measurements and the current binary's canary.
     /// See [`MemoryHealthStatus`].
@@ -256,6 +258,57 @@ impl SecretsRedactedStatus {
             by_kind: by_kind.into_iter().collect(),
             disabled: crate::redact::scrub_disabled(),
         }
+    }
+}
+
+/// The transcript mirror's footprint, summed from the `transcript_mirror`
+/// state table. Never walks the mirror directory.
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct MirrorStatus {
+    pub files: i64,
+    pub source_bytes: i64,
+    pub zst_bytes: i64,
+    /// `source_bytes / zst_bytes`; 0 while the mirror is empty.
+    pub ratio: f64,
+    pub sealed: i64,
+    /// Mirrors whose source JSONL Claude Code has since deleted.
+    pub sources_gone: i64,
+    pub errors: i64,
+    pub last_sync: Option<String>,
+    /// `CSR_NO_MIRROR=1` is set in the reporting process.
+    pub disabled: bool,
+}
+
+impl MirrorStatus {
+    fn read(storage: &Storage) -> Self {
+        let totals = storage.mirror_totals().unwrap_or_default();
+        let ratio = if totals.zst_bytes > 0 {
+            ((totals.source_bytes as f64 / totals.zst_bytes as f64) * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+        Self {
+            files: totals.files,
+            source_bytes: totals.source_bytes,
+            zst_bytes: totals.zst_bytes,
+            ratio,
+            sealed: totals.sealed,
+            sources_gone: totals.sources_gone,
+            errors: storage
+                .get_meta_counter(crate::storage::transcript_mirror::MIRROR_ERRORS_KEY)
+                .ok()
+                .flatten()
+                .unwrap_or(0),
+            last_sync: storage
+                .get_meta(crate::storage::transcript_mirror::MIRROR_LAST_SYNC_KEY)
+                .ok()
+                .flatten(),
+            disabled: crate::mirror::mirror_disabled(),
+        }
+    }
+
+    pub fn for_cli(storage: &Storage) -> Self {
+        Self::read(storage)
     }
 }
 
@@ -1025,6 +1078,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
             secrets_redacted: SecretsRedactedStatus::default(),
+            mirror: MirrorStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: gather_memory_health(None),
             provenance_coverage: ProvenanceCoverageStatus::default(),
@@ -1065,6 +1119,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let csr_tool_blocks_suppressed = storage.get_csr_tool_blocks_suppressed().unwrap_or(0);
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
     let secrets_redacted = SecretsRedactedStatus::read(&storage);
+    let mirror = MirrorStatus::read(&storage);
     let contamination = if deep {
         storage.refresh_contamination_cache().ok()
     } else {
@@ -1170,6 +1225,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_tool_blocks_suppressed,
         csr_hook_wrappers_scrubbed,
         secrets_redacted,
+        mirror,
         contamination,
         memory_health,
         provenance_coverage,
@@ -2297,6 +2353,7 @@ mod tests {
             csr_tool_blocks_suppressed: 0,
             csr_hook_wrappers_scrubbed: 0,
             secrets_redacted: SecretsRedactedStatus::default(),
+            mirror: MirrorStatus::default(),
             contamination: ContaminationStatus::default(),
             memory_health: MemoryHealthStatus::from_cache(
                 &crate::health::HealthSnapshot::default(),
@@ -3250,6 +3307,50 @@ mod tests {
         assert!(value["secrets_redacted"]["by_kind"]
             .get("aws_access_key")
             .is_none());
+    }
+
+    #[test]
+    fn status_mirror_block_comes_from_the_state_table_without_a_directory_walk() {
+        use crate::storage::transcript_mirror::MirrorRow;
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let projects_dir = dir.path().join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        for (rel, gone, sealed) in [("p/a.jsonl", None, true), ("p/b.jsonl", Some("t"), false)] {
+            storage
+                .mirror_upsert(&MirrorRow {
+                    rel_path: rel.into(),
+                    source_bytes: 1000,
+                    tail_hash: "h".into(),
+                    zst_bytes: 250,
+                    frames: 1,
+                    sealed,
+                    updated_at: "t".into(),
+                    source_gone_at: gone.map(str::to_string),
+                })
+                .unwrap();
+        }
+        storage.set_meta("mirror_errors", "3").unwrap();
+        storage
+            .set_meta("mirror_last_sync", "2026-10-14T12:00:00Z")
+            .unwrap();
+        // The mirror directory does not exist: the numbers cannot come from a walk.
+        assert!(!dir.path().join("mirror").exists());
+
+        let value =
+            serde_json::to_value(gather_status(&db_path, &projects_dir, false).unwrap()).unwrap();
+        let mirror = &value["mirror"];
+        assert_eq!(mirror["files"], 2);
+        assert_eq!(mirror["source_bytes"], 2000);
+        assert_eq!(mirror["zst_bytes"], 500);
+        assert_eq!(mirror["ratio"], 4.0);
+        assert_eq!(mirror["sealed"], 1);
+        assert_eq!(mirror["sources_gone"], 1);
+        assert_eq!(mirror["errors"], 3);
+        assert_eq!(mirror["last_sync"], "2026-10-14T12:00:00Z");
+        assert_eq!(mirror["disabled"], false);
     }
 
     #[test]

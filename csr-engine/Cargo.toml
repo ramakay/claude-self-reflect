@@ -60,6 +60,7 @@ axum = { version = "0.8", default-features = false, features = [
     "tracing",
 ] }
 libc = "0.2"
+zstd = "0.14.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -166,6 +166,8 @@ pub struct ParsedTranscript {
     /// delivered) instead of staying armed to dedupe an unrelated later
     /// prompt with the same text (gap-G6, inbox-B3 review #2 finding 1a).
     pub(crate) queue_events: Vec<QueueEvent>,
+    /// Parsed from the transcript mirror's scrubbed copy, not the original JSONL.
+    pub from_mirror: bool,
 }
 
 /// A `queue-operation` line other than `enqueue` — `remove` or `dequeue` —
@@ -206,6 +208,16 @@ pub fn parse_transcript(path: &Path) -> Result<ParsedTranscript> {
         File::open(path).with_context(|| format!("opening transcript {}", path.display()))?;
     let reader = BufReader::new(file);
     Ok(parse_transcript_reader(reader))
+}
+
+/// [`parse_transcript`] over a transcript mirror file (`*.jsonl.zst`),
+/// decoded as a stream: even the largest transcript is never held decoded.
+pub fn parse_mirrored_transcript(path: &Path) -> Result<ParsedTranscript> {
+    let reader = crate::mirror::open_transcript(path)
+        .with_context(|| format!("opening mirrored transcript {}", path.display()))?;
+    let mut parsed = parse_transcript_reader(reader);
+    parsed.from_mirror = true;
+    Ok(parsed)
 }
 
 pub(crate) fn parse_transcript_fragment(raw: &str) -> ParsedTranscript {
@@ -863,6 +875,7 @@ pub(crate) fn prompt_noise_class(e: &Entry) -> Option<&'static str> {
 /// projects-dir walk entirely.
 pub(crate) fn resolve_session_path(
     projects_dir: &Path,
+    data_dir: Option<&Path>,
     session: &str,
     project: Option<&str>,
 ) -> crate::mcp::tools::ConversationLookup {
@@ -876,7 +889,20 @@ pub(crate) fn resolve_session_path(
             .unwrap_or_else(|| "unknown".to_string());
         return ConversationLookup::Found(direct.to_path_buf(), project_name);
     }
-    crate::mcp::tools::find_conversation_file(projects_dir, session, project)
+    // The JSONL wins whenever it exists; the mirror answers only once it is gone.
+    match crate::mcp::tools::find_conversation_file(projects_dir, session, project) {
+        ConversationLookup::NotFound => match data_dir {
+            Some(data_dir) => {
+                crate::mcp::tools::find_mirrored_conversation(data_dir, session, project)
+            }
+            None => ConversationLookup::NotFound,
+        },
+        found => found,
+    }
+}
+
+fn is_mirror_file(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(".jsonl.zst")
 }
 
 // ─── Request / dispatch ───
@@ -1097,13 +1123,24 @@ fn sidechains_reserved_message(json: bool) -> String {
 /// (`csr-engine transcript`) and the `csr_transcript` MCP tool call —
 /// exercised directly by tests, independent of clap or rmcp.
 pub fn run(projects_dir: &Path, req: &TranscriptRequest) -> String {
+    run_with_mirror(projects_dir, None, req)
+}
+
+/// [`run`], falling back to the transcript mirror under `data_dir` for a
+/// session whose JSONL Claude Code has deleted. The output says it came from
+/// the mirror.
+pub fn run_with_mirror(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    req: &TranscriptRequest,
+) -> String {
     if req.sidechains {
         return sidechains_reserved_message(req.json);
     }
 
     use crate::mcp::tools::ConversationLookup;
     let (path, project) =
-        match resolve_session_path(projects_dir, &req.session, req.project.as_deref()) {
+        match resolve_session_path(projects_dir, data_dir, &req.session, req.project.as_deref()) {
             ConversationLookup::Found(p, proj) => (p, proj),
             ConversationLookup::NotFound => return not_found_message(&req.session, req.json),
             ConversationLookup::Ambiguous(candidates) => {
@@ -1111,7 +1148,11 @@ pub fn run(projects_dir: &Path, req: &TranscriptRequest) -> String {
             }
         };
 
-    let parsed = match parse_transcript(&path) {
+    let parsed = match if is_mirror_file(&path) {
+        parse_mirrored_transcript(&path)
+    } else {
+        parse_transcript(&path)
+    } {
         Ok(p) => p,
         Err(e) => {
             let msg = format!("failed to read transcript at {}: {e}", path.display());

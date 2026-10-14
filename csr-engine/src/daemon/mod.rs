@@ -617,6 +617,63 @@ impl Daemon {
             );
         }
 
+        // Transcript mirror loop: a full walk of the projects dir every 30 minutes
+        // (first pass a minute after start-up, which is also the backfill). It
+        // appends new transcript bytes to the scrubbed zstd copies, seals quiet
+        // ones, and flags mirrors whose source Claude Code has deleted. It never
+        // touches chunks or the HNSW index, so it takes no heavy-work permit and
+        // honours shutdown between files.
+        let mirror_handle = {
+            let storage = self.storage.clone();
+            let projects_root = self.projects_dir.clone();
+            let data_dir = self
+                .index_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.index_dir.clone());
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                if crate::mirror::mirror_disabled() {
+                    tracing::info!("transcript mirror loop disabled via CSR_NO_MIRROR");
+                    return;
+                }
+                let mut wait_ticks = 6;
+                loop {
+                    for _ in 0..wait_ticks {
+                        if shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                    wait_ticks = 180;
+                    let (storage, projects_root, data_dir, shutdown) = (
+                        storage.clone(),
+                        projects_root.clone(),
+                        data_dir.clone(),
+                        shutdown.clone(),
+                    );
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mirror =
+                            crate::mirror::Mirror::new(&storage, &data_dir, &projects_root);
+                        let stats = mirror.sync_pass(Some(shutdown.as_ref()));
+                        tracing::debug!(
+                            files = stats.files,
+                            synced = stats.synced,
+                            source_bytes = stats.source_bytes,
+                            sealed = stats.sealed,
+                            sources_gone = stats.sources_gone,
+                            errors = stats.errors,
+                            "transcript mirror pass"
+                        );
+                    })
+                    .await;
+                }
+            })
+        };
+        tracing::info!(
+            "transcript mirror loop started (projects dir → <data_dir>/mirror/transcripts)"
+        );
+
         // Populate one structural-provenance batch per idle window. Parsing
         // happens before the bounded write transaction and the shared permit
         // keeps it out of the watch/import and dream critical sections.
@@ -1339,6 +1396,9 @@ impl Daemon {
         // Memory registry only upserts its own SQLite table transactionally —
         // no HNSW mutation — so a timeout here cannot corrupt the search index.
         let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
+        // The mirror pass checks shutdown between files; one in-flight file is
+        // bounded and crash-safe (state follows the fsync), so a timeout is safe.
+        let _ = tokio::time::timeout(timeout, mirror_handle).await;
         let _ = tokio::time::timeout(timeout, provenance_backfill_handle).await;
         // Same shape as the provenance backfill above: single-statement
         // upserts into `conversation_entrypoint`, no HNSW mutation.

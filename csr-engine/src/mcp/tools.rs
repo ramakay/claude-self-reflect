@@ -3382,6 +3382,32 @@ pub(crate) fn find_conversation_file(
     conversation_id: &str,
     project: Option<&str>,
 ) -> ConversationLookup {
+    find_transcript_file(projects_dir, ".jsonl", conversation_id, project)
+}
+
+/// The same lookup over the transcript mirror's `<project>/<id>.jsonl.zst`
+/// files, for when Claude Code has deleted the JSONL.
+pub(crate) fn find_mirrored_conversation(
+    data_dir: &Path,
+    conversation_id: &str,
+    project: Option<&str>,
+) -> ConversationLookup {
+    find_transcript_file(
+        &crate::mirror::transcripts_dir(data_dir),
+        ".jsonl.zst",
+        conversation_id,
+        project,
+    )
+}
+
+/// `find_conversation_file`'s one rule, parameterized by the root to search and
+/// the file-name suffix that marks a transcript there.
+fn find_transcript_file(
+    projects_dir: &Path,
+    suffix: &str,
+    conversation_id: &str,
+    project: Option<&str>,
+) -> ConversationLookup {
     // Validate conversation_id: must be non-empty, alphanumeric + hyphens + underscores only
     if conversation_id.is_empty()
         || !conversation_id
@@ -3426,9 +3452,9 @@ pub(crate) fn find_conversation_file(
         if let Ok(files) = std::fs::read_dir(dir) {
             for entry in files.flatten() {
                 let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "jsonl") {
-                    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                    let is_exact = &*stem == conversation_id;
+                let file_name = entry.file_name();
+                if let Some(stem) = file_name.to_string_lossy().strip_suffix(suffix) {
+                    let is_exact = stem == conversation_id;
                     if is_exact || stem.contains(conversation_id) {
                         let project_name = dir
                             .file_name()
@@ -3483,9 +3509,11 @@ fn candidate_listing(candidates: &[&(PathBuf, String, bool)]) -> Vec<(String, St
         .iter()
         .map(|(path, project_name, _)| {
             (
-                path.file_stem()
+                path.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
+                    .trim_end_matches(".zst")
+                    .trim_end_matches(".jsonl")
                     .to_string(),
                 project_name.clone(),
             )
@@ -3496,13 +3524,29 @@ fn candidate_listing(candidates: &[&(PathBuf, String, bool)]) -> Vec<(String, St
     listing
 }
 
-/// Locate the JSONL file for a conversation.
+/// Locate the JSONL file for a conversation. When the JSONL is gone but the
+/// transcript mirror (under `data_dir`) still has it, point at the mirror copy
+/// and say how to read it.
 pub fn get_full_conversation(
     projects_dir: &Path,
+    data_dir: Option<&Path>,
     conversation_id: &str,
     project: Option<&str>,
 ) -> String {
-    match find_conversation_file(projects_dir, conversation_id, project) {
+    let mut lookup = find_conversation_file(projects_dir, conversation_id, project);
+    let mut mirrored = false;
+    if let (ConversationLookup::NotFound, Some(data_dir)) = (&lookup, data_dir) {
+        lookup = find_mirrored_conversation(data_dir, conversation_id, project);
+        mirrored = true;
+    }
+    match lookup {
+        ConversationLookup::Found(path, project_name) if mirrored => {
+            format::format_mirrored_conversation(
+                conversation_id,
+                &path.to_string_lossy(),
+                &project_name,
+            )
+        }
         ConversationLookup::Found(path, project_name) => format::format_full_conversation(
             conversation_id,
             Some(&path.to_string_lossy()),
@@ -3549,6 +3593,7 @@ const MCP_TRANSCRIPT_MAX_BUDGET_CHARS: usize = 60_000;
 #[allow(clippy::too_many_arguments)]
 pub fn transcript(
     projects_dir: &Path,
+    data_dir: Option<&Path>,
     session: &str,
     view: &str,
     project: Option<&str>,
@@ -3609,7 +3654,11 @@ pub fn transcript(
         include_system,
     };
 
-    Ok(crate::transcript::run(projects_dir, &req))
+    Ok(crate::transcript::run_with_mirror(
+        projects_dir,
+        data_dir,
+        &req,
+    ))
 }
 
 /// Get learnings for a specific session.
@@ -11117,7 +11166,7 @@ mod tests {
         write_session_file(dir.path(), "proj-a", "abc123-one");
         write_session_file(dir.path(), "proj-b", "abc123-two");
 
-        let out = get_full_conversation(dir.path(), "abc123", None);
+        let out = get_full_conversation(dir.path(), None, "abc123", None);
         assert!(out.contains("is ambiguous"));
         assert!(out.contains("abc123-one"));
         assert!(out.contains("abc123-two"));

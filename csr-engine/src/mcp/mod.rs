@@ -802,6 +802,7 @@ impl CsrServer {
         let p = params.0;
         let text = tools::get_full_conversation(
             &self.projects_dir,
+            self.index_dir.parent(),
             &p.conversation_id,
             p.project.as_deref(),
         );
@@ -849,6 +850,7 @@ impl CsrServer {
         let json_mode = p.json.unwrap_or(false);
         let result = tools::transcript(
             &self.projects_dir,
+            self.index_dir.parent(),
             &p.session,
             &p.view,
             p.project.as_deref(),
@@ -1372,6 +1374,7 @@ mod tests {
 
         let default_out = tools::transcript(
             dir.path(),
+            None,
             &session_path.to_string_lossy(),
             "prompts",
             None,
@@ -1394,6 +1397,7 @@ mod tests {
 
         let with_system_out = tools::transcript(
             dir.path(),
+            None,
             &session_path.to_string_lossy(),
             "prompts",
             None,

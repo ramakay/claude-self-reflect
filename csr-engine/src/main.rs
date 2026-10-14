@@ -186,6 +186,12 @@ enum Commands {
         #[arg(long)]
         include_system: bool,
     },
+    /// The transcript mirror: scrubbed, zstd-compressed copies of every
+    /// Claude Code transcript, kept in the data folder after the JSONL goes.
+    Mirror {
+        #[command(subcommand)]
+        action: MirrorAction,
+    },
     /// Run ratification extraction for specific conversation IDs (one-off,
     /// bypasses the daemon queue ordering)
     Ratify {
@@ -501,6 +507,23 @@ enum ProvenanceAction {
 /// `--report` mean something entirely different from the witness-ledger
 /// `dream` command's flags of the same name, and clap subcommand namespaces
 /// keep the two from colliding.
+/// `mirror` subcommands. None of them loads the embedding model or the index.
+#[derive(Subcommand, Debug)]
+enum MirrorAction {
+    /// One full pass: mirror new transcript bytes, seal quiet transcripts, flag
+    /// mirrors whose source is gone. Prints files, bytes and errors.
+    Sync,
+    /// Totals from the state table (no directory walk).
+    Status,
+    /// Delete the compressed transcripts and their state rows. Prints what it
+    /// would delete unless --yes is given.
+    Purge {
+        /// Actually delete.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum DreamAction {
     /// Deterministic supersession mining over historical episodes, with a
@@ -1131,10 +1154,71 @@ async fn run(
             sidechains,
             include_system,
         };
-        let out = csr_engine::transcript::run(&args.projects_dir, &req);
+        let data_dir = args.db_path.parent().map(std::path::Path::to_path_buf);
+        let out =
+            csr_engine::transcript::run_with_mirror(&args.projects_dir, data_dir.as_deref(), &req);
         print!("{out}");
         if !out.ends_with('\n') {
             println!();
+        }
+        return Ok(());
+    }
+
+    if let Some(Commands::Mirror { ref action }) = args.command {
+        let data_dir = args
+            .db_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let MirrorAction::Status = action {
+            // Read-only: never create a database just to report on it.
+            let status = match csr_engine::storage::Storage::open_read_only(&args.db_path) {
+                Ok(storage) => csr_engine::status::MirrorStatus::for_cli(&storage),
+                Err(_) => csr_engine::status::MirrorStatus::default(),
+            };
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            return Ok(());
+        }
+        std::fs::create_dir_all(&data_dir)?;
+        let storage = csr_engine::storage::Storage::open(&args.db_path)?;
+        let mirror = csr_engine::mirror::Mirror::new(&storage, &data_dir, &args.projects_dir);
+        match action {
+            MirrorAction::Sync => {
+                if mirror.disabled {
+                    println!("transcript mirror is off (CSR_NO_MIRROR is set); nothing to do");
+                    return Ok(());
+                }
+                let stats = mirror.sync_pass(None);
+                println!(
+                    "files {}  synced {}  source_bytes {}  sealed {}  sources_gone {}  errors {}",
+                    stats.files,
+                    stats.synced,
+                    stats.source_bytes,
+                    stats.sealed,
+                    stats.sources_gone,
+                    stats.errors
+                );
+                if stats.errors > 0 {
+                    std::process::exit(1);
+                }
+            }
+            MirrorAction::Purge { yes } => {
+                let report = mirror.purge(*yes)?;
+                if report.deleted {
+                    println!(
+                        "deleted {} mirrored transcripts ({} compressed bytes) and their state rows",
+                        report.files, report.zst_bytes
+                    );
+                } else {
+                    println!(
+                        "dry run: would delete {} mirrored transcripts ({} compressed bytes) under {} and clear their state rows; pass --yes to do it",
+                        report.files,
+                        report.zst_bytes,
+                        csr_engine::mirror::transcripts_dir(&data_dir).display()
+                    );
+                }
+            }
+            MirrorAction::Status => unreachable!("handled above"),
         }
         return Ok(());
     }

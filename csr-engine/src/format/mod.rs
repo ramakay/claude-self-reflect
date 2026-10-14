@@ -1166,6 +1166,20 @@ pub fn format_full_conversation(
     }
 }
 
+/// get_full_conversation response when the JSONL is gone and only the
+/// transcript mirror's scrubbed zstd copy is left. The file is not readable
+/// with the Read tool, so the message routes to `csr_transcript`.
+pub fn format_mirrored_conversation(
+    conversation_id: &str,
+    mirror_path: &str,
+    project: &str,
+) -> String {
+    format!(
+        "<conversation_file>\n<conversation_id>{}</conversation_id>\n<mirror_path>{}</mirror_path>\n<project>{}</project>\n<message>The original JSONL no longer exists. CSR kept a scrubbed, zstd-compressed copy at this path; it cannot be read with the Read tool. Read it with csr_transcript(session=\"{}\", view=...) or `csr-engine transcript {} <view>`.</message>\n</conversation_file>",
+        conversation_id, mirror_path, project, conversation_id, conversation_id,
+    )
+}
+
 /// Format session learnings response.
 pub fn format_session_learnings(
     session_id: &str,

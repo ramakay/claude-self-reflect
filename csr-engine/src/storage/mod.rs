@@ -16,6 +16,7 @@ pub mod queries;
 pub mod recap_feeds;
 pub mod sidechain_provenance;
 pub mod trained_rerank;
+pub mod transcript_mirror;
 pub mod usage_reservation;
 pub mod vocabulary;
 pub mod witness_ledger;
