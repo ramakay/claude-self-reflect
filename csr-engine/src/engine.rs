@@ -528,22 +528,18 @@ impl Engine {
             .transpose()?;
         // Chunk rows stored before the scrubber are never rewritten: a legacy
         // conversation is picked up after the last message they cover.
-        let resume = match import::legacy_resume::resolve(
-            &self.storage,
-            file_path,
-            &conversation_id,
-            parent_context.as_ref(),
-        )? {
-            import::legacy_resume::Resume::Fresh => None,
-            import::legacy_resume::Resume::At(point) => Some(point),
-            import::legacy_resume::Resume::Unplaced => {
-                self.storage.mark_file_imported(
-                    file_path,
-                    self.storage.get_imported_chunk_count(file_path)?,
-                )?;
-                return Ok(0);
-            }
-        };
+        let resume =
+            match import::legacy_resume::resolve(&self.storage, file_path, &conversation_id)? {
+                import::legacy_resume::Resume::Fresh => None,
+                import::legacy_resume::Resume::At(point) => Some(point),
+                import::legacy_resume::Resume::Unplaced => {
+                    self.storage.mark_file_imported(
+                        file_path,
+                        self.storage.get_imported_chunk_count(file_path)?,
+                    )?;
+                    return Ok(0);
+                }
+            };
         let stored_chunks = resume.map_or(0, |point| point.first_chunk);
         let parsed = import::parse_jsonl_file_resuming(
             file_path,

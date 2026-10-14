@@ -657,12 +657,7 @@ pub(crate) async fn import_file_content_diff(
         .transpose()?;
     // Chunk rows stored before the scrubber are never rewritten: a legacy
     // conversation is picked up after the last message they cover.
-    let resume = match import::legacy_resume::resolve(
-        storage,
-        file_path,
-        &conv_id,
-        parent_context.as_ref(),
-    )? {
+    let resume = match import::legacy_resume::resolve(storage, file_path, &conv_id)? {
         import::legacy_resume::Resume::Fresh => None,
         import::legacy_resume::Resume::At(point) => Some(point),
         import::legacy_resume::Resume::Unplaced => {

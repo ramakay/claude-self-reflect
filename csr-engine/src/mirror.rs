@@ -2182,14 +2182,28 @@ mod tests {
             "-----END RSA PRIV",
             "ATE KEY-----"
         );
+        let texts: Vec<String> = (0..4)
+            .map(|n| format!("dump {n}\n{pem}\nend {n}"))
+            .collect();
+        let conv = legacy_conversation_of(engine, src, &texts).await;
+        assert!(chunks_like(engine, "Zm9vYmFy") >= 4);
+        conv
+    }
+
+    /// A conversation stored by a build without the scrubber, one user message
+    /// per entry of `texts`.
+    async fn legacy_conversation_of(
+        engine: &crate::engine::Engine,
+        src: &Path,
+        texts: &[String],
+    ) -> String {
         let _off = crate::redact::DisabledForTest::set(true);
         let mut body = String::new();
-        for n in 0..4 {
-            body.push_str(&session_message(n, &format!("dump {n}\n{pem}\nend {n}")));
+        for (n, text) in texts.iter().enumerate() {
+            body.push_str(&session_message(n, text));
         }
         fs::write(src, body).unwrap();
-        assert!(engine.import_file(src, "proj").await.unwrap() >= 4);
-        assert!(chunks_like(engine, "Zm9vYmFy") >= 4);
+        assert!(engine.import_file(src, "proj").await.unwrap() >= texts.len());
         src.file_stem().unwrap().to_string_lossy().to_string()
     }
 
@@ -2522,6 +2536,412 @@ mod tests {
         filetime_touch(&lost);
         import_via(&engine, &rig, &lost, Via::Engine).await;
         assert_eq!((counts().placed, counts().waiting), (2, 0));
+    }
+
+    /// A second handle on the engine's database file: another importer.
+    fn other_importer(rig: &Rig) -> Storage {
+        Storage::open(&rig.data_dir.join("csr-engine.db")).unwrap()
+    }
+
+    fn drop_receipts(engine: &crate::engine::Engine) {
+        engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute("DELETE FROM chunk_spans", [])?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn frontier_rows(engine: &crate::engine::Engine) -> i64 {
+        engine
+            .storage()
+            .with_connection(|conn| {
+                Ok(
+                    conn.query_row("SELECT COUNT(*) FROM legacy_import_frontier", [], |r| {
+                        r.get(0)
+                    })?,
+                )
+            })
+            .unwrap()
+    }
+
+    fn stamp_of(engine: &crate::engine::Engine, src: &Path) -> Option<String> {
+        engine
+            .storage()
+            .with_connection(|conn| {
+                Ok(conn.query_row(
+                    "SELECT secrets_redacted FROM import_state WHERE file_path = ?1",
+                    [src.to_string_lossy().to_string()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+    }
+
+    /// What the importer does to a conversation once it has its resume point:
+    /// stamp the import state as written by a scrubbing build.
+    fn finish_import(other: &Storage, src: &Path) {
+        other
+            .mark_file_imported_with_suppression(
+                src,
+                0,
+                crate::import::CsrSuppressionStats::default(),
+            )
+            .unwrap();
+    }
+
+    use crate::import::legacy_resume::{resolve, resolve_with, Gap, Resume};
+    use crate::storage::legacy_frontier::{FrontierCommit, LegacyState};
+
+    /// The watcher looks, finds no frontier; the engine then places the
+    /// conversation, writes its frontier and stamps it, all on another handle
+    /// to the same database; the watcher then reads the stored rows. It must get
+    /// the frontier, not "fresh": a fresh import re-chunks from message zero over
+    /// rows that must never be rewritten.
+    #[tokio::test]
+    async fn a_frontier_recorded_between_the_look_and_the_read_is_not_fresh() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-race.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        let before = stored_rows(&engine, &conv);
+        let other = other_importer(&rig);
+
+        let mut engine_saw = None;
+        let watcher = resolve_with(engine.storage(), &src, &conv, &mut |gap| {
+            if gap == Gap::AfterNoFrontier {
+                engine_saw = Some(resolve(&other, &src, &conv).unwrap());
+                finish_import(&other, &src);
+            }
+        })
+        .unwrap();
+
+        let Some(Resume::At(point)) = engine_saw else {
+            panic!("the engine should have placed it: {engine_saw:?}");
+        };
+        assert_eq!(point.after_seq, 3);
+        assert_eq!(
+            watcher,
+            Resume::At(point),
+            "the watcher must not read fresh"
+        );
+        assert_eq!(frontier_rows(&engine), 1);
+        assert_eq!(stored_rows(&engine, &conv), before);
+    }
+
+    /// The same, one step later: the watcher has already computed its own
+    /// candidate (a slow file parse) when the other importer writes a frontier.
+    /// The one stored first stands, and is what the watcher returns.
+    #[tokio::test]
+    async fn the_frontier_stored_first_stands_when_a_slower_importer_computed_its_own() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-race-late.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        let other = other_importer(&rig);
+        let first_chunk = match engine.storage().legacy_state(&src, &conv).unwrap() {
+            LegacyState::Legacy(rows) => rows.first_chunk,
+            state => panic!("expected a legacy conversation, got {state:?}"),
+        };
+
+        // The other importer recorded a different (earlier) place first.
+        let watcher = resolve_with(engine.storage(), &src, &conv, &mut |gap| {
+            if gap == Gap::BeforeCommit {
+                other.record_legacy_frontier(&conv, 1, first_chunk).unwrap();
+            }
+        })
+        .unwrap();
+
+        match watcher {
+            Resume::At(point) => assert_eq!(
+                (point.after_seq, point.first_chunk),
+                (1, first_chunk),
+                "the watcher used its own candidate over the stored one"
+            ),
+            other => panic!("expected the stored frontier, got {other:?}"),
+        }
+        assert_eq!(
+            engine.storage().legacy_frontier(&conv).unwrap(),
+            Some((1, first_chunk))
+        );
+        assert_eq!(frontier_rows(&engine), 1);
+    }
+
+    /// While the watcher computed its candidate the conversation was stamped by
+    /// a scrubbing import: it is not legacy any more, and nothing is recorded.
+    #[tokio::test]
+    async fn a_conversation_stamped_while_a_candidate_was_computed_is_not_given_a_frontier() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-race-stamped.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        let other = other_importer(&rig);
+        let watcher = resolve_with(engine.storage(), &src, &conv, &mut |gap| {
+            if gap == Gap::BeforeCommit {
+                finish_import(&other, &src);
+            }
+        })
+        .unwrap();
+        assert_eq!(watcher, Resume::Fresh);
+        assert_eq!(frontier_rows(&engine), 0);
+    }
+
+    /// A candidate computed from rows that are not the stored rows now is not
+    /// written.
+    #[tokio::test]
+    async fn a_candidate_computed_from_other_rows_is_not_written() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-race-rows.jsonl");
+        let conv = legacy_conversation(&engine, &src).await;
+        let LegacyState::Legacy(mut stale) = engine.storage().legacy_state(&src, &conv).unwrap()
+        else {
+            panic!("expected a legacy conversation");
+        };
+        stale.first_chunk += 1;
+        assert_eq!(
+            engine
+                .storage()
+                .commit_legacy_frontier(&src, &conv, &stale, 3)
+                .unwrap(),
+            FrontierCommit::RowsChanged
+        );
+        assert_eq!(frontier_rows(&engine), 0);
+    }
+
+    fn repeated(word: &str) -> String {
+        format!("{word} ").repeat(600 / (word.len() + 1))
+    }
+
+    /// The newest stored chunk's text also occurs earlier in the transcript.
+    /// The place is the one the earlier chunks lead up to, not the first match.
+    #[tokio::test]
+    async fn repeated_text_is_placed_by_the_chunks_before_it() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-repeat.jsonl");
+        // Each message is a chunk of its own: [P] [Q] [P].
+        let (p, q) = (repeated("alphaword"), repeated("bravoword"));
+        let conv = legacy_conversation_of(&engine, &src, &[p.clone(), q.clone(), p.clone()]).await;
+        drop_receipts(&engine);
+        let before = stored_rows(&engine, &conv);
+        assert_eq!(before.len(), 3);
+
+        append(
+            &src,
+            session_message(10, "freshly appended alpha").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Watcher).await;
+
+        assert_eq!(
+            engine.storage().legacy_frontier(&conv).unwrap(),
+            Some((2, 3)),
+            "placed at the last message, not at the first copy of its text"
+        );
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(
+            after.len(),
+            4,
+            "no stored message was chunked a second time"
+        );
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+    }
+
+    /// A run of identical messages is told apart by walking back through every
+    /// stored chunk to the head of the transcript.
+    #[tokio::test]
+    async fn a_run_of_identical_chunks_is_placed_by_the_whole_stored_chain() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-run.jsonl");
+        let p = repeated("alphaword");
+        let conv = legacy_conversation_of(&engine, &src, &[p.clone(), p.clone()]).await;
+        drop_receipts(&engine);
+        let before = stored_rows(&engine, &conv);
+
+        append(&src, session_message(2, &p).as_bytes());
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Engine).await;
+
+        assert_eq!(
+            engine.storage().legacy_frontier(&conv).unwrap(),
+            Some((1, 2))
+        );
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(after.len(), 3, "the new copy lands once");
+    }
+
+    /// When the stored rows cannot tell the places apart, nothing is guessed:
+    /// the conversation waits, no row is written and no frontier recorded.
+    #[tokio::test]
+    async fn text_the_stored_rows_cannot_place_is_left_unplaced() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-ambiguous.jsonl");
+        let p = repeated("alphaword");
+        let conv = legacy_conversation_of(&engine, &src, &[p.clone(), p.clone()]).await;
+        drop_receipts(&engine);
+        // The head of the conversation is gone from the stored rows.
+        engine
+            .storage()
+            .with_connection(|conn| {
+                conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+                conn.execute(
+                    "DELETE FROM chunks WHERE conversation_id = ?1 AND seq = 0",
+                    [&conv],
+                )?;
+                conn.execute_batch("PRAGMA foreign_keys=ON")?;
+                Ok(())
+            })
+            .unwrap();
+        let before = stored_rows(&engine, &conv);
+
+        append(&src, session_message(2, &p).as_bytes());
+        append(
+            &src,
+            session_message(3, "freshly appended alpha").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Watcher).await;
+
+        assert_eq!(stored_rows(&engine, &conv), before);
+        assert_eq!(engine.storage().legacy_frontier(&conv).unwrap(), None);
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 0);
+        assert_eq!(
+            crate::status::LegacyFrontierStatus::read(engine.storage()).waiting,
+            1
+        );
+    }
+
+    /// `CSR_NO_SECRET_SCRUB` does not switch preservation off: with the scrub
+    /// off the stored rows are still not rewritten (the last one is short, so a
+    /// fresh re-chunk would grow it), and the conversation is not stamped as
+    /// scrub-aware, so turning the scrub back on does not rewrite it either.
+    async fn legacy_rows_survive_the_scrub_switch(via: Via) {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-switch.jsonl");
+        let pem = format!(
+            "{}{}\n{}\n{}{}",
+            "-----BEGIN RSA PRIV",
+            "ATE KEY-----",
+            "Zm9vYmFy".repeat(200),
+            "-----END RSA PRIV",
+            "ATE KEY-----"
+        );
+        let conv = legacy_conversation_of(
+            &engine,
+            &src,
+            &[pem.clone(), pem, "a short last message".to_string()],
+        )
+        .await;
+        let before = stored_rows(&engine, &conv);
+        assert!(stamp_of(&engine, &src).is_none());
+
+        {
+            let _off = crate::redact::DisabledForTest::set(true);
+            append(
+                &src,
+                session_message(10, "freshly appended alpha").as_bytes(),
+            );
+            filetime_touch(&src);
+            import_via(&engine, &rig, &src, via).await;
+        }
+        let during = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(during.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert!(engine.storage().legacy_frontier(&conv).unwrap().is_some());
+        assert_eq!(
+            stamp_of(&engine, &src),
+            None,
+            "a scrub-off import must not stamp a legacy conversation scrub-aware"
+        );
+
+        // The scrub is on again.
+        let token = format!("{}{}", "ghp_", "Q".repeat(36));
+        append(
+            &src,
+            session_message(11, &format!("freshly appended bravo {token}")).as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, via).await;
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert_eq!(chunks_like(&engine, "ghp_"), 0);
+        assert_eq!(chunks_like(&engine, "[secret redacted: github_token]"), 1);
+    }
+
+    #[tokio::test]
+    async fn the_scrub_switch_does_not_unprotect_legacy_rows_in_the_engine_path() {
+        legacy_rows_survive_the_scrub_switch(Via::Engine).await;
+    }
+
+    #[tokio::test]
+    async fn the_scrub_switch_does_not_unprotect_legacy_rows_in_the_watcher_path() {
+        legacy_rows_survive_the_scrub_switch(Via::Watcher).await;
+    }
+
+    /// A malformed line import skipped must not leave the conversation unplaced:
+    /// replay skips what import skips and numbers messages the same way.
+    #[tokio::test]
+    async fn a_malformed_old_line_does_not_leave_a_receiptless_conversation_unplaced() {
+        let rig = Rig::new();
+        let engine = engine_for(&rig).await;
+        let src = rig.source("sess-malformed.jsonl");
+        let mut body: Vec<u8> = Vec::new();
+        let _off = crate::redact::DisabledForTest::set(true);
+        for n in 0..4 {
+            body.extend(
+                session_message(n, &format!("old message {n} {}", repeated("zulu"))).bytes(),
+            );
+            match n {
+                0 => body.extend(b"{this line is not json\n"),
+                1 => body.extend(b"\xff\xfe not utf8 \xc3\x28\n"),
+                _ => {}
+            }
+        }
+        fs::write(&src, body).unwrap();
+        assert!(engine.import_file(&src, "proj").await.unwrap() >= 4);
+        let conv = src.file_stem().unwrap().to_string_lossy().to_string();
+        drop(_off);
+        drop_receipts(&engine);
+        let before = stored_rows(&engine, &conv);
+
+        append(
+            &src,
+            session_message(10, "freshly appended alpha").as_bytes(),
+        );
+        filetime_touch(&src);
+        import_via(&engine, &rig, &src, Via::Watcher).await;
+
+        assert_eq!(
+            engine
+                .storage()
+                .legacy_frontier(&conv)
+                .unwrap()
+                .map(|f| f.0),
+            Some(3),
+            "four messages, numbered the way import numbers them"
+        );
+        let after = stored_rows(&engine, &conv);
+        for row in &before {
+            assert!(after.contains(row), "a stored row changed or went: {row}");
+        }
+        assert_eq!(chunks_like(&engine, "freshly appended alpha"), 1);
+        assert_eq!(chunks_like(&engine, "old message 3"), 1);
     }
 
     /// The import-state check compares mtimes; make sure an append inside the

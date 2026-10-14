@@ -38,6 +38,31 @@ impl MessageIndex {
         parent: Option<&super::ParentContext>,
         needles: &[&str],
     ) -> Result<Self> {
+        Self::read_lines(path, conversation_id, codex, plan, parent, needles, false)
+    }
+
+    /// [`Self::read`] for a transcript the importer has already read: a line it
+    /// cannot parse is skipped and takes no message number, exactly as import
+    /// skips it, so message numbers agree. Provenance backfill keeps the strict
+    /// [`Self::read`]: a record that hides prior context must fail the file.
+    pub(super) fn read_as_imported(
+        path: &Path,
+        conversation_id: &str,
+        needles: &[&str],
+    ) -> Result<Self> {
+        Self::read_lines(path, conversation_id, false, false, None, needles, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_lines(
+        path: &Path,
+        conversation_id: &str,
+        codex: bool,
+        plan: bool,
+        parent: Option<&super::ParentContext>,
+        needles: &[&str],
+        skip_malformed: bool,
+    ) -> Result<Self> {
         let mut documents = vec![
             Document::default(),
             Document::default(),
@@ -172,8 +197,20 @@ impl MessageIndex {
                         continue;
                     }
                     // A malformed record could hide prior context. Fail the file
-                    // closed rather than silently assign a higher assistant floor.
-                    let message: serde_json::Value = serde_json::from_slice(&line)?;
+                    // closed rather than silently assign a higher assistant floor,
+                    // unless the caller replays what import already decided.
+                    let message: serde_json::Value = if skip_malformed {
+                        // Import reads a line as text and skips what is not JSON.
+                        match std::str::from_utf8(&line)
+                            .ok()
+                            .and_then(|text| sonic_rs::from_str(text).ok())
+                        {
+                            Some(message) => message,
+                            None => continue,
+                        }
+                    } else {
+                        serde_json::from_slice(&line)?
+                    };
                     if matches!(
                         message.get("type").and_then(|v| v.as_str()),
                         Some("user" | "human" | "assistant")
@@ -203,11 +240,31 @@ impl MessageIndex {
     /// Map complete-message forward cuts onto an exact stored slice.
     /// Repeated source text is usable only when every occurrence agrees.
     pub(super) fn locate(&self, chunk_id: &str, content: &str) -> Option<ChunkEvidence> {
-        if content.is_empty() {
-            return None;
-        }
         let mut best: Option<ChunkEvidence> = None;
-        for document in &self.documents {
+        for occurrence in self.occurrences(chunk_id, content) {
+            let evidence = occurrence.evidence;
+            // Identical text can occur under different speakers. Never choose
+            // the first/highest-trust occurrence merely because it is earlier.
+            if best.as_ref().is_none_or(|b| {
+                evidence.min_trust < b.min_trust
+                    || (evidence.min_trust == b.min_trust
+                        && evidence.tool_result_share > b.tool_result_share)
+            }) {
+                best = Some(evidence);
+            }
+        }
+        best
+    }
+
+    /// Every place `content` occurs as an exact slice, in document order, with
+    /// the evidence for each. `locate` picks one by trust; a caller that needs
+    /// the place (not the speaker) must not.
+    pub(super) fn occurrences(&self, chunk_id: &str, content: &str) -> Vec<Occurrence> {
+        let mut found = Vec::new();
+        if content.is_empty() {
+            return found;
+        }
+        for (index, document) in self.documents.iter().enumerate() {
             for &start in document
                 .anchors
                 .get(&anchor(content.as_bytes()))
@@ -250,26 +307,39 @@ impl MessageIndex {
                 if spans.is_empty() {
                     continue;
                 }
-                let evidence = ChunkEvidence {
-                    chunk_id: chunk_id.into(),
-                    events,
-                    spans,
-                    min_trust: floor,
-                    tool_result_share: Some(tool_chars as f64 / content.chars().count() as f64),
-                };
-                // Identical text can occur under different speakers. Never choose
-                // the first/highest-trust occurrence merely because it is earlier.
-                if best.as_ref().is_none_or(|b| {
-                    evidence.min_trust < b.min_trust
-                        || (evidence.min_trust == b.min_trust
-                            && evidence.tool_result_share > b.tool_result_share)
-                }) {
-                    best = Some(evidence);
-                }
+                found.push(Occurrence {
+                    document: index,
+                    start,
+                    end,
+                    evidence: ChunkEvidence {
+                        chunk_id: chunk_id.into(),
+                        events,
+                        spans,
+                        min_trust: floor,
+                        tool_result_share: Some(tool_chars as f64 / content.chars().count() as f64),
+                    },
+                });
             }
         }
-        best
+        found
     }
+
+    /// Is `document.text[from..to]` empty or only whitespace? Chunks are stored
+    /// without edge whitespace, so two neighbours can have some between them.
+    pub(super) fn blank_between(&self, document: usize, from: usize, to: usize) -> bool {
+        self.documents
+            .get(document)
+            .and_then(|d| d.text.get(from..to))
+            .is_some_and(|gap| gap.chars().all(char::is_whitespace))
+    }
+}
+
+/// One place a stored chunk's text occurs in the replayed transcript.
+pub(super) struct Occurrence {
+    pub document: usize,
+    pub start: usize,
+    pub end: usize,
+    pub evidence: ChunkEvidence,
 }
 
 fn components(

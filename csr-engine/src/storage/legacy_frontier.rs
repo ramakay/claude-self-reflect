@@ -26,6 +26,32 @@ pub struct LegacyRows {
     pub receipt_seq: Option<usize>,
     /// The newest stored chunk: id and text.
     pub last_chunk: (String, String),
+    /// The stored chunk indexes are exactly `0..n`: the rows are the whole
+    /// opening of the conversation, with none missing.
+    pub from_the_start: bool,
+}
+
+/// What the stored rows say about a conversation, read in one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacyState {
+    /// A frontier is recorded: `(after_seq, first_chunk)`.
+    Placed(usize, usize),
+    /// Chunk rows predate the scrubber and nothing has placed them yet.
+    Legacy(LegacyRows),
+    /// No chunk row predates the scrubber.
+    Fresh,
+}
+
+/// How a frontier commit ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontierCommit {
+    /// The frontier now stored: `(after_seq, first_chunk)`. When another import
+    /// recorded one first this is theirs, not the one offered.
+    Stored(usize, usize),
+    /// The conversation is no longer legacy (a scrub-aware import stamped it).
+    NoLongerLegacy,
+    /// The stored rows are not the ones the candidate was computed from.
+    RowsChanged,
 }
 
 impl super::Storage {
@@ -34,15 +60,81 @@ impl super::Storage {
         self.with_connection(|conn| frontier(conn, conversation_id))
     }
 
-    /// The stored rows of `conversation_id` when it is a conversation the
-    /// scrubber has not touched: chunk rows exist, no frontier row, and its
-    /// import state (`file_path`) carries no scrub stamp.
-    pub fn legacy_rows(
+    /// What the stored rows say about `conversation_id`, in one read snapshot:
+    /// a recorded frontier, chunk rows no scrubber has touched (chunk rows, no
+    /// frontier row, and an import state (`file_path`) with no scrub stamp), or
+    /// neither. A recorded frontier is reported as such, never as "fresh".
+    pub fn legacy_state(
         &self,
         file_path: &std::path::Path,
         conversation_id: &str,
-    ) -> Result<Option<LegacyRows>> {
-        self.with_connection(|conn| legacy_rows(conn, file_path, conversation_id))
+    ) -> Result<LegacyState> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            legacy_state(&tx, file_path, conversation_id)
+        })
+    }
+
+    /// The stored chunks of `conversation_id`, oldest first: id and text.
+    pub fn legacy_chunk_texts(&self, conversation_id: &str) -> Result<Vec<(String, String)>> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM chunks WHERE conversation_id = ?1
+                 ORDER BY seq, rowid",
+            )?;
+            let rows = stmt
+                .query_map(params![conversation_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Record the frontier of a legacy conversation, deciding in one short
+    /// write transaction. `expected` is the state the candidate was computed
+    /// from, outside any transaction: the file parse is slow and another import
+    /// may have got there first. Inside the transaction a frontier already
+    /// stored stands (the first record wins) and is what comes back; a
+    /// conversation that is no longer legacy, or whose rows are not `expected`,
+    /// gets nothing written. A conversation that was waiting to be placed waits
+    /// no more.
+    pub fn commit_legacy_frontier(
+        &self,
+        file_path: &std::path::Path,
+        conversation_id: &str,
+        expected: &LegacyRows,
+        after_seq: usize,
+    ) -> Result<FrontierCommit> {
+        let mut conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let first_chunk = match legacy_state(&tx, file_path, conversation_id)? {
+            LegacyState::Placed(after_seq, first_chunk) => {
+                return Ok(FrontierCommit::Stored(after_seq, first_chunk));
+            }
+            LegacyState::Fresh => return Ok(FrontierCommit::NoLongerLegacy),
+            LegacyState::Legacy(rows) if &rows != expected => {
+                return Ok(FrontierCommit::RowsChanged);
+            }
+            LegacyState::Legacy(rows) => rows.first_chunk,
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO legacy_import_frontier
+             (conversation_id, after_seq, first_chunk, recorded_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                conversation_id,
+                after_seq as i64,
+                first_chunk as i64,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM legacy_import_unplaced WHERE conversation_id = ?1",
+            params![conversation_id],
+        )?;
+        tx.commit()?;
+        Ok(FrontierCommit::Stored(after_seq, first_chunk))
     }
 
     /// Record the frontier of a legacy conversation. The first record stands.
@@ -125,14 +217,25 @@ fn frontier(conn: &Connection, conversation_id: &str) -> Result<Option<(usize, u
         .optional()?)
 }
 
+fn legacy_state(
+    conn: &Connection,
+    file_path: &std::path::Path,
+    conversation_id: &str,
+) -> Result<LegacyState> {
+    if let Some((after_seq, first_chunk)) = frontier(conn, conversation_id)? {
+        return Ok(LegacyState::Placed(after_seq, first_chunk));
+    }
+    Ok(match legacy_rows(conn, file_path, conversation_id)? {
+        Some(rows) => LegacyState::Legacy(rows),
+        None => LegacyState::Fresh,
+    })
+}
+
 fn legacy_rows(
     conn: &Connection,
     file_path: &std::path::Path,
     conversation_id: &str,
 ) -> Result<Option<LegacyRows>> {
-    if frontier(conn, conversation_id)?.is_some() {
-        return Ok(None);
-    }
     let path = file_path.to_string_lossy();
     let (stamped, checkpoint): (bool, i64) = conn
         .query_row(
@@ -146,21 +249,23 @@ fn legacy_rows(
     if stamped {
         return Ok(None);
     }
-    let (rows, max_seq, with_receipt): (i64, Option<i64>, i64) = conn.query_row(
-        "SELECT COUNT(*), MAX(seq),
+    let (rows, min_seq, max_seq, with_receipt): (i64, Option<i64>, Option<i64>, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), MIN(seq), MAX(seq),
                 SUM(EXISTS (SELECT 1 FROM chunk_spans s
                             JOIN provenance_events e ON e.event_id = s.event_id
                             WHERE s.chunk_id = chunks.id AND e.receipt_kind = 'jsonl'))
          FROM chunks WHERE conversation_id = ?1",
-        params![conversation_id],
-        |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-            ))
-        },
-    )?;
+            params![conversation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                ))
+            },
+        )?;
     if rows == 0 {
         return Ok(None);
     }
@@ -188,5 +293,6 @@ fn legacy_rows(
         first_chunk,
         receipt_seq,
         last_chunk,
+        from_the_start: min_seq == Some(0) && max_seq == Some(rows - 1),
     }))
 }

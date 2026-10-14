@@ -6,7 +6,11 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::{provenance_matcher::MessageIndex, ParentContext, ResumePoint};
+use super::{
+    provenance_matcher::{MessageIndex, Occurrence},
+    ResumePoint,
+};
+use crate::storage::legacy_frontier::{FrontierCommit, LegacyRows, LegacyState};
 use crate::storage::Storage;
 
 /// How the next import of one conversation proceeds.
@@ -23,58 +27,190 @@ pub(crate) enum Resume {
     Unplaced,
 }
 
+/// Where `resolve` can be interrupted in a test: the two places a second
+/// importer on the same database can get in between its steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gap {
+    /// After the quick look found no frontier, before the stored rows are read.
+    AfterNoFrontier,
+    /// After the candidate frontier was computed (slow: the transcript is
+    /// parsed), before it is written.
+    BeforeCommit,
+}
+
 /// Decide, and on first sight of a legacy conversation record, the resume
-/// point. Call it under the operation lock, before parsing.
+/// point. Call it under the operation lock, before parsing. The operation lock
+/// is shared, so the watcher and `Engine::import_file` can both be here for the
+/// same conversation; every decision below is made against the stored state in
+/// one read, and the write re-checks it in one short transaction.
 pub(crate) fn resolve(
     storage: &Storage,
     file_path: &Path,
     conversation_id: &str,
-    parent: Option<&ParentContext>,
 ) -> Result<Resume> {
-    if let Some((after_seq, first_chunk)) = storage.legacy_frontier(conversation_id)? {
-        return Ok(Resume::At(ResumePoint {
+    resolve_with(storage, file_path, conversation_id, &mut |_| {})
+}
+
+/// [`resolve`] with `between` called at each [`Gap`], so a test can run a
+/// second importer there.
+pub(crate) fn resolve_with(
+    storage: &Storage,
+    file_path: &Path,
+    conversation_id: &str,
+    between: &mut dyn FnMut(Gap),
+) -> Result<Resume> {
+    let placed = |after_seq, first_chunk| {
+        Resume::At(ResumePoint {
             after_seq,
             first_chunk,
-        }));
-    }
-    // With the scrub off nothing differs from how the rows were cut.
-    if crate::redact::scrub_disabled() {
-        return Ok(Resume::Fresh);
-    }
-    let Some(rows) = storage.legacy_rows(file_path, conversation_id)? else {
-        return Ok(Resume::Fresh);
+        })
     };
-    let after_seq = match rows.receipt_seq {
-        Some(seq) => Some(seq),
-        // A chunk stored before receipts existed, or whose backfill found no
-        // match: find the newest chunk's text in the transcript itself.
-        None => {
-            let (chunk_id, content) = &rows.last_chunk;
-            MessageIndex::read(
-                file_path,
-                conversation_id,
-                false,
-                false,
-                parent,
-                &[content.as_str()],
-            )
-            .ok()
-            .and_then(|index| index.locate(chunk_id, content))
-            .and_then(|evidence| evidence.events.iter().map(|event| event.seq).max())
+    if let Some((after_seq, first_chunk)) = storage.legacy_frontier(conversation_id)? {
+        return Ok(placed(after_seq, first_chunk));
+    }
+    between(Gap::AfterNoFrontier);
+    // Preservation does not depend on `CSR_NO_SECRET_SCRUB`: a row stored before
+    // the scrubber is as unrewritable with the scrub off as with it on.
+    // A few rounds: only a changed row set sends the loop round again.
+    for _ in 0..3 {
+        let rows = match storage.legacy_state(file_path, conversation_id)? {
+            // A frontier recorded since the look above is the answer, never "fresh".
+            LegacyState::Placed(after_seq, first_chunk) => {
+                return Ok(placed(after_seq, first_chunk));
+            }
+            LegacyState::Fresh => return Ok(Resume::Fresh),
+            LegacyState::Legacy(rows) => rows,
+        };
+        let Some(after_seq) = place(storage, file_path, conversation_id, &rows) else {
+            tracing::warn!(
+                file = %file_path.display(),
+                "stored chunks predate the secret scrub and their place in the transcript is unknown; \
+                 import leaves them alone and retries on the next change"
+            );
+            storage.record_legacy_unplaced(conversation_id)?;
+            return Ok(Resume::Unplaced);
+        };
+        between(Gap::BeforeCommit);
+        match storage.commit_legacy_frontier(file_path, conversation_id, &rows, after_seq)? {
+            FrontierCommit::Stored(after_seq, first_chunk) => {
+                return Ok(placed(after_seq, first_chunk));
+            }
+            FrontierCommit::NoLongerLegacy => return Ok(Resume::Fresh),
+            FrontierCommit::RowsChanged => continue,
         }
-    };
-    let Some(after_seq) = after_seq else {
-        tracing::warn!(
-            file = %file_path.display(),
-            "stored chunks predate the secret scrub and their place in the transcript is unknown; \
-             import leaves them alone and retries on the next change"
-        );
-        storage.record_legacy_unplaced(conversation_id)?;
-        return Ok(Resume::Unplaced);
-    };
-    storage.record_legacy_frontier(conversation_id, after_seq, rows.first_chunk)?;
-    Ok(Resume::At(ResumePoint {
-        after_seq,
-        first_chunk: rows.first_chunk,
-    }))
+    }
+    // The rows kept changing under us; nothing was written, try again next change.
+    storage.record_legacy_unplaced(conversation_id)?;
+    Ok(Resume::Unplaced)
+}
+
+/// The highest message sequence the stored rows cover, or `None` when it cannot
+/// be said for certain.
+fn place(
+    storage: &Storage,
+    file_path: &Path,
+    conversation_id: &str,
+    rows: &LegacyRows,
+) -> Option<usize> {
+    // A chunk stored before receipts existed, or whose backfill found no match:
+    // find the stored text in the transcript itself.
+    rows.receipt_seq
+        .or_else(|| place_by_text(storage, file_path, conversation_id, rows))
+}
+
+fn place_by_text(
+    storage: &Storage,
+    file_path: &Path,
+    conversation_id: &str,
+    rows: &LegacyRows,
+) -> Option<usize> {
+    let (chunk_id, content) = &rows.last_chunk;
+    let index =
+        MessageIndex::read_as_imported(file_path, conversation_id, &[content.as_str()]).ok()?;
+    let last = index.occurrences(chunk_id, content);
+    if let Some(seq) = unanimous(&last) {
+        return Some(seq);
+    }
+    if last.is_empty() {
+        return None;
+    }
+    // The newest chunk's text occurs more than once, at places that end at
+    // different messages. The stored rows, in order, say which: the chunk before
+    // it must end just where this one starts, and so back.
+    let stored = storage.legacy_chunk_texts(conversation_id).ok()?;
+    let texts: Vec<&str> = stored.iter().map(|(_, text)| text.as_str()).collect();
+    let index = MessageIndex::read_as_imported(file_path, conversation_id, &texts).ok()?;
+    follow_the_chain(&index, &stored, rows.from_the_start)
+}
+
+/// The one message sequence every occurrence ends at, if they agree.
+fn unanimous(occurrences: &[Occurrence]) -> Option<usize> {
+    let mut seqs = occurrences.iter().map(ends_at);
+    let first = seqs.next()?;
+    seqs.all(|seq| seq == first).then_some(first)
+}
+
+fn ends_at(occurrence: &Occurrence) -> usize {
+    occurrence
+        .evidence
+        .events
+        .iter()
+        .map(|event| event.seq)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Keep, of the places the newest stored chunk could be, those the earlier
+/// stored chunks lead up to without a gap. Stop at the first step where the
+/// survivors agree. When the rows run out first, only a chain that also starts
+/// at the head of the transcript (and rows that hold the conversation from its
+/// first chunk) settles it. Anything else is ambiguous: `None`.
+fn follow_the_chain(
+    index: &MessageIndex,
+    stored: &[(String, String)],
+    from_the_start: bool,
+) -> Option<usize> {
+    let newest = stored.len().checked_sub(1)?;
+    // (message the candidate ends at, document, where the chunk walked back to starts)
+    let mut live: Vec<(usize, usize, usize)> = index
+        .occurrences(&stored[newest].0, &stored[newest].1)
+        .iter()
+        .map(|o| (ends_at(o), o.document, o.start))
+        .collect();
+    for back in 1..=newest {
+        if let Some(seq) = agreed(&live) {
+            return Some(seq);
+        }
+        let (id, text) = &stored[newest - back];
+        let before = index.occurrences(id, text);
+        live = live
+            .iter()
+            .flat_map(|&(seq, document, start)| {
+                before
+                    .iter()
+                    .filter(move |o| {
+                        o.document == document
+                            && o.end <= start
+                            && index.blank_between(document, o.end, start)
+                    })
+                    .map(move |o| (seq, document, o.start))
+            })
+            .collect();
+        if live.is_empty() {
+            return None;
+        }
+    }
+    if let Some(seq) = agreed(&live) {
+        return Some(seq);
+    }
+    if !from_the_start {
+        return None;
+    }
+    live.retain(|&(_, document, start)| index.blank_between(document, 0, start));
+    agreed(&live)
+}
+
+fn agreed(live: &[(usize, usize, usize)]) -> Option<usize> {
+    let first = live.first()?.0;
+    live.iter().all(|c| c.0 == first).then_some(first)
 }
