@@ -1230,4 +1230,144 @@ mod tests {
         assert_eq!(calls(&backend), 4);
         assert_eq!(meta(&storage), before, "a stopped run saves nothing");
     }
+    fn silent() -> Canned {
+        Canned {
+            pages: HashMap::new(),
+            fail_on: None,
+        }
+    }
+
+    fn hours(n: i64) -> chrono::Duration {
+        chrono::Duration::hours(n)
+    }
+
+    #[tokio::test]
+    async fn interleaved_refresh_by_another_process_is_not_overwritten() {
+        use crate::health::{commit_measured, load_health, measure_health, run_health};
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 12);
+        let (search, backend) = (engine(), silent());
+
+        let first = run_health(&storage, &search, &backend, false, now(), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        let a_id = first.snapshot.sample.unwrap().sample_id;
+
+        // this run starts against sample A and is slow...
+        let stale = measure_health(&storage, &search, &backend, false, now() + hours(1), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        // ...meanwhile another process refreshes to sample B and records its verdict
+        let other = run_health(&storage, &search, &backend, true, now() + hours(2), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        let b_id = other.snapshot.sample.unwrap().sample_id;
+        assert_ne!(a_id, b_id);
+
+        // the slow run saves last: it must not write over B or B's verdict
+        assert!(commit_measured(&storage, &stale).unwrap().is_none());
+        let after = load_health(&storage).unwrap();
+        assert_eq!(after.sample.unwrap().sample_id, b_id);
+        assert_eq!(
+            after.state.probe.unwrap().sample_id.as_deref(),
+            Some(b_id.as_str())
+        );
+        assert_eq!(
+            after.runs.len(),
+            2,
+            "A's run and B's run; the stale run left no record"
+        );
+        assert_eq!(after.runs[1].sample_id.as_deref(), Some(b_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn two_first_enrollments_leave_exactly_the_first_sample() {
+        use crate::health::{commit_measured, load_health, measure_health};
+        let storage = Storage::open_memory().unwrap();
+        seed_users(&storage, 12);
+        let (search, backend) = (engine(), silent());
+        let one = measure_health(&storage, &search, &backend, false, now(), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        let two = measure_health(&storage, &search, &backend, false, now() + hours(1), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_id = one.probe.sample_id.clone().unwrap();
+        assert_ne!(Some(first_id.clone()), two.probe.sample_id);
+
+        assert!(commit_measured(&storage, &one).unwrap().is_some());
+        assert!(commit_measured(&storage, &two).unwrap().is_none());
+        let stored = load_health(&storage).unwrap();
+        assert_eq!(stored.sample.unwrap().sample_id, first_id);
+        assert_eq!(stored.state.probe.unwrap().sample_id, Some(first_id));
+        assert_eq!(stored.runs.len(), 1);
+    }
+
+    /// While the first measurement is searching, another process stores its own
+    /// enrollment (committed here, on the first search).
+    struct Racer {
+        storage: Arc<Storage>,
+        pending: std::sync::Mutex<Option<crate::health::Measured>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProbeBackend for Racer {
+        async fn final_page(&self, _query: &str) -> Result<Vec<String>> {
+            if let Some(other) = self.pending.lock().unwrap().take() {
+                assert!(crate::health::commit_measured(&self.storage, &other)
+                    .unwrap()
+                    .is_some());
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_commit_is_measured_again_against_the_stored_sample() {
+        use crate::health::{load_health, measure_health, run_health};
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        seed_users(&storage, 12);
+        let search = engine();
+        let other = measure_health(
+            &storage,
+            &search,
+            &silent(),
+            false,
+            now() + hours(1),
+            &NEVER,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let other_id = other.probe.sample_id.clone().unwrap();
+        let racer = Racer {
+            storage: storage.clone(),
+            pending: std::sync::Mutex::new(Some(other)),
+        };
+        let run = run_health(&storage, &search, &racer, false, now(), &NEVER)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.probe.sample_id.as_deref(), Some(other_id.as_str()));
+        let stored = load_health(&storage).unwrap();
+        assert_eq!(
+            stored.sample.unwrap().sample_id,
+            other_id,
+            "the first enrollment won"
+        );
+        assert_eq!(
+            stored.runs.len(),
+            2,
+            "its own verdict, then the repeat against it"
+        );
+        assert!(stored
+            .runs
+            .iter()
+            .all(|r| r.sample_id.as_deref() == Some(other_id.as_str())));
+    }
 }

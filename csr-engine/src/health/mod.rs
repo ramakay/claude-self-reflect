@@ -200,30 +200,64 @@ pub fn load_health(storage: &Storage) -> Result<HealthSnapshot> {
     })
 }
 
-/// Persist the health meta in one transaction. The history is bounded to the
-/// last seven records here, so no caller can grow it.
-pub fn save_health(storage: &Storage, snapshot: &HealthSnapshot) -> Result<()> {
+/// Write the three keys on `conn`, the history bounded to the last seven
+/// records. The caller owns the transaction.
+fn write_snapshot(conn: &Connection, snapshot: &HealthSnapshot) -> Result<()> {
     let mut runs = snapshot.runs.clone();
     if runs.len() > RUN_HISTORY {
         runs.drain(..runs.len() - RUN_HISTORY);
     }
-    let state = serde_json::to_string(&snapshot.state)?;
-    let runs = serde_json::to_string(&runs)?;
-    let sample = snapshot
-        .sample
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
+    queries::set_meta(conn, META_HEALTH, &serde_json::to_string(&snapshot.state)?)?;
+    queries::set_meta(conn, META_RUNS, &serde_json::to_string(&runs)?)?;
+    if let Some(sample) = &snapshot.sample {
+        queries::set_meta(conn, META_SAMPLE, &serde_json::to_string(sample)?)?;
+    }
+    Ok(())
+}
+
+/// Persist the health meta in one transaction. The history is bounded to the
+/// last seven records here, so no caller can grow it. This overwrites what is
+/// stored; a measurement that ran concurrently with another process goes
+/// through [`update_health`] instead.
+pub fn save_health(storage: &Storage, snapshot: &HealthSnapshot) -> Result<()> {
     storage.with_connection(|conn| {
         let tx = conn.unchecked_transaction()?;
-        queries::set_meta(&tx, META_HEALTH, &state)?;
-        queries::set_meta(&tx, META_RUNS, &runs)?;
-        if let Some(sample) = &sample {
-            queries::set_meta(&tx, META_SAMPLE, sample)?;
-        }
+        write_snapshot(&tx, snapshot)?;
         tx.commit()?;
         Ok(())
     })
+}
+
+/// Read, change and write the health meta in one write transaction taken up
+/// front (`BEGIN IMMEDIATE`), so a second process cannot slip a write between
+/// the read and the write. `change` sees what is stored now, not what this
+/// process read earlier, and returns `None` to write nothing.
+pub fn update_health<T>(
+    storage: &Storage,
+    change: impl FnOnce(&mut HealthSnapshot) -> Option<T>,
+) -> Result<Option<T>> {
+    storage.with_connection(|conn| {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let mut snapshot = HealthSnapshot {
+            state: read_json(&tx, META_HEALTH)?.unwrap_or_default(),
+            runs: read_json(&tx, META_RUNS)?.unwrap_or_default(),
+            sample: read_json(&tx, META_SAMPLE)?,
+        };
+        let Some(out) = change(&mut snapshot) else {
+            return Ok(None);
+        };
+        write_snapshot(&tx, &snapshot)?;
+        tx.commit()?;
+        Ok(Some(out))
+    })
+}
+
+/// The id of a frozen sample: one with enough cases to have been stored.
+fn frozen_id(sample: Option<&ProbeSample>) -> Option<String> {
+    sample
+        .filter(|sample| sample.cases.len() >= probe::SAMPLE_MIN)
+        .map(|sample| sample.sample_id.clone())
 }
 
 /// Exact-content duplicate rate over every `chunks` row (SQLite BINARY
@@ -274,44 +308,59 @@ pub fn config_identity() -> String {
     )
 }
 
-/// One full measurement: the canary for this binary, the duplicate rate and
-/// the recall probe, persisted together. A probe error is recorded beside the
-/// previous completed result and never overwrites it. `refresh_sample`
-/// deliberately creates a new sample (see `probe::load_or_create_sample`).
-pub async fn run_health(
+/// What one measurement found, before it is written.
+#[derive(Debug, Clone)]
+pub(crate) struct Measured {
+    at: String,
+    canary: CanaryRecord,
+    duplicates: Option<DuplicateReport>,
+    probe: ProbeReport,
+    /// The frozen sample stored when this run began (`None` when there was
+    /// none). The result is only valid while that is still the stored one.
+    base_sample: Option<String>,
+    /// A sample this run created and means to store.
+    new_sample: Option<ProbeSample>,
+}
+
+/// Measure: the canary for this binary, the duplicate rate and the recall
+/// probe. Nothing is written. `None` when `cancel` was raised.
+pub(crate) async fn measure_health(
     storage: &Storage,
     search: &Arc<RwLock<SearchEngine>>,
     backend: &dyn probe::ProbeBackend,
     refresh_sample: bool,
     now: DateTime<Utc>,
     cancel: &AtomicBool,
-) -> Result<Option<HealthRun>> {
-    let mut snapshot = load_health(storage)?;
+) -> Result<Option<Measured>> {
+    let snapshot = load_health(storage)?;
     let at = now.to_rfc3339();
 
     let canary = crate::eval::contamination::emitter_canary();
-    snapshot.state.canary = Some(CanaryRecord {
+    let canary = CanaryRecord {
         at: at.clone(),
         passed: canary.passed,
         detail: canary.detail,
-    });
+    };
     if cancel.load(Ordering::SeqCst) {
         return Ok(None);
     }
-    match duplicate_report(storage) {
+    let duplicates = match duplicate_report(storage) {
         Ok(mut report) => {
             report.at = at.clone();
-            snapshot.state.duplicates = Some(report);
+            Some(report)
         }
-        Err(error) => tracing::warn!(%error, "duplicate-rate measurement failed"),
-    }
+        Err(error) => {
+            tracing::warn!(%error, "duplicate-rate measurement failed");
+            None
+        }
+    };
 
     let load = probe::load_or_create_sample(storage, &snapshot, refresh_sample, now)?;
     if let Some(note) = &load.note {
         tracing::warn!("{note}");
     }
     let sample_id = load.frozen.then(|| load.sample.sample_id.clone());
-    let Some(report) = probe::run_probe(
+    let Some(probe) = probe::run_probe(
         storage,
         search,
         backend,
@@ -327,25 +376,80 @@ pub async fn run_health(
     if cancel.load(Ordering::SeqCst) {
         return Ok(None);
     }
-    if load.created {
-        snapshot.sample = Some(load.sample);
-    }
-    snapshot.state.version = 1;
-    snapshot.state.last_attempt_at = Some(at);
-    snapshot.state.config = Some(config_identity());
-    if report.grade == ProbeGrade::Error {
-        snapshot.state.last_probe_error = Some(report.clone());
-    } else {
-        let rate = snapshot.state.duplicates.as_ref().and_then(|d| d.rate);
-        snapshot.runs.push(RunRecord::from_probe(&report, rate));
-        snapshot.state.probe = Some(report.clone());
-        snapshot.state.last_probe_error = None;
-    }
-    save_health(storage, &snapshot)?;
-    Ok(Some(HealthRun {
-        snapshot,
-        probe: report,
+    Ok(Some(Measured {
+        at,
+        canary,
+        duplicates,
+        probe,
+        base_sample: frozen_id(snapshot.sample.as_ref()),
+        new_sample: load.created.then_some(load.sample),
     }))
+}
+
+/// Write a measurement into what is stored NOW, in one write transaction.
+/// `None` (and nothing written) when the stored sample is no longer the one
+/// the run began with: another process refreshed it, or enrolled one first.
+/// A new sample is stored only where none was; a verdict is stored only for
+/// the sample it was measured against.
+pub(crate) fn commit_measured(storage: &Storage, measured: &Measured) -> Result<Option<HealthRun>> {
+    update_health(storage, |snapshot| {
+        if frozen_id(snapshot.sample.as_ref()) != measured.base_sample {
+            return None;
+        }
+        if let Some(sample) = &measured.new_sample {
+            snapshot.sample = Some(sample.clone());
+        }
+        let state = &mut snapshot.state;
+        state.version = 1;
+        state.last_attempt_at = Some(measured.at.clone());
+        state.config = Some(config_identity());
+        state.canary = Some(measured.canary.clone());
+        if measured.duplicates.is_some() {
+            state.duplicates = measured.duplicates.clone();
+        }
+        let report = measured.probe.clone();
+        if report.grade == ProbeGrade::Error {
+            state.last_probe_error = Some(report.clone());
+        } else {
+            let rate = state.duplicates.as_ref().and_then(|d| d.rate);
+            state.probe = Some(report.clone());
+            state.last_probe_error = None;
+            snapshot.runs.push(RunRecord::from_probe(&report, rate));
+        }
+        Some(HealthRun {
+            snapshot: snapshot.clone(),
+            probe: report,
+        })
+    })
+}
+
+/// One full measurement, persisted. A probe error is recorded beside the
+/// previous completed result and never overwrites it. `refresh_sample`
+/// deliberately creates a new sample (see `probe::load_or_create_sample`).
+/// If another process changed the stored sample meanwhile, this run's verdict
+/// is dropped and the measurement is repeated once against the stored sample;
+/// a second conflict is an error. `None` when `cancel` was raised.
+pub async fn run_health(
+    storage: &Storage,
+    search: &Arc<RwLock<SearchEngine>>,
+    backend: &dyn probe::ProbeBackend,
+    refresh_sample: bool,
+    now: DateTime<Utc>,
+    cancel: &AtomicBool,
+) -> Result<Option<HealthRun>> {
+    for attempt in 0..2 {
+        // a repeat has nothing to refresh: the other process already did
+        let refresh = refresh_sample && attempt == 0;
+        let Some(measured) = measure_health(storage, search, backend, refresh, now, cancel).await?
+        else {
+            return Ok(None);
+        };
+        if let Some(run) = commit_measured(storage, &measured)? {
+            return Ok(Some(run));
+        }
+        tracing::warn!("the stored recall sample changed during the measurement; measuring again");
+    }
+    anyhow::bail!("the stored recall sample kept changing during the measurement")
 }
 
 /// How many five-minute ticks a due measurement waits for a due dream pass
@@ -375,14 +479,16 @@ pub fn defer_for_dream(dream_pending: bool, deferred_ticks: u32) -> bool {
 /// database-free to evaluate; only the record is written.
 pub fn record_canary(storage: &Storage, now: DateTime<Utc>) -> Result<()> {
     let canary = crate::eval::contamination::emitter_canary();
-    let mut snapshot = load_health(storage)?;
-    snapshot.state.version = 1;
-    snapshot.state.canary = Some(CanaryRecord {
-        at: now.to_rfc3339(),
-        passed: canary.passed,
-        detail: canary.detail,
-    });
-    save_health(storage, &snapshot)
+    update_health(storage, |snapshot| {
+        snapshot.state.version = 1;
+        snapshot.state.canary = Some(CanaryRecord {
+            at: now.to_rfc3339(),
+            passed: canary.passed,
+            detail: canary.detail,
+        });
+        Some(())
+    })?;
+    Ok(())
 }
 
 /// What one cadence check did.
