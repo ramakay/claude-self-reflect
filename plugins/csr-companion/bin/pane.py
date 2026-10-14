@@ -1688,6 +1688,24 @@ def start_refresh(binary, transcript, cwd):
         return None
 
 
+REFRESH_NOTE_LIFE = 15  # seconds the pane keeps the row saying a refresh found nothing new
+
+
+def map_stamp(smap):
+    """Which telling a Shift Map is: its (rev, at); None with no map."""
+    return (smap['rev'], smap['at']) if smap else None
+
+
+def refresh_ended(proc, before, smap):
+    """What a refresh that has just ended tells the person, or None when it made a new telling. `before` is the
+    map's map_stamp when it started; unchanged now means csr-engine wrote nothing (it exits 0 when it skips)."""
+    if map_stamp(smap) != before:
+        return None
+    if proc.poll() == 0:
+        return 'no new shift map: nothing asked since its telling'
+    return 'the shift map was not updated: the refresh did not finish'
+
+
 RETOLD = 'next at compact'  # when csr-engine tells the story again: after a compaction (and at the session's end)
 
 
@@ -4549,6 +4567,9 @@ def page_main(data, s, now, ui=None):
                                          hint=SHIFT_HINT))
             if data.get('refreshing'):
                 told.append(dict(key='shiftrefreshing', title='updating the shift map…', lines=1, quiet=True, unrated=True,
+                                 detail=[], send='', nosend=True))
+            elif data.get('refresh_note'):  # a refresh that ended with nothing new says so, for REFRESH_NOTE_LIFE seconds
+                told.append(dict(key='shiftrefreshnote', title=data['refresh_note'], lines=1, quiet=True, unrated=True,
                                  detail=[], send='', nosend=True))
             elif data.get('can_refresh') and refresh_news(story_map, s):  # only with news: you asked something since
                 told.append(dict(key='shiftrefresh', title=refresh_label(data.get('story_cost')), lines=1, quiet=True,
@@ -7523,6 +7544,8 @@ class Pane:
         self.map_motion = MapMotion()  # the Shift Map's arrival, draw-on and fold
         self.map_due, self.animating = None, False  # when it next changes, and whether it is drawing on now
         self.refresh = None  # the csr-engine process of a refresh the pane started, until it ends
+        self.refresh_from = None  # the map_stamp of the Shift Map when that refresh started
+        self.refresh_note = None  # (words, until): what a refresh that ended with nothing new says, for a while
 
     def phone(self, cols, rows, now):
         """Whether herdr shows this pane on a phone now: read from its layout on a new size, else at most every
@@ -7553,7 +7576,11 @@ class Pane:
             self.data['story'] = session_story(self.session and self.session.id)
             self.data['story_map'] = session_story_map(self.session and self.session.id)
             self.data['refreshing'] = bool(self.refresh and self.refresh.poll() is None)
+            if self.refresh and not self.data['refreshing']:  # it just ended: a new telling shows itself, none says so
+                words = refresh_ended(self.refresh, self.refresh_from, self.data['story_map'])
+                self.refresh_note = (words, now + REFRESH_NOTE_LIFE) if words else None
             self.refresh = self.refresh if self.data['refreshing'] else None
+            self.data['refresh_note'] = self.refresh_note[0] if self.refresh_note and now < self.refresh_note[1] else None
             self.data['can_refresh'] = bool(self.session and self.session.path and engine_binary())
             self.data['agents'] = fail_open(agents_of, agents_lib.empty(), self.session and self.session.id)
             self.data['codex'] = fail_open(codex_lib.codex_snapshot, None, HOME, now)  # None: no ~/.codex, no section
@@ -7614,7 +7641,7 @@ class Pane:
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
                           self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.data.get('story_map'), self.data.get('map_view'),
-                          self.data.get('refreshing'), self.data.get('can_refresh'), self.data.get('story_cost'), self.held, self.data.get('agents'), self.data.get('codex'),
+                          self.data.get('refreshing'), self.data.get('refresh_note'), self.data.get('can_refresh'), self.data.get('story_cost'), self.held, self.data.get('agents'), self.data.get('codex'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
                           value_pieces(self.data.get('value')),  # what it says: the dollars under it move each step
@@ -7795,8 +7822,10 @@ class Pane:
             self.feed.back(act['back'], time.time())
             self.open, self.hold, self.main_top = None, None, 0
         elif act.get('refresh'):  # the shift map's refresh: csr-engine tells the story again, detached; the pane waits
-            self.refresh = self.refresh or start_refresh(engine_binary(), getattr(self.session, 'path', None),
-                                                         ((getattr(self.session, 'record', None) or {}).get('cwd')) or self.root)
+            if not self.refresh:
+                self.refresh = start_refresh(engine_binary(), getattr(self.session, 'path', None),
+                                             ((getattr(self.session, 'record', None) or {}).get('cwd')) or self.root)
+                self.refresh_from, self.refresh_note = map_stamp((self.data or {}).get('story_map')), None
         elif act['key'] != self.open:
             self.open, self.sent = act['key'], None
             self.anchor = (act['key'], row) if self.view == 'main' else None

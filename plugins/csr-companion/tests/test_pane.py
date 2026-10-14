@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -5144,6 +5145,49 @@ class ShiftMapRefreshAndLikes(unittest.TestCase):
             proc.poll = lambda: 0
             self.frame(box)
             self.assertEqual((box.data['refreshing'], box.refresh), (False, None))
+
+    def test_a_refresh_that_ends_with_no_new_telling_says_so_for_a_few_seconds(self):
+        smap = self.smap()
+        box = self.pane_over(self.fresh(), session_story_map=lambda sid: smap)
+        box.session.path = '/t/x.jsonl'
+        with mock.patch.object(pane, 'engine_binary', lambda: '/bin/e'):
+            box.refresh, box.refresh_from = types.SimpleNamespace(poll=lambda: None), pane.map_stamp(smap)
+            self.frame(box)
+            self.assertIsNone(box.data['refresh_note'])  # still running: the row says "updating"
+            box.refresh = types.SimpleNamespace(poll=lambda: 0)  # ended, and the telling is the one it started from
+            self.frame(box)
+            self.assertEqual(box.data['refresh_note'], 'no new shift map: nothing asked since its telling')
+            self.assertIsNone(box.refresh)
+            self.frame(box)  # and it stays for its life, with the process gone
+            self.assertEqual(box.data['refresh_note'], 'no new shift map: nothing asked since its telling')
+            words, until = box.refresh_note
+            self.assertAlmostEqual(until - time.time(), pane.REFRESH_NOTE_LIFE, delta=3)
+            box.refresh_note = (words, time.time() - 1)
+            self.frame(box)
+            self.assertIsNone(box.data['refresh_note'])
+
+    def test_a_refresh_that_made_a_new_telling_or_failed_is_told_apart(self):
+        smap = self.smap()
+        box = self.pane_over(self.fresh(), session_story_map=lambda sid: smap)
+        box.session.path = '/t/x.jsonl'
+        with mock.patch.object(pane, 'engine_binary', lambda: '/bin/e'):
+            box.refresh, box.refresh_from = types.SimpleNamespace(poll=lambda: 0), (smap['rev'] - 1, smap['at'])
+            self.frame(box)
+            self.assertIsNone(box.data['refresh_note'])  # the new map is the answer
+            box.refresh, box.refresh_from = types.SimpleNamespace(poll=lambda: 1), pane.map_stamp(smap)
+            self.frame(box)
+            self.assertEqual(box.data['refresh_note'], 'the shift map was not updated: the refresh did not finish')
+
+    def test_the_note_takes_the_controls_place_while_it_lasts(self):
+        news = dict(can_refresh=True, story_cost=None)
+        words = 'no new shift map: nothing asked since its telling'
+        got = self.items(prompts=[1995.0], more=dict(news, refresh_note=words))
+        self.assertEqual(got['shiftrefreshnote']['title'], words)
+        self.assertTrue(got['shiftrefreshnote']['nosend'] and not got['shiftrefreshnote'].get('refresh'))
+        self.assertNotIn('shiftrefresh', got)
+        back = self.items(prompts=[1995.0], more=dict(news, refresh_note=None))
+        self.assertIn('shiftrefresh', back)
+        self.assertNotIn('shiftrefreshnote', back)
 
 
 class StoryNews(unittest.TestCase):
