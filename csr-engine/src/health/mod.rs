@@ -10,7 +10,14 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
+
+use crate::search::SearchEngine;
 use crate::storage::{queries, Storage};
+
+pub mod probe;
 
 /// Latest canary, duplicate and probe results, with timestamps.
 pub const META_HEALTH: &str = "memory_health_v1";
@@ -254,6 +261,76 @@ pub fn health_due(storage: &Storage, now: DateTime<Utc>) -> bool {
         Some(at) => now - at >= Duration::hours(HEALTH_INTERVAL_HOURS),
         None => true,
     }
+}
+
+/// Engine version and the search settings the numbers were taken under.
+pub fn config_identity() -> String {
+    format!(
+        "engine={};search_mode={};trained_rerank={}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::var("CSR_SEARCH_MODE").unwrap_or_else(|_| "default".into()),
+        crate::search::trained_rerank::trained_rerank_requested()
+    )
+}
+
+/// One full measurement: the canary for this binary, the duplicate rate and
+/// the recall probe, persisted together. A probe error is recorded beside the
+/// previous completed result and never overwrites it. `refresh_sample`
+/// deliberately creates a new sample (see `probe::load_or_create_sample`).
+pub async fn run_health(
+    storage: &Storage,
+    search: &Arc<RwLock<SearchEngine>>,
+    backend: &dyn probe::ProbeBackend,
+    refresh_sample: bool,
+    now: DateTime<Utc>,
+) -> Result<HealthSnapshot> {
+    let mut snapshot = load_health(storage)?;
+    let at = now.to_rfc3339();
+
+    let canary = crate::eval::contamination::emitter_canary();
+    snapshot.state.canary = Some(CanaryRecord {
+        at: at.clone(),
+        passed: canary.passed,
+        detail: canary.detail,
+    });
+    match duplicate_report(storage) {
+        Ok(mut report) => {
+            report.at = at.clone();
+            snapshot.state.duplicates = Some(report);
+        }
+        Err(error) => tracing::warn!(%error, "duplicate-rate measurement failed"),
+    }
+
+    let load = probe::load_or_create_sample(storage, &snapshot, refresh_sample, now)?;
+    if let Some(note) = &load.note {
+        tracing::warn!("{note}");
+    }
+    let sample_id = load.frozen.then(|| load.sample.sample_id.clone());
+    let report = probe::run_probe(
+        storage,
+        search,
+        backend,
+        sample_id.as_deref(),
+        &load.sample.cases,
+        now,
+    )
+    .await;
+    if load.created {
+        snapshot.sample = Some(load.sample);
+    }
+    snapshot.state.version = 1;
+    snapshot.state.last_attempt_at = Some(at);
+    snapshot.state.config = Some(config_identity());
+    if report.grade == ProbeGrade::Error {
+        snapshot.state.last_probe_error = Some(report);
+    } else {
+        let rate = snapshot.state.duplicates.as_ref().and_then(|d| d.rate);
+        snapshot.runs.push(RunRecord::from_probe(&report, rate));
+        snapshot.state.probe = Some(report);
+        snapshot.state.last_probe_error = None;
+    }
+    save_health(storage, &snapshot)?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]
