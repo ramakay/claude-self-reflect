@@ -481,9 +481,12 @@ pub(crate) fn displayed_receipts(
     const MAX_CLAIM_CHARS: usize = 100;
     let render = |done: &crate::hooks::stop::CompletionReceipt| {
         let receipt = normalize_feed_text(&done.receipt);
-        let claim = extractable(&done.claim)
-            .filter(|claim| !crate::import::contamination::has_csr_text(claim))
-            .map(|claim| sanitize_preview(&claim))?;
+        // The detector reads the claim as stored, before extraction trims it:
+        // an indented claim is code the detector leaves alone.
+        if crate::import::contamination::has_csr_text(&done.claim) {
+            return None;
+        }
+        let claim = extractable(&done.claim).map(|claim| sanitize_preview(&claim))?;
         (!receipt.is_empty() && has_substance(&claim) && claim.chars().count() <= MAX_CLAIM_CHARS)
             .then(|| format!("{} ({receipt})", claim.trim_end_matches(TRAILING_JUNK)))
     };
@@ -1577,6 +1580,26 @@ mod tests {
             recap.contains("Implemented deterministic recap output"),
             "{recap}"
         );
+    }
+
+    /// The detector reads the claim as it was stored, before extraction trims
+    /// it: an indented claim is code the detector leaves alone and still renders;
+    /// the same claim unindented is CSR text and does not.
+    #[test]
+    fn an_indented_claim_still_renders_and_the_unindented_one_does_not() {
+        let rule = "A standing rule from 10-12: “Keep receipts”";
+        let recap_with = |claim: String| {
+            let mut ep = episode();
+            ep.completions = vec![CompletionReceipt {
+                claim,
+                receipt: "abc1234".into(),
+            }];
+            compose_recap(&ep, &RecapFeeds::empty(), "now").unwrap()
+        };
+        let indented = recap_with(format!("    {rule}"));
+        assert!(indented.contains("Keep receipts"), "{indented}");
+        let plain = recap_with(rule.to_string());
+        assert!(!plain.contains("Keep receipts"), "{plain}");
     }
 
     #[test]
