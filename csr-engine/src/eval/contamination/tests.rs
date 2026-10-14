@@ -251,3 +251,106 @@ fn stored_chunks_must_be_the_expected_text_byte_for_byte() {
     };
     assert_eq!(stored_by_import(&tool), Ok(None));
 }
+
+// --- the companion's agents envelope, from the real Python formatter ---
+
+#[test]
+fn plugin_agents_context_and_handoff_fixtures_are_detected() {
+    let document = agents_document();
+    assert_eq!(document.formatter, "plugin_agents_v1");
+    let mut seen = Vec::new();
+    for (name, fixture) in &document.fixtures {
+        seen.push(name.as_str());
+        let hits = detect(&fixture.text);
+        let reasons: Vec<_> = hits.iter().map(|hit| hit.reason).collect();
+        assert_eq!(
+            reasons,
+            [
+                ContaminationReason::PluginAgentsEnvelope,
+                ContaminationReason::PluginAgentsEnvelope
+            ],
+            "{name}: the opening and closing marker lines, and nothing between them"
+        );
+        assert_eq!(hits[0].start_byte, 0, "{name}");
+        assert_eq!(
+            &fixture.text[hits[0].start_byte..hits[0].end_byte],
+            "[[CSR:AGENTS:v1]]\n"
+        );
+        assert_eq!(
+            &fixture.text[hits[1].start_byte..hits[1].end_byte],
+            "[[/CSR:AGENTS:v1]]\n"
+        );
+        assert_eq!(hits[1].end_byte, fixture.text.len(), "{name}");
+    }
+    assert_eq!(seen, ["context", "handoff"]);
+    // the canary reports both
+    let report = run_canary();
+    assert_eq!((report.agents_generated, report.agents_correct), (2, 2));
+    assert!(report.failures.is_empty(), "{:#?}", report.failures);
+}
+
+#[test]
+fn plugin_agents_fixtures_import_byte_identical() {
+    for (name, fixture) in &agents_document().fixtures {
+        for channel in ["user_text", "assistant_text"] {
+            let case = Case {
+                id: format!("agents-{name}-{channel}"),
+                source: "conversation".to_string(),
+                channel: channel.to_string(),
+                input: fixture.text.clone(),
+                expected: fixture.text.clone(),
+                reason: Some(ContaminationReason::PluginAgentsEnvelope),
+            };
+            run_case(&case).unwrap();
+            let stored = stored_by_import(&case).unwrap().unwrap();
+            assert!(
+                chunks_are_exactly(&stored, &fixture.text),
+                "{name} via {channel} was not stored byte for byte: {stored:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn plugin_agents_production_fixture_digest_matches() {
+    use sha2::{Digest, Sha256};
+    let hex = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    let document = agents_document();
+    assert!(agents_failures().is_empty(), "{:#?}", agents_failures());
+    for (name, fixture) in &document.fixtures {
+        assert_eq!(hex(fixture.text.as_bytes()), fixture.sha256, "{name}");
+    }
+    assert_eq!(document.source_digest.len(), 64);
+
+    // With the plugin beside the crate, the engine's copy is the plugin's file
+    // and the plugin's own check passes: the fixture is what bin/agents.py
+    // writes now.
+    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/csr-companion");
+    let copy = plugin.join("tests/fixtures/emissions/agents-v1.json");
+    let Ok(plugin_text) = std::fs::read_to_string(&copy) else {
+        return; // packaged without the plugin beside it
+    };
+    assert_eq!(
+        plugin_text,
+        include_str!("../../../tests/fixtures/contamination/agents-v1.json"),
+        "the engine's copy of agents-v1.json differs from the plugin's"
+    );
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-B"])
+        .arg(plugin.join("tests/export-agent-emissions.py"))
+        .arg("--check")
+        .output();
+    match output {
+        Ok(output) => assert!(
+            output.status.success(),
+            "agents-v1.json is not what bin/agents.py writes now: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => eprintln!("python3 unavailable, digest check skipped: {error}"),
+    }
+}

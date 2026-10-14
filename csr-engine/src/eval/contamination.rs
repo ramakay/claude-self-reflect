@@ -36,6 +36,11 @@ const CASES_JSONL: &str = include_str!("../../tests/fixtures/contamination/cases
 /// keeps an identical copy; this one keeps the crate self-contained.
 const PANE_JSON: &str = include_str!("../../tests/fixtures/contamination/pane-v1.json");
 
+/// The companion's agents envelopes (context and handoff), written by the real
+/// Python formatter (`plugins/csr-companion/tests/export-agent-emissions.py`).
+/// Identical to the plugin's copy; this one keeps the crate self-contained.
+const AGENTS_JSON: &str = include_str!("../../tests/fixtures/contamination/agents-v1.json");
+
 /// Prefix of the generated rows in `cases.jsonl`.
 pub const MATRIX_PREFIX: &str = "matrix-";
 
@@ -774,6 +779,79 @@ pub fn pane_document() -> PaneDocument {
     serde_json::from_str(PANE_JSON).expect("pane-v1.json")
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentsFixture {
+    pub text: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentsDocument {
+    pub schema: String,
+    pub formatter: String,
+    /// SHA-256 of the Python formatter's source and constants, recorded by the
+    /// exporter (`--check` recomputes it).
+    pub source_digest: String,
+    /// `context` and `handoff`, in that order.
+    pub fixtures: std::collections::BTreeMap<String, AgentsFixture>,
+}
+
+pub fn agents_document() -> AgentsDocument {
+    serde_json::from_str(AGENTS_JSON).expect("agents-v1.json")
+}
+
+/// Why the agents envelopes the plugin wrote are not read right, empty when
+/// they are: each text must match its recorded digest, be found from its first
+/// byte as the registered `plugin_agents_v1` marker lines, and be stored by the
+/// real import parser byte for byte, as the person's text and as Claude's.
+pub fn agents_failures() -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let document = agents_document();
+    let mut failures = Vec::new();
+    if document.formatter != "plugin_agents_v1" {
+        failures.push(format!(
+            "agents-v1.json is for `{}`, not plugin_agents_v1",
+            document.formatter
+        ));
+    }
+    for (name, fixture) in &document.fixtures {
+        let digest: String = Sha256::digest(fixture.text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        if digest != fixture.sha256 {
+            failures.push(format!(
+                "agents-{name}: the fixture text does not match its recorded sha256"
+            ));
+        }
+        let hits = detect(&fixture.text);
+        let marker_lines = hits.len() == 2
+            && hits
+                .iter()
+                .all(|hit| hit.reason == ContaminationReason::PluginAgentsEnvelope);
+        if !marker_lines || hits.first().map(|hit| hit.start_byte) != Some(0) {
+            failures.push(format!(
+                "agents-{name}: expected the opening and closing marker lines as plugin_agents_v1 hits, got {:?}",
+                hits.iter().map(|hit| (hit.reason, hit.start_byte)).collect::<Vec<_>>()
+            ));
+        }
+        for channel in ["user_text", "assistant_text"] {
+            let case = Case {
+                id: format!("agents-{name}-{channel}"),
+                source: "conversation".to_string(),
+                channel: channel.to_string(),
+                input: fixture.text.clone(),
+                expected: fixture.text.clone(),
+                reason: Some(ContaminationReason::PluginAgentsEnvelope),
+            };
+            if let Err(failure) = run_case(&case) {
+                failures.push(failure);
+            }
+        }
+    }
+    failures
+}
+
 /// The registry formatter a pane send belongs to.
 fn pane_formatter(reason: ContaminationReason) -> &'static str {
     use ContaminationReason as R;
@@ -1068,6 +1146,10 @@ pub struct CanaryReport {
     /// Mention forms tried over those outputs.
     pub protected: usize,
     pub correctly_unlabeled: usize,
+    /// The companion's agents envelopes (context, handoff) read from the
+    /// plugin's fixture, and how many passed every check on them.
+    pub agents_generated: usize,
+    pub agents_correct: usize,
     pub failures: Vec<String>,
 }
 
@@ -1101,6 +1183,17 @@ pub fn run_canary() -> CanaryReport {
             }
         }
     }
+    // The agents envelopes the real Python formatter wrote: found, kept
+    // byte for byte, and the fixture is the one on record.
+    let agents = agents_document();
+    report.agents_generated = agents.fixtures.len();
+    let agents_failures = agents_failures();
+    report.agents_correct = if agents_failures.is_empty() {
+        report.agents_generated
+    } else {
+        0
+    };
+    report.failures.extend(agents_failures);
     // The registry must be exercised: a formatter registered without an
     // output here is a formatter nobody watches.
     let produced: std::collections::HashSet<&str> = engine_outputs()
@@ -1179,11 +1272,13 @@ pub fn emitter_canary() -> EvalResult {
     let report = run_canary();
     let cases = run_cases();
     let detail = format!(
-        "generated {} / detected {} / protected {} / unlabeled {}; cases.jsonl {}/{} ({} labeled, {} unlabeled)",
+        "generated {} / detected {} / protected {} / unlabeled {}; agents envelopes {}/{}; cases.jsonl {}/{} ({} labeled, {} unlabeled)",
         report.generated,
         report.correctly_detected,
         report.protected,
         report.correctly_unlabeled,
+        report.agents_correct,
+        report.agents_generated,
         cases.passed,
         cases.total,
         cases.labeled_rows,
