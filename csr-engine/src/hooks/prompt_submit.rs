@@ -2835,6 +2835,7 @@ mod tests {
             crate::mcp::tools::ConvValidity {
                 demote: true,
                 note: "stale".into(),
+                csr_only_demote: false,
             },
         )]
         .into_iter()

@@ -494,6 +494,44 @@ impl Storage {
         queries::get_chunks_by_ids_with_provenance(&conn, ids)
     }
 
+    /// The chunks, among `chunks`, whose text a CSR formatter's grammar matches
+    /// and that can carry CSR text at all: the one question search, hooks and
+    /// status ask. A chunk read from the chunks table carries the default
+    /// author, so the true author is read from `chunk_provenance` here (one
+    /// pass). Read-only; nothing stored changes.
+    pub fn csr_text_hits(
+        &self,
+        chunks: &[ConversationChunk],
+    ) -> std::collections::HashMap<String, crate::import::contamination::Hit> {
+        use crate::provenance::Speaker;
+        let unresolved: Vec<String> = chunks
+            .iter()
+            .filter(|chunk| chunk.author == Speaker::ToolResult)
+            .map(|chunk| chunk.id.clone())
+            .collect();
+        let authors = if unresolved.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            self.conn
+                .lock()
+                .ok()
+                .and_then(|conn| queries::chunk_authors(&conn, &unresolved).ok())
+                .unwrap_or_default()
+        };
+        chunks
+            .iter()
+            .filter_map(|chunk| {
+                let author = authors.get(&chunk.id).copied().unwrap_or(chunk.author);
+                crate::import::contamination::text_hit(
+                    &chunk.conversation_id,
+                    author,
+                    &chunk.content,
+                )
+                .map(|hit| (chunk.id.clone(), hit))
+            })
+            .collect()
+    }
+
     // ─── Reflection operations ───
 
     pub fn insert_reflection(
