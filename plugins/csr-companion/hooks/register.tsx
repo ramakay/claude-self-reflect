@@ -1233,8 +1233,9 @@ const seamFields = (seam: Seam) => ({
 let storyRefreshing = false
 async function refreshStory($: EngineInterface): Promise<StoryWhy | 'off' | 'busy'> {
   if (storyRefreshing) return 'busy'
-  const set = async (name: string) => (await $.env.get(name).catch(() => undefined)) === '1'
-  if (!(await set('CSR_STORY_REWRITES')) || (await set('CSR_NO_STORY_MAP'))) return 'off'
+  const rewrites = (await $.env.get('CSR_STORY_REWRITES').catch(() => undefined)) === '1'
+  const killed = (await $.env.get('CSR_NO_STORY_MAP').catch(() => undefined)) === '1'
+  if (!rewrites || killed) return 'off'
   storyRefreshing = true
   let started = false
   try {
