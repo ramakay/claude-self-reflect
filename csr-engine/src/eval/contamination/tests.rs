@@ -225,3 +225,29 @@ fn the_census_result_reports_labeled_chunks_and_conversations_of_one_population(
         result.detail
     );
 }
+
+#[test]
+fn stored_chunks_must_be_the_expected_text_byte_for_byte() {
+    let chunks = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+    // exact, edge whitespace trimmed, split at whitespace
+    assert!(chunks_are_exactly(&chunks(&["a b"]), "a b"));
+    assert!(chunks_are_exactly(&chunks(&["a b"]), "  a b\n"));
+    assert!(chunks_are_exactly(&chunks(&["aaa", "bbb"]), "aaa \n bbb"));
+    // inner whitespace collapsed: a whitespace-stripped comparison would pass this
+    assert!(!chunks_are_exactly(&chunks(&["a b"]), "a  b"));
+    // a changed, dropped, or reordered piece
+    assert!(!chunks_are_exactly(&chunks(&["a c"]), "a b"));
+    assert!(!chunks_are_exactly(&chunks(&["aaa"]), "aaa bbb"));
+    assert!(!chunks_are_exactly(&chunks(&["bbb", "aaa"]), "aaa bbb"));
+    assert!(!chunks_are_exactly(&[], "aaa"));
+    // a non-text channel has nothing to compare
+    let tool = Case {
+        id: "t".into(),
+        source: "conversation".into(),
+        channel: "non_csr_tool_result".into(),
+        input: "x".into(),
+        expected: "x".into(),
+        reason: None,
+    };
+    assert_eq!(stored_by_import(&tool), Ok(None));
+}

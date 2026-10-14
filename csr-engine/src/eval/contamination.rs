@@ -92,15 +92,14 @@ pub fn expected_stored(channel: &str, input: &str) -> String {
     }
 }
 
-/// What the real import parser stores for a user or assistant row of text. The
-/// row goes through the same parser a transcript does; its chunks concatenated
-/// are the stored text. `None` for a channel that is not the person's or
-/// Claude's own text.
-fn stored_by_import(case: &Case) -> Option<String> {
+/// What the real import parser stores for a user or assistant row of text: the
+/// chunk texts, in order. `Ok(None)` for a channel that is not the person's or
+/// Claude's own text; a parser error is an `Err`, which fails the case.
+fn stored_by_import(case: &Case) -> std::result::Result<Option<Vec<String>>, String> {
     let role = match case.channel.as_str() {
         "user_text" => "user",
         "assistant_text" => "assistant",
-        _ => return None,
+        _ => return Ok(None),
     };
     let line = serde_json::json!({
         "type": role,
@@ -116,14 +115,35 @@ fn stored_by_import(case: &Case) -> Option<String> {
         None,
         None,
     )
-    .ok()?;
-    Some(parsed.chunks.iter().map(|c| c.content.as_str()).collect())
+    .map_err(|error| format!("{}: the import parser failed: {error}", case.id))?;
+    Ok(Some(parsed.chunks.into_iter().map(|c| c.content).collect()))
+}
+
+/// Whether `chunks` are `expected` byte for byte: in order, each a verbatim
+/// slice of it, with only whitespace between them and at the ends (a chunk is
+/// stored without edge whitespace, and a long text is split where whitespace
+/// falls). Nothing else may be missing, added or changed.
+pub fn chunks_are_exactly(chunks: &[String], expected: &str) -> bool {
+    let mut cursor = 0;
+    for chunk in chunks {
+        let Some(found) = expected[cursor..].find(chunk.as_str()) else {
+            return false;
+        };
+        if !expected[cursor..cursor + found]
+            .chars()
+            .all(char::is_whitespace)
+        {
+            return false;
+        }
+        cursor += found + chunk.len();
+    }
+    expected[cursor..].chars().all(char::is_whitespace)
 }
 
 /// Run one fixture row; `Err` names how it failed. A detection never edits, so
-/// the row's `expected` is the input itself, and the real import parser must
-/// store it byte for byte (a chunk is stored without edge whitespace, and a
-/// text longer than a chunk is split where whitespace falls).
+/// the row's `expected` is the input itself (except the one structural cut, a
+/// complete hook-labelled wrapper in the person's turn), and the real import
+/// parser must store it byte for byte. A parser error fails the row.
 pub fn run_case(case: &Case) -> std::result::Result<(), String> {
     if case.expected != expected_stored(&case.channel, &case.input) {
         return Err(format!(
@@ -142,9 +162,8 @@ pub fn run_case(case: &Case) -> std::result::Result<(), String> {
             case.id, reason, case.reason
         ));
     }
-    if let Some(stored) = stored_by_import(case) {
-        let squeeze = |text: &str| text.split_whitespace().collect::<String>();
-        if stored != case.expected.trim() && squeeze(&stored) != squeeze(&case.expected) {
+    if let Some(stored) = stored_by_import(case)? {
+        if !chunks_are_exactly(&stored, &case.expected) {
             return Err(format!(
                 "{}: the import parser stored different text than the row's expected text",
                 case.id
