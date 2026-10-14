@@ -76,8 +76,13 @@ pub async fn generate_session_story(
         return None;
     }
     let prompt = build_prompt(context);
-    let parsed = call_claude_headless(&prompt).await?;
-    Some((parsed.text.clone(), parsed))
+    let mut parsed = call_claude_headless(&prompt).await?;
+    let (prose, _) = crate::story_map::finish_story_output(
+        &parsed.text,
+        !crate::story_map::story_map_disabled(),
+    );
+    parsed.text = prose.clone();
+    Some((prose, parsed))
 }
 
 /// Build the Haiku prompt from assembled DB context.
@@ -122,6 +127,11 @@ fn build_prompt(ctx: &StoryContext) -> String {
          Be specific about technical details. No preamble, no markdown headers.",
     );
 
+    if !crate::story_map::story_map_disabled() {
+        prompt.push_str("\n\n");
+        prompt.push_str(crate::story_map::shifts_instruction());
+    }
+
     prompt
 }
 
@@ -131,7 +141,7 @@ fn build_prompt(ctx: &StoryContext) -> String {
 /// sessions (2026-10-10): the summary alone reported finished work as still open, and a sample of
 /// the first and last messages lost the middle.
 fn summary_story_prompt(summary: &str, tail: &str) -> String {
-    format!(
+    let mut prompt = format!(
         "You are summarizing a coding session for future context restoration after memory compaction.\n\n\
          CLAUDE CODE'S SUMMARY OF THE SESSION (written at its latest compaction, from the whole \
          conversation except its last messages):\n{summary}\n\n\
@@ -142,11 +152,17 @@ fn summary_story_prompt(summary: &str, tail: &str) -> String {
          (done/in-progress/blocked). Where the last messages and the summary differ, trust the last \
          messages. Be specific about technical details. Keep it under 800 characters. No preamble, \
          no markdown headers."
-    )
+    );
+    if !crate::story_map::story_map_disabled() {
+        prompt.push_str("\n\n");
+        prompt.push_str(crate::story_map::shifts_instruction());
+    }
+    prompt
 }
 
 /// Invoke `claude -p` (model chain: env override → haiku alias → CLI default)
 /// with prompt piped via stdin (avoids OS arg length limits).
+/// Returns the model's text uncapped: the caller applies `story_map::finish_story_output`.
 async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNarrative> {
     use tokio::io::AsyncWriteExt;
 
@@ -213,9 +229,7 @@ async fn call_claude_headless(prompt: &str) -> Option<crate::narrative::ParsedNa
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 match crate::narrative::classify_attempt(output.status.success(), &stdout, &stderr)
                 {
-                    crate::narrative::AttemptOutcome::Parsed(mut parsed) => {
-                        // Cap at 1000 chars — stories should be concise
-                        parsed.text = parsed.text.chars().take(1000).collect();
+                    crate::narrative::AttemptOutcome::Parsed(parsed) => {
                         return Some(parsed);
                     }
                     crate::narrative::AttemptOutcome::ModelNotFound => continue,
@@ -772,7 +786,20 @@ async fn haiku_story(
     if parsed.is_none() {
         log_story_event(project, conv_id, "skip:haiku_unavailable_or_timeout");
     }
-    parsed.map(|parsed| parsed.text)
+    parsed.map(|parsed| {
+        let (prose, entries) = crate::story_map::finish_story_output(
+            &parsed.text,
+            !crate::story_map::story_map_disabled(),
+        );
+        if !entries.is_empty() {
+            log_story_event(
+                project,
+                conv_id,
+                &format!("shifts_parsed:{}", entries.len()),
+            );
+        }
+        prose
+    })
 }
 
 /// Generate story and store it. Separated so the lock scope is clear.
@@ -1369,5 +1396,65 @@ Summary:
             .collect();
         let result = sample_transcript(&messages, 20, 500);
         assert!(result.len() <= 520); // cap + "... (truncated)"
+    }
+
+    #[test]
+    fn prompts_ask_for_the_shifts_block_by_default() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        let ctx = StoryContext {
+            current_session_excerpt: "user: hello".to_string(),
+            current_v3_enrichment: None,
+            related_sessions: vec![],
+            project_name: "test".to_string(),
+        };
+        let first_prompt = build_prompt(&ctx);
+        assert!(first_prompt.contains("2-3 sentences"));
+        assert!(first_prompt.contains("@shifts"));
+
+        let sum_prompt = summary_story_prompt("summary text", "tail text");
+        assert!(sum_prompt.contains("under 800 characters"));
+        assert!(sum_prompt.contains("@shifts"));
+    }
+
+    #[test]
+    fn kill_switch_leaves_both_prompts_byte_identical() {
+        let _guard = crate::story_map::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CSR_NO_STORY_MAP", "1");
+
+        let ctx = StoryContext {
+            current_session_excerpt: "user: hello".to_string(),
+            current_v3_enrichment: None,
+            related_sessions: vec![],
+            project_name: "test".to_string(),
+        };
+        let first_prompt = build_prompt(&ctx);
+        let sum_prompt = summary_story_prompt("summary text", "tail text");
+
+        std::env::remove_var("CSR_NO_STORY_MAP");
+
+        assert!(!first_prompt.contains("@shifts"));
+        assert!(first_prompt.ends_with("No preamble, no markdown headers."));
+        assert!(!sum_prompt.contains("@shifts"));
+        assert!(sum_prompt.ends_with("no markdown headers."));
+        // the whole prompt is today's, nothing more
+        assert_eq!(
+            sum_prompt,
+            "You are summarizing a coding session for future context restoration after memory compaction.\n\n\
+             CLAUDE CODE'S SUMMARY OF THE SESSION (written at its latest compaction, from the whole \
+             conversation except its last messages):\nsummary text\n\n\
+             THE LAST MESSAGES (the summary did not see these; they show where the work actually \
+             stood):\ntail text\n\n\
+             Write 3-4 sentences: what the session was about across its whole life and its main \
+             threads, the key files/tools used, and where the work stood at the end \
+             (done/in-progress/blocked). Where the last messages and the summary differ, trust the last \
+             messages. Be specific about technical details. Keep it under 800 characters. No preamble, \
+             no markdown headers."
+        );
     }
 }

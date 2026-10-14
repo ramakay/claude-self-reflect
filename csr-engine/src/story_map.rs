@@ -345,12 +345,47 @@ pub fn sig(project: &str, entry: &ShiftEntry) -> String {
     s
 }
 
+pub const RAW_CAP_WITH_MAP: usize = 1600;
+pub const STORY_PROSE_CAP: usize = 1000;
+
+/// Prompt continuation appended after the story prose instruction when the
+/// Shift Map is enabled (`!story_map_disabled()`).
+pub fn shifts_instruction() -> &'static str {
+    "After the prose, if the session changed code, add a newline, the line `@shifts`, and 1 to 4 lines in this exact 4-field pipe format:\n\
+kind|before|after|claim\n\
+- kind: shift | risk | decision | regression\n\
+- before, after: `-` if empty, or `file[:symbol][mark]` optionally joined to a second endpoint by ` -> `, ` ~> `, or ` -x-> ` (marks: `+` added, `~` changed, `-` removed, `!` risk). Use only real file or symbol names from the session.\n\
+- claim: plain ASCII summary <= 72 chars, no `|`.\n\
+Put `@shifts` last. Write no `@shifts` block if no code changed.\n\
+Example:\n\
+@shifts\n\
+shift|summarizer.rs:store_story~ -> reflections-|summarizer.rs:store_story~ -> reflections:narrative_shift+|Keep prior shift reflections on story rewrite\n\
+decision|-|summarizer.rs:ground_shifts+ -> code_evolution|Check shift endpoints against AST evolution rows"
+}
+
+/// Applies the capture cap, splits the optional `@shifts` block when `map_on`
+/// is true, and caps the returned story prose at `STORY_PROSE_CAP` (1000) chars.
+///
+/// When `!map_on`, returns the first 1000 characters of `raw_full` unchanged
+/// and an empty shift list.
+pub fn finish_story_output(raw_full: &str, map_on: bool) -> (String, Vec<ShiftEntry>) {
+    if !map_on {
+        return (raw_full.chars().take(STORY_PROSE_CAP).collect(), Vec::new());
+    }
+    let mut chars = raw_full.chars();
+    let raw: String = chars.by_ref().take(RAW_CAP_WITH_MAP).collect();
+    let cut_off = chars.next().is_some();
+    let (prose, entries) = split_story_output(&raw, cut_off);
+    let prose_capped: String = prose.chars().take(STORY_PROSE_CAP).collect();
+    (prose_capped, entries)
+}
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     const EXAMPLE: &str = "We split shift grounding out of store_story in summarizer.rs so each compaction appends verified architecture shifts without deleting prior shift reflections. session_start.rs now passes edited file stems into the story prompt, and pane.py renders the before-after map above the story text. Where it stands: engine storage tests pass, pending pane snapshot checks.\n@shifts\nshift|summarizer.rs:store_story~ -> reflections-|summarizer.rs:store_story~ -> reflections:narrative_shift+|Keep prior shift reflections on story rewrite\ndecision|-|summarizer.rs:ground_shifts+ -> code_evolution|Check Haiku shift endpoints against AST evolution rows\nrisk|pane.py:session_story -> reflections|pane.py:session_story~ -> meta:story_map+|Pane must fail open when story_map meta key is absent\n";
 
@@ -491,7 +526,7 @@ mod tests {
 
     #[test]
     fn kill_switch_reads_env() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("CSR_NO_STORY_MAP");
         assert!(!story_map_disabled());
         std::env::set_var("CSR_NO_STORY_MAP", "1");
@@ -501,6 +536,79 @@ mod tests {
         std::env::set_var("CSR_NO_STORY_MAP", "0");
         assert!(!story_map_disabled());
         std::env::remove_var("CSR_NO_STORY_MAP");
+    }
+
+    #[test]
+    fn finish_output_without_block_equals_todays_cap() {
+        let long_no_sentinel: String = "abcd ".repeat(300); // 1500 chars
+        assert_eq!(long_no_sentinel.chars().count(), 1500);
+        let (on_prose, on_entries) = finish_story_output(&long_no_sentinel, true);
+        let (off_prose, off_entries) = finish_story_output(&long_no_sentinel, false);
+        assert!(on_entries.is_empty());
+        assert!(off_entries.is_empty());
+        assert_eq!(on_prose.chars().count(), 1000);
+        assert_eq!(on_prose, off_prose);
+
+        let short_no_sentinel: String = "xyzw ".repeat(80); // 400 chars
+        assert_eq!(short_no_sentinel.chars().count(), 400);
+        let (on_short, on_short_entries) = finish_story_output(&short_no_sentinel, true);
+        let (off_short, off_short_entries) = finish_story_output(&short_no_sentinel, false);
+        assert!(on_short_entries.is_empty());
+        assert!(off_short_entries.is_empty());
+        assert_eq!(on_short, short_no_sentinel);
+        assert_eq!(on_short, off_short);
+    }
+
+    #[test]
+    fn finish_output_splits_prose_from_block() {
+        let (prose, entries) = finish_story_output(EXAMPLE, true);
+        assert!(prose.starts_with("We split shift grounding"));
+        assert!(!prose.contains("@shifts"));
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn finish_output_cut_off_at_the_raw_cap_drops_the_last_line() {
+        let prose = "p".repeat(1500);
+        let block =
+            "\n@shifts\nshift|a.rs:f1~|b.rs:f2+|First complete claim\nshift|c.rs:g1~|d.rs:g2+|";
+        let tail = "x".repeat(1700 - prose.len() - block.len());
+        let raw_full = format!("{prose}{block}{tail}");
+        assert_eq!(raw_full.chars().count(), 1700);
+
+        let (out_prose, entries) = finish_story_output(&raw_full, true);
+        assert_eq!(out_prose.chars().count(), 1000);
+        assert!(out_prose.chars().all(|c| c == 'p'));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].claim, "First complete claim");
+    }
+
+    #[test]
+    fn finish_output_bad_block_is_prose_only() {
+        let raw = "The session fixed the parser.\n@shifts\nnot_a_kind|a|b|c\nshift|-|-|empty\n";
+        let (prose, entries) = finish_story_output(raw, true);
+        assert_eq!(prose, "The session fixed the parser.");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn finish_output_map_off_returns_block_text_as_today() {
+        let (prose, entries) = finish_story_output(EXAMPLE, false);
+        assert!(entries.is_empty());
+        assert!(prose.contains("@shifts"));
+        let expected: String = EXAMPLE.chars().take(1000).collect();
+        assert_eq!(prose, expected);
+    }
+
+    #[test]
+    fn finish_output_caps_prose_in_chars_not_bytes() {
+        let multibyte_prose = "é".repeat(1200); // 1200 chars, 2400 bytes
+        let raw = format!("{multibyte_prose}\n@shifts\nshift|a.rs:f~|b.rs:g+|Ascii claim\n");
+        let (prose, entries) = finish_story_output(&raw, true);
+        assert_eq!(prose.chars().count(), 1000);
+        assert_eq!(prose.len(), 2000);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].claim, "Ascii claim");
     }
 
     #[test]
@@ -523,6 +631,8 @@ mod tests {
             let _ = split_story_output(case, true);
             let _ = parse_shifts_block(case, false);
             let _ = parse_shift_line(case);
+            let _ = finish_story_output(case, true);
+            let _ = finish_story_output(case, false);
         }
     }
 }
