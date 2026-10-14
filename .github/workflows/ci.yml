@@ -31,13 +31,15 @@ jobs:
 
   plugin:
     runs-on: ubuntu-latest
-    env:
-      # The plugin's tests write under $HOME/.claude-self-reflect; keep that off the runner's real home.
-      HOME: ${{ runner.temp }}/plugin-home
     steps:
-      - uses: actions/checkout@v7
       - name: Prepare home
-        run: mkdir -p "$HOME"
+        # The plugin's tests write under $HOME/.claude-self-reflect; keep that off the runner's real home. The
+        # `runner` context is not available in a job-level `env:`, so HOME is set for the steps below from here.
+        # pip --user and `claude plugin test` both resolve under it.
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin-home"
+          echo "HOME=$RUNNER_TEMP/plugin-home" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22
