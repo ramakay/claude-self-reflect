@@ -791,6 +791,19 @@ class LostAndFound(unittest.TestCase):
         self.assertEqual((importer['state'], importer['times'], importer['first_seen'], importer['last_seen']), ('open', 3, 1000.0, 3000.0))
         self.assertEqual(len([t for t in threads if 'importer' in t['text']]), 2)  # the fix, and the next step's run of it
 
+    def test_a_section_whose_name_is_bold_after_the_number_is_found(self):
+        # Claude Code writes "7. **Pending Tasks:**" as often as "7. Pending Tasks:"
+        for heading in ('7. Pending Tasks:', '7. **Pending Tasks:**', '7. **Pending Tasks**:', '**7. Pending Tasks:**',
+                        '### 7. **Pending Tasks:**'):
+            text = ('1. **Primary Request and Intent:**\n   - The ask.\n\n' + heading
+                    + "\n   - Awaiting the user's go on the push guard.\n\n8. **Current Work:**\n   - Something else.\n")
+            self.assertEqual(pane.summary_section(text, 'Pending Tasks'),
+                             ["   - Awaiting the user's go on the push guard.", ''], heading)
+            self.assertEqual([head for head, _ in pane.summary_items(text)], ["Awaiting the user's go on the push guard."], heading)
+        # a bold bullet inside the section is still not a heading
+        self.assertIsNone(pane.NUMBERED.match('   - **Fix the importer:** remove the old cache.'))
+        self.assertIsNone(pane.NUMBERED.match('7. **Pending Tasks:** and then some prose after it'))
+
     def test_waiting_on_you_is_flagged_and_ranks_first(self):
         threads = pane.lost_found(SUMMARIES)
         self.assertEqual([t['rank'] for t in threads], sorted(t['rank'] for t in threads))
@@ -4523,15 +4536,15 @@ class ShiftMapText(unittest.TestCase):
             'new risk: Keep prior shifts on rewrite',
             '  was store_story -> reflections',
             '  now store_story -> narrative_shift',
-            "  Haiku's reading, checked",
+            "  Haiku's words · names match",
             '  commit 3f2a1b0 and your edits',
             'decision: Check endpoints against AST e…',
             '  added ground_shifts -> code_evolution',
-            "  Haiku's reading, checked · call graph",
+            "  Haiku's words · names match call graph",
             'new risk: Fail open when story_map meta…',
             '  was pane.py:session_story',
             '  now added meta:story_map',
-            "  Haiku's guess, not checked",
+            "  Haiku's words · names not checked",
         ])
 
     def test_text_snapshot_of_a_receipts_only_map(self):
@@ -4562,15 +4575,15 @@ class ShiftMapText(unittest.TestCase):
             'new shift · plugins/csr-companion/bin/pane.py:shift_map_rows',
             'Before: The map drew its labels at 9 to 10 px.',
             'After:  The map writes Before and After as text.',
-            "Haiku's reading, checked · commit 3f2a1b0 and your edits",
+            "Haiku's words · names match commit 3f2a1b0 and your edits",
             'decision · summarizer.rs:ground_shifts',
             # no before: "New:" in the place of Before and After
             'New:    ground_shifts checks each shift against AST evolution rows.',
-            "Haiku's reading, checked · call graph",
+            "Haiku's words · names match call graph",
             'new risk · pane.py:session_story_map',
             'Before: session_story_map ignores the was and now fields.',
             'After:  session_story_map reads the was and now fields.',
-            "Haiku's guess, not checked",
+            "Haiku's words · names not checked",
         ])
 
     def test_an_old_entry_in_a_new_map_renders_as_before(self):
@@ -4583,7 +4596,7 @@ class ShiftMapText(unittest.TestCase):
         self.assertEqual(rows[at:], [
             'regression: Keep the old four-field line',
             '  changed store.rs:load',
-            "  Haiku's reading, checked · your edits",
+            "  Haiku's words · names match your edits",
         ])
 
     def test_a_sentence_wraps_at_word_boundaries_on_a_46_column_pane_and_hangs_under_its_text(self):
@@ -4595,7 +4608,7 @@ class ShiftMapText(unittest.TestCase):
             '        10 px.',
             'After:  The map writes Before and After',
             '        as text.',
-            "Haiku's reading, checked",
+            "Haiku's words · names match",
             'commit 3f2a1b0 and your edits',
             'decision · summarizer.rs:ground_shifts',
             'New:    ground_shifts checks each shift',
@@ -4655,12 +4668,38 @@ class ShiftMapText(unittest.TestCase):
         self.assertEqual(rows[3:6], [
             'After:  The map writes Before and After',
             '        as plain text rows that wrap to…',
-            "Haiku's reading, checked",  # two rows, not three: the evidence follows
+            "Haiku's words · names match",  # two rows, not three: the evidence follows
         ])
 
     def test_the_path_is_cut_from_the_left_and_the_symbol_stays(self):
         rows = pane.shift_map_rows(self.shown(self.NEW_RAW), 60, 40)[1]
         self.assertEqual(rows[0], 'new shift · …/bin/pane.py:shift_map_rows')
+
+    def test_the_evidence_row_says_whose_words_they_are_and_what_was_checked(self):
+        # grounded: the names matched evidence, and the sentences are Haiku's
+        def entry(receipts, grounded=True):
+            return dict(grounded=grounded, receipts=receipts)
+
+        wide = 80
+        self.assertEqual(pane._shift_source(entry(['oid:3f2a1b0aa', 'evo:1']), 'Haiku', wide),
+                         ["Haiku's words · names match commit 3f2a1b0 and your edits"])
+        self.assertEqual(pane._shift_source(entry(['evo:1']), 'Haiku', wide), ["Haiku's words · names match your edits"])
+        self.assertEqual(pane._shift_source(entry(['edge:1']), 'Haiku', wide), ["Haiku's words · names match call graph"])
+        self.assertEqual(pane._shift_source(entry(['node:1']), 'Haiku', wide), ["Haiku's words · names match code index"])
+        self.assertEqual(pane._shift_source(entry([]), 'Haiku', wide), ["Haiku's words · names match"])
+        # too narrow to sit side by side: two rows, the evidence second
+        self.assertEqual(pane._shift_source(entry(['oid:3f2a1b0aa', 'evo:1']), 'Haiku', 40),
+                         ["Haiku's words · names match", 'commit 3f2a1b0 and your edits'])
+        # not grounded: nothing matched, and it says so
+        self.assertEqual(pane._shift_source(entry(['evo:1'], grounded=False), 'Haiku', wide),
+                         ["Haiku's words · names not checked"])
+        # a map built from receipts has no Haiku words: it keeps its own wording
+        self.assertEqual(pane._shift_source(entry(['oid:3f2a1b0aa', 'evo:1']), 'receipts', wide),
+                         ['from commit 3f2a1b0 and your edits'])
+        self.assertEqual(pane._shift_source(entry([]), 'receipts', wide), ['checked'])
+        for line in pane._shift_source(entry(['oid:3f2a1b0aa', 'evo:1']), 'Haiku', 40):
+            self.assertNotIn('reading', line)
+            self.assertNotIn('guess', line)
 
     def test_the_header_names_the_before_side_when_there_is_no_after(self):
         smap = self.shown(self.NEW_RAW)

@@ -1490,10 +1490,11 @@ def _shift_side(parts, room):
 
 
 def _shift_source(entry, by, room):
-    """Where a shift's evidence comes from, in words a new user knows: one row, or two when the reading and
-    its evidence do not fit side by side."""
+    """What was checked about a shift, and whose words it is: one row, or two when the claim and its evidence do not
+    fit side by side. Checked means the names (the file or symbol) were found in the evidence; the sentences are
+    Haiku's either way. A map built from receipts says where its evidence comes from."""
     if not entry.get('grounded'):
-        return ["Haiku's guess, not checked"]
+        return ["Haiku's words · names not checked"]
     receipts = entry.get('receipts') or []
     commit = next((r.split(':', 1)[1][:7] for r in receipts if r.startswith('oid:') and len(r) > 4), None)
     edits = any(r.startswith('evo:') for r in receipts)
@@ -1503,10 +1504,10 @@ def _shift_source(entry, by, room):
                          + ([graph] if graph and not (commit or edits) else []))
     if by == 'receipts':
         return ['from ' + found if found else 'checked']
-    reading = "Haiku's reading, checked"
+    words = "Haiku's words · names match"
     if not found:
-        return [reading]
-    return [f'{reading} · {found}'] if len(reading) + 3 + len(found) <= room else [reading, found]
+        return [words]
+    return [f'{words} {found}'] if len(words) + 1 + len(found) <= room else [words, found]
 
 
 BEFORE_LABEL, AFTER_LABEL, NEW_LABEL = 'Before: ', 'After:  ', 'New:    '  # one width: the sentences start in one column
@@ -7424,7 +7425,7 @@ LOST_ANSWERS = ('drop', 'later')  # what sets a thread aside; a sent line is non
 SECTION['lost'], GLYPH['lost'] = 'turn', '?'  # its ink (vermilion) and its mark where no pictures are drawn
 SAME_THREAD = 0.5  # two items are one thread when this share of their words match
 CARRIED = ('Pending Tasks', 'Optional Next Step')  # the summary sections that name what is still owed
-NUMBERED = re.compile(r"^(?:#+\s*)?\**\d+\.\s+[A-Z][A-Za-z /&,'-]{2,50}:?\**\s*$")
+NUMBERED = re.compile(r"^(?:#+\s*)?\**\d+\.\s+\**[A-Z][A-Za-z /&,'-]{2,50}\**:?\**\s*$")  # "7. Pending Tasks:", "**7. Pending Tasks:**", "7. **Pending Tasks:**"
 BULLET = re.compile(r'^(\s*)(?:[-*•]|\d+[.)])\s+(.*)$')
 WAITING = re.compile(r"\b(awaiting|waiting (?:on|for) (?:you|the user)|wait for the user|needs? (?:your|their|the user'?s) "
                      r"(?:go|ok|approval|call|decision)|approval|the user'?s (?:answer|go|pick|picks|decision|decisions|call|pasted)|"
