@@ -860,8 +860,16 @@ pub fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
             (SELECT conversation_id FROM queued_prompt_chunks WHERE chunk_id = ?1)",
         params![chunk_id],
     )?;
+    // Every part of the prompt loses its ledger row, not only the deleted part's: the ledger
+    // answers "is this transcript line indexed" by (conversation, line offset), so a surviving
+    // part's row would keep the missing part from being indexed again. Re-indexing writes all
+    // the parts again; the surviving ones hit `ON CONFLICT DO NOTHING` on their chunk rows.
     conn.execute(
-        "DELETE FROM queued_prompt_chunks WHERE chunk_id = ?1",
+        "DELETE FROM queued_prompt_chunks WHERE EXISTS (
+            SELECT 1 FROM queued_prompt_chunks gone
+            WHERE gone.chunk_id = ?1
+              AND gone.conversation_id = queued_prompt_chunks.conversation_id
+              AND gone.line_offset = queued_prompt_chunks.line_offset)",
         params![chunk_id],
     )?;
     conn.execute(

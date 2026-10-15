@@ -1166,6 +1166,106 @@ mod tests {
         assert_eq!((counts.indexed, counts.scanned, counts.pending), (2, 1, 0));
     }
 
+    /// Deleting one part of a prompt cut at the chunk budget takes the ledger rows of every
+    /// part, or the surviving rows would keep the line looking indexed and the missing part
+    /// would never come back.
+    #[tokio::test]
+    async fn deleting_one_part_of_a_long_queued_prompt_lets_every_part_be_indexed_again() {
+        let rig = Rig::new();
+        let engine = rig.engine();
+        let src = rig.source("sess-parts.jsonl");
+        let long = format!("{} {}", "wombatsprawl".repeat(40), "tail ".repeat(300));
+        let head = [user(0, "start"), assistant(1, "ok")].concat();
+        fs::write(
+            &src,
+            format!(
+                "{head}{}{}",
+                queued(2, &long, Some(true)),
+                assistant(3, "yes")
+            ),
+        )
+        .unwrap();
+        engine.import_file(&src, "proj").await.unwrap();
+        let parts = scalar(&engine, "SELECT COUNT(*) FROM queued_prompt_chunks");
+        assert!(parts >= 2, "{parts}");
+        let part_ids: Vec<String> = engine
+            .storage()
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT chunk_id FROM queued_prompt_chunks")?;
+                let ids = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(ids)
+            })
+            .unwrap();
+        let part_one: String = engine
+            .storage()
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT chunk_id FROM queued_prompt_chunks WHERE part = 1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+
+        engine.storage().delete_chunk(&part_one).unwrap();
+        assert_eq!(
+            scalar(&engine, "SELECT COUNT(*) FROM queued_prompt_chunks"),
+            0,
+            "every part's ledger row went with the deleted part"
+        );
+        let ids = part_ids
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scalar(
+                &engine,
+                &format!(
+                    "SELECT COUNT(*) FROM chunks WHERE id IN ({})",
+                    ids.join(",")
+                )
+            ),
+            parts - 1,
+            "the other parts' chunk rows stay"
+        );
+
+        let stats = backfill(&engine, &rig, "", 50).await;
+        assert_eq!((stats.scanned, stats.added, stats.failed), (1, 1, 0));
+        assert_eq!(
+            scalar(&engine, "SELECT COUNT(*) FROM queued_prompt_chunks"),
+            parts
+        );
+        assert_eq!(
+            scalar(
+                &engine,
+                "SELECT COUNT(*) FROM queued_prompt_chunks q JOIN chunks c ON c.id = q.chunk_id"
+            ),
+            parts,
+            "every ledger row has its chunk"
+        );
+        assert_eq!(
+            scalar(
+                &engine,
+                &format!("SELECT COUNT(*) FROM chunks WHERE id = '{part_one}'")
+            ),
+            1,
+            "the deleted part is back"
+        );
+        assert_eq!(
+            scalar(
+                &engine,
+                "SELECT COUNT(*) FROM (SELECT chunk_id FROM queued_prompt_chunks
+                  GROUP BY chunk_id HAVING COUNT(*) > 1)"
+            ),
+            0,
+            "one ledger row per chunk"
+        );
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!((counts.indexed, counts.scanned, counts.pending), (1, 1, 0));
+    }
+
     /// Rows other adapters keep in import_state, and transcripts that are gone or
     /// mention no queued command, are marked read without a parse.
     #[tokio::test]
