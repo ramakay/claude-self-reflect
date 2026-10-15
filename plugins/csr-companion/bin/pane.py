@@ -472,15 +472,19 @@ CONTINUED_WAIT = 60  # seconds before a session that continues nothing is looked
 _CONTINUED = {}  # session id -> (the session it continues or None, when that was last looked for)
 
 
-def _find_continued(session_id, path=None):
-    """The session a transcript's folder says this one continues: a sibling written since this one began whose
-    last 256 KB holds Claude Code's continued-in row naming this session. None when there is none."""
+def _own_transcript(session_id, path=None):
+    """The path of this session's transcript (the one given, else the first folder holding it), or None."""
     found = [path] if path else glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
-    if not found:
-        return None
-    mine = found[0]
+    return found[0] if found else None
+
+
+def _find_continued(session_id, mine):
+    """The session a transcript's folder says this one continues: a sibling written since this one began whose
+    last 256 KB holds a continued-in row of its own (its sessionId is the file's name) naming this session.
+    Where the file system keeps no birth time there is no time bound at all, only the 200 newest and the tail size."""
     stat = os.stat(mine)
-    since = (getattr(stat, 'st_birthtime', None) or stat.st_mtime) - 120  # the old file is still written to after this one begins
+    born = getattr(stat, 'st_birthtime', None)
+    since = born - 120 if born else None  # the old file is still written to after this one begins
     folder, others = os.path.dirname(mine), []
     for name in os.listdir(folder):
         other = os.path.join(folder, name)
@@ -490,7 +494,7 @@ def _find_continued(session_id, path=None):
             written = os.stat(other).st_mtime
         except OSError:
             continue
-        if written >= since:
+        if since is None or written >= since:
             others.append((written, other))
     for _, other in sorted(others, reverse=True)[:200]:
         try:
@@ -509,7 +513,8 @@ def _find_continued(session_id, path=None):
             if isinstance(entry, dict) and entry.get('type') == 'continued-in' \
                     and entry.get('continuedInSessionId') == session_id:
                 before = entry.get('sessionId')
-                if isinstance(before, str) and re.fullmatch(r'[\w-]+', before):
+                if isinstance(before, str) and re.fullmatch(r'[\w-]+', before) and before != session_id \
+                        and before == os.path.basename(other)[:-6]:  # a row in B.jsonl speaks for B, no one else
                     return before
     return None
 
@@ -524,7 +529,10 @@ def continued_from(session_id, path=None):
     now, seen = time.time(), _CONTINUED.get(session_id)
     if seen and (seen[0] or now - seen[1] < CONTINUED_WAIT):
         return seen[0]
-    found = fail_open(_find_continued, None, session_id, path)
+    mine = _own_transcript(session_id, path)
+    if not mine:  # Claude Code writes the row before it creates this transcript: once it exists, the row is there
+        return None
+    found = fail_open(_find_continued, None, session_id, mine)
     _CONTINUED[session_id] = (found, now)
     return found
 

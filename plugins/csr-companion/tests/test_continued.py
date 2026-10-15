@@ -77,6 +77,45 @@ def test_none_is_looked_for_again_after_a_minute_and_a_find_is_kept(home, monkey
     assert pane.continued_from(NEW) == OLD, 'a find is kept for the life of the process'
 
 
+def test_a_row_speaks_only_for_the_file_it_is_in(home):
+    tmp, folder = home
+    stranger = 'bbbbbbbb-0000-4000-8000-000000000000'
+    write(str(folder / f'{stranger}.jsonl'),  # newer than the genuine one, and it claims another session continued into NEW
+          [dict(type='continued-in', sessionId='xxxxxxxx-0000-4000-8000-000000000000', continuedInSessionId=NEW)], 6000.0)
+    assert pane.continued_from(NEW) == OLD, 'the genuine row wins; the newer sibling cannot name a stranger'
+    pane._CONTINUED.clear()
+    (folder / f'{OLD}.jsonl').unlink()
+    assert pane.continued_from(NEW) is None, 'a row whose sessionId is not its file is ignored'
+    pane._CONTINUED.clear()
+    write(str(folder / f'{stranger}.jsonl'), [dict(type='continued-in', sessionId=NEW, continuedInSessionId=NEW)], 6000.0)
+    write(str(folder / f'{NEW}.jsonl'), [dict(type='continued-in', sessionId=NEW, continuedInSessionId=NEW)], 6000.0)
+    assert pane.continued_from(NEW) is None, 'a session is never its own predecessor'
+
+
+def test_without_a_birth_time_there_is_no_time_bound(home, monkeypatch):
+    tmp, folder = home
+    os.utime(folder / f'{OLD}.jsonl', (1000.0, 1000.0))  # the old file went quiet long before the new one's last write
+    os.utime(folder / f'{NEW}.jsonl', (1300.0, 1300.0))
+    real = os.stat
+
+    def no_birthtime(path, *a, **k):  # a Linux stat: no st_birthtime
+        found = real(path, *a, **k)
+        return type('Stat', (), dict(st_mtime=found.st_mtime, st_size=found.st_size))()
+    monkeypatch.setattr(pane.os, 'stat', no_birthtime)
+    assert pane.continued_from(NEW) == OLD
+
+
+def test_a_miss_is_not_kept_while_the_own_transcript_is_missing(home):
+    tmp, folder = home
+    (folder / f'{NEW}.jsonl').rename(folder / 'parked.jsonl')
+    (folder / f'{OLD}.jsonl').rename(folder / 'parked-old.jsonl')
+    assert pane.continued_from(NEW) is None
+    assert NEW not in pane._CONTINUED
+    (folder / 'parked.jsonl').rename(folder / f'{NEW}.jsonl')
+    (folder / 'parked-old.jsonl').rename(folder / f'{OLD}.jsonl')
+    assert pane.continued_from(NEW) == OLD, 'no clock advance: the miss was never written'
+
+
 def test_the_kill_switch_returns_none(home, monkeypatch):
     monkeypatch.setenv('CSR_NO_CONTINUED', '1')
     assert pane.continued_from(NEW) is None
