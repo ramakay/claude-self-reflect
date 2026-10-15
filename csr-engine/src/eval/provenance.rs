@@ -169,7 +169,9 @@ fn rendered_why_receipt_is_honest(output: &str) -> bool {
         return false;
     };
     let sections: Vec<&str> = receipt.split(" | ").collect();
-    if sections.len() != 5 {
+    // seeds | symbols | graph | episodes, framed by scope and the closing
+    // `probes excluded=N` field (six sections).
+    if sections.len() != 6 || !sections[5].starts_with("probes excluded=") {
         return false;
     }
     let footer = (
@@ -432,7 +434,7 @@ conv_a:\n\
   best_via=blend reached_by=seed+blend+graph score=0.8\n\
 conv_b:\n\
   best_via=episode reached_by=episode score=0.7\n\
-receipt: scope=p | seeds selected=1 conversations=1 surfaced=1 | symbols matched=1 [x] | graph walks=2 accepted=1 surfaced=1 | episodes links=1 resolved=1 accepted=1 surfaced=1 (below-cut=0, below-threshold=0, dangling=0, out-of-scope=0, unembedded=0)\n";
+receipt: scope=p | seeds selected=1 conversations=1 surfaced=1 | symbols matched=1 [x] | graph walks=2 accepted=1 surfaced=1 | episodes links=1 resolved=1 accepted=1 surfaced=1 (below-cut=0, below-threshold=0, dangling=0, out-of-scope=0, unembedded=0) | probes excluded=0\n";
         assert!(rendered_why_receipt_is_honest(honest));
         assert!(!rendered_why_receipt_is_honest(&honest.replace(
             "accepted=1 surfaced=1 | episodes",

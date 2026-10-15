@@ -138,6 +138,10 @@ pub struct ReinstateTrace {
     pub episode_dangling: usize,
     pub episode_out_of_scope: usize,
     pub episode_unembedded: usize,
+    /// Distinct experiment-probe conversations dropped from the pool (see
+    /// [`EXPERIMENT_PROBE_OPENINGS`]), across every stage that could have
+    /// surfaced them.
+    pub probes_excluded: usize,
 }
 
 /// Evidence plus the walk receipt used to render honest stage accounting.
@@ -187,7 +191,7 @@ fn surfaced_counts(items: &[EvidenceItem]) -> (usize, usize, usize) {
 pub fn render_receipt(trace: &ReinstateTrace, items: &[EvidenceItem]) -> String {
     let (seed_count, graph_count, episode_count) = surfaced_counts(items);
     format!(
-        "receipt: scope={} | seeds selected={} conversations={} surfaced={} | symbols matched={} [{}] | graph walks={} accepted={} surfaced={} | episodes links={} resolved={} accepted={} surfaced={} (below-cut={}, below-threshold={}, dangling={}, out-of-scope={}, unembedded={})",
+        "receipt: scope={} | seeds selected={} conversations={} surfaced={} | symbols matched={} [{}] | graph walks={} accepted={} surfaced={} | episodes links={} resolved={} accepted={} surfaced={} (below-cut={}, below-threshold={}, dangling={}, out-of-scope={}, unembedded={}) | probes excluded={}",
         trace.scope_projects.join(","),
         trace.seeds_selected,
         trace.seed_conversations,
@@ -206,6 +210,7 @@ pub fn render_receipt(trace: &ReinstateTrace, items: &[EvidenceItem]) -> String 
         trace.episode_dangling,
         trace.episode_out_of_scope,
         trace.episode_unembedded,
+        trace.probes_excluded,
     )
 }
 
@@ -228,6 +233,79 @@ pub fn rendered_receipt_surface_counts_match(
         "episodes links={} resolved={} accepted={} surfaced={episodes}",
         trace.episode_links, trace.episode_resolved, trace.episode_accepted
     ))
+}
+
+/// Openings of the July 2026 T3 / Gate-D experiment probes. Their prompt is
+/// shaped like every why-question ("Answer in at most 8 sentences. Be specific:
+/// name the decision, event, or evidence you are relying on"), so the blend hop
+/// lifts them above the real origin conversation and the graph walk then spreads
+/// from them. Their transcripts are gone and `conversation_entrypoint` has no
+/// rows for them, so the stored text is the only signal. Only the OPENING of a
+/// conversation counts: a session that quotes a template later is kept.
+pub const EXPERIMENT_PROBE_OPENINGS: [&str; 2] = [
+    "You are the long-time maintainer of this codebase and its development history.",
+    "You are the long-term maintainer of the csr-engine project",
+];
+
+/// Characters of a conversation's first chunk read to test its opening.
+const PROBE_PREFIX_CHARS: usize = 512;
+
+/// True when a conversation's first stored chunk opens with a probe template.
+/// Leading whitespace is ignored; nothing after the opening matters.
+pub fn is_experiment_probe_opening(first_chunk: &str) -> bool {
+    let opening = first_chunk.trim_start();
+    EXPERIMENT_PROBE_OPENINGS
+        .iter()
+        .any(|probe| opening.starts_with(probe))
+}
+
+/// Per-walk probe verdicts. `classify` resolves any conversations not yet seen in
+/// ONE batched query; `exclude` answers from the cache and counts each excluded
+/// conversation once for the receipt.
+#[derive(Default)]
+struct ProbeFilter {
+    verdict: HashMap<String, bool>,
+    excluded: BTreeSet<String>,
+}
+
+impl ProbeFilter {
+    fn classify<'a>(
+        &mut self,
+        storage: &Storage,
+        conversations: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let unknown: Vec<String> = conversations
+            .into_iter()
+            .filter(|conv| !self.verdict.contains_key(*conv))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let probes: HashSet<String> = storage
+            .first_chunk_prefixes(&unknown, PROBE_PREFIX_CHARS)?
+            .into_iter()
+            .filter(|(_, prefix)| is_experiment_probe_opening(prefix))
+            .map(|(conv, _)| conv)
+            .collect();
+        for conv in unknown {
+            let is_probe = probes.contains(&conv);
+            self.verdict.insert(conv, is_probe);
+        }
+        Ok(())
+    }
+
+    /// True (and counted) when `conv` is a probe conversation. A conversation
+    /// that was never classified is kept.
+    fn exclude(&mut self, conv: &str) -> bool {
+        let is_probe = self.verdict.get(conv).copied().unwrap_or(false);
+        if is_probe {
+            self.excluded.insert(conv.to_string());
+        }
+        is_probe
+    }
 }
 
 /// Internal fusion candidate — pre-enrichment (no timestamp/excerpt yet, those are
@@ -747,7 +825,7 @@ pub async fn reinstate(
     // find cfg.seeds real seeds — on a re-asked question the top hits are all
     // prior askings of it. Final output stays capped at cfg.k after rerank.
     let hop1_k = (cfg.k * 4).max(cfg.seeds * 8);
-    let (chunk_hits, reflection_hits) = {
+    let (mut chunk_hits, reflection_hits) = {
         let idx = search.read().await;
         let chunks = if let Some(ref ids) = project_chunk_ids {
             idx.search_chunks_filtered(&query_vec, hop1_k, 0.20, ids)
@@ -759,23 +837,48 @@ pub async fn reinstate(
     };
 
     let mut pool: HashMap<String, Candidate> = HashMap::new();
+    let mut probes = ProbeFilter::default();
 
     let chunk_ids: Vec<String> = chunk_hits.iter().map(|r| r.id.clone()).collect();
     let chunk_meta = storage.get_chunks_by_ids(&chunk_ids)?;
     let meta_by_id: HashMap<&str, &crate::import::ConversationChunk> =
         chunk_meta.iter().map(|c| (c.id.as_str(), c)).collect();
 
+    // Reflection hits resolve to their `conv_<id>` tag; classify those and the
+    // chunk hits' conversations together, one batched lookup.
+    let mut reflection_rows: Vec<(&crate::search::SearchResult, String)> = Vec::new();
     for r in &reflection_hits {
         if let Ok(Some((_content, tags, _timestamp))) = storage.get_reflection_by_id(&r.id) {
             let conv = tags
                 .iter()
                 .find_map(|t| t.strip_prefix("conv_").map(str::to_string))
                 .unwrap_or_else(|| format!("refl_{}", r.id));
-            push_candidate(
-                &mut pool,
-                Candidate::new(r.id.clone(), conv, r.score, Via::Reflection),
-            );
+            reflection_rows.push((r, conv));
         }
+    }
+    probes.classify(
+        storage,
+        chunk_meta
+            .iter()
+            .map(|c| c.conversation_id.as_str())
+            .chain(reflection_rows.iter().map(|(_, conv)| conv.as_str())),
+    )?;
+
+    // Probe conversations leave the pool at the door: no seed, no blend
+    // candidate, no launch anchor, no reflection.
+    chunk_hits.retain(|hit| {
+        meta_by_id
+            .get(hit.id.as_str())
+            .is_none_or(|chunk| !probes.exclude(&chunk.conversation_id))
+    });
+    for (r, conv) in reflection_rows {
+        if probes.exclude(&conv) {
+            continue;
+        }
+        push_candidate(
+            &mut pool,
+            Candidate::new(r.id.clone(), conv, r.score, Via::Reflection),
+        );
     }
 
     // seeds = top-N NON-ECHO chunk hits (hits are already score-sorted by
@@ -858,8 +961,10 @@ pub async fn reinstate(
             MAX_STRUCTURAL_CONVERSATIONS,
         )
     })?);
+    probes.classify(storage, structural_conversations.iter().map(String::as_str))?;
     let structural_conversations: Vec<String> = structural_conversations
         .into_iter()
+        .filter(|conv| !probes.exclude(conv))
         .take(MAX_STRUCTURAL_CONVERSATIONS)
         .collect();
 
@@ -960,8 +1065,12 @@ pub async fn reinstate(
             };
             let bids: Vec<String> = blend_hits.iter().map(|r| r.id.clone()).collect();
             let bmeta = storage.get_chunks_by_ids(&bids)?;
+            probes.classify(storage, bmeta.iter().map(|c| c.conversation_id.as_str()))?;
             for r in &blend_hits {
                 if let Some(c) = bmeta.iter().find(|c| c.id == r.id) {
+                    if probes.exclude(&c.conversation_id) {
+                        continue;
+                    }
                     push_candidate(
                         &mut pool,
                         Candidate::new(
@@ -998,7 +1107,11 @@ pub async fn reinstate(
                         12,
                     )
                 })?;
+                probes.classify(storage, neighbors.iter().map(String::as_str))?;
                 for neighbor in neighbors {
+                    if probes.exclude(&neighbor) {
+                        continue;
+                    }
                     trace.graph_walks += 1;
                     if let Some((id, cos)) =
                         best_chunk_for_conv(storage, &query_vec, &neighbor, &family_projects)?
@@ -1023,7 +1136,11 @@ pub async fn reinstate(
         }
 
         // (3) episode chain: seed session's episode -> prev episode -> its session
-        if let Some(prev_conv) = episode_prev_session(storage, &seed_conv)? {
+        let prev_episode = episode_prev_session(storage, &seed_conv)?;
+        if let Some(prev) = prev_episode.as_deref() {
+            probes.classify(storage, [prev])?;
+        }
+        if let Some(prev_conv) = prev_episode.filter(|prev| !probes.exclude(prev)) {
             trace.episode_links += 1;
             match resolve_episode_target(storage, &query_vec, &prev_conv, &family_projects)? {
                 EpisodeTarget::Resolved { chunk_id, cosine } => {
@@ -1120,6 +1237,7 @@ pub async fn reinstate(
         });
     }
 
+    trace.probes_excluded = probes.excluded.len();
     trace.episode_accepted = episode_accepted_ids.len();
     let surfaced_episode_ids: HashSet<&str> = items
         .iter()
@@ -1609,5 +1727,249 @@ mod tests {
         let storage = crate::storage::Storage::open_memory().unwrap();
         let result = episode_prev_session(&storage, "no-such-conv").unwrap();
         assert_eq!(result, None);
+    }
+
+    // ---- experiment-probe exclusion ----
+
+    const PROBE_A: &str = "You are the long-time maintainer of this codebase and its development history. Answer the question below using ONLY your recollection. Answer in at most 8 sentences. Be specific: name the decision, event, or evidence you are relying on.";
+    const PROBE_B: &str = "You are the long-term maintainer of the csr-engine project (claude-self-reflect: Rust MCP memory engine). A teammate makes the following request:";
+    const WHY_QUERY: &str =
+        "why must the release squash-merge instead of merging the dev branch history";
+
+    fn probe_chunk(
+        id: &str,
+        conv: &str,
+        seq: usize,
+        content: &str,
+    ) -> crate::import::ConversationChunk {
+        crate::import::ConversationChunk {
+            id: id.into(),
+            conversation_id: conv.into(),
+            project_name: "claude-self-reflect".into(),
+            timestamp: "2026-08-03T00:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq,
+            is_sidechain: false,
+        }
+    }
+
+    #[test]
+    fn probe_opening_matches_both_templates_and_ignores_leading_whitespace() {
+        assert!(is_experiment_probe_opening(PROBE_A));
+        assert!(is_experiment_probe_opening(PROBE_B));
+        assert!(is_experiment_probe_opening(&format!("\n \t {PROBE_A}")));
+        assert!(!is_experiment_probe_opening(
+            "I wrote: You are the long-time maintainer of this codebase and its development history."
+        ));
+        assert!(!is_experiment_probe_opening("why did we squash-merge"));
+        assert!(!is_experiment_probe_opening(""));
+    }
+
+    #[test]
+    fn probe_filter_reads_only_the_first_chunk_of_a_conversation() {
+        let storage = Storage::open_memory().unwrap();
+        let dim = [0.1_f32; 4];
+        // Opens with the template: a probe, even with leading whitespace.
+        storage
+            .insert_chunk(
+                &probe_chunk("p0", "probe", 0, &format!("  \n{PROBE_A}")),
+                &dim,
+            )
+            .unwrap();
+        // Quotes the template only in a later chunk: kept.
+        storage
+            .insert_chunk(
+                &probe_chunk("q0", "quoter", 0, "Reviewing the probes."),
+                &dim,
+            )
+            .unwrap();
+        storage
+            .insert_chunk(&probe_chunk("q1", "quoter", 1, PROBE_A), &dim)
+            .unwrap();
+        // First by seq, not by insertion order: the opener sits at seq 1 here.
+        storage
+            .insert_chunk(&probe_chunk("l1", "late-opener", 1, PROBE_B), &dim)
+            .unwrap();
+        storage
+            .insert_chunk(
+                &probe_chunk("l0", "late-opener", 0, "ordinary opening"),
+                &dim,
+            )
+            .unwrap();
+
+        let mut filter = ProbeFilter::default();
+        filter
+            .classify(&storage, ["probe", "quoter", "late-opener", "absent"])
+            .unwrap();
+        assert!(filter.exclude("probe"));
+        assert!(!filter.exclude("quoter"), "quoting must never exclude");
+        assert!(!filter.exclude("late-opener"));
+        assert!(!filter.exclude("absent"));
+        assert_eq!(filter.excluded.len(), 1);
+    }
+
+    async fn why_with(
+        storage: &Arc<Storage>,
+        embeddings: &Arc<EmbeddingEngine>,
+        engine: SearchEngine,
+        query: &str,
+    ) -> ReinstateResult {
+        reinstate(
+            storage,
+            embeddings,
+            &Arc::new(RwLock::new(engine)),
+            query,
+            Some("claude-self-reflect"),
+            &ReinstateConfig::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn probe_conversations_never_reach_seeds_blend_or_reflections() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let mut engine = SearchEngine::new(384);
+        let add = |id: &str, conv: &str, seq: usize, content: &str, engine: &mut SearchEngine| {
+            let v = embeddings.embed_single(content).unwrap();
+            storage
+                .insert_chunk(&probe_chunk(id, conv, seq, content), &v)
+                .unwrap();
+            engine.insert_chunk(id.into(), v);
+        };
+        add(
+            "real0",
+            "real",
+            0,
+            "The release must squash-merge instead of merging the dev branch history, because that history carries work-email commits.",
+            &mut engine,
+        );
+        // Probes that quote the question word for word: top semantic hits.
+        add(
+            "probe-a0",
+            "probe-a",
+            0,
+            &format!("{PROBE_A}\n\nQUESTION: {WHY_QUERY}"),
+            &mut engine,
+        );
+        add(
+            "probe-b0",
+            "probe-b",
+            0,
+            &format!("\n   {PROBE_B}\n\nREQUEST: {WHY_QUERY}"),
+            &mut engine,
+        );
+        // Quotes the template in a later chunk only.
+        add(
+            "quote0",
+            "quoter",
+            0,
+            "Auditing the release squash-merge probes.",
+            &mut engine,
+        );
+        add(
+            "quote1",
+            "quoter",
+            1,
+            &format!("The probe prompt reads: {PROBE_A} Question was: {WHY_QUERY}, release squash-merge."),
+            &mut engine,
+        );
+        // A reflection tagged to a probe conversation.
+        let rv = embeddings.embed_single(WHY_QUERY).unwrap();
+        storage
+            .insert_reflection("refl-probe", WHY_QUERY, &["conv_probe-a".to_string()], &rv)
+            .unwrap();
+        engine.insert_reflection("refl-probe".into(), rv);
+
+        let result = why_with(&storage, &embeddings, engine, WHY_QUERY).await;
+
+        let convs: Vec<&str> = result
+            .items
+            .iter()
+            .map(|item| item.conversation_id.as_str())
+            .collect();
+        assert!(convs.contains(&"real"), "{convs:?}");
+        assert!(
+            convs.contains(&"quoter"),
+            "quoting must never exclude: {convs:?}"
+        );
+        assert!(!convs.contains(&"probe-a"), "{convs:?}");
+        assert!(!convs.contains(&"probe-b"), "{convs:?}");
+        assert!(
+            result
+                .items
+                .iter()
+                .all(|item| item.chunk_id != "refl-probe"),
+            "a reflection tagged to a probe conversation is excluded"
+        );
+        assert_eq!(result.trace.probes_excluded, 2);
+        let receipt = render_receipt(&result.trace, &result.items);
+        assert!(receipt.ends_with(" | probes excluded=2"), "{receipt}");
+    }
+
+    #[tokio::test]
+    async fn probe_conversation_is_excluded_from_the_episode_hop() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let embeddings = Arc::new(EmbeddingEngine::new().unwrap());
+        let mut engine = SearchEngine::new(384);
+        let real = "The release must squash-merge instead of merging the dev branch history, because that history carries work-email commits.";
+        let rv = embeddings.embed_single(real).unwrap();
+        storage
+            .insert_chunk(&probe_chunk("real0", "real", 0, real), &rv)
+            .unwrap();
+        engine.insert_chunk("real0".into(), rv);
+        // The probe is stored but NOT in the vector index, so hop 1 cannot see
+        // it: only the episode chain can reach it.
+        let probe_text = format!("{PROBE_A}\n\nQUESTION: {WHY_QUERY}");
+        let pv = embeddings.embed_single(&probe_text).unwrap();
+        storage
+            .insert_chunk(&probe_chunk("probe0", "probe-ep", 0, &probe_text), &pv)
+            .unwrap();
+        // Control: a normal previous episode IS reached through the same chain.
+        let prev = "An earlier session settled the release squash-merge: the dev branch history carries work-email commits.";
+        let nv = embeddings.embed_single(prev).unwrap();
+        storage
+            .insert_chunk(&probe_chunk("prev0", "prev-ep", 0, prev), &nv)
+            .unwrap();
+        storage
+            .insert_reflection(
+                "episode-real",
+                &serde_json::json!({ "prev_episode_id": "probe-ep" }).to_string(),
+                &["session_episode".to_string(), "conv_real".to_string()],
+                &[],
+            )
+            .unwrap();
+
+        let result = why_with(&storage, &embeddings, engine, WHY_QUERY).await;
+        assert!(
+            result.items.iter().all(|i| i.conversation_id != "probe-ep"),
+            "{:?}",
+            result.items
+        );
+        assert_eq!(result.trace.probes_excluded, 1);
+        assert_eq!(
+            result.trace.episode_links, 0,
+            "a probe is skipped before the link is counted"
+        );
+
+        // Same chain pointing at the normal conversation is walked.
+        storage
+            .insert_reflection(
+                "episode-real",
+                &serde_json::json!({ "prev_episode_id": "prev-ep" }).to_string(),
+                &["session_episode".to_string(), "conv_real".to_string()],
+                &[],
+            )
+            .unwrap();
+        let mut engine = SearchEngine::new(384);
+        let rv = embeddings.embed_single(real).unwrap();
+        engine.insert_chunk("real0".into(), rv);
+        let control = why_with(&storage, &embeddings, engine, WHY_QUERY).await;
+        assert_eq!(control.trace.episode_links, 1, "{:?}", control.trace);
+        assert_eq!(control.trace.probes_excluded, 0);
     }
 }

@@ -1968,6 +1968,18 @@ impl Storage {
         queries::get_chunk_ids_for_conversation(&conn, conversation_id)
     }
 
+    /// First stored chunk (lowest `seq`) of each conversation, cut to
+    /// `prefix_chars` characters. One batched query; see
+    /// [`queries::first_chunk_prefixes`].
+    pub fn first_chunk_prefixes(
+        &self,
+        conversation_ids: &[String],
+        prefix_chars: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::first_chunk_prefixes(&conn, conversation_ids, prefix_chars)
+    }
+
     pub fn get_chunk_vectors_by_ids(&self, ids: &[String]) -> Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_chunk_vectors_by_ids(&conn, ids)

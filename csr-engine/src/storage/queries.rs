@@ -4366,6 +4366,45 @@ pub fn get_chunk_ids_for_conversation_in_projects(
         .map_err(Into::into)
 }
 
+/// The first stored chunk of each requested conversation, cut to `prefix_chars`
+/// characters: `(conversation_id, content prefix)`. "First" is the lowest `seq`
+/// (rows whose `seq` was never backfilled sort after numbered ones, then by
+/// rowid). Conversations with no chunks are absent from the result. One batched
+/// query per 400 ids, never one per conversation.
+pub fn first_chunk_prefixes(
+    conn: &Connection,
+    conversation_ids: &[String],
+    prefix_chars: usize,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(conversation_ids.len());
+    for batch in conversation_ids.chunks(400) {
+        let sql = format!(
+            "SELECT c.conversation_id, substr(c.content, 1, ?)
+             FROM chunks c
+             WHERE c.conversation_id IN ({})
+               AND c.id = (
+                   SELECT f.id FROM chunks f
+                   WHERE f.conversation_id = c.conversation_id
+                   ORDER BY f.seq IS NULL, f.seq, f.rowid
+                   LIMIT 1
+               )",
+            string_placeholders(batch.len())
+        );
+        let prefix_chars = prefix_chars as i64;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(batch.len() + 1);
+        params.push(&prefix_chars);
+        params.extend(batch.iter().map(|id| id as &dyn rusqlite::ToSql));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
 /// Lean exact-symbol row used by query-aware reinstatement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReinstatementSymbolNode {
