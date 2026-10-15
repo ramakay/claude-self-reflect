@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
-import { BLOCK_MAX, BRIEF_HEAD, BRIEF_TAIL, subagentBlock } from '../hooks/subagent'
+import { BLOCK_MAX, BRIEF_HEAD, BRIEF_TAIL, byteLength, subagentBlock } from '../hooks/subagent'
 import { canAfford, facts, freshChapter, freshPace, median, owed, paceText, spacing } from '../hooks/pace'
 const rankOfRoot = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1) // as register.tsx ranks a copy
 import { addTerm, AS_TEXT, commands, gitParse, gitVerdict, HOOKS_OFF, isBareDigit, mergeGuards, parseGuard, NO_VERIFY, PROTECTED, RELEASE, tripwire, UNRESOLVED } from '../hooks/coach'
@@ -78,6 +78,7 @@ type World = {
   gitExit?: Record<string, number> // a git question that fails with this exit, keyed as `git` is
   compactFails?: boolean
   agents?: Array<{ id: string; type: string; description: string }> // what $.agent.list() answers
+  agentListHangs?: boolean // $.agent.list() never settles (set once the session has started)
   lost?: unknown[] | string // what pane.py --lost prints (a string as is, 'hangs' a timeout); undefined makes it fail
   json?: Record<string, unknown> // what pane.py --json prints, where SHIFTS is not the case
   jsonHangs?: boolean // pane.py --json runs past its time limit: process.run rejects
@@ -134,7 +135,7 @@ function host(on: On, world: World) {
     on('clock.after', async () => ({ value: undefined }) as never) // a wait the plugin sets (the agents file's trailing write, a completion's 20 s): never fires here
     on('clock.now', async () => ({ value: world.clock?.now ?? NOW }))
   }
-  on('agent.list', async () => ({ value: world.agents ?? [] }) as never)
+  on('agent.list', async () => (world.agentListHangs ? new Promise<never>(() => {}) : ({ value: world.agents ?? [] }) as never))
   const logged: string[] = [] // what the plugin wrote to the log
   on('ui.log', async (_$, e) => {
     logged.push(e.text)
@@ -2163,7 +2164,7 @@ test('a compacting subagent gets its brief, commits, edited files, last test out
   await $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: SUBAGENT } as never)
   expect(seen.compacted.at(-1)).toBe(`keep the plan\n\n${SUBAGENT_BLOCK}`)
   expect(seen.compacted.at(-1)).not.toContain('Reminders from CSR') // the main session's threads are not the subagent's
-  expect(seen.logged.some(line => line.includes('csr-sonnet-high subagent sub-1 compacting') && line.includes(`${SUBAGENT_BLOCK.length} characters`))).toBe(true)
+  expect(seen.logged.some(line => line.includes('subagent sub-1 compacting (auto)') && line.includes(`${byteLength(SUBAGENT_BLOCK)} bytes`))).toBe(true)
   await $.session.compact({ trigger: 'manual', agentId: 'sub-1', messages: SUBAGENT } as never)
   expect(seen.compacted.at(-1)).toBe(SUBAGENT_BLOCK) // no instructions: the block alone
 })
@@ -2219,14 +2220,62 @@ test('a subagent brief over 6 KB is cut to its first 4 KB and last 2 KB with a m
   expect(seen.compacted.at(-1)).not.toContain('cut …')
 })
 
-test('a subagent whose type cannot be looked up still keeps its block, and a transcript with nothing to keep leaves the instructions alone', async ($, on) => {
-  const seen = host(on, { herdr: false, repo: true, agents: 'not a list' as never })
+test('a transcript with nothing to keep leaves the instructions alone', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true })
   await $.session.start(START as never)
-  await $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: SUBAGENT } as never)
-  expect(seen.compacted.at(-1)).toBe(`keep the plan\n\n${SUBAGENT_BLOCK}`)
-  expect(seen.logged.some(line => line.includes('unknown subagent sub-1'))).toBe(true)
   await $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: [{ role: 'assistant', text: '', toolUses: [] }] } as never)
   expect(seen.compacted.at(-1)).toBe('keep the plan')
+})
+
+test('a subagent compaction asks nothing of $.agent.list: a list that never settles holds nothing up', async ($, on) => {
+  const world: World = { herdr: false, repo: true, lost: THREADS }
+  const seen = host(on, world)
+  await $.session.start(START as never)
+  world.agentListHangs = true
+  const done = await Promise.race([
+    $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: SUBAGENT } as never).then(() => 'done'),
+    new Promise<string>(resolve => setTimeout(() => resolve('held'), 1500)),
+  ])
+  expect(done).toBe('done')
+  expect(seen.compacted.at(-1)).toBe(`keep the plan\n\n${SUBAGENT_BLOCK}`)
+  expect(seen.logged.some(line => line.includes('subagent sub-1 compacting (auto)'))).toBe(true)
+})
+
+const utf8 = (text: string) => new TextEncoder().encode(text).length // the encoder's count, independent of byteLength
+const loneSurrogate = (text: string) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(text)
+
+test('the subagent block is capped in UTF-8 bytes, not characters', () => {
+  const brief = '界'.repeat(6144) // 6144 characters, 18 KB
+  const block = subagentBlock([{ role: 'user' as const, text: brief, toolUses: [] }, { role: 'assistant' as const, text: '界'.repeat(900), toolUses: [] }])!
+  expect(byteLength(block)).toBeLessThanOrEqual(BLOCK_MAX)
+  expect(byteLength(block)).toBe(utf8(block))
+  expect(block).toContain('Task brief')
+  expect(loneSurrogate(block)).toBe(false)
+  // the newest words are capped in bytes too
+  const only = subagentBlock([{ role: 'user' as const, text: 'the brief', toolUses: [] }, { role: 'assistant' as const, text: '界'.repeat(900), toolUses: [] }])!
+  const words = only.slice(only.indexOf('In progress (its newest words):\n') + 'In progress (its newest words):\n'.length)
+  expect(utf8(words)).toBeLessThanOrEqual(600)
+  const wide = subagentBlock([{ role: 'user' as const, text: '界'.repeat(2500), toolUses: [] }])!
+  expect(wide).toMatch(/\[… \d+ characters cut …\]/)
+  const kept = wide.slice(wide.indexOf('verbatim):\n') + 'verbatim):\n'.length)
+  expect(utf8(kept)).toBeLessThanOrEqual(BRIEF_HEAD + BRIEF_TAIL + 64)
+})
+
+test('a cut never splits a surrogate pair', () => {
+  // the newest words: 598 characters, then an emoji that straddles the 600-byte cut, then one more character
+  const words = `${'a'.repeat(598)}😀b`
+  const block = subagentBlock([{ role: 'user' as const, text: 'the brief', toolUses: [] }, { role: 'assistant' as const, text: words, toolUses: [] }])!
+  expect(loneSurrogate(block)).toBe(false)
+  expect(block).toContain('a'.repeat(597))
+  expect(block).not.toContain('😀')
+  // the brief's two cut points: the head and the tail each land inside an emoji
+  for (const pad of [0, 1, 2, 3]) {
+    const brief = `${'a'.repeat(BRIEF_HEAD - 2 + pad)}${'😀'.repeat(400)}${'b'.repeat(pad)}${'😀'.repeat(300)}`
+    const told = subagentBlock([{ role: 'user' as const, text: brief, toolUses: [] }])!
+    expect(loneSurrogate(told)).toBe(false)
+    expect(told).toContain('characters cut')
+    expect(byteLength(told)).toBeLessThanOrEqual(BLOCK_MAX)
+  }
 })
 
 test('a subagent block that cannot be composed throws out of subagentBlock, which the handler answers with the instructions it had', () => {
@@ -2246,8 +2295,8 @@ test('the subagent block holds the newest 30 files, the newest test run that say
   expect(block).toContain('test result: ok. 3 passed; 0 failed') // the newest result with a test line, not the newest result
   expect(block).toContain('the brief')
   expect(block).not.toContain('/f9.rs') // the first ten edits fall off the newest 30
-  expect(block).toContain('z'.repeat(599)) // the newest words, 600 characters
-  expect(block).not.toContain('z'.repeat(601))
+  expect(block).toContain('z'.repeat(597)) // the newest words, 600 bytes with the cut mark
+  expect(block).not.toContain('z'.repeat(598))
   expect(subagentBlock([{ role: 'assistant' as const, text: '', toolUses: [] }])).toBeNull() // nothing to keep: no block
 })
 

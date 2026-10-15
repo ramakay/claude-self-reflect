@@ -13,26 +13,81 @@ export type Said = {
   toolResults?: ReadonlyArray<{ tool_use_id: string; text: string }>
 }
 
-export const BRIEF_MAX = 6144 // 6 KB of characters; longer keeps the first 4 KB and the last 2 KB
+// Every size here is in UTF-8 bytes, what a "KB" of the summarizer's instructions is, and every cut falls between
+// code points, never inside a surrogate pair.
+export const BRIEF_MAX = 6144 // 6 KB; longer keeps the first 4 KB and the last 2 KB
 export const BRIEF_HEAD = 4096
 export const BRIEF_TAIL = 2048
-export const BLOCK_MAX = 8192 // the whole block, in characters
+export const BLOCK_MAX = 8192 // the whole block
 export const FILES_MAX = 30
 export const COMMITS_MAX = 20
 export const TEST_LINES_MAX = 10
-export const TEST_LINE_CHARS = 200
-export const PROGRESS_CHARS = 600
+export const TEST_LINE_BYTES = 200
+export const PROGRESS_BYTES = 600
 const EDITS = new Set(['Edit', 'Write', 'MultiEdit'])
 const HEAD = `${KEEP_HEADER} subagent. Keep these verbatim in the summary; they are the subagent's task and state:`
-const MIN_ROOM = 40 // a section with less room than this is left out whole
+const MIN_ROOM = 40 // bytes; a section with less room than this is left out whole
 
-const cut = (text: string, max: number) => (text.length > max ? `${text.slice(0, Math.max(0, max - 1))}…` : text)
+const ELLIPSIS = '…'
+const isHigh = (unit: number) => unit >= 0xd800 && unit <= 0xdbff
+const isLow = (unit: number) => unit >= 0xdc00 && unit <= 0xdfff
+
+// UTF-8 bytes of a string; a lone surrogate counts as the 3 bytes of U+FFFD, as an encoder writes it.
+export function byteLength(text: string): number {
+  let bytes = 0
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i)
+    if (unit < 0x80) bytes += 1
+    else if (unit < 0x800) bytes += 2
+    else if (isHigh(unit) && i + 1 < text.length && isLow(text.charCodeAt(i + 1))) {
+      bytes += 4
+      i++
+    } else bytes += 3
+  }
+  return bytes
+}
+
+// The longest start of `text` that fits `max` bytes, ending between code points.
+function firstBytes(text: string, max: number): string {
+  let bytes = 0
+  let i = 0
+  while (i < text.length) {
+    const unit = text.charCodeAt(i)
+    const pair = isHigh(unit) && i + 1 < text.length && isLow(text.charCodeAt(i + 1))
+    const size = unit < 0x80 ? 1 : unit < 0x800 ? 2 : pair ? 4 : 3
+    if (bytes + size > max) break
+    bytes += size
+    i += pair ? 2 : 1
+  }
+  return text.slice(0, i)
+}
+
+// The longest end of `text` that fits `max` bytes, starting between code points.
+function lastBytes(text: string, max: number): string {
+  let bytes = 0
+  let i = text.length
+  while (i > 0) {
+    const unit = text.charCodeAt(i - 1)
+    const pair = isLow(unit) && i - 2 >= 0 && isHigh(text.charCodeAt(i - 2))
+    const size = unit < 0x80 ? 1 : unit < 0x800 ? 2 : pair ? 4 : 3
+    if (bytes + size > max) break
+    bytes += size
+    i -= pair ? 2 : 1
+  }
+  return text.slice(i)
+}
+
+// `text` in at most `max` bytes, the cut marked by an ellipsis that is counted in them.
+const cut = (text: string, max: number) =>
+  byteLength(text) <= max ? text : max < byteLength(ELLIPSIS) ? '' : `${firstBytes(text, max - byteLength(ELLIPSIS))}${ELLIPSIS}`
 
 // The brief, whole to 6 KB; past it the head and the tail around a cut mark that says how much is missing.
 export function briefOf(text: string): string {
-  if (text.length <= BRIEF_MAX) return text
-  const missing = text.length - BRIEF_HEAD - BRIEF_TAIL
-  return `${text.slice(0, BRIEF_HEAD)}\n[… ${missing} characters cut …]\n${text.slice(text.length - BRIEF_TAIL)}`
+  if (byteLength(text) <= BRIEF_MAX) return text
+  const head = firstBytes(text, BRIEF_HEAD)
+  const tail = lastBytes(text.slice(head.length), BRIEF_TAIL)
+  const missing = [...text.slice(head.length, text.length - tail.length)].length
+  return `${head}\n[… ${missing} characters cut …]\n${tail}`
 }
 
 type Result = { tool: string | undefined; text: string; order: number }
@@ -88,13 +143,13 @@ export function subagentBlock(messages: readonly Said[]): string | null {
     if (result.tool !== undefined && result.tool !== 'Bash') continue // a Read of a file that says "passed" is no test run
     const lines = result.text.split('\n').map(line => line.trim()).filter(line => TESTED.test(line))
     if (lines.length) {
-      tests = lines.slice(-TEST_LINES_MAX).map(line => cut(line, TEST_LINE_CHARS))
+      tests = lines.slice(-TEST_LINES_MAX).map(line => cut(line, TEST_LINE_BYTES))
       break
     }
   }
 
   const newest = [...messages].reverse().find(message => message.role === 'assistant' && message.text.trim())
-  const progress = newest ? cut(newest.text.trim(), PROGRESS_CHARS) : ''
+  const progress = newest ? cut(newest.text.trim(), PROGRESS_BYTES) : ''
 
   const lines = (items: string[], mark = '- ') => items.map(item => `${mark}${item}`).join('\n')
   // [priority, title, body]: shown in this order; room is given in the order of the priority column (lower first).
@@ -108,14 +163,14 @@ export function subagentBlock(messages: readonly Said[]): string | null {
   const present = parts.filter(([, , body]) => body)
   if (!present.length) return null
 
-  let room = BLOCK_MAX - HEAD.length
+  let room = BLOCK_MAX - byteLength(HEAD)
   const given = new Map<number, string>()
   for (const [rank, title, body] of [...present].sort((a, b) => a[0] - b[0])) {
-    const space = room - title.length - 2 // the newlines around it
+    const space = room - byteLength(title) - 2 // the newlines around it
     if (space < MIN_ROOM) continue
-    const fitted = body.length <= space ? body : cut(body, space)
+    const fitted = cut(body, space)
     given.set(rank, `${title}\n${fitted}`)
-    room -= title.length + fitted.length + 2
+    room -= byteLength(title) + byteLength(fitted) + 2
   }
   const shown = present.filter(([rank]) => given.has(rank)).map(([rank]) => given.get(rank)!)
   return shown.length ? [HEAD, ...shown].join('\n') : null

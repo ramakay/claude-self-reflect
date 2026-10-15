@@ -5,7 +5,7 @@ import type { AgentState, CompactView, CompletionKey, CompletionDisposition, Inf
 import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, handoffRequests, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
 import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
-import { subagentBlock } from './subagent'
+import { byteLength, subagentBlock } from './subagent'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
 import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, closeTurn, countStep, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
@@ -2387,8 +2387,8 @@ export const register: Register = (on, options) => {
     try {
       const block = subagentBlock(e.messages)
       if (block) {
-        const type = await $.agent.list().then(list => list.find(agent => agent.id === id)?.type).catch(() => undefined)
-        $.ui.log(`csr-companion: ${type ?? 'unknown'} subagent ${id} compacting (${e.trigger}): kept ${block.length} characters of its task and state`, { to: 'debug' })
+        // No lookup of the agent's type: an awaited $.agent.list() that never settles would hold the compaction.
+        $.ui.log(`csr-companion: subagent ${id} compacting (${e.trigger}): kept ${byteLength(block)} bytes of its task and state`, { to: 'debug' })
         told = { ...e, instructions: e.instructions ? `${e.instructions}\n\n${block}` : block }
       }
     } catch {
