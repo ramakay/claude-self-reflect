@@ -116,6 +116,34 @@ def test_a_miss_is_not_kept_while_the_own_transcript_is_missing(home):
     assert pane.continued_from(NEW) == OLD, 'no clock advance: the miss was never written'
 
 
+def test_an_explicit_path_that_is_not_there_yet_is_not_a_scan_and_is_not_kept(home):
+    tmp, folder = home
+    mine = str(folder / f'{NEW}.jsonl')
+    os.rename(mine, mine + '.parked')
+    os.rename(str(folder / f'{OLD}.jsonl'), str(folder / 'parked-old'))
+    assert pane.continued_from(NEW, mine) is None
+    assert NEW not in pane._CONTINUED
+    assert pane.previous_session(mine, 4000.0) is None
+    os.rename(mine + '.parked', mine)
+    os.rename(str(folder / 'parked-old'), str(folder / f'{OLD}.jsonl'))
+    assert pane.continued_from(NEW, mine) == OLD, 'no clock advance: nothing was kept'
+    assert pane.previous_session(mine, 4000.0) == str(folder / f'{OLD}.jsonl')
+
+
+def test_a_transcript_that_vanishes_during_the_scan_is_not_kept_as_a_miss(home, monkeypatch):
+    tmp, folder = home
+    mine = str(folder / f'{NEW}.jsonl')
+    real = os.listdir
+
+    def vanishing(path):
+        raise FileNotFoundError(path)
+    monkeypatch.setattr(pane.os, 'listdir', vanishing)
+    assert pane.continued_from(NEW, mine) is None
+    assert NEW not in pane._CONTINUED
+    monkeypatch.setattr(pane.os, 'listdir', real)
+    assert pane.continued_from(NEW, mine) == OLD
+
+
 def test_the_kill_switch_returns_none(home, monkeypatch):
     monkeypatch.setenv('CSR_NO_CONTINUED', '1')
     assert pane.continued_from(NEW) is None

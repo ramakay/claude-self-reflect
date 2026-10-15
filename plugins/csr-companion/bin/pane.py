@@ -473,8 +473,9 @@ _CONTINUED = {}  # session id -> (the session it continues or None, when that wa
 
 
 def _own_transcript(session_id, path=None):
-    """The path of this session's transcript (the one given, else the first folder holding it), or None."""
-    found = [path] if path else glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
+    """The path of this session's transcript (the one given if that file exists, else the first folder holding it), or None."""
+    found = [path] if path and os.path.isfile(path) else [] if path else \
+        glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
     return found[0] if found else None
 
 
@@ -532,7 +533,12 @@ def continued_from(session_id, path=None):
     mine = _own_transcript(session_id, path)
     if not mine:  # Claude Code writes the row before it creates this transcript: once it exists, the row is there
         return None
-    found = fail_open(_find_continued, None, session_id, mine)
+    try:
+        found = _find_continued(session_id, mine)
+    except OSError:  # this transcript or its folder could not be read (it vanished): not a scan, so not an answer to keep
+        return None
+    except Exception:
+        found = None
     _CONTINUED[session_id] = (found, now)
     return found
 
