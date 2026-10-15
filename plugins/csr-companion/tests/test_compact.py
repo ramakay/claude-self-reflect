@@ -277,6 +277,7 @@ class Card(unittest.TestCase):
         self.assertIsNone(pane.compaction_card(done, [], 1010.0 + pane.CARD_LIFE + 1))
         self.assertIsNone(pane.compaction_card([record('plan', 1000.0)], [], 1001.0))  # a plan is the masthead's row
 
+    @mock.patch.object(pane, 'PIXELS', True)  # the headings are read without the gutter glyph; pane.py fixes PIXELS from TERM_PROGRAM at import
     def test_on_the_page_it_sits_under_the_pinned_story_while_it_runs_and_once_done(self):
         story = dict(rev=3, now='Building the card.', text='Building the card.', at=1990.0)
         running = dict(card=pane.compaction_card([record('start', 1958.0, keep=KEEP)], [], 2000.0))
