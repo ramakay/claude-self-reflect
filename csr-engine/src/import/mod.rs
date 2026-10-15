@@ -1412,6 +1412,8 @@ pub struct QueuedPrompt {
     /// How many messages precede it: where it sits among them.
     pub place: usize,
     pub text: String,
+    /// When it was typed, from the row; None when the row carries no readable time.
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// [`parse_jsonl_messages`] plus the human-typed `queued_command` attachments, in
@@ -1455,10 +1457,12 @@ pub(crate) fn parse_jsonl_messages_with_queued(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let at = crate::temporal::parse_timestamp(&stamp);
             if command.human_turn && seen.insert((stamp, command.prompt.clone())) {
                 queued.push(QueuedPrompt {
                     place: messages.len(),
                     text: command.prompt,
+                    at,
                 });
             }
         }
@@ -1495,6 +1499,7 @@ pub(crate) fn parse_jsonl_messages_for_search_with_queued(
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
+                at: prompt.at,
             }
         })
         .collect();

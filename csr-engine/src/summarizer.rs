@@ -344,6 +344,8 @@ pub struct PriorStory {
     /// The session's message count when it was written; None for a story from before the
     /// count was kept.
     pub covered: Option<usize>,
+    /// When the story was written, from its stored reflection; None when that is unreadable.
+    pub written_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
@@ -361,6 +363,9 @@ fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
         ids: rows.iter().map(|(id, _, _, _)| id.clone()).collect(),
         rev,
         covered: storage.story_messages_covered(conv_id).ok().flatten(),
+        written_at: rows
+            .first()
+            .and_then(|(_, _, _, written)| crate::temporal::parse_timestamp(written)),
     })
 }
 
@@ -403,9 +408,11 @@ pub fn story_due(
 /// What the person typed after the story covering the first `covered` messages. A prompt typed
 /// while Claude was busy has no user row, only a `queued_command` attachment; `queued` holds
 /// those, each with its place among the messages. One whose text also arrives as a user row at
-/// or after its place is that same prompt, counted once. That holds across the story's edge: a
-/// prompt queued inside the covered part was told by the story, so its user row landing after
-/// the edge is not a new ask.
+/// or after its place is that same prompt, counted once. A prompt the story already told is not
+/// a new ask: one queued inside the covered part, or typed before the story was written (a
+/// rewrite that found nothing new to cover leaves `covered` where it was, so place alone would
+/// count the same prompt on every rewrite). That holds across the story's edge: the user row of
+/// a told prompt landing after it is not a new ask either.
 fn asked_since(
     messages: &[serde_json::Value],
     queued: &[crate::import::QueuedPrompt],
@@ -415,31 +422,27 @@ fn asked_since(
         .and_then(|p| p.covered)
         .unwrap_or(0)
         .min(messages.len());
-    let mut rows_by_text: std::collections::HashMap<String, Vec<usize>> = Default::default();
-    for (at, message) in messages.iter().enumerate() {
-        for text in typed_prompts(std::slice::from_ref(message), 1, usize::MAX) {
-            rows_by_text.entry(text).or_default().push(at);
-        }
-    }
-    // User rows that are the twin of a prompt queued inside the covered part.
+    let written_at = prior.and_then(|p| p.written_at);
+    let told_by_story = |prompt: &crate::import::QueuedPrompt| {
+        prompt.place < covered || matches!((prompt.at, written_at), (Some(at), Some(w)) if at <= w)
+    };
+    let rows_by_text = user_rows_by_text(messages);
+    // User rows that are the twin of a prompt the story told.
     let mut told: HashSet<usize> = HashSet::new();
     let mut from_queue = 0;
-    let keyed: Vec<(usize, Option<String>)> = queued
-        .iter()
-        .map(|prompt| (prompt.place, typed_words(&prompt.text)))
-        .collect();
+    let keyed = queued_keys(queued);
     let twins = crate::import::queued_prompts::pair_with_rows(&keyed, &rows_by_text);
-    for ((place, key), twin) in keyed.iter().zip(twins) {
+    for ((prompt, (_, key)), twin) in queued.iter().zip(&keyed).zip(twins) {
         if key.is_none() {
             continue;
         }
         match twin {
             Some(at) => {
-                if *place < covered {
+                if told_by_story(prompt) {
                     told.insert(at);
                 }
             }
-            None if *place >= covered => from_queue += 1,
+            None if !told_by_story(prompt) => from_queue += 1,
             None => {}
         }
     }
@@ -449,6 +452,68 @@ fn asked_since(
         .filter(|at| **at >= covered && !told.contains(at))
         .count();
     rows + from_queue
+}
+
+/// The typed text of each user row, by message index.
+fn user_rows_by_text(
+    messages: &[serde_json::Value],
+) -> std::collections::HashMap<String, Vec<usize>> {
+    let mut rows_by_text: std::collections::HashMap<String, Vec<usize>> = Default::default();
+    for (at, message) in messages.iter().enumerate() {
+        for text in typed_prompts(std::slice::from_ref(message), 1, usize::MAX) {
+            rows_by_text.entry(text).or_default().push(at);
+        }
+    }
+    rows_by_text
+}
+
+/// Each queued prompt's place and typed words, the key `pair_with_rows` matches on.
+fn queued_keys(queued: &[crate::import::QueuedPrompt]) -> Vec<(usize, Option<String>)> {
+    queued
+        .iter()
+        .map(|prompt| (prompt.place, typed_words(&prompt.text)))
+        .collect()
+}
+
+/// The messages in `range` as the story's prompt shows them: each human-typed prompt that has no
+/// user row of its own (typed while Claude was busy) put in as a user line at its place, so the
+/// story can tell what was asked mid-turn. The messages themselves, their numbering and the
+/// stored `covered` count are not touched; this is text for the prompt only. A prompt queued
+/// after the last message belongs to a range that runs to the end.
+fn with_queued_prompts(
+    messages: &[serde_json::Value],
+    queued: &[crate::import::QueuedPrompt],
+    range: std::ops::Range<usize>,
+) -> Vec<serde_json::Value> {
+    let keyed = queued_keys(queued);
+    let twins = crate::import::queued_prompts::pair_with_rows(&keyed, &user_rows_by_text(messages));
+    let extra: Vec<&crate::import::QueuedPrompt> = queued
+        .iter()
+        .zip(&keyed)
+        .zip(twins)
+        .filter(|((_, (_, key)), twin)| key.is_some() && twin.is_none())
+        .map(|((prompt, _), _)| prompt)
+        .collect();
+    let mut shown = Vec::with_capacity(range.len() + extra.len());
+    for at in range.start..=range.end {
+        if at < range.end || range.end == messages.len() {
+            shown.extend(
+                extra
+                    .iter()
+                    .filter(|prompt| prompt.place == at)
+                    .map(|prompt| {
+                        serde_json::json!({
+                            "type": "user",
+                            "message": {"role": "user", "content": prompt.text}
+                        })
+                    }),
+            );
+        }
+        if at < range.end {
+            shown.push(messages[at].clone());
+        }
+    }
+    shown
 }
 
 /// Claude Code's own summary at the session's newest compaction: where it sits among the
@@ -548,11 +613,12 @@ pub async fn build_story_context(
     engine: &Engine,
     cwd: &str,
     messages: &[serde_json::Value],
+    queued: &[crate::import::QueuedPrompt],
 ) -> StoryContext {
     let project_name = resolve_project_from_cwd(cwd).unwrap_or_else(|| "unknown".to_string());
 
     // 1. Sample transcript
-    let excerpt = sample_transcript(messages, TRANSCRIPT_SAMPLE_MSGS, TRANSCRIPT_CHAR_CAP);
+    let excerpt = story_excerpt(messages, queued);
 
     // 2. Get V3 enrichment for this project's most recent conversation
     let v3 = get_latest_v3_enrichment(engine.storage(), &project_name);
@@ -572,6 +638,30 @@ pub async fn build_story_context(
         related_sessions: related,
         project_name,
     }
+}
+
+/// The transcript sample a story is told from, with the prompts typed while Claude was busy at
+/// their places.
+fn story_excerpt(messages: &[serde_json::Value], queued: &[crate::import::QueuedPrompt]) -> String {
+    sample_transcript(
+        &with_queued_prompts(messages, queued, 0..messages.len()),
+        TRANSCRIPT_SAMPLE_MSGS,
+        TRANSCRIPT_CHAR_CAP,
+    )
+}
+
+/// The messages of `range` a summary story reads beside Claude Code's summary, with the prompts
+/// typed while Claude was busy at their places.
+fn story_tail(
+    messages: &[serde_json::Value],
+    queued: &[crate::import::QueuedPrompt],
+    range: std::ops::Range<usize>,
+) -> String {
+    sample_transcript(
+        &with_queued_prompts(messages, queued, range),
+        TAIL_MSGS,
+        TRANSCRIPT_CHAR_CAP,
+    )
 }
 
 /// Get the latest V3 enrichment reflection for this project.
@@ -741,7 +831,16 @@ pub async fn generate_story_cli(
     let result = match (mode, summary) {
         (StoryMode::First, _) | (StoryMode::Rewrite, None) => {
             // Lock held — generate story (Haiku call happens here)
-            generate_and_store(engine, cwd, &conv_id, &project, &messages, prior.as_ref()).await
+            generate_and_store(
+                engine,
+                cwd,
+                &conv_id,
+                &project,
+                &messages,
+                &queued,
+                prior.as_ref(),
+            )
+            .await
         }
         (StoryMode::FromCompaction, None) => Ok(()), // story_due refused it already
         (_, Some((at, text))) => {
@@ -749,13 +848,13 @@ pub async fn generate_story_cli(
             // a compaction, everything after it at the session's end
             let by_haiku = mode == StoryMode::Rewrite || story_rewrites_enabled();
             let after = if mode == StoryMode::FromCompaction {
-                &messages[at.saturating_sub(TAIL_MSGS)..at]
+                at.saturating_sub(TAIL_MSGS)..at
             } else {
-                &messages[(at + 1).min(messages.len())..]
+                (at + 1).min(messages.len())..messages.len()
             };
             let mut told = None;
             if by_haiku {
-                let tail = sample_transcript(after, TAIL_MSGS, TRANSCRIPT_CHAR_CAP);
+                let tail = story_tail(&messages, &queued, after);
                 told = haiku_story(
                     engine,
                     &summary_story_prompt(&text, &tail),
@@ -887,9 +986,10 @@ async fn generate_and_store(
     conv_id: &str,
     project: &str,
     messages: &[serde_json::Value],
+    queued: &[crate::import::QueuedPrompt],
     prior: Option<&PriorStory>,
 ) -> anyhow::Result<()> {
-    let ctx = build_story_context(engine, cwd, messages).await;
+    let ctx = build_story_context(engine, cwd, messages, queued).await;
     let Some((story, shifts)) = haiku_story(engine, &build_prompt(&ctx), project, conv_id).await
     else {
         return Ok(());
@@ -1551,6 +1651,191 @@ mod tests {
         let early = prior(1, Some(7));
         assert_eq!(asked_since(&messages, &queued, Some(&early)), 0);
         assert_eq!(asked_since(&more, &queued, Some(&early)), 1);
+    }
+
+    fn written(covered: usize, at: &str) -> PriorStory {
+        PriorStory {
+            written_at: crate::temporal::parse_timestamp(at),
+            ..prior(1, Some(covered))
+        }
+    }
+
+    fn parsed(
+        dir: &tempfile::TempDir,
+    ) -> (Vec<serde_json::Value>, Vec<crate::import::QueuedPrompt>) {
+        crate::import::parse_jsonl_messages_for_search_with_queued(&dir.path().join("s.jsonl"))
+            .unwrap()
+    }
+
+    /// A rewrite that has nothing new to cover leaves `covered` where it was. The prompt that
+    /// was queued after the last message is told by then, and must not count again.
+    #[test]
+    fn a_queued_prompt_the_story_was_written_after_is_not_asked_again() {
+        let dir = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!("also fix the pane"),
+                true,
+                "2026-10-14T20:59:56Z",
+            )],
+        );
+        let (messages, queued) = parsed(&dir);
+        assert_eq!(queued[0].place, 6);
+        // First rewrite: the story is older than the prompt, so it is a new ask.
+        let before = written(6, "2026-10-14T20:00:00Z");
+        assert_eq!(asked_since(&messages, &queued, Some(&before)), 1);
+        // After the rewrite: covered is still 6, but the story postdates the prompt.
+        let after = written(6, "2026-10-14T21:05:00Z");
+        assert_eq!(asked_since(&messages, &queued, Some(&after)), 0);
+        assert_eq!(
+            story_due(
+                StoryMode::Rewrite,
+                Some(&after),
+                messages.len(),
+                None,
+                asked_since(&messages, &queued, Some(&after)),
+            ),
+            Err("skip:nothing_asked_since(6/6)".to_string())
+        );
+        // A story whose time is unknown cannot rule the prompt out.
+        assert_eq!(asked_since(&messages, &queued, Some(&prior(1, Some(6)))), 1);
+        // Nor can a prompt whose row carries no time.
+        let undated = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!("also fix the pane"),
+                true,
+                "not a time",
+            )],
+        );
+        let (messages, queued) = parsed(&undated);
+        assert_eq!(queued[0].at, None);
+        assert_eq!(asked_since(&messages, &queued, Some(&after)), 1);
+        // A prompt typed after the story was written is new.
+        let newer = transcript_with(
+            6,
+            &[queued_row(
+                serde_json::json!("and one more thing"),
+                true,
+                "2026-10-14T21:10:00Z",
+            )],
+        );
+        let (messages, queued) = parsed(&newer);
+        assert_eq!(asked_since(&messages, &queued, Some(&after)), 1);
+    }
+
+    /// The story told the queued prompt; its user row landing after the edge is that same
+    /// prompt, not a new ask.
+    #[test]
+    fn the_user_row_of_a_prompt_the_story_told_by_time_is_not_asked_again() {
+        let typed = "also fix the pane";
+        let dir = transcript_with(
+            6,
+            &[
+                queued_row(serde_json::json!(typed), true, "2026-10-14T20:59:56Z"),
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": typed}}),
+            ],
+        );
+        let (messages, queued) = parsed(&dir);
+        assert_eq!(messages.len(), 7);
+        assert_eq!(
+            asked_since(
+                &messages,
+                &queued,
+                Some(&written(6, "2026-10-14T21:05:00Z"))
+            ),
+            0
+        );
+        // Written before the prompt was typed, the row is the prompt arriving: one ask.
+        assert_eq!(
+            asked_since(
+                &messages,
+                &queued,
+                Some(&written(6, "2026-10-14T20:00:00Z"))
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn the_story_a_session_has_remembers_when_it_was_written() {
+        let storage = Storage::open_memory().unwrap();
+        let tags = vec!["session_story".to_string(), "conv_conv-w".to_string()];
+        storage
+            .insert_reflection("story", "the story", &tags, &[0.0; 384])
+            .unwrap();
+        let found = prior_story(&storage, "conv-w").unwrap();
+        let written = found.written_at.expect("the reflection has a time");
+        assert!(
+            (chrono::Utc::now() - written).num_seconds().abs() < 60,
+            "{written}"
+        );
+    }
+
+    /// Haiku reads the prompt typed while Claude was busy, where it was typed. The messages
+    /// the numbering rests on are the same as before.
+    #[test]
+    fn the_story_prompt_shows_prompts_typed_while_claude_was_busy() {
+        let dir = transcript_with(
+            4,
+            &[
+                queued_row(
+                    serde_json::json!("alpha typed mid turn"),
+                    true,
+                    "2026-10-14T20:00:00Z",
+                ),
+                serde_json::json!({"type": "assistant", "message": {"role": "assistant", "content": "working"}}),
+                // This one reaches the transcript as a user row too: shown once.
+                queued_row(
+                    serde_json::json!("beta typed mid turn"),
+                    true,
+                    "2026-10-14T20:01:00Z",
+                ),
+                serde_json::json!({"type": "user", "message": {"role": "user", "content": "beta typed mid turn"}}),
+                // A harness notice is not the person.
+                queued_row(
+                    serde_json::json!("<task-notification>gamma</task-notification>"),
+                    false,
+                    "2026-10-14T20:02:00Z",
+                ),
+                // Queued after the last message.
+                queued_row(
+                    serde_json::json!("delta typed at the end"),
+                    true,
+                    "2026-10-14T20:03:00Z",
+                ),
+            ],
+        );
+        let (messages, queued) = parsed(&dir);
+        assert_eq!(messages.len(), 6);
+        let before = messages.clone();
+
+        let excerpt = story_excerpt(&messages, &queued);
+        assert_eq!(messages, before, "the messages are not touched");
+        assert_eq!(excerpt.matches("alpha typed mid turn").count(), 1);
+        assert_eq!(excerpt.matches("beta typed mid turn").count(), 1);
+        assert_eq!(excerpt.matches("delta typed at the end").count(), 1);
+        assert!(!excerpt.contains("gamma"));
+        let position = |needle: &str| excerpt.find(needle).unwrap();
+        // alpha sits after the fourth message and before the assistant row that follows it.
+        assert!(position("ask 2") < position("alpha"));
+        assert!(position("alpha") < position("working"));
+        assert!(position("beta") > position("working"));
+        assert!(position("delta") > position("beta"));
+        assert!(
+            excerpt.contains("[user]: ") && excerpt.contains("alpha"),
+            "shown as a user line: {excerpt}"
+        );
+
+        // The summary path reads a range of the messages: the same prompts, by place.
+        let tail = story_tail(&messages, &queued, 4..messages.len());
+        assert!(tail.contains("alpha") && tail.contains("delta"), "{tail}");
+        assert!(!tail.contains("ask 2"));
+        let prompt = summary_story_prompt("the summary", &tail);
+        assert!(prompt.contains("alpha typed mid turn"));
+        // A range that stops short of a prompt's place leaves it out.
+        let head = story_tail(&messages, &queued, 0..4);
+        assert!(!head.contains("alpha") && !head.contains("delta"), "{head}");
     }
 
     fn prior_covering_all(messages: &[serde_json::Value]) -> PriorStory {
