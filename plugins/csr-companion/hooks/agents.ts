@@ -300,10 +300,19 @@ const statusOf = (word: string | undefined): AgentStatusWord => (word && WORDS.h
 // The list brought into the state. A row the list no longer has is not finished, failed or killed: it keeps its last
 // state, marked not listed. A row that ended in an event keeps that unless the list says it runs again (it resumed
 // under the same id). The list gives no model, no start and no activity: last_at is never moved by it.
+// One exception: a row no list entry or spawn event ever gave a type, a description or a start, still active and
+// untouched for STALL_MS, is a ghost (one tool event of an in-process agent the list never reports) and is dropped;
+// a later event of that id makes it again, as before.
+const isGhost = (row: AgentRec, at: number) =>
+  isActive(row.status) && !row.listed && row.type === null && row.description === '' && row.started === null && at - row.last_at >= STALL_MS
+
 export function reconcileAgentList(state: AgentState, list: readonly Listed[], at: number): AgentState {
   const ids = new Set(list.map(entry => entry.id))
   const rows: Record<string, AgentRec> = {}
-  for (const [id, row] of Object.entries(state.rows)) rows[id] = ids.has(id) ? row : row.listed ? { ...row, listed: false } : row
+  for (const [id, row] of Object.entries(state.rows)) {
+    if (ids.has(id)) rows[id] = row
+    else if (!isGhost(row, at)) rows[id] = row.listed ? { ...row, listed: false } : row
+  }
   for (const entry of list) {
     const row = rows[entry.id] ?? provisional(entry.id, at, statusOf(entry.status))
     const listed = statusOf(entry.status)

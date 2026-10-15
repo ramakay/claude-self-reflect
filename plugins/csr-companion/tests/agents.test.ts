@@ -224,6 +224,51 @@ test('pending_waiting_idle_are_not_stalled', async () => {
   expect(isStalled(waiting.rows.a1!, at + 60 * 60_000)).toBe(false)
 })
 
+test('a never-listed active row untouched for STALL_MS is dropped by the next poll, and nothing else is', async () => {
+  const ids = (state: ReturnType<typeof emptyAgentState>) => Object.keys(state.rows).sort()
+  const running = (state: ReturnType<typeof emptyAgentState>, now: number) =>
+    projectAgentsFile(state, now).agents.filter(row => row.status === 'running').length
+  // the ghost: one touch of an in-process agent the list never reports; no type, description or start
+  let ghost = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'touch', at: T0, agentId: 'ghost', tool: 'Edit' })
+  expect(ghost.rows.ghost).toMatchObject({ type: null, description: '', started: null, listed: false, status: 'running' })
+  expect(running(ghost, T0 + STALL_MS)).toBe(1)
+  // within STALL_MS it stays
+  expect(ids(reconcileAgentList(ghost, [], T0 + STALL_MS - 1))).toEqual(['ghost'])
+  // past it, one poll drops it; the agents file and its running count omit it
+  const dropped = reconcileAgentList(ghost, [], T0 + STALL_MS)
+  expect(ids(dropped)).toEqual([])
+  expect(projectAgentsFile(dropped, T0 + STALL_MS).agents).toEqual([])
+  expect(running(dropped, T0 + STALL_MS)).toBe(0)
+  // a later event of that id makes it again, as before
+  ghost = reduceAgentEvent(dropped, { kind: 'touch', at: T0 + STALL_MS + 5, agentId: 'ghost', tool: 'Edit' })
+  expect(ids(ghost)).toEqual(['ghost'])
+
+  // a listed agent that drops off the list keeps its last state, however long it has been quiet
+  let listed = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'touch', at: T0, agentId: 'a1', tool: 'Bash' })
+  listed = reconcileAgentList(listed, [{ id: 'a1', type: 'Explore', description: 'x', status: 'running' }], T0 + 1000)
+  const off = reconcileAgentList(listed, [], T0 + 3 * STALL_MS)
+  expect(off.rows.a1).toMatchObject({ status: 'running', listed: false, type: 'Explore' })
+  const later = reconcileAgentList(off, [], T0 + 6 * STALL_MS)
+  expect(later.rows.a1).toMatchObject({ status: 'running', listed: false })
+  expect(running(later, T0 + 6 * STALL_MS)).toBe(1)
+
+  // a row a spawn event gave a type and a description keeps today's rule too
+  let spawned = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'spawn', at: T0, toolUseId: 'u1', description: 'Scan', type: 'Explore', parent: null, model: null })
+  spawned = reduceAgentEvent(spawned, { kind: 'spawned', at: T0, toolUseId: 'u1', agentId: 's1', model: 'm' })
+  expect(ids(reconcileAgentList(spawned, [], T0 + 3 * STALL_MS))).toEqual(['s1'])
+
+  // a finished never-listed row is not a ghost
+  const done = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'complete', at: T0, agentId: 'c1', turnId: 't1', reason: 'answer', answer: 'ok' })
+  expect(ids(reconcileAgentList(done, [], T0 + 3 * STALL_MS))).toEqual(['c1'])
+
+  // one dropped ghost among live rows leaves the others alone
+  let mixed = reduceAgentEvent(emptyAgentState(SESSION), { kind: 'touch', at: T0, agentId: 'ghost', tool: 'Edit' })
+  mixed = reduceAgentEvent(mixed, { kind: 'touch', at: T0 + STALL_MS, agentId: 'a1', tool: 'Bash' })
+  mixed = reconcileAgentList(mixed, [{ id: 'a1', type: 'Explore', description: 'x', status: 'running' }], T0 + STALL_MS + 10)
+  expect(ids(mixed)).toEqual(['a1'])
+  expect(running(mixed, T0 + STALL_MS + 10)).toBe(1)
+})
+
 test('resumed_agent_has_new_completion_identity', async ($, on) => {
   host(on)
   await spawn($, 'tu-1')
