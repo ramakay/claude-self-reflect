@@ -381,8 +381,9 @@ def load(root, limit, session_id=None):
         floor, shifts = load_shifts(con, root)
         changes = load_changes(con, shifts, session_id)
         carried, told = reminded(con, floor)
-        recalled = con.execute('select count(*) from retrieval_events where session_id=?',
-                               (session_id or '',)).fetchone()[0]
+        ids = fail_open(lineage, [session_id], session_id) if session_id else ['']  # a continued session counts its past too
+        recalled = con.execute(f"select count(*) from retrieval_events where session_id in ({','.join('?' * len(ids))})",
+                               ids).fetchone()[0]
     finally:
         con.close()
     dreams, look, chapter = load_dream_log(root), last_look(root), last_chapter(root, session_id)
@@ -465,6 +466,78 @@ def fail_open(call, empty, *args):
         return call(*args)
     except Exception:
         return empty
+
+
+CONTINUED_WAIT = 60  # seconds before a session that continues nothing is looked at again
+_CONTINUED = {}  # session id -> (the session it continues or None, when that was last looked for)
+
+
+def _find_continued(session_id, path=None):
+    """The session a transcript's folder says this one continues: a sibling written since this one began whose
+    last 256 KB holds Claude Code's continued-in row naming this session. None when there is none."""
+    found = [path] if path else glob.glob(os.path.join(HOME, '.claude', 'projects', '*', f'{session_id}.jsonl'))
+    if not found:
+        return None
+    mine = found[0]
+    stat = os.stat(mine)
+    since = (getattr(stat, 'st_birthtime', None) or stat.st_mtime) - 120  # the old file is still written to after this one begins
+    folder, others = os.path.dirname(mine), []
+    for name in os.listdir(folder):
+        other = os.path.join(folder, name)
+        if not name.endswith('.jsonl') or other == mine:
+            continue
+        try:
+            written = os.stat(other).st_mtime
+        except OSError:
+            continue
+        if written >= since:
+            others.append((written, other))
+    for _, other in sorted(others, reverse=True)[:200]:
+        try:
+            with open(other, 'rb') as handle:
+                handle.seek(max(0, os.path.getsize(other) - (1 << 18)))
+                tail = handle.read()
+        except OSError:
+            continue
+        for raw in reversed(tail.splitlines()):
+            if b'continued-in' not in raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue  # the first line of a tail can be cut short
+            if isinstance(entry, dict) and entry.get('type') == 'continued-in' \
+                    and entry.get('continuedInSessionId') == session_id:
+                before = entry.get('sessionId')
+                if isinstance(before, str) and re.fullmatch(r'[\w-]+', before):
+                    return before
+    return None
+
+
+def continued_from(session_id, path=None):
+    """The session this one continues (`claude -c` gives the conversation a new id and leaves a continued-in row in
+    the old transcript), or None. An answer found is kept for the life of the process; none is looked for again
+    after CONTINUED_WAIT seconds. CSR_NO_CONTINUED=1 turns it off."""
+    if not session_id or not re.fullmatch(r'[\w-]+', str(session_id)) \
+            or os.environ.get('CSR_NO_CONTINUED', '').strip().lower() in ('1', 'true'):
+        return None
+    now, seen = time.time(), _CONTINUED.get(session_id)
+    if seen and (seen[0] or now - seen[1] < CONTINUED_WAIT):
+        return seen[0]
+    found = fail_open(_find_continued, None, session_id, path)
+    _CONTINUED[session_id] = (found, now)
+    return found
+
+
+def lineage(session_id, hops=5):
+    """[this session, the one it continues, the one before that, ...]: at most `hops` before it, no id twice."""
+    out = [session_id]
+    while len(out) <= hops:
+        before = continued_from(out[-1])
+        if not before or before in out:
+            break
+        out.append(before)
+    return out
 
 
 def kept_status(session_id, now):
@@ -1338,7 +1411,20 @@ def session_about(con, conversation):
 
 def session_story(session_id):
     """This session's story as csr-engine last told it: its words, its revision, who wrote it and when.
-    csr-engine retells it after each compaction and at the session's end."""
+    csr-engine retells it after each compaction and at the session's end. Until a continued session has its own,
+    the nearest session it continues gives one, with from_sid naming it."""
+    story = own_story(session_id)
+    if story or not session_id:
+        return story
+    for before in fail_open(lineage, [session_id], session_id)[1:]:
+        story = own_story(before)
+        if story:
+            return dict(story, from_sid=before)
+    return None
+
+
+def own_story(session_id):
+    """The story csr-engine told of exactly this session id, or None."""
     if not session_id:
         return None
     con = connect()
@@ -1383,6 +1469,16 @@ def _norm_shift_side(raw):
         else:
             return None
     return parts
+
+
+def display_story_map(session_id):
+    """(the Shift Map to draw, the session it is from): this session's own, else the nearest session it continues
+    that has one. (None, session_id) with none. story_news stays on the own map: its counts are of one transcript."""
+    for before in fail_open(lineage, [session_id], session_id) if session_id else ():
+        smap = session_story_map(before)
+        if smap:
+            return smap, before
+    return None, session_id
 
 
 def session_story_map(session_id):
@@ -1582,19 +1678,19 @@ def _shift_group(entry, smap, room):
     return rows + [(fit(line, room), False) for line in _shift_source(entry, by, room)]
 
 
-def shift_map_marked(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=None):
+def shift_map_marked(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=None, source=None):
     """The Shift Map as plain words, (title, rows) with rows as (text, loud): per shift its rows (_shift_group), the
     Before, After and New sentences loud, the rest quiet. shut shows the first shift; budget caps the rows the
     shifts take (at least one whole shift is shown). Shifts left out are said in a last row. No ANSI and no badges;
     every row is at most `room` characters. The title carries how far behind the map is, counted in transcript
-    messages."""
+    messages. A map from the session this one continues says so: 'from 6ca2a4d5'."""
     covered = smap.get('covered')
     if isinstance(messages_now, int) and not isinstance(messages_now, bool) and isinstance(covered, int):
         behind = max(0, messages_now - covered)
         stale = 'current' if not behind else f"as of {behind} message{'' if behind == 1 else 's'} ago"
     else:
         stale = ''
-    title = 'Shift Map' + (f' · {stale}' if stale else '')
+    title = 'Shift Map' + (f' · {stale}' if stale else '') + (f' · from {source[:8]}' if source else '')
     groups = [_shift_group(entry, smap, room) for entry in smap['entries'][:4]]
     keep, used = 0, 0
     for group in groups[:1 if shut else len(groups)]:
@@ -1609,9 +1705,9 @@ def shift_map_marked(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=Non
     return title, rows
 
 
-def shift_map_rows(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=None):
+def shift_map_rows(smap, messages_now, room=SHIFT_ROOM, shut=False, budget=None, source=None):
     """The Shift Map as plain words, (title, rows of text): shift_map_marked without which rows are loud."""
-    title, rows = shift_map_marked(smap, messages_now, room, shut, budget)
+    title, rows = shift_map_marked(smap, messages_now, room, shut, budget, source)
     return title, [text for text, _ in rows]
 
 
@@ -1666,12 +1762,12 @@ def refresh_news(smap, s):
 
 def shift_map_json(sid):
     """The Shift Map as the pane's own words, dict(title, rows), for the mod's Ink pane; None with no map."""
-    smap = session_story_map(sid)
+    smap, source = display_story_map(sid)
     if not smap:
         return None
-    session = Session(sid)
+    session = Session(source)  # an inherited map is counted against the transcript it was told from
     session.read_transcript()
-    title, rows = shift_map_rows(smap, session.messages)
+    title, rows = shift_map_rows(smap, session.messages, source=source if source != sid else None)
     return dict(title=title, rows=rows)
 
 
@@ -1809,6 +1905,7 @@ def story_rights(story, now):
     if not story:
         return ['']
     rev, old = f"rev {story['rev']}", story.get('at') and told_ago(max(0, now - story['at']))
+    rev += f" · from {story['from_sid'][:8]}" if story.get('from_sid') else ''  # the session this one continues told it
     forms = [(rev, story.get('by'), old, RETOLD), (rev, old, RETOLD), (rev, old), (old or rev,)]
     return [' · '.join(x for x in form if x) for form in forms]
 
@@ -3888,6 +3985,15 @@ def reading_in(line, marks):
 
 
 def how_claude_read(session_id, most=2):
+    """This session's newest readings; while it has none, the nearest session it continues that has some."""
+    for before in fail_open(lineage, [session_id], session_id) if session_id else [session_id]:
+        found = own_readings(before, most)
+        if found:
+            return found
+    return []
+
+
+def own_readings(session_id, most=2):
     """This session's newest readings, newest first: lines of its compaction summaries that say how Claude
     read your words (Interpreted as: · Read as: · "(unclear)" · most likely a typo for), and the first
     sentence of a reply that says so. Read on from where the last look stopped; no model calls."""
@@ -4178,7 +4284,9 @@ def page_main(data, s, now, ui=None):
         room = max(24, cols - 1) - gutter(ui) if isinstance(cols, int) else SHIFT_ROOM  # the width the rows are laid in
         shut = (data.get('map_view') or {}).get('open') is False and not map_open((ui or {}).get('open'))  # MapMotion folded it, and no click holds it open
         budget = max(8, tall // 2) if isinstance(tall, int) else None  # the open map never takes more than half the pane
-        built_shifts = fail_open(shift_map_marked, None, story_map, (s or {}).get('messages'), room, shut, budget)
+        from_sid = data.get('story_map_from')
+        messages = data.get('story_map_messages') if from_sid else (s or {}).get('messages')
+        built_shifts = fail_open(shift_map_marked, None, story_map, messages, room, shut, budget, from_sid)
         if built_shifts and built_shifts[1]:
             map_title, marked = built_shifts
             map_rows = [text for text, _ in marked]
@@ -7116,6 +7224,7 @@ class Pane:
         self.spend = Spend()  # this machine's spend in the plan's week, read from the transcripts a little at a time
         self.map_motion = MapMotion()  # the Shift Map's arrival and fold
         self.map_due = None  # when the Shift Map next folds
+        self.sources = {}  # session id -> the Session an inherited Shift Map was told from, for its message count
         self.refresh = None  # the csr-engine process of a refresh the pane started, until it ends
         self.refresh_from = None  # the map_stamp of the Shift Map when that refresh started
         self.refresh_note = None  # (words, until): what a refresh that ended with nothing new says, for a while
@@ -7130,6 +7239,18 @@ class Pane:
         found = bool(me) and is_mobile(herdr('pane', 'layout', '--pane', me) or '', mobile_threshold())
         self.seen_phone = ((cols, rows), now, found)
         return found
+
+    def shown_map(self, sid):
+        """(the Shift Map to draw, the session it is from or None when it is this one's own). The messages an inherited
+        map is counted against are those of the transcript it was told from, kept in data['story_map_messages']."""
+        smap, source = display_story_map(sid)
+        if not smap or source == sid:
+            self.data['story_map_messages'] = None
+            return smap, None
+        session = self.sources.setdefault(source, Session(source))
+        session.read_transcript()
+        self.data['story_map_messages'] = session.messages
+        return smap, source
 
     def frame(self, force):
         cols, rows = shutil.get_terminal_size((60, 30))
@@ -7147,7 +7268,7 @@ class Pane:
             self.data['chapter'] = last_chapter(self.root, self.session and self.session.id)
             self.data['claude_line'] = claude_status(self.session and self.session.id, now)
             self.data['story'] = session_story(self.session and self.session.id)
-            self.data['story_map'] = session_story_map(self.session and self.session.id)
+            self.data['story_map'], self.data['story_map_from'] = self.shown_map(self.session and self.session.id)
             self.data['refreshing'] = bool(self.refresh and self.refresh.poll() is None)
             if self.refresh and not self.data['refreshing']:  # it just ended: a new telling shows itself, none says so
                 words = refresh_ended(self.refresh, self.refresh_from, self.data['story_map'])
@@ -7212,7 +7333,7 @@ class Pane:
                           [self.data.get('claude_fields'), self.data.get('claude_at'), self.data.get('limits'),
                            self.data.get('sts'), int(now // 60)],
                           [(d['id'], d['answer']) for d in self.data['dreams']], self.data.get('look'),
-                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.data.get('story_map'), self.data.get('map_view'),
+                          self.data.get('chapter'), sorted(self.folds), self.data.get('story'), self.data.get('story_map'), self.data.get('story_map_from'), self.data.get('map_view'),
                           self.data.get('refreshing'), self.data.get('refresh_note'), self.data.get('can_refresh'), self.data.get('story_cost'), self.held, self.data.get('agents'), self.data.get('codex'),
                           compact_key(self.data), self.data.get('readings'), self.threads_top, self.main_top,
                           self.info_top, bool(s and s.get('busy')), self.feed and self.feed.key(now),
@@ -7695,10 +7816,13 @@ CARRY_DIR = 'carried'  # KEEP/carried/<session>.json: what the pane read, for --
 def previous_session(path, started):
     """The session before this one in the same project: the newest transcript last written before this one
     began (a session still running beside this one is not it), within a week, started by a person at the
-    terminal, not by `claude -p`."""
+    terminal, not by `claude -p`. A session that continues another (continued_from) has that one first."""
     if not path or not started:
         return None
     folder, mine, found = os.path.dirname(path), os.path.basename(path), []
+    before = continued_from(mine[:-6], path)  # `claude -c`: the session it continues, though that file was written after this began
+    if before and os.path.exists(os.path.join(folder, f'{before}.jsonl')):
+        return os.path.join(folder, f'{before}.jsonl')
     try:
         names = os.listdir(folder)
     except OSError:
@@ -8353,9 +8477,14 @@ def main():
     elif args.png:
         now, cell = time.time(), (16, 34)
         data = load(root, args.limit, args.sid)
+        shown, source = display_story_map(args.sid)
         data.update(look=last_look(root), chapter=last_chapter(root, args.sid), story=session_story(args.sid),
-                    story_map=session_story_map(args.sid), readings=how_claude_read(args.sid),
+                    story_map=shown, readings=how_claude_read(args.sid),
                     limits=account_limits(now), sts=csr_status(now))
+        if shown and source != args.sid:  # inherited: counted against the transcript it was told from
+            inherited = Session(source)
+            inherited.read_transcript()
+            data.update(story_map_from=source, story_map_messages=inherited.messages)
         data['claude_fields'], data['claude_at'] = kept_status(args.sid, now)
         data['claude_line'] = claude_status(args.sid, now)
         os.makedirs(args.png, exist_ok=True)
