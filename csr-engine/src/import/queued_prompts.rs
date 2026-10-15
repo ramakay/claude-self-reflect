@@ -260,8 +260,8 @@ fn chunks_for(target: &Target<'_>, row: &QueuedRow) -> Vec<(ConversationChunk, C
 }
 
 /// Index the prompts of one conversation that are not indexed yet, and record
-/// that its transcript was read. Returns how many prompts were added. Call it
-/// under the operation lock.
+/// that its transcript was read, once all are. Returns how many prompts were
+/// added. Call it under the operation lock.
 pub(crate) async fn index(
     storage: &Storage,
     embeddings: &Arc<EmbeddingEngine>,
@@ -270,6 +270,15 @@ pub(crate) async fn index(
     rows: &[QueuedRow],
 ) -> Result<usize> {
     let indexed = storage.queued_prompt_offsets(target.conversation_id)?;
+    if rows.iter().any(|r| !indexed.contains(&r.line_offset)) {
+        // This transcript holds prompts not indexed yet. Until every one is, the
+        // conversation must not read as scanned: an embedding or insert error
+        // below returns before the record is written, and a record left from an
+        // earlier pass would keep the backfill from ever retrying it. A pass with
+        // nothing to index leaves the record alone, so a live session's watcher
+        // does not write on every turn.
+        storage.clear_queued_scan(target.conversation_id)?;
+    }
     let mut added = 0usize;
     for row in rows.iter().filter(|r| !indexed.contains(&r.line_offset)) {
         let chunks = chunks_for(target, row);
@@ -1039,6 +1048,122 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// Make every write to the ledger fail, as a full disk or a crash would.
+    fn break_ledger(engine: &Engine) {
+        engine
+            .storage()
+            .with_connection(|c| {
+                Ok(c.execute_batch(
+                    "CREATE TRIGGER fail_ledger BEFORE INSERT ON queued_prompt_chunks
+                     BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+                )?)
+            })
+            .unwrap();
+    }
+
+    fn mend_ledger(engine: &Engine) {
+        engine
+            .storage()
+            .with_connection(|c| Ok(c.execute_batch("DROP TRIGGER fail_ledger;")?))
+            .unwrap();
+    }
+
+    /// A transcript already scanned gains queued prompts, and indexing them fails
+    /// on the first try. The old scan record must not survive that: the next
+    /// backfill pass indexes the prompts.
+    async fn failed_indexing_is_retried_by_the_backfill(via: Via) {
+        let rig = Rig::new();
+        let engine = rig.engine();
+        let src = rig.source("sess-retry.jsonl");
+        fs::write(&src, user(0, "the first thing asked of the importer")).unwrap();
+        import_via(&engine, &rig, &src, via).await;
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!((counts.indexed, counts.scanned, counts.pending), (0, 1, 0));
+
+        append(&src, &busy_session("ignored, already stored"));
+        break_ledger(&engine);
+        import_via(&engine, &rig, &src, via).await;
+        assert_eq!(chunks_like(&engine, "zebracrossing"), 0, "{via:?}");
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!(
+            (counts.indexed, counts.scanned, counts.pending),
+            (0, 0, 1),
+            "{via:?}: the failed conversation reads as unscanned"
+        );
+
+        mend_ledger(&engine);
+        let stats = backfill(&engine, &rig, "", 50).await;
+        assert_eq!(
+            (stats.scanned, stats.added, stats.failed, stats.done),
+            (1, 2, 0, true),
+            "{via:?}"
+        );
+        assert_eq!(chunks_like(&engine, "zebracrossing"), 1, "{via:?}");
+        assert_eq!(chunks_like(&engine, "quokkaparade"), 1, "{via:?}");
+        assert!(found_by_search(&engine, "zebracrossing"), "{via:?}");
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!((counts.indexed, counts.scanned, counts.pending), (2, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_failed_queued_indexing_is_retried_by_the_backfill_after_an_engine_import() {
+        failed_indexing_is_retried_by_the_backfill(Via::Engine).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_queued_indexing_is_retried_by_the_backfill_after_a_watcher_import() {
+        failed_indexing_is_retried_by_the_backfill(Via::Watcher).await;
+    }
+
+    /// Deleting a queued prompt's chunk takes its ledger row and the
+    /// conversation's scan record with it, so the prompt can be indexed again.
+    #[tokio::test]
+    async fn deleting_a_queued_prompt_chunk_lets_it_be_indexed_again() {
+        let rig = Rig::new();
+        let engine = rig.engine();
+        let src = rig.source("sess-del.jsonl");
+        fs::write(&src, busy_session("the opening ask")).unwrap();
+        engine.import_file(&src, "proj").await.unwrap();
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!((counts.indexed, counts.scanned), (2, 1));
+        let id: String = engine
+            .storage()
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT c.id FROM chunks c JOIN queued_prompt_chunks q ON q.chunk_id = c.id
+                     WHERE c.content LIKE '%zebracrossing%'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+
+        engine.storage().delete_chunk(&id).unwrap();
+        assert_eq!(chunks_like(&engine, "zebracrossing"), 0);
+        assert_eq!(
+            scalar(
+                &engine,
+                &format!("SELECT COUNT(*) FROM queued_prompt_chunks WHERE chunk_id = '{id}'")
+            ),
+            0,
+            "the ledger row went with the chunk"
+        );
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!((counts.indexed, counts.scanned, counts.pending), (1, 0, 1));
+        assert_eq!(
+            chunks_like(&engine, "quokkaparade"),
+            1,
+            "the other prompt is untouched"
+        );
+
+        let stats = backfill(&engine, &rig, "", 50).await;
+        assert_eq!((stats.scanned, stats.added, stats.failed), (1, 1, 0));
+        assert_eq!(chunks_like(&engine, "zebracrossing"), 1);
+        assert_eq!(chunks_like(&engine, "quokkaparade"), 1);
+        let counts = engine.storage().queued_prompt_counts().unwrap();
+        assert_eq!((counts.indexed, counts.scanned, counts.pending), (2, 1, 0));
     }
 
     /// Rows other adapters keep in import_state, and transcripts that are gone or

@@ -155,6 +155,20 @@ impl super::Storage {
         })
     }
 
+    /// Forget that a conversation's transcript was read, so the backfill reads it
+    /// again. A pass that has prompts to index calls this first and writes the
+    /// record back (`record_queued_scan`) only once every prompt is indexed: a
+    /// failure midway then leaves the conversation pending, not marked done.
+    pub fn clear_queued_scan(&self, conversation_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM queued_prompt_scan WHERE conversation_id = ?1",
+                params![conversation_id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Imported transcripts the pass has not read, by file path after `after`.
     pub fn pending_queued_scan_batch(
         &self,

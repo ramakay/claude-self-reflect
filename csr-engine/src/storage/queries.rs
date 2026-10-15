@@ -852,6 +852,18 @@ pub fn purge_reflections(conn: &Connection, ids: &[String]) -> Result<usize> {
 }
 
 pub fn delete_chunk(conn: &Connection, chunk_id: &str) -> Result<()> {
+    // A queued-prompt chunk leaves its ledger row and its conversation's scan
+    // record with it: the ledger is what says "indexed", so a row left behind
+    // would keep the deleted prompt from ever being indexed again.
+    conn.execute(
+        "DELETE FROM queued_prompt_scan WHERE conversation_id IN
+            (SELECT conversation_id FROM queued_prompt_chunks WHERE chunk_id = ?1)",
+        params![chunk_id],
+    )?;
+    conn.execute(
+        "DELETE FROM queued_prompt_chunks WHERE chunk_id = ?1",
+        params![chunk_id],
+    )?;
     conn.execute(
         "DELETE FROM chunk_embeddings WHERE chunk_id = ?1",
         params![chunk_id],
