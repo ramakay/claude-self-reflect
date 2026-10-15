@@ -7425,7 +7425,9 @@ LOST_ANSWERS = ('drop', 'later')  # what sets a thread aside; a sent line is non
 SECTION['lost'], GLYPH['lost'] = 'turn', '?'  # its ink (vermilion) and its mark where no pictures are drawn
 SAME_THREAD = 0.5  # two items are one thread when this share of their words match
 CARRIED = ('Pending Tasks', 'Optional Next Step')  # the summary sections that name what is still owed
-NUMBERED = re.compile(r"^(?:#+\s*)?\**\d+\.\s+\**[A-Z][A-Za-z /&,'-]{2,50}\**:?\**\s*$")  # "7. Pending Tasks:", "**7. Pending Tasks:**", "7. **Pending Tasks:**"
+NUMBERED = re.compile(r"^(?:#+\s*)?\**(\d+)\.\s+\**[A-Z][A-Za-z /&,'-]{2,50}\**:?\**\s*$")  # "7. Pending Tasks:", "**7. Pending Tasks:**", "7. **Pending Tasks:**"; group 1 is the number
+SECTION_NAMES = {n.lower() for n in ('Primary Request and Intent', 'Key Technical Concepts', 'Files and Code Sections', 'Errors and fixes',
+                                     'Problem Solving', 'All user messages', 'Pending Tasks', 'Current Work', 'Optional Next Step')}  # Claude Code's compaction template
 BULLET = re.compile(r'^(\s*)(?:[-*•]|\d+[.)])\s+(.*)$')
 WAITING = re.compile(r"\b(awaiting|waiting (?:on|for) (?:you|the user)|wait for the user|needs? (?:your|their|the user'?s) "
                      r"(?:go|ok|approval|call|decision)|approval|the user'?s (?:answer|go|pick|picks|decision|decisions|call|pasted)|"
@@ -7474,17 +7476,31 @@ def same_words(a, b):
     return shared / len(a | b) >= SAME_THREAD or (shared >= 3 and shared / min(len(a), len(b)) >= 0.6)
 
 
+def ends_section(line, number):
+    """Whether a numbered line, found after section `number` began, is the next section's heading and not a
+    numbered task inside it: its number is greater, and it is a known section name or ends with a colon."""
+    m = NUMBERED.match(line.strip())
+    if not m or int(m.group(1)) <= number:
+        return False
+    title = re.sub(r'^#+\s*|\*+', '', line.strip())
+    title = re.sub(r'^\d+\.\s+', '', title).strip()
+    return title.endswith(':') or title.lower() in SECTION_NAMES
+
+
 def summary_section(text, name):
-    """The lines of one numbered section ("7. Pending Tasks:") of a compaction summary, up to the next."""
-    lines, found = [], False
+    """The lines of one numbered section ("7. Pending Tasks:") of a compaction summary, up to the next. A
+    numbered bold task inside it ("1. **Fix the importer**") does not end it."""
+    lines, found, number = [], False, 0
     for line in text.splitlines():
         if found and REMINDERS.search(line):
             break  # prep-compact's reminders: what you set aside, not what is owed
-        if NUMBERED.match(line.strip()) and not line.startswith(' '):
-            if found:
-                break
-            found = name.lower() in line.lower()
+        m = NUMBERED.match(line.strip()) if not line.startswith(' ') else None
+        if m and not found:
+            if name.lower() in line.lower():
+                found, number = True, int(m.group(1))
         elif found:
+            if m and ends_section(line, number):
+                break
             lines.append(line)
     return lines
 

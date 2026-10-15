@@ -804,6 +804,23 @@ class LostAndFound(unittest.TestCase):
         self.assertIsNone(pane.NUMBERED.match('   - **Fix the importer:** remove the old cache.'))
         self.assertIsNone(pane.NUMBERED.match('7. **Pending Tasks:** and then some prose after it'))
 
+    def test_a_numbered_bold_task_inside_pending_tasks_does_not_end_the_section(self):
+        body = ("   - Awaiting the user's go on the push guard.\n"
+                '1. **Fix the importer**\n   - Run the importer fix.\n'
+                '8. **Ship it**\n   - Push it after the user confirms.\n')
+        for head, next_one in (('7. **Pending Tasks:**', '8. **Current Work:**'), ('7. Pending Tasks:', '8. Current Work:'),
+                               ('7. **Pending Tasks**:', '9. **Optional Next Step:**'), ('7. **Pending Tasks:**', '8. **What happened next:**'),
+                               ('7. **Pending Tasks:**', '### 8. Problem Solving')):
+            text = '1. **Primary Request and Intent:**\n   - The ask.\n\n' + head + '\n' + body + '\n' + next_one + '\n   - Something else.\n'
+            lines = pane.summary_section(text, 'Pending Tasks')
+            self.assertIn('1. **Fix the importer**', lines, head + next_one)
+            self.assertIn('8. **Ship it**', lines, head + next_one)
+            self.assertIn('   - Push it after the user confirms.', lines, head + next_one)
+            self.assertNotIn('   - Something else.', lines, head + next_one)
+        # a lower number never ends the section, even when it reads like a heading
+        text = '7. **Pending Tasks:**\n   - Run the thing.\n3. **Current Work:**\n   - Still the thing.\n'
+        self.assertIn('   - Still the thing.', pane.summary_section(text, 'Pending Tasks'))
+
     def test_waiting_on_you_is_flagged_and_ranks_first(self):
         threads = pane.lost_found(SUMMARIES)
         self.assertEqual([t['rank'] for t in threads], sorted(t['rank'] for t in threads))
