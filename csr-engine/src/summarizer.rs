@@ -346,6 +346,25 @@ pub struct PriorStory {
     pub covered: Option<usize>,
     /// When the story was written, from its stored reflection; None when that is unreadable.
     pub written_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The newest line of the transcript snapshot the story was generated from. A prompt typed
+    /// at or before it is told; one typed after it is not, even if it landed before the story
+    /// was stored (generation waits on a lock and a model call). None for a story written
+    /// before this was kept, which falls back to `written_at`.
+    pub told_through: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The newest timestamp among the lines of a transcript snapshot: its messages and its queued
+/// prompts. None when no line carries a readable time.
+fn snapshot_cutoff(
+    messages: &[serde_json::Value],
+    queued: &[crate::import::QueuedPrompt],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("timestamp")?.as_str())
+        .filter_map(crate::temporal::parse_timestamp)
+        .chain(queued.iter().filter_map(|q| q.at))
+        .max()
 }
 
 fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
@@ -366,6 +385,11 @@ fn prior_story(storage: &Storage, conv_id: &str) -> Option<PriorStory> {
         written_at: rows
             .first()
             .and_then(|(_, _, _, written)| crate::temporal::parse_timestamp(written)),
+        told_through: storage
+            .story_told_through(conv_id)
+            .ok()
+            .flatten()
+            .and_then(|at| crate::temporal::parse_timestamp(&at)),
     })
 }
 
@@ -422,9 +446,11 @@ fn asked_since(
         .and_then(|p| p.covered)
         .unwrap_or(0)
         .min(messages.len());
-    let written_at = prior.and_then(|p| p.written_at);
+    // The snapshot the story was generated from, or for an older story the time it was stored.
+    let told_through = prior.and_then(|p| p.told_through.or(p.written_at));
     let told_by_story = |prompt: &crate::import::QueuedPrompt| {
-        prompt.place < covered || matches!((prompt.at, written_at), (Some(at), Some(w)) if at <= w)
+        prompt.place < covered
+            || matches!((prompt.at, told_through), (Some(at), Some(w)) if at <= w)
     };
     let rows_by_text = user_rows_by_text(messages);
     // User rows that are the twin of a prompt the story told.
@@ -890,6 +916,7 @@ pub async fn generate_story_cli(
                         &story,
                         prior.as_ref(),
                         messages.len(),
+                        snapshot_cutoff(&messages, &queued),
                         tags,
                     )
                     .await?;
@@ -1003,6 +1030,7 @@ async fn generate_and_store(
         &story,
         prior,
         messages.len(),
+        snapshot_cutoff(messages, queued),
         Vec::new(),
     )
     .await?;
@@ -1029,6 +1057,7 @@ async fn store_story(
     story: &str,
     prior: Option<&PriorStory>,
     covered: usize,
+    told_through: Option<chrono::DateTime<chrono::Utc>>,
     extra_tags: Vec<String>,
 ) -> anyhow::Result<()> {
     let _operation = engine.storage().operation_lock()?;
@@ -1064,7 +1093,7 @@ async fn store_story(
     // Record how much of the session it covers: what the next story is measured against
     let _ = engine
         .storage()
-        .mark_story_written(conv_id, &reflection_id, covered);
+        .mark_story_written(conv_id, &reflection_id, covered, told_through);
 
     log_story_event(
         project,
@@ -1724,6 +1753,79 @@ mod tests {
         assert_eq!(asked_since(&messages, &queued, Some(&after)), 1);
     }
 
+    /// The story is generated from a snapshot, then waits on a lock and a model call before it
+    /// is stored. A prompt typed in that window is after the snapshot's newest line, so the
+    /// next rewrite check still sees it as new, though it landed before the story was stored.
+    #[test]
+    fn a_prompt_typed_while_the_story_was_generated_is_still_a_new_ask() {
+        let stamped = |n: usize, at: &str| {
+            let role = if n.is_multiple_of(2) {
+                "user"
+            } else {
+                "assistant"
+            };
+            serde_json::json!({
+                "type": role, "timestamp": at,
+                "message": {"role": role, "content": format!("line {n}")}
+            })
+        };
+        let snapshot_dir = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        for n in 0..6 {
+            body.push_str(&format!("{}\n", stamped(n, "2026-01-01T10:00:00Z")));
+        }
+        std::fs::write(snapshot_dir.path().join("s.jsonl"), &body).unwrap();
+        let (messages, queued) = parsed(&snapshot_dir);
+        let cutoff = snapshot_cutoff(&messages, &queued);
+        assert_eq!(
+            cutoff,
+            crate::temporal::parse_timestamp("2026-01-01T10:00:00Z")
+        );
+
+        // The story is stored now (long after the snapshot), carrying the snapshot's cutoff.
+        let storage = Storage::open_memory().unwrap();
+        let tags = vec!["session_story".to_string(), "conv_conv-race".to_string()];
+        storage
+            .insert_reflection("story", "the story", &tags, &[0.0; 384])
+            .unwrap();
+        storage
+            .mark_story_written("conv-race", "story_conv-race", messages.len(), cutoff)
+            .unwrap();
+        let prior = prior_story(&storage, "conv-race").unwrap();
+        assert_eq!(prior.told_through, cutoff);
+
+        // Typed after the snapshot, before the story was stored.
+        let mut later = body.clone();
+        later.push_str(&format!(
+            "{}\n",
+            queued_row(
+                serde_json::json!("typed during generation"),
+                true,
+                "2026-01-01T10:05:00Z",
+            )
+        ));
+        std::fs::write(snapshot_dir.path().join("s.jsonl"), later).unwrap();
+        let (messages, queued) = parsed(&snapshot_dir);
+        assert!(prior.written_at.unwrap() > queued[0].at.unwrap());
+        assert_eq!(asked_since(&messages, &queued, Some(&prior)), 1);
+        assert_eq!(
+            story_due(
+                StoryMode::Rewrite,
+                Some(&prior),
+                messages.len(),
+                None,
+                asked_since(&messages, &queued, Some(&prior)),
+            ),
+            Ok(())
+        );
+        // A story from before the cutoff was kept falls back to its write time.
+        let legacy = PriorStory {
+            told_through: None,
+            ..prior
+        };
+        assert_eq!(asked_since(&messages, &queued, Some(&legacy)), 0);
+    }
+
     /// The story told the queued prompt; its user row landing after the edge is that same
     /// prompt, not a new ask.
     #[test]
@@ -1984,7 +2086,7 @@ Summary:
             .insert_reflection("new", "second story", &tags(&["story_rev_2"]), &[0.0; 384])
             .unwrap();
         storage
-            .mark_story_written("conv-a", "story_conv-a", 640)
+            .mark_story_written("conv-a", "story_conv-a", 640, None)
             .unwrap();
         let found = prior_story(&storage, "conv-a").unwrap();
         assert_eq!((found.rev, found.covered), (2, Some(640)));
@@ -2083,6 +2185,7 @@ Summary:
                 "First session story.",
                 None,
                 10,
+                None,
                 vec!["story_by_haiku".to_string()],
             )
             .await
@@ -2116,6 +2219,7 @@ Summary:
                 "Second rewritten session story.",
                 prior.as_ref(),
                 25,
+                None,
                 vec!["story_by_haiku".to_string()],
             )
             .await

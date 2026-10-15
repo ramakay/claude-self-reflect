@@ -488,6 +488,17 @@ pub fn run(conn: &Connection) -> Result<()> {
             "ALTER TABLE enrichment_state ADD COLUMN batch_transient_failures INTEGER NOT NULL DEFAULT 0")?;
     }
 
+    // The newest transcript line a session story was generated from. Nullable: stories written
+    // before it was kept stay as they are and fall back to the reflection's write time.
+    if !has_column(conn, "enrichment_state", "told_through")? {
+        add_column(
+            conn,
+            "enrichment_state",
+            "told_through",
+            "ALTER TABLE enrichment_state ADD COLUMN told_through TEXT",
+        )?;
+    }
+
     // TAD: retrieval events — tracks which memories were surfaced and session outcomes
     conn.execute_batch(
         "
@@ -3420,6 +3431,7 @@ mod tests {
             run(&conn).unwrap();
             conn.execute_batch(
                 "ALTER TABLE enrichment_state DROP COLUMN batch_failures;
+                ALTER TABLE enrichment_state DROP COLUMN told_through;
                 ALTER TABLE import_state DROP COLUMN csr_tool_blocks_suppressed;
                 ALTER TABLE import_state DROP COLUMN csr_hook_wrappers_scrubbed;
                 ALTER TABLE import_state DROP COLUMN secrets_redacted;

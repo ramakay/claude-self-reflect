@@ -2461,20 +2461,39 @@ pub fn story_messages_covered(conn: &Connection, conversation_id: &str) -> Resul
     Ok(covered.map(|n| n.max(0) as usize))
 }
 
-/// Record a story written over the conversation's first `messages` messages.
+/// The newest transcript line a conversation's story was generated from (RFC 3339). None when
+/// it has no story, or one written before the cutoff was kept.
+pub fn story_told_through(conn: &Connection, conversation_id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT told_through FROM enrichment_state
+             WHERE conversation_id = ?1 AND enrichment_type = 'session_story' AND status = 'completed'",
+            params![conversation_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Record a story written over the conversation's first `messages` messages, from a transcript
+/// snapshot whose newest line is `told_through`.
 pub fn mark_story_written(
     conn: &Connection,
     conversation_id: &str,
     reflection_id: &str,
     messages: usize,
+    told_through: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    let told_through =
+        told_through.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
     conn.execute(
         "INSERT INTO enrichment_state
-             (conversation_id, enrichment_type, status, reflection_id, chunk_count, updated_at)
-         VALUES (?1, 'session_story', 'completed', ?2, ?3, datetime('now'))
+             (conversation_id, enrichment_type, status, reflection_id, chunk_count, told_through, updated_at)
+         VALUES (?1, 'session_story', 'completed', ?2, ?3, ?4, datetime('now'))
          ON CONFLICT(conversation_id, enrichment_type) DO UPDATE SET
-             status = 'completed', reflection_id = ?2, chunk_count = ?3, updated_at = datetime('now')",
-        params![conversation_id, reflection_id, messages as i64],
+             status = 'completed', reflection_id = ?2, chunk_count = ?3, told_through = ?4,
+             updated_at = datetime('now')",
+        params![conversation_id, reflection_id, messages as i64, told_through],
     )?;
     Ok(())
 }
@@ -5952,10 +5971,19 @@ mod tests {
         // a story written before the count was kept covers an unknown part
         mark_enrichment_completed(&conn, "conv-s", "session_story", "story_conv-s").unwrap();
         assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), None);
-        mark_story_written(&conn, "conv-s", "story_conv-s", 300).unwrap();
+        assert_eq!(story_told_through(&conn, "conv-s").unwrap(), None);
+        mark_story_written(&conn, "conv-s", "story_conv-s", 300, None).unwrap();
         assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), Some(300));
-        mark_story_written(&conn, "conv-s", "story_conv-s", 640).unwrap();
+        assert_eq!(story_told_through(&conn, "conv-s").unwrap(), None);
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-10-14T20:59:56Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        mark_story_written(&conn, "conv-s", "story_conv-s", 640, Some(cutoff)).unwrap();
         assert_eq!(story_messages_covered(&conn, "conv-s").unwrap(), Some(640));
+        assert_eq!(
+            story_told_through(&conn, "conv-s").unwrap().as_deref(),
+            Some("2026-10-14T20:59:56.000Z")
+        );
         assert!(is_conversation_enriched(&conn, "conv-s", "session_story").unwrap());
     }
 

@@ -770,14 +770,27 @@ impl Storage {
         queries::story_messages_covered(&conn, conversation_id)
     }
 
+    /// The newest transcript line the conversation's story was generated from, as RFC 3339.
+    pub fn story_told_through(&self, conversation_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::story_told_through(&conn, conversation_id)
+    }
+
     pub fn mark_story_written(
         &self,
         conversation_id: &str,
         reflection_id: &str,
         messages: usize,
+        told_through: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        queries::mark_story_written(&conn, conversation_id, reflection_id, messages)
+        queries::mark_story_written(
+            &conn,
+            conversation_id,
+            reflection_id,
+            messages,
+            told_through,
+        )
     }
 
     pub fn mark_enrichment_failed(
