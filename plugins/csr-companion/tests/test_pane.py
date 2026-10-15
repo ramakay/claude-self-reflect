@@ -2881,6 +2881,40 @@ class Phone(unittest.TestCase):
                 os.environ['HERDR_PANE_ID'] = env
 
 
+class DreamsOnByDefault(unittest.TestCase):
+    """The mod's /config row: unset is on, and only an explicit false is off."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.addCleanup(setattr, pane, 'HOME', pane.HOME)
+        pane.HOME = self.tmp
+
+    def settings(self, text):
+        os.makedirs(os.path.join(self.tmp, '.claude'), exist_ok=True)
+        with open(os.path.join(self.tmp, '.claude', 'settings.json'), 'w', encoding='utf-8') as handle:
+            handle.write(text)
+
+    def test_no_settings_file_or_no_row_is_on(self):
+        self.assertTrue(pane.dreams_on())
+        self.settings('{}')
+        self.assertTrue(pane.dreams_on())
+        self.settings('{"pluginConfigs": {"csr-companion@inline": {"options": {"autoCompact": "off"}}}}')
+        self.assertTrue(pane.dreams_on())
+
+    def test_only_an_explicit_false_is_off(self):
+        self.settings('{"pluginConfigs": {"csr-companion@inline": {"options": {"dreams": false}}}}')
+        self.assertFalse(pane.dreams_on())
+        self.settings('{"pluginConfigs": {"csr-companion@inline": {"options": {"dreams": true}}}}')
+        self.assertTrue(pane.dreams_on())
+        self.settings('{"pluginConfigs": {"other@x": {"options": {"dreams": false}}}}')
+        self.assertTrue(pane.dreams_on())
+
+    def test_the_manifest_ships_dreams_on(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.claude-plugin', 'plugin.json'), encoding='utf-8') as handle:
+            self.assertIs(json.load(handle)['userConfig']['dreams']['default'], True)
+
+
 class SampleDream(unittest.TestCase):
     """While dreams are off the pane shows a dream you took up, from either of the mod's logs."""
 

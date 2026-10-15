@@ -447,7 +447,15 @@ test('a subagent reading the file raises no note, and an unanswered note clears 
   expect(answers.map(a => a.answer)).toEqual(['shown', 'ignored'])
 })
 
-test('dreams are off by default, as You should know is: no look, however long Claude works', async ($, on) => {
+test('dreams are on by default: with no option set, a look can run as Claude works', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
+  await steps($, 30)
+  await settle(() => seen.forks.length > 0)
+  expect(seen.forks.length).toBeGreaterThan(0)
+  expect(JSON.stringify(await $.command.run(DREAMS))).not.toContain('Dreams are off')
+})
+
+test('dreams turned off in /config: no look, however long Claude works, and /csr dreams says where to turn them on', { options: { dreams: false } }, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, replies: [DREAM_REPLY] })
   await steps($, 30)
   await settle(() => false)
@@ -2300,7 +2308,7 @@ test('the subagent block holds the newest 30 files, the newest test run that say
   expect(subagentBlock([{ role: 'assistant' as const, text: '', toolUses: [] }])).toBeNull() // nothing to keep: no block
 })
 
-test('the pane offers dreams while they are off; its 1 asks again, as they turn on in all your sessions', async ($, on) => {
+test('the pane offers dreams while they are off; its 1 asks again, as they turn on in all your sessions', { options: { dreams: false } }, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, json: QUIET })
   await $.session.start(START as never)
   await settle(() => seen.opened.length > 0)
@@ -2320,7 +2328,7 @@ test('the pane offers dreams while they are off; its 1 asks again, as they turn 
   expect(await pane.find({ type: 'Button' })).toBeUndefined()
 })
 
-test('a refused /config row leaves the offer up and says where to turn dreams on', async ($, on) => {
+test('a refused /config row leaves the offer up and says where to turn dreams on', { options: { dreams: false } }, async ($, on) => {
   const seen = host(on, { herdr: false, repo: true, json: QUIET, configRefused: true })
   await $.session.start(START as never)
   const pane = await $.ui.mount(PANE)
@@ -2364,7 +2372,7 @@ test('with changes found the pane lists them, and no longer promises them', ON, 
   expect(await pane.find({ text: /a later commit changes shows here/ })).toBeUndefined()
 })
 
-test('with dreams off the pane shows the dream you marked helpful as its sample', async ($, on) => {
+test('with dreams off the pane shows the dream you marked helpful as its sample', { options: { dreams: false } }, async ($, on) => {
   const sample = { line: 'What if the pre-commit hook reran a failed test once before blocking?', at: Date.UTC(2026, 9, 10, 16, 51) / 1000, answer: 'helpful', project: 'claude-self-reflect' }
   host(on, { herdr: false, repo: true, json: { ...QUIET, sample } })
   await $.session.start(START as never)
@@ -2472,7 +2480,8 @@ test('a hand-off is text: @, paste placeholders and ultra words cannot act, and 
 const keyEdit = ($: Engine, key: string) =>
   ($.prompt as unknown as { edit: (e: unknown) => Promise<unknown> }).edit({ origin: { kind: 'composer' }, text: '', cursor: 0, start: 0, end: 0, inputText: key, key: { key } })
 const SETUP = { command: 'csr', args: 'setup', origin: { kind: 'human' } } as never
-// What a person who never chose has in force; the manifest's own default is test_compact.py's to check.
+// What a person who never chose has in force: dreams on, compaction at suggest (neither option set, dreams not named).
+// The manifest's own default is test_compact.py's to check.
 const FRESH = { options: { autoCompact: 'suggest' } }
 
 test('the plugin just added: two steps above the prompt, each digit writes its /config row, then it is gone', FRESH, async ($, on) => {
@@ -2482,16 +2491,17 @@ test('the plugin just added: two steps above the prompt, each digit writes its /
   expect(await band.find({ text: /CSR setup 1\/2/ })).toBeDefined()
   expect(await band.find({ text: /checks before each look that its spend stays within/ })).toBeDefined() // not "at most": a fork has no token cap
   expect(await band.find({ text: /A look can run over; the next waits until Claude has caught up/ })).toBeDefined()
-  expect(await band.find({ type: 'Button', text: 'Off (now)' })).toBeDefined() // dreams start off
-  await band.press({ key: 'setup-dreams-1' })
-  expect(seen.configured).toEqual([{ key: 'csr-companion.dreams', value: true }])
+  expect(await band.find({ type: 'Button', text: 'On (now)' })).toBeDefined() // dreams start on
+  expect(await band.find({ type: 'Button', text: 'Off' })).toBeDefined()
+  await band.press({ key: 'setup-dreams-0' })
+  expect(seen.configured).toEqual([{ key: 'csr-companion.dreams', value: false }])
   expect(await band.find({ text: /CSR setup 2\/2/ })).toBeDefined()
   expect(await band.find({ type: 'Button', text: 'Suggest (now)' })).toBeDefined() // compacting on its own is opt-in
   expect(await band.find({ text: /Auto: on its own. A 20 s countdown at the terminal; at once from the phone/ })).toBeDefined()
   await band.press({ key: 'setup-autoCompact-1' })
-  expect(seen.configured).toEqual([{ key: 'csr-companion.dreams', value: true }, { key: 'csr-companion.autoCompact', value: 'auto' }])
+  expect(seen.configured).toEqual([{ key: 'csr-companion.dreams', value: false }, { key: 'csr-companion.autoCompact', value: 'auto' }])
   expect(await band.find({ text: /CSR setup/ })).toBeUndefined()
-  expect(seen.store.get('setup:answer:dreams')).toEqual(expect.objectContaining({ value: true }))
+  expect(seen.store.get('setup:answer:dreams')).toEqual(expect.objectContaining({ value: false }))
   expect(seen.store.get('setup:answer:autoCompact')).toEqual(expect.objectContaining({ value: 'auto' }))
 })
 
@@ -2499,7 +2509,7 @@ test('keeping what is in force writes nothing: no /config write, no reload', FRE
   const seen = host(on, { herdr: false, repo: true, firstRun: true })
   await $.session.start(START as never)
   const band = await $.ui.mount(BAND)
-  await band.press({ key: 'setup-dreams-0' })
+  await band.press({ key: 'setup-dreams-1' })
   await band.press({ key: 'setup-autoCompact-2' })
   expect(seen.configured).toEqual([])
   expect(seen.store.get('setup:answer:autoCompact')).toEqual(expect.objectContaining({ value: 'suggest' }))
@@ -2510,7 +2520,7 @@ test('a refused /config row says where to set it and moves on; on the last step 
   const seen = host(on, { herdr: false, repo: true, firstRun: true, configRefused: true })
   await $.session.start(START as never)
   const band = await $.ui.mount(BAND)
-  await band.press({ key: 'setup-dreams-1' })
+  await band.press({ key: 'setup-dreams-0' })
   expect(await band.find({ text: /CSR setup 2\/2/ })).toBeDefined()
   expect(await band.find({ text: "Couldn't set it here. Use /config: csr-companion, Dreams." })).toBeDefined()
   await band.press({ key: 'setup-autoCompact-1' })

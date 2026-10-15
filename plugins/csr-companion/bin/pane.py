@@ -965,9 +965,9 @@ def dreams_on():
         with open(os.path.join(HOME, '.claude', 'settings.json'), encoding='utf-8') as handle:
             configs = json.load(handle).get('pluginConfigs') or {}
     except (OSError, ValueError, AttributeError):
-        return False
-    return any(name.split('@')[0] == 'csr-companion' and ((config or {}).get('options') or {}).get('dreams') is True
-               for name, config in configs.items())
+        return True  # no settings to read: the option is unset, and unset is on
+    return not any(name.split('@')[0] == 'csr-companion' and ((config or {}).get('options') or {}).get('dreams') is False
+                   for name, config in configs.items())
 
 
 def status_text(data):
@@ -8478,7 +8478,7 @@ def main():
         return
     if args.json:
         if not root or not os.path.exists(DB):
-            print(json.dumps(dict(repo=None, total=0, shifts=[], changes=[], changes_total=0, dreams=[], dreams_on=False,
+            print(json.dumps(dict(repo=None, total=0, shifts=[], changes=[], changes_total=0, dreams=[], dreams_on=dreams_on(),
                                   recalled=0, dreams_7d=0, dream_tokens_7d=0, reminded_7d=0,
                                   status=None if not root else '☾ ' + SETUP)))
             return

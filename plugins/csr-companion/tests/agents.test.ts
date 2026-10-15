@@ -394,7 +394,7 @@ test('redaction by agents.ts is the helper\'s table, and then some', async () =>
   expect(redactAgentValue(redactAgentValue('password=hunter2 and sk-abcdefghijklmnopqrstuv'))).toBe('password=[redacted] and [redacted]')
 })
 
-test('the agents file is written at once, then at most every five seconds, terminal events included', async ($, on) => {
+test('the agents file is written at once, then at most every five seconds, terminal events included', { options: { dreams: false } }, async ($, on) => {
   const writes: NonNullable<World['writes']> = []
   const clock = host(on, { writes })
   await spawn($, 'tu-1')

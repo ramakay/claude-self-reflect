@@ -30,7 +30,7 @@ import { CHOICES, dueSteps, heading, LINES, refusedText, STEPS } from './setup'
 //  - Dream: every few steps of Claude's work, the dreamer asks one "what if...?",
 //    the question you keep asking the agent, grounded in what CSR remembers.
 //    It forks this session the way You should know does, so it spends tokens:
-//    off by default, a /config row as You should know is a /plugin switch, and
+//    on by default, turned off by a /config row (only an explicit false), and
 //    paced by what it earns (./pace.ts), not a daily number.
 //
 // The pane: this session live, the dreams by date, and code that changed since
@@ -1752,7 +1752,7 @@ async function armCompletions($: EngineInterface, fleet: Fleet, wait = COMPLETIO
 }
 
 export const register: Register = (on, options) => {
-  const dreamsOn = options.dreams === true
+  const dreamsOn = options.dreams !== false // on unless the person turned it off
   // What the hooks of this load share: whether a look runs (one at a time, whoever started it), whether the main loop is
   // mid-turn, when it last stepped and what that step cost (a completion's look waits for a quiet main loop and borrows
   // the cost for its budget check), and whether a timer waits to offer the reports that came in.

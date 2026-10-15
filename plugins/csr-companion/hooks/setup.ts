@@ -2,7 +2,7 @@ import type { StepId } from '../types'
 import { BAND, k } from './compact'
 
 // The first run's walkthrough: each setting a person should choose, one step at a time above the prompt.
-// Nothing that acts on its own is on until they say so: dreams start off, compaction starts at suggest.
+// Dreams start on, and can be turned off here or in /config; compaction starts at suggest and acts only when told.
 
 export const STEPS: StepId[] = ['dreams', 'autoCompact']
 // A step set aside without an answer shows at this many session starts, then never; /csr setup reopens it.
