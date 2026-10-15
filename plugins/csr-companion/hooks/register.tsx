@@ -5,6 +5,7 @@ import type { AgentState, CompactView, CompletionKey, CompletionDisposition, Inf
 import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, handoffRequests, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
 import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
+import { subagentBlock } from './subagent'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
 import { allowance, CHAPTER_MS, FIRST_EVERY, USUAL_STEPS, canAfford, closeTurn, countStep, dreamsLeft, facts, freshChapter, freshPace, guess, hasNews, mayLook, median, owed, paceText, spacing } from './pace'
@@ -2372,6 +2373,28 @@ export const register: Register = (on, options) => {
       block = null
     }
     return next(block ? { ...e, instructions: e.instructions ? `${e.instructions}\n\n${block}` : block } : e)
+  }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
+
+  // A compacting subagent keeps its brief and its progress. CSR cannot start or veto a subagent's compaction, but
+  // the companion is told of each one with that subagent's own transcript: its brief, commits, edited files, last
+  // test outcome and newest words go to the summarizer as things to keep. Built from e.messages alone (no process,
+  // no engine call, no model call); a block that cannot be built lets the compaction go on with the instructions
+  // it had. Its own matcher, as the hooks above and below: the engine refuses two that match every trigger.
+  on('session.compact', { trigger: /^(manual|auto|plugin)$/ }, async ($, e, next) => {
+    const id = e.agentId
+    if (id === undefined) return next(e)
+    let told = e
+    try {
+      const block = subagentBlock(e.messages)
+      if (block) {
+        const type = await $.agent.list().then(list => list.find(agent => agent.id === id)?.type).catch(() => undefined)
+        $.ui.log(`csr-companion: ${type ?? 'unknown'} subagent ${id} compacting (${e.trigger}): kept ${block.length} characters of its task and state`, { to: 'debug' })
+        told = { ...e, instructions: e.instructions ? `${e.instructions}\n\n${block}` : block }
+      }
+    } catch {
+      told = e
+    }
+    return next(told)
   }).catch((_$, e, next) => next(e)) // never a guard: a failure here lets the compaction go on
 
   // The pane says what CSR did here, what it found, and what it can do: with dreams off it offers them.

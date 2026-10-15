@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
+import { BLOCK_MAX, BRIEF_HEAD, BRIEF_TAIL, subagentBlock } from '../hooks/subagent'
 import { canAfford, facts, freshChapter, freshPace, median, owed, paceText, spacing } from '../hooks/pace'
 const rankOfRoot = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1) // as register.tsx ranks a copy
 import { addTerm, AS_TEXT, commands, gitParse, gitVerdict, HOOKS_OFF, isBareDigit, mergeGuards, parseGuard, NO_VERIFY, PROTECTED, RELEASE, tripwire, UNRESOLVED } from '../hooks/coach'
@@ -76,6 +77,7 @@ type World = {
   noRepo?: boolean // `git rev-parse --git-dir` fails: git refuses the settings, or there is no repository
   gitExit?: Record<string, number> // a git question that fails with this exit, keyed as `git` is
   compactFails?: boolean
+  agents?: Array<{ id: string; type: string; description: string }> // what $.agent.list() answers
   lost?: unknown[] | string // what pane.py --lost prints (a string as is, 'hangs' a timeout); undefined makes it fail
   json?: Record<string, unknown> // what pane.py --json prints, where SHIFTS is not the case
   jsonHangs?: boolean // pane.py --json runs past its time limit: process.run rejects
@@ -132,7 +134,12 @@ function host(on: On, world: World) {
     on('clock.after', async () => ({ value: undefined }) as never) // a wait the plugin sets (the agents file's trailing write, a completion's 20 s): never fires here
     on('clock.now', async () => ({ value: world.clock?.now ?? NOW }))
   }
-  on('agent.list', async () => ({ value: [] }) as never)
+  on('agent.list', async () => ({ value: world.agents ?? [] }) as never)
+  const logged: string[] = [] // what the plugin wrote to the log
+  on('ui.log', async (_$, e) => {
+    logged.push(e.text)
+    return { value: undefined }
+  })
   on('turn.start', async (_$, e) => ({ turnId: e.turnId })) // the main loop's turn and an agent's end: nothing beneath the plugin
   on('turn.complete', async (_$, e) => ({ text: e.answer }))
   const toasts: string[] = []
@@ -305,7 +312,7 @@ function host(on: On, world: World) {
     opened.push(e.id)
     return { value: { isPlaced: true } }
   })
-  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock }
+  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock, logged }
 }
 
 async function settle(done: () => boolean | Promise<boolean>) {
@@ -2120,6 +2127,128 @@ test('prep-compact also carries the threads into a compaction made ahead of time
   await $.session.start(START as never)
   await $.session.compact({ trigger: 'precompute', messages: MESSAGES } as never)
   expect(seen.compacted.at(-1) ?? '').toContain('Reminders from CSR (not tasks)')
+})
+
+// A compacting subagent keeps its brief and its progress: the block is built from its own transcript (e.messages).
+const call = (tool_use_id: string, tool: string, input: Record<string, unknown>, text?: string) => ({ tool_use_id, tool, input, ...(text === undefined ? {} : { text }) })
+const BRIEF_OF_THE_AGENT = 'Implement section F2.9 in /repo/plugins/csr-companion.\nWork alone in the worktree and commit once.'
+const SUBAGENT = [
+  { role: 'user', text: BRIEF_OF_THE_AGENT, toolUses: [] },
+  { role: 'assistant', text: 'Reading the handlers first.', toolUses: [call('t1', 'Read', { file_path: '/repo/hooks/register.tsx' }, 'a file that says all 3 passed')] },
+  { role: 'assistant', text: '', toolUses: [call('t2', 'Edit', { file_path: '/repo/hooks/register.tsx', old_string: 'a', new_string: 'b' }, 'ok')] },
+  { role: 'assistant', text: '', toolUses: [call('t3', 'Write', { file_path: '/repo/hooks/subagent.ts', content: 'x' }, 'ok'), call('t4', 'Edit', { file_path: '/repo/hooks/register.tsx' }, 'ok')] },
+  { role: 'assistant', text: 'Running the plugin tests.', toolUses: [call('t5', 'Bash', { command: 'claude plugin test' }, 'running\n  ✓ one\n12 passed, 1 failed\ndone')] },
+  { role: 'assistant', text: '', toolUses: [call('t6', 'Bash', { command: 'git commit -m x' })] },
+  { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 't6', text: '[feat/story-map abc1234] feat(plugin): keep a subagent brief\n 2 files changed, 9 insertions(+)', isError: false }] },
+  { role: 'assistant', text: 'Now writing the tests for the second handler.', toolUses: [call('t7', 'Bash', { command: 'git status' }, 'clean')] },
+]
+const SUBAGENT_BLOCK = [
+  "CSR COMPACT KEEP — subagent. Keep these verbatim in the summary; they are the subagent's task and state:",
+  'Task brief (its first message, verbatim):',
+  BRIEF_OF_THE_AGENT,
+  'Commits it made:',
+  '- [feat/story-map abc1234] feat(plugin): keep a subagent brief',
+  'Files it edited (newest 30):',
+  '- /repo/hooks/subagent.ts',
+  '- /repo/hooks/register.tsx',
+  'Its last test outcome:',
+  '- 12 passed, 1 failed',
+  'In progress (its newest words):',
+  'Now writing the tests for the second handler.',
+].join('\n')
+
+test('a compacting subagent gets its brief, commits, edited files, last test outcome and newest words, after the instructions it had', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: THREADS, agents: [{ id: 'sub-1', type: 'csr-sonnet-high', description: 'U11' }] })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: SUBAGENT } as never)
+  expect(seen.compacted.at(-1)).toBe(`keep the plan\n\n${SUBAGENT_BLOCK}`)
+  expect(seen.compacted.at(-1)).not.toContain('Reminders from CSR') // the main session's threads are not the subagent's
+  expect(seen.logged.some(line => line.includes('csr-sonnet-high subagent sub-1 compacting') && line.includes(`${SUBAGENT_BLOCK.length} characters`))).toBe(true)
+  await $.session.compact({ trigger: 'manual', agentId: 'sub-1', messages: SUBAGENT } as never)
+  expect(seen.compacted.at(-1)).toBe(SUBAGENT_BLOCK) // no instructions: the block alone
+})
+
+test('a main-session compaction gets the instructions it had and the Lost and found carry block, with nothing of the subagent block', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: THREADS })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: SUBAGENT } as never)
+  const told = seen.compacted.at(-1) ?? ''
+  expect(told.startsWith(`keep the plan\n\n${REMINDERS.slice(0, -1)}`)).toBe(true) // exactly what prep-compact makes of it
+  expect(told).toContain('- Try the cache countdown in the masthead.')
+  expect(told).not.toContain('CSR COMPACT KEEP')
+  expect(told).not.toContain('Task brief')
+  expect(seen.logged.some(line => line.includes('subagent'))).toBe(false)
+})
+
+test('a main-session compaction with no threads to carry keeps exactly its instructions, whatever the transcript holds', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: [] })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'manual', instructions: 'keep the plan', messages: SUBAGENT } as never)
+  expect(seen.compacted.at(-1)).toBe('keep the plan')
+  await $.session.compact({ trigger: 'auto', messages: SUBAGENT } as never)
+  expect(seen.compacted.at(-1)).toBeUndefined()
+})
+
+test('a subagent compaction asks no process: no pane.py, no model call', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, lost: THREADS })
+  await $.session.start(START as never)
+  await settle(() => seen.runs.some(run => run.includes('--coach')))
+  await new Promise<void>(resolve => setTimeout(() => resolve(), 100)) // what the start began has been asked
+  const before = seen.runs.length
+  const forks = seen.forks.length
+  await $.session.compact({ trigger: 'auto', agentId: 'sub-1', messages: SUBAGENT } as never)
+  await new Promise<void>(resolve => setTimeout(() => resolve(), 100))
+  // the pane's own background reads (--json, --coach) go on whatever is compacting; nothing else is run
+  expect(seen.runs.slice(before).filter(run => !run.includes('--json') && !run.includes('--coach'))).toEqual([])
+  expect(seen.runs.some(run => run.includes('--lost') || run.includes('--keep'))).toBe(false)
+  expect(seen.forks.length).toBe(forks)
+  expect(seen.compacted.at(-1)).toBe(SUBAGENT_BLOCK)
+})
+
+test('a subagent brief over 6 KB is cut to its first 4 KB and last 2 KB with a mark', async ($, on) => {
+  const long = `${'H'.repeat(BRIEF_HEAD)}${'m'.repeat(5000)}${'T'.repeat(BRIEF_TAIL)}`
+  const seen = host(on, { herdr: false, repo: true })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'auto', agentId: 'sub-1', messages: [{ role: 'user', text: long, toolUses: [] }] } as never)
+  const told = seen.compacted.at(-1) ?? ''
+  expect(told).toContain(`${'H'.repeat(BRIEF_HEAD)}\n[… 5000 characters cut …]\n${'T'.repeat(BRIEF_TAIL)}`)
+  expect(told).not.toContain('m'.repeat(10))
+  const exact = 'e'.repeat(6144)
+  await $.session.compact({ trigger: 'auto', agentId: 'sub-1', messages: [{ role: 'user', text: exact, toolUses: [] }] } as never)
+  expect(seen.compacted.at(-1)).toContain(exact) // 6 KB itself is kept whole
+  expect(seen.compacted.at(-1)).not.toContain('cut …')
+})
+
+test('a subagent whose type cannot be looked up still keeps its block, and a transcript with nothing to keep leaves the instructions alone', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, agents: 'not a list' as never })
+  await $.session.start(START as never)
+  await $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: SUBAGENT } as never)
+  expect(seen.compacted.at(-1)).toBe(`keep the plan\n\n${SUBAGENT_BLOCK}`)
+  expect(seen.logged.some(line => line.includes('unknown subagent sub-1'))).toBe(true)
+  await $.session.compact({ trigger: 'auto', instructions: 'keep the plan', agentId: 'sub-1', messages: [{ role: 'assistant', text: '', toolUses: [] }] } as never)
+  expect(seen.compacted.at(-1)).toBe('keep the plan')
+})
+
+test('a subagent block that cannot be composed throws out of subagentBlock, which the handler answers with the instructions it had', () => {
+  // The engine checks the messages it hands a hook, so the handler's own try/catch is out of a test's reach;
+  // what it guards is exactly this call.
+  expect(() => subagentBlock([{ role: 'user', text: 'the brief', toolUses: [], toolResults: [null] }] as never)).toThrow()
+})
+
+test('the subagent block holds the newest 30 files, the newest test run that says something, and 8 KB in all', () => {
+  const edits = Array.from({ length: 40 }, (_, k) => ({ role: 'assistant' as const, text: '', toolUses: [call(`e${k}`, 'Edit', { file_path: `/repo/${'d'.repeat(150)}/f${k}.rs` }, 'ok')] }))
+  const runs = [
+    { role: 'assistant' as const, text: '', toolUses: [call('r1', 'Bash', { command: 'cargo test' }, 'test result: ok. 3 passed; 0 failed')] },
+    { role: 'assistant' as const, text: '', toolUses: [call('r2', 'Bash', { command: 'ls' }, 'a.rs\nb.rs')] },
+  ]
+  const block = subagentBlock([{ role: 'user' as const, text: 'the brief', toolUses: [] }, ...edits, ...runs, { role: 'assistant' as const, text: 'z'.repeat(2000), toolUses: [] }])!
+  expect(block.length).toBeLessThanOrEqual(BLOCK_MAX)
+  expect(block).toContain('test result: ok. 3 passed; 0 failed') // the newest result with a test line, not the newest result
+  expect(block).toContain('the brief')
+  expect(block).not.toContain('/f9.rs') // the first ten edits fall off the newest 30
+  expect(block).toContain('z'.repeat(599)) // the newest words, 600 characters
+  expect(block).not.toContain('z'.repeat(601))
+  expect(subagentBlock([{ role: 'assistant' as const, text: '', toolUses: [] }])).toBeNull() // nothing to keep: no block
 })
 
 test('the pane offers dreams while they are off; its 1 asks again, as they turn on in all your sessions', async ($, on) => {
