@@ -1970,7 +1970,17 @@ pub fn get_chunk_ids_in_timerange(
 /// matches) and hyphens/special characters never parse as FTS5 operators.
 /// `None` when no word survives sanitizing.
 pub fn fts5_match_expr(query: &str) -> Option<String> {
-    let words: Vec<String> = query
+    let words = fts5_query_words(query);
+    if words.is_empty() {
+        return None;
+    }
+    Some(fts5_or_expr(&words))
+}
+
+/// The words of a free-text query that survive FTS5 sanitizing: whitespace
+/// split, only alphanumerics, `_` and `-` kept, at least two characters.
+pub fn fts5_query_words(query: &str) -> Vec<String> {
+    query
         .split_whitespace()
         .map(|w| {
             w.chars()
@@ -1978,17 +1988,32 @@ pub fn fts5_match_expr(query: &str) -> Option<String> {
                 .collect::<String>()
         })
         .filter(|w| w.len() >= 2)
-        .collect();
-    if words.is_empty() {
-        return None;
-    }
-    Some(
-        words
-            .iter()
-            .map(|w| format!("\"{}\"", w))
-            .collect::<Vec<_>>()
-            .join(" OR "),
-    )
+        .collect()
+}
+
+/// `words` as quoted FTS5 phrases joined by OR, the form [`fts5_match_expr`]
+/// builds. `words` must come from [`fts5_query_words`] (nothing in them parses
+/// as an FTS5 operator).
+pub fn fts5_or_expr(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| format!("\"{}\"", w))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// How many chunks contain `word`, counted only up to `cap`. The FTS5 match is
+/// walked lazily and stops at `cap` rows, so a common word costs the same as a
+/// rare one instead of a scan of every match.
+pub fn fts5_chunk_doc_count(conn: &Connection, word: &str, cap: usize) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT count(*) FROM (SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ?1 LIMIT ?2)",
+    )?;
+    let n: i64 = stmt.query_row(
+        params![fts5_or_expr(&[word.to_string()]), cap as i64],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
 }
 
 /// Keyword hits over `reflections_fts`: `(reflection_id, ordinal, bm25)` in
@@ -2121,10 +2146,31 @@ pub fn fts5_search_in_window(
     project: Option<&str>,
     window: Option<(&str, &str)>,
 ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
-    let (start, end) = window.map_or((None, None), |(start, end)| (Some(start), Some(end)));
     let Some(fts_query) = fts5_match_expr(query) else {
         return Ok(Vec::new());
     };
+    fts5_search_matched(conn, &fts_query, limit, project, window)
+}
+
+/// [`fts5_search`] for a ready-made FTS5 match expression (built from
+/// [`fts5_query_words`] / [`fts5_or_expr`]).
+pub fn fts5_search_expr(
+    conn: &Connection,
+    fts_query: &str,
+    limit: usize,
+    project: Option<&str>,
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+    fts5_search_matched(conn, fts_query, limit, project, None)
+}
+
+fn fts5_search_matched(
+    conn: &Connection,
+    fts_query: &str,
+    limit: usize,
+    project: Option<&str>,
+    window: Option<(&str, &str)>,
+) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+    let (start, end) = window.map_or((None, None), |(start, end)| (Some(start), Some(end)));
 
     let chunks_with_bm25 = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(
@@ -5774,6 +5820,42 @@ mod tests {
             hits[0].2 <= hits[1].2,
             "FTS5 bm25 order must be ascending: {hits:?}"
         );
+    }
+
+    #[test]
+    fn fts5_doc_count_stops_at_the_cap_and_expr_search_matches_the_text_search() {
+        let conn = mem();
+        for i in 0..5 {
+            insert_chunk(
+                &conn,
+                &test_chunk(&format!("common-{i}"), "commonword filler"),
+                &[0.1; 4],
+            )
+            .unwrap();
+        }
+        insert_chunk(
+            &conn,
+            &test_chunk("rare", "commonword raretoken"),
+            &[0.2; 4],
+        )
+        .unwrap();
+
+        assert_eq!(fts5_chunk_doc_count(&conn, "commonword", 3).unwrap(), 3);
+        assert_eq!(fts5_chunk_doc_count(&conn, "commonword", 100).unwrap(), 6);
+        assert_eq!(fts5_chunk_doc_count(&conn, "raretoken", 3).unwrap(), 1);
+        assert_eq!(fts5_chunk_doc_count(&conn, "absentword", 3).unwrap(), 0);
+
+        let words = fts5_query_words("raretoken a commonword");
+        assert_eq!(words, ["raretoken", "commonword"]);
+        assert_eq!(
+            fts5_match_expr("raretoken a commonword").unwrap(),
+            fts5_or_expr(&words)
+        );
+        let by_text = fts5_search(&conn, "raretoken", 5, None).unwrap();
+        let by_expr =
+            fts5_search_expr(&conn, &fts5_or_expr(&["raretoken".to_string()]), 5, None).unwrap();
+        assert_eq!(by_text.len(), 1);
+        assert_eq!(by_text[0].0.id, by_expr[0].0.id);
     }
 
     #[test]

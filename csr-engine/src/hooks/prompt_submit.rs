@@ -51,6 +51,10 @@ const EPISODE_CORRELATION_MIN: f32 = 0.45;
 /// Prevents 3-month-old conversations from winning on semantic similarity alone.
 const MAX_CHUNK_AGE_DAYS: i64 = 21;
 
+/// Chunk slots a prompt renders (`scored.iter().take(5)`). Keyword-only hits
+/// are admitted only up to this many chunks in total, after the vector hits.
+const KEYWORD_FILL_SLOTS: usize = 5;
+
 /// A derived reflection (session story, v3 extract, heuristic narrative,
 /// context cache, convention fact) summarises a conversation and ages like
 /// that conversation's chunks: past [`MAX_CHUNK_AGE_DAYS`] it is handed over
@@ -623,6 +627,7 @@ async fn handle_inner(
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
     let chunk_results = search_chunks_with_vec(
         engine,
+        prompt,
         &query_vec,
         15,
         0.55,
@@ -1531,8 +1536,10 @@ fn is_own_subagent(
 /// Search chunks using a pre-computed embedding vector (P-1 optimization).
 /// Scoped to `project` — chunks from other projects are filtered out, and so
 /// is anything `is_self_echo` names.
+#[allow(clippy::too_many_arguments)]
 async fn search_chunks_with_vec(
     engine: &Engine,
+    query: &str,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
@@ -1542,6 +1549,8 @@ async fn search_chunks_with_vec(
 ) -> Vec<RawResult> {
     search_chunks_with_vec_core(
         engine,
+        query,
+        crate::search::hybrid::search_mode_from_env(),
         query_vec,
         limit,
         min_score,
@@ -1552,13 +1561,98 @@ async fn search_chunks_with_vec(
     .await
 }
 
+/// Chunk candidates for the prompt: the vector hits, fused with FTS5 keyword
+/// hits by the same reciprocal-rank fusion the MCP search path uses
+/// (`search::hybrid`, `CSR_SEARCH_MODE` honoured, hybrid by default). The
+/// keyword channel searches only the prompt's few rare words
+/// (`hybrid::hook_keyword_chunk_hits`), so a long prompt does not rank most of
+/// the table. Output is
+/// in fused order. A vector hit keeps its cosine; a keyword-only hit has no
+/// cosine, so it carries the MCP path's keyword-only score (a decayed 0.45) and
+/// is not held to `min_score`, which is a cosine floor. Keyword hits are
+/// searched inside `project` when one is given. Every candidate then meets the
+/// same filters in [`search_chunks_with_vec_core`].
+#[allow(clippy::too_many_arguments)]
+async fn hybrid_chunk_candidates(
+    engine: &Engine,
+    query: &str,
+    mode: crate::search::hybrid::SearchMode,
+    query_vec: &[f32],
+    limit: usize,
+    min_score: f32,
+    project: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> (Vec<crate::search::SearchResult>, HashSet<String>) {
+    use crate::search::hybrid::{self, SearchMode};
+
+    let semantic = if mode == SearchMode::Fts {
+        Vec::new()
+    } else {
+        let idx = engine.search().read().await;
+        idx.search_chunks(query_vec, limit, min_score)
+    };
+    if mode == SearchMode::Vector {
+        return (semantic, HashSet::new());
+    }
+
+    let mut keyword = hybrid::hook_keyword_chunk_hits(
+        engine.storage(),
+        query,
+        limit,
+        (!project.is_empty()).then_some(project),
+    );
+    // A chunk the live index does not hold (its embedding was deleted, or it
+    // was never embedded) is not recalled by keyword either: the vector index
+    // is what says which chunks exist for recall, so a deletion that reached
+    // the index also reaches the keyword channel.
+    {
+        let idx = engine.search().read().await;
+        keyword
+            .hits
+            .retain(|(chunk, _, _)| idx.has_chunk(&chunk.id));
+    }
+    if keyword.hits.is_empty() {
+        return (semantic, HashSet::new());
+    }
+    let semantic_order: Vec<String> = semantic.iter().map(|r| r.id.clone()).collect();
+    let fts_order: Vec<String> = keyword.hits.iter().map(|(c, _, _)| c.id.clone()).collect();
+    let order = match mode {
+        SearchMode::Fts => fts_order,
+        _ => hybrid::fuse_rrf(&semantic_order, &fts_order, hybrid::RRF_K),
+    };
+    let cosine: HashMap<&str, f32> = semantic.iter().map(|r| (r.id.as_str(), r.score)).collect();
+    let timestamps: HashMap<&str, &str> = keyword
+        .hits
+        .iter()
+        .map(|(c, _, _)| (c.id.as_str(), c.timestamp.as_str()))
+        .collect();
+    let keyword_only: HashSet<String> = order
+        .iter()
+        .filter(|id| !cosine.contains_key(id.as_str()))
+        .cloned()
+        .collect();
+    let fused = order
+        .into_iter()
+        .map(|id| {
+            let score = cosine.get(id.as_str()).copied().unwrap_or_else(|| {
+                hybrid::keyword_only_score(timestamps.get(id.as_str()).copied().unwrap_or(""), now)
+            });
+            crate::search::SearchResult { id, score }
+        })
+        .collect();
+    (fused, keyword_only)
+}
+
 /// [`search_chunks_with_vec`] with the repository test supplied, so unit tests
 /// decide which conversations widen without a filesystem or `git`. `same_repo`
 /// is called at most once, and only when some candidate's label differs from
 /// `project` and has a recorded transcript path. A prompt whose candidates all
 /// match by label costs nothing; any other costs one batched query first.
+#[allow(clippy::too_many_arguments)]
 async fn search_chunks_with_vec_core(
     engine: &Engine,
+    query: &str,
+    mode: crate::search::hybrid::SearchMode,
     query_vec: &[f32],
     limit: usize,
     min_score: f32,
@@ -1566,16 +1660,15 @@ async fn search_chunks_with_vec_core(
     current_session: Option<&str>,
     same_repo: impl FnOnce(HashMap<String, Vec<String>>) -> super::scope_folder::RepoConversations,
 ) -> Vec<RawResult> {
-    let search = engine.search();
     let storage = engine.storage();
 
-    let results = {
-        let idx = search.read().await;
-        idx.search_chunks(query_vec, limit, min_score)
-    };
-
     let now = chrono::Utc::now();
+    let (results, keyword_only) = hybrid_chunk_candidates(
+        engine, query, mode, query_vec, limit, min_score, project, &now,
+    )
+    .await;
     let mut raw_results = Vec::new();
+    let mut kept_keyword_only: Vec<usize> = Vec::new();
 
     // Batch the row fetch. `get_chunks_by_ids` already takes a slice, but was
     // being called once per hit via `from_ref`, making this N+1 over the HNSW
@@ -1675,6 +1768,9 @@ async fn search_chunks_with_vec_core(
                     }
                 }
 
+                if keyword_only.contains(&result.id) {
+                    kept_keyword_only.push(raw_results.len());
+                }
                 raw_results.push(RawResult {
                     content: formatter::truncate_item(&chunk.content, 300),
                     score: result.score,
@@ -1692,6 +1788,21 @@ async fn search_chunks_with_vec_core(
                 });
             }
         }
+    }
+
+    // Keyword-only hits fill the slots the vector hits left empty; they never
+    // compete with vector hits that passed the same filters. Ranking weighs
+    // recency and file overlap beside similarity, so a keyword-only chunk with
+    // a weak similarity could otherwise push a strong vector hit out of the
+    // rendered slots. `fts` mode asked for keyword hits only, so it keeps all.
+    if mode != crate::search::hybrid::SearchMode::Fts && !kept_keyword_only.is_empty() {
+        let room = KEYWORD_FILL_SLOTS.saturating_sub(raw_results.len() - kept_keyword_only.len());
+        let drop: HashSet<usize> = kept_keyword_only.iter().skip(room).copied().collect();
+        let mut index = 0;
+        raw_results.retain(|_| {
+            index += 1;
+            !drop.contains(&(index - 1))
+        });
     }
 
     raw_results
@@ -2531,17 +2642,274 @@ mod tests {
             root.path().to_path_buf(),
         );
 
-        let results =
-            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 1, 0.0, "project", None, |_| {
-                HashMap::new()
-            })
-            .await;
+        let results = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            1,
+            0.0,
+            "project",
+            None,
+            |_| HashMap::new(),
+        )
+        .await;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].min_trust,
             crate::provenance::TrustTier::UserHistory
         );
+    }
+
+    /// Hybrid fixture: one strong semantic chunk, and several chunks that only the
+    /// keyword channel can reach (their vectors sit below any cosine floor), each
+    /// failing a different hook filter except `kw-ok`.
+    #[allow(clippy::type_complexity)]
+    async fn hybrid_engine() -> (Engine, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let old = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+        let keyword = "implementation of parse_widget_identifier";
+        let csr_rule = format!(
+            "A standing rule from 10-12: \u{201c}{} parse_widget_identifier\u{201d}",
+            "x".repeat(400)
+        );
+        let rows: [(&str, &str, &str, &str, &str, [f32; 2]); 7] = [
+            (
+                "sem-high",
+                "conv-sem",
+                "project",
+                &fresh,
+                "unrelated conceptual match",
+                [1.0, 0.0],
+            ),
+            (
+                "kw-ok",
+                "conv-ok",
+                "project",
+                &fresh,
+                keyword,
+                [0.4, 0.916_515_1],
+            ),
+            (
+                "kw-other-project",
+                "conv-other",
+                "elsewhere",
+                &fresh,
+                keyword,
+                [0.4, 0.916_515_1],
+            ),
+            (
+                "kw-self",
+                "current-session",
+                "project",
+                &fresh,
+                keyword,
+                [0.4, 0.916_515_1],
+            ),
+            (
+                "kw-old",
+                "conv-old",
+                "project",
+                &old,
+                keyword,
+                [0.4, 0.916_515_1],
+            ),
+            (
+                "kw-csr",
+                "conv-csr",
+                "project",
+                &fresh,
+                &csr_rule,
+                [0.4, 0.916_515_1],
+            ),
+            (
+                "kw-unrelated",
+                "conv-un",
+                "project",
+                &fresh,
+                "nothing to match here",
+                [0.4, 0.916_515_1],
+            ),
+        ];
+        for (seq, (id, conv, project, ts, content, vec)) in rows.iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: (*id).into(),
+                conversation_id: (*conv).into(),
+                project_name: (*project).into(),
+                timestamp: (*ts).into(),
+                content: (*content).into(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, vec).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::User,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+            search.insert_chunk(chunk.id.clone(), vec.to_vec());
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        (engine, root)
+    }
+
+    async fn hybrid_ids(
+        engine: &Engine,
+        mode: crate::search::hybrid::SearchMode,
+    ) -> Vec<(String, f32)> {
+        search_chunks_with_vec_core(
+            engine,
+            "parse_widget_identifier",
+            mode,
+            &[1.0, 0.0],
+            10,
+            0.5,
+            "project",
+            Some("current-session"),
+            |_| HashMap::new(),
+        )
+        .await
+        .into_iter()
+        .map(|r| (r.memory_id.unwrap(), r.score))
+        .collect()
+    }
+
+    /// `n_vector` chunks that match by vector, and two that only the keyword
+    /// channel reaches.
+    async fn fill_engine(n_vector: usize) -> (Engine, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(crate::storage::Storage::open_memory().unwrap());
+        let mut search = crate::search::SearchEngine::new(8);
+        let fresh = chrono::Utc::now().to_rfc3339();
+        let mut rows: Vec<(String, String, [f32; 2])> = (0..n_vector)
+            .map(|i| {
+                (
+                    format!("vec-{i}"),
+                    format!("unrelated conceptual match {i}"),
+                    [1.0, 0.0],
+                )
+            })
+            .collect();
+        for i in 0..2 {
+            rows.push((
+                format!("kw-{i}"),
+                format!("implementation {i} of parse_widget_identifier"),
+                [0.4, 0.916_515_1],
+            ));
+        }
+        for (seq, (id, content, vec)) in rows.iter().enumerate() {
+            let chunk = crate::import::ConversationChunk {
+                id: id.clone(),
+                conversation_id: format!("conv-{id}"),
+                project_name: "project".into(),
+                timestamp: fresh.clone(),
+                content: content.clone(),
+                message_count: 1,
+                summary: None,
+                author: crate::provenance::Speaker::User,
+                seq,
+                is_sidechain: false,
+            };
+            storage.insert_chunk(&chunk, vec).unwrap();
+            storage
+                .insert_chunk_provenance(
+                    id,
+                    &crate::provenance::ChunkProvenance {
+                        author: crate::provenance::Speaker::User,
+                        source_conv_id: chunk.conversation_id.clone(),
+                        supersedes: None,
+                    },
+                )
+                .unwrap();
+            search.insert_chunk(chunk.id.clone(), vec.to_vec());
+        }
+        let engine = crate::engine::Engine::from_parts(
+            storage,
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(search)),
+            root.path().to_path_buf(),
+        );
+        (engine, root)
+    }
+
+    #[tokio::test]
+    async fn keyword_only_hits_fill_empty_slots_and_never_displace_vector_hits() {
+        use crate::search::hybrid::SearchMode;
+        // Three vector hits leave two slots: both keyword-only hits are kept.
+        let (engine, _root) = fill_engine(3).await;
+        let ids = hybrid_ids(&engine, SearchMode::Hybrid).await;
+        let kw = |ids: &[(String, f32)]| ids.iter().filter(|(i, _)| i.starts_with("kw-")).count();
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        assert_eq!(kw(&ids), 2, "{ids:?}");
+
+        // Five vector hits fill every slot: no keyword-only hit is added.
+        let (engine, _root) = fill_engine(5).await;
+        let ids = hybrid_ids(&engine, SearchMode::Hybrid).await;
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        assert_eq!(kw(&ids), 0, "{ids:?}");
+
+        // Four vector hits leave one slot: the better keyword hit is kept.
+        let (engine, _root) = fill_engine(4).await;
+        let ids = hybrid_ids(&engine, SearchMode::Hybrid).await;
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        assert_eq!(kw(&ids), 1, "{ids:?}");
+
+        // fts mode asked for keyword hits only: all of them stay.
+        let ids = hybrid_ids(&engine, SearchMode::Fts).await;
+        assert_eq!(kw(&ids), 2, "{ids:?}");
+        assert_eq!(ids.len(), 2, "{ids:?}");
+    }
+
+    #[tokio::test]
+    async fn hybrid_prompt_search_surfaces_a_keyword_hit_below_the_cosine_floor() {
+        use crate::search::hybrid::SearchMode;
+        let (engine, _root) = hybrid_engine().await;
+
+        let hybrid = hybrid_ids(&engine, SearchMode::Hybrid).await;
+        let names: Vec<&str> = hybrid.iter().map(|(id, _)| id.as_str()).collect();
+        // The keyword hit reaches the page; every filter still removes its own victim.
+        assert!(names.contains(&"sem-high"), "{names:?}");
+        assert!(names.contains(&"kw-ok"), "{names:?}");
+        for filtered in [
+            "kw-other-project",
+            "kw-self",
+            "kw-old",
+            "kw-csr",
+            "kw-unrelated",
+        ] {
+            assert!(!names.contains(&filtered), "{filtered} leaked: {names:?}");
+        }
+        // The vector hit keeps its cosine; the keyword-only hit carries the
+        // MCP path's decayed keyword score.
+        let score = |id: &str| hybrid.iter().find(|(i, _)| i == id).unwrap().1;
+        assert!((score("sem-high") - 1.0).abs() < 1e-4, "{hybrid:?}");
+        let keyword = score("kw-ok");
+        assert!(keyword > 0.40 && keyword <= 0.45, "{keyword}");
+
+        // Vector mode is the old behaviour; fts mode is keyword only.
+        let vector = hybrid_ids(&engine, SearchMode::Vector).await;
+        assert_eq!(vector.len(), 1);
+        assert_eq!(vector[0].0, "sem-high");
+        let fts = hybrid_ids(&engine, SearchMode::Fts).await;
+        assert_eq!(fts.len(), 1);
+        assert_eq!(fts[0].0, "kw-ok");
     }
 
     /// The detector reads the whole chunk, before the 300-byte preview is cut:
@@ -2587,11 +2955,18 @@ mod tests {
             std::sync::Arc::new(tokio::sync::RwLock::new(search)),
             root.path().to_path_buf(),
         );
-        let results =
-            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 5, 0.0, "project", None, |_| {
-                HashMap::new()
-            })
-            .await;
+        let results = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            5,
+            0.0,
+            "project",
+            None,
+            |_| HashMap::new(),
+        )
+        .await;
         let ids: Vec<_> = results
             .iter()
             .filter_map(|r| r.memory_id.as_deref())
@@ -2631,11 +3006,18 @@ mod tests {
             std::sync::Arc::new(tokio::sync::RwLock::new(search)),
             root.path().to_path_buf(),
         );
-        let results =
-            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 5, 0.0, "project", None, |_| {
-                HashMap::new()
-            })
-            .await;
+        let results = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            5,
+            0.0,
+            "project",
+            None,
+            |_| HashMap::new(),
+        )
+        .await;
         let ids: Vec<_> = results
             .iter()
             .filter_map(|r| r.memory_id.as_deref())
@@ -2760,6 +3142,8 @@ mod tests {
             async move {
                 let mut ids: Vec<String> = search_chunks_with_vec_core(
                     engine,
+                    "",
+                    crate::search::hybrid::SearchMode::Vector,
                     &[1.0, 0.0],
                     10,
                     0.0,
@@ -2828,18 +3212,27 @@ mod tests {
             root.path().to_path_buf(),
         );
         let seen = std::cell::RefCell::new(None);
-        let mut ids: Vec<String> =
-            search_chunks_with_vec_core(&engine, &[1.0, 0.0], 10, 0.0, project, None, |paths| {
+        let mut ids: Vec<String> = search_chunks_with_vec_core(
+            &engine,
+            "",
+            crate::search::hybrid::SearchMode::Vector,
+            &[1.0, 0.0],
+            10,
+            0.0,
+            project,
+            None,
+            |paths| {
                 *seen.borrow_mut() = Some(paths.clone());
                 widen
                     .iter()
                     .map(|(id, label)| (id.to_string(), HashSet::from([label.to_string()])))
                     .collect()
-            })
-            .await
-            .into_iter()
-            .filter_map(|result| result.memory_id)
-            .collect();
+            },
+        )
+        .await
+        .into_iter()
+        .filter_map(|result| result.memory_id)
+        .collect();
         ids.sort();
         (ids, seen.into_inner())
     }
@@ -2967,6 +3360,7 @@ mod tests {
         );
         let mut ids: Vec<String> = search_chunks_with_vec(
             &engine,
+            "",
             &[1.0, 0.0],
             10,
             0.0,

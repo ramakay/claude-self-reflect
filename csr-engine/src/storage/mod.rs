@@ -669,6 +669,24 @@ impl Storage {
         queries::fts5_search(&conn, query, limit, project)
     }
 
+    /// [`Self::fts5_search`] for a ready-made FTS5 match expression.
+    pub fn fts5_search_expr(
+        &self,
+        fts_query: &str,
+        limit: usize,
+        project: Option<&str>,
+    ) -> Result<Vec<(ConversationChunk, usize, f64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_search_expr(&conn, fts_query, limit, project)
+    }
+
+    /// Chunks containing `word`, counted up to `cap` (see
+    /// `queries::fts5_chunk_doc_count`).
+    pub fn fts5_chunk_doc_count(&self, word: &str, cap: usize) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::fts5_chunk_doc_count(&conn, word, cap)
+    }
+
     pub fn fts5_search_in_window(
         &self,
         query: &str,

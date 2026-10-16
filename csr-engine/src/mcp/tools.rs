@@ -807,30 +807,8 @@ pub(crate) enum RecallRerankMode<'a> {
     Candidate(&'a crate::search::trained_rerank::LinearModel),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SearchMode {
-    Hybrid,
-    Vector,
-    Fts,
-}
-
-impl SearchMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Hybrid => "hybrid",
-            Self::Vector => "vector",
-            Self::Fts => "fts",
-        }
-    }
-}
-
-pub fn search_mode_from(value: Option<&str>) -> SearchMode {
-    match value {
-        Some("vector") => SearchMode::Vector,
-        Some("fts") => SearchMode::Fts,
-        _ => SearchMode::Hybrid,
-    }
-}
+use crate::search::hybrid::{fuse_rrf, keyword_chunk_hits, RRF_K};
+pub use crate::search::hybrid::{search_mode_from, SearchMode};
 
 /// An out-of-family reflection keeps its fused rank under an explicit project
 /// filter when it is among the first K rows of the reflection keyword ranking.
@@ -885,27 +863,6 @@ fn sink_out_of_family_under_explicit_scope(
         .partition(|e| in_family(e) || strong(e));
     enriched.extend(keep);
     enriched.extend(sink);
-}
-
-fn fuse_rrf(semantic_order: &[String], fts_order: &[String], k: usize) -> Vec<String> {
-    let mut fused_order = Vec::with_capacity(semantic_order.len() + fts_order.len());
-    let mut scores: HashMap<String, f64> = HashMap::new();
-
-    for ranking in [semantic_order, fts_order] {
-        let mut seen = HashSet::new();
-        for (rank, id) in ranking.iter().enumerate() {
-            if !seen.insert(id.as_str()) {
-                continue;
-            }
-            if !scores.contains_key(id) {
-                fused_order.push(id.clone());
-            }
-            *scores.entry(id.clone()).or_default() += 1.0 / (k + rank) as f64;
-        }
-    }
-
-    fused_order.sort_by(|left, right| scores[right].total_cmp(&scores[left]));
-    fused_order
 }
 
 /// Move every id in `prefix_ids` that also appears in `order` to the front,
@@ -1682,29 +1639,13 @@ async fn reflect_gather_pass(
     // Hybrid always supplements semantic retrieval with FTS5. Vector mode
     // skips FTS entirely; FTS mode reaches this block with no semantic hits.
     if search_mode != SearchMode::Vector {
-        let fts_searches = if scope.effective_project.is_some() {
-            let mut projects: Vec<&str> =
-                scope.family_projects.iter().map(String::as_str).collect();
-            projects.sort_unstable();
-            projects
-                .into_iter()
-                .map(|project| storage.fts5_search(query, fetch, Some(project)))
-                .collect::<Vec<_>>()
-        } else {
-            vec![storage.fts5_search(query, fetch, None)]
-        };
-        let mut fts_hits = Vec::new();
-        let mut fts_window_full = false;
-        for hits in fts_searches.into_iter().flatten() {
-            fts_window_full |= hits.len() == fetch;
-            fts_hits.extend(hits);
-        }
-        fts_hits.sort_by(|left, right| {
-            left.2
-                .total_cmp(&right.2)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.0.id.cmp(&right.0.id))
-        });
+        let family: Option<Vec<&str>> = scope
+            .effective_project
+            .is_some()
+            .then(|| scope.family_projects.iter().map(String::as_str).collect());
+        let keyword = keyword_chunk_hits(storage, query, fetch, family);
+        let mut fts_window_full = keyword.window_full;
+        let fts_hits = keyword.hits;
         // Reflections have their own keyword index (`reflections_fts`). Merge
         // both families by bm25 into ONE keyword ranking, so a stored memory can
         // earn a keyword rank in the RRF fusion below instead of always arriving
@@ -2091,7 +2032,7 @@ async fn reflect_gather_pass(
     // while active forgetting may reorder only the demoted section by
     // accelerated decay in hybrid, vector, and FTS modes alike.
     let final_order = match search_mode {
-        SearchMode::Hybrid => fuse_rrf(&semantic_order, &fts_order, 60),
+        SearchMode::Hybrid => fuse_rrf(&semantic_order, &fts_order, RRF_K),
         SearchMode::Vector => order,
         SearchMode::Fts => fts_order,
     };
@@ -4341,15 +4282,22 @@ fn score_fts_candidate(
 ) -> (f32, bool) {
     let demoted = is_demote_channel(validity, &chunk.id);
     if demoted && !active_forgetting {
-        return (0.45, false);
+        return (crate::search::hybrid::FTS_ONLY_BASE_SCORE, false);
     }
     let Ok(timestamp) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() else {
-        return (if demoted { 0.45 } else { 0.40 }, false);
+        return (
+            if demoted {
+                crate::search::hybrid::FTS_ONLY_BASE_SCORE
+            } else {
+                crate::search::hybrid::FTS_ONLY_UNDATED_SCORE
+            },
+            false,
+        );
     };
     if demoted {
         return (
             decay::apply_decay_with_age_multiplier(
-                0.45,
+                crate::search::hybrid::FTS_ONLY_BASE_SCORE,
                 &timestamp,
                 now,
                 None,
@@ -4365,7 +4313,7 @@ fn score_fts_candidate(
     let ancestry_applied = timestamp < *now && releases_behind.is_some_and(|releases| releases > 0);
     (
         decay::apply_decay_with_release_ancestry(
-            0.45,
+            crate::search::hybrid::FTS_ONLY_BASE_SCORE,
             &timestamp,
             now,
             None,
