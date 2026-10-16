@@ -35,6 +35,34 @@
 //!
 //! Optional: CSR_HOOKRECALL_N (default 200), CSR_HOOKRECALL_SEED (default 7).
 //!
+//! # CSR_HOOKRECALL_CWD decides which stored chunks the hook may return
+//!
+//! The hook returns only chunks whose stored project label equals the label it
+//! derives from its cwd (`resolve_project_from_cwd`), plus chunks filed under a
+//! sub-folder label of the SAME git repository (`scope_folder`, which needs
+//! `git rev-parse --show-toplevel` to work in the cwd and in the decoded
+//! folder). Sampling `claude-self-reflect-csr-engine` while the cwd is
+//! `.../claude-self-reflect/csr-engine` therefore depends on the live
+//! checkout's git state: with `core.bare = true` in its `.git/config` (set
+//! 2026-10-14) every such chunk is dropped as "wrong project" and every arm
+//! scores 0.000. Point the cwd at a scratch directory whose last path
+//! component after a `projects` component is the sample label, for example
+//! `/tmp/csr-recall/<arm>/projects/claude-self-reflect-csr-engine`: the label
+//! then matches exactly and no git state is consulted. The run aborts when the
+//! labels differ and git cannot describe the cwd, and warns when it ends with
+//! no chunk item rendered.
+//!
+//! # The prompt is a slice of the chunk, past its opening
+//!
+//! The prompt replayed for a chunk is its text from character 120 on (cut at a
+//! word boundary, 400 characters), not its first 400 characters. The hook drops
+//! any item whose opening sits inside the prompt (`quoted_in_prompt`: pasted
+//! text is already in front of Claude), so a prompt cut from the chunk's start
+//! made the hook filter the very chunk being scored, and the whole run scored
+//! hit@5 0.000. Prompts that still quote their source are skipped and counted
+//! as `skipped_source_quoted`. Scores from before this change (v7 and earlier,
+//! first-400-chars prompts) are not comparable with scores after it.
+//!
 //! Optional replay-hardening knobs:
 //!
 //!   CSR_HOOKRECALL_SAMPLE_IDS      path to either a prior scores.ndjson (each
@@ -79,7 +107,9 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use csr_engine::engine::Engine;
 use csr_engine::extraction::provenance::is_csr_emission;
+use csr_engine::extraction::repo_root::git_place;
 use csr_engine::hooks::{prompt_submit, HookInput};
+use csr_engine::search::cross_project::resolve_project_from_cwd;
 use csr_engine::temporal::parse_timestamp;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
@@ -96,6 +126,20 @@ const SESSION_NAMESPACE: Uuid = Uuid::from_bytes([
 const SAMPLE_AGE_MAX_DAYS: f64 = 19.0;
 /// Mirrors the char budget used to derive a prompt from a chunk's content.
 const PROMPT_TRUNCATE_CHARS: usize = 400;
+/// Leading characters of the source chunk the prompt skips. The hook drops any
+/// item whose first 40 normalized characters sit inside the prompt
+/// (`prompt_submit::quoted_in_prompt`, cd92ab7b, 2026-10-10: a person who pastes
+/// an item has it in front of them, so handing it back is an echo). A prompt cut
+/// from the START of the source chunk therefore always quotes it, so the hook
+/// filtered the very chunk being scored and every arm scored hit@5 0.000.
+/// Cutting from further in keeps the prompt a verbatim slice of the source
+/// conversation without quoting its opening.
+const PROMPT_SKIP_CHARS: usize = 120;
+/// `prompt_submit::OPENING_KEY_CHARS` / `MIN_OPENING_KEY_CHARS`.
+const MIRROR_OPENING_KEY_CHARS: usize = 40;
+const MIRROR_MIN_OPENING_KEY_CHARS: usize = 24;
+/// `prompt_submit` formats a hit with `truncate_item(content, 300)`.
+const MIRROR_ITEM_CHARS: usize = 300;
 const CONTENT_LEN_MIN: i64 = 400;
 const CONTENT_LEN_MAX: i64 = 1500;
 const LIVE_DB_MARKER: &str = ".claude-self-reflect";
@@ -191,6 +235,68 @@ fn mirror_is_continuation_prompt(prompt: &str) -> bool {
     PHRASES
         .iter()
         .any(|ph| p == *ph || p.starts_with(&format!("{ph} ")))
+}
+
+/// Mirrors `hooks::prompt_submit::normalized_words`.
+fn mirror_normalized_words(text: &str) -> String {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Mirrors `hooks::prompt_submit::opening_key`.
+fn mirror_opening_key(content: &str) -> String {
+    const WRAPPER_LABELS: [&str; 3] = ["markdown ", "user request ", "search summary "];
+    let mut words = mirror_normalized_words(content);
+    while let Some(label) = WRAPPER_LABELS.iter().find(|l| words.starts_with(*l)) {
+        words.drain(..label.len());
+    }
+    words.chars().take(MIRROR_OPENING_KEY_CHARS).collect()
+}
+
+/// Mirrors `hooks::prompt_submit::quoted_in_prompt`, applied to the item the
+/// hook would render for `chunk_content` (its first 300 characters).
+fn mirror_quoted_in_prompt(chunk_content: &str, prompt: &str) -> bool {
+    let item: String = chunk_content.chars().take(MIRROR_ITEM_CHARS).collect();
+    let key = mirror_opening_key(&item);
+    key.len() >= MIRROR_MIN_OPENING_KEY_CHARS && mirror_normalized_words(prompt).contains(&key)
+}
+
+/// The prompt replayed for a chunk: a slice of its content that starts past the
+/// opening (see [`PROMPT_SKIP_CHARS`]), cut at a word boundary.
+fn derive_prompt(content: &str) -> String {
+    let rest: String = content.chars().skip(PROMPT_SKIP_CHARS).collect();
+    let rest = match rest.find(char::is_whitespace) {
+        Some(i) => &rest[i..],
+        None => "",
+    };
+    rest.trim_start()
+        .chars()
+        .take(PROMPT_TRUNCATE_CHARS)
+        .collect()
+}
+
+/// Why a replay could not reach its own corpus, or `None` when it can. The hook
+/// serves a chunk when its label equals `hook_project`, or when the folder rule
+/// widens it, which needs git to describe the cwd (`git_describes_cwd`).
+fn scope_problem(
+    hook_project: &str,
+    sample_project: Option<&str>,
+    git_describes_cwd: bool,
+) -> Option<String> {
+    let sample = sample_project?;
+    if hook_project == sample || git_describes_cwd {
+        return None;
+    }
+    Some(format!(
+        "the hook derives project {hook_project:?} from CSR_HOOKRECALL_CWD but the sample is \
+         {sample:?}, and git cannot describe that directory (bare repository, no work tree, \
+         or not a repository), so the folder rule widens nothing and the hook would drop \
+         every sampled chunk as 'wrong project': every arm would score 0.000. Use a cwd \
+         whose label is exactly {sample:?}, e.g. <arm>/projects/{sample}"
+    ))
 }
 
 // ─── Config ───
@@ -471,6 +577,9 @@ struct SkipCounters {
     skipped_continuation: u64,
     skipped_slash: u64,
     skipped_short: u64,
+    /// The derived prompt still quotes its own source chunk's opening, so the
+    /// hook would filter the scored chunk as an echo.
+    skipped_source_quoted: u64,
 }
 
 impl SkipCounters {
@@ -481,6 +590,7 @@ impl SkipCounters {
             + self.skipped_continuation
             + self.skipped_slash
             + self.skipped_short
+            + self.skipped_source_quoted
     }
 }
 
@@ -526,7 +636,7 @@ fn pool_filter_candidate(
 /// The mirrored `early_exit` predicates, shared by the seeded sampler and
 /// explicit-ids replay.
 fn accept_pool_item(item: PoolItem, counters: &mut SkipCounters) -> Option<SampleItem> {
-    let prompt: String = item.content.chars().take(PROMPT_TRUNCATE_CHARS).collect();
+    let prompt = derive_prompt(&item.content);
     if mirror_is_harness_turn(&prompt) {
         counters.skipped_harness_turn_early_exit += 1;
         return None;
@@ -541,6 +651,10 @@ fn accept_pool_item(item: PoolItem, counters: &mut SkipCounters) -> Option<Sampl
     }
     if prompt.trim().len() < 3 {
         counters.skipped_short += 1;
+        return None;
+    }
+    if mirror_quoted_in_prompt(&item.content, &prompt) {
+        counters.skipped_source_quoted += 1;
         return None;
     }
     Some(SampleItem {
@@ -768,6 +882,7 @@ struct SamplingFilters {
     cwd: String,
     projects_dir: String,
     prompt_truncate_chars: usize,
+    prompt_skip_chars: usize,
     now: String,
 }
 
@@ -790,6 +905,7 @@ struct SummaryBody {
     skipped_short: u64,
     skipped_slash: u64,
     skipped_continuation: u64,
+    skipped_source_quoted: u64,
     excluded_age_window: u64,
     exposure_rows_missing_sessions: usize,
     hit_at_1: f64,
@@ -799,6 +915,8 @@ struct SummaryBody {
     rendered_rate: f64,
     exposed_project_totals: BTreeMap<String, i64>,
     source_project_items_exposed: i64,
+    hook_project: String,
+    chunk_items_exposed: i64,
     sampling_filters: SamplingFilters,
     retrieved_set_semantics: String,
     mirrored_predicates: Vec<String>,
@@ -925,6 +1043,7 @@ fn mirrored_predicates_list() -> Vec<String> {
         "hooks::prompt_submit::is_self_referential_noise's private NOISE_PATTERNS list (extraction::provenance::is_csr_emission is pub and called directly, not mirrored)".to_string(),
         "hooks::prompt_submit::is_continuation_prompt".to_string(),
         "hooks::prompt_submit::early_exit's slash-command and bare-acknowledgment (trim().len() < 3) guards".to_string(),
+        "hooks::prompt_submit::quoted_in_prompt (+ opening_key / normalized_words), applied to the source chunk and the derived prompt".to_string(),
     ]
 }
 
@@ -979,6 +1098,17 @@ async fn run(config: Config) -> Result<(), String> {
         (raw, conversation_ids)
     };
     drop(sample_conn);
+
+    let hook_project = resolve_project_from_cwd(&config.cwd.to_string_lossy()).unwrap_or_default();
+    let git_ok = git_place(
+        &config.cwd,
+        Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .is_some();
+    if let Some(problem) = scope_problem(&hook_project, config.sample_project.as_deref(), git_ok) {
+        return Err(problem);
+    }
+    eprintln!("hook_recall_replay: hook project {hook_project:?} (git describes cwd: {git_ok})");
 
     let mut counters = SkipCounters::default();
     let sample = if config.sample_ids_path.is_some() {
@@ -1084,6 +1214,7 @@ async fn run(config: Config) -> Result<(), String> {
     let mut rendered_count = 0usize;
     let mut exposed_project_totals: BTreeMap<String, i64> = BTreeMap::new();
     let mut source_project_items_exposed: i64 = 0;
+    let mut chunk_items_exposed: i64 = 0;
 
     for (item, sid) in &sessions {
         let retrieved = readback_retrieved(&readback_conn, sid)?;
@@ -1132,6 +1263,10 @@ async fn run(config: Config) -> Result<(), String> {
             }
         }
 
+        chunk_items_exposed += retrieved
+            .iter()
+            .filter(|r| r.source_type == "chunk")
+            .count() as i64;
         let exposure: Vec<(i64, String, String)> = retrieved
             .iter()
             .map(|r| (r.rank, r.memory_id.clone(), r.source_type.clone()))
@@ -1202,6 +1337,7 @@ async fn run(config: Config) -> Result<(), String> {
         cwd: cwd_string.clone(),
         projects_dir: config.projects_dir.to_string_lossy().to_string(),
         prompt_truncate_chars: PROMPT_TRUNCATE_CHARS,
+        prompt_skip_chars: PROMPT_SKIP_CHARS,
         now: config.now_raw.clone(),
     };
 
@@ -1215,6 +1351,7 @@ async fn run(config: Config) -> Result<(), String> {
         skipped_short: counters.skipped_short,
         skipped_slash: counters.skipped_slash,
         skipped_continuation: counters.skipped_continuation,
+        skipped_source_quoted: counters.skipped_source_quoted,
         excluded_age_window: counters.excluded_age_window,
         exposure_rows_missing_sessions,
         hit_at_1,
@@ -1224,6 +1361,8 @@ async fn run(config: Config) -> Result<(), String> {
         rendered_rate,
         exposed_project_totals,
         source_project_items_exposed,
+        hook_project: hook_project.clone(),
+        chunk_items_exposed,
         sampling_filters,
         retrieved_set_semantics: "rerank_exposure_items holds the preface + RENDERED items the \
             hook actually wrote (post scored.iter().take(5), post dedup, post noise filter, \
@@ -1289,6 +1428,93 @@ async fn run(config: Config) -> Result<(), String> {
          hit@1={hit_at_1:.3} hit@5={hit_at_5:.3} hit@15={hit_at_15:.3} mrr={mrr:.3} rendered_rate={rendered_rate:.3}",
         out.body.n_skipped
     );
+    eprintln!(
+        "hook_recall_replay: hook_project={hook_project:?} chunk_items_exposed={chunk_items_exposed} \
+         empty_prompts={exposure_rows_missing_sessions}"
+    );
+    if chunk_items_exposed == 0 {
+        eprintln!(
+            "hook_recall_replay: WARNING no chunk item was rendered for any prompt; the hook \
+             cannot reach the sampled corpus from this cwd, so these scores do not discriminate"
+        );
+    }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(n_words: usize) -> String {
+        (0..n_words)
+            .map(|i| format!("word{i}x"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn a_prompt_cut_from_the_chunk_start_quotes_its_source() {
+        let content = chunk(120);
+        let old_prompt: String = content.chars().take(PROMPT_TRUNCATE_CHARS).collect();
+        assert!(mirror_quoted_in_prompt(&content, &old_prompt));
+    }
+
+    #[test]
+    fn the_derived_prompt_does_not_quote_its_source_and_is_a_slice_of_it() {
+        let content = chunk(120);
+        let prompt = derive_prompt(&content);
+        assert!(!prompt.is_empty());
+        assert!(content.contains(&prompt));
+        assert!(!mirror_quoted_in_prompt(&content, &prompt));
+        assert!(prompt.chars().count() <= PROMPT_TRUNCATE_CHARS);
+        assert!(!prompt.starts_with(char::is_whitespace));
+        // Cut at a word boundary: the prompt starts at the start of a word.
+        let at = content.find(&prompt).unwrap();
+        assert!(content[..at].ends_with(' '));
+    }
+
+    #[test]
+    fn a_chunk_that_repeats_its_opening_later_is_skipped_not_scored() {
+        let opening = "the quick brown fox jumps over the lazy dog and keeps on running";
+        let content = format!("{opening} {} {opening} tail", "padding ".repeat(30));
+        let mut counters = SkipCounters::default();
+        let item = PoolItem {
+            id: "c".into(),
+            conversation_id: "v".into(),
+            content,
+        };
+        assert!(accept_pool_item(item, &mut counters).is_none());
+        assert_eq!(counters.skipped_source_quoted, 1);
+        assert_eq!(counters.n_skipped(), 1);
+    }
+
+    #[test]
+    fn a_label_mismatch_with_no_git_view_of_the_cwd_is_refused() {
+        let sub = "claude-self-reflect-csr-engine";
+        // Hook derives the repo label, the sample sits under a sub-folder label,
+        // and git cannot describe the cwd (bare repository): refused.
+        let problem = scope_problem("claude-self-reflect", Some(sub), false).unwrap();
+        assert!(problem.contains(sub) && problem.contains("0.000"));
+        // Exact label: no widening needed, git state is irrelevant.
+        assert!(scope_problem(sub, Some(sub), false).is_none());
+        // Mismatch but git works: the folder rule can widen.
+        assert!(scope_problem("claude-self-reflect", Some(sub), true).is_none());
+        // Explicit ids with no project: nothing to compare.
+        assert!(scope_problem("x", None, false).is_none());
+    }
+
+    #[test]
+    fn a_scratch_cwd_named_for_the_sample_label_resolves_to_it() {
+        let cwd = "/tmp/csr-recall/arm/projects/claude-self-reflect-csr-engine";
+        assert_eq!(
+            resolve_project_from_cwd(cwd).as_deref(),
+            Some("claude-self-reflect-csr-engine")
+        );
+    }
+
+    #[test]
+    fn a_chunk_shorter_than_the_skip_yields_no_prompt() {
+        assert_eq!(derive_prompt("short"), "");
+    }
 }
