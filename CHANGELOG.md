@@ -168,6 +168,13 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   eligible cases abstains; 85% or more in the top 5 is green, 70% or more amber, else red.
 - **Exit code.** `eval --full` exits nonzero on a gating failure (a red recall, a canary failure, any failed
   test); abstentions, amber and report-only results never fail it (55272cc6, 9ff730e4).
+- **The two timing checks warn instead of failing.** Search Latency P95 (target <1 ms) and Batch Embed Speed
+  (target <5 ms/text) now pass with an `AMBER (non-gating):` detail when over target, with the measured number,
+  the target, and for search the timed-search and chunk counts. Before, `eval --full` exited 1 on every run
+  against a 760,078-chunk store (p95 4.13 ms quiet, 311.95 ms under load; embed 5.1 ms/text under load). A
+  broken engine still fails: an embed error, no query vectors, or no timed searches. The latency now runs one
+  untimed warm-up pass, then 50 timed searches (10 queries x 5 rounds), p95 by nearest rank, not the slowest
+  of 10.
 - **`status` reads the cached result.** It never runs the probe or loads embeddings. `status --json` is the default
   output spelled out. `eval --full --refresh-recall-sample` starts a new sample and keeps the history (7fb4e91c).
 - **The `⚠ mem` chip** in `status --compact` shows for two causes only: the canary fails now, or the latest

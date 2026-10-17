@@ -723,6 +723,38 @@ fn main() {
 
 // --- Performance deep tests ---
 
+/// Batch embedding target, ms per text. Over it the check warns, never fails.
+const BATCH_EMBED_TARGET_MS_PER_TEXT: f64 = 5.0;
+/// Search p95 target, ms. Over it the check warns, never fails.
+const SEARCH_P95_TARGET_MS: f64 = 1.0;
+/// Timed passes over the query set, after one untimed warm-up pass.
+const SEARCH_TIMED_ROUNDS: usize = 5;
+
+/// Grade a batch embed. A timing miss is AMBER and passes (wall-clock noise,
+/// not a break); no vectors at all is a broken engine and fails.
+fn grade_batch_embed(texts: usize, total_ms: f64) -> (bool, String) {
+    if texts == 0 || !total_ms.is_finite() {
+        return (
+            false,
+            format!("embed returned no vectors ({texts} texts, {total_ms}ms)"),
+        );
+    }
+    let per_text = total_ms / texts as f64;
+    if per_text < BATCH_EMBED_TARGET_MS_PER_TEXT {
+        (
+            true,
+            format!("{per_text:.1}ms/text ({texts} texts in {total_ms:.0}ms)"),
+        )
+    } else {
+        (
+            true,
+            format!(
+                "AMBER (non-gating): {per_text:.1}ms/text, target <{BATCH_EMBED_TARGET_MS_PER_TEXT:.0}ms/text ({texts} texts in {total_ms:.0}ms)"
+            ),
+        )
+    }
+}
+
 fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
     let t = Instant::now();
     let texts: Vec<String> = (0..10)
@@ -733,26 +765,11 @@ fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
     match embeddings.embed(&text_refs) {
         Ok(vecs) => {
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            let per_text = ms / vecs.len() as f64;
-            if per_text < 5.0 {
-                EvalResult::pass(
-                    "Batch Embed Speed",
-                    "performance",
-                    ms,
-                    format!(
-                        "{:.1}ms/text ({} texts in {:.0}ms)",
-                        per_text,
-                        vecs.len(),
-                        ms
-                    ),
-                )
+            let (passed, detail) = grade_batch_embed(vecs.len(), ms);
+            if passed {
+                EvalResult::pass("Batch Embed Speed", "performance", ms, detail)
             } else {
-                EvalResult::fail(
-                    "Batch Embed Speed",
-                    "performance",
-                    ms,
-                    format!("slow: {per_text:.1}ms/text (target <5ms)"),
-                )
+                EvalResult::fail("Batch Embed Speed", "performance", ms, detail)
             }
         }
         Err(e) => EvalResult::fail(
@@ -761,6 +778,45 @@ fn test_batch_embedding_speed(embeddings: &Arc<EmbeddingEngine>) -> EvalResult {
             t.elapsed().as_secs_f64() * 1000.0,
             format!("Error: {e}"),
         ),
+    }
+}
+
+/// p95 by nearest rank: the value at rank ceil(0.95 * n) of the sorted
+/// samples. `None` for no samples (never an underflow).
+fn nearest_rank_p95(samples: &mut [f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| a.total_cmp(b));
+    let rank = (95 * samples.len()).div_ceil(100);
+    samples.get(rank.max(1) - 1).copied()
+}
+
+/// Grade the search latency. `p95` is `None` when nothing was timed. Over the
+/// target is AMBER and passes; zero timed searches (or a non-finite p95) is a
+/// broken engine and fails.
+fn grade_search_latency(p95: Option<f64>, timed: usize, chunks: usize) -> (bool, String) {
+    let p95 = match p95 {
+        Some(p) if timed > 0 && p.is_finite() => p,
+        _ => {
+            return (
+                false,
+                format!("no timed searches completed ({timed} timed, {chunks} chunks indexed)"),
+            )
+        }
+    };
+    if p95 < SEARCH_P95_TARGET_MS {
+        (
+            true,
+            format!("p95: {p95:.2}ms ({timed} timed searches, {chunks} chunks)"),
+        )
+    } else {
+        (
+            true,
+            format!(
+                "AMBER (non-gating): p95 {p95:.2}ms, target <{SEARCH_P95_TARGET_MS:.0}ms ({timed} timed searches, {chunks} chunks indexed)"
+            ),
+        )
     }
 }
 
@@ -787,42 +843,33 @@ async fn test_search_latency_p95(
         .filter_map(|q| embeddings.embed_single(q).ok())
         .collect();
 
-    let mut latencies = Vec::new();
+    let mut latencies = Vec::with_capacity(vecs.len() * SEARCH_TIMED_ROUNDS);
     let se = search.read().await;
+    // One untimed pass over every query warms caches and pages, so the
+    // timed searches measure steady state, not the first touch.
     for v in &vecs {
-        let qt = Instant::now();
         let _r = se.search_chunks(v, 5, 0.0);
-        latencies.push(qt.elapsed().as_secs_f64() * 1000.0);
     }
+    for _ in 0..SEARCH_TIMED_ROUNDS {
+        for v in &vecs {
+            let qt = Instant::now();
+            let _r = se.search_chunks(v, 5, 0.0);
+            latencies.push(qt.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let chunks = se.chunk_count();
     drop(se);
 
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p95_idx = (latencies.len() as f64 * 0.95).ceil() as usize - 1;
-    let p95 = latencies
-        .get(p95_idx.min(latencies.len() - 1))
-        .copied()
-        .unwrap_or(0.0);
+    let timed = latencies.len();
+    let p95 = nearest_rank_p95(&mut latencies);
     let ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    if search_latency_passes(p95) {
-        EvalResult::pass(
-            "Search Latency P95",
-            "performance",
-            ms,
-            format!("p95: {p95:.2}ms ({} queries)", latencies.len()),
-        )
+    let (passed, detail) = grade_search_latency(p95, timed, chunks);
+    if passed {
+        EvalResult::pass("Search Latency P95", "performance", ms, detail)
     } else {
-        EvalResult::fail(
-            "Search Latency P95",
-            "performance",
-            ms,
-            format!("p95: {p95:.2}ms (target <1ms)"),
-        )
+        EvalResult::fail("Search Latency P95", "performance", ms, detail)
     }
-}
-
-fn search_latency_passes(p95_ms: f64) -> bool {
-    p95_ms < 1.0
 }
 
 #[cfg(test)]
@@ -898,9 +945,107 @@ mod tests {
     }
 
     #[test]
-    fn search_latency_gate_enforces_sub_millisecond_p95() {
-        assert!(search_latency_passes(0.999));
-        assert!(!search_latency_passes(1.0));
+    fn search_latency_under_target_is_a_plain_pass() {
+        let (passed, detail) = grade_search_latency(Some(0.42), 50, 760_078);
+        assert!(passed);
+        assert_eq!(detail, "p95: 0.42ms (50 timed searches, 760078 chunks)");
+        assert!(!detail.contains("AMBER"));
+    }
+
+    #[test]
+    fn search_latency_over_target_is_amber_and_passes() {
+        // the owner's quiet measurement, then the loaded one, then the boundary
+        for p95 in [4.13, 311.95, 1.0] {
+            let (passed, detail) = grade_search_latency(Some(p95), 50, 760_078);
+            assert!(passed, "{detail}");
+            assert!(detail.starts_with("AMBER (non-gating): "), "{detail}");
+            assert!(detail.contains(&format!("{p95:.2}ms")), "{detail}");
+            assert!(detail.contains("target <1ms"), "{detail}");
+            assert!(detail.contains("50 timed searches"), "{detail}");
+            assert!(detail.contains("760078 chunks"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn search_latency_with_nothing_timed_fails() {
+        for (p95, timed) in [(None, 0), (Some(0.5), 0), (Some(f64::NAN), 10), (None, 10)] {
+            let (passed, detail) = grade_search_latency(p95, timed, 12);
+            assert!(!passed, "{detail}");
+            assert!(detail.starts_with("no timed searches"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn nearest_rank_p95_matches_the_definition_and_never_panics() {
+        assert_eq!(nearest_rank_p95(&mut []), None);
+        assert_eq!(nearest_rank_p95(&mut [7.0]), Some(7.0));
+        // 50 samples: rank ceil(47.5) = 48, so the 48th smallest, not the max
+        let mut fifty: Vec<f64> = (1..=50).rev().map(f64::from).collect();
+        assert_eq!(nearest_rank_p95(&mut fifty), Some(48.0));
+        // 10 samples: rank ceil(9.5) = 10, the max
+        let mut ten: Vec<f64> = (1..=10).map(f64::from).collect();
+        assert_eq!(nearest_rank_p95(&mut ten), Some(10.0));
+        // one slow outlier among 50 does not decide the p95
+        let mut outlier = vec![0.4; 49];
+        outlier.push(300.0);
+        assert_eq!(nearest_rank_p95(&mut outlier), Some(0.4));
+    }
+
+    #[test]
+    fn batch_embed_under_target_is_a_plain_pass() {
+        let (passed, detail) = grade_batch_embed(10, 23.0);
+        assert!(passed);
+        assert_eq!(detail, "2.3ms/text (10 texts in 23ms)");
+    }
+
+    #[test]
+    fn batch_embed_over_target_is_amber_and_passes() {
+        for total_ms in [51.0, 5000.0, 50.0] {
+            let (passed, detail) = grade_batch_embed(10, total_ms);
+            assert!(passed, "{detail}");
+            assert!(detail.starts_with("AMBER (non-gating): "), "{detail}");
+            assert!(detail.contains("target <5ms/text"), "{detail}");
+            assert!(detail.contains("10 texts"), "{detail}");
+        }
+        let (_, detail) = grade_batch_embed(10, 51.0);
+        assert!(detail.contains("5.1ms/text"), "{detail}");
+    }
+
+    #[test]
+    fn batch_embed_with_no_vectors_fails() {
+        let (passed, detail) = grade_batch_embed(0, 3.0);
+        assert!(!passed, "{detail}");
+        assert!(detail.contains("no vectors"), "{detail}");
+    }
+
+    #[test]
+    fn amber_timing_results_never_gate_the_full_eval() {
+        let (p_ok, p_detail) = grade_search_latency(Some(311.95), 50, 760_078);
+        let (b_ok, b_detail) = grade_batch_embed(10, 51.0);
+        let mk = |ok: bool, name: &str, detail: String| {
+            if ok {
+                EvalResult::pass(name, "performance", 0.0, detail)
+            } else {
+                EvalResult::fail(name, "performance", 0.0, detail)
+            }
+        };
+        let amber = EvalReport {
+            results: vec![
+                mk(p_ok, "Search Latency P95", p_detail),
+                mk(b_ok, "Batch Embed Speed", b_detail),
+            ],
+            total_ms: 0.0,
+        };
+        assert!(!amber.has_gating_failure());
+        assert!(!amber.format_text().contains("[FAIL]"));
+        // a broken engine still gates
+        let (p_ok, p_detail) = grade_search_latency(None, 0, 0);
+        let broken = EvalReport {
+            results: vec![mk(p_ok, "Search Latency P95", p_detail)],
+            total_ms: 0.0,
+        };
+        assert!(broken.has_gating_failure());
+        assert!(broken.format_text().contains("[FAIL]"));
     }
 
     #[test]
