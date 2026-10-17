@@ -113,8 +113,11 @@ impl Storage {
     /// Negative dream verdicts recorded inside `[window_start, window_end]` for
     /// `project`, grouped by receipt commit, counting distinct witnesses. A group
     /// counts only when its commit date is inside the window as well: a long
-    /// session otherwise sweeps in old backfill commits. Empty unless
-    /// `CSR_DREAM_CONSUMPTION=full`, without touching `witness_verdicts`.
+    /// session otherwise sweeps in old backfill commits. On by default
+    /// (`annotate`): the clause carries counts and commits, never a retired
+    /// claim, so the recap's full-only gate for named retirements does not
+    /// apply. Empty under `CSR_DREAM_CONSUMPTION=off`, without touching
+    /// `witness_verdicts`.
     pub fn learnt_verdicts(
         &self,
         project: &str,
@@ -122,7 +125,7 @@ impl Storage {
         window_end: &str,
         mode: ConsumptionMode,
     ) -> Result<Vec<VerdictGroup>> {
-        if mode != ConsumptionMode::Full {
+        if mode == ConsumptionMode::Off {
             return Ok(Vec::new());
         }
         self.with_connection(|conn| {
@@ -196,7 +199,7 @@ impl Storage {
             }
             Err(error) => tracing::debug!(%error, "learnt confirmed-verdict feed unavailable"),
         }
-        if mode == ConsumptionMode::Full {
+        if mode != ConsumptionMode::Off {
             match self.learnt_session_start(session_id) {
                 Ok(Some(start)) => match self.learnt_verdicts(project, &start, window_end, mode) {
                     Ok(groups) => feeds.verdicts = groups,
@@ -427,12 +430,19 @@ mod tests {
             Some(in_window),
         );
 
-        for mode in [ConsumptionMode::Off, ConsumptionMode::AnnotateOnly] {
-            assert!(s.learnt_verdicts("p", start, end, mode).unwrap().is_empty());
-        }
+        assert!(s
+            .learnt_verdicts("p", start, end, ConsumptionMode::Off)
+            .unwrap()
+            .is_empty());
+        // Counts only, so on by default: annotate and full agree.
         let groups = s
-            .learnt_verdicts("p", start, end, ConsumptionMode::Full)
+            .learnt_verdicts("p", start, end, ConsumptionMode::AnnotateOnly)
             .unwrap();
+        assert_eq!(
+            groups,
+            s.learnt_verdicts("p", start, end, ConsumptionMode::Full)
+                .unwrap()
+        );
         assert_eq!(
             groups,
             [
@@ -451,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn feeds_wrapper_needs_a_registered_session_window_and_the_full_gate() {
+    fn feeds_wrapper_needs_a_registered_session_window_and_dreams_not_off() {
         let s = Storage::open_memory().unwrap();
         seed_note(&s, "/a", "a-note", "sess-1", Some("2026-10-16T09:00:00Z"));
         let in_window = "2026-10-13T08:00:00Z";
@@ -475,6 +485,8 @@ mod tests {
         let feeds = s.learnt_feeds("p", "sess-1", end, ConsumptionMode::Full);
         assert_eq!(feeds.verdicts.len(), 1);
         let feeds = s.learnt_feeds("p", "sess-1", end, ConsumptionMode::AnnotateOnly);
+        assert_eq!(feeds.verdicts.len(), 1);
+        let feeds = s.learnt_feeds("p", "sess-1", end, ConsumptionMode::Off);
         assert!(feeds.verdicts.is_empty());
         assert_eq!(feeds.notes_total, 1);
     }

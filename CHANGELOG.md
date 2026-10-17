@@ -18,8 +18,8 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
 ### Learnt line
 
 - **A separate `learnt [<age>]: ... [[CSR:LEARNT]]` line at SessionStart** (`startup`, `resume`) names what CSR stored for
-  the previous session: memory notes by session id, user-confirmed `csr_resolve` verdicts, and, under
-  `CSR_DREAM_CONSUMPTION=full`, anchors retired by a commit inside the session window. At most 320 bytes, a receipt
+  the previous session: memory notes by session id, user-confirmed `csr_resolve` verdicts, and anchors
+  retired by a commit inside the session window (counts only, on by default, off with `CSR_DREAM_CONSUMPTION=off`). At most 320 bytes, a receipt
   on every clause, no line when there is no evidence, `CSR_NO_LEARNT=1` turns it off. Re-import is blocked by a new
   machine sentinel and an import-scrub formatter. On `resume` a bounded scan of sibling transcripts for the
   `continued-in` row puts the resumed session's episode first, for the recap as well as the learnt line.

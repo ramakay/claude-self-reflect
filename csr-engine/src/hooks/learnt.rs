@@ -51,7 +51,7 @@ pub struct LearntFeeds {
     pub notes_total: usize,
     /// `YYYY-MM-DD` of the newest note.
     pub notes_date: Option<String>,
-    /// Count-descending; only populated under `CSR_DREAM_CONSUMPTION=full`.
+    /// Count-descending; empty under `CSR_DREAM_CONSUMPTION=off`.
     pub verdicts: Vec<VerdictGroup>,
 }
 
