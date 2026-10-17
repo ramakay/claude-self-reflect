@@ -2744,12 +2744,25 @@ mod session_start_learnt {
             run.stdout
         );
 
-        // A `startup` never uses lineage, even with the row present.
-        let startup = f.run("startup", "eeee5555-0000-0000-0000-other0000000", &[]);
+        // A `startup` never uses lineage, even with the row present. Use the
+        // very sid the `continued-in` row names: lineage would match it, so only
+        // the `source == "resume"` gate keeps the concurrent episode in front.
+        let startup = f.run("startup", NEW_SID, &[]);
+        assert!(startup.success);
+        let recap = recap_line(&startup.stdout);
         assert!(
-            recap_line(&startup.stdout).contains("Tune the search ranker"),
+            recap.contains("Tune the search ranker"),
             "{}",
             startup.stdout
         );
+        assert!(
+            !recap.contains("Refactor the billing exporter"),
+            "{}",
+            startup.stdout
+        );
+        let lines = learnt_lines(&startup.stdout);
+        assert_eq!(lines.len(), 1, "{}", startup.stdout);
+        assert!(lines[0].contains("(cccc3333, "), "{}", lines[0]);
+        assert!(!lines[0].contains("(aaaa1111, "), "{}", lines[0]);
     }
 }

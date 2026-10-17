@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn verdicts_are_full_gated_project_scoped_aggregated_and_commit_dated_in_window() {
+    fn verdicts_hide_only_when_off_and_are_project_scoped_aggregated_and_commit_dated_in_window() {
         let s = Storage::open_memory().unwrap();
         let (start, end) = ("2026-10-08T22:33:09+00:00", "2026-10-15T04:20:30+00:00");
         let in_window = "2026-10-13T08:00:00-07:00";

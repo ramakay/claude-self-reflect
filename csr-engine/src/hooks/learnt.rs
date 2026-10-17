@@ -484,6 +484,66 @@ mod tests {
         assert_eq!(compose_learnt(&feeds, "1h ago", "6ca2a4d5", ""), None);
     }
 
+    /// `n` distinct CJK chars (3 bytes each), seeded so slugs differ.
+    fn cjk(seed: u32, n: u32) -> String {
+        (0..n)
+            .map(|i| char::from_u32(0x4E00 + seed * 100 + i).unwrap())
+            .collect()
+    }
+
+    fn assert_one_line_within_byte_budget(line: &str) {
+        assert!(line.len() <= LEARNT_MAX_BYTES, "{} bytes", line.len());
+        assert_eq!(line.lines().count(), 1, "{line}");
+        assert!(!line.contains('\n') && !line.contains('\r'));
+        assert!(line.ends_with(LEARNT_SENTINEL), "{line}");
+        assert_eq!(line.matches(LEARNT_SENTINEL).count(), 1);
+    }
+
+    #[test]
+    fn the_cap_counts_bytes_not_chars_when_whole_clauses_are_dropped() {
+        // A 60-char CJK claim plus three 25-char slugs: every clause together is
+        // well under 320 chars but about 500 bytes.
+        let feeds = LearntFeeds {
+            confirmed: vec![ConfirmedItem {
+                claim: cjk(0, 60),
+                status: "resolved".into(),
+                receipt: "abc1234".into(),
+            }],
+            confirmed_total: 1,
+            notes: (1..=3).map(|i| cjk(i, 25)).collect(),
+            notes_total: 3,
+            notes_date: Some("2026-10-16".into()),
+            ..Default::default()
+        };
+        let line = compose_learnt(&feeds, "yesterday", "6ca2a4d5", "").unwrap();
+        // The scenario is real: the multi-byte claim is in the line.
+        assert!(line.contains(&cjk(0, 60)), "{line}");
+        assert!(line.len() > line.chars().count());
+        assert_one_line_within_byte_budget(&line);
+        // The notes clause (tail) was dropped to fit the bytes.
+        assert!(!line.contains("memory notes"), "{line}");
+    }
+
+    #[test]
+    fn the_cap_counts_bytes_not_chars_when_the_first_clause_is_shortened() {
+        // Three slugs of 20 emoji + 20 CJK (140 bytes, 40 chars each): the full
+        // notes clause is ~150 chars but over 450 bytes.
+        let slug = |seed: u32| format!("{}{}", "🧠".repeat(20), cjk(seed, 20));
+        let feeds = LearntFeeds {
+            notes: (1..=3).map(slug).collect(),
+            notes_total: 3,
+            notes_date: Some("2026-10-16".into()),
+            ..Default::default()
+        };
+        let line = compose_learnt(&feeds, "yesterday", "6ca2a4d5", "").unwrap();
+        assert!(line.contains(&slug(1)), "{line}");
+        assert!(line.len() > line.chars().count());
+        assert_one_line_within_byte_budget(&line);
+        // Shortened, not cut mid-clause: fewer slugs, and "+K more" says so.
+        assert!(!line.contains(&slug(3)), "{line}");
+        assert!(line.contains(" more ("), "{line}");
+    }
+
     #[test]
     fn db_text_cannot_add_a_line() {
         let feeds = LearntFeeds {

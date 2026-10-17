@@ -219,6 +219,28 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_named_jsonl_is_never_followed_and_a_non_file_is_skipped() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = write(outside.path(), "real.log", &row("old-1", "new-1"));
+        let dir = tempfile::tempdir().unwrap();
+        // Control: the same row in a regular file inside the dir is found.
+        let control = tempfile::tempdir().unwrap();
+        write(control.path(), "x.jsonl", &row("old-1", "new-1"));
+        assert_eq!(
+            resume_predecessor(control.path(), "new-1").as_deref(),
+            Some("old-1")
+        );
+        // A symlink `x.jsonl` to a file outside the dir holding a matching row.
+        std::os::unix::fs::symlink(&target, dir.path().join("x.jsonl")).unwrap();
+        assert_eq!(resume_predecessor(dir.path(), "new-1"), None);
+        // A directory named `*.jsonl` is not a file either.
+        let dirs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dirs.path().join("d.jsonl")).unwrap();
+        assert_eq!(resume_predecessor(dirs.path(), "new-1"), None);
+    }
+
     #[test]
     fn at_most_64_files_are_opened_newest_first() {
         let dir = tempfile::tempdir().unwrap();
