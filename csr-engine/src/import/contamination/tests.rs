@@ -75,6 +75,7 @@ fn registry_ids_are_unique_and_every_appendix_b_formatter_is_registered() {
         "recap",
         "dream_injection",
         "lessons",
+        "learnt",
         "memory_manifest",
         "briefing",
         "continuity",
@@ -372,6 +373,37 @@ fn zero_width_noise_helps_match_the_sentinel_inside_a_valid_line_only() {
     assert_eq!(reasons(dream), [ContaminationReason::DreamInjection]);
     assert_unlabeled("[[CSR:LESSONS]]\n");
     assert_unlabeled("[[CSR:LESSONS]]\nand then some prose");
+}
+
+const LEARNT: &str =
+    "learnt [yesterday]: 17 memory notes: a-note, +16 more (6ca2a4d5, 2026-10-16). [[CSR:LEARNT]]";
+
+#[test]
+fn learnt_line_is_labelled_and_stripped_and_quoting_it_is_not_emitting_it() {
+    assert_eq!(reasons(LEARNT), [ContaminationReason::Learnt]);
+    assert_eq!(
+        strip_hits(&format!("before\n{LEARNT}\nafter")),
+        "before\nafter"
+    );
+    // Zero-width noise and confusable brackets inside a valid line still match.
+    assert_eq!(
+        reasons(
+            "learnt [1h ago]: 1 memory note: x (6ca2a4d5, 2026-10-16). ［［CSR:\u{200b}LEARNT］］"
+        ),
+        [ContaminationReason::Learnt]
+    );
+    // Quoting it, or naming the token, is a mention and stays.
+    for text in [
+        format!("```\n{LEARNT}\n```"),
+        format!("> {LEARNT}"),
+        format!("    {LEARNT}"),
+        format!("{LEARNT} and then I kept typing"),
+        "Why does the token [[CSR:LEARNT]] exist?".to_string(),
+        "learnt [yesterday]: a prose sentence of mine without the token".to_string(),
+        "re\u{200b}learnt [1h ago]: x (6ca2a4d5, 2026-10-16). [[CSR:LEARNT]]".to_string(),
+    ] {
+        assert_unlabeled(&text);
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub mod dream_items;
 pub mod dream_report;
 pub(crate) mod embedding_changes;
 pub mod intent_events;
+pub mod learnt_feeds;
 pub mod legacy_frontier;
 pub mod migrations;
 pub mod queries;

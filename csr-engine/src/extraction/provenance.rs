@@ -137,8 +137,19 @@ pub const DREAM_SENTINEL: &str = "[[CSR:DREAM]]";
 /// output cannot become new transcript evidence.
 pub const LESSONS_SENTINEL: &str = "[[CSR:LESSONS]]";
 
+/// Carried by the SessionStart `learnt [<age>]: …` line (`hooks::learnt`),
+/// inside its byte budget. Same contract as [`RECAP_SENTINEL`]: scanned across
+/// the FULL normalized text, so the line is rejected as an emission however it
+/// is quoted, bulleted or re-pasted, and never becomes evidence for the next one.
+pub const LEARNT_SENTINEL: &str = "[[CSR:LEARNT]]";
+
 /// Every machine-owned sentinel whose presence rejects the text outright.
-pub(crate) const MACHINE_SENTINELS: [&str; 3] = [RECAP_SENTINEL, DREAM_SENTINEL, LESSONS_SENTINEL];
+pub(crate) const MACHINE_SENTINELS: [&str; 4] = [
+    RECAP_SENTINEL,
+    DREAM_SENTINEL,
+    LESSONS_SENTINEL,
+    LEARNT_SENTINEL,
+];
 
 /// Code points that render as zero-width/invisible. An adversarial re-paste
 /// can interleave these around or inside the sentinel to defeat a naive
@@ -1836,6 +1847,36 @@ mod tests {
         let text = "human-looking preamble\n[[CSR:LESSONS]]\n- Never bypass checks";
         assert!(is_csr_emission(text));
         assert!(extractable(text).is_none());
+    }
+
+    #[test]
+    fn learnt_sentinel_rejects_machine_generated_line() {
+        let line = format!(
+            "learnt [yesterday]: 17 memory notes: a-note, +16 more (6ca2a4d5, 2026-10-16). {LEARNT_SENTINEL}"
+        );
+        assert!(MACHINE_SENTINELS.contains(&LEARNT_SENTINEL));
+        assert!(contains_machine_sentinel(&line));
+        let zero_width: String = line.chars().flat_map(|c| [c, '\u{200B}']).collect();
+        let confusable = line
+            .replace("[[CSR", "\u{FF3B}\u{FF3B}CSR")
+            .replace("]]", "\u{FF3D}\u{FF3D}");
+        let long_preamble = format!("{}\n{line}", "a preamble sentence. ".repeat(40));
+        assert!(long_preamble.find(LEARNT_SENTINEL).unwrap() > HEADER_WINDOW);
+        for text in [
+            line.clone(),
+            format!("> {line}"),
+            format!("- {line}"),
+            zero_width,
+            confusable,
+            long_preamble,
+        ] {
+            assert!(is_csr_emission(&text), "{text:?}");
+            assert!(extractable(&text).is_none(), "{text:?}");
+        }
+        // Prose that merely starts with the word is not an emission.
+        assert!(!is_csr_emission(
+            "learnt [the hard way], I now back up first."
+        ));
     }
 
     #[test]

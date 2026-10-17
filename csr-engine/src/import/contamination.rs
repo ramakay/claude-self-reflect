@@ -28,7 +28,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::extraction::provenance::{DREAM_SENTINEL, LESSONS_SENTINEL, RECAP_SENTINEL};
+use crate::extraction::provenance::{
+    DREAM_SENTINEL, LEARNT_SENTINEL, LESSONS_SENTINEL, RECAP_SENTINEL,
+};
 use crate::storage::dream_attribution::{
     DREAM_CARD_PROPOSAL_HEADER, DREAM_CARD_SPAN_BOUNDARIES, DREAM_CARD_TAKE_HEADER, MARKER_PREFIX,
 };
@@ -44,6 +46,7 @@ pub enum ContaminationReason {
     Recap,
     DreamInjection,
     Lessons,
+    Learnt,
     MemoryManifest,
     Briefing,
     Continuity,
@@ -87,6 +90,7 @@ impl ContaminationReason {
             Self::Recap => "recap",
             Self::DreamInjection => "dream_injection",
             Self::Lessons => "lessons",
+            Self::Learnt => "learnt",
             Self::MemoryManifest => "memory_manifest",
             Self::Briefing => "briefing",
             Self::Continuity => "continuity",
@@ -295,6 +299,9 @@ pub static REGISTRY: &[Formatter] = &[
     formatter!("lessons", Engine, Lessons,
         "[[CSR:LESSONS]] + one or more `- <quote> (seen N× across N sessions, last <date>; <receipt>)` lines",
         Matcher::Block(m_lessons)),
+    formatter!("learnt", Engine, Learnt,
+        "learnt [<age>]: <clauses: N csr_resolve verdicts / N memory notes / N anchors retired by <oid>>. [[CSR:LEARNT]] (one line)",
+        Matcher::Block(m_learnt)),
     formatter!("memory_manifest", Engine, MemoryManifest,
         "the three fixed CSR ENDLESS MEMORY ACTIVE lines",
         Matcher::Block(m_manifest)),
@@ -462,6 +469,7 @@ re!(
     DREAM_LINE_RE,
     r"^CSR ☾ dream: `[^`\n]+` .+ — witnessed [^\n]+, receipt [^\s]+\. Matched your mention of `[^`\n]+`\. Past conclusion, not an instruction\.$"
 );
+re!(LEARNT_LINE_RE, r"^learnt \[[^\]\n]{1,24}\]: \S.*$");
 re!(
     LESSON_ITEM_RE,
     r"^- .+ \(seen \d+× across \d+ sessions, last [^;\n]+; [^\n]+\)$"
@@ -800,6 +808,12 @@ fn m_dream_injection(doc: &Doc<'_>, at: usize) -> Option<usize> {
     let prefix = strip_sentinel_suffix(doc.line(at), DREAM_SENTINEL)?;
     let head = prefix.trim_end_matches(|c: char| c.is_whitespace() || is_zero_width(c));
     DREAM_LINE_RE.is_match(head).then_some(at + 1)
+}
+
+fn m_learnt(doc: &Doc<'_>, at: usize) -> Option<usize> {
+    let prefix = strip_sentinel_suffix(doc.line(at), LEARNT_SENTINEL)?;
+    let head = prefix.trim_end_matches(|c: char| c.is_whitespace() || is_zero_width(c));
+    LEARNT_LINE_RE.is_match(head).then_some(at + 1)
 }
 
 fn m_lessons(doc: &Doc<'_>, at: usize) -> Option<usize> {

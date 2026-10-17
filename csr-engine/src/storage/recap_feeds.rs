@@ -54,7 +54,7 @@ static RECEIPT_OID_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Keep receipts compact: prefer a git-style short OID, otherwise a short
 /// human-readable preview of the evidence text.
-fn shorten_receipt(evidence: &str) -> String {
+pub(super) fn shorten_receipt(evidence: &str) -> String {
     RECEIPT_OID_RE
         .captures_iter(evidence)
         .find_map(|captures| {

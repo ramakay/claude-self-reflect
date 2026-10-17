@@ -414,6 +414,40 @@ pub fn engine_outputs() -> Vec<Output> {
         ]),
     ));
 
+    // learnt
+    let learnt_notes = crate::hooks::learnt::LearntFeeds {
+        notes: vec!["subagent-compact-window".to_string()],
+        notes_total: 1,
+        notes_date: Some("2026-10-16".to_string()),
+        ..Default::default()
+    };
+    let learnt_full = crate::hooks::learnt::LearntFeeds {
+        confirmed: vec![crate::hooks::learnt::ConfirmedItem {
+            claim: "Fix the review 404".to_string(),
+            status: "resolved".to_string(),
+            receipt: "a624305".to_string(),
+        }],
+        confirmed_total: 1,
+        verdicts: vec![crate::hooks::learnt::VerdictGroup {
+            oid: "12bf158".to_string(),
+            count: 3,
+            date: "2026-10-13".to_string(),
+        }],
+        ..learnt_notes.clone()
+    };
+    for (id, feeds) in [
+        ("learnt-notes", &learnt_notes),
+        ("learnt-full", &learnt_full),
+    ] {
+        out.push(output(
+            id,
+            "learnt",
+            R::Learnt,
+            crate::hooks::learnt::compose_learnt(feeds, age, "6ca2a4d5", "")
+                .expect("learnt composes"),
+        ));
+    }
+
     // Tier-0 blocks: CONTINUUM with and without NEXT/TODOS, anchors with and
     // without names, and the recap-backed form.
     let tier0 = |ep: &crate::hooks::stop::Episode, verdicts: &[(String, AnchorVerdict)]| {

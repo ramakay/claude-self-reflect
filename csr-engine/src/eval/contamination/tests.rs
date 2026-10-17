@@ -178,6 +178,8 @@ fn matrix_covers_every_engine_branch() {
         "pickup-semantic",
         "recap-minimal",
         "recap-full",
+        "learnt-notes",
+        "learnt-full",
         "session-start-blob",
     ] {
         assert!(ids.iter().any(|id| id == needed), "{needed}");
