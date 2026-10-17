@@ -2434,3 +2434,322 @@ fn full_engine_flush_rewrites_the_manifest() {
         "a normal engine's flush is expected to rewrite the cache (control)"
     );
 }
+
+/// The SessionStart `learnt` line and resume lineage, through the real binary
+/// against a temp store (`--db-path`), temp HOME and temp transcript dir. No live
+/// data is read.
+#[cfg(unix)]
+mod session_start_learnt {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    const OLD_SID: &str = "aaaa1111-0000-0000-0000-old000000000";
+    const CONCURRENT_SID: &str = "cccc3333-0000-0000-0000-concurrent00";
+    const NEW_SID: &str = "dddd4444-0000-0000-0000-new0000000000";
+    const OLD_REQUEST: &str = "Refactor the billing exporter into a streaming pipeline";
+    const CONCURRENT_REQUEST: &str = "Tune the search ranker recency weighting";
+
+    struct Fixture {
+        dir: tempfile::TempDir,
+    }
+
+    struct Run {
+        stdout: String,
+        success: bool,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let fixture = Fixture {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            std::fs::create_dir_all(fixture.home()).unwrap();
+            std::fs::create_dir_all(fixture.cwd()).unwrap();
+            std::fs::create_dir_all(fixture.transcript_dir()).unwrap();
+            // Open once so the schema exists, then close before the binary runs.
+            drop(csr_engine::storage::Storage::open(&fixture.db()).unwrap());
+            fixture
+        }
+        fn home(&self) -> PathBuf {
+            self.dir.path().join("home")
+        }
+        fn cwd(&self) -> PathBuf {
+            self.dir.path().join("projects").join("lproj")
+        }
+        fn transcript_dir(&self) -> PathBuf {
+            self.dir.path().join("claude-projects").join("lproj")
+        }
+        fn db(&self) -> PathBuf {
+            self.dir.path().join("csr-engine.db")
+        }
+        fn sql(&self, statements: &[(&str, Vec<String>)]) {
+            let conn = rusqlite::Connection::open(self.db()).unwrap();
+            for (sql, args) in statements {
+                conn.execute(sql, rusqlite::params_from_iter(args.iter()))
+                    .unwrap();
+            }
+        }
+        fn episode(&self, session: &str, request: &str, completed: &str, timestamp: &str) {
+            let content = serde_json::json!({
+                "schema": "v2", "session_id": session, "project": "lproj",
+                "timestamp": timestamp, "request": request, "investigated": [],
+                "completed": completed, "outcome": "success", "error_signatures": [],
+                "tools_used": [], "files_modified": [], "message_count": 12,
+                "duration_minutes": 0, "recap_evidence_version": 1,
+                "anchor_request": request,
+                "completions": [{"claim": completed, "receipt": "1a2b3c4"}],
+            })
+            .to_string();
+            let storage = csr_engine::storage::Storage::open(&self.db()).unwrap();
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &content,
+                    &[
+                        "session_episode".to_string(),
+                        "schema_v2".to_string(),
+                        "project_lproj".to_string(),
+                        format!("conv_{session}"),
+                    ],
+                    &[0.0; 4],
+                )
+                .unwrap();
+            drop(storage);
+            self.sql(&[(
+                "UPDATE reflections SET timestamp = ?1 WHERE id = ?2",
+                vec![timestamp.to_string(), format!("ep-{session}")],
+            )]);
+        }
+        fn note(&self, session: &str, slug: &str) {
+            self.sql(&[(
+                "INSERT INTO memory_registry
+                    (file_path, project, slug, description, mem_type, origin_session_id,
+                     modified_ts, file_mtime, content_hash, links_json, last_seen_scan)
+                 VALUES (?1, 'm', ?2, 'd', 'project', ?3, '2026-10-16T09:00:00Z', 0, 'h', '[]', 1)",
+                vec![
+                    format!("/m/{session}/{slug}.md"),
+                    slug.to_string(),
+                    session.to_string(),
+                ],
+            )]);
+        }
+        fn transcript(&self, session: &str, body: &str) -> PathBuf {
+            let path = self.transcript_dir().join(format!("{session}.jsonl"));
+            std::fs::write(&path, body).unwrap();
+            path
+        }
+        fn run(&self, source: &str, session: &str, env: &[(&str, &str)]) -> Run {
+            let transcript = self.transcript(session, "");
+            let payload = serde_json::json!({
+                "session_id": session, "transcript_path": transcript,
+                "cwd": self.cwd(), "source": source,
+            });
+            let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+            command
+                .args(["hook", "session-start", "--db-path"])
+                .arg(self.db())
+                .arg("--projects-dir")
+                .arg(self.dir.path().join("projects"))
+                .env("HOME", self.home())
+                .env("CSR_TIMING_LOG", self.dir.path().join("timing.log"))
+                .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+                .env_remove("CSR_NO_LEARNT")
+                .env_remove("CSR_NO_RECAP")
+                .env_remove("CSR_DREAM_CONSUMPTION");
+            for (key, value) in env {
+                command.env(key, value);
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            Run {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                success: output.status.success(),
+            }
+        }
+    }
+
+    fn learnt_lines(stdout: &str) -> Vec<&str> {
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("learnt ["))
+            .collect()
+    }
+
+    fn recap_line(stdout: &str) -> &str {
+        stdout
+            .lines()
+            .find(|l| l.starts_with("recap ["))
+            .unwrap_or("")
+    }
+
+    fn continued_in(old: &str, new: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{old}\"}}\n{{\"type\":\"continued-in\",\"sessionId\":\"{old}\",\"continuedInSessionId\":\"{new}\"}}\n"
+        )
+    }
+
+    fn seeded() -> Fixture {
+        let f = Fixture::new();
+        f.episode(
+            OLD_SID,
+            OLD_REQUEST,
+            "Streaming exporter merged",
+            "2026-10-15T04:20:30Z",
+        );
+        f.note(OLD_SID, "exporter-batch-size");
+        f.note(OLD_SID, "billing-csv-quirks");
+        f
+    }
+
+    #[test]
+    fn session_start_resume_emits_learnt_line_after_the_recap_block() {
+        let f = seeded();
+        let run = f.run("resume", NEW_SID, &[]);
+        assert!(run.success);
+        let lines = learnt_lines(&run.stdout);
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        let line = lines[0];
+        assert!(line.ends_with("[[CSR:LEARNT]]"), "{line}");
+        assert!(line.len() <= 320, "{} bytes", line.len());
+        assert!(line.contains("2 memory notes"), "{line}");
+        assert!(line.contains("(aaaa1111, 2026-10-16)"), "{line}");
+        let at = |needle: &str| {
+            run.stdout
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {}", run.stdout))
+        };
+        assert!(at("Full state:") < at("learnt ["), "{}", run.stdout);
+        assert!(
+            recap_line(&run.stdout).contains("Refactor the billing exporter"),
+            "{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn session_start_startup_new_session_gets_line_for_previous_session() {
+        let f = seeded();
+        let run = f.run("startup", NEW_SID, &[]);
+        assert!(run.success);
+        let lines = learnt_lines(&run.stdout);
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        assert!(lines[0].contains("(aaaa1111, "), "{}", lines[0]);
+        assert!(lines[0].contains("exporter-batch-size"), "{}", lines[0]);
+        // A session with no evidence prints no line at all.
+        let bare = Fixture::new();
+        bare.episode(
+            OLD_SID,
+            OLD_REQUEST,
+            "Streaming exporter merged",
+            "2026-10-15T04:20:30Z",
+        );
+        let run = bare.run("startup", NEW_SID, &[]);
+        assert!(run.success);
+        assert!(learnt_lines(&run.stdout).is_empty(), "{}", run.stdout);
+        assert!(!run.stdout.contains("[[CSR:LEARNT]]"));
+        assert!(run.stdout.contains("recap ["), "{}", run.stdout);
+    }
+
+    #[test]
+    fn session_start_learnt_kill_switch_removes_only_the_line() {
+        let f = seeded();
+        let on = f.run("resume", NEW_SID, &[]);
+        let off = f.run("resume", NEW_SID, &[("CSR_NO_LEARNT", "1")]);
+        assert!(on.success && off.success);
+        assert_eq!(learnt_lines(&on.stdout).len(), 1);
+        assert!(learnt_lines(&off.stdout).is_empty(), "{}", off.stdout);
+        assert_eq!(recap_line(&off.stdout), recap_line(&on.stdout));
+        assert!(!recap_line(&off.stdout).is_empty());
+        let without_line: String = on
+            .stdout
+            .lines()
+            .filter(|l| !l.starts_with("learnt ["))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(without_line.trim_end(), off.stdout.trim_end());
+    }
+
+    #[test]
+    fn session_start_learnt_feed_failure_keeps_recap_and_exits_zero() {
+        let f = seeded();
+        f.sql(&[
+            ("DROP TABLE memory_registry", vec![]),
+            ("DROP TABLE session_registry", vec![]),
+        ]);
+        let run = f.run("resume", NEW_SID, &[("CSR_DREAM_CONSUMPTION", "full")]);
+        assert!(run.success);
+        assert!(run.stdout.contains("recap ["), "{}", run.stdout);
+        assert!(learnt_lines(&run.stdout).is_empty(), "{}", run.stdout);
+        assert!(!run.stdout.contains("degraded"), "{}", run.stdout);
+        assert!(!run.stdout.contains("DEGRADED"), "{}", run.stdout);
+    }
+
+    #[test]
+    fn resume_lineage_makes_recap_and_learnt_name_the_predecessor_not_the_concurrent_session() {
+        let f = seeded();
+        // A concurrent session in the same project is newer than the one resumed.
+        f.episode(
+            CONCURRENT_SID,
+            CONCURRENT_REQUEST,
+            "Ranker weights retuned",
+            "2026-10-16T08:00:00Z",
+        );
+        f.note(CONCURRENT_SID, "ranker-recency-knob");
+
+        // Control: with no `continued-in` row the newest episode wins (today's order).
+        let control = f.run("resume", NEW_SID, &[]);
+        assert!(control.success);
+        assert!(
+            recap_line(&control.stdout).contains("Tune the search ranker"),
+            "{}",
+            control.stdout
+        );
+        assert!(
+            learnt_lines(&control.stdout)[0].contains("(cccc3333, "),
+            "{}",
+            control.stdout
+        );
+
+        // The old transcript gains its `continued-in` row naming the new sid.
+        f.transcript(OLD_SID, &continued_in(OLD_SID, NEW_SID));
+        let run = f.run("resume", NEW_SID, &[]);
+        assert!(run.success);
+        let recap = recap_line(&run.stdout);
+        assert!(
+            recap.contains("Refactor the billing exporter"),
+            "{}",
+            run.stdout
+        );
+        assert!(!recap.contains("Tune the search ranker"), "{}", run.stdout);
+        let lines = learnt_lines(&run.stdout);
+        assert_eq!(lines.len(), 1, "{}", run.stdout);
+        assert!(lines[0].contains("(aaaa1111, "), "{}", lines[0]);
+        assert!(!lines[0].contains("ranker-recency-knob"), "{}", lines[0]);
+        // Nothing dropped: the concurrent session is still listed in the index.
+        assert!(
+            run.stdout.contains("Tune the search ranker"),
+            "{}",
+            run.stdout
+        );
+
+        // A `startup` never uses lineage, even with the row present.
+        let startup = f.run("startup", "eeee5555-0000-0000-0000-other0000000", &[]);
+        assert!(
+            recap_line(&startup.stdout).contains("Tune the search ranker"),
+            "{}",
+            startup.stdout
+        );
+    }
+}

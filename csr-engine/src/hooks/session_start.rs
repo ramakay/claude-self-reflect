@@ -224,7 +224,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             .take(MAX_TIER0_VERIFY)
             .map(|a| (a.name.clone(), verify_anchor(a, cwd)))
             .collect();
-        output.push_str(&format_session_start_tier0_for_session(
+        let tier0 = format_session_start_tier0_for_session(
             engine.storage(),
             project_name,
             ep,
@@ -232,7 +232,26 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             age,
             input.session_id.as_deref(),
             input.source.as_deref(),
-        ));
+        );
+        output.push_str(&tier0);
+        // What CSR stored last session: its own line after the Tier-0 block, so the
+        // recap block (through `Full state:`) stays whole, and it still appears when
+        // the recap abstains. Fails open: no feed error reaches the degraded branch.
+        if let Some((line, learnt_session)) = learnt_block(
+            input,
+            &episodes,
+            engine.storage(),
+            project_name,
+            &tier0,
+            crate::storage::recap_feeds::dream_consumption_mode(),
+        ) {
+            output.push_str(&line);
+            exposure_items.push(session_exposure_item(
+                &learnt_session,
+                Some(&learnt_session),
+                "learnt",
+            ));
+        }
         output.push_str(&format_episode_index(&episodes[1..]));
         output.push_str(DEEPER_CONTEXT_FOOTER);
         exposure_items.extend(episodes.iter().map(|(episode, _)| {
@@ -713,6 +732,7 @@ fn is_session_framing_line(line: &str) -> bool {
         || trimmed.starts_with("SESSION CONTINUITY DETECTED")
         || trimmed.starts_with("EPISODE INDEX")
         || trimmed.starts_with("recap [")
+        || trimmed.starts_with("learnt [")
 }
 
 fn focus_text_from_output_line(line: &str) -> &str {
@@ -982,6 +1002,54 @@ pub fn format_tier0_block(
         None,
         crate::provenance::TrustTier::Unknown,
     )
+}
+
+/// `CSR_NO_LEARNT=1|true` removes the learnt line and nothing else. Independent
+/// of `CSR_NO_RECAP`. SessionStart-only, so it is not a prompt-path policy key.
+fn learnt_disabled() -> bool {
+    std::env::var("CSR_NO_LEARNT")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// The episode the learnt line talks about: `startup` and `resume` only, never a
+/// subagent. On `startup` the session's own episode is skipped; on `resume` the
+/// first episode stays (a same-sid resume continues that very session, and a
+/// new-sid resume leads with its predecessor when lineage found one).
+pub(crate) fn learnt_target<'a>(
+    episodes: &'a [(Episode, String)],
+    input: &HookInput,
+) -> Option<&'a (Episode, String)> {
+    if input.subagent().is_some() {
+        return None;
+    }
+    match input.source.as_deref().unwrap_or("startup") {
+        "resume" => episodes.first(),
+        "startup" => episodes
+            .iter()
+            .find(|(ep, _)| Some(ep.session_id.as_str()) != input.session_id.as_deref()),
+        _ => None,
+    }
+}
+
+/// The learnt line plus the newline that ends it, and the session it describes.
+/// `recap_text` is the Tier-0 block already composed, for the receipt dedupe.
+pub(crate) fn learnt_block(
+    input: &HookInput,
+    episodes: &[(Episode, String)],
+    storage: &crate::storage::Storage,
+    project: &str,
+    recap_text: &str,
+    mode: crate::storage::recap_feeds::ConsumptionMode,
+) -> Option<(String, String)> {
+    if learnt_disabled() {
+        return None;
+    }
+    let (ep, age) = learnt_target(episodes, input)?;
+    let feeds = storage.learnt_feeds(project, &ep.session_id, &ep.timestamp, mode);
+    let session8: String = ep.session_id.chars().take(8).collect();
+    let line = crate::hooks::learnt::compose_learnt(&feeds, age, &session8, recap_text)?;
+    Some((format!("{line}\n"), ep.session_id.clone()))
 }
 
 fn recap_disabled() -> bool {
@@ -2981,6 +3049,132 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
             .iter()
             .map(|(e, _)| e.session_id.as_str())
             .collect()
+    }
+
+    fn learnt_input(source: Option<&str>, session_id: &str) -> HookInput {
+        HookInput {
+            source: source.map(String::from),
+            session_id: Some(session_id.into()),
+            ..Default::default()
+        }
+    }
+
+    fn seed_learnt_note(storage: &crate::storage::Storage, session: &str, slug: &str) {
+        storage
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO memory_registry
+                        (file_path, project, slug, description, mem_type, origin_session_id,
+                         modified_ts, file_mtime, content_hash, links_json, last_seen_scan)
+                     VALUES (?1, 'p', ?2, 'd', 'project', ?3, '2026-10-16T09:00:00Z', 0, 'h', '[]', 1)",
+                    rusqlite::params![format!("/m/{slug}.md"), slug, session],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn learnt_target_skips_own_sid_on_startup_keeps_it_on_resume_and_is_none_elsewhere() {
+        let list = lineage_episodes(&["me", "previous", "older"]);
+        let pick =
+            |input: &HookInput| learnt_target(&list, input).map(|(e, _)| e.session_id.as_str());
+        assert_eq!(pick(&learnt_input(Some("startup"), "me")), Some("previous"));
+        assert_eq!(pick(&learnt_input(None, "me")), Some("previous"));
+        assert_eq!(
+            pick(&learnt_input(Some("startup"), "brand-new")),
+            Some("me")
+        );
+        assert_eq!(pick(&learnt_input(Some("resume"), "me")), Some("me"));
+        assert_eq!(pick(&learnt_input(Some("resume"), "new-sid")), Some("me"));
+        for source in ["compact", "clear", "other"] {
+            assert_eq!(pick(&learnt_input(Some(source), "x")), None, "{source}");
+        }
+        let mut subagent = learnt_input(Some("startup"), "x");
+        subagent.agent_id = Some("agent-1".into());
+        assert_eq!(pick(&subagent), None);
+        assert!(learnt_target(&[], &learnt_input(Some("resume"), "x")).is_none());
+        let only_self = lineage_episodes(&["me"]);
+        assert!(learnt_target(&only_self, &learnt_input(Some("startup"), "me")).is_none());
+    }
+
+    #[test]
+    fn learnt_block_carries_the_line_without_a_recap_and_honours_the_kill_switch() {
+        use crate::storage::recap_feeds::ConsumptionMode;
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_LEARNT");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let list = lineage_episodes(&["previous-session-id"]);
+        seed_learnt_note(&storage, "previous-session-id", "a-note");
+        let input = learnt_input(Some("startup"), "new");
+
+        // The recap abstains (empty text); the line is still there.
+        let (line, session) = learnt_block(
+            &input,
+            &list,
+            &storage,
+            "p",
+            "",
+            ConsumptionMode::AnnotateOnly,
+        )
+        .expect("a note is evidence");
+        assert_eq!(session, "previous-session-id");
+        assert!(line.starts_with("learnt ["), "{line}");
+        assert!(
+            line.contains("1 memory note: a-note (previous, 2026-10-16). [[CSR:LEARNT]]\n"),
+            "{line}"
+        );
+        assert_eq!(line.matches('\n').count(), 1);
+
+        std::env::set_var("CSR_NO_LEARNT", "1");
+        let off = learnt_block(
+            &input,
+            &list,
+            &storage,
+            "p",
+            "",
+            ConsumptionMode::AnnotateOnly,
+        );
+        std::env::set_var("CSR_NO_LEARNT", "TRUE");
+        let off_upper = learnt_block(
+            &input,
+            &list,
+            &storage,
+            "p",
+            "",
+            ConsumptionMode::AnnotateOnly,
+        );
+        std::env::remove_var("CSR_NO_LEARNT");
+        assert!(off.is_none() && off_upper.is_none());
+
+        // No evidence for the target: no line, zero bytes.
+        let bare = lineage_episodes(&["no-notes-session"]);
+        assert!(learnt_block(&input, &bare, &storage, "p", "", ConsumptionMode::Full).is_none());
+    }
+
+    #[test]
+    fn learnt_block_feed_failure_is_an_absent_line_not_an_error() {
+        use crate::storage::recap_feeds::ConsumptionMode;
+        let _guard = crate::daemon::dream_cadence::env_test_guard();
+        std::env::remove_var("CSR_NO_LEARNT");
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        storage
+            .with_connection(|conn| {
+                conn.execute_batch("DROP TABLE memory_registry; DROP TABLE session_registry;")?;
+                Ok(())
+            })
+            .unwrap();
+        let list = lineage_episodes(&["previous-session-id"]);
+        let input = learnt_input(Some("resume"), "new");
+        assert!(learnt_block(&input, &list, &storage, "p", "", ConsumptionMode::Full).is_none());
+    }
+
+    #[test]
+    fn the_learnt_line_is_session_framing_for_the_focus_file() {
+        assert!(is_session_framing_line(
+            "learnt [yesterday]: 17 memory notes: a, +16 more (6ca2a4d5, 2026-10-16). [[CSR:LEARNT]]"
+        ));
+        assert!(!is_session_framing_line("learning how to ship"));
     }
 
     #[test]
