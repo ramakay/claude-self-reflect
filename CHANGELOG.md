@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 71457f3c, 31d78e5b, d6b9c454, 46e14f16, 962f8e03, 6e3a08b1, aededb4a (replaced by 76e390d6), cecddb48, c7e4e285,
 c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
 
+### Learnt line
+
+- **A separate `learnt [<age>]: ... [[CSR:LEARNT]]` line at SessionStart** (`startup`, `resume`) names what CSR stored for
+  the previous session: memory notes by session id, user-confirmed `csr_resolve` verdicts, and, under
+  `CSR_DREAM_CONSUMPTION=full`, anchors retired by a commit inside the session window. At most 320 bytes, a receipt
+  on every clause, no line when there is no evidence, `CSR_NO_LEARNT=1` turns it off. Re-import is blocked by a new
+  machine sentinel and an import-scrub formatter. On `resume` a bounded scan of sibling transcripts for the
+  `continued-in` row puts the resumed session's episode first, for the recap as well as the learnt line.
+
 ### Recap
 
 - **One causal paragraph at SessionStart** replaces the CONTINUUM / LAST / NEXT / ANCHORS fragments:
