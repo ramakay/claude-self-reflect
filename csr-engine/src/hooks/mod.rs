@@ -16,6 +16,7 @@ pub mod prompt_submit;
 pub mod prompt_transport;
 pub mod reaction;
 pub mod recap;
+pub(crate) mod resume_lineage;
 mod scope_folder;
 pub mod session_briefing;
 pub mod session_end;

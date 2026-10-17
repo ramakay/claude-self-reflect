@@ -119,7 +119,19 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // dominant continue-latest case); the rest form the EPISODE INDEX, which
     // defers episode *selection* to the reading agent — the agent sees the
     // user's actual prompt, so it corrects a stale anchor pick in one line.
-    let episodes = recent_episodes(engine, cwd, EPISODE_INDEX_MAX);
+    // On `resume` Claude Code starts a NEW session id; the transcript the user resumed
+    // names itself in a `continued-in` row, and its episode leads the list so the
+    // recap and the learnt line talk about it, not about a concurrent session.
+    let predecessor = resume_predecessor_for(input);
+    let episodes = match resolve_project_from_cwd(&cwd.to_string_lossy()) {
+        Some(p) => recent_project_episodes_resuming(
+            engine.storage(),
+            &p,
+            EPISODE_INDEX_MAX,
+            predecessor.as_deref(),
+        ),
+        None => Vec::new(),
+    };
     let tier0_session_id = episodes.first().map(|(ep, _)| ep.session_id.clone());
 
     let mut output = String::new();
@@ -777,6 +789,41 @@ pub(crate) fn recent_project_episodes(
     project: &str,
     limit: usize,
 ) -> Vec<(Episode, String)> {
+    recent_project_episodes_resuming(storage, project, limit, None)
+}
+
+/// The predecessor session of a `source=resume` SessionStart, from the
+/// project transcript dir (the parent of this session's own `transcript_path`).
+/// `None` for any other source, a subagent, or when the scan finds nothing.
+fn resume_predecessor_for(input: &HookInput) -> Option<String> {
+    if input.source.as_deref() != Some("resume") || input.subagent().is_some() {
+        return None;
+    }
+    let sid = input.session_id.as_deref()?;
+    let dir = Path::new(input.transcript_path.as_deref()?).parent()?;
+    super::resume_lineage::resume_predecessor(dir, sid)
+}
+
+/// Move the predecessor's episode to the front, keeping every other episode
+/// in its existing order. No episode for it, or `None`: order unchanged.
+fn promote_predecessor(episodes: &mut Vec<(Episode, String)>, predecessor: Option<&str>) {
+    let Some(at) =
+        predecessor.and_then(|sid| episodes.iter().position(|(e, _)| e.session_id == sid))
+    else {
+        return;
+    };
+    let promoted = episodes.remove(at);
+    episodes.insert(0, promoted);
+}
+
+/// [`recent_project_episodes`] with the resumed session's episode (when
+/// `predecessor` names one) moved to the front before the list is truncated.
+pub(crate) fn recent_project_episodes_resuming(
+    storage: &crate::storage::Storage,
+    project: &str,
+    limit: usize,
+    predecessor: Option<&str>,
+) -> Vec<(Episode, String)> {
     let project_tag = format!("project_{}", project);
     let Ok(rows) = storage.get_reflections_by_tag(&project_tag, 50) else {
         return Vec::new();
@@ -807,6 +854,7 @@ pub(crate) fn recent_project_episodes(
         });
     episodes.retain(|(ep, _)| !headless.contains(&ep.session_id));
     episodes.sort_by(|a, b| b.1.cmp(&a.1));
+    promote_predecessor(&mut episodes, predecessor);
     episodes.truncate(limit);
     episodes
         .into_iter()
@@ -2916,6 +2964,81 @@ Full state: csr_reflect_on_past(\"conv_s\")\n"
         sessions.sort();
         // An unrecorded entrypoint is unknown, not headless: it stays.
         assert_eq!(sessions, ["human", "unrecorded"]);
+    }
+
+    fn lineage_episodes(ids: &[&str]) -> Vec<(Episode, String)> {
+        ids.iter()
+            .map(|id| {
+                let mut ep = minimal_episode("Fix the auth middleware regression", "", None);
+                ep.session_id = (*id).into();
+                (ep, format!("{id} ago"))
+            })
+            .collect()
+    }
+
+    fn session_ids(episodes: &[(Episode, String)]) -> Vec<&str> {
+        episodes
+            .iter()
+            .map(|(e, _)| e.session_id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn promote_predecessor_is_a_stable_move_to_front_that_drops_nothing() {
+        let mut list = lineage_episodes(&["concurrent", "a", "old", "b"]);
+        promote_predecessor(&mut list, Some("old"));
+        assert_eq!(session_ids(&list), ["old", "concurrent", "a", "b"]);
+        // The age label travels with its episode.
+        assert_eq!(list[0].1, "old ago");
+
+        for none_case in [None, Some("unknown-session")] {
+            let mut list = lineage_episodes(&["concurrent", "a", "old"]);
+            promote_predecessor(&mut list, none_case);
+            assert_eq!(session_ids(&list), ["concurrent", "a", "old"]);
+        }
+        let mut empty = Vec::new();
+        promote_predecessor(&mut empty, Some("old"));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn resuming_promotes_before_truncation_and_without_a_predecessor_is_unchanged() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        for (i, session) in ["oldest", "middle", "newest"].iter().enumerate() {
+            let mut ep = minimal_episode("Fix the auth middleware regression", "", None);
+            ep.session_id = (*session).into();
+            ep.project = "proj".into();
+            let tags = crate::hooks::stop::episode_tags(&ep);
+            storage
+                .insert_reflection(
+                    &format!("ep-{session}"),
+                    &serde_json::to_string(&ep).unwrap(),
+                    &tags,
+                    &[0.0; 4],
+                )
+                .unwrap();
+            storage
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE reflections SET timestamp = ?1 WHERE id = ?2",
+                        rusqlite::params![
+                            format!("2026-10-1{i}T10:00:00Z"),
+                            format!("ep-{session}")
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let plain = recent_project_episodes(&storage, "proj", 10);
+        assert_eq!(session_ids(&plain), ["newest", "middle", "oldest"]);
+        // Even a predecessor beyond the truncation limit leads the list.
+        let resumed = recent_project_episodes_resuming(&storage, "proj", 1, Some("oldest"));
+        assert_eq!(session_ids(&resumed), ["oldest"]);
+        let resumed = recent_project_episodes_resuming(&storage, "proj", 10, Some("middle"));
+        assert_eq!(session_ids(&resumed), ["middle", "newest", "oldest"]);
+        let same = recent_project_episodes_resuming(&storage, "proj", 10, None);
+        assert_eq!(session_ids(&same), session_ids(&plain));
     }
 
     const RULE_TEXT: &str = "A standing rule from 10-12: “Keep receipts”";
