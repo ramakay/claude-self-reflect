@@ -376,6 +376,10 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   (e0fe86f5). Re-extraction retires dropped symbols, never on an empty or partial parse (b939bac0, e64775ee,
   51ed42cb). csr_why's episode hop had resolved 0 of 665 links (43a635ab). `reflect_on_past` sinks resolved
   chunks before the limit cut (b721a745).
+- The herdr pane beside `claude attach <id>` took the attach client's own session id, which has no transcript and no
+  status line, so every gauge was blank. It now asks herdr what runs beside it and follows the attached job's session.
+  A failed narrative call stored with model `unknown` and no tokens hid the week's cost figure; a call with no tokens
+  now costs $0 whatever model it names.
 
 ### Known limitations
 

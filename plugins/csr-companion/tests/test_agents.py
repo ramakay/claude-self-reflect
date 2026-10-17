@@ -977,3 +977,45 @@ class HandedThreads(Folder):
         handed = the_thread(threads(pane.handoffs_of(SESSION)))
         self.assertEqual((handed['state'], handed['hidden']), ('handed', 'handed'))
         self.assertIn(f"handed to a subagent {clock(sent):%H:%M} · it reported", handed['why'])
+
+
+# ---------------------------------------------------------------- beside `claude attach`
+
+class AttachedSession(unittest.TestCase):
+    """`claude attach <id>` runs the plugin under a session id of its own, with no transcript and no status line: the pane
+    keys on the attached job's session instead, read from ~/.claude/jobs/<id>/state.json (2026-10-17, every gauge blank)."""
+    FULL = 'eda7fbcf-964f-4c64-ad87-95e35a9a1b70'
+
+    def setUp(self):
+        self.jobs = tempfile.mkdtemp(prefix='csr-jobs-')
+        self.addCleanup(shutil.rmtree, self.jobs, True)
+        saved = pane.herdr, pane.JOBS
+        self.addCleanup(lambda: setattr(pane, 'herdr', saved[0]) or setattr(pane, 'JOBS', saved[1]))
+        pane.JOBS = self.jobs
+        self.job('eda7fbcf', self.FULL)
+
+    def job(self, short, session):
+        os.makedirs(os.path.join(self.jobs, short), exist_ok=True)
+        with open(os.path.join(self.jobs, short, 'state.json'), 'w', encoding='utf-8') as handle:
+            json.dump(dict(state='working', sessionId=session, daemonShort=short), handle)
+
+    def leader(self, argv):
+        pane.herdr = lambda *args: process_info('claude', argv=argv) if args[1] == 'process-info' else ''
+
+    def test_an_attach_client_names_its_jobs_session(self):
+        for argv in (['/Users/me/.local/bin/claude', 'attach', 'eda7fbcf'], ['claude', 'attach', self.FULL],
+                     ['claude', 'attach', '--quiet', 'eda7fbcf']):
+            self.leader(argv)
+            self.assertEqual(pane.attached_session('w2:p1'), self.FULL, argv)
+
+    def test_anything_else_keeps_the_mods_own_id(self):
+        for argv in (['claude', '-c'], ['claude', '--resume', 'eda7fbcf'], ['claude', 'attach'], ['zsh'],
+                     ['claude', 'attach', '../../etc'], ['claude', 'attach', 'deadbeef']):  # no such job
+            self.leader(argv)
+            self.assertIsNone(pane.attached_session('w2:p1'), argv)
+        self.job('0badf00d', 'eda7fbcf-0000')  # a state file naming another job's session is not believed
+        self.leader(['claude', 'attach', '0badf00d'])
+        self.assertIsNone(pane.attached_session('w2:p1'))
+        for said in (None, '', 'not json', '{}'):
+            pane.herdr = lambda *args, said=said: said
+            self.assertIsNone(pane.attached_session('w2:p1'), repr(said))

@@ -3721,6 +3721,10 @@ class ValueLine(unittest.TestCase):
         self.patch(connect=lambda: usage_db(rows + [(self.iso(60), 'gpt-6', 5, 5, 0, 0)]))
         got = pane.narrative_week(self.NOW - pane.WEEK)
         self.assertEqual((got['usd'], got['unpriced']), (None, ['gpt-6']))  # a model with no price: no figure at all
+        self.patch(connect=lambda: usage_db(rows + [(self.iso(60), 'unknown', 0, 0, 0, 0)]))  # a failed call that named none
+        got = pane.narrative_week(self.NOW - pane.WEEK)
+        self.assertEqual(got['unpriced'], [])  # no tokens bill nothing, so the week keeps its figure (10-17: Fuel went blank)
+        self.assertAlmostEqual(got['usd'], (haiku + 5 * 3.0 + 7777 * 15.0) / 1e6)
         self.patch(connect=self.intent_db)  # an engine without the table: the pane fails open to nothing
         self.assertEqual(pane.fail_open(pane.narrative_week, {}, self.NOW), {})
 

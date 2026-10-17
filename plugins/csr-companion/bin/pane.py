@@ -86,6 +86,7 @@ DREAMER_SAID = "CSR's dreamer asked this while you worked"
 PANES = os.path.join(KEEP, 'panes')  # <session>.json: the pid of the pane open beside that session
 STATUS_LINES = os.path.join(KEEP, 'statusline')  # <session>.json: Claude's status line, moved into the pane
 AGENTS = os.path.join(KEEP, 'agents')  # <session>.json: the session's agents, written by hooks/agents.ts
+JOBS = os.path.join(HOME, '.claude', 'jobs')  # <id>/state.json: a background session, by the id `claude attach` takes
 HANDOFFS = os.path.join(KEEP, 'handoffs')  # <session>.json (the hooks') and <session>.drafts.jsonl (the pane's): Lost and found handoffs
 
 
@@ -3590,6 +3591,28 @@ def claude_in_front(agent):
         return False
 
 
+def attached_session(agent):
+    """The session id a `claude attach <id>` in Claude's herdr pane shows, from that background job's state.json; None
+    when what runs there is not an attach client, or on any doubt. That client runs the plugin under a session id of its
+    own, which names no transcript and gets no status line, so the pane follows the attached session instead
+    (2026-10-17: every gauge blank beside `claude attach eda7fbcf`)."""
+    try:
+        info = json.loads(herdr('pane', 'process-info', '--pane', agent) or '')['result']['process_info']
+        leader = next(p for p in info['foreground_processes'] if p['pid'] == info['foreground_process_group_id'])
+        argv = [str(word) for word in leader.get('argv') or ()]
+        if len(argv) < 3 or os.path.basename(argv[0]) != 'claude' or argv[1] != 'attach':
+            return None
+        job = next(word for word in argv[2:] if not word.startswith('-'))
+        if not re.fullmatch(r'[0-9a-f-]+', job):
+            return None
+        with open(os.path.join(JOBS, job[:8], 'state.json'), encoding='utf-8') as handle:
+            session = json.load(handle).get('sessionId')
+        ok = isinstance(session, str) and re.fullmatch(r'[0-9a-f-]+', session) and session.startswith(job)
+        return session if ok else None
+    except (OSError, ValueError, KeyError, TypeError, StopIteration, AttributeError):
+        return None
+
+
 def send_draft(agent, text, named=None):
     """Words into Claude's prompt, unsent, over more than one line: each line is typed with send-text and a Ctrl+J, Claude Code's
     own new line, between them; an Enter is never sent, so nothing submits. False as soon as one step fails (the pane's herdr
@@ -5228,7 +5251,7 @@ def narrative_week(start):
         if 'haiku' in str(model or '').lower():
             out['calls'] += int(calls or 0)
             out['tokens'] += sum(counts)
-        cost = cost_of(model, *counts)
+        cost = cost_of(model, *counts) if any(counts) else 0.0  # no tokens, nothing billed: a failed call's 'unknown' model too
         if cost is None:
             out['unpriced'].append(model)
         else:
@@ -8519,7 +8542,7 @@ def main():
         if not root:
             print('not a git repository, and CSR has no sessions from here:', args.repo)
             return
-        watch(root, args.limit, args.sid, args.agent)
+        watch(root, args.limit, (args.agent and attached_session(args.agent)) or args.sid, args.agent)
 
 
 if __name__ == '__main__':
