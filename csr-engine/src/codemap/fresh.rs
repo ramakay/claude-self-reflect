@@ -1619,9 +1619,10 @@ mod tests {
             pump_loop(&ctx, &mut pump);
         });
         // 600 ms at one tick per 100 ms is about 6; a spinning loop makes
-        // thousands.
+        // thousands. The floor is 1, not 3: a loaded machine can starve the
+        // loop, and a low count says nothing against a spin.
         assert!(
-            (3..=10).contains(&pump.ticks),
+            (1..=10).contains(&pump.ticks),
             "pump ticked {} times in 600 ms",
             pump.ticks
         );
