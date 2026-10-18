@@ -34,14 +34,14 @@ fn graph(
     mode: &str,
     map_off: bool,
 ) -> String {
-    let family = vec!["p".to_string()];
-    code_graph_with_map(storage, symbol, file, mode, 20, "p", &family, map_off).unwrap()
+    let family = vec!["mapfx".to_string()];
+    code_graph_with_map(storage, symbol, file, mode, 20, "mapfx", &family, map_off).unwrap()
 }
 
 fn node(id: &str, file: &str, name: &str) -> NodeRow {
     NodeRow {
         id: id.into(),
-        project: "p".into(),
+        project: "mapfx".into(),
         file: file.into(),
         kind: "function".into(),
         name: name.into(),
@@ -357,4 +357,133 @@ fn the_map_section_is_off_when_the_kill_switch_is_set_for_the_graph_too() {
         let off = graph(&storage, Some("alpha_one"), None, mode, true);
         assert!(!off.contains("<code_map"), "{mode}: {off}");
     }
+}
+
+/// Two repos that both hold `src/lib.rs` (byte-identical, so one blob) with
+/// `fn shared()`, and a `crowd.rs` that repo B holds twelve times under paths
+/// that sort before repo A's one.
+fn two_repo_storage() -> (crate::codemap::testutil::Fx, Arc<Storage>) {
+    use crate::codemap::testutil::{write, Fx};
+    let fx = Fx::new();
+    let a = fx.init_repo("repoa");
+    let b = fx.init_repo("repob");
+    for repo in [&a, &b] {
+        write(repo, "src/lib.rs", "pub fn shared() {}\n");
+    }
+    write(&a, "zz/crowd.rs", "pub fn crowd_a() {}\n");
+    for i in 0..12 {
+        write(
+            &b,
+            &format!("many/m{i:02}/crowd.rs"),
+            &format!("pub fn crowd_{i}() {{}}\n"),
+        );
+    }
+    fx.commit_all(&a, "init");
+    fx.commit_all(&b, "init");
+    let storage = Arc::new(Storage::open_memory().unwrap());
+    storage
+        .with_connection(|conn| {
+            scan_repo_into(conn, &fx, &a);
+            scan_repo_into(conn, &fx, &b);
+            Ok(())
+        })
+        .unwrap();
+    (fx, storage)
+}
+
+#[tokio::test]
+async fn search_by_file_shows_only_the_projects_repos_in_the_map() {
+    let (_fx, storage) = two_repo_storage();
+    let empty_root = tempfile::tempdir().unwrap();
+    let _root = crate::search::cross_project::ProjectsRootGuard::set(empty_root.path());
+    let scoped = |project: Option<&'static str>, arg: &'static str| {
+        let storage = storage.clone();
+        async move {
+            search_by_file_with_map(&storage, arg, 10, project, false)
+                .await
+                .unwrap()
+        }
+    };
+
+    let a = scoped(Some("repoa"), "src/lib.rs").await;
+    assert!(a.contains("<file path='src/lib.rs'"), "{a}");
+    assert!(a.contains("only in main"), "A has one view: {a}");
+    assert!(
+        a.contains("<code_map paths='1'>"),
+        "only repo A's path counts: {a}"
+    );
+    assert!(!a.contains("repob"), "{a}");
+
+    let b = scoped(Some("repob"), "src/lib.rs").await;
+    assert!(b.contains("<code_map paths='1'>"), "{b}");
+
+    // Omitted and "all": every repo, as before.
+    for project in [None, Some("all")] {
+        let all = scoped(project, "src/lib.rs").await;
+        assert!(all.contains("<code_map paths='2'>"), "{project:?}: {all}");
+    }
+
+    // A project that owns no mapped repo: no section, the old empty answer.
+    let c = scoped(Some("repoc"), "src/lib.rs").await;
+    assert!(!c.contains("<code_map"), "{c}");
+    assert!(c.contains("No conversations found analyzing"), "{c}");
+    assert_eq!(
+        c,
+        search_by_file_with_map(&storage, "src/lib.rs", 10, Some("repoc"), true)
+            .await
+            .unwrap()
+    );
+
+    // The scope applies before the 10-path cap: B's twelve crowd.rs paths sort
+    // first, yet A still finds its own.
+    let crowd_a = scoped(Some("repoa"), "crowd.rs").await;
+    assert!(crowd_a.contains("<file path='zz/crowd.rs'"), "{crowd_a}");
+    assert!(!crowd_a.contains("many/"), "{crowd_a}");
+    let crowd_all = scoped(None, "crowd.rs").await;
+    assert!(
+        !crowd_all.contains("zz/crowd.rs"),
+        "capped out unscoped: {crowd_all}"
+    );
+}
+
+#[test]
+fn code_graph_shows_only_the_projects_definitions_from_the_map() {
+    let (_fx, storage) = two_repo_storage();
+    let empty_root = tempfile::tempdir().unwrap();
+    let _root = crate::search::cross_project::ProjectsRootGuard::set(empty_root.path());
+    let run = |symbol: &str, file: Option<&str>, project: &str| {
+        let family = if project.is_empty() {
+            Vec::new()
+        } else {
+            vec![project.to_string()]
+        };
+        code_graph_with_map(
+            &storage,
+            Some(symbol).filter(|s| !s.is_empty()),
+            file,
+            "neighbors",
+            20,
+            project,
+            &family,
+            false,
+        )
+        .unwrap()
+    };
+
+    let a = run("shared", None, "repoa");
+    assert!(a.contains("<code_map definitions='1'>"), "{a}");
+    assert!(a.contains("only in main"), "{a}");
+    assert!(a.contains("path='src/lib.rs'"), "{a}");
+    let both = run("shared", None, "");
+    assert!(both.contains("<code_map definitions='2'>"), "{both}");
+    let c = run("shared", None, "repoc");
+    assert!(!c.contains("<code_map"), "{c}");
+    assert!(c.contains("No neighbors found"), "{c}");
+
+    // The file form is scoped the same way.
+    let file_a = run("", Some("crowd.rs"), "repoa");
+    assert!(
+        file_a.contains("<file path='zz/crowd.rs'") && !file_a.contains("many/"),
+        "{file_a}"
+    );
 }

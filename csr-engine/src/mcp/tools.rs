@@ -2497,6 +2497,34 @@ const CODE_MAP_PATH_CAP: usize = 10;
 /// Definitions of the code map's `<code_map>` section for a symbol lookup.
 const CODE_MAP_DEFINITION_CAP: usize = 10;
 
+/// Which repos of the code map a tool call may show: those of one explicit
+/// project, its family aliases included. `None` = every repo.
+#[derive(Clone, Copy)]
+struct MapScope<'a> {
+    project: &'a str,
+    family_projects: &'a [String],
+}
+
+impl<'a> MapScope<'a> {
+    /// A scope for an explicit, specific project; none for an empty or `all` one.
+    fn for_project(project: &'a str, family_projects: &'a [String]) -> Option<Self> {
+        (!project.is_empty() && !project.eq_ignore_ascii_case("all")).then_some(Self {
+            project,
+            family_projects,
+        })
+    }
+
+    /// The map repos whose checkout or worktree directory name is the project,
+    /// a family alias of it, or in the family list.
+    fn repos(&self, conn: &rusqlite::Connection) -> Result<crate::codemap::RepoScope> {
+        crate::codemap::repos_matching(conn, &|label| {
+            label == self.project
+                || self.family_projects.iter().any(|f| f == label)
+                || cross_project::same_project_family(self.project, label)
+        })
+    }
+}
+
 /// The code map's answer for a file argument: the formatted `<code_map>` section
 /// and how many distinct views hold the matched paths. `None` when the code map
 /// is off, its tables are missing, or nothing matches. Read-only; any storage
@@ -2505,12 +2533,16 @@ fn code_map_file_section(
     storage: &Arc<Storage>,
     arg: &str,
     map_off: bool,
+    scope: Option<MapScope<'_>>,
 ) -> Option<(String, usize)> {
     if map_off || arg.trim().is_empty() {
         return None;
     }
     let lookup = storage
-        .with_connection(|conn| crate::codemap::lookup_files(conn, arg, CODE_MAP_PATH_CAP))
+        .with_connection(|conn| {
+            let repos = scope.map(|s| s.repos(conn)).transpose()?;
+            crate::codemap::lookup_files_scoped(conn, arg, CODE_MAP_PATH_CAP, repos.as_ref())
+        })
         .ok()?;
     if lookup.files.is_empty() {
         return None;
@@ -2532,13 +2564,20 @@ fn code_map_definitions_section(
     storage: &Arc<Storage>,
     symbol: &str,
     map_off: bool,
+    scope: Option<MapScope<'_>>,
 ) -> Option<String> {
     if map_off || symbol.trim().is_empty() {
         return None;
     }
     let hits = storage
         .with_connection(|conn| {
-            crate::codemap::query_exact(conn, symbol.trim(), CODE_MAP_DEFINITION_CAP)
+            let repos = scope.map(|s| s.repos(conn)).transpose()?;
+            crate::codemap::query_exact_scoped(
+                conn,
+                symbol.trim(),
+                CODE_MAP_DEFINITION_CAP,
+                repos.as_ref(),
+            )
         })
         .ok()?;
     (!hits.is_empty()).then(|| format::format_code_map_definitions(&hits))
@@ -2571,7 +2610,12 @@ pub(super) async fn search_by_file_with_map(
     };
 
     let mut ledger = storage.code_file_ledger(&proj, file_path)?;
-    let map = code_map_file_section(storage, file_path, map_off);
+    let map = code_map_file_section(
+        storage,
+        file_path,
+        map_off,
+        MapScope::for_project(&proj, &[]),
+    );
     if !ledger.symbols.is_empty() || !ledger.timeline.is_empty() {
         attach_attribution(storage, &mut ledger.symbols);
         let mut out = format::format_file_ledger(&ledger);
@@ -2694,13 +2738,17 @@ pub(super) fn code_graph_with_map(
     if map_off {
         return Ok(graph_out);
     }
+    // A specific project sees only its own repos in the map, as the graph does.
+    let scope = MapScope::for_project(project, family_projects);
     // A symbol wins over a file, as in `resolve_node_id`.
     let section = match (
         symbol.filter(|s| !s.trim().is_empty()),
         file.filter(|f| !f.trim().is_empty()),
     ) {
-        (Some(s), _) => code_map_definitions_section(storage, s, map_off),
-        (None, Some(f)) => code_map_file_section(storage, f, map_off).map(|(section, _)| section),
+        (Some(s), _) => code_map_definitions_section(storage, s, map_off, scope),
+        (None, Some(f)) => {
+            code_map_file_section(storage, f, map_off, scope).map(|(section, _)| section)
+        }
         (None, None) => None,
     };
     let Some(section) = section else {

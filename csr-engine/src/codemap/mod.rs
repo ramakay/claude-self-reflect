@@ -51,9 +51,12 @@ mod tests;
 pub(crate) mod testutil;
 
 pub use discover::{discover, Candidate};
-pub use files::{files_for, lookup_files, CodemapFile, FileDef, FilesLookup};
+pub use files::{
+    files_for, lookup_files, lookup_files_scoped, repos_matching, CodemapFile, FileDef,
+    FilesLookup, RepoScope,
+};
 pub use fresh::{run_loop, LoopOpts};
-pub use query::{query, query_exact, CodemapHit, ViewPresence};
+pub use query::{query, query_exact, query_exact_scoped, CodemapHit, ViewPresence};
 pub use scan::{rescan_paths, scan_repo, view_changed, PathScanReport, RepoScanReport, ScanOpts};
 pub use status::{status_report, CodemapStatus};
 

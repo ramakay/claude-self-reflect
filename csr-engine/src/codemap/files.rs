@@ -5,7 +5,7 @@
 //! their argument here. Read-only; every function answers "nothing" when the
 //! code map tables do not exist.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use rusqlite::{params, Connection};
@@ -139,13 +139,18 @@ type PathPairs = (Vec<(String, String)>, usize);
 ///   `/` boundary) and that holds the remainder gives the repo and the path;
 /// - else an exact repo-relative path (a leading `./` is ignored);
 /// - else a suffix: paths ending in `/<arg>`.
-fn resolve_paths(conn: &Connection, arg: &str, cap: usize) -> Result<PathPairs> {
+fn resolve_paths(
+    conn: &Connection,
+    arg: &str,
+    cap: usize,
+    scope: Option<&RepoScope>,
+) -> Result<PathPairs> {
     let arg = arg.trim();
     if arg.is_empty() {
         return Ok((Vec::new(), 0));
     }
     if arg.starts_with('/') {
-        return resolve_absolute(conn, arg);
+        return resolve_absolute(conn, arg, scope);
     }
 
     let rel = arg.trim_start_matches("./").trim_end_matches('/');
@@ -158,7 +163,10 @@ fn resolve_paths(conn: &Connection, arg: &str, cap: usize) -> Result<PathPairs> 
     )?;
     let commons = exact
         .query_map(params![rel], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|c| in_scope(scope, c))
+        .collect::<Vec<_>>();
     if !commons.is_empty() {
         let total = commons.len();
         let pairs = commons
@@ -186,13 +194,13 @@ fn resolve_paths(conn: &Connection, arg: &str, cap: usize) -> Result<PathPairs> 
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
-        .filter(|(_, path)| path.ends_with(&needle))
+        .filter(|(common, path)| path.ends_with(&needle) && in_scope(scope, common))
         .collect();
     let total = all.len();
     Ok((all.into_iter().take(cap).collect(), total))
 }
 
-fn resolve_absolute(conn: &Connection, arg: &str) -> Result<PathPairs> {
+fn resolve_absolute(conn: &Connection, arg: &str, scope: Option<&RepoScope>) -> Result<PathPairs> {
     let abs = super::identity::normalize_lexical(std::path::Path::new(arg));
     let abs = abs.to_string_lossy().to_string();
     let mut stmt = conn.prepare_cached("SELECT common_dir, worktree_path FROM codemap_views")?;
@@ -202,6 +210,9 @@ fn resolve_absolute(conn: &Connection, arg: &str) -> Result<PathPairs> {
     // Longest worktree first: a nested worktree beats the checkout around it.
     views.sort_by_key(|(_, wt)| std::cmp::Reverse(wt.len()));
     for (common, wt) in views {
+        if !in_scope(scope, &common) {
+            continue;
+        }
         let Some(rel) = abs
             .strip_prefix(wt.trim_end_matches('/'))
             .and_then(|rest| rest.strip_prefix('/'))
@@ -292,10 +303,57 @@ fn file_for(conn: &Connection, common: &str, path: &str) -> Result<Option<Codema
 /// Resolve `arg` against the map's paths and return up to `limit` files with
 /// their per-view presence, plus how many paths matched. Read-only.
 pub fn lookup_files(conn: &Connection, arg: &str, limit: usize) -> Result<FilesLookup> {
+    lookup_files_scoped(conn, arg, limit, None)
+}
+
+/// The common dirs (the repo identity) of the repos a project owns. See
+/// [`repos_matching`].
+pub type RepoScope = BTreeSet<String>;
+
+pub(super) fn in_scope(scope: Option<&RepoScope>, common_dir: &str) -> bool {
+    scope.is_none_or(|repos| repos.contains(common_dir))
+}
+
+/// The repos with a label that satisfies `belongs`. A repo's labels are its
+/// checkout directory name ([`repo_label`]) and the directory name of each of
+/// its worktrees, so a project named after a linked worktree finds its repo.
+/// Empty when the code map tables do not exist.
+pub fn repos_matching(conn: &Connection, belongs: &dyn Fn(&str) -> bool) -> Result<RepoScope> {
+    let mut found = RepoScope::new();
+    if !super::store::tables_ready(conn) {
+        return Ok(found);
+    }
+    let mut stmt = conn.prepare_cached("SELECT common_dir, worktree_path FROM codemap_views")?;
+    let views = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (common, worktree) in views {
+        if found.contains(&common) {
+            continue;
+        }
+        let worktree_name = std::path::Path::new(&worktree)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string());
+        if belongs(&repo_label(&common)) || worktree_name.is_some_and(|n| belongs(&n)) {
+            found.insert(common);
+        }
+    }
+    Ok(found)
+}
+
+/// [`lookup_files`] limited to the repos in `scope` (`None` = every repo). The
+/// scope applies before the cap, so a large unrelated repo cannot crowd out the
+/// project's own paths.
+pub fn lookup_files_scoped(
+    conn: &Connection,
+    arg: &str,
+    limit: usize,
+    scope: Option<&RepoScope>,
+) -> Result<FilesLookup> {
     if !super::store::tables_ready(conn) || limit == 0 {
         return Ok(FilesLookup::default());
     }
-    let (pairs, total_paths) = resolve_paths(conn, arg, limit)?;
+    let (pairs, total_paths) = resolve_paths(conn, arg, limit, scope)?;
     let mut files = Vec::new();
     for (common, path) in pairs {
         if let Some(file) = file_for(conn, &common, &path)? {

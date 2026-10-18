@@ -176,7 +176,7 @@ pub fn query(conn: &Connection, text: &str, limit: usize) -> Result<Vec<CodemapH
     if !super::store::tables_ready(conn) || limit == 0 {
         return Ok(Vec::new());
     }
-    hits_from_raw(conn, raw_matches(conn, text, limit)?, limit)
+    hits_from_raw(conn, raw_matches(conn, text, limit)?, limit, None)
 }
 
 /// Definitions whose name is exactly `name` (case-sensitive), grouped like
@@ -184,32 +184,60 @@ pub fn query(conn: &Connection, text: &str, limit: usize) -> Result<Vec<CodemapH
 /// rows, so a short name can be crowded out by longer ones; this asks the name
 /// index directly, so an exact definition is never lost to the cap.
 pub fn query_exact(conn: &Connection, name: &str, limit: usize) -> Result<Vec<CodemapHit>> {
+    query_exact_scoped(conn, name, limit, None)
+}
+
+/// [`query_exact`] limited to the repos in `scope` (`None` = every repo). Rows
+/// are limited in SQL to files some in-scope view holds, before the row cap, so
+/// a large unrelated repo cannot crowd out the project's own definitions.
+pub fn query_exact_scoped(
+    conn: &Connection,
+    name: &str,
+    limit: usize,
+    scope: Option<&super::files::RepoScope>,
+) -> Result<Vec<CodemapHit>> {
     if !super::store::tables_ready(conn) || limit == 0 || name.is_empty() {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare(
+    let mut sql = String::from(
         "SELECT d.name, COALESCE(d.signature, ''), f.path, d.blob_oid
          FROM codemap_defs d JOIN codemap_view_files f ON f.blob_oid = d.blob_oid
-         WHERE d.extractor_version = ?1 AND d.name = ?2
-         GROUP BY d.blob_oid, d.name, f.path ORDER BY f.path LIMIT ?3",
-    )?;
+         WHERE d.extractor_version = ?1 AND d.name = ?2",
+    );
+    let mut args: Vec<rusqlite::types::Value> = vec![
+        extractor_version().to_string().into(),
+        name.to_string().into(),
+    ];
+    if let Some(repos) = scope {
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; repos.len()].join(",");
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM codemap_views v WHERE v.id = f.view_id
+                          AND v.common_dir IN ({marks}))"
+        ));
+        args.extend(repos.iter().map(|c| c.clone().into()));
+    }
+    args.push(((limit * 8).clamp(50, 4000) as i64).into());
+    sql.push_str(&format!(
+        " GROUP BY d.blob_oid, d.name, f.path ORDER BY f.path LIMIT ?{}",
+        args.len()
+    ));
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(
-            params![
-                extractor_version(),
-                name,
-                (limit * 8).clamp(50, 4000) as i64
-            ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?
+        .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    hits_from_raw(conn, rows, limit)
+    hits_from_raw(conn, rows, limit, scope)
 }
 
 fn hits_from_raw(
     conn: &Connection,
     raw: Vec<(String, String, String, String)>,
     limit: usize,
+    scope: Option<&super::files::RepoScope>,
 ) -> Result<Vec<CodemapHit>> {
     // (common_dir, path, name) -> blobs the matches named, in first-seen order.
     let mut order: Vec<(String, String, String)> = Vec::new();
@@ -221,7 +249,7 @@ fn hits_from_raw(
         }
         let mut commons: Vec<&str> = holders_cache[&path]
             .iter()
-            .filter(|h| h.blob_oid == blob)
+            .filter(|h| h.blob_oid == blob && super::files::in_scope(scope, &h.common_dir))
             .map(|h| h.common_dir.as_str())
             .collect();
         commons.sort_unstable();
