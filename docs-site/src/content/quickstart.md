@@ -37,7 +37,7 @@ You don't need to do anything for these:
 - **Session start**: Past context injected before you ask
 - **Every prompt**: Context predicted and provided proactively
 - **Session end**: Session summarized and indexed
-- **Context compaction**: State backed up before trim
+- **Context compaction**: Transcript imported and recap anchor refreshed before trim
 - **File edits**: Tracked for future file-based search
 
 ## Run Evaluation

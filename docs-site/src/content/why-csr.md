@@ -29,8 +29,8 @@ Most memory tools give you a search box. CSR also **actively injects** relevant 
 - **SessionStart** — Searches history and surfaces relevant past work before you ask
 - **UserPromptSubmit** — Predicts context needed from your prompt using multi-signal scoring (semantic 50%, recency 20%, file overlap 20%, error patterns 10%)
 - **SessionEnd** — Auto-generates searchable narratives. No manual tagging
-- **Stop** — Detects stuck patterns, surfaces anti-patterns from past sessions
-- **PreCompact** — Backs up state before context compaction
+- **Stop**: Imports the transcript, keeps a rolling summary, stores a structured episode
+- **PreCompact**: Imports the transcript, refreshes the recap anchor, starts one dream cycle
 - **PostToolUse** — Tracks file edits with session-scoped deduplication
 
 ### Progressive Enrichment

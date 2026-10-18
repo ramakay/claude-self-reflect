@@ -14,20 +14,23 @@ This is what separates CSR from passive memory tools. **Context finds you.**
 
 ## SessionStart — Past Context Injection
 
-Fires when you start a conversation. Injects three things:
+Fires when you start a conversation. Injects one recap paragraph and, on `startup` and `resume`, one `learnt` line. No LLM writes either.
 
-- **CONTINUUM** — last session's state: what was asked, where it ended (LAST), what's next (NEXT), and how many code anchors are still intact. Anchors are AST symbols in the six parsed languages, with whole-file fallback anchors for everything else (v9.3) — Swift, Kotlin, any language
-- **EPISODE INDEX** — recent sessions as a pickup menu, newest first, each with its outcome and a one-call lookup
-- **Anti-patterns** from incomplete past sessions
+- **Recap**: a single causal paragraph about your last session. Each clause drops out when there is no evidence for it, `Next:` is never invented, and every settled claim carries a receipt.
+- **Learnt line**: what CSR stored for the previous session: memory notes, `csr_resolve` verdicts you confirmed, anchors retired by a commit. At most 320 bytes.
+- **Fallback**: if the recap feeds fail, SessionStart prints the older fragments (CONTINUUM, EPISODE INDEX) byte for byte.
 
-What Claude sees:
+The recap grammar:
 ```
-CSR CONTINUUM [2h ago]: fix the import chunking bug
-LAST: Fix verified — coverage went from ~1% to full transcripts (outcome=success)
-EPISODE INDEX — earlier threads, newest first:
-- [1d ago] release prep v9.2 — gated on go (outcome=partial) → csr_reflect_on_past("conv_...")
-- [3d ago] hook injection audit (outcome=success) → csr_reflect_on_past("conv_...")
+recap [<age>]: <intent>: <completed>. Settled: <claim> (<receipt>). Now: <blockers|still-open|proposals|todos>. Learnt-then-retired while away: <label> (superseded <date>, <oid>). Next: <evidenced next step>.
 ```
+
+The learnt line:
+```
+learnt [<age>]: <clauses>. [[CSR:LEARNT]]
+```
+
+Turn them off with `CSR_NO_RECAP=1` and `CSR_NO_LEARNT=1`.
 
 ## UserPromptSubmit — Predictive Injection
 
@@ -75,18 +78,13 @@ Project: claude-self-reflect | 2 hours, 102 messages
 - Iteration dedup prevents 500 embeddings/session
 ```
 
-## Stop — Stuck Detection
+## Stop: Transcript and Episode
 
-Surfaces anti-patterns from past sessions:
-```
-⚠️ Past anti-patterns detected:
-- Mocking the database caused prod migration failures
-- subprocess.run with shell=True caused injection vulnerabilities
-```
+Fires at the end of every response. Imports the growing transcript so it is searchable now, writes a rolling `session_latest` summary so SessionStart has something to show if the session dies, and extracts a structured episode: what was asked, files investigated and modified, tools, outcome, errors and todos. It also caches the anchor that a later compaction recap uses.
 
-## PreCompact — State Backup
+## PreCompact: Import, Refresh, Dream
 
-Captures session state before context compaction. Preserves progress.
+Fires before a compaction. Imports the transcript so it stays searchable after the compact, refreshes the saved task anchor so the post-compaction recap names the current task, and starts one detached dream cycle. It never blocks the compaction. Opt out of the dream with `CSR_NO_DREAM_ON_COMPACT=1` or `CSR_NO_DREAMING=1`.
 
 ## PostToolUse — File Edit Tracking
 

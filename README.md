@@ -232,8 +232,8 @@ All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/sp
 | **SessionStart** | Surfaces relevant past context at conversation start |
 | **UserPromptSubmit** | Predicts and injects context before Claude responds |
 | **PostToolUse** | Tracks file edits with session-scoped dedup |
-| **Stop** | Stores iteration learnings, detects stuck patterns |
-| **PreCompact** | Backs up state before context compaction |
+| **Stop** | Imports the transcript, keeps a rolling summary, stores a structured episode |
+| **PreCompact** | Imports the transcript, refreshes the recap anchor, starts one dream cycle |
 | **SessionEnd** | Stores session narrative for future retrieval |
 
 All hooks use catch-all error handling. They never block Claude Code.
