@@ -128,7 +128,7 @@ Smaller features that ship in this release. Each line says what you get.
 ### Memory that shows up by itself
 
 - **Recap line:** a session starts with one line on where you left off: intent, what got done, what was settled, what is open, what you corrected, the next step.
-- **Learnt line:** verified facts come first at session start, about 320 bytes, ahead of model-written summaries.
+- **Learnt line:** one line at session start on what CSR stored for your last session: memory notes, verdicts you confirmed, anchors a commit retired. Each clause carries a receipt. At most 320 bytes.
 - **Worktree and subfolder recall:** start Claude in a worktree or a subfolder and you get the repo's history, not an empty memory.
 - **Resume lineage:** after `claude -c` or a resume, CSR names the session you continued and treats it as the last session.
 - **Dream line at prompt time:** when your prompt names a symbol or file a dream concluded on, one line appears. The same dream never repeats.
