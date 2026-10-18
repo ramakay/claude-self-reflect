@@ -13,6 +13,7 @@ use std::path::Path;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use super::chunks::{self, RebuiltChunk, RebuiltSession};
 use super::{
     index_tool_results, truncate_chars, Entry, ParsedTranscript, Role, TranscriptRequest, ViewKind,
     DEFAULT_LAST_N,
@@ -26,7 +27,7 @@ use super::{
 /// envelope verbatim (adversarial review finding 2). JSON views don't need
 /// this — `serde_json` already escapes strings correctly; this is only for
 /// the compact-text renderer, which builds its own tags by hand.
-fn xml_escape(s: &str) -> String {
+pub(super) fn xml_escape(s: &str) -> String {
     if !s.contains(['&', '<', '>']) {
         return s.to_string();
     }
@@ -117,6 +118,231 @@ pub fn render_view(
             }
         },
     }
+}
+
+// ─── Views over a session rebuilt from indexed chunks ───
+
+/// One line said instead of numbers for the views that need structure the
+/// chunks do not keep.
+const CHUNKS_UNAVAILABLE: &str = "not available from indexed chunks: tool calls, tool results, errors and touched files are reduced to one-line markers or cut, so no count or list can be given";
+
+fn author_matches(role: super::RoleFilter, author: &str) -> bool {
+    use super::RoleFilter;
+    match role {
+        RoleFilter::All => true,
+        RoleFilter::User => author == "user",
+        RoleFilter::Assistant => author == "assistant",
+        RoleFilter::System => false,
+    }
+}
+
+fn chunk_item(turn: usize, c: &RebuiltChunk) -> RenderItem {
+    let many = if c.message_count > 1 {
+        format!(" (x{} messages)", c.message_count)
+    } else {
+        String::new()
+    };
+    RenderItem {
+        turn,
+        text: format!(
+            "[turn {turn}] {}{many}: {}",
+            xml_escape(&c.author),
+            xml_escape(&c.content)
+        ),
+        json: json!({
+            "turn": turn,
+            "role": c.author,
+            "chunk_timestamp": c.timestamp,
+            "seq": c.seq,
+            "message_count": c.message_count,
+            "text": c.content,
+        }),
+    }
+}
+
+/// A list view over the rebuilt chunks: the source header lines, then `items`.
+fn chunk_view(
+    s: &RebuiltSession,
+    view: &'static str,
+    open_tag: &str,
+    extra: Vec<(String, Value)>,
+    items: Vec<RenderItem>,
+    empty_message: String,
+) -> ViewData {
+    let mut header_lines = vec![open_tag.to_string()];
+    header_lines.extend(chunks::header_lines(s).into_iter().map(|l| xml_escape(&l)));
+    let mut extra_json = chunks::json_fields(s);
+    extra_json.extend(extra);
+    ViewData {
+        view,
+        extra_json,
+        header_lines,
+        items,
+        empty_message,
+    }
+}
+
+fn render_chunk_stats(s: &RebuiltSession, req: &TranscriptRequest) -> String {
+    let mut by_author: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut chars = 0usize;
+    for c in &s.chunks {
+        *by_author.entry(c.author.as_str()).or_insert(0) += 1;
+        chars += c.content.chars().count();
+    }
+    if req.json {
+        let mut value = serde_json::Map::new();
+        value.insert("view".into(), json!("stats"));
+        for (k, v) in chunks::json_fields(s) {
+            value.insert(k, v);
+        }
+        value.insert("chunks_by_author".into(), json!(by_author));
+        value.insert("chars".into(), json!(chars));
+        value.insert("unavailable".into(), json!(CHUNKS_UNAVAILABLE));
+        enforce_hard_ceiling(Value::Object(value).to_string(), req.budget_chars)
+    } else {
+        let mut out = String::from("<transcript_stats>\n");
+        for line in chunks::header_lines(s) {
+            out.push_str(&format!("  <note>{}</note>\n", xml_escape(&line)));
+        }
+        out.push_str(&format!(
+            "  <project>{}</project>\n",
+            xml_escape(&s.project)
+        ));
+        let authors = by_author
+            .iter()
+            .map(|(k, v)| format!("{}={v}", xml_escape(k)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "  <chunks total=\"{}\" read=\"{}\" by_author=\"{authors}\" chars=\"{chars}\"/>\n",
+            s.total_chunks,
+            s.chunks.len()
+        ));
+        out.push_str(&format!(
+            "  <span first=\"{}\" last=\"{}\"/>\n",
+            xml_escape(&s.first_ts),
+            xml_escape(&s.last_ts)
+        ));
+        out.push_str(&format!(
+            "  <unavailable>{}</unavailable>\n</transcript_stats>\n",
+            xml_escape(CHUNKS_UNAVAILABLE)
+        ));
+        enforce_hard_ceiling(out, req.budget_chars)
+    }
+}
+
+fn chunk_error(message: &str, json: bool) -> String {
+    if json {
+        json!({ "error": message }).to_string()
+    } else {
+        format!("<transcript_error>\n<error>{message}</error>\n</transcript_error>")
+    }
+}
+
+/// Render `req.view` over a session rebuilt from chunks. `grep` and `slice`
+/// read the rebuilt text, `prompts` lists the chunks whose author is the user,
+/// `stats` gives chunk counts, and the structural views say they are not
+/// available. A turn is a chunk.
+pub(crate) fn render_rebuilt(s: &RebuiltSession, req: &TranscriptRequest) -> String {
+    let in_scope = |i: usize, c: &RebuiltChunk| {
+        author_matches(req.role, &c.author) && turn_in_range(i + 1, req.turns)
+    };
+    let view = match req.view {
+        ViewKind::Stats => return render_chunk_stats(s, req),
+        ViewKind::Grep => {
+            let Some(pattern) = req.grep.as_deref() else {
+                return chunk_error("grep view requires --grep <regex>", req.json);
+            };
+            let re = match Regex::new(pattern) {
+                Ok(re) => re,
+                Err(e) => {
+                    return chunk_error(&format!("invalid --grep regex '{pattern}': {e}"), req.json)
+                }
+            };
+            let items = s
+                .chunks
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| in_scope(*i, c) && re.is_match(&c.content))
+                .map(|(i, c)| chunk_item(i + 1, c))
+                .collect();
+            chunk_view(
+                s,
+                "grep",
+                "<transcript_grep>",
+                vec![("pattern".to_string(), json!(pattern))],
+                items,
+                "(no matches)".to_string(),
+            )
+        }
+        ViewKind::Slice => {
+            let by_role: Vec<(usize, &RebuiltChunk)> = s
+                .chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| author_matches(req.role, &c.author))
+                .collect();
+            let selected: Vec<(usize, &RebuiltChunk)> = if req.turns.is_some() {
+                by_role
+                    .into_iter()
+                    .filter(|(i, _)| turn_in_range(i + 1, req.turns))
+                    .collect()
+            } else {
+                let n = req.last.unwrap_or(DEFAULT_LAST_N);
+                let skip = by_role.len().saturating_sub(n);
+                by_role.into_iter().skip(skip).collect()
+            };
+            let items = selected
+                .into_iter()
+                .map(|(i, c)| chunk_item(i + 1, c))
+                .collect();
+            chunk_view(
+                s,
+                "slice",
+                "<transcript_slice>",
+                vec![],
+                items,
+                "(no turns in the requested range)".to_string(),
+            )
+        }
+        ViewKind::Prompts => {
+            let items = s
+                .chunks
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| c.author == "user" && in_scope(*i, c))
+                .map(|(i, c)| chunk_item(i + 1, c))
+                .collect();
+            let mut v = chunk_view(
+                s,
+                "prompts",
+                "<transcript_prompts>",
+                vec![("include_system".to_string(), json!(req.include_system))],
+                items,
+                "(no user prompts found)".to_string(),
+            );
+            v.header_lines.push(xml_escape(
+                "prompts here = chunks whose stored author is the user; the hidden-class filter (task notifications, skill bodies, ...) is not applied, and a chunk marked (xN messages) holds more than one message",
+            ));
+            v
+        }
+        ViewKind::Tools | ViewKind::Files | ViewKind::Errors => {
+            let (name, tag) = match req.view {
+                ViewKind::Tools => ("tools", "<transcript_tools>"),
+                ViewKind::Files => ("files", "<transcript_files>"),
+                _ => ("errors", "<transcript_errors>"),
+            };
+            chunk_view(
+                s,
+                name,
+                tag,
+                vec![("available".to_string(), json!(false))],
+                Vec::new(),
+                format!("({CHUNKS_UNAVAILABLE})"),
+            )
+        }
+    };
+    view.render(req.budget_chars, req.json)
 }
 
 // ─── Generic list-view renderer (prompts/tools/files/errors/slice/grep) ───
@@ -239,28 +465,48 @@ impl ViewData {
             acc += item_chars;
             shown += 1;
         }
-        let truncated = shown < self.items.len();
 
-        let mut obj = serde_json::Map::new();
-        obj.insert("view".into(), json!(self.view));
-        for (k, v) in &self.extra_json {
-            obj.insert(k.clone(), v.clone());
+        let build = |shown: usize| -> String {
+            let truncated = shown < self.items.len();
+            let mut obj = serde_json::Map::new();
+            obj.insert("view".into(), json!(self.view));
+            for (k, v) in &self.extra_json {
+                obj.insert(k.clone(), v.clone());
+            }
+            if self.items.is_empty() {
+                obj.insert("message".into(), json!(self.empty_message));
+            }
+            obj.insert(
+                "items".into(),
+                Value::Array(self.items[..shown].iter().map(|i| i.json.clone()).collect()),
+            );
+            obj.insert("truncated".into(), json!(truncated));
+            if truncated {
+                let remaining = self.items.len() - shown;
+                let resume_turn = self.items[shown].turn;
+                obj.insert("remaining".into(), json!(remaining));
+                obj.insert("resume_turns".into(), json!(format!("{resume_turn}..")));
+            }
+            serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default()
+        };
+        let mut rendered = build(shown);
+        // The estimate above counts compact items; the pretty-printed object
+        // with its extra fields can run past the ceiling, and cutting that
+        // string mid-way would leave invalid JSON. Drop whole items instead,
+        // to the largest count that fits.
+        let ceiling = budget_chars.saturating_add(TRUNCATION_MARKER_OVERHEAD_CHARS);
+        if rendered.chars().count() > ceiling && shown > 0 {
+            let (mut lo, mut hi) = (0usize, shown - 1);
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if build(mid).chars().count() <= ceiling {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            rendered = build(lo);
         }
-        if self.items.is_empty() {
-            obj.insert("message".into(), json!(self.empty_message));
-        }
-        obj.insert(
-            "items".into(),
-            Value::Array(self.items[..shown].iter().map(|i| i.json.clone()).collect()),
-        );
-        obj.insert("truncated".into(), json!(truncated));
-        if truncated {
-            let remaining = self.items.len() - shown;
-            let resume_turn = self.items[shown].turn;
-            obj.insert("remaining".into(), json!(remaining));
-            obj.insert("resume_turns".into(), json!(format!("{resume_turn}..")));
-        }
-        let rendered = serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default();
         enforce_hard_ceiling(rendered, budget_chars)
     }
 }

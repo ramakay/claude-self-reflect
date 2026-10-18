@@ -3490,6 +3490,21 @@ pub fn get_full_conversation(
     conversation_id: &str,
     project: Option<&str>,
 ) -> String {
+    get_full_conversation_with_db(projects_dir, data_dir, None, conversation_id, project)
+}
+
+/// [`get_full_conversation`], and when neither the JSONL nor the mirror copy
+/// exists, answer from the session's indexed chunks in `db`: the rebuilt text
+/// under a header that says it is lossy, cut at the same cap `csr_transcript`
+/// uses. A session only the registry knows gets a registry-aware error.
+pub fn get_full_conversation_with_db(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    db: Option<&Storage>,
+    conversation_id: &str,
+    project: Option<&str>,
+) -> String {
+    use crate::transcript::chunks::{self, DbLookup};
     let mut lookup = find_conversation_file(projects_dir, conversation_id, project);
     let mut mirrored = false;
     if let (ConversationLookup::NotFound, Some(data_dir)) = (&lookup, data_dir) {
@@ -3510,7 +3525,18 @@ pub fn get_full_conversation(
             Some(&project_name),
         ),
         ConversationLookup::NotFound => {
-            format::format_full_conversation(conversation_id, None, None)
+            match db.map(|d| chunks::lookup(d, conversation_id, project)) {
+                Some(DbLookup::Rebuilt(rebuilt)) => {
+                    chunks::full_conversation_text(&rebuilt, MCP_TRANSCRIPT_MAX_BUDGET_CHARS)
+                }
+                Some(DbLookup::Known(known)) => chunks::known_message(&known, false),
+                Some(DbLookup::Ambiguous(candidates)) => {
+                    format_ambiguous_conversation(conversation_id, &candidates)
+                }
+                Some(DbLookup::Unknown) | None => {
+                    format::format_full_conversation(conversation_id, None, None)
+                }
+            }
         }
         ConversationLookup::Ambiguous(candidates) => {
             format_ambiguous_conversation(conversation_id, &candidates)
@@ -3551,6 +3577,45 @@ const MCP_TRANSCRIPT_MAX_BUDGET_CHARS: usize = 60_000;
 pub fn transcript(
     projects_dir: &Path,
     data_dir: Option<&Path>,
+    session: &str,
+    view: &str,
+    project: Option<&str>,
+    role: Option<&str>,
+    turns: Option<&str>,
+    last: Option<usize>,
+    grep: Option<&str>,
+    tool: Option<&str>,
+    json: bool,
+    budget_chars: Option<usize>,
+    sidechains: bool,
+    include_system: bool,
+) -> Result<String> {
+    transcript_with_db(
+        projects_dir,
+        data_dir,
+        None,
+        session,
+        view,
+        project,
+        role,
+        turns,
+        last,
+        grep,
+        tool,
+        json,
+        budget_chars,
+        sidechains,
+        include_system,
+    )
+}
+
+/// [`transcript`], answering from the indexed chunks in `db` when the JSONL and
+/// the mirror copy are both gone.
+#[allow(clippy::too_many_arguments)]
+pub fn transcript_with_db(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    db: Option<&Storage>,
     session: &str,
     view: &str,
     project: Option<&str>,
@@ -3611,9 +3676,10 @@ pub fn transcript(
         include_system,
     };
 
-    Ok(crate::transcript::run_with_mirror(
+    Ok(crate::transcript::run_with_sources(
         projects_dir,
         data_dir,
+        db,
         &req,
     ))
 }

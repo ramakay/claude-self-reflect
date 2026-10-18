@@ -800,9 +800,10 @@ impl CsrServer {
         params: Parameters<GetFullConversationParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
-        let text = tools::get_full_conversation(
+        let text = tools::get_full_conversation_with_db(
             &self.projects_dir,
             self.index_dir.parent(),
+            Some(&self.storage),
             &p.conversation_id,
             p.project.as_deref(),
         );
@@ -848,9 +849,10 @@ impl CsrServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let p = params.0;
         let json_mode = p.json.unwrap_or(false);
-        let result = tools::transcript(
+        let result = tools::transcript_with_db(
             &self.projects_dir,
             self.index_dir.parent(),
+            Some(&self.storage),
             &p.session,
             &p.view,
             p.project.as_deref(),

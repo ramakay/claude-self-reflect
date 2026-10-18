@@ -942,7 +942,7 @@ fn parse_jsonl_reader_resuming<R: BufRead>(
 
 /// Character budget per chunk. Kept under the embedding model's ~256-token window
 /// (all-MiniLM-L6-v2) so each chunk embeds in full rather than head-truncated.
-const CHUNK_CHAR_BUDGET: usize = 900;
+pub(crate) const CHUNK_CHAR_BUDGET: usize = 900;
 
 /// Chunk an already-parsed sequence of messages through the same bounded
 /// transcript path used by JSONL imports. Benchmark adapters use this seam so
@@ -1264,7 +1264,7 @@ fn attach_chunk_evidence(
 
 /// Per-tool_result character cap. Bounds giant logs while preserving enough of a
 /// fetched doc / subagent report for the size-based chunker to slice and embed.
-const MAX_TOOL_RESULT_CHARS: usize = 4000;
+pub(crate) const MAX_TOOL_RESULT_CHARS: usize = 4000;
 
 fn provenance_event_id(
     conversation_id: &str,
@@ -1832,6 +1832,9 @@ pub(crate) fn strip_private_tags(text: &str) -> String {
     result
 }
 
+/// Characters of a `command` input kept in a tool_use marker.
+pub(crate) const TOOL_COMMAND_DETAIL_CHARS: usize = 120;
+
 /// Extract searchable context from tool_use blocks in a message.
 ///
 /// Coding sessions are dominated by tool calls (Read, Edit, Bash, Grep, etc.).
@@ -1874,7 +1877,7 @@ fn extract_tool_context(msg: &serde_json::Value) -> String {
             parts.into_iter().rev().collect::<Vec<_>>().join("/")
         } else if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
             // Truncate long commands
-            let truncated: String = cmd.chars().take(120).collect();
+            let truncated: String = cmd.chars().take(TOOL_COMMAND_DETAIL_CHARS).collect();
             truncated
         } else if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
             pat.to_string()

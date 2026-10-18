@@ -143,7 +143,10 @@ enum Commands {
     /// grep — without hand-rolling a jq/Python parser over raw JSONL.
     Transcript {
         /// Session id (substring match against files under --projects-dir)
-        /// or an explicit path to a transcript JSONL file.
+        /// or an explicit path to a transcript JSONL file. When the JSONL and
+        /// the mirror copy are both gone, a session CSR holds indexed chunks
+        /// for (exact id, or a unique prefix of 8+ characters) is rebuilt from
+        /// them in --db-path, read-only, under a header that says it is lossy.
         session: String,
 
         /// View to render: stats|prompts|tools|files|errors|slice|grep
@@ -1295,8 +1298,20 @@ async fn run(
             include_system,
         };
         let data_dir = args.db_path.parent().map(std::path::Path::to_path_buf);
-        let out =
-            csr_engine::transcript::run_with_mirror(&args.projects_dir, data_dir.as_deref(), &req);
+        // Read-only: no migrations, no write, and no database is created just
+        // to answer. A missing or unreadable database leaves the JSONL and
+        // mirror answers as they were.
+        let db = if args.db_path.is_file() {
+            csr_engine::storage::Storage::open_read_only(&args.db_path).ok()
+        } else {
+            None
+        };
+        let out = csr_engine::transcript::run_with_sources(
+            &args.projects_dir,
+            data_dir.as_deref(),
+            db.as_ref(),
+            &req,
+        );
         print!("{out}");
         if !out.ends_with('\n') {
             println!();

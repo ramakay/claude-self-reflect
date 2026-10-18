@@ -29,6 +29,9 @@
 //! Session-id → path resolution, however, *is* shared: both this module and
 //! `get_full_conversation` call [`crate::mcp::tools::find_conversation_file`].
 
+pub(crate) mod chunks;
+#[cfg(test)]
+mod chunks_tests;
 pub mod instrumentation;
 pub mod intent_events;
 pub mod query;
@@ -1168,6 +1171,19 @@ pub fn run_with_mirror(
     data_dir: Option<&Path>,
     req: &TranscriptRequest,
 ) -> String {
+    run_with_sources(projects_dir, data_dir, None, req)
+}
+
+/// [`run_with_mirror`], and when the JSONL and the mirror copy are both gone,
+/// answer from the indexed chunks in `db` (opened read-only by the caller).
+/// Order: JSONL, mirror, database chunks, a registry-aware error, the plain
+/// not-found message. A session rebuilt from chunks is lossy and says so.
+pub fn run_with_sources(
+    projects_dir: &Path,
+    data_dir: Option<&Path>,
+    db: Option<&crate::storage::Storage>,
+    req: &TranscriptRequest,
+) -> String {
     if req.sidechains {
         return sidechains_reserved_message(req.json);
     }
@@ -1176,7 +1192,20 @@ pub fn run_with_mirror(
     let (path, project) =
         match resolve_session_path(projects_dir, data_dir, &req.session, req.project.as_deref()) {
             ConversationLookup::Found(p, proj) => (p, proj),
-            ConversationLookup::NotFound => return not_found_message(&req.session, req.json),
+            ConversationLookup::NotFound => {
+                return match db.map(|d| chunks::lookup(d, &req.session, req.project.as_deref())) {
+                    Some(chunks::DbLookup::Rebuilt(rebuilt)) => {
+                        query::render_rebuilt(&rebuilt, req)
+                    }
+                    Some(chunks::DbLookup::Known(known)) => chunks::known_message(&known, req.json),
+                    Some(chunks::DbLookup::Ambiguous(candidates)) => {
+                        ambiguous_message(&req.session, &candidates, req.json)
+                    }
+                    Some(chunks::DbLookup::Unknown) | None => {
+                        not_found_message(&req.session, req.json)
+                    }
+                };
+            }
             ConversationLookup::Ambiguous(candidates) => {
                 return ambiguous_message(&req.session, &candidates, req.json)
             }
