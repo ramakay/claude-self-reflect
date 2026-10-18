@@ -12,11 +12,12 @@ Single 44MB binary. No databases. No containers. No API keys required.
 
 [Install](#install) | [How It Works](#how-it-works) | [MCP Tools](#mcp-tools) | [Paper](docs/plans/annaswamy-2026-similarity-drowns-intent.pdf) | [FAQ](https://ramakay.github.io/claude-self-reflect/#/docs/troubleshooting)
 
-> **v9.4 — Multi-Source Memory**
-> CSR now remembers more than transcripts: task outcomes, plan documents, and a cross-project session registry — each absorbed at the lifecycle stage it belongs to.
-> Episodes carry real task state again (Claude Code's TodoWrite→TaskCreate rename had silently emptied them — found, fixed, and guarded with schema-miss telemetry).
+> **v10.1.0: Recap, Dreaming, Multi-Source Memory**
+> Each session starts with one recap paragraph (intent, what got done, what was settled, what is open, the next step) instead of a pile of fragments, plus a `learnt` line of what CSR stored last time. Every clause carries a receipt or drops out.
+> Dreaming checks old conclusions against your git history and marks a stale anchor with the commit that changed it. No LLM in that check.
+> CSR also reads plans, task state, Codex sessions, subagent transcripts, memory-file metadata and the session registry, and ships a companion plugin with a pane beside the session.
 > Sub-millisecond search, ~150ms cached startup, 1150+ tests (lib, verified at commit ff4ad3f), zero external dependencies.
-> [Release notes](https://github.com/ramakay/claude-self-reflect/releases/tag/v9.4.0)
+> [Release notes](CHANGELOG.md)
 
 <img src="docs-site/public/images/csr-demo.gif" alt="CSR Demo — Setup, Search, and Hooks" width="800" />
 

@@ -842,26 +842,26 @@ function PullQuoteCard() {
 function WhatsNewCard() {
   return (
     <BentoCard className="card--whatsnew" delay={560} id="whats-new">
-      <CardKicker number="—" label="LATEST RELEASE" accent="purple" />
-      <h2 className="type-hl-sm">What's New in v9.4.0</h2>
+      <CardKicker number="—" label="UPCOMING RELEASE" accent="purple" />
+      <h2 className="type-hl-sm">What's New in v10.1.0</h2>
       <ul className="whatsnew-list">
         <li>
-          <strong>Multi-source memory</strong> — CSR now absorbs more of <code>~/.claude</code> than transcripts: task outcomes, plan documents, and a cross-project session registry, each at the lifecycle stage it belongs to
+          <strong>Recap paragraph</strong>: SessionStart injects one causal paragraph: intent, what got done, what was settled, what is open now, the next step. Each clause drops when there is no evidence, <code>Next:</code> is never invented, and there is no LLM call
         </li>
         <li>
-          <strong>Task-state regression fixed</strong> — Claude Code renamed TodoWrite → TaskCreate and episode task extraction silently emptied; episodes carry real todos and task-aware outcomes again, with open tasks capping a session at "partial"
+          <strong>Learnt line</strong>: a separate line of what CSR stored for the previous session: memory notes, <code>csr_resolve</code> verdicts you confirmed, anchors retired by a commit
         </li>
         <li>
-          <strong>Plan documents searchable</strong> — <code>~/.claude/plans/*.md</code> imported as decay-aware chunks, correlated to their origin conversation; the origin always outranks its plan restatement in search
+          <strong>Dreaming</strong>: <code>codewitness</code> stamps code spans at commit OIDs and checks old conclusions against git history; search shows <code>[stale anchor]</code> and <code>[evolved]</code> notes with commit receipts
         </li>
         <li>
-          <strong>Honest coverage</strong> — <code>csr-engine status</code> now measures sessions seen vs imported, unindexed transcripts, and per-source schema-miss counters so silent format churn can't rot quality invisibly
+          <strong>More sources</strong>: subagent transcripts, <code>~/.claude/plans</code>, task state, Codex sessions, and memory-file metadata join the corpus; <code>csr_transcript</code> is the 16th MCP tool
         </li>
         <li>
-          <strong>Resolution proposals</strong> — completed tasks matching still-open items generate proposals a human promotes via <code>csr_resolve</code>; never automatic verdicts
+          <strong>Companion plugin</strong>: a pane beside the session shows what memory handed Claude and which code changed since your past sessions
         </li>
       </ul>
-      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/releases/tag/v9.4.0" target="_blank" rel="noopener noreferrer">Full release notes →</a>
+      <a className="cite-link" href="https://github.com/ramakay/claude-self-reflect/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">Full changelog →</a>
     </BentoCard>
   )
 }
