@@ -23,7 +23,7 @@ Configured in `~/.claude/settings.json` via `csr-engine hook install --apply`.
 | CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | Custom DB path |
 | CSR_TIMING_LOG | ~/.claude-self-reflect/hook-timing.log | Custom hook-timing log path (test runs redirect to a temp file automatically) |
 
-AI narratives run through the Claude Code CLI (`claude -p`) — no API key required.
+AI narratives run through the Claude Code CLI (`claude -p`) and your Claude Code login, so no API key is required. `ANTHROPIC_API_KEY` is read only by the optional Batch API narrator in the daemon.
 
 ## Database
 

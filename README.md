@@ -262,7 +262,7 @@ settled in 997 ms. The six shell hooks keep running underneath. Receipts and cav
 <details>
 <summary><strong>AI Narratives</strong> — optional 9.3x quality boost</summary>
 
-Transform raw conversations into rich, searchable narratives. Requires an Anthropic API key.
+Transform raw conversations into rich, searchable narratives. Runs through `claude -p` with your Claude Code login, so no API key is needed. An `ANTHROPIC_API_KEY` is read only by the optional Batch API path.
 
 ```bash
 csr-engine daemon
@@ -272,7 +272,7 @@ csr-engine daemon
 |--------|---------|-------------------|
 | Search quality | 0.074 | 0.691 (9.3x) |
 | Token compression | 100% | 18% (82% reduction) |
-| Cost per conversation | - | ~$0.012 (Batch API) |
+| Cost per conversation | - | ~$0.012 (Batch API path, needs a key) |
 
 > **Token transparency:** Optional AI narratives (session briefings + story extraction) run
 > `claude -p` against your existing Claude subscription — smallest available model, capped
