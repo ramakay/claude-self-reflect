@@ -332,12 +332,25 @@ Full guide: [Documentation](https://ramakay.github.io/claude-self-reflect/#/docs
 <details>
 <summary><strong>Uninstall</strong></summary>
 
+There is no `uninstall` command. `npm uninstall` does not touch your Claude Code settings, and `csr-engine hook install --apply` only adds hooks. Remove the hooks and the daemon by hand:
+
 ```bash
+# 1. Stop the daemon LaunchAgent, if you installed it (macOS)
+launchctl bootout gui/$(id -u)/com.ramakay.csr-engine.daemon
+rm ~/Library/LaunchAgents/com.ramakay.csr-engine.daemon.plist
+
+# 2. Unregister the MCP server
 claude mcp remove claude-self-reflect
+
+# 3. Delete CSR's data, including the transcript mirror
 rm -rf ~/.claude-self-reflect/
+
+# 4. Delete the binary
 rm ~/.local/bin/csr-engine
 npm uninstall -g claude-self-reflect  # if installed via npm
 ```
+
+Then open `~/.claude/settings.json` and delete every entry under `hooks` whose command starts with `csr-engine hook` (SessionStart, UserPromptSubmit, PostToolUse, Stop, PreCompact, SessionEnd). Claude Code keeps calling them until you do, and they fail once the binary is gone. If you installed the companion plugin, remove it with `/plugin` in Claude Code.
 
 </details>
 
