@@ -45,6 +45,10 @@ crossterm = "0.29"
 ignore = "0.4"
 toml = "1.1"
 codewitness = { path = "../codewitness" }
+# Code map (src/codemap): reads each worktree's HEAD and index without spawning git.
+# Same gix version and backend as codewitness; "index" is already in the graph via
+# its "revision" feature, so this adds no crate to Cargo.lock.
+gix = { version = "0.86", default-features = false, features = ["index", "sha1"] }
 minijinja = "2.22"
 # Journal v4 dream server (loopback only). `default-features = false` keeps
 # http2, ws, multipart, form and macros OUT of the binary: the server binds

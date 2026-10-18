@@ -119,6 +119,14 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Live code map: a per-worktree map of every definition in your repos, so
+    /// CSR can answer for code no conversation touched. `add`/`remove` register
+    /// repos, `scan` builds the map, `status` and `query` read it. Off with
+    /// `CSR_NO_CODEMAP=1`.
+    Codemap {
+        #[command(subcommand)]
+        action: CodemapAction,
+    },
     /// Facts about a symbol's history, read straight from git (never opens
     /// the database): `symbol change` says whether a commit authored a
     /// change to a symbol and, for a merge that did not, which commit did.
@@ -518,6 +526,40 @@ enum ProvenanceAction {
 /// `dream` command's flags of the same name, and clap subcommand namespaces
 /// keep the two from colliding.
 /// `mirror` subcommands. None of them loads the embedding model or the index.
+/// `codemap` subcommands. They use the global `--db-path`; none loads the
+/// embedding model or the search index.
+#[derive(Subcommand, Debug)]
+enum CodemapAction {
+    /// Register a repo (any path inside it) and list its worktrees
+    Add { path: PathBuf },
+    /// Stop mapping a repo: drops its views and keeps discovery from re-adding it
+    Remove { path: PathBuf },
+    /// Map a repo's worktrees (`--repo`), or every discovered and registered repo (`--all`)
+    Scan {
+        /// Any path inside the repo to scan
+        #[arg(long, conflicts_with = "all")]
+        repo: Option<PathBuf>,
+        /// Scan every registered repo plus the ones discovery finds
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Per repo and worktree: branch, head, files, dirty, untracked, age; totals
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find a definition by name, signature or path; shows which worktrees hold the same blob
+    Query {
+        text: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+}
+
 /// `symbol` subcommands. None of them opens the database or loads the
 /// embedding model or the index.
 #[derive(Subcommand, Debug)]
@@ -1233,6 +1275,21 @@ async fn run(
             Err(message) => {
                 println!("{}", serde_json::json!({ "error": message }));
                 std::process::exit(1);
+            }
+        };
+    }
+
+    if let Some(Commands::Codemap { ref action }) = args.command {
+        use csr_engine::codemap::cli;
+        return match action {
+            CodemapAction::Add { path } => cli::add(&args.db_path, path),
+            CodemapAction::Remove { path } => cli::remove(&args.db_path, path),
+            CodemapAction::Scan { repo, all, json } => {
+                cli::scan(&args.db_path, repo.as_deref(), *all, *json)
+            }
+            CodemapAction::Status { json } => cli::status(&args.db_path, *json),
+            CodemapAction::Query { text, json, limit } => {
+                cli::query(&args.db_path, text, *json, *limit)
             }
         };
     }

@@ -26,7 +26,7 @@ use crate::storage::codegraph::upsert_repo_defs;
 /// Most of these are also caught by the walker's default hidden-file filter
 /// (`.git`), but build/vendor dirs like `node_modules` or `target` are not
 /// dot-prefixed, so they need an explicit skip.
-const HARD_SKIP_DIRS: &[&str] = &[
+pub(crate) const HARD_SKIP_DIRS: &[&str] = &[
     ".git",
     "node_modules",
     "target",
@@ -46,13 +46,13 @@ const HARD_SKIP_DIRS: &[&str] = &[
 /// counted in `files_scanned`, but `extract_graph_fragment_for_file` returns
 /// an empty fragment for them (its internal `lang_from_path_str` yields
 /// `None`), so they never contribute defs. Documented deviation, not a bug.
-const CODE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "py", "go", "swift"];
+pub(crate) const CODE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "py", "go", "swift"];
 
 /// Per-file size cap: files larger than this are never read or extracted.
-const MAX_FILE_BYTES: u64 = 512 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 512 * 1024;
 
 /// Per-project scan cap: stop after this many files have been scanned.
-const MAX_FILES_PER_PROJECT: usize = 5000;
+pub(crate) const MAX_FILES_PER_PROJECT: usize = 5000;
 
 /// A single line longer than this is treated as evidence the file is
 /// minified/bundled rather than hand-written source (WCR Phase 6, TASK D).
@@ -104,7 +104,7 @@ impl ScanStats {
 /// True when `path`/`source` looks minified/bundled rather than
 /// hand-written: a `.min.js` filename, or any single line over
 /// `MINIFIED_LINE_LEN_THRESHOLD` characters.
-fn looks_minified(path: &Path, source: &str) -> bool {
+pub(crate) fn looks_minified(path: &Path, source: &str) -> bool {
     let min_js_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -116,7 +116,7 @@ fn looks_minified(path: &Path, source: &str) -> bool {
             .any(|line| line.len() > MINIFIED_LINE_LEN_THRESHOLD)
 }
 
-fn has_code_extension(path: &Path) -> bool {
+pub(crate) fn has_code_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| {
@@ -127,7 +127,7 @@ fn has_code_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_hard_skip_dir(name: &str) -> bool {
+pub(crate) fn is_hard_skip_dir(name: &str) -> bool {
     HARD_SKIP_DIRS.contains(&name)
 }
 

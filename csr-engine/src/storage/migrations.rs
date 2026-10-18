@@ -2280,10 +2280,92 @@ pub fn run(conn: &Connection) -> Result<()> {
         );",
     )?;
 
+    // Code map (src/codemap): a per-worktree map of every definition in the user's
+    // repos. Additive only (IF NOT EXISTS, nothing dropped or altered), so
+    // re-running this on an up-to-date database writes nothing. The tables that the
+    // freshness job (`codemap_queue`) and the consumers (`codemap_fts`) need are
+    // created here with the rest, so they add no migration of their own.
+    conn.execute_batch(CREATE_CODEMAP)?;
+
     finish_chunks_fts_compaction(conn)?;
 
     Ok(())
 }
+
+/// Code map schema. A repo is a git common dir; a view is one worktree of it;
+/// a blob is file content keyed by git blob oid and parsed once per extractor
+/// version however many views hold it. `codemap_fts` has one row per distinct
+/// (path, blob, def) that at least one view currently holds; its rowid is a
+/// hash of those parts, so rows are added and removed without scanning the table.
+const CREATE_CODEMAP: &str = "
+    CREATE TABLE IF NOT EXISTS codemap_repos (
+        common_dir   TEXT PRIMARY KEY,
+        main_path    TEXT,
+        source       TEXT NOT NULL,
+        enabled      INTEGER NOT NULL DEFAULT 1,
+        added_at     INTEGER NOT NULL,
+        last_poll_at INTEGER,
+        status       TEXT NOT NULL DEFAULT 'ok'
+    );
+    CREATE TABLE IF NOT EXISTS codemap_views (
+        id             INTEGER PRIMARY KEY,
+        common_dir     TEXT NOT NULL,
+        worktree_path  TEXT NOT NULL UNIQUE,
+        branch         TEXT,
+        head_oid       TEXT,
+        index_mtime_ns INTEGER,
+        index_size     INTEGER,
+        scanned_at     INTEGER,
+        status         TEXT NOT NULL,
+        files          INTEGER NOT NULL DEFAULT 0,
+        truncated      INTEGER NOT NULL DEFAULT 0,
+        scan_ms        INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_codemap_views_common_dir ON codemap_views(common_dir);
+    CREATE TABLE IF NOT EXISTS codemap_view_files (
+        view_id  INTEGER NOT NULL,
+        path     TEXT NOT NULL,
+        blob_oid TEXT NOT NULL,
+        dirty    INTEGER NOT NULL DEFAULT 0,
+        size     INTEGER,
+        mtime_ns INTEGER,
+        PRIMARY KEY (view_id, path)
+    ) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS idx_codemap_view_files_blob ON codemap_view_files(blob_oid);
+    CREATE INDEX IF NOT EXISTS idx_codemap_view_files_path ON codemap_view_files(path);
+    CREATE TABLE IF NOT EXISTS codemap_blobs (
+        blob_oid          TEXT NOT NULL,
+        extractor_version TEXT NOT NULL,
+        lang              TEXT,
+        status            TEXT NOT NULL,
+        defs              INTEGER NOT NULL DEFAULT 0,
+        parsed_at         INTEGER NOT NULL,
+        PRIMARY KEY (blob_oid, extractor_version)
+    ) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS codemap_defs (
+        blob_oid          TEXT NOT NULL,
+        extractor_version TEXT NOT NULL,
+        name              TEXT NOT NULL,
+        fqname            TEXT,
+        kind              TEXT NOT NULL,
+        span_start        INTEGER NOT NULL,
+        span_end          INTEGER NOT NULL,
+        signature         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_codemap_defs_blob ON codemap_defs(blob_oid, extractor_version);
+    CREATE INDEX IF NOT EXISTS idx_codemap_defs_name ON codemap_defs(name);
+    CREATE TABLE IF NOT EXISTS codemap_queue (
+        path        TEXT PRIMARY KEY,
+        enqueued_at INTEGER NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS codemap_fts USING fts5(
+        name,
+        signature,
+        path,
+        blob_oid UNINDEXED,
+        tokenize='porter unicode61'
+    );
+";
 
 /// `intent_events_v2`: make the transcript part of an event's identity.  A
 /// parent session may have many child transcripts whose turns and byte

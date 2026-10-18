@@ -1007,6 +1007,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "fs2",
+ "gix",
  "hnsw_rs",
  "ignore",
  "libc",

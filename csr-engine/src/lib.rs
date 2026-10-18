@@ -1,5 +1,6 @@
 pub mod api;
 pub mod binary_identity;
+pub mod codemap;
 pub mod daemon;
 pub mod dream;
 pub mod embeddings;
