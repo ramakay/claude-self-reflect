@@ -20,11 +20,9 @@ Installing CSR does not activate it. Nothing is written to `~/.claude/settings.j
 
 ## Optional Cloud: AI Narratives
 
-Only Layer 3 uses cloud API. Requires explicit opt-in:
-1. Your own ANTHROPIC_API_KEY
-2. Running `csr-engine daemon`
+Only Layer 3 sends text to a cloud model. It runs through `claude -p`, so it uses your existing Claude Code login and no API key. Running `csr-engine daemon` starts it. Set `CSR_NO_AI_NARRATIVES=1` to turn it off.
 
-Cost: ~$0.012/conversation.
+The daemon's separate Batch API narrator runs only if `ANTHROPIC_API_KEY` is set. Cost: ~$0.012/conversation.
 
 ## Data
 
@@ -37,7 +35,10 @@ Source conversations never modified.
 
 ## Security
 
-- No open ports (stdio only)
+- The MCP server speaks stdio and opens no port
+- The dream journal (a web page) is served by the daemon on `127.0.0.1:7373` only. It has no setting to bind another interface. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOURNAL_SERVER=1` turns it off
 - No code execution from search results
 - Read-only access to conversations
-- Standard file permissions
+- Secrets are redacted before text is indexed or mirrored: API keys and tokens become `[secret redacted: <kind>]`. `CSR_NO_SECRET_SCRUB=1` turns this off
+- Text wrapped in `<private>...</private>` is stripped before it is stored
+- The transcript mirror (scrubbed, compressed copies of your transcripts) lives under `~/.claude-self-reflect/mirror/` with directories at `0700` and files at `0600`. `CSR_NO_MIRROR=1` turns it off
