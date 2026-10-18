@@ -42,6 +42,7 @@ pub mod identity;
 pub mod lock;
 pub mod query;
 pub mod scan;
+pub mod session;
 pub mod status;
 pub mod store;
 

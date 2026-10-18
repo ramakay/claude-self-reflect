@@ -140,7 +140,74 @@ fn firmlink_len(comps: &[String]) -> usize {
 /// - the firmlink spellings of the first two, `/System/Volumes/Data/Users/...`.
 ///
 /// Lexical and case-folded (APFS): the filesystem is never consulted.
+///
+/// The one exception is a session scope (`session_scope`): on the thread that
+/// holds one, the protected folder the user's own session is working in is not
+/// reported, so the session's scan child can map the repo it was started in.
 pub fn tcc_root(path: &Path, home: Option<&Path>) -> Option<TccRoot> {
+    let root = tcc_root_raw(path, home)?;
+    let allowed = SESSION_SCOPE.with(|s| s.borrow().as_deref() == Some(root.key.as_str()));
+    if allowed {
+        return None;
+    }
+    Some(root)
+}
+
+thread_local! {
+    /// Key (`TccRoot::key`) of the protected folder this thread may enter.
+    static SESSION_SCOPE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Lets the current thread enter the one protected folder a user's session is
+/// working in, until dropped. Installed only by `codemap scan --session` and
+/// `codemap drain`, the processes a SessionStart / PostToolUse hook spawns when the
+/// session's cwd is under Desktop, Documents, Downloads, iCloud Drive or a volume.
+/// The daemon never installs one, so it never touches those folders.
+#[derive(Debug)]
+pub struct SessionScope {
+    previous: Option<String>,
+    /// The protected folder allowed, as spelled in the cwd; `None` when the cwd
+    /// is not in a protected folder (the scope then changes nothing).
+    pub root: Option<PathBuf>,
+}
+
+impl Drop for SessionScope {
+    fn drop(&mut self) {
+        SESSION_SCOPE.with(|s| *s.borrow_mut() = self.previous.take());
+    }
+}
+
+/// The protected folder `cwd` is in: lexically, or through a symlink chain that
+/// `resolve_safe` refuses at the first protected prefix (no stat inside it).
+pub fn protected_class(cwd: &Path, home: Option<&Path>) -> Option<TccRoot> {
+    if let Some(root) = tcc_root_raw(cwd, home) {
+        return Some(root);
+    }
+    match resolve_safe(cwd, home) {
+        Err(e) => e
+            .downcast_ref::<ProtectedPath>()
+            .and_then(|p| tcc_root_raw(&p.path, home)),
+        Ok(_) => None,
+    }
+}
+
+/// Open a session scope for `cwd` (see `SessionScope`).
+pub fn session_scope(cwd: &Path, home: Option<&Path>) -> SessionScope {
+    let root = protected_class(cwd, home);
+    let previous = SESSION_SCOPE.with(|s| {
+        let prev = s.borrow().clone();
+        if let Some(r) = &root {
+            *s.borrow_mut() = Some(r.key.clone());
+        }
+        prev
+    });
+    SessionScope {
+        previous,
+        root: root.map(|r| r.shown),
+    }
+}
+
+fn tcc_root_raw(path: &Path, home: Option<&Path>) -> Option<TccRoot> {
     let norm = normalize_lexical(path);
     let orig: Vec<String> = norm
         .components()
@@ -1146,5 +1213,94 @@ mod tests {
         std::fs::write(gd.join("config"), "[remote \"o\"]\n\tworktree = /x\n").unwrap();
         let listing = list_views_with(&gd, home).unwrap();
         assert_eq!((listing.views.len(), listing.stale), (0, 0));
+    }
+
+    #[test]
+    fn a_session_scope_opens_only_the_protected_folder_of_the_session_and_only_while_held() {
+        let home = Path::new("/Users/nobody-here");
+        let docs = Path::new("/Users/nobody-here/Documents/probe/src");
+        let desk = Path::new("/Users/nobody-here/Desktop/p");
+        assert!(is_tcc_path(docs, Some(home)));
+        {
+            let scope = session_scope(docs, Some(home));
+            assert_eq!(
+                scope.root.as_deref(),
+                Some(Path::new("/Users/nobody-here/Documents"))
+            );
+            assert!(!is_tcc_path(docs, Some(home)), "the session's folder opens");
+            assert!(
+                !is_tcc_path(Path::new("/users/NOBODY-HERE/documents/x"), Some(home)),
+                "whatever the spelling"
+            );
+            assert!(is_tcc_path(desk, Some(home)), "another folder stays shut");
+            assert!(is_tcc_path(Path::new("/Volumes/x/p"), Some(home)));
+        }
+        assert!(is_tcc_path(docs, Some(home)), "closed again on drop");
+    }
+
+    #[test]
+    fn a_session_scope_for_an_ordinary_cwd_changes_nothing_and_scopes_nest() {
+        let home = Path::new("/Users/nobody-here");
+        let docs = Path::new("/Users/nobody-here/Documents/probe");
+        let desk = Path::new("/Users/nobody-here/Desktop/p");
+        let plain = session_scope(Path::new("/Users/nobody-here/projects/x"), Some(home));
+        assert_eq!(plain.root, None);
+        assert!(is_tcc_path(docs, Some(home)));
+        drop(plain);
+        let outer = session_scope(docs, Some(home));
+        {
+            let inner = session_scope(desk, Some(home));
+            assert!(!is_tcc_path(desk, Some(home)));
+            assert!(is_tcc_path(docs, Some(home)), "the inner scope replaces it");
+            drop(inner);
+        }
+        assert!(
+            !is_tcc_path(docs, Some(home)),
+            "the outer scope is restored"
+        );
+        drop(outer);
+        assert!(is_tcc_path(docs, Some(home)));
+    }
+
+    #[test]
+    fn a_session_scope_is_per_thread() {
+        let home = Path::new("/Users/nobody-here");
+        let docs = Path::new("/Users/nobody-here/Documents/probe");
+        let _scope = session_scope(docs, Some(home));
+        let other = std::thread::spawn(|| {
+            is_tcc_path(
+                Path::new("/Users/nobody-here/Documents/probe"),
+                Some(Path::new("/Users/nobody-here")),
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(other, "another thread (the daemon's) is still refused");
+    }
+
+    #[test]
+    fn the_protected_class_of_a_cwd_follows_a_symlink_chain_without_a_stat_inside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = base.join("home");
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(docs.join("probe")).unwrap();
+        let hop2 = base.join("hop2");
+        let hop1 = base.join("hop1");
+        std::os::unix::fs::symlink(docs.join("probe"), &hop2).unwrap();
+        std::os::unix::fs::symlink(&hop2, &hop1).unwrap();
+        let lexical = protected_class(&docs.join("probe/src"), Some(&home)).unwrap();
+        assert_eq!(lexical.shown, docs);
+        let chained = protected_class(&hop1, Some(&home)).unwrap();
+        assert_eq!(chained.key, lexical.key);
+        assert!(protected_class(&base.join("plain"), Some(&home)).is_none());
+        // The scope for the chained cwd opens the folder the chain leads to.
+        let scope = session_scope(&hop1, Some(&home));
+        assert_eq!(scope.root.as_deref(), Some(docs.as_path()));
+        assert!(!is_tcc_path(&docs.join("probe"), Some(&home)));
+        assert_eq!(
+            resolve_safe(&hop1, Some(&home)).unwrap(),
+            docs.join("probe")
+        );
     }
 }

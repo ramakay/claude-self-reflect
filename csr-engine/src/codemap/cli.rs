@@ -1,4 +1,4 @@
-//! `csr-engine codemap ...`: add, remove, scan, status, query, watch.
+//! `csr-engine codemap ...`: add, remove, scan, drain, status, query, watch.
 //!
 //! The handlers print to stdout and return `Ok(())` unless the request itself is
 //! wrong. `add`, `remove` and `scan` open the database read-write; `status` and
@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use super::discover::discover;
 use super::identity::{self, home_dir};
 use super::lock;
-use super::scan::{scan_repo, RepoScanReport, ScanOpts};
+use super::scan::{rescan_paths, scan_repo, view_changed, RepoScanReport, ScanOpts};
 use super::status::{status_report, CodemapStatus};
 use super::store;
 use crate::storage::Storage;
@@ -145,8 +145,21 @@ fn scan_locked<T>(
     }
 }
 
-/// `codemap scan [--repo <path> | --all] [--json]`.
-pub fn scan(db_path: &Path, repo: Option<&Path>, all: bool, json: bool) -> Result<()> {
+/// `codemap scan [--repo <path> [--session] | --all] [--json]`.
+///
+/// `session` is the opt-in the SessionStart hook's detached child passes for a
+/// repo inside a macOS-protected folder (Desktop, Documents, Downloads, iCloud
+/// Drive, a volume): the scan may enter THAT folder, because the user's own session
+/// is already working there. The repo is registered with source `session` (or
+/// `signal` outside a protected folder) and is not re-enabled if `codemap remove`
+/// tombstoned it. Without `session` a protected path is refused, as ever.
+pub fn scan(
+    db_path: &Path,
+    repo: Option<&Path>,
+    all: bool,
+    json: bool,
+    session: bool,
+) -> Result<()> {
     if super::disabled() {
         println!("{}", disabled_notice());
         return Ok(());
@@ -154,11 +167,39 @@ pub fn scan(db_path: &Path, repo: Option<&Path>, all: bool, json: bool) -> Resul
     if repo.is_none() && !all {
         bail!("pass --repo <path> or --all");
     }
+    if session && repo.is_none() {
+        bail!("--session needs --repo <path>");
+    }
     let storage = Storage::open(db_path)?;
     let opts = ScanOpts::default();
     if let Some(path) = repo {
+        let home = home_dir();
+        // Held until this function returns; only this thread, only this folder.
+        let scope = session.then(|| identity::session_scope(path, home.as_deref()));
+        let protected = scope.as_ref().is_some_and(|s| s.root.is_some());
         let id = identity::identify(path)?;
         let common = id.common_dir.to_string_lossy().to_string();
+        let (source, force) = match (session, protected) {
+            (false, _) => ("cli", true),
+            (true, true) => ("session", false),
+            (true, false) => ("signal", false),
+        };
+        if session {
+            let removed = storage.with_connection(|conn| {
+                Ok(store::list_repos(conn)?
+                    .iter()
+                    .any(|r| r.common_dir == common && !r.enabled))
+            })?;
+            if removed {
+                let line = format!("scan skipped: {common} was removed with `codemap remove`");
+                if json {
+                    println!("{}", serde_json::json!({ "skipped": line }));
+                } else {
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+        }
         let report = storage.with_connection(|conn| {
             let main = (id.common_dir.file_name().is_some_and(|n| n == ".git"))
                 .then(|| id.common_dir.parent().map(Path::to_path_buf))
@@ -167,8 +208,8 @@ pub fn scan(db_path: &Path, repo: Option<&Path>, all: bool, json: bool) -> Resul
                 conn,
                 &common,
                 main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
-                "cli",
-                true,
+                source,
+                force,
             )?;
             scan_locked(db_path, &common, || scan_repo(conn, &id.common_dir, &opts))
         })?;
@@ -307,6 +348,108 @@ pub fn query(db_path: &Path, text: &str, json: bool, limit: usize) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// `codemap drain --repo <path> [--debounce SECS]`: the session's partial rescan
+/// for a repo in a protected folder, started by the PostToolUse hook (detached).
+///
+/// Waits `debounce` so a burst of edits becomes one rescan, rescans the queued
+/// paths that lie in the repo's views, or the whole repo when HEAD or the index
+/// moved (or a worktree appeared or went), then repeats while new rows arrived, and
+/// exits. It ends after `session::DRAIN_MAX` whatever is queued: the next hook
+/// starts another. On exit it removes its session lock file.
+pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Result<()> {
+    if super::disabled() {
+        println!("{}", disabled_notice());
+        return Ok(());
+    }
+    // The lock file is removed on every way out of this function.
+    let _hold = super::session::LockHold::new(super::session::lock_path(db_path, repo));
+    let home = home_dir();
+    let _scope = identity::session_scope(repo, home.as_deref());
+    let id = identity::identify(repo)?;
+    let storage = Storage::open(db_path)?;
+    let started = std::time::Instant::now();
+    let mut passes = 0usize;
+    loop {
+        std::thread::sleep(debounce);
+        if started.elapsed() > super::session::DRAIN_MAX {
+            println!("drain: time limit after {passes} passes");
+            break;
+        }
+        let did = storage
+            .with_connection(|conn| drain_pass(conn, db_path, &id.common_dir, home.as_deref()))?;
+        if !did {
+            break;
+        }
+        passes += 1;
+    }
+    println!("drain: {passes} passes");
+    Ok(())
+}
+
+/// One drain pass. True when it did work (or could not yet: another scanner holds
+/// the repo), false when nothing was queued and no view moved.
+fn drain_pass(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    common: &Path,
+    home: Option<&Path>,
+) -> Result<bool> {
+    let common_str = common.to_string_lossy().to_string();
+    let listing = identity::list_views_with(common, home)?;
+    let live: std::collections::BTreeSet<String> = listing
+        .views
+        .iter()
+        .map(|v| v.worktree_path.to_string_lossy().to_string())
+        .collect();
+    let stored: std::collections::BTreeSet<String> = store::stored_views(conn, Some(&common_str))?
+        .into_iter()
+        .map(|v| v.worktree_path)
+        .collect();
+    let mut changed = live != stored;
+    if !changed {
+        for v in &listing.views {
+            if view_changed(conn, v).unwrap_or(true) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+    let rows = super::session::rows_under(conn, &roots)?;
+    if rows.is_empty() && !changed {
+        return Ok(false);
+    }
+    let held = lock::acquire(db_path, &common_str, lock::wait_from_env(), &|| false)?;
+    let lock::Acquired::Held(_held) = held else {
+        // Another scanner has the repo; the rows stay and the next pass retries.
+        println!("{}", lock::skipped_line(&common_str));
+        return Ok(true);
+    };
+    if changed {
+        let report = scan_repo(conn, common, &ScanOpts::default())?;
+        println!(
+            "drain: full scan {} views, {} defs written",
+            report.views.len(),
+            report.totals.defs_written
+        );
+    } else {
+        let paths: Vec<std::path::PathBuf> = rows
+            .iter()
+            .map(|(p, _)| std::path::PathBuf::from(p))
+            .collect();
+        let report = rescan_paths(conn, &paths)?;
+        println!(
+            "drain: {} paths, {} updated, {} removed, {} unchanged",
+            report.paths, report.updated, report.removed, report.unchanged
+        );
+    }
+    // Only the rows this pass saw: one re-enqueued meanwhile keeps its newer stamp.
+    for (p, at) in &rows {
+        store::queue_delete_upto(conn, p, *at)?;
+    }
+    Ok(true)
 }
 
 fn stamp() -> String {

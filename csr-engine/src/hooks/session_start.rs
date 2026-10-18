@@ -79,6 +79,9 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     // Code map session signal, for every source (startup, resume, compact,
     // clear): this cwd has a live session. One upsert, no git, no stat.
     super::record_codemap_signal(input, engine, "session_start");
+    // A session in a protected folder is mapped by a detached scan the session
+    // starts; the daemon never enters those folders. No-op elsewhere.
+    super::codemap_session_start(input, engine);
 
     // A subagent's own compaction fires this hook with the PARENT's session id. Injecting
     // the parent's recap into the subagent, or respinning the parent's story, is wrong

@@ -27,6 +27,9 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     // Code map session signal: this cwd has a live session. One upsert, first,
     // so the slow transcript import below cannot delay or starve it.
     super::record_codemap_signal(input, engine, "post_tool_use");
+    // A session in a protected folder (Desktop, Documents, ...) is mapped by the
+    // session itself: queue the edit and start the detached drain. No-op elsewhere.
+    super::codemap_session_post_tool_use(input, engine);
 
     // Import growing transcript (real-time searchability)
     super::import_current_transcript(input, engine, cwd).await;

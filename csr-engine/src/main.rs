@@ -544,6 +544,21 @@ enum CodemapAction {
         all: bool,
         #[arg(long)]
         json: bool,
+        /// Session opt-in: let this scan enter the macOS-protected folder (Desktop,
+        /// Documents, Downloads, iCloud Drive, a volume) that `--repo` is in. The
+        /// SessionStart hook passes it; the daemon never does
+        #[arg(long, requires = "repo", conflicts_with = "all")]
+        session: bool,
+    },
+    /// Rescan the queued edits of one repo in a protected folder, then exit (the
+    /// PostToolUse hook starts this detached; there is no daemon for these repos)
+    Drain {
+        /// Any path inside the repo
+        #[arg(long)]
+        repo: PathBuf,
+        /// Seconds to wait for more edits before rescanning
+        #[arg(long, value_name = "SECS", default_value_t = 5)]
+        debounce: u64,
     },
     /// Per repo and worktree: branch, head, files, dirty, untracked, age; totals
     Status {
@@ -1290,9 +1305,17 @@ async fn run(
         return match action {
             CodemapAction::Add { path } => cli::add(&args.db_path, path),
             CodemapAction::Remove { path } => cli::remove(&args.db_path, path),
-            CodemapAction::Scan { repo, all, json } => {
-                cli::scan(&args.db_path, repo.as_deref(), *all, *json)
-            }
+            CodemapAction::Scan {
+                repo,
+                all,
+                json,
+                session,
+            } => cli::scan(&args.db_path, repo.as_deref(), *all, *json, *session),
+            CodemapAction::Drain { repo, debounce } => cli::drain(
+                &args.db_path,
+                repo,
+                std::time::Duration::from_secs(*debounce),
+            ),
             CodemapAction::Status { json } => cli::status(&args.db_path, *json),
             CodemapAction::Watch { for_secs } => cli::watch(&args.db_path, *for_secs),
             CodemapAction::Query { text, json, limit } => {

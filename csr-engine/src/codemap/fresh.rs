@@ -603,14 +603,25 @@ fn cover(roots: &[PathBuf]) -> BTreeSet<PathBuf> {
 /// Drain `codemap_queue`: read the rows, call `rescan` with their paths, then
 /// delete only rows not re-enqueued meanwhile. A failed rescan keeps the rows
 /// (and drops the ones older than an hour). Returns (rows read, report).
+///
+/// Rows inside a protected folder (lexical check against `home`) are LEFT IN PLACE:
+/// the session's own `codemap drain` takes them. The daemon never rescans them,
+/// but it does drop the ones older than an hour, so a protected repo nobody edits
+/// any more does not keep rows forever.
 pub(crate) fn drain_queue<F>(
     conn: &Connection,
+    home: Option<&Path>,
     rescan: F,
 ) -> Result<Option<(usize, PathScanReport)>>
 where
     F: FnOnce(&[PathBuf]) -> Result<PathScanReport>,
 {
-    let rows = store::queue_read(conn)?;
+    let mut rows = store::queue_read(conn)?;
+    let all = rows.len();
+    rows.retain(|(p, _)| !is_tcc_path(Path::new(p), home));
+    if rows.len() < all {
+        store::queue_gc(conn, super::now_nanos() - QUEUE_STALE_NANOS)?;
+    }
     if rows.is_empty() {
         return Ok(None);
     }
@@ -880,10 +891,9 @@ impl<'a> Pump<'a> {
 
     pub(crate) fn drain_queue_now(&mut self) {
         let ctx = self.ctx;
-        match self
-            .storage
-            .with_connection(|conn| drain_queue(conn, |paths| rescan_gated(ctx, conn, paths)))
-        {
+        match self.storage.with_connection(|conn| {
+            drain_queue(conn, Some(ctx.home), |paths| rescan_gated(ctx, conn, paths))
+        }) {
             Ok(Some((n, r))) => log_paths(ctx, "queue", n, &r),
             Ok(None) => {}
             Err(e) => ctx.log(&format!("paths via=queue failed: {}", short_err(&e))),
@@ -1649,7 +1659,7 @@ mod tests {
         let b = Path::new("/w/r/b.py");
         crate::codemap::enqueue(&conn, a).unwrap();
         crate::codemap::enqueue(&conn, b).unwrap();
-        let (n, _) = drain_queue(&conn, |paths| {
+        let (n, _) = drain_queue(&conn, None, |paths| {
             assert_eq!(paths.len(), 2);
             // The hook fires again for a.py while the rescan runs.
             crate::codemap::enqueue(&conn, a).unwrap();
@@ -1662,9 +1672,47 @@ mod tests {
         assert_eq!(left.len(), 1, "only the re-enqueued row survives");
         assert_eq!(left[0].0, "/w/r/a.py");
         // The next drain takes it.
-        drain_queue(&conn, |_| Ok(PathScanReport::default()))
+        drain_queue(&conn, None, |_| Ok(PathScanReport::default()))
             .unwrap()
             .unwrap();
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_daemon_queue_drain_leaves_protected_rows_in_place_and_drops_old_ones() {
+        let conn = crate::codemap::testutil::db();
+        let home = Path::new("/Users/nobody-here");
+        let protected = "/Users/nobody-here/Documents/probe/a.rs";
+        let ordinary = "/w/r/a.rs";
+        crate::codemap::enqueue(&conn, Path::new(protected)).unwrap();
+        crate::codemap::enqueue(&conn, Path::new(ordinary)).unwrap();
+        let mut seen = Vec::new();
+        let (n, _) = drain_queue(&conn, Some(home), |paths| {
+            seen = paths.to_vec();
+            Ok(PathScanReport::default())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!((n, seen), (1, vec![PathBuf::from(ordinary)]));
+        let left = store::queue_read(&conn).unwrap();
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(
+            left[0].0, protected,
+            "the protected row waits for its session"
+        );
+        // Only protected rows left: nothing to rescan, the rescan is not called.
+        let none = drain_queue(&conn, Some(home), |_| panic!("rescan must not run")).unwrap();
+        assert!(none.is_none());
+        assert_eq!(store::queue_read(&conn).unwrap().len(), 1);
+        // A protected row older than an hour is dropped, like any stale row.
+        conn.execute_batch("DELETE FROM codemap_queue").unwrap();
+        store::queue_push(
+            &conn,
+            protected,
+            crate::codemap::now_nanos() - 2 * QUEUE_STALE_NANOS,
+        )
+        .unwrap();
+        drain_queue(&conn, Some(home), |_| panic!("rescan must not run")).unwrap();
         assert!(store::queue_read(&conn).unwrap().is_empty());
     }
 
@@ -1672,7 +1720,7 @@ mod tests {
     fn a_failed_rescan_keeps_the_queue_rows() {
         let conn = crate::codemap::testutil::db();
         crate::codemap::enqueue(&conn, Path::new("/w/r/a.py")).unwrap();
-        let r = drain_queue(&conn, |_| Err(anyhow::anyhow!("boom")));
+        let r = drain_queue(&conn, None, |_| Err(anyhow::anyhow!("boom")));
         assert!(r.is_err());
         assert_eq!(store::queue_read(&conn).unwrap().len(), 1);
     }

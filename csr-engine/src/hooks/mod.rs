@@ -219,6 +219,100 @@ pub(crate) fn record_codemap_signal(input: &HookInput, engine: &Engine, source: 
     }
 }
 
+/// The database file behind the engine's connection, for the code map's detached
+/// children (`--db-path`). `None` for an in-memory store.
+pub(crate) fn engine_db_path(engine: &Engine) -> Option<std::path::PathBuf> {
+    engine
+        .storage()
+        .with_connection(|conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok())
+        })
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The cwd of a hook when it is absolute and sits in a macOS-protected folder
+/// (lexically, or through a symlink chain `resolve_safe` refuses without a stat
+/// inside it). `None` for every ordinary cwd and when the code map is off.
+fn protected_hook_cwd(input: &HookInput) -> Option<std::path::PathBuf> {
+    if crate::codemap::disabled() {
+        return None;
+    }
+    let cwd = std::path::PathBuf::from(input.cwd.as_deref().filter(|c| !c.trim().is_empty())?);
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let home = crate::codemap::identity::home_dir();
+    crate::codemap::identity::protected_class(&cwd, home.as_deref())?;
+    Some(cwd)
+}
+
+/// SessionStart in a protected folder: start the detached session scan (see
+/// `codemap::session`). Nothing for an ordinary cwd or a subagent. Best effort:
+/// the hook never waits for the child and never fails because of it.
+pub(crate) fn codemap_session_start(input: &HookInput, engine: &Engine) {
+    if input.subagent().is_some() {
+        return;
+    }
+    let Some(cwd) = protected_hook_cwd(input) else {
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    crate::codemap::session::on_session_start(
+        &cwd,
+        &db,
+        crate::codemap::identity::home_dir().as_deref(),
+        crate::codemap::disabled(),
+        &crate::codemap::session::DetachedSpawner,
+    );
+}
+
+/// PostToolUse after an edit in a protected folder: queue the file and start the
+/// detached drain unless one is in flight. Nothing for an ordinary cwd.
+pub(crate) fn codemap_session_post_tool_use(input: &HookInput, engine: &Engine) {
+    let Some(cwd) = protected_hook_cwd(input) else {
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    let edited = if post_tool_use::is_acted_on_tool(input.tool_name.as_deref()) {
+        input
+            .tool_input
+            .as_ref()
+            .and_then(|t| t.get("file_path"))
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    };
+    let home = crate::codemap::identity::home_dir();
+    let _ = engine.storage().with_connection(|conn| {
+        crate::codemap::session::on_post_tool_use(
+            conn,
+            &cwd,
+            edited.as_deref(),
+            &db,
+            home.as_deref(),
+            crate::codemap::disabled(),
+            crate::codemap::now_secs(),
+            &crate::codemap::session::pid_alive,
+            &crate::codemap::session::DetachedSpawner,
+        );
+        Ok(())
+    });
+}
+
 /// Resolve the directory a hook operates on. Prefers the cwd Claude Code sent,
 /// falls back to the process cwd, and **never fails**.
 ///
