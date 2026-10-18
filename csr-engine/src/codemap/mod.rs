@@ -38,6 +38,7 @@ pub mod discover;
 pub mod files;
 pub mod fresh;
 pub mod identity;
+pub mod lock;
 pub mod query;
 pub mod scan;
 pub mod status;
@@ -57,7 +58,10 @@ pub use files::{
 };
 pub use fresh::{run_loop, LoopOpts};
 pub use query::{query, query_exact, query_exact_scoped, CodemapHit, ViewPresence};
-pub use scan::{rescan_paths, scan_repo, view_changed, PathScanReport, RepoScanReport, ScanOpts};
+pub use scan::{
+    rescan_paths, rescan_paths_with, scan_repo, view_changed, PathScanReport, RepoGuard,
+    RepoScanReport, ScanOpts,
+};
 pub use status::{status_report, CodemapStatus};
 
 /// Version of the codemap row format. Bump when the shape of a def row changes.

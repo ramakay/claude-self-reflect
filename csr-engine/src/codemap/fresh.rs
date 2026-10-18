@@ -19,10 +19,11 @@
 //! mutex: the *poller* (discovery, poll, full scans, which wait for the daemon's
 //! heavy-work permit) and the *pump* (watcher batches and the queue, which never
 //! wait for it unless a batch is larger than `SMALL_BATCH`). A path edit
-//! therefore lands in seconds even while a dream holds the permit. The two
-//! threads do share one scan lock (`Ctx::scan_lock`): a path batch waits for a
-//! full scan in progress, so a scan that read an older blob can never commit it
-//! over a newer partial rescan.
+//! therefore lands in seconds even while a dream holds the permit. Scans of one
+//! repo are serialised by a per-repo FILE lock (`lock.rs`), shared with every other
+//! process that scans (`codemap scan`, the session children): a path batch waits
+//! for a full scan in progress, so a scan that read an older blob can never commit
+//! it over a newer partial rescan. Lock order: heavy permit, then repo lock.
 //!
 //! Nothing here busy-loops: both threads wake once a second to compare clocks,
 //! and an idle wake does no I/O except the pump's 5 s queue probe (one SELECT on
@@ -32,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -43,8 +44,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use super::discover::{discover, max_repos_from_env, tier};
 use super::identity::{self, is_tcc_path, ViewId};
 use super::scan::{
-    dir_event_rel_ok, expand_dir_events, rel_passes_caps, rescan_paths, scan_repo, view_changed,
-    PathScanReport, ScanOpts,
+    dir_event_rel_ok, expand_dir_events, rel_passes_caps, rescan_paths_with, scan_repo,
+    view_changed, PathScanReport, ScanOpts,
 };
 use super::store::{self, StoredRepo};
 use crate::extraction::repo_scan::has_code_extension;
@@ -72,6 +73,9 @@ pub struct LoopOpts {
     pub tick: Duration,
     /// A repo whose scan failed is not retried for this long.
     pub error_backoff: Duration,
+    /// How long a scan waits for another scanner of the same repo
+    /// (`CSR_CODEMAP_LOCK_WAIT_SECS`) before it skips the repo.
+    pub lock_wait: Duration,
     /// Start the notify watcher (tests that only need the poller turn it off).
     pub watch: bool,
     /// Scan options; `home` is overwritten with the loop's home.
@@ -88,6 +92,7 @@ impl Default for LoopOpts {
             queue_tick: Duration::from_secs(5),
             tick: Duration::from_secs(1),
             error_backoff: Duration::from_secs(600),
+            lock_wait: super::lock::DEFAULT_WAIT,
             watch: true,
             scan: ScanOpts::default(),
         }
@@ -102,6 +107,7 @@ impl LoopOpts {
         let mut o = Self {
             watch: !std::env::var("CSR_CODEMAP_NO_WATCH")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            lock_wait: super::lock::wait_from_env(),
             ..Self::default()
         };
         if let Some(n) = std::env::var("CSR_CODEMAP_POLL_SECS")
@@ -126,16 +132,6 @@ pub(crate) struct Ctx<'a> {
     /// Bumped by the poller whenever the set of stored views may have changed;
     /// the pump re-syncs its watched roots when it sees a new value.
     roots_version: AtomicU64,
-    /// Serialises the poller's full `scan_repo` and the pump's `rescan_paths`.
-    /// Without it a full scan can read a file's blob A, a dirty edit then be
-    /// committed as blob B by the pump, and the scan commit A over it: a dirty
-    /// edit moves neither HEAD nor the index, so `view_changed` never notices
-    /// and A stays until the next edit. Lock order is heavy permit first, then
-    /// this lock; the heavy permit is never taken while this lock is held.
-    ///
-    /// Covers the two threads of this loop only. A separate `csr-engine codemap
-    /// scan` process (or a second daemon) has its own lock and is not covered.
-    scan_lock: Mutex<()>,
 }
 
 impl<'a> Ctx<'a> {
@@ -156,7 +152,6 @@ impl<'a> Ctx<'a> {
             heavy,
             log,
             roots_version: AtomicU64::new(0),
-            scan_lock: Mutex::new(()),
         }
     }
 
@@ -164,22 +159,13 @@ impl<'a> Ctx<'a> {
         self.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Take `scan_lock`, polling so a shutdown is noticed while a long full scan
-    /// holds it. `None` means shutdown was requested first. A poisoned lock (a
-    /// scan thread panicked) is recovered, never a panic: it guards no data.
-    fn lock_scan(&self) -> Option<MutexGuard<'_, ()>> {
-        loop {
-            match self.scan_lock.try_lock() {
-                Ok(guard) => return Some(guard),
-                Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
-                Err(TryLockError::WouldBlock) => {
-                    if self.stop() {
-                        return None;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
+    /// Take the repo's file lock (see `lock.rs`), polling so a shutdown is
+    /// noticed while another scanner holds it. Always called AFTER the heavy
+    /// permit, never before it.
+    fn lock_repo(&self, common_dir: &str) -> Result<super::lock::Acquired> {
+        super::lock::acquire(self.db_path, common_dir, self.opts.lock_wait, &|| {
+            self.stop()
+        })
     }
 
     fn log(&self, msg: &str) {
@@ -243,6 +229,8 @@ pub(crate) struct PollOutcome {
     pub views_removed: Vec<String>,
     pub backed_off: usize,
     pub errors: usize,
+    /// Repos whose scan was skipped because another scanner held the repo lock.
+    pub skipped_locked: usize,
 }
 
 pub(crate) struct Poller<'a> {
@@ -451,15 +439,22 @@ impl<'a> Poller<'a> {
         if matches!(gate, Gate::Shutdown) {
             return Ok(());
         }
-        // Heavy permit first (taken above), then the scan lock.
-        let Some(scan_guard) = self.ctx.lock_scan() else {
-            return Ok(());
+        // Heavy permit first (taken above), then the repo's file lock.
+        let repo_lock = match self.ctx.lock_repo(common_str)? {
+            super::lock::Acquired::Held(l) => l,
+            super::lock::Acquired::Cancelled => return Ok(()),
+            super::lock::Acquired::Busy => {
+                // Not an error and no backoff: the next poll tries again.
+                self.ctx.log(&super::lock::skipped_line(common_str));
+                out.skipped_locked += 1;
+                return Ok(());
+            }
         };
         let opts = self.ctx.opts.scan.clone();
         let report = self
             .storage
             .with_connection(|conn| scan_repo(conn, common, &opts))?;
-        drop(scan_guard);
+        drop(repo_lock);
         drop(gate);
 
         self.checked.insert(common_str.to_string());
@@ -585,12 +580,38 @@ fn rescan_gated(ctx: &Ctx<'_>, conn: &Connection, paths: &[PathBuf]) -> Result<P
             ..Default::default()
         });
     }
-    // After the heavy permit, never before it. An Err keeps the queue rows.
-    let Some(_scan) = ctx.lock_scan() else {
-        anyhow::bail!("code map loop is shutting down");
-    };
-    rescan_paths(conn, paths)
+    // Each repo's file lock is taken after the heavy permit, never before it, and
+    // only for that repo's views. An Err keeps the queue rows.
+    let report = rescan_paths_with(conn, paths, &|common| match ctx.lock_repo(common) {
+        Ok(super::lock::Acquired::Held(l)) => Some(Box::new(l)),
+        Ok(super::lock::Acquired::Busy) => {
+            ctx.log(&super::lock::skipped_line(common));
+            None
+        }
+        Ok(super::lock::Acquired::Cancelled) => None,
+        Err(e) => {
+            ctx.log(&format!("lock failed for {common}: {}", short_err(&e)));
+            None
+        }
+    })?;
+    if let Some(repo) = report.locked_repos.first() {
+        return Err(RepoLocked(repo.clone()).into());
+    }
+    Ok(report)
 }
+
+/// A path batch could not take a repo's lock: the paths must be tried again, not
+/// dropped.
+#[derive(Debug)]
+pub(crate) struct RepoLocked(pub String);
+
+impl std::fmt::Display for RepoLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", super::lock::skipped_line(&self.0))
+    }
+}
+
+impl std::error::Error for RepoLocked {}
 
 fn log_paths(ctx: &Ctx<'_>, via: &str, n: usize, r: &PathScanReport) {
     ctx.log(&format!(
@@ -779,6 +800,17 @@ impl<'a> Pump<'a> {
             rescan_gated(ctx, conn, &expanded.paths)
         }) {
             Ok(r) => log_paths(ctx, "watch", paths.len(), &r),
+            Err(e) if e.downcast_ref::<RepoLocked>().is_some() => {
+                // Another scanner held the repo for the whole wait: keep the
+                // paths for the next flush instead of losing the edit.
+                ctx.log(&format!("paths via=watch deferred: {e}"));
+                if !ctx.stop() {
+                    let now = Instant::now();
+                    for p in paths {
+                        self.add_pending(p, now);
+                    }
+                }
+            }
             Err(e) => ctx.log(&format!("paths via=watch failed: {}", short_err(&e))),
         }
     }
@@ -987,6 +1019,7 @@ mod tests {
             o.max_wait = Duration::from_secs(2);
             o.queue_tick = Duration::from_millis(200);
             o.tick = Duration::from_millis(100);
+            o.lock_wait = Duration::from_secs(10);
             o
         }
     }
@@ -1517,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pump_flush_waits_for_the_scan_lock_and_then_writes() {
+    fn a_pump_flush_waits_for_the_repo_lock_and_then_writes() {
         let rig = Rig::new();
         let repo = repo_with_alpha(&rig);
         let mut opts = rig.opts();
@@ -1526,7 +1559,7 @@ mod tests {
         Poller::new(&ctx).unwrap().step(Instant::now()).unwrap();
         write(&repo, "a.py", &py(&["alpha", "newest_fn"]));
 
-        let guard = ctx.lock_scan().expect("lock is free");
+        let guard = take(&ctx, &repo.join(".git").to_string_lossy());
         std::thread::scope(|s| {
             let flusher = s.spawn(|| {
                 let mut pump = Pump::new(&ctx).unwrap();
@@ -1628,27 +1661,146 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_poisoned_scan_lock_is_recovered_and_a_shutdown_ends_the_wait() {
-        let rig = Rig::new();
-        let ctx = rig.ctx(rig.opts());
-        let joined = std::thread::scope(|s| {
-            s.spawn(|| {
-                let _held = ctx.scan_lock.lock().unwrap();
-                panic!("a scan thread died holding the lock");
-            })
-            .join()
-        });
-        assert!(joined.is_err());
-        assert!(ctx.scan_lock.is_poisoned());
-        assert!(ctx.lock_scan().is_some(), "recovered with into_inner");
+    fn take(ctx: &Ctx<'_>, common: &str) -> crate::codemap::lock::RepoLock {
+        match ctx.lock_repo(common).unwrap() {
+            crate::codemap::lock::Acquired::Held(l) => l,
+            other => panic!("repo lock not free: {other:?}"),
+        }
+    }
 
-        let held = ctx.lock_scan().unwrap();
+    #[test]
+    fn a_shutdown_ends_the_wait_for_a_repo_lock_and_a_busy_one_times_out() {
+        let rig = Rig::new();
+        let mut opts = rig.opts();
+        opts.lock_wait = Duration::from_millis(300);
+        let ctx = rig.ctx(opts);
+        let held = take(&ctx, "/w/r/.git");
+        let t0 = Instant::now();
+        assert!(matches!(
+            ctx.lock_repo("/w/r/.git").unwrap(),
+            crate::codemap::lock::Acquired::Busy
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(250));
+
+        let mut opts = rig.opts();
+        opts.lock_wait = Duration::from_secs(30);
+        let ctx = rig.ctx(opts);
         rig.shutdown.store(true, Ordering::SeqCst);
         let t0 = Instant::now();
-        assert!(ctx.lock_scan().is_none(), "shutdown ends the wait");
-        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            ctx.lock_repo("/w/r/.git").unwrap(),
+            crate::codemap::lock::Acquired::Cancelled
+        ));
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "shutdown ends the wait"
+        );
         drop(held);
+    }
+
+    #[test]
+    fn a_poll_skips_a_repo_another_scanner_holds_and_scans_it_on_the_next_poll() {
+        let rig = Rig::new();
+        let repo = repo_with_alpha(&rig);
+        let mut opts = rig.opts();
+        opts.watch = false;
+        opts.lock_wait = Duration::from_millis(200);
+        let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let log = |m: &str| lines.lock().unwrap().push(m.to_string());
+        let ctx = Ctx::new(
+            &rig.db,
+            &rig.fx.home,
+            rig.shutdown.clone(),
+            opts,
+            None,
+            &log,
+        );
+        let common = repo.join(".git").to_string_lossy().to_string();
+        let t0 = Instant::now();
+        let mut p = Poller::new(&ctx).unwrap();
+
+        let held = take(&ctx, &common);
+        let o = p.step(t0).unwrap();
+        assert_eq!(o.skipped_locked, 1);
+        assert!(o.scanned.is_empty());
+        assert_eq!(o.errors, 0, "a busy repo is not an error");
+        assert_eq!(rig.hits("alpha"), 0, "nothing was written");
+        let want = format!("scan skipped: {common} locked by another scanner");
+        assert!(
+            lines.lock().unwrap().contains(&want),
+            "{:?}",
+            lines.lock().unwrap()
+        );
+
+        drop(held);
+        let o = p.step(t0 + Duration::from_secs(61)).unwrap();
+        assert_eq!(o.scanned.len(), 1, "no backoff: scanned on the next poll");
+        assert_eq!(rig.hits("alpha"), 1);
+    }
+
+    #[test]
+    fn a_path_batch_a_busy_repo_refused_is_kept_for_the_next_flush() {
+        let rig = Rig::new();
+        let repo = repo_with_alpha(&rig);
+        let mut opts = rig.opts();
+        opts.watch = false;
+        opts.lock_wait = Duration::from_millis(200);
+        let ctx = rig.ctx(opts);
+        Poller::new(&ctx).unwrap().step(Instant::now()).unwrap();
+        let common = repo.join(".git").to_string_lossy().to_string();
+        write(&repo, "a.py", &py(&["alpha", "edit_while_locked"]));
+        let mut pump = Pump::new(&ctx).unwrap();
+        pump.add_pending(repo.join("a.py"), Instant::now());
+
+        let held = take(&ctx, &common);
+        pump.flush();
+        assert_eq!(
+            rig.hits("edit_while_locked"),
+            0,
+            "nothing written meanwhile"
+        );
+        assert!(
+            pump.pending.contains(&repo.join("a.py")),
+            "the edit is kept"
+        );
+
+        drop(held);
+        pump.flush();
+        assert_eq!(rig.hits("edit_while_locked"), 1, "and lands on the retry");
+        assert!(pump.pending.is_empty());
+    }
+
+    #[test]
+    fn queue_rows_stay_when_the_repo_is_locked_and_are_taken_after() {
+        let rig = Rig::new();
+        let repo = repo_with_alpha(&rig);
+        let mut opts = rig.opts();
+        opts.watch = false;
+        opts.lock_wait = Duration::from_millis(200);
+        let ctx = rig.ctx(opts);
+        Poller::new(&ctx).unwrap().step(Instant::now()).unwrap();
+        let common = repo.join(".git").to_string_lossy().to_string();
+        write(&repo, "a.py", &py(&["alpha", "queued_while_locked"]));
+        rig.conn()
+            .with_connection(|c| crate::codemap::enqueue(c, &repo.join("a.py")))
+            .unwrap();
+        let mut pump = Pump::new(&ctx).unwrap();
+        let held = take(&ctx, &common);
+        pump.drain_queue_now();
+        assert_eq!(rig.hits("queued_while_locked"), 0);
+        assert_eq!(
+            rig.conn().with_connection(store::queue_read).unwrap().len(),
+            1,
+            "the row stays for the next drain"
+        );
+        drop(held);
+        pump.drain_queue_now();
+        assert_eq!(rig.hits("queued_while_locked"), 1);
+        assert!(rig
+            .conn()
+            .with_connection(store::queue_read)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

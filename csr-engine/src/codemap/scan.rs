@@ -135,6 +135,9 @@ pub struct PathScanReport {
     pub defs_written: usize,
     pub gc_blobs: usize,
     pub views_touched: Vec<String>,
+    /// Repos (common dirs) whose paths were left alone because another scanner
+    /// held the repo lock for the whole wait.
+    pub locked_repos: Vec<String>,
     pub ms: u64,
 }
 
@@ -1067,6 +1070,22 @@ pub(crate) fn expand_dir_events(conn: &Connection, abs_paths: &[PathBuf]) -> Res
 /// oid cannot be derived from its stored row (a modified or new file, or an index
 /// that moved since the last scan). Views no path maps to are not read.
 pub fn rescan_paths(conn: &Connection, abs_paths: &[PathBuf]) -> Result<PathScanReport> {
+    rescan_paths_with(conn, abs_paths, &|_| Some(Box::new(())))
+}
+
+/// What `rescan_paths_with` calls before it touches a repo's views: returns the
+/// guard that keeps the repo exclusive while its paths are rescanned (dropped
+/// afterwards), or `None` to leave that repo's paths alone (another scanner holds
+/// it; the repo lands in `PathScanReport::locked_repos`).
+pub type RepoGuard<'a> = &'a dyn Fn(&str) -> Option<Box<dyn std::any::Any>>;
+
+/// `rescan_paths`, taking `guard` for each repo before any of its files is read,
+/// so a path rescan and a full scan of the same repo never interleave.
+pub fn rescan_paths_with(
+    conn: &Connection,
+    abs_paths: &[PathBuf],
+    guard: RepoGuard<'_>,
+) -> Result<PathScanReport> {
     let t0 = Instant::now();
     let mut report = PathScanReport {
         paths: abs_paths.len(),
@@ -1109,6 +1128,13 @@ pub fn rescan_paths(conn: &Connection, abs_paths: &[PathBuf]) -> Result<PathScan
     }
 
     for (_, (view, rels)) in by_view {
+        // Held for this view's read and write, dropped before the next view.
+        let Some(_held) = guard(&view.common_dir) else {
+            if !report.locked_repos.contains(&view.common_dir) {
+                report.locked_repos.push(view.common_dir.clone());
+            }
+            continue;
+        };
         rescan_view_paths(conn, &view, &rels, &mut report)?;
         report.views_touched.push(view.worktree_path.clone());
     }

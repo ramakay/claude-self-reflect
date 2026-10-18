@@ -11,6 +11,7 @@ use anyhow::{bail, Context, Result};
 
 use super::discover::discover;
 use super::identity::{self, home_dir};
+use super::lock;
 use super::scan::{scan_repo, RepoScanReport, ScanOpts};
 use super::status::{status_report, CodemapStatus};
 use super::store;
@@ -84,6 +85,11 @@ pub fn remove(db_path: &Path, path: &Path) -> Result<()> {
             }
         }
     };
+    // Deleting views while a scan writes them would leave the scan's rows behind.
+    let _lock = match lock::acquire(db_path, &common, lock::wait_from_env(), &|| false)? {
+        lock::Acquired::Held(l) => l,
+        _ => bail!("remove skipped: {common} locked by another scanner"),
+    };
     let dropped = storage.with_connection(|conn| {
         store::disable_repo(conn, &common, (!main.is_empty()).then_some(main.as_str()))?;
         let mut views = 0usize;
@@ -125,6 +131,20 @@ fn print_report(r: &RepoScanReport) {
     );
 }
 
+/// Run `f` while holding the repo's file lock (`lock.rs`), waiting at most
+/// `CSR_CODEMAP_LOCK_WAIT_SECS`. `None` means another scanner held the repo for
+/// the whole wait; the caller prints `lock::skipped_line` and exits 0.
+fn scan_locked<T>(
+    db_path: &Path,
+    common_dir: &str,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    match lock::acquire(db_path, common_dir, lock::wait_from_env(), &|| false)? {
+        lock::Acquired::Held(_lock) => f().map(Some),
+        lock::Acquired::Busy | lock::Acquired::Cancelled => Ok(None),
+    }
+}
+
 /// `codemap scan [--repo <path> | --all] [--json]`.
 pub fn scan(db_path: &Path, repo: Option<&Path>, all: bool, json: bool) -> Result<()> {
     if super::disabled() {
@@ -138,23 +158,28 @@ pub fn scan(db_path: &Path, repo: Option<&Path>, all: bool, json: bool) -> Resul
     let opts = ScanOpts::default();
     if let Some(path) = repo {
         let id = identity::identify(path)?;
+        let common = id.common_dir.to_string_lossy().to_string();
         let report = storage.with_connection(|conn| {
             let main = (id.common_dir.file_name().is_some_and(|n| n == ".git"))
                 .then(|| id.common_dir.parent().map(Path::to_path_buf))
                 .flatten();
             store::upsert_repo(
                 conn,
-                &id.common_dir.to_string_lossy(),
+                &common,
                 main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
                 "cli",
                 true,
             )?;
-            scan_repo(conn, &id.common_dir, &opts)
+            scan_locked(db_path, &common, || scan_repo(conn, &id.common_dir, &opts))
         })?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        } else {
-            print_report(&report);
+        match report {
+            Some(report) if json => println!("{}", serde_json::to_string_pretty(&report)?),
+            Some(report) => print_report(&report),
+            None if json => println!(
+                "{}",
+                serde_json::json!({ "skipped": lock::skipped_line(&common) })
+            ),
+            None => println!("{}", lock::skipped_line(&common)),
         }
         return Ok(());
     }
@@ -176,8 +201,10 @@ pub fn scan(db_path: &Path, repo: Option<&Path>, all: bool, json: bool) -> Resul
             )?;
         }
         for c in &candidates {
-            match scan_repo(conn, &c.common_dir, &opts) {
-                Ok(r) => reports.push(r),
+            let common = c.common_dir.to_string_lossy().to_string();
+            match scan_locked(db_path, &common, || scan_repo(conn, &c.common_dir, &opts)) {
+                Ok(Some(r)) => reports.push(r),
+                Ok(None) => eprintln!("{}", lock::skipped_line(&common)),
                 Err(e) => {
                     eprintln!("scan failed for {}: {e:#}", c.common_dir.display());
                 }
