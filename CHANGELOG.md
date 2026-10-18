@@ -410,7 +410,7 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
   last told it. It reads the csr-engine database read-only
   and makes no model call.
-- **Dreamer** (off until you turn it on in `/config`): asks one "what if...?" when your past sessions give it a
+- **Dreamer** (on by default; turn it off in `/config`): asks one "what if...?" when your past sessions give it a
   reason and slows down when it finds nothing. Before each look it checks that its spend, plus the last look's cost,
   stays within 1 token for every 10 Claude spends. That is a check, not a cap: a fork takes no token ceiling, so one
   look can cost more than guessed. The real cost is recorded the moment the fork returns, whatever becomes of the
