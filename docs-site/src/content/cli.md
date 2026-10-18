@@ -57,6 +57,8 @@ csr-engine quality src/main.rs
 
 | Flag | Description |
 |------|-------------|
+| `--db-path <path>` | SQLite database file (global; default `~/.claude-self-reflect/csr-engine.db`) |
+| `--projects-dir <path>` | Claude projects directory (global) |
 | `--import` | Import conversations |
 | `--enrich` | Backfill enrichment |
 | `--watch` | Watch for new conversations |
@@ -68,7 +70,6 @@ csr-engine quality src/main.rs
 |----------|---------|-------------|
 | CSR_NARRATIVE_MODEL | (none) | Override AI narrative model (chain: this → `haiku` → CLI default) |
 | CSR_NO_AI_NARRATIVES | (none) | Set to `1` to disable AI narratives |
-| CSR_DB_PATH | ~/.claude-self-reflect/csr-engine.db | DB location |
 
 ## Data Locations
 
