@@ -35,6 +35,7 @@ export const navigation = [
       { label: 'Upgrading to v8', href: '/docs/upgrading' },
       { label: 'Search Strategies', href: '/docs/search-strategies' },
       { label: 'Privacy & Security', href: '/docs/privacy' },
+      { label: 'btw, these too', href: '/docs/btw-these-too' },
       { label: 'Troubleshooting', href: '/docs/troubleshooting' },
     ],
   },
@@ -72,6 +73,7 @@ import privacy from './privacy.md?raw'
 import troubleshooting from './troubleshooting.md?raw'
 import devSetup from './dev-setup.md?raw'
 import structure from './structure.md?raw'
+import btwTheseToo from './btw-these-too.md?raw'
 
 export const pages = {
   '/docs/why-csr': { title: 'Why Claude Self-Reflect?', description: 'What makes CSR different from other Claude Code memory tools.', content: stripFrontmatter(whyCsr), path: '/docs/why-csr' },
@@ -87,6 +89,7 @@ export const pages = {
   '/docs/upgrading': { title: 'Upgrading to v8', description: 'Migrate from v7.x to the single Rust binary.', content: stripFrontmatter(upgrading), path: '/docs/upgrading' },
   '/docs/search-strategies': { title: 'Search Strategies', description: 'Get the best results from CSR\'s search tools.', content: stripFrontmatter(searchStrategies), path: '/docs/search-strategies' },
   '/docs/privacy': { title: 'Privacy & Security', description: 'Everything runs locally by default.', content: stripFrontmatter(privacy), path: '/docs/privacy' },
+  '/docs/btw-these-too': { title: 'btw, these too', description: 'Smaller features that ship with this release.', content: stripFrontmatter(btwTheseToo), path: '/docs/btw-these-too' },
   '/docs/troubleshooting': { title: 'Troubleshooting', description: 'Solutions compiled from 160+ resolved GitHub issues.', content: stripFrontmatter(troubleshooting), path: '/docs/troubleshooting' },
   '/docs/dev-setup': { title: 'Development Setup', description: 'Get started contributing to CSR.', content: stripFrontmatter(devSetup), path: '/docs/dev-setup' },
   '/docs/structure': { title: 'Project Structure', description: 'A tour of the csr-engine codebase.', content: stripFrontmatter(structure), path: '/docs/structure' },
