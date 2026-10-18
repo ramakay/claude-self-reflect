@@ -166,49 +166,111 @@ def load_shifts(con, root):
     return _SHIFTS[root][1]
 
 
-ENGINE_WAIT = 5  # seconds the engine gets to say who wrote a change before the shift is left out
+ENGINE_WAIT = 5  # seconds the engine gets, for all the merges of one read, to say who wrote them before they are left out
+MERGE_CHUNK = 400  # receipt commits one git call asks about
 _AUTHORS = {}  # (repo, commit, file, symbol, from) -> (when asked, the engine's answer or None)
+# What the engine said about a merge, kept between runs: a commit's history never changes, so an answer that named
+# who wrote the change (or said the merge did) stands for good. A failure or an abstention is never kept here.
+AUTHOR_LOG = os.path.join(KEEP, 'merge-authors.jsonl')
+AUTHOR_RULE = 1  # the engine's rule the kept answers were made under; a line from another rule is not read
+_AUTHORS_READ = []  # the AUTHOR_LOG already read into _AUTHORS
 
 
-def is_merge(top, oid):
-    """Whether oid is a merge commit (git says: the commit and two or more parents)."""
-    out = subprocess.run(['git', '-C', top, 'rev-list', '--parents', '-n', '1', oid], capture_output=True, text=True)
-    return out.returncode == 0 and len(out.stdout.split()) >= 3
+def settled(answer):
+    return isinstance(answer, dict) and (answer.get('authored') is True
+                                         or (answer.get('authored') is False and bool(answer.get('author'))))
 
 
-def commit_author(top, rel, symbol, oid, at_oid):
-    """csr-engine's answer to "did oid author this change?" (symbol change) for the witness taken at at_oid:
-    {authored, author, author_committed_at, ...}, or None when the engine is missing, slow or unreadable.
-    An answer is kept for the life of the process; a failure only for a minute."""
-    key = (top, oid, rel, symbol, at_oid)
+def read_authors():
+    if _AUTHORS_READ == [AUTHOR_LOG]:
+        return
+    _AUTHORS_READ[:] = [AUTHOR_LOG]
+    try:
+        with open(AUTHOR_LOG, encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    if record.get('rule') == AUTHOR_RULE and settled(record.get('answer')):
+                        _AUTHORS.setdefault(tuple(record['key']), (0, record['answer']))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+    except OSError:
+        pass
+
+
+def keep_authors(keys):
+    """Append the settled answers among keys to AUTHOR_LOG."""
+    lines = [json.dumps(dict(rule=AUTHOR_RULE, key=list(key), answer=_AUTHORS[key][1])) + '\n'
+             for key in keys if settled(_AUTHORS.get(key, (0, None))[1])]
+    if lines:
+        try:
+            private.append(AUTHOR_LOG, ''.join(lines), root=KEEP)
+        except OSError:
+            pass
+
+
+def merge_commits(top, oids):
+    """The merge commits among oids (full or abbreviated), from one git call per MERGE_CHUNK distinct commits."""
+    wanted = sorted({oid for oid in oids if re.fullmatch(r'[0-9a-f]{4,64}', oid or '')})
+    merges = set()
+    for i in range(0, len(wanted), MERGE_CHUNK):
+        chunk = wanted[i:i + MERGE_CHUNK]
+        cmd = ['git', '-C', top, 'log', '--no-walk=unsorted', '--format=%H %P']
+        out = subprocess.run(cmd + chunk, capture_output=True, text=True)
+        if out.returncode != 0:  # one name git does not know fails the whole call: ask again about those it knows
+            known = subprocess.run(['git', '-C', top, 'cat-file', '--batch-check'], input='\n'.join(chunk) + '\n',
+                                   capture_output=True, text=True).stdout.splitlines()
+            chunk = [oid for oid, line in zip(chunk, known) if line.endswith(' commit') or ' commit ' in line]
+            out = subprocess.run(cmd + chunk, capture_output=True, text=True) if chunk else None
+        for line in (out.stdout.splitlines() if out is not None and out.returncode == 0 else []):
+            fields = line.split()
+            if len(fields) >= 3:
+                merges.add(fields[0])
+    return {oid for oid in wanted if oid in merges or (len(oid) < 40 and any(m.startswith(oid) for m in merges))}
+
+
+def known_answer(key):
+    """(True, answer) when the engine was already asked this and the answer still stands: an answer for the life of
+    the process, a failure for a minute. (False, None) when it has to be asked."""
     hit = _AUTHORS.get(key)
     if hit and (hit[1] is not None or time.time() - hit[0] < 60):
-        return hit[1]
-    answer, binary = None, engine_binary()
-    if binary:
-        cmd = [binary, 'symbol', 'change', '--repo', top, '--file', rel, '--oid', oid, '--from', at_oid]
-        if symbol:
-            cmd += ['--symbol', symbol]
+        return True, hit[1]
+    return False, None
+
+
+def ask_engine(questions):
+    """Every question, {key: {repo, file, symbol, oid, from}}, put to csr-engine in ONE `symbol change --batch` spawn
+    within ENGINE_WAIT seconds in all. An answer is {authored, author, author_committed_at, ...}; a question the
+    engine did not answer (no engine, too slow, bad output, an error line) is remembered as None."""
+    lines = []
+    binary = engine_binary()
+    if binary and questions:
+        asked = ''.join(json.dumps(question) + '\n' for question in questions.values())
         try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=ENGINE_WAIT, stdin=subprocess.DEVNULL)
-            answer = json.loads(out.stdout) if out.returncode == 0 else None
+            out = subprocess.run([binary, 'symbol', 'change', '--batch'], input=asked, capture_output=True, text=True,
+                                 timeout=ENGINE_WAIT)
+            lines = out.stdout.splitlines() if out.returncode == 0 else []
+        except subprocess.TimeoutExpired as late:  # what it had answered by then still counts
+            partial = late.stdout.decode('utf-8', 'replace') if isinstance(late.stdout, bytes) else late.stdout
+            lines = (partial or '').splitlines()
         except (OSError, ValueError, subprocess.SubprocessError):
+            lines = []
+    now = time.time()
+    for i, key in enumerate(questions):
+        try:
+            answer = json.loads(lines[i]) if i < len(lines) else None
+        except ValueError:
             answer = None
-    if not isinstance(answer, dict) or answer.get('oid') is None:
-        answer = None
-    _AUTHORS[key] = (time.time(), answer)
-    return answer
+        _AUTHORS[key] = (now, answer if isinstance(answer, dict) and answer.get('oid') is not None else None)
 
 
 def author_of(top, rel, symbol, merge, at_oids):
     """Who wrote the change a merge receipt carries, from every witness's own starting commit: 'self' when the merge
     itself changed the code, the author's (oid, committed_at) when it only brought the change in, None when the
-    engine cannot say or its answers differ."""
+    engine cannot say or its answers differ. Reads what ask_engine remembered."""
     verdicts = set()
     for at_oid in sorted(at_oids, key=str):
-        if not at_oid:
-            return None
-        answer = commit_author(top, rel, symbol, merge, at_oid)
+        answer = known_answer((top, merge, rel, symbol, at_oid))[1] if at_oid else None
         if answer is None:
             return None
         if answer.get('authored') is True:
@@ -222,9 +284,12 @@ def author_of(top, rel, symbol, merge, at_oids):
 
 def settle_merges(con, top, root, shifts):
     """A merge that left the code as its first parent had it did not write the change it brought in: a shift whose
-    receipt is such a merge moves to the commit that did, and is left out when the engine cannot say which. Shifts
-    whose receipt is not a merge never ask the engine."""
-    merges = {key: shift for key, shift in shifts.items() if is_merge(top, shift['oid'])}
+    receipt is such a merge moves to the commit that did, and is left out when the engine cannot say which. One git
+    call finds the merges among the receipts and one engine call settles them; shifts whose receipt is not a merge
+    cost neither."""
+    read_authors()
+    merging = merge_commits(top, [shift['oid'] for shift in shifts.values()])
+    merges = {key: shift for key, shift in shifts.items() if shift['oid'] in merging}
     if not merges:
         return shifts
     wids = sorted({wid for shift in merges.values() for wid in shift['wids']})
@@ -233,10 +298,20 @@ def settle_merges(con, top, root, shifts):
                               wids).fetchall())
     except sqlite3.Error:
         at = {}
+    rels = {key: os.path.relpath(os.path.join(root, shift['file']), top) for key, shift in merges.items()}
+    ats = {key: {at.get(wid) for wid in shift['wids']} for key, shift in merges.items()}
+    questions = {}
+    for key, shift in merges.items():
+        for at_oid in ats[key]:
+            ask = (top, shift['oid'], rels[key], shift['symbol'], at_oid)
+            if at_oid and not known_answer(ask)[0]:
+                questions[ask] = dict(repo=top, file=rels[key], symbol=shift['symbol'] or None, oid=shift['oid'],
+                                      **{'from': at_oid})
+    ask_engine(questions)
+    keep_authors(questions)
     out = {key: shift for key, shift in shifts.items() if key not in merges}
     for key, shift in merges.items():
-        rel = os.path.relpath(os.path.join(root, shift['file']), top)
-        who = author_of(top, rel, shift['symbol'], shift['oid'], {at.get(wid) for wid in shift['wids']})
+        who = author_of(top, rels[key], shift['symbol'], shift['oid'], ats[key])
         if who == 'self':
             out[key] = shift
         elif who:

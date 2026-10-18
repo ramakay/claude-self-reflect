@@ -3233,8 +3233,9 @@ class CodewitnessForTheDreamer(unittest.TestCase):
 
 
 class MergeReceipts(unittest.TestCase):
-    """A shift note named a merge instead of the commit that wrote the change. A merge receipt is asked about:
-    csr-engine says who wrote the change, the shift moves there, and a shift the engine cannot place is left out."""
+    """A shift note named a merge instead of the commit that wrote the change. The merge receipts of a read are found
+    with one git call and put to csr-engine in one spawn: the shift moves to the commit that wrote the change, and a
+    shift the engine cannot place is left out."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -3262,6 +3263,8 @@ class MergeReceipts(unittest.TestCase):
         self.git('merge', '--no-ff', '-q', '-m', 'merge side', 'side')
         self.merge = self.git('rev-parse', 'HEAD')
         self.log = os.path.join(self.tmp, 'engine.log')
+        self.said = dict(oid=self.merge, merge=True, authored=False, author=self.author,
+                         author_committed_at='2026-10-10T10:30:00+00:00')
         con = sqlite3.connect(':memory:')
         con.executescript("""
           create table meta(key text primary key, value text);
@@ -3276,22 +3279,36 @@ class MergeReceipts(unittest.TestCase):
           create table session_registry(session_id text, first_prompt text, first_ts text);
           create table intent_events(kind text, file text, ts text, quote text, session_id text);
         """)
-        con.execute('insert into witness_ledger values (1, ?, ?, ?, ?, ?)',
-                    ('repo', self.path, 'f', '2026-10-10T10:00:00Z', self.side))
-        con.execute("insert into witness_verdicts values (1, 1, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', "
-                    "'2026-10-10T11:00:00Z')", (self.merge, self.merge))
+        self.shift_row(1, 'f', self.side, self.merge)
         # an earlier session worked on f at 10:00 and ended at 10:05; the merge is dated 11:00
         con.execute("insert into code_nodes values (?, 'f', 'sess-old', '2026-10-10T10:00:00Z')", (self.path,))
         con.execute("insert into chunks values ('c2', 'sess-old', '2026-10-10T10:05:00Z')")
         con.execute("insert into session_registry values ('sess-old', 'build the thing', '2026-10-10T09:00:00Z')")
         self.con = con
         self.addCleanup(con.close)
-        for cache in (pane._SHIFTS, pane._AUTHORS):
+        self.kept = os.path.join(self.tmp, 'keep', 'merge-authors.jsonl')
+        for patched in (mock.patch.object(pane, 'AUTHOR_LOG', self.kept), mock.patch.object(pane, 'KEEP', os.path.dirname(self.kept))):
+            patched.start()
+            self.addCleanup(patched.stop)
+        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ):
             cache.clear()
             self.addCleanup(cache.clear)
         patcher = mock.patch.object(pane, 'first_prompts', lambda: {})
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def shift_row(self, wid, symbol, at_oid, receipt, when='2026-10-10T11:00:00Z'):
+        """A witness on `symbol` taken at at_oid, whose latest verdict is receipted at `receipt`."""
+        self.con_rows = getattr(self, 'con_rows', [])
+        self.con_rows.append((wid, symbol, at_oid, receipt, when))
+
+    def commit_rows(self):
+        for wid, symbol, at_oid, receipt, when in self.con_rows:
+            self.con.execute('insert into witness_ledger values (?, ?, ?, ?, ?, ?)',
+                             (wid, 'repo', self.path, symbol, '2026-10-10T10:00:00Z', at_oid))
+            self.con.execute("insert into witness_verdicts values (?, ?, 'superseded_by', ?, ?, "
+                             "'2026-10-10T12:00:00Z', ?)", (wid, wid, receipt, receipt, when))
+        self.con_rows = []
 
     def write(self, source, other=None, other_text=None):
         if source is not None:
@@ -3301,30 +3318,53 @@ class MergeReceipts(unittest.TestCase):
             with open(os.path.join(self.root, other), 'w') as handle:
                 handle.write(other_text)
 
-    def engine(self, reply, wait=0):
-        """A csr-engine stand-in that logs its arguments and prints `reply`."""
+    def engine(self, replies, wait=0):
+        """A csr-engine stand-in: logs each spawn and each question, and answers every question line with the reply
+        for its `from` (else the '*' one). A reply that is a string starting RAW: is printed as it is."""
         script = os.path.join(self.tmp, 'csr-engine')
+        replies = replies if '*' in replies else {'*': replies}
         with open(script, 'w') as handle:
-            handle.write(f"#!/bin/sh\necho \"$@\" >> '{self.log}'\n"
-                         + (f'sleep {wait}\n' if wait else '') + f"printf '%s' '{json.dumps(reply)}'\n")
+            handle.write(f"#!{sys.executable}\nimport json, sys, time\nREPLIES = json.loads({json.dumps(json.dumps(replies))})\n"
+                         f"LOG = {self.log!r}\nlog = open(LOG, 'a')\nlog.write('spawn ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                         f"time.sleep({wait})\nfor line in sys.stdin:\n    q = json.loads(line)\n    log.write('Q ' + line)\n"
+                         "    log.flush()\n    reply = REPLIES.get(q['from'], REPLIES['*'])\n"
+                         "    print(reply[4:] if isinstance(reply, str) and reply.startswith('RAW:') else json.dumps(reply), flush=True)\n")
         os.chmod(script, 0o755)
         patcher = mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': script})
         patcher.start()
         self.addCleanup(patcher.stop)
         return script
 
-    def asked(self):
+    def log_lines(self):
         if not os.path.exists(self.log):
             return []
         with open(self.log) as handle:
             return handle.read().splitlines()
 
+    def spawns(self):
+        return [line for line in self.log_lines() if line.startswith('spawn ')]
+
+    def questions(self):
+        return [json.loads(line[2:]) for line in self.log_lines() if line.startswith('Q ')]
+
     def notes(self):
+        self.commit_rows()
         return pane.notes_for(self.con, self.root, self.path, 'sess-now')
 
+    def spy_runs(self):
+        """Every command pane.py runs while the test goes on."""
+        calls, real = [], subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            return real(cmd, *args, **kwargs)
+        patcher = mock.patch.object(pane.subprocess, 'run', spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
     def test_a_merge_receipt_moves_to_the_commit_that_wrote_the_change(self):
-        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
-                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        self.engine(self.said)
         notes = self.notes()
         self.assertEqual([n['oid'] for n in notes], [self.author])
         self.assertIn(f'changed in {self.author[:7]}', notes[0]['line'])
@@ -3334,16 +3374,16 @@ class MergeReceipts(unittest.TestCase):
         _, shifts = pane.load_shifts(self.con, self.root)
         self.assertEqual([(s['oid'], s['wids'], s['date'], s['subject']) for s in shifts],
                          [(self.author, [1], '2026-10-10', 'change f')])
-        self.assertEqual(self.asked(), [f'symbol change --repo {self.root} --file a.py --oid {self.merge} '
-                                        f'--from {self.side} --symbol f'])
+        self.assertEqual(self.spawns(), ['spawn symbol change --batch'])
+        self.assertEqual(self.questions(), [dict(repo=self.root, file='a.py', symbol='f', oid=self.merge,
+                                                 **{'from': self.side})])
 
     def test_the_answer_is_kept_for_the_life_of_the_process(self):
-        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
-                         author_committed_at='2026-10-10T10:30:00+00:00'))
-        self.notes()
+        self.engine(self.said)
+        self.assertEqual(len(self.notes()), 1)
         pane._SHIFTS.clear()  # the minute is up: the shifts are read again
         self.assertEqual(len(self.notes()), 1)
-        self.assertEqual(len(self.asked()), 1)
+        self.assertEqual(len(self.spawns()), 1)
 
     def test_a_merge_that_changed_the_code_itself_stays(self):
         self.engine(dict(oid=self.merge, merge=True, authored=True, author=self.merge,
@@ -3353,13 +3393,14 @@ class MergeReceipts(unittest.TestCase):
     def test_a_merge_the_engine_cannot_place_is_left_out(self):
         for reply in (dict(oid=self.merge, merge=True, authored=False, author=None, author_committed_at=None),
                       dict(oid=self.merge, merge=True, authored=None, author=None, author_committed_at=None),
-                      dict(error='not a commit')):
+                      dict(error='not a commit'), 'RAW:not json'):
             pane._SHIFTS.clear()
             pane._AUTHORS.clear()
             self.engine(reply)
             self.assertEqual(self.notes(), [], reply)
 
     def test_no_engine_leaves_the_merge_out_rather_than_naming_it(self):
+        self.commit_rows()
         with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': os.path.join(self.tmp, 'missing')}):
             self.assertEqual(self.notes(), [])
         pane._SHIFTS.clear()
@@ -3368,48 +3409,106 @@ class MergeReceipts(unittest.TestCase):
             self.assertEqual(self.notes(), [])
 
     def test_an_engine_past_its_time_leaves_the_merge_out(self):
-        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
-                         author_committed_at='2026-10-10T10:30:00+00:00'), wait=3)
-        with mock.patch.object(pane, 'ENGINE_WAIT', 0.3):
+        self.engine(self.said, wait=3)
+        with mock.patch.object(pane, 'ENGINE_WAIT', 0.5):
             started = time.time()
             self.assertEqual(self.notes(), [])
         self.assertLess(time.time() - started, 2.5)
 
-    def test_broken_output_leaves_the_merge_out(self):
-        script = self.engine(dict())
-        with open(script, 'w') as handle:
-            handle.write('#!/bin/sh\necho "not json"\n')
-        self.assertEqual(self.notes(), [])
-
     def test_a_receipt_that_is_not_a_merge_never_asks_the_engine(self):
-        self.con.execute('update witness_verdicts set receipt_oid=?', (self.author,))
-        self.engine(dict(oid=self.author, merge=False, authored=True, author=self.author,
-                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        self.con_rows = []
+        self.shift_row(1, 'f', self.side, self.author)
+        self.engine(dict(self.said, oid=self.author, merge=False, authored=True, author=self.author))
+        calls = self.spy_runs()
         self.assertEqual([n['oid'] for n in self.notes()], [self.author])
-        self.assertEqual(self.asked(), [])
+        self.assertEqual(self.spawns(), [])
+        self.assertEqual([c for c in calls if 'rev-list' in c], [])
 
     def test_witnesses_with_different_starting_commits_must_agree(self):
-        self.con.execute('insert into witness_ledger values (2, ?, ?, ?, ?, ?)',
-                         ('repo', self.path, 'f', '2026-10-10T10:00:00Z', self.author))
-        self.con.execute("insert into witness_verdicts values (2, 2, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', "
-                         "'2026-10-10T11:00:00Z')", (self.merge, self.merge))
-        script = self.engine(dict())
-        with open(script, 'w') as handle:  # the witness that started on the side branch says the merge only brought it in; the other says it wrote it
-            handle.write(f"#!/bin/sh\necho \"$@\" >> '{self.log}'\ncase \"$*\" in *'--from {self.side}'*)\n"
-                         f"printf '%s' '{json.dumps(dict(oid=self.merge, merge=True, authored=False, author=self.author, author_committed_at='2026-10-10T10:30:00+00:00'))}';;\n"
-                         f"*) printf '%s' '{json.dumps(dict(oid=self.merge, merge=True, authored=True, author=self.merge, author_committed_at='2026-10-10T11:00:00+00:00'))}';;\nesac\n")
+        self.shift_row(2, 'f', self.author, self.merge)
+        # the witness that started on the side branch says the merge only brought it in; the other says it wrote it
+        self.engine({self.side: self.said, self.author: dict(self.said, authored=True, author=self.merge)})
         self.assertEqual(self.notes(), [])
-        self.assertEqual(len(self.asked()), 2)
+        self.assertEqual(sorted(q['from'] for q in self.questions()), sorted([self.side, self.author]))
+        self.assertEqual(len(self.spawns()), 1)
 
     def test_a_shift_moved_onto_a_commit_that_already_has_one_joins_it(self):
-        self.con.execute('insert into witness_ledger values (2, ?, ?, ?, ?, ?)',
-                         ('repo', self.path, 'f', '2026-10-10T10:00:00Z', self.side))
-        self.con.execute("insert into witness_verdicts values (2, 2, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', "
-                         "'2026-10-10T10:30:00Z')", (self.author, self.author))
-        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
-                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        self.shift_row(2, 'f', self.side, self.author, '2026-10-10T10:30:00Z')
+        self.engine(self.said)
+        self.commit_rows()
         _, shifts = pane.read_shifts(self.con, self.root)
         self.assertEqual([(s['oid'], s['wids']) for s in shifts], [(self.author, [1, 2])])
+
+    def test_many_merge_shifts_cost_one_git_call_and_one_engine_spawn(self):
+        for wid, symbol in enumerate('ghijk', 3):
+            self.shift_row(wid, symbol, self.side, self.merge)
+        self.shift_row(8, 'f', self.side, self.author, '2026-10-10T10:30:00Z')  # not a merge
+        self.shift_row(9, 'm', self.side, '0' * 40)  # a receipt this repository does not have
+        self.engine(self.said)
+        self.commit_rows()
+        calls = self.spy_runs()
+        _, shifts = pane.read_shifts(self.con, self.root)
+        self.assertEqual({s['oid'] for s in shifts if s['symbol'] != 'm'}, {self.author})
+        self.assertEqual(len(shifts), 7)  # f, g, h, i, j, k on the author, and m on its unknown receipt
+        self.assertEqual(len(self.spawns()), 1)
+        self.assertEqual(len(self.questions()), 6)  # f, g, h, i, j, k asked once each, in that one spawn
+        self.assertEqual([c for c in calls if 'rev-list' in c], [])
+        walks = [c for c in calls if any(part.startswith('--no-walk') for part in c)]
+        self.assertEqual(len(walks), 2)  # the unknown receipt fails the first call; the retry names only known ones
+        self.assertEqual(len([c for c in calls if c[0] == pane.engine_binary()]), 1)
+
+    def test_a_clean_read_asks_git_once(self):
+        for wid, symbol in enumerate('ghijk', 3):
+            self.shift_row(wid, symbol, self.side, self.merge)
+        self.engine(self.said)
+        self.commit_rows()
+        calls = self.spy_runs()
+        pane.read_shifts(self.con, self.root)
+        walks = [c for c in calls if any(part.startswith('--no-walk') for part in c)]
+        self.assertEqual(len(walks), 1)
+
+    def test_the_merge_commits_are_found_in_chunks(self):
+        with mock.patch.object(pane, 'MERGE_CHUNK', 1):
+            calls = self.spy_runs()
+            found = pane.merge_commits(self.root, [self.merge, self.author, self.merge, 'not an oid'])
+        self.assertEqual(found, {self.merge})
+        self.assertEqual(len([c for c in calls if any(part.startswith('--no-walk') for part in c)]), 2)
+
+    def test_what_the_engine_settled_is_kept_for_the_next_run(self):
+        self.engine(self.said)
+        self.assertEqual([n['oid'] for n in self.notes()], [self.author])
+        self.assertEqual(len(self.spawns()), 1)
+        # a new process: nothing in memory, the kept file is all there is
+        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ):
+            cache.clear()
+        self.assertEqual([n['oid'] for n in self.notes()], [self.author])
+        self.assertEqual(len(self.spawns()), 1, 'the second run asked the engine again')
+        with open(self.kept) as handle:
+            records = [json.loads(line) for line in handle]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['key'], [self.root, self.merge, 'a.py', 'f', self.side])
+        self.assertEqual(os.stat(self.kept).st_mode & 0o777, 0o600)
+
+    def test_an_abstention_or_a_failure_is_not_kept(self):
+        self.engine(dict(self.said, authored=False, author=None))
+        self.assertEqual(self.notes(), [])
+        self.assertFalse(os.path.exists(self.kept))
+        pane._SHIFTS.clear()
+        pane._AUTHORS.clear()
+        with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': os.path.join(self.tmp, 'missing')}):
+            self.assertEqual(self.notes(), [])
+        self.assertFalse(os.path.exists(self.kept))
+
+    def test_a_kept_answer_from_another_rule_or_a_damaged_line_is_not_trusted(self):
+        os.makedirs(os.path.dirname(self.kept))
+        key = [self.root, self.merge, 'a.py', 'f', self.side]
+        with open(self.kept, 'w') as handle:
+            handle.write(json.dumps(dict(rule=pane.AUTHOR_RULE + 1, key=key, answer=self.said)) + '\n')
+            handle.write('{"rule": 1, "key": \n')
+            handle.write(json.dumps(dict(rule=pane.AUTHOR_RULE, key=key, answer=dict(self.said, author=None))) + '\n')
+        self.engine(self.said)
+        self.assertEqual([n['oid'] for n in self.notes()], [self.author])
+        self.assertEqual(len(self.spawns()), 1)
 
 
 class MemoryRoot(unittest.TestCase):
