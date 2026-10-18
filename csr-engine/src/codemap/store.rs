@@ -672,6 +672,24 @@ pub fn stored_files(conn: &Connection, view_id: i64) -> Result<Vec<FileRec>> {
     Ok(rows)
 }
 
+/// Paths a view holds below the directory `dir_rel` (repo-relative, no trailing
+/// slash). One range scan of the primary key: `'0'` is `'/'` plus one, so
+/// `path >= 'dir/' AND path < 'dir0'` is exactly the paths that start with
+/// `dir/`, and `dir.py`, `dir-x/a` and `dir2/a` fall outside it.
+pub fn stored_paths_under(conn: &Connection, view_id: i64, dir_rel: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT path FROM codemap_view_files
+         WHERE view_id = ?1 AND path >= ?2 AND path < ?3 ORDER BY path",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![view_id, format!("{dir_rel}/"), format!("{dir_rel}0")],
+            |r| r.get(0),
+        )?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    Ok(rows)
+}
+
 /// One stored file row, if the view holds the path.
 pub fn stored_file(conn: &Connection, view_id: i64, path: &str) -> Result<Option<FileRec>> {
     Ok(conn

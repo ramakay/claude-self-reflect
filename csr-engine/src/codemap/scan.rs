@@ -433,12 +433,22 @@ fn settle_file(
     Ok(())
 }
 
-/// Untracked code files of a worktree, in path order: `.gitignore`,
-/// `.git/info/exclude` and the user's global ignore apply; hard-skip
-/// directories, tool-cache dot directories and any directory with its own `.git`
-/// are not entered.
-fn walk_untracked(view: &ViewId, common_dir: &Path, tracked: &HashSet<String>) -> Vec<String> {
-    let mut builder = WalkBuilder::new(&view.worktree_path);
+/// What a bounded walk found.
+struct WalkOutcome {
+    /// Repo-relative '/'-separated paths of code files, in path order.
+    files: Vec<String>,
+    /// The walk stopped before the end: more files than the allowance, or more
+    /// entries than the visit budget.
+    stopped: bool,
+}
+
+/// The walker the full scan's untracked pass and the directory-event pass share:
+/// `.gitignore`, `.git/info/exclude` apply; hard-skip directories, tool-cache
+/// dot directories and any directory with its own `.git` are not entered.
+/// `only_under` restricts the walk to that directory (plus the ancestors that
+/// lead to it, so their `.gitignore` files still apply).
+fn untracked_walk(root: &Path, common_dir: &Path, only_under: Option<&Path>) -> ignore::Walk {
+    let mut builder = WalkBuilder::new(root);
     builder
         .require_git(false)
         .hidden(false)
@@ -446,9 +456,16 @@ fn walk_untracked(view: &ViewId, common_dir: &Path, tracked: &HashSet<String>) -
         .git_exclude(false)
         .sort_by_file_path(|a, b| a.cmp(b));
     let _ = builder.add_ignore(common_dir.join("info").join("exclude"));
-    builder.filter_entry(|entry| {
+    let only = only_under.map(Path::to_path_buf);
+    builder.filter_entry(move |entry| {
         if entry.depth() == 0 {
             return true;
+        }
+        if let Some(only) = &only {
+            let p = entry.path();
+            if !(only.starts_with(p) || p.starts_with(only)) {
+                return false;
+            }
         }
         let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
         let name = entry.file_name().to_str();
@@ -459,21 +476,55 @@ fn walk_untracked(view: &ViewId, common_dir: &Path, tracked: &HashSet<String>) -
         // `.git` that is a symlink is never followed.
         !(is_dir && std::fs::symlink_metadata(entry.path().join(".git")).is_ok())
     });
-    let mut out = Vec::new();
-    for entry in builder.build().flatten() {
+    builder.build()
+}
+
+/// Code files found by `untracked_walk` that `keep` accepts, in path order.
+/// Stops (`stopped`) at the first file beyond `allowance` files.
+fn collect_walk(
+    root: &Path,
+    common_dir: &Path,
+    only_under: Option<&Path>,
+    keep: impl Fn(&str) -> bool,
+    allowance: usize,
+) -> WalkOutcome {
+    let mut out = WalkOutcome {
+        files: Vec::new(),
+        stopped: false,
+    };
+    for entry in untracked_walk(root, common_dir, only_under).flatten() {
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(&view.worktree_path) else {
+        if only_under.is_some_and(|d| !entry.path().starts_with(d)) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
         let Some(rel) = rel.to_str() else { continue };
-        if !rel_passes_caps(rel) || tracked.contains(rel) {
+        if !rel_passes_caps(rel) || !keep(rel) {
             continue;
         }
-        out.push(rel.to_string());
+        if out.files.len() >= allowance {
+            out.stopped = true;
+            break;
+        }
+        out.files.push(rel.to_string());
     }
     out
+}
+
+/// Untracked code files of a worktree, in path order.
+fn walk_untracked(view: &ViewId, common_dir: &Path, tracked: &HashSet<String>) -> Vec<String> {
+    collect_walk(
+        &view.worktree_path,
+        common_dir,
+        None,
+        |rel| !tracked.contains(rel),
+        usize::MAX,
+    )
+    .files
 }
 
 fn collect_view(
@@ -791,6 +842,95 @@ fn untracked_excluded(root: &Path, common_dir: &Path, rel: &str) -> bool {
         }
     }
     false
+}
+
+// ---- directory events ----------------------------------------------------------------
+
+/// Can an event on this repo-relative path with no file extension be a
+/// directory that was renamed, created or removed? Every segment, the last
+/// included, must clear the hard-skip and tool-cache lists (`target`,
+/// `node_modules`, `.git`, `.venv` ...). Lexical.
+pub(crate) fn dir_event_rel_ok(rel: &str) -> bool {
+    !rel.is_empty()
+        && rel
+            .split('/')
+            .all(|s| !s.is_empty() && !is_hard_skip_dir(s) && !UNTRACKED_SKIP_DIRS.contains(&s))
+}
+
+/// What `expand_dir_events` did.
+#[derive(Debug, Default)]
+pub(crate) struct DirExpansion {
+    /// The paths to hand to `rescan_paths`: the code paths given, plus the
+    /// stored and the on-disk code files below every directory event.
+    pub paths: Vec<PathBuf>,
+    /// Extension-less paths inside a view that were looked at.
+    pub dir_events: usize,
+}
+
+/// Turn the extension-less paths of a watcher batch (a renamed, created or
+/// removed directory) into the code files below them, so `rescan_paths` can drop
+/// the rows of the old location and add the new one. Code paths pass through.
+///
+/// For each such path inside a stored view: one `lstat`, and one indexed range
+/// query for the stored rows below it (a plain file such as `4913` or `Makefile`
+/// costs nothing more). If it is a directory now, its code files are added from
+/// a bounded walk with the untracked walk's ignore rules, at most the view's
+/// remaining file allowance, never following a symlink and never entering a
+/// protected folder.
+pub(crate) fn expand_dir_events(conn: &Connection, abs_paths: &[PathBuf]) -> Result<DirExpansion> {
+    let mut out: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut result = DirExpansion::default();
+    let mut views: Option<Vec<StoredView>> = None;
+    let home = identity::home_dir();
+    for p in abs_paths {
+        if has_code_extension(p) {
+            out.insert(p.clone());
+            continue;
+        }
+        if p.extension().is_some() {
+            continue;
+        }
+        let abs = normalize_lexical(p);
+        if is_tcc_path(&abs, home.as_deref()) {
+            continue;
+        }
+        if views.is_none() {
+            views = Some(store::stored_views(conn, None)?);
+        }
+        let Some(view) = views.as_deref().and_then(|vs| longest_view_for(vs, &abs)) else {
+            continue;
+        };
+        let Some(rel) = abs
+            .strip_prefix(&view.worktree_path)
+            .ok()
+            .and_then(|r| r.to_str())
+            .filter(|r| dir_event_rel_ok(r))
+        else {
+            continue;
+        };
+        result.dir_events += 1;
+        let root = PathBuf::from(&view.worktree_path);
+        // Rows below the path (it may be gone, or now a file): rescan_paths
+        // drops those whose file no longer exists.
+        let stored = store::stored_paths_under(conn, view.id, rel)?;
+        out.extend(stored.iter().map(|s| root.join(s)));
+        // `lstat`: a symlink is not a directory to the full scan either.
+        let is_dir = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_dir());
+        if !is_dir || identity::resolve_safe(&abs, home.as_deref()).is_err() {
+            continue;
+        }
+        let room = (MAX_FILES_PER_PROJECT as i64 - view.files).max(0) as usize + stored.len();
+        let found = collect_walk(
+            &root,
+            Path::new(&view.common_dir),
+            Some(&abs),
+            |_| true,
+            room,
+        );
+        out.extend(found.files.iter().map(|f| root.join(f)));
+    }
+    result.paths = out.into_iter().collect();
+    Ok(result)
 }
 
 /// Redo steps 2-5 of the scan for these absolute paths only, in the views that

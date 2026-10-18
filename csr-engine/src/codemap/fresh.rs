@@ -43,7 +43,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use super::discover::{discover, max_repos_from_env, tier};
 use super::identity::{self, is_tcc_path, ViewId};
 use super::scan::{
-    rel_passes_caps, rescan_paths, scan_repo, view_changed, PathScanReport, ScanOpts,
+    dir_event_rel_ok, expand_dir_events, rel_passes_caps, rescan_paths, scan_repo, view_changed,
+    PathScanReport, ScanOpts,
 };
 use super::store::{self, StoredRepo};
 use crate::extraction::repo_scan::has_code_extension;
@@ -497,11 +498,20 @@ impl<'a> Poller<'a> {
 // ---- watcher filter ---------------------------------------------------------------
 
 /// The cheap lexical filter the watcher callback applies before anything is
-/// queued: a code extension, a stored view root above the path, no hard-skip
-/// directory (`target/`, `node_modules/`, `.git/` ...) below that root, and not
-/// in a protected folder. No filesystem call.
+/// queued: a stored view root above the path, no hard-skip directory
+/// (`target/`, `node_modules/`, `.git/` ...) below that root, not in a protected
+/// folder, and either
+///
+/// - a code extension (a file edit), or
+/// - no extension at all, with no hard-skip or tool-cache segment even in the
+///   last position: a directory that may have been renamed, created or removed
+///   (`mv src lib` makes events for `src` and `lib`, neither with an extension).
+///   The pump decides what such a path is; the callback only forwards it.
+///
+/// No filesystem call.
 pub(crate) fn event_path_relevant(path: &Path, roots: &[PathBuf], home: Option<&Path>) -> bool {
-    if !has_code_extension(path) {
+    let code = has_code_extension(path);
+    if !code && path.extension().is_some() {
         return false;
     }
     let Some(root) = roots
@@ -514,7 +524,12 @@ pub(crate) fn event_path_relevant(path: &Path, roots: &[PathBuf], home: Option<&
     let Some(rel) = path.strip_prefix(root).ok().and_then(|r| r.to_str()) else {
         return false;
     };
-    rel_passes_caps(rel) && !is_tcc_path(path, home)
+    let shape_ok = if code {
+        rel_passes_caps(rel)
+    } else {
+        dir_event_rel_ok(rel)
+    };
+    shape_ok && !is_tcc_path(path, home)
 }
 
 /// The roots that cover all of `roots`: those not inside another root.
@@ -751,10 +766,18 @@ impl<'a> Pump<'a> {
         self.flushes += 1;
         self.flushed_paths += paths.len();
         let ctx = self.ctx;
-        match self
-            .storage
-            .with_connection(|conn| rescan_gated(ctx, conn, &paths))
-        {
+        match self.storage.with_connection(|conn| {
+            // Directory events (renames) become the code files below them.
+            let expanded = expand_dir_events(conn, &paths)?;
+            if expanded.dir_events > 0 {
+                ctx.log(&format!(
+                    "dirs n={} -> {} paths",
+                    expanded.dir_events,
+                    expanded.paths.len()
+                ));
+            }
+            rescan_gated(ctx, conn, &expanded.paths)
+        }) {
             Ok(r) => log_paths(ctx, "watch", paths.len(), &r),
             Err(e) => ctx.log(&format!("paths via=watch failed: {}", short_err(&e))),
         }
@@ -1131,6 +1154,170 @@ mod tests {
             &tcc,
             None
         ));
+    }
+
+    #[test]
+    fn lexical_filter_forwards_extensionless_paths_that_may_be_directories() {
+        let roots = vec![PathBuf::from("/w/repo")];
+        let ok = |p: &str| event_path_relevant(Path::new(p), &roots, None);
+        // Directories (and files like Makefile): forwarded, the pump decides.
+        assert!(ok("/w/repo/src"));
+        assert!(ok("/w/repo/src/deep/lib"));
+        assert!(ok("/w/repo/Makefile"));
+        assert!(ok("/w/repo/.plans"));
+        // Every segment, the last included, clears the skip lists.
+        assert!(!ok("/w/repo/target"));
+        assert!(!ok("/w/repo/web/node_modules"));
+        assert!(!ok("/w/repo/target/debug/build"));
+        assert!(!ok("/w/repo/.git"));
+        assert!(!ok("/w/repo/.git/objects/ab"));
+        assert!(!ok("/w/repo/.venv"));
+        assert!(!ok("/w/repo/.cache/x"));
+        // The root itself, paths outside any root, and files with some other
+        // extension are not directory candidates.
+        assert!(!ok("/w/repo"));
+        assert!(!ok("/elsewhere/src"));
+        assert!(!ok("/w/repo/README.md"));
+        assert!(!ok("/w/repo/src/notes.txt"));
+        // Protected folders stay out, whatever the shape.
+        let tcc = vec![PathBuf::from("/Users/nobody/Desktop/p")];
+        assert!(!event_path_relevant(
+            Path::new("/Users/nobody/Desktop/p/src"),
+            &tcc,
+            None
+        ));
+    }
+
+    fn stored_paths(rig: &Rig) -> Vec<String> {
+        rig.conn()
+            .with_connection(|c| {
+                let view = store::stored_views(c, None)?.remove(0);
+                Ok(store::stored_files(c, view.id)?
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn renaming_a_directory_replaces_its_rows() {
+        let rig = Rig::new();
+        let repo = rig.fx.init_repo("r");
+        write(&repo, "src/a.py", &py(&["alpha_fn"]));
+        write(&repo, "src/b.py", &py(&["beta_fn"]));
+        write(&repo, "keep.py", &py(&["keep_fn"]));
+        rig.fx.commit_all(&repo, "one");
+        rig.register(&repo);
+        let mut opts = rig.opts();
+        opts.watch = false;
+        let ctx = rig.ctx(opts);
+        Poller::new(&ctx).unwrap().step(Instant::now()).unwrap();
+        let before = vec!["keep.py", "src/a.py", "src/b.py"];
+        assert_eq!(stored_paths(&rig), before);
+
+        // No git involved: `mv src lib`.
+        std::fs::rename(repo.join("src"), repo.join("lib")).unwrap();
+        let mut pump = Pump::new(&ctx).unwrap();
+
+        // A vim-style `4913` probe file and a Makefile: one stat and one range
+        // query each, nothing else, and nothing changes.
+        write(&repo, "4913", "x");
+        write(&repo, "Makefile", "all:\n");
+        pump.add_pending(repo.join("4913"), Instant::now());
+        pump.add_pending(repo.join("Makefile"), Instant::now());
+        pump.flush();
+        assert_eq!(stored_paths(&rig), before, "plain files change nothing");
+
+        // The two directory events of the rename: the old and the new path.
+        pump.add_pending(repo.join("src"), Instant::now());
+        pump.add_pending(repo.join("lib"), Instant::now());
+        pump.flush();
+        assert_eq!(stored_paths(&rig), vec!["keep.py", "lib/a.py", "lib/b.py"]);
+        let hit_paths = |name: &str| -> Vec<String> {
+            rig.conn()
+                .with_connection(|c| query::query(c, name, 20))
+                .unwrap()
+                .into_iter()
+                .map(|h| h.path)
+                .collect()
+        };
+        assert_eq!(hit_paths("alpha_fn"), vec!["lib/a.py"]);
+        assert_eq!(hit_paths("beta_fn"), vec!["lib/b.py"]);
+        let fts: i64 = rig
+            .conn()
+            .with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM codemap_fts WHERE path LIKE 'src/%'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(fts, 0, "no search row names the old location");
+
+        // A directory removed outright drops its rows too.
+        std::fs::remove_dir_all(repo.join("lib")).unwrap();
+        pump.add_pending(repo.join("lib"), Instant::now());
+        pump.flush();
+        assert_eq!(stored_paths(&rig), vec!["keep.py"]);
+    }
+
+    #[test]
+    fn a_directory_event_only_touches_paths_below_it() {
+        let rig = Rig::new();
+        let repo = rig.fx.init_repo("r");
+        for p in [
+            "src/a.py",
+            "src.py",
+            "src2/x.py",
+            "src-x/y.py",
+            "target/gen.py",
+        ] {
+            write(&repo, p, &py(&["f"]));
+        }
+        rig.fx.commit_all(&repo, "one");
+        rig.register(&repo);
+        let ctx = rig.ctx(rig.opts());
+        Poller::new(&ctx).unwrap().step(Instant::now()).unwrap();
+        let conn = rig.conn();
+        let (view_id, root) = conn
+            .with_connection(|c| {
+                let v = store::stored_views(c, None)?.remove(0);
+                Ok((v.id, PathBuf::from(v.worktree_path)))
+            })
+            .unwrap();
+        let under = conn
+            .with_connection(|c| store::stored_paths_under(c, view_id, "src"))
+            .unwrap();
+        assert_eq!(
+            under,
+            vec!["src/a.py"],
+            "src.py, src2/ and src-x/ are not below src"
+        );
+
+        // `src` expands to its stored file (the same file is on disk, so the
+        // walk adds nothing new). A hard-skip `target`, a path outside every
+        // view and a missing name inside the view expand to nothing; the missing
+        // name is looked at (one stat) but is neither stored nor a directory.
+        let exp = conn
+            .with_connection(|c| {
+                expand_dir_events(
+                    c,
+                    &[
+                        root.join("src"),
+                        root.join("target"),
+                        root.join("no-such-name"),
+                        PathBuf::from("/nowhere/at/all"),
+                    ],
+                )
+            })
+            .unwrap();
+        assert_eq!(exp.paths, vec![root.join("src/a.py")]);
+        assert_eq!(
+            exp.dir_events, 2,
+            "src and no-such-name; target and outside are not"
+        );
     }
 
     #[test]
