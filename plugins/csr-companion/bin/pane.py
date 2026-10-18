@@ -589,7 +589,7 @@ def notes_for(con, root, path, session_id=None, before=None):
             line += f" What changed: {what}."
         sketch = [f"{talked}  \u25cf your session  {quoted(change['title'], 34)}",
                   f"{changed}  \u25b2 {latest['oid'][:7]}  {', '.join(symbols[:3])}{' +' + str(len(symbols) - 3) if len(symbols) > 3 else ''}"
-                  f"{f' \u00b7 {what}' if what else ''}"]
+                  + (' \u00b7 ' + what if what else '')]
         notes.append(dict(id=f"shift:{rel}:{latest['oid'][:12]}:{change['conversation'][:8]}", kind='shift', file=rel,
                           line=line, title=f"Your {talked} work on {symbols[0]} has changed since",
                           text=text, sketch=sketch, symbol=symbols[0], oid=latest['oid'],
