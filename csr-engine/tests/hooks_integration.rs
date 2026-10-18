@@ -125,6 +125,140 @@ mod subagent_compaction {
     }
 }
 
+/// Code map session scope: every SessionStart, whatever its source, leaves one
+/// `codemap_signals` row naming the session's cwd. Runs the real binary against a
+/// temp db/HOME, never live data.
+#[cfg(unix)]
+mod codemap_session_signal {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn fire(dir: &std::path::Path, hook: &str, payload: serde_json::Value) {
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.join("projects")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", hook, "--db-path"])
+            .arg(dir.join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.join("projects"))
+            .env("HOME", &home)
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .env_remove("CSR_NO_CODEMAP")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{:?}", output.status);
+    }
+
+    fn signals(dir: &std::path::Path) -> Vec<(String, String, i64)> {
+        let conn = rusqlite::Connection::open(dir.join("csr-engine.db")).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT cwd, source, last_at FROM codemap_signals ORDER BY cwd")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn session_start_records_its_cwd_for_every_source() {
+        for source in ["startup", "resume", "compact", "clear"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = "/w/signal-probe/repo";
+            fire(
+                dir.path(),
+                "session-start",
+                serde_json::json!({
+                    "session_id": format!("sess-{source}"),
+                    "cwd": cwd,
+                    "source": source,
+                }),
+            );
+            let rows = signals(dir.path());
+            assert_eq!(rows.len(), 1, "{source}: {rows:?}");
+            assert_eq!(rows[0].0, cwd, "{source}");
+            assert_eq!(rows[0].1, "session_start", "{source}");
+            assert!(
+                rows[0].2 > 1_700_000_000,
+                "{source}: seconds, got {}",
+                rows[0].2
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_start_without_a_cwd_records_no_signal_and_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        fire(
+            dir.path(),
+            "session-start",
+            serde_json::json!({ "session_id": "no-cwd", "source": "startup" }),
+        );
+        assert!(signals(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn post_tool_use_records_the_cwd_even_for_a_non_edit_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        fire(
+            dir.path(),
+            "post-tool-use",
+            serde_json::json!({
+                "session_id": "sess-ptu",
+                "cwd": "/w/signal-probe/repo",
+                "tool_name": "Read",
+                "tool_input": { "file_path": "/w/signal-probe/repo/a.rs" },
+            }),
+        );
+        let rows = signals(dir.path());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].0, "/w/signal-probe/repo");
+        assert_eq!(rows[0].1, "post_tool_use");
+    }
+
+    #[test]
+    fn the_kill_switch_records_no_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(dir.path().join("projects")).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "session-start", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", &home)
+            .env("CSR_NO_CODEMAP", "1")
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"s","cwd":"/w/signal-probe/repo","source":"startup"}"#)
+            .unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+        assert!(signals(dir.path()).is_empty());
+    }
+}
+
 #[cfg(unix)]
 mod prompt_process {
     use std::io::{Read, Write};

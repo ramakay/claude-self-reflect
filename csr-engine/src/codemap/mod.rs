@@ -142,6 +142,53 @@ pub fn enqueue(conn: &rusqlite::Connection, path: &std::path::Path) -> anyhow::R
     store::queue_push(conn, &abs.to_string_lossy(), now_nanos())
 }
 
+/// How long a hook waits for the database write lock before it skips its code
+/// map write. The storage default is 5 s, which would stall the hook whenever the
+/// daemon holds the lock; the signal and the enqueue are best effort.
+pub(crate) const HOOK_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Run one hook write under `HOOK_BUSY_TIMEOUT`. The storage default is restored
+/// on every path, success or error.
+pub(crate) fn with_hook_busy_timeout(
+    conn: &rusqlite::Connection,
+    f: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    conn.busy_timeout(HOOK_BUSY_TIMEOUT)?;
+    let result = f();
+    let restored = conn.busy_timeout(crate::storage::DEFAULT_BUSY_TIMEOUT);
+    result?;
+    restored?;
+    Ok(())
+}
+
+/// Session signal: tell the code map that a session is working in `cwd`. ONE
+/// upsert under the short busy timeout (contention means skip); no git, no
+/// parse, no filesystem call on `cwd`. Nothing when the code map is off or `cwd`
+/// is not absolute.
+pub fn record_signal(
+    conn: &rusqlite::Connection,
+    cwd: &std::path::Path,
+    source: &str,
+) -> anyhow::Result<()> {
+    record_signal_at(conn, cwd, source, now_secs(), disabled())
+}
+
+fn record_signal_at(
+    conn: &rusqlite::Connection,
+    cwd: &std::path::Path,
+    source: &str,
+    at: i64,
+    disabled: bool,
+) -> anyhow::Result<()> {
+    if disabled || !cwd.is_absolute() {
+        return Ok(());
+    }
+    let cwd = identity::normalize_lexical(cwd);
+    with_hook_busy_timeout(conn, || {
+        store::signal_upsert(conn, &cwd.to_string_lossy(), source, at)
+    })
+}
+
 /// Should a hook enqueue this path? Absolute, a code extension, outside the
 /// protected folders (lexical check, no filesystem call), and the code map is on.
 pub fn should_enqueue(path: &std::path::Path, home: Option<&std::path::Path>) -> bool {

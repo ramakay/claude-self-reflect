@@ -76,6 +76,10 @@ const CONTINUITY_THRESHOLD_MINUTES: i64 = 2880;
 /// Handle the session-start hook.
 /// Wrapped in catch-all: ALWAYS returns Ok(()) to never block Claude Code (C-1 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    // Code map session signal, for every source (startup, resume, compact,
+    // clear): this cwd has a live session. One upsert, no git, no stat.
+    super::record_codemap_signal(input, engine, "session_start");
+
     // A subagent's own compaction fires this hook with the PARENT's session id. Injecting
     // the parent's recap into the subagent, or respinning the parent's story, is wrong
     // both ways: the subagent works on a different task and the parent did not compact.

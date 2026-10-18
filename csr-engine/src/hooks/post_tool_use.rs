@@ -24,6 +24,10 @@ pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    // Code map session signal: this cwd has a live session. One upsert, first,
+    // so the slow transcript import below cannot delay or starve it.
+    super::record_codemap_signal(input, engine, "post_tool_use");
+
     // Import growing transcript (real-time searchability)
     super::import_current_transcript(input, engine, cwd).await;
 
@@ -68,20 +72,11 @@ fn enqueue_for_codemap(input: &HookInput, engine: &Engine) -> Result<()> {
         .with_connection(|conn| enqueue_best_effort(conn, path))
 }
 
-/// How long the hook waits for the write lock before it skips the enqueue.
-const ENQUEUE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// One queue INSERT under a short busy timeout. The storage default is 5 s,
-/// which would stall the hook whenever the daemon holds the write lock; the
-/// enqueue is best effort, so contention means skip. The default is restored
-/// on every path, success or error.
+/// One queue INSERT under a short busy timeout (see
+/// `codemap::with_hook_busy_timeout`): the enqueue is best effort, so contention
+/// means skip.
 fn enqueue_best_effort(conn: &rusqlite::Connection, path: &Path) -> Result<()> {
-    conn.busy_timeout(ENQUEUE_BUSY_TIMEOUT)?;
-    let result = crate::codemap::enqueue(conn, path);
-    let restored = conn.busy_timeout(crate::storage::DEFAULT_BUSY_TIMEOUT);
-    result?;
-    restored?;
-    Ok(())
+    crate::codemap::with_hook_busy_timeout(conn, || crate::codemap::enqueue(conn, path))
 }
 
 /// Conversation id for provenance: transcript filename stem, else session id.
@@ -619,6 +614,144 @@ mod tests {
         // And a later enqueue, with the lock free, lands.
         enqueue_for_codemap(&edit_input("Edit", "/w/repo/src/free.rs"), &engine).unwrap();
         assert_eq!(queue_rows(&storage), vec!["/w/repo/src/free.rs"]);
+    }
+
+    fn signal_rows(storage: &crate::storage::Storage) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = storage
+            .with_connection(|c| crate::codemap::store::list_signals(c, 0))
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.cwd, s.source))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn input_in(cwd: Option<&str>, tool: &str, file_path: &str) -> crate::hooks::HookInput {
+        crate::hooks::HookInput {
+            cwd: cwd.map(str::to_string),
+            ..edit_input(tool, file_path)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_post_tool_use_fire_records_its_cwd_as_a_signal() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A Read is not an edit, but the session is live: it still signals.
+        handle(
+            &input_in(Some("/w/repo/src"), "Read", "/w/repo/src/a.rs"),
+            &engine,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        handle(
+            &input_in(Some("/w/repo/src"), "Edit", "/w/repo/src/a.rs"),
+            &engine,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        handle(
+            &input_in(Some("/w/other"), "Write", "/w/other/b.rs"),
+            &engine,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            signal_rows(&storage),
+            vec![
+                ("/w/other".to_string(), "post_tool_use".to_string()),
+                ("/w/repo/src".to_string(), "post_tool_use".to_string()),
+            ],
+            "one row per cwd"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_cwd_or_missing_signals_table_does_not_fail_the_hook() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        for cwd in [None, Some(""), Some("relative/dir")] {
+            handle(
+                &input_in(cwd, "Read", "/w/repo/src/a.rs"),
+                &engine,
+                tmp.path(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(signal_rows(&storage).is_empty(), "nothing to record");
+        storage
+            .with_connection(|c| {
+                c.execute_batch("DROP TABLE codemap_signals")?;
+                Ok(())
+            })
+            .unwrap();
+        handle(
+            &input_in(Some("/w/repo"), "Write", "/w/repo/src/a.rs"),
+            &engine,
+            tmp.path(),
+        )
+        .await
+        .expect("the hook still returns Ok when the signals table is missing");
+        // The edit's queue row was not lost to the failed signal.
+        assert_eq!(queue_rows(&storage), vec!["/w/repo/src/a.rs"]);
+    }
+
+    #[test]
+    fn the_signal_gives_up_fast_when_the_writer_lock_is_held_and_restores_the_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(&db).unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = crate::engine::Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            dir.path().to_path_buf(),
+        );
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        crate::hooks::record_codemap_signal(
+            &input_in(Some("/w/repo"), "Edit", "/w/repo/a.rs"),
+            &engine,
+            "post_tool_use",
+        );
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "the signal waited {took:?} on a held write lock"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            signal_rows(&storage).is_empty(),
+            "the skipped row is absent"
+        );
+        let timeout_ms: i64 = storage
+            .with_connection(|c| Ok(c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(
+            timeout_ms,
+            crate::storage::DEFAULT_BUSY_TIMEOUT.as_millis() as i64,
+            "the default busy timeout is restored after the skipped signal"
+        );
+        crate::hooks::record_codemap_signal(
+            &input_in(Some("/w/repo"), "Edit", "/w/repo/a.rs"),
+            &engine,
+            "post_tool_use",
+        );
+        assert_eq!(
+            signal_rows(&storage),
+            vec![("/w/repo".to_string(), "post_tool_use".to_string())]
+        );
     }
 
     fn test_engine() -> (

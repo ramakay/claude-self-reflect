@@ -664,6 +664,7 @@ fn migration_creates_every_codemap_table() {
         "codemap_blobs",
         "codemap_defs",
         "codemap_queue",
+        "codemap_signals",
         "codemap_fts",
     ] {
         assert_eq!(
@@ -1005,4 +1006,114 @@ fn the_visit_budget_stops_a_walk_over_many_non_code_entries_and_marks_the_view_t
         "the scan's own walk stopped at the budget"
     );
     assert_invariants(&conn);
+}
+
+// ---- session signals --------------------------------------------------------------------
+
+#[test]
+fn the_signals_table_has_its_columns_and_a_migration_rerun_adds_nothing() {
+    let conn = db();
+    assert!(store::signals_ready(&conn));
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('codemap_signals') ORDER BY cid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(cols, ["cwd", "last_at", "source", "common_dir", "status"]);
+    store::signal_upsert(&conn, "/w/a", "session_start", 10).unwrap();
+    let schema_before: Vec<String> = conn
+        .prepare("SELECT sql FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get::<_, Option<String>>(0))
+        .unwrap()
+        .map(|r| r.unwrap().unwrap_or_default())
+        .collect();
+    crate::storage::migrations::run(&conn).unwrap();
+    let schema_after: Vec<String> = conn
+        .prepare("SELECT sql FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get::<_, Option<String>>(0))
+        .unwrap()
+        .map(|r| r.unwrap().unwrap_or_default())
+        .collect();
+    assert_eq!(schema_before, schema_after, "the rerun changes no schema");
+    assert_eq!(
+        store::list_signals(&conn, 0).unwrap().len(),
+        1,
+        "and keeps the rows"
+    );
+}
+
+#[test]
+fn a_signal_upsert_is_one_row_per_cwd_and_keeps_the_newest_time_and_the_daemon_columns() {
+    let conn = db();
+    store::signal_upsert(&conn, "/w/a", "session_start", 1_000).unwrap();
+    store::signal_upsert(&conn, "/w/b", "post_tool_use", 2_000).unwrap();
+    store::signal_resolve(&conn, "/w/a", Some("/w/a/.git"), "repo").unwrap();
+    // A later fire for /w/a: newer time, new source, the resolved columns stay.
+    store::signal_upsert(&conn, "/w/a", "post_tool_use", 3_000).unwrap();
+    // A late, out-of-order fire never moves the time back.
+    store::signal_upsert(&conn, "/w/a", "session_start", 500).unwrap();
+    let all = store::list_signals(&conn, 0).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].cwd, "/w/a");
+    assert_eq!(all[0].last_at, 3_000);
+    assert_eq!(all[0].common_dir.as_deref(), Some("/w/a/.git"));
+    assert_eq!(all[0].status.as_deref(), Some("repo"));
+    assert_eq!(all[1].cwd, "/w/b");
+    assert_eq!(
+        (all[1].common_dir.clone(), all[1].status.clone()),
+        (None, None)
+    );
+    // The window is inclusive at its start.
+    assert_eq!(store::list_signals(&conn, 2_000).unwrap().len(), 2);
+    assert_eq!(store::list_signals(&conn, 2_001).unwrap().len(), 1);
+}
+
+#[test]
+fn resolving_a_signal_to_the_same_answer_writes_nothing_and_gc_drops_old_rows() {
+    let conn = db();
+    store::signal_upsert(&conn, "/w/a", "session_start", 1_000).unwrap();
+    store::signal_resolve(&conn, "/w/a", Some("/w/a/.git"), "repo").unwrap();
+    let before = conn.total_changes();
+    store::signal_resolve(&conn, "/w/a", Some("/w/a/.git"), "repo").unwrap();
+    assert_eq!(conn.total_changes(), before, "unchanged answer, no write");
+    store::signal_resolve(&conn, "/w/a", None, "not-a-repo").unwrap();
+    assert_eq!(conn.total_changes(), before + 1);
+    store::signal_upsert(&conn, "/w/new", "session_start", 9_000).unwrap();
+    assert_eq!(store::signal_gc(&conn, 5_000).unwrap(), 1);
+    let left = store::list_signals(&conn, 0).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].cwd, "/w/new");
+}
+
+#[test]
+fn a_database_without_the_signals_table_reads_as_no_signals() {
+    let conn = db();
+    conn.execute_batch("DROP TABLE codemap_signals").unwrap();
+    assert!(!store::signals_ready(&conn));
+    assert!(store::list_signals(&conn, 0).unwrap().is_empty());
+    assert_eq!(store::signal_gc(&conn, 10).unwrap(), 0);
+}
+
+#[test]
+fn record_signal_normalizes_the_cwd_lexically_and_skips_relative_and_disabled() {
+    let conn = db();
+    let rec = |cwd: &str, source: &str, at: i64, disabled: bool| {
+        super::record_signal_at(&conn, Path::new(cwd), source, at, disabled).unwrap()
+    };
+    rec("/w/repo/./sub/..", "session_start", 100, false);
+    rec("relative/dir", "session_start", 100, false);
+    rec("/w/off", "session_start", 100, true);
+    let got = store::list_signals(&conn, 0).unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].cwd, "/w/repo");
+    assert_eq!(got[0].source, "session_start");
+    assert_eq!(got[0].last_at, 100);
+    // A protected cwd is recorded too: the signal does no check and no stat; the
+    // daemon decides what to do with it.
+    rec("/Users/nobody/Documents/proj", "post_tool_use", 200, false);
+    assert_eq!(store::list_signals(&conn, 0).unwrap().len(), 2);
 }

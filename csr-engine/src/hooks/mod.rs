@@ -201,6 +201,24 @@ fn hook_input_from(read: StdinRead) -> HookInput {
     }
 }
 
+/// Code map session signal: record the cwd Claude Code sent as live. The hook's
+/// own cwd resolution (`resolve_hook_cwd`) canonicalizes, which stats the path;
+/// the signal takes the string as sent and does no filesystem call of its own.
+/// Best effort: a missing cwd, a missing table or a busy database is skipped,
+/// and nothing here can fail the hook.
+pub(crate) fn record_codemap_signal(input: &HookInput, engine: &Engine, source: &str) {
+    let Some(cwd) = input.cwd.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return;
+    };
+    let cwd = Path::new(cwd);
+    if let Err(e) = engine
+        .storage()
+        .with_connection(|conn| crate::codemap::record_signal(conn, cwd, source))
+    {
+        eprintln!("CSR: code map signal skipped (non-fatal): {e}");
+    }
+}
+
 /// Resolve the directory a hook operates on. Prefers the cwd Claude Code sent,
 /// falls back to the process cwd, and **never fails**.
 ///

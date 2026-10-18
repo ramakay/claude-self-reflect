@@ -2358,6 +2358,17 @@ const CREATE_CODEMAP: &str = "
         path        TEXT PRIMARY KEY,
         enqueued_at INTEGER NOT NULL
     );
+    -- Session signals: the SessionStart and PostToolUse hooks upsert the cwd of a
+    -- live session (one statement, no git, no stat). The daemon maps the repos
+    -- that have a recent signal; it fills common_dir and status when it resolves
+    -- the cwd, so the status report needs no filesystem call.
+    CREATE TABLE IF NOT EXISTS codemap_signals (
+        cwd        TEXT PRIMARY KEY,
+        last_at    INTEGER NOT NULL,
+        source     TEXT NOT NULL,
+        common_dir TEXT,
+        status     TEXT
+    );
     CREATE VIRTUAL TABLE IF NOT EXISTS codemap_fts USING fts5(
         name,
         signature,

@@ -830,6 +830,100 @@ pub fn record_poll(conn: &Connection, common_dir: &str, status: &str) -> Result<
     Ok(())
 }
 
+// ---- session signals --------------------------------------------------------
+
+/// A session cwd as stored.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StoredSignal {
+    pub cwd: String,
+    /// Seconds since the epoch of the latest hook fire for this cwd.
+    pub last_at: i64,
+    /// `session_start` or `post_tool_use`.
+    pub source: String,
+    /// The repo the daemon resolved the cwd to (set by `signal_resolve`).
+    pub common_dir: Option<String>,
+    /// What resolving it came to: `repo`, `protected`, `not-a-repo`, `temp`,
+    /// `home`, `removed` (set by `signal_resolve`).
+    pub status: Option<String>,
+}
+
+/// True when the signals table exists (a database from an older binary may not
+/// have it; every reader then sees no signals).
+pub fn signals_ready(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'codemap_signals'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n == 1)
+    .unwrap_or(false)
+}
+
+/// Record that a session is working in `cwd` at `at` (seconds). ONE statement:
+/// the hooks call this, so it does no read, no git and no filesystem call. The
+/// daemon-filled columns survive the update.
+pub fn signal_upsert(conn: &Connection, cwd: &str, source: &str, at: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO codemap_signals (cwd, last_at, source) VALUES (?1, ?2, ?3)
+         ON CONFLICT(cwd) DO UPDATE SET
+            last_at = MAX(excluded.last_at, codemap_signals.last_at),
+            source = excluded.source",
+        params![cwd, at, source],
+    )?;
+    Ok(())
+}
+
+/// Signals at or after `since` (seconds), newest first.
+pub fn list_signals(conn: &Connection, since: i64) -> Result<Vec<StoredSignal>> {
+    if !signals_ready(conn) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT cwd, last_at, source, common_dir, status FROM codemap_signals
+         WHERE last_at >= ?1 ORDER BY last_at DESC, cwd",
+    )?;
+    let rows = stmt
+        .query_map(params![since], |r| {
+            Ok(StoredSignal {
+                cwd: r.get(0)?,
+                last_at: r.get(1)?,
+                source: r.get(2)?,
+                common_dir: r.get(3)?,
+                status: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Record what the daemon made of a signal's cwd. Writes only when the stored
+/// answer differs, so a steady state costs no write.
+pub fn signal_resolve(
+    conn: &Connection,
+    cwd: &str,
+    common_dir: Option<&str>,
+    status: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE codemap_signals SET common_dir = ?2, status = ?3
+         WHERE cwd = ?1 AND (common_dir IS NOT ?2 OR status IS NOT ?3)",
+        params![cwd, common_dir, status],
+    )?;
+    Ok(())
+}
+
+/// Drop signals last seen before `cutoff` (seconds): the table must not grow
+/// with every directory a session ever started in.
+pub fn signal_gc(conn: &Connection, cutoff: i64) -> Result<usize> {
+    if !signals_ready(conn) {
+        return Ok(0);
+    }
+    Ok(conn.execute(
+        "DELETE FROM codemap_signals WHERE last_at < ?1",
+        params![cutoff],
+    )?)
+}
+
 // ---- queue ----------------------------------------------------------------
 
 /// Queue one absolute path for a partial rescan. `at` is nanoseconds since the
