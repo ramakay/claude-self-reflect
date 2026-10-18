@@ -608,6 +608,8 @@ pub(crate) struct Pump<'a> {
     /// Watcher batches handed to `rescan_paths`, and the paths in them.
     pub(crate) flushes: usize,
     pub(crate) flushed_paths: usize,
+    /// Scheduler steps taken (`tick` calls).
+    pub(crate) ticks: usize,
 }
 
 impl<'a> Pump<'a> {
@@ -654,6 +656,7 @@ impl<'a> Pump<'a> {
             seen_version: None,
             flushes: 0,
             flushed_paths: 0,
+            ticks: 0,
         })
     }
 
@@ -771,6 +774,7 @@ impl<'a> Pump<'a> {
 
     /// One scheduler step at time `now`.
     pub(crate) fn tick(&mut self, now: Instant) {
+        self.ticks += 1;
         self.take_events(now);
         let version = self.ctx.roots_version.load(Ordering::SeqCst);
         let resync_due = self
@@ -828,10 +832,19 @@ fn pump_main(ctx: &Ctx<'_>) {
             "off"
         }
     ));
+    pump_loop(ctx, &mut pump);
+}
+
+/// The pump's wake loop: once per `tick`, or at once when the watcher sends a
+/// path. With the watcher off (`CSR_CODEMAP_NO_WATCH=1`, or no backend) the only
+/// `Sender` is already dropped, so `recv_timeout` reports `Disconnected` without
+/// waiting; the loop must sleep the tick itself or it spins a core.
+fn pump_loop(ctx: &Ctx<'_>, pump: &mut Pump<'_>) {
     while !ctx.stop() {
         match pump.rx.recv_timeout(ctx.opts.tick) {
             Ok(p) => pump.add_pending(p, Instant::now()),
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => std::thread::sleep(ctx.opts.tick),
         }
         pump.tick(Instant::now());
     }
@@ -1398,6 +1411,32 @@ mod tests {
             rig.hits("zeta_older"),
             0,
             "the older scan did not overwrite it"
+        );
+    }
+
+    #[test]
+    fn the_pump_loop_does_not_spin_when_the_watcher_is_off() {
+        let rig = Rig::new();
+        let mut opts = rig.opts();
+        opts.watch = false;
+        opts.tick = Duration::from_millis(100);
+        let ctx = rig.ctx(opts);
+        let mut pump = Pump::new(&ctx).unwrap();
+        assert!(pump.watcher.is_none(), "no watcher: the Sender is dropped");
+        let stop = rig.shutdown.clone();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(600));
+                stop.store(true, Ordering::SeqCst);
+            });
+            pump_loop(&ctx, &mut pump);
+        });
+        // 600 ms at one tick per 100 ms is about 6; a spinning loop makes
+        // thousands.
+        assert!(
+            (3..=10).contains(&pump.ticks),
+            "pump ticked {} times in 600 ms",
+            pump.ticks
         );
     }
 
