@@ -287,6 +287,28 @@ fn the_pane_fixture_is_the_one_pane_py_would_write_now() {
     }
 }
 
+/// The handoff of a shift note (hooks/register.tsx `handoff()`), with the
+/// `What changed:` sentence pane.py adds to the note's line and text. The
+/// grammar is the opener and the quote block under it, so the sentence rides
+/// along inside it: nothing of the note may survive into the corpus.
+#[test]
+fn a_shift_note_handoff_with_what_changed_is_one_side_note() {
+    let handoff = "Here is a note offered by CSR (claude-self-reflect):\n\n\
+        > Heads up · `StationCard` in radio.tsx changed in 1c4183b on 09-14, after your 09-02 session worked on it. \
+        What changed: isFreeStation → isUnwalledStation; now uses isFullyFreeStation.\n\
+        >\n\
+        > On 09-02 you asked “fix the radio wall”. That session worked on `StationCard` in anukriti-mvp-expo/app/radio.tsx. \
+        On 09-14, commit 1c4183b “free stations skip the wall” changed it. \
+        What changed: isFreeStation → isUnwalledStation; now uses isFullyFreeStation. \
+        What that session concluded about it may no longer hold, so check the code, not the memory.\n\
+        >\n\
+        > Receipts: commit 1c4183b, session 5d0aa1c2.";
+    let hits = detect(handoff);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].reason, ContaminationReason::PluginSideNote);
+    assert_eq!((hits[0].start_byte, hits[0].end_byte), (0, handoff.len()));
+}
+
 #[test]
 fn the_dreamer_forms_are_found_wherever_a_line_carries_them() {
     let pane = "CSR's dreamer asked this while you worked, quoted: “Q?” Its reasoning: “R.”";

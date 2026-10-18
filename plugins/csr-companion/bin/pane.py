@@ -174,6 +174,14 @@ _AUTHORS = {}  # (repo, commit, file, symbol, from) -> (when asked, the engine's
 AUTHOR_LOG = os.path.join(KEEP, 'merge-authors.jsonl')
 AUTHOR_RULE = 1  # the engine's rule the kept answers were made under; a line from another rule is not read
 _AUTHORS_READ = []  # the AUTHOR_LOG already read into _AUTHORS
+# What a commit did inside a symbol (the engine's `summary`), kept the same way: a commit never changes, so the
+# line the engine wrote for it stands for good, and so does "no clean summary" (null). Keyed apart from the
+# merge answers above so those need no new rule.
+WHAT_LOG = os.path.join(KEEP, 'shift-whats.jsonl')
+WHAT_RULE = 1  # the engine's summary rule the kept lines were made under; a line from another rule is not read
+WHAT_MOST = 120  # characters: the engine caps at 100, a longer line is not one of its
+_WHATS = {}  # (repo, commit, file, symbol) -> (when asked, the engine's answer or None)
+_WHATS_READ = []  # the WHAT_LOG already read into _WHATS
 
 
 def settled(answer):
@@ -229,19 +237,21 @@ def merge_commits(top, oids):
     return {oid for oid in wanted if oid in merges or (len(oid) < 40 and any(m.startswith(oid) for m in merges))}
 
 
-def known_answer(key):
+def known_answer(key, memo=None):
     """(True, answer) when the engine was already asked this and the answer still stands: an answer for the life of
     the process, a failure for a minute. (False, None) when it has to be asked."""
-    hit = _AUTHORS.get(key)
+    hit = (_AUTHORS if memo is None else memo).get(key)
     if hit and (hit[1] is not None or time.time() - hit[0] < 60):
         return True, hit[1]
     return False, None
 
 
-def ask_engine(questions):
+def ask_engine(questions, memo=None, need=None):
     """Every question, {key: {repo, file, symbol, oid, from}}, put to csr-engine in ONE `symbol change --batch` spawn
     within ENGINE_WAIT seconds in all. An answer is {authored, author, author_committed_at, ...}; a question the
-    engine did not answer (no engine, too slow, bad output, an error line) is remembered as None."""
+    engine did not answer (no engine, too slow, bad output, an error line, or no `need` key in the answer: an engine
+    from before that key) is remembered as None. The answers go into `memo` (_AUTHORS)."""
+    memo = _AUTHORS if memo is None else memo
     lines = []
     binary = engine_binary()
     if binary and questions:
@@ -261,7 +271,64 @@ def ask_engine(questions):
             answer = json.loads(lines[i]) if i < len(lines) else None
         except ValueError:
             answer = None
-        _AUTHORS[key] = (now, answer if isinstance(answer, dict) and answer.get('oid') is not None else None)
+        ok = isinstance(answer, dict) and answer.get('oid') is not None and (need is None or need in answer)
+        memo[key] = (now, answer if ok else None)
+
+
+def read_whats():
+    if _WHATS_READ == [WHAT_LOG]:
+        return
+    _WHATS_READ[:] = [WHAT_LOG]
+    try:
+        with open(WHAT_LOG, encoding='utf-8') as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    if record.get('rule') == WHAT_RULE and 'summary' in record:
+                        _WHATS.setdefault(tuple(record['key']), (0, dict(summary=record['summary'])))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+    except OSError:
+        pass
+
+
+def keep_whats(keys):
+    """Append what the engine said about keys, a line or its lack of one, to WHAT_LOG."""
+    lines = [json.dumps(dict(rule=WHAT_RULE, key=list(key), summary=_WHATS[key][1].get('summary'))) + '\n'
+             for key in keys if _WHATS.get(key, (0, None))[1] is not None
+             and (_WHATS[key][1].get('summary') is None or tidy_what(_WHATS[key][1].get('summary')))]
+    if lines:
+        try:
+            private.append(WHAT_LOG, ''.join(lines), root=KEEP)
+        except OSError:
+            pass
+
+
+def tidy_what(summary):
+    """The engine's summary as one short line, or None for anything that is not one."""
+    if not isinstance(summary, str):
+        return None
+    summary = ' '.join(summary.split())
+    return summary if summary and len(summary) <= WHAT_MOST else None
+
+
+def whats_of(top, picks):
+    """What the commit of each pick, (file relative to top, symbol, commit), changed inside its symbol, from ONE engine
+    spawn for every pick not already known: {pick: the engine's one line or None}. No engine, too slow or a bad answer
+    leaves a pick without a line; nothing here raises."""
+    try:
+        read_whats()
+        questions = {}
+        for rel, symbol, oid in picks:
+            key = (top, oid, rel, symbol)
+            if symbol and oid and not known_answer(key, _WHATS)[0]:
+                questions[key] = dict(repo=top, file=rel, symbol=symbol, oid=oid)
+        ask_engine(questions, _WHATS, need='summary')
+        keep_whats(questions)
+        return {pick: tidy_what((known_answer((top, pick[2], pick[0], pick[1]), _WHATS)[1] or {}).get('summary'))
+                for pick in picks}
+    except Exception:
+        return {}
 
 
 def author_of(top, rel, symbol, merge, at_oids):
@@ -306,7 +373,7 @@ def settle_merges(con, top, root, shifts):
             ask = (top, shift['oid'], rels[key], shift['symbol'], at_oid)
             if at_oid and not known_answer(ask)[0]:
                 questions[ask] = dict(repo=top, file=rels[key], symbol=shift['symbol'] or None, oid=shift['oid'],
-                                      **{'from': at_oid})
+                                      summary=False, **{'from': at_oid})
     ask_engine(questions)
     keep_authors(questions)
     out = {key: shift for key, shift in shifts.items() if key not in merges}
@@ -483,11 +550,24 @@ def notes_for(con, root, path, session_id=None, before=None):
         _, theirs = load_shifts(con, main)
         mine += [shift for shift in theirs if shift['file'] == rel and has_commit(root, shift['oid'])]
     notes = []
+    chosen = []
     for change in load_changes(con, mine, session_id, before):
         if change['current'] and not change['earlier']:
             continue  # this session's own work is not news to it
         latest = max(change['shifts'], key=lambda s: s['at'])
         same = [s for s in change['shifts'] if s['oid'] == latest['oid']]
+        chosen.append((change, latest, same))
+    # What each commit did inside its symbol: one engine spawn for all the notes below. Only a note about one
+    # symbol that a commit changed is asked; for the others the engine's line would speak for one of several.
+    top = repo_root(root) if chosen else None
+    picks = []
+    for change, latest, same in chosen:
+        symbol = same[0]['symbol']
+        one = top and latest['verb'] == 'changed' and symbol and len({s['symbol'] for s in same}) == 1
+        picks.append((os.path.relpath(path, top), symbol, latest['oid']) if one else None)
+    whats = whats_of(top, [pick for pick in picks if pick]) if any(picks) else {}
+    for (change, latest, same), pick in zip(chosen, picks):
+        what = whats.get(pick)
         symbols = list(dict.fromkeys(s['symbol'] or name for s in same))
         verb = {'changed': 'changed', 'removed': 'was removed', 'came back': 'came back'}[latest['verb']]
         lead = f"`{symbols[0]}`" + (f" and {len(symbols) - 1} more" if len(symbols) > 1 else '')
@@ -503,13 +583,18 @@ def notes_for(con, root, path, session_id=None, before=None):
         text = (f"On {talked} you asked {quoted(change['title'], 90)}. That session worked on "
                 f"{', '.join(f'`{x}`' for x in symbols[:4])}{' and more' if len(symbols) > 4 else ''} in {rel}. "
                 f"On {changed}, commit {latest['oid'][:7]} {quoted(latest['subject'], 70)} {verb.replace('was ', '')} "
-                f"{them}. What that session concluded about {them} may no longer hold, so check the code, not the memory.")
+                f"{them}.{f' What changed: {what}.' if what else ''} "
+                f"What that session concluded about {them} may no longer hold, so check the code, not the memory.")
+        if what:
+            line += f" What changed: {what}."
         sketch = [f"{talked}  \u25cf your session  {quoted(change['title'], 34)}",
-                  f"{changed}  \u25b2 {latest['oid'][:7]}  {', '.join(symbols[:3])}{' +' + str(len(symbols) - 3) if len(symbols) > 3 else ''}"]
+                  f"{changed}  \u25b2 {latest['oid'][:7]}  {', '.join(symbols[:3])}{' +' + str(len(symbols) - 3) if len(symbols) > 3 else ''}"
+                  f"{f' \u00b7 {what}' if what else ''}"]
         notes.append(dict(id=f"shift:{rel}:{latest['oid'][:12]}:{change['conversation'][:8]}", kind='shift', file=rel,
                           line=line, title=f"Your {talked} work on {symbols[0]} has changed since",
                           text=text, sketch=sketch, symbol=symbols[0], oid=latest['oid'],
-                          conversation=change['conversation'], at=latest['at'], earlier=bool(change['earlier'])))
+                          conversation=change['conversation'], at=latest['at'], earlier=bool(change['earlier']),
+                          what=what))
     for when, quote, session in con.execute(
             "select ts, quote, session_id from intent_events where kind='correction' and file is not null "
             "and file != '' and (?1 = file or ?1 like '%/' || file) order by ts desc limit 3", (path,)).fetchall():

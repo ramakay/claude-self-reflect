@@ -69,6 +69,7 @@ export type Note = {
   conversation: string
   at: number
   tokens?: number
+  what?: string | null // a shift note: one line saying what the commit changed inside the symbol, already in line and text
 }
 
 // The band, as You should know draws its own: an offer, the note opened, then

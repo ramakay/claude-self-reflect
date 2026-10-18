@@ -3287,10 +3287,12 @@ class MergeReceipts(unittest.TestCase):
         self.con = con
         self.addCleanup(con.close)
         self.kept = os.path.join(self.tmp, 'keep', 'merge-authors.jsonl')
-        for patched in (mock.patch.object(pane, 'AUTHOR_LOG', self.kept), mock.patch.object(pane, 'KEEP', os.path.dirname(self.kept))):
+        self.kept_whats = os.path.join(self.tmp, 'keep', 'shift-whats.jsonl')
+        for patched in (mock.patch.object(pane, 'AUTHOR_LOG', self.kept), mock.patch.object(pane, 'WHAT_LOG', self.kept_whats),
+                        mock.patch.object(pane, 'KEEP', os.path.dirname(self.kept))):
             patched.start()
             self.addCleanup(patched.stop)
-        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ):
+        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ, pane._WHATS, pane._WHATS_READ):
             cache.clear()
             self.addCleanup(cache.clear)
         patcher = mock.patch.object(pane, 'first_prompts', lambda: {})
@@ -3327,7 +3329,7 @@ class MergeReceipts(unittest.TestCase):
             handle.write(f"#!{sys.executable}\nimport json, sys, time\nREPLIES = json.loads({json.dumps(json.dumps(replies))})\n"
                          f"LOG = {self.log!r}\nlog = open(LOG, 'a')\nlog.write('spawn ' + ' '.join(sys.argv[1:]) + '\\n')\n"
                          f"time.sleep({wait})\nfor line in sys.stdin:\n    q = json.loads(line)\n    log.write('Q ' + line)\n"
-                         "    log.flush()\n    reply = REPLIES.get(q['from'], REPLIES['*'])\n"
+                         "    log.flush()\n    reply = REPLIES.get(q.get('from') or 'what', REPLIES['*'])\n"
                          "    print(reply[4:] if isinstance(reply, str) and reply.startswith('RAW:') else json.dumps(reply), flush=True)\n")
         os.chmod(script, 0o755)
         patcher = mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': script})
@@ -3363,6 +3365,152 @@ class MergeReceipts(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return calls
 
+    WHAT = 'old_name → new_name; now uses helper'
+
+    def what_engine(self, summary=WHAT):
+        """An engine that places the merge (a settle question has a `from`) and says what the author commit did
+        (the question with none)."""
+        return self.engine({'*': self.said, 'what': dict(oid=self.author, merge=False, authored=True, author=self.author,
+                                                         author_committed_at='2026-10-10T10:30:00+00:00',
+                                                         summary=summary)})
+
+    def whats_asked(self):
+        return [q for q in self.questions() if 'from' not in q]
+
+    def settle_spawns(self):
+        """The engine spawns that were asked who wrote a merge (a question with a `from`); the ones asking what a
+        commit changed are counted by whats_asked."""
+        batches, current = [], None
+        for line in self.log_lines():
+            if line.startswith('spawn '):
+                current = []
+                batches.append(current)
+            elif line.startswith('Q ') and current is not None:
+                current.append(json.loads(line[2:]))
+        return [batch for batch in batches if any('from' in q for q in batch)]
+
+    def test_a_note_says_what_the_commit_changed(self):
+        self.what_engine()
+        note, = self.notes()
+        self.assertEqual(note['oid'], self.author)
+        self.assertEqual(note['what'], self.WHAT)
+        self.assertTrue(note['line'].endswith(f' What changed: {self.WHAT}.'), note['line'])
+        self.assertIn(f"commit {self.author[:7]} “change f” changed it. What changed: {self.WHAT}. "
+                      f"What that session concluded about it", note['text'])
+        self.assertTrue(note['sketch'][1].endswith(f'  f · {self.WHAT}'), note['sketch'])
+        self.assertEqual(note['sketch'][0], self.notes()[0]['sketch'][0])
+        # the merge is settled in one spawn, and what its author did is asked in one more, about the author
+        self.assertEqual(self.spawns(), ['spawn symbol change --batch'] * 2)
+        self.assertEqual(self.whats_asked(), [dict(repo=self.root, file='a.py', symbol='f', oid=self.author)])
+
+    def test_a_note_without_a_line_is_byte_for_byte_what_it_was(self):
+        self.what_engine(summary=None)
+        quiet, = self.notes()
+        self.assertIsNone(quiet['what'])
+        # the same words as before the engine had a summary: nothing added, nothing moved
+        self.assertEqual(quiet['line'], f"`f` in a.py changed in {self.author[:7]} on 10-10, after your "
+                                        f"{pane.short_date(pane.epoch('2026-10-10T10:00:00Z'))} session worked on it.")
+        self.assertEqual(quiet['text'], f"On {pane.short_date(pane.epoch('2026-10-10T10:00:00Z'))} you asked "
+                                        f"“build the thing”. That session worked on `f` in a.py. On 10-10, commit "
+                                        f"{self.author[:7]} “change f” changed it. What that session concluded about it "
+                                        f"may no longer hold, so check the code, not the memory.")
+        self.assertEqual(quiet['sketch'][1], f"10-10  \u25b2 {self.author[:7]}  f")
+        for cache in (pane._SHIFTS, pane._WHATS):
+            cache.clear()
+        self.what_engine('a → b')
+        said, = self.notes()
+        self.assertEqual(said['line'], quiet['line'] + ' What changed: a → b.')
+
+    def test_an_engine_that_cannot_say_leaves_the_note_as_it_was(self):
+        self.what_engine('a → b')
+        said, = self.notes()
+        for cache in (pane._SHIFTS, pane._WHATS):
+            cache.clear()
+        os.remove(self.kept_whats)
+        for broken in ({'*': self.said, 'what': dict(error='no')}, {'*': self.said, 'what': 'RAW:not json'},
+                       {'*': self.said, 'what': {k: v for k, v in self.said.items() if k != 'summary'}},
+                       {'*': self.said, 'what': dict(self.said, summary=['a list'])},
+                       {'*': self.said, 'what': dict(self.said, summary='x' * 500)}):
+            for cache in (pane._SHIFTS, pane._WHATS):
+                cache.clear()
+            self.engine(broken)
+            plain, = self.notes()
+            self.assertIsNone(plain['what'], broken)
+            self.assertEqual(plain['line'], said['line'].split(' What changed:')[0])
+            self.assertNotIn('What changed', plain['text'])
+        self.assertFalse(os.path.exists(self.kept_whats), 'a failure is not kept')
+        # no engine at all
+        for cache in (pane._SHIFTS, pane._WHATS):
+            cache.clear()
+        with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': os.path.join(self.tmp, 'missing')}):
+            plain, = self.notes()
+        self.assertIsNone(plain['what'])
+        self.assertEqual(plain['line'], said['line'].split(' What changed:')[0])
+
+    def test_what_a_commit_did_is_asked_once_and_kept_for_the_next_run(self):
+        self.what_engine()
+        self.assertEqual(self.notes()[0]['what'], self.WHAT)
+        pane._SHIFTS.clear()  # the minute is up: the notes are built again
+        self.assertEqual(self.notes()[0]['what'], self.WHAT)
+        self.assertEqual(len(self.whats_asked()), 1)
+        # a new process: nothing in memory, the kept file is all there is
+        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ, pane._WHATS, pane._WHATS_READ):
+            cache.clear()
+        with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': os.path.join(self.tmp, 'missing')}):
+            self.assertEqual(self.notes()[0]['what'], self.WHAT)
+        with open(self.kept_whats) as handle:
+            records = [json.loads(line) for line in handle]
+        self.assertEqual(records, [dict(rule=pane.WHAT_RULE, key=[self.root, self.author, 'a.py', 'f'], summary=self.WHAT)])
+        self.assertEqual(os.stat(self.kept_whats).st_mode & 0o777, 0o600)
+
+    def test_no_clean_summary_is_kept_too_and_not_asked_again(self):
+        self.what_engine(summary=None)
+        self.assertIsNone(self.notes()[0]['what'])
+        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ, pane._WHATS, pane._WHATS_READ):
+            cache.clear()
+        self.assertIsNone(self.notes()[0]['what'])
+        self.assertEqual(len(self.whats_asked()), 1)
+
+    def test_a_kept_line_from_another_rule_or_a_damaged_line_is_not_trusted(self):
+        os.makedirs(os.path.dirname(self.kept_whats))
+        key = [self.root, self.author, 'a.py', 'f']
+        with open(self.kept_whats, 'w') as handle:
+            handle.write(json.dumps(dict(rule=pane.WHAT_RULE + 1, key=key, summary='from the future')) + '\n')
+            handle.write('{"rule": 1, "key": \n')
+            handle.write(json.dumps(dict(rule=pane.WHAT_RULE, key=key)) + '\n')
+        self.what_engine()
+        self.assertEqual(self.notes()[0]['what'], self.WHAT)
+        self.assertEqual(len(self.whats_asked()), 1)
+
+    def test_every_note_of_a_read_is_asked_about_in_one_spawn(self):
+        self.shift_row(2, 'g', self.author, self.side)  # a second note: another session, another commit, another symbol
+        self.con.execute("insert into code_nodes values (?, 'g', 'sess-old2', '2026-10-10T10:00:00Z')", (self.path,))
+        self.con.execute("insert into chunks values ('c3', 'sess-old2', '2026-10-10T10:05:00Z')")
+        self.con.execute("insert into session_registry values ('sess-old2', 'build the other thing', '2026-10-10T09:00:00Z')")
+        self.what_engine('p → q')
+        notes = self.notes()
+        self.assertEqual(sorted((n['symbol'], n['what']) for n in notes), [('f', 'p → q'), ('g', 'p → q')])
+        self.assertEqual(len(self.settle_spawns()), 1)
+        self.assertEqual(len(self.spawns()), 2)
+        self.assertEqual(sorted((q['symbol'], q['oid']) for q in self.whats_asked()),
+                         sorted([('f', self.author), ('g', self.side)]))
+
+    def test_a_note_about_several_symbols_of_one_commit_gets_no_line(self):
+        self.shift_row(2, 'g', self.side, self.merge)
+        self.con.execute("insert into code_nodes values (?, 'g', 'sess-old', '2026-10-10T10:00:00Z')", (self.path,))
+        self.what_engine('p → q')
+        note, = self.notes()
+        self.assertIn('and 1 more', note['line'])
+        self.assertIsNone(note['what'])
+        self.assertEqual(self.whats_asked(), [])
+
+    def test_a_merge_that_changed_the_code_itself_is_asked_about_itself(self):
+        self.engine({'*': dict(oid=self.merge, merge=True, authored=True, author=self.merge,
+                               author_committed_at='2026-10-10T11:00:00+00:00', summary='x → y')})
+        note, = self.notes()
+        self.assertEqual((note['oid'], note['what']), (self.merge, 'x → y'))
+        self.assertEqual(self.whats_asked(), [dict(repo=self.root, file='a.py', symbol='f', oid=self.merge)])
+
     def test_a_merge_receipt_moves_to_the_commit_that_wrote_the_change(self):
         self.engine(self.said)
         notes = self.notes()
@@ -3374,16 +3522,18 @@ class MergeReceipts(unittest.TestCase):
         _, shifts = pane.load_shifts(self.con, self.root)
         self.assertEqual([(s['oid'], s['wids'], s['date'], s['subject']) for s in shifts],
                          [(self.author, [1], '2026-10-10', 'change f')])
-        self.assertEqual(self.spawns(), ['spawn symbol change --batch'])
-        self.assertEqual(self.questions(), [dict(repo=self.root, file='a.py', symbol='f', oid=self.merge,
-                                                 **{'from': self.side})])
+        self.assertEqual(len(self.settle_spawns()), 1)
+        self.assertEqual(self.spawns(), ['spawn symbol change --batch'] * 2)  # the second asks what the author did
+        self.assertEqual(self.questions()[0], dict(repo=self.root, file='a.py', symbol='f', oid=self.merge,
+                                                   summary=False, **{'from': self.side}))
 
     def test_the_answer_is_kept_for_the_life_of_the_process(self):
         self.engine(self.said)
         self.assertEqual(len(self.notes()), 1)
         pane._SHIFTS.clear()  # the minute is up: the shifts are read again
         self.assertEqual(len(self.notes()), 1)
-        self.assertEqual(len(self.spawns()), 1)
+        self.assertEqual(len(self.settle_spawns()), 1)
+        self.assertEqual(len(self.spawns()), 2)  # the other asked what the author did, and a failure waits a minute
 
     def test_a_merge_that_changed_the_code_itself_stays(self):
         self.engine(dict(oid=self.merge, merge=True, authored=True, author=self.merge,
@@ -3421,7 +3571,9 @@ class MergeReceipts(unittest.TestCase):
         self.engine(dict(self.said, oid=self.author, merge=False, authored=True, author=self.author))
         calls = self.spy_runs()
         self.assertEqual([n['oid'] for n in self.notes()], [self.author])
-        self.assertEqual(self.spawns(), [])
+        self.assertEqual(self.settle_spawns(), [])  # nobody asked who wrote it ...
+        self.assertEqual(len(self.whats_asked()), 1)  # ... only what it did, in one spawn
+        self.assertEqual(len(self.spawns()), 1)
         self.assertEqual([c for c in calls if 'rev-list' in c], [])
 
     def test_witnesses_with_different_starting_commits_must_agree(self):
@@ -3477,12 +3629,12 @@ class MergeReceipts(unittest.TestCase):
     def test_what_the_engine_settled_is_kept_for_the_next_run(self):
         self.engine(self.said)
         self.assertEqual([n['oid'] for n in self.notes()], [self.author])
-        self.assertEqual(len(self.spawns()), 1)
+        self.assertEqual(len(self.settle_spawns()), 1)
         # a new process: nothing in memory, the kept file is all there is
         for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ):
             cache.clear()
         self.assertEqual([n['oid'] for n in self.notes()], [self.author])
-        self.assertEqual(len(self.spawns()), 1, 'the second run asked the engine again')
+        self.assertEqual(len(self.settle_spawns()), 1, 'the second run asked the engine again')
         with open(self.kept) as handle:
             records = [json.loads(line) for line in handle]
         self.assertEqual(len(records), 1)
@@ -3508,7 +3660,7 @@ class MergeReceipts(unittest.TestCase):
             handle.write(json.dumps(dict(rule=pane.AUTHOR_RULE, key=key, answer=dict(self.said, author=None))) + '\n')
         self.engine(self.said)
         self.assertEqual([n['oid'] for n in self.notes()], [self.author])
-        self.assertEqual(len(self.spawns()), 1)
+        self.assertEqual(len(self.settle_spawns()), 1)
 
 
 class MemoryRoot(unittest.TestCase):
