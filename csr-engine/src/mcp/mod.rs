@@ -1233,6 +1233,9 @@ impl ServerHandler for CsrServer {
 }
 
 #[cfg(test)]
+mod code_map_tests;
+
+#[cfg(test)]
 mod tests {
 
     #[cfg(unix)]

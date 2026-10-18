@@ -81,15 +81,15 @@ fn fts_expression(text: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
-struct Holder {
-    common_dir: String,
-    worktree_path: String,
-    branch: Option<String>,
-    blob_oid: String,
-    dirty: i64,
+pub(super) struct Holder {
+    pub(super) common_dir: String,
+    pub(super) worktree_path: String,
+    pub(super) branch: Option<String>,
+    pub(super) blob_oid: String,
+    pub(super) dirty: i64,
 }
 
-fn holders_of_path(conn: &Connection, path: &str) -> Result<Vec<Holder>> {
+pub(super) fn holders_of_path(conn: &Connection, path: &str) -> Result<Vec<Holder>> {
     let mut stmt = conn.prepare_cached(
         "SELECT v.common_dir, v.worktree_path, v.branch, f.blob_oid, f.dirty
          FROM codemap_view_files f JOIN codemap_views v ON v.id = f.view_id
@@ -109,7 +109,7 @@ fn holders_of_path(conn: &Connection, path: &str) -> Result<Vec<Holder>> {
     Ok(rows)
 }
 
-fn view_label(common_dir: &str, worktree_path: &str) -> String {
+pub(super) fn view_label(common_dir: &str, worktree_path: &str) -> String {
     let main = std::path::Path::new(common_dir)
         .file_name()
         .is_some_and(|n| n == ".git")
@@ -176,11 +176,46 @@ pub fn query(conn: &Connection, text: &str, limit: usize) -> Result<Vec<CodemapH
     if !super::store::tables_ready(conn) || limit == 0 {
         return Ok(Vec::new());
     }
+    hits_from_raw(conn, raw_matches(conn, text, limit)?, limit)
+}
+
+/// Definitions whose name is exactly `name` (case-sensitive), grouped like
+/// [`query`]. The keyword search ranks by relevance and caps its candidate
+/// rows, so a short name can be crowded out by longer ones; this asks the name
+/// index directly, so an exact definition is never lost to the cap.
+pub fn query_exact(conn: &Connection, name: &str, limit: usize) -> Result<Vec<CodemapHit>> {
+    if !super::store::tables_ready(conn) || limit == 0 || name.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT d.name, COALESCE(d.signature, ''), f.path, d.blob_oid
+         FROM codemap_defs d JOIN codemap_view_files f ON f.blob_oid = d.blob_oid
+         WHERE d.extractor_version = ?1 AND d.name = ?2
+         GROUP BY d.blob_oid, d.name, f.path ORDER BY f.path LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                extractor_version(),
+                name,
+                (limit * 8).clamp(50, 4000) as i64
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    hits_from_raw(conn, rows, limit)
+}
+
+fn hits_from_raw(
+    conn: &Connection,
+    raw: Vec<(String, String, String, String)>,
+    limit: usize,
+) -> Result<Vec<CodemapHit>> {
     // (common_dir, path, name) -> blobs the matches named, in first-seen order.
     let mut order: Vec<(String, String, String)> = Vec::new();
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut holders_cache: HashMap<String, Vec<Holder>> = HashMap::new();
-    for (name, _signature, path, blob) in raw_matches(conn, text, limit)? {
+    for (name, _signature, path, blob) in raw {
         if !holders_cache.contains_key(&path) {
             holders_cache.insert(path.clone(), holders_of_path(conn, &path)?);
         }

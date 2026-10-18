@@ -35,6 +35,7 @@
 
 pub mod cli;
 pub mod discover;
+pub mod files;
 pub mod fresh;
 pub mod identity;
 pub mod query;
@@ -43,13 +44,16 @@ pub mod status;
 pub mod store;
 
 #[cfg(test)]
+mod files_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod testutil;
+pub(crate) mod testutil;
 
 pub use discover::{discover, Candidate};
+pub use files::{files_for, lookup_files, CodemapFile, FileDef, FilesLookup};
 pub use fresh::{run_loop, LoopOpts};
-pub use query::{query, CodemapHit};
+pub use query::{query, query_exact, CodemapHit, ViewPresence};
 pub use scan::{rescan_paths, scan_repo, view_changed, PathScanReport, RepoScanReport, ScanOpts};
 pub use status::{status_report, CodemapStatus};
 

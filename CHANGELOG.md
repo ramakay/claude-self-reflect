@@ -55,6 +55,45 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   PreCompact Haiku call (45f718e4). `CSR_STORY_REWRITES=1` has Haiku write from summary plus last 20 messages;
   blind judges scored it 16.8 and 13.2 of 20, against 11.2 and 9.0 for the free extract (a5c6ca73).
 
+### Code map
+
+- **A live map of every definition in your repos, per worktree.** The conversation code graph only knows symbols a
+  session touched; the map reads the repos, so CSR answers for code no conversation mentioned and says which worktree
+  holds which version of it. It is keyed by git blob oid: a worktree is a view of file paths and blob oids, and a blob
+  is parsed once per extractor version however many worktrees hold it. On the owner's machine (sandbox DB):
+  claude-self-reflect is 9 views, 2,495 view-file pairs, 449 unique blobs and 23,536 defs, mapped cold in 6.2 s at 81 MB
+  max RSS; a warm rescan takes 0.06 s and parses 0 blobs. anukriti is 2 views, 1,643 pairs, 835 blobs, cold in 3.2 s.
+  34.8% (claude-self-reflect) and 64.1% (anukriti) of the mapped files were never touched by a conversation
+  (b2f108e8).
+- **Which repos:** repos from the conversation code graph (`code_nodes`), the last 30 days of Claude Code history
+  (`~/.claude/history.jsonl` project paths), `csr-engine codemap add` and `CSR_CODEMAP_REPOS`, capped at 16
+  (`CSR_CODEMAP_MAX_REPOS`). The map only reads those repos: no git command that writes, no index refresh. Caps: 5000
+  files per view, 512 KiB per file. Nothing under `~/Desktop`, `~/Documents` or `~/Downloads` is ever opened, so the
+  macOS privacy prompt never fires (b2f108e8).
+- **CLI:** `csr-engine codemap add | remove | scan | status | query | watch`. `status` and `query` take `--json`;
+  `query` shows, per definition, which worktrees hold the same blob and which differ (b2f108e8, 1a175565).
+- **Three freshness signals** (1a175565): a 60 s poll of every enabled repo (`CSR_CODEMAP_POLL_SECS`), a file watcher
+  with a 5 s debounce (`CSR_CODEMAP_NO_WATCH=1` turns it off), and a queue the PostToolUse hook fills with one insert
+  and no parse. A dirty edit shows in 5.1-5.4 s. A commit shows in 5.1 s with the watcher and in 36-54 s by the poll
+  alone. `git worktree add` takes 33-48 s to appear and `remove` 39-42 s. 2,000 files written under `target/` caused
+  0 rescans.
+- **Cost, measured with `codemap watch` on the owner's machine under real load** (7 repos, 41 views, 28 watch roots,
+  34,728 defs): the cold first map peaks at 100 MB max RSS and uses 11.0 s CPU over about 400 s; a warm watch holds
+  62.5 MB max RSS and uses 0.85 s CPU over 130 s; a `codemap status` call alone is 16.2 MB.
+- **Two tools and `status` use it, with no new MCP tool (still 16).** `csr_search_by_file` appends a `<code_map>`
+  section after the ledger: for each matching path (an absolute path by its worktree, else an exact repo-relative
+  path, else a suffix on a `/` boundary, at most 10) the views holding it grouped by blob, such as `same blob in main,
+  a; differs in b (dirty)`, plus the definitions of the blob most views share. When no conversation touched the file
+  it says so and the map is the answer. `csr_code_graph` appends the map's definitions of the exact symbol name, and
+  answers from the map when the conversation graph does not know the symbol, saying these are definitions, not call
+  edges (callers and callees are not in the map). Each section is at most 1,500 bytes and read-only. `csr-engine
+  status` gains a `codemap` block: repos, views, view-file pairs, unique blobs, defs, queue depth, truncated and
+  errored views, and freshness lag (oldest poll and oldest scan). `--compact` does not read it.
+- **`CSR_NO_CODEMAP=1` turns it all off:** the daemon job, the watcher, the hook enqueue, the CLI and the two
+  sections.
+- **Not in this release:** `witness_ledger` worktree-tier stamps from the map. The map answers "where does this
+  definition live, and does each worktree hold the same bytes"; it does not feed the dream verdicts.
+
 ### Dreaming / witness
 
 - **Evidence-grounded forgetting** (b721a745, 834fa704). `codewitness` stamps spans with BLAKE3 at commit OIDs and

@@ -2482,6 +2482,77 @@ pub async fn search_by_file(
     limit: usize,
     project: Option<&str>,
 ) -> Result<String> {
+    search_by_file_with_map(
+        storage,
+        file_path,
+        limit,
+        project,
+        crate::codemap::disabled(),
+    )
+    .await
+}
+
+/// Paths of the code map's `<code_map>` section for a file lookup.
+const CODE_MAP_PATH_CAP: usize = 10;
+/// Definitions of the code map's `<code_map>` section for a symbol lookup.
+const CODE_MAP_DEFINITION_CAP: usize = 10;
+
+/// The code map's answer for a file argument: the formatted `<code_map>` section
+/// and how many distinct views hold the matched paths. `None` when the code map
+/// is off, its tables are missing, or nothing matches. Read-only; any storage
+/// error counts as "no answer", never as a failure of the tool.
+fn code_map_file_section(
+    storage: &Arc<Storage>,
+    arg: &str,
+    map_off: bool,
+) -> Option<(String, usize)> {
+    if map_off || arg.trim().is_empty() {
+        return None;
+    }
+    let lookup = storage
+        .with_connection(|conn| crate::codemap::lookup_files(conn, arg, CODE_MAP_PATH_CAP))
+        .ok()?;
+    if lookup.files.is_empty() {
+        return None;
+    }
+    let views: HashSet<&str> = lookup
+        .files
+        .iter()
+        .flat_map(|f| f.presence.iter().map(|p| p.worktree_path.as_str()))
+        .collect();
+    Some((
+        format::format_code_map_files(&lookup.files, lookup.total_paths),
+        views.len(),
+    ))
+}
+
+/// The code map's definitions named exactly `symbol`, formatted as a
+/// `<code_map>` section. `None` when off, missing tables, or no definition.
+fn code_map_definitions_section(
+    storage: &Arc<Storage>,
+    symbol: &str,
+    map_off: bool,
+) -> Option<String> {
+    if map_off || symbol.trim().is_empty() {
+        return None;
+    }
+    let hits = storage
+        .with_connection(|conn| {
+            crate::codemap::query_exact(conn, symbol.trim(), CODE_MAP_DEFINITION_CAP)
+        })
+        .ok()?;
+    (!hits.is_empty()).then(|| format::format_code_map_definitions(&hits))
+}
+
+/// [`search_by_file`] with the code-map switch injectable, so tests need not
+/// touch the process environment.
+pub(super) async fn search_by_file_with_map(
+    storage: &Arc<Storage>,
+    file_path: &str,
+    limit: usize,
+    project: Option<&str>,
+    map_off: bool,
+) -> Result<String> {
     // The code-graph ledger (`code_nodes`/`code_evolution`/
     // `code_graph_file_state`) filters by an exact `project` match — no
     // family-alias widening like `family_chunk_ids` gives the chunk search
@@ -2500,9 +2571,15 @@ pub async fn search_by_file(
     };
 
     let mut ledger = storage.code_file_ledger(&proj, file_path)?;
+    let map = code_map_file_section(storage, file_path, map_off);
     if !ledger.symbols.is_empty() || !ledger.timeline.is_empty() {
         attach_attribution(storage, &mut ledger.symbols);
-        return Ok(format::format_file_ledger(&ledger));
+        let mut out = format::format_file_ledger(&ledger);
+        if let Some((section, _)) = &map {
+            out.push('\n');
+            out.push_str(section);
+        }
+        return Ok(out);
     }
 
     // Secondary enrichment: fall back to FTS5 over chunk content. The ledger
@@ -2521,12 +2598,27 @@ pub async fn search_by_file(
         .into_iter()
         .partition(|chunk| !notes.contains_key(&chunk.id));
     let chunks: Vec<_> = clean.into_iter().chain(csr).collect();
-    Ok(format::format_file_results(
-        &chunks,
-        file_path,
-        ledger.indexed,
-        &notes,
-    ))
+    let Some((section, views)) = map else {
+        return Ok(format::format_file_results(
+            &chunks,
+            file_path,
+            ledger.indexed,
+            &notes,
+        ));
+    };
+    if chunks.is_empty() {
+        // No conversation touched the file, but the code map holds it.
+        return Ok(format::format_file_map_only(
+            file_path,
+            ledger.indexed,
+            views,
+            &section,
+        ));
+    }
+    let mut out = format::format_file_results(&chunks, file_path, ledger.indexed, &notes);
+    out.push('\n');
+    out.push_str(&section);
+    Ok(out)
 }
 
 /// Code-graph query: neighbors | callers | callees (no transitive impact in v1).
@@ -2570,13 +2662,89 @@ fn code_graph_for_projects(
     project: &str,
     family_projects: &[String],
 ) -> Result<String> {
+    code_graph_with_map(
+        storage,
+        symbol,
+        file,
+        mode,
+        limit,
+        project,
+        family_projects,
+        crate::codemap::disabled(),
+    )
+}
+
+/// [`code_graph_for_projects`] plus the code map: its definitions of the exact
+/// symbol name (or its entry for the file) are appended to the graph answer, and
+/// replace the empty answer when the conversation code graph does not know the
+/// target. `map_off` is the injectable kill switch.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn code_graph_with_map(
+    storage: &Arc<Storage>,
+    symbol: Option<&str>,
+    file: Option<&str>,
+    mode: &str,
+    limit: usize,
+    project: &str,
+    family_projects: &[String],
+    map_off: bool,
+) -> Result<String> {
+    let (graph_knows, graph_out) =
+        code_graph_core(storage, symbol, file, mode, limit, project, family_projects)?;
+    if map_off {
+        return Ok(graph_out);
+    }
+    // A symbol wins over a file, as in `resolve_node_id`.
+    let section = match (
+        symbol.filter(|s| !s.trim().is_empty()),
+        file.filter(|f| !f.trim().is_empty()),
+    ) {
+        (Some(s), _) => code_map_definitions_section(storage, s, map_off),
+        (None, Some(f)) => code_map_file_section(storage, f, map_off).map(|(section, _)| section),
+        (None, None) => None,
+    };
+    let Some(section) = section else {
+        return Ok(graph_out);
+    };
+    if graph_knows {
+        return Ok(format!("{graph_out}\n{section}"));
+    }
+    let target_label = symbol.or(file).unwrap_or("");
+    let shown_mode = match mode {
+        "callers" | "callees" => mode,
+        _ => "neighbors",
+    };
+    Ok(format::format_code_graph_from_map(
+        shown_mode,
+        target_label,
+        &section,
+    ))
+}
+
+/// The conversation code graph's answer, and whether the graph knows the target
+/// at all (false when no node resolves, or a callers lookup finds nothing for a
+/// symbol the graph has no node for).
+fn code_graph_core(
+    storage: &Arc<Storage>,
+    symbol: Option<&str>,
+    file: Option<&str>,
+    mode: &str,
+    limit: usize,
+    project: &str,
+    family_projects: &[String],
+) -> Result<(bool, String)> {
     let target_label = symbol.or(file).unwrap_or("").to_string();
 
     match mode {
         "callers" => {
             let name = match symbol {
                 Some(s) if !s.is_empty() => s,
-                _ => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
+                _ => {
+                    return Ok((
+                        false,
+                        format::format_code_graph(mode, &target_label, &[], &[]),
+                    ))
+                }
             };
             let mut nodes = storage.with_connection(|conn| {
                 crate::storage::codegraph::query_callers_in_projects(
@@ -2587,12 +2755,22 @@ fn code_graph_for_projects(
                 )
             })?;
             attach_attribution(storage, &mut nodes);
-            Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
+            let knows = !nodes.is_empty()
+                || resolve_node_id(storage, symbol, file, project, family_projects)?.is_some();
+            Ok((
+                knows,
+                format::format_code_graph(mode, &target_label, &nodes, &[]),
+            ))
         }
         "callees" => {
             let node_id = match resolve_node_id(storage, symbol, file, project, family_projects)? {
                 Some(id) => id,
-                None => return Ok(format::format_code_graph(mode, &target_label, &[], &[])),
+                None => {
+                    return Ok((
+                        false,
+                        format::format_code_graph(mode, &target_label, &[], &[]),
+                    ))
+                }
             };
             let mut nodes = storage.with_connection(|conn| {
                 crate::storage::codegraph::query_callees_in_projects(
@@ -2603,18 +2781,19 @@ fn code_graph_for_projects(
                 )
             })?;
             attach_attribution(storage, &mut nodes);
-            Ok(format::format_code_graph(mode, &target_label, &nodes, &[]))
+            Ok((
+                true,
+                format::format_code_graph(mode, &target_label, &nodes, &[]),
+            ))
         }
         _ => {
             // Default: neighbors (1-hop, both directions).
             let node_id = match resolve_node_id(storage, symbol, file, project, family_projects)? {
                 Some(id) => id,
                 None => {
-                    return Ok(format::format_code_graph(
-                        "neighbors",
-                        &target_label,
-                        &[],
-                        &[],
+                    return Ok((
+                        false,
+                        format::format_code_graph("neighbors", &target_label, &[], &[]),
                     ))
                 }
             };
@@ -2636,11 +2815,9 @@ fn code_graph_for_projects(
                         .unwrap_or_else(|_| "unattributed".to_string())
                 };
             }
-            Ok(format::format_code_graph(
-                "neighbors",
-                &target_label,
-                &[],
-                &neighbors,
+            Ok((
+                true,
+                format::format_code_graph("neighbors", &target_label, &[], &neighbors),
             ))
         }
     }

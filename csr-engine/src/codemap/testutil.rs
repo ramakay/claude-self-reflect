@@ -101,6 +101,60 @@ pub(crate) fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
+/// A repo with a main checkout and two linked worktrees, not yet scanned:
+/// `main` and `same` hold identical files; `diff` has an uncommitted edit of
+/// `src/radio.py` (so its blob differs and it is dirty).
+pub(crate) struct MapFixture {
+    pub fx: Fx,
+    pub main: PathBuf,
+    pub same: PathBuf,
+    pub diff: PathBuf,
+}
+
+pub(crate) fn map_fixture() -> MapFixture {
+    let fx = Fx::new();
+    let main = fx.init_repo("mapfx");
+    write(&main, "src/radio.py", &py(&["alpha_one", "beta_two"]));
+    write(&main, "src/only.py", &py(&["gamma_three"]));
+    write(&main, "lib/util/helpers.py", &py(&["help_me"]));
+    write(&main, "pkg_a/dup.py", &py(&["dup_a"]));
+    write(&main, "pkg_b/dup.py", &py(&["dup_b"]));
+    for i in 0..12 {
+        write(
+            &main,
+            &format!("many/m{i:02}/same_name.py"),
+            &py(&["many_fn"]),
+        );
+    }
+    fx.commit_all(&main, "init");
+    let same = fx.add_worktree(&main, &fx.root.join("mapfx-same"), "same");
+    let diff = fx.add_worktree(&main, &fx.root.join("mapfx-diff"), "diff");
+    write(
+        &diff,
+        "src/radio.py",
+        &py(&["alpha_one", "beta_two", "delta_four"]),
+    );
+    MapFixture {
+        fx,
+        main,
+        same,
+        diff,
+    }
+}
+
+/// Scan every view of the repo whose main checkout is `repo` into `conn`.
+pub(crate) fn scan_repo_into(conn: &Connection, fx: &Fx, repo: &Path) {
+    super::scan::scan_repo(
+        conn,
+        &repo.join(".git"),
+        &super::scan::ScanOpts {
+            home: Some(fx.home.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
 /// A Python source defining the given functions.
 pub(crate) fn py(defs: &[&str]) -> String {
     defs.iter()

@@ -1454,10 +1454,178 @@ pub fn format_code_graph(
     out
 }
 
+/// The file-search answer when no conversation touched the file but the code
+/// map holds it: the plain statement, then the map's section.
+pub fn format_file_map_only(
+    file_path: &str,
+    indexed: bool,
+    views: usize,
+    code_map_section: &str,
+) -> String {
+    format!(
+        "<file_search file='{}' indexed='{}'>\n  <message>No conversation touched this file; the code map holds it in {} {}.</message>\n{}\n</file_search>",
+        xml_escape(file_path),
+        indexed,
+        views,
+        if views == 1 { "view" } else { "views" },
+        code_map_section
+    )
+}
+
+/// The code-graph answer when the conversation code graph does not know the
+/// target but the code map does. Says where the answer comes from and, for the
+/// edge modes, that call edges are not in the map.
+pub fn format_code_graph_from_map(mode: &str, target: &str, code_map_section: &str) -> String {
+    let edges = match mode {
+        "callers" => " Callers are not in the code map.",
+        "callees" => " Callees are not in the code map.",
+        _ => "",
+    };
+    format!(
+        "<code_graph mode='{}' target='{}' source='code_map'>\n  <message>Not in the conversation code graph. This answer comes from the code map: definitions, not call edges.{}</message>\n{}\n</code_graph>",
+        xml_escape(mode),
+        xml_escape(target),
+        edges,
+        code_map_section
+    )
+}
+
+/// Byte budget of a `<code_map>` section.
+pub const CODE_MAP_SECTION_BUDGET: usize = 1500;
+
+fn lines_attr(span_start: i64, span_end: i64) -> String {
+    format!("{}-{}", span_start + 1, span_end + 1)
+}
+
+/// Render `render(a, b)` with `a` and `b` shrunk until the text fits the budget:
+/// `b` (defs per file) halves down to zero first, then `a` (items) drops by one.
+/// Falls back to `empty` when even one bare item does not fit.
+fn fit_section(
+    items: usize,
+    max_inner: usize,
+    empty: String,
+    render: impl Fn(usize, usize) -> String,
+) -> String {
+    let mut shown = items;
+    let mut inner = max_inner;
+    loop {
+        let text = render(shown, inner);
+        if text.len() <= CODE_MAP_SECTION_BUDGET {
+            return text;
+        }
+        if inner > 0 {
+            inner = if inner > 3 { inner / 2 } else { inner - 1 };
+        } else if shown > 1 {
+            shown -= 1;
+        } else {
+            return empty;
+        }
+    }
+}
+
+/// The `<code_map>` section for files: per path, the views holding it grouped
+/// by blob, and the definitions of the blob most views share. At most
+/// [`CODE_MAP_SECTION_BUDGET`] bytes; empty string when there are no files.
+/// `total_paths` is how many paths matched before the caller's cap.
+pub fn format_code_map_files(files: &[crate::codemap::CodemapFile], total_paths: usize) -> String {
+    use std::fmt::Write as _;
+
+    if files.is_empty() {
+        return String::new();
+    }
+    let total_paths = total_paths.max(files.len());
+    let render = |shown: usize, max_defs: usize| {
+        let mut out = String::new();
+        let _ = writeln!(out, "<code_map paths='{total_paths}'>");
+        for file in files.iter().take(shown) {
+            let _ = writeln!(
+                out,
+                "  <file path='{}' repo='{}' views='{}'>",
+                xml_escape(&file.path),
+                xml_escape(&crate::codemap::files::repo_label(&file.repo)),
+                file.view_count(),
+            );
+            let _ = writeln!(
+                out,
+                "    <presence>{}</presence>",
+                xml_escape(&crate::codemap::files::presence_summary(&file.presence))
+            );
+            for def in file.defs.iter().take(max_defs) {
+                let _ = writeln!(
+                    out,
+                    "    <def name='{}' kind='{}' lines='{}'/>",
+                    xml_escape(&def.name),
+                    xml_escape(&def.kind),
+                    lines_attr(def.span_start, def.span_end),
+                );
+            }
+            let hidden = file
+                .defs_total
+                .saturating_sub(max_defs.min(file.defs.len()));
+            if hidden > 0 {
+                let _ = writeln!(out, "    <more defs='{hidden}'/>");
+            }
+            out.push_str("  </file>\n");
+        }
+        if shown < files.len() || total_paths > files.len() {
+            let _ = writeln!(out, "  <more paths='{}'/>", total_paths - shown);
+        }
+        out.push_str("</code_map>");
+        out
+    };
+    fit_section(
+        files.len(),
+        crate::codemap::files::MAX_FILE_DEFS.min(12),
+        format!("<code_map paths='{total_paths}' truncated='true'/>"),
+        render,
+    )
+}
+
+/// The `<code_map>` section for definitions of one symbol name: each with its
+/// file, lines and per-view presence. At most [`CODE_MAP_SECTION_BUDGET`]
+/// bytes; empty string when there are no hits.
+pub fn format_code_map_definitions(hits: &[crate::codemap::CodemapHit]) -> String {
+    use std::fmt::Write as _;
+
+    if hits.is_empty() {
+        return String::new();
+    }
+    let render = |shown: usize, _unused: usize| {
+        let mut out = String::new();
+        let _ = writeln!(out, "<code_map definitions='{}'>", hits.len());
+        for hit in hits.iter().take(shown) {
+            let _ = writeln!(
+                out,
+                "  <definition name='{}' kind='{}' repo='{}' path='{}' lines='{}' presence='{}'/>",
+                xml_escape(&hit.name),
+                xml_escape(&hit.kind),
+                xml_escape(&crate::codemap::files::repo_label(&hit.repo)),
+                xml_escape(&hit.path),
+                lines_attr(hit.span_start, hit.span_end),
+                xml_escape(&crate::codemap::files::presence_summary(&hit.presence)),
+            );
+        }
+        if shown < hits.len() {
+            let _ = writeln!(out, "  <more definitions='{}'/>", hits.len() - shown);
+        }
+        out.push_str("</code_map>");
+        out
+    };
+    fit_section(
+        hits.len(),
+        0,
+        format!("<code_map definitions='{}' truncated='true'/>", hits.len()),
+        render,
+    )
+}
+
 /// Parse a JSON string array of names; empty vec on any error.
 fn parse_json_names(json: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(json).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod code_map_tests;
 
 #[cfg(test)]
 mod tests {

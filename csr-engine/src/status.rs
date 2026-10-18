@@ -71,6 +71,9 @@ pub struct StatusReport {
     pub secrets_redacted: SecretsRedactedStatus,
     /// The transcript mirror, read from its state table (no directory walk).
     pub mirror: MirrorStatus,
+    /// The code map: what it holds and how stale it is. Read from its own
+    /// tables; left at the default on `--compact`, which never reads it.
+    pub codemap: CodemapStatusBlock,
     /// Conversations stored before the secret scrubber: placed, or waiting to be.
     pub legacy_frontier: LegacyFrontierStatus,
     /// Prompts typed while Claude was busy, which a transcript holds only as an
@@ -358,6 +361,118 @@ impl MirrorStatus {
 
     pub fn for_cli(storage: &Storage) -> Self {
         Self::read(storage)
+    }
+}
+
+/// What the code map holds and how stale it is, from [`crate::codemap::status_report`].
+/// Read-only; a database without the code map tables reads as the default.
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct CodemapStatusBlock {
+    /// The code map tables exist.
+    pub initialised: bool,
+    /// `CSR_NO_CODEMAP=1` is set in the reporting process.
+    pub disabled: bool,
+    /// Enabled (not removed) repos.
+    pub repos: i64,
+    pub views: i64,
+    pub view_file_pairs: i64,
+    pub unique_blobs: i64,
+    pub defs: i64,
+    /// Paths waiting for a partial rescan.
+    pub queue_depth: i64,
+    /// Views that hit the per-view file cap.
+    pub views_truncated: i64,
+    /// Views whose last scan did not end `ok`.
+    pub views_in_error: i64,
+    /// Enabled repos the daemon has not polled yet.
+    pub repos_never_polled: i64,
+    /// Seconds since the least recently polled enabled repo was polled.
+    pub poll_lag_secs: Option<i64>,
+    /// Seconds since the least recently scanned view was scanned.
+    pub scan_lag_secs: Option<i64>,
+}
+
+impl CodemapStatusBlock {
+    fn read(storage: &Storage) -> Self {
+        storage
+            .with_connection(crate::codemap::status_report)
+            .ok()
+            .map(|report| Self::from_report(&report, chrono::Utc::now().timestamp()))
+            .unwrap_or_default()
+    }
+
+    /// Fold a full report into the block. `now` is epoch seconds.
+    pub(crate) fn from_report(report: &crate::codemap::CodemapStatus, now: i64) -> Self {
+        if !report.initialised {
+            return Self {
+                disabled: report.disabled,
+                ..Self::default()
+            };
+        }
+        let enabled: Vec<_> = report.repos.iter().filter(|r| r.enabled).collect();
+        let oldest_poll = enabled.iter().filter_map(|r| r.last_poll_at).min();
+        let oldest_scan = report
+            .repos
+            .iter()
+            .flat_map(|r| r.views.iter())
+            .filter_map(|v| v.scanned_at)
+            .min();
+        Self {
+            initialised: true,
+            disabled: report.disabled,
+            repos: enabled.len() as i64,
+            views: report.totals.views,
+            view_file_pairs: report.totals.view_file_pairs,
+            unique_blobs: report.totals.unique_blobs,
+            defs: report.totals.defs,
+            queue_depth: report.totals.queue_depth,
+            views_truncated: report.totals.truncated_views,
+            views_in_error: report
+                .repos
+                .iter()
+                .flat_map(|r| r.views.iter())
+                .filter(|v| v.status != "ok")
+                .count() as i64,
+            repos_never_polled: enabled.iter().filter(|r| r.last_poll_at.is_none()).count() as i64,
+            poll_lag_secs: oldest_poll.map(|t| (now - t).max(0)),
+            scan_lag_secs: oldest_scan.map(|t| (now - t).max(0)),
+        }
+    }
+
+    /// Plain-text lines for the human outputs. Empty when the code map has
+    /// never been filled and is not switched off.
+    fn text_lines(&self) -> Vec<String> {
+        if !self.initialised {
+            return if self.disabled {
+                vec!["Code map: off (CSR_NO_CODEMAP=1)".to_string()]
+            } else {
+                Vec::new()
+            };
+        }
+        let lag = |secs: Option<i64>| secs.map_or("n/a".to_string(), |s| format!("{s}s"));
+        let off = if self.disabled {
+            " [off: CSR_NO_CODEMAP=1]"
+        } else {
+            ""
+        };
+        vec![
+            format!(
+                "Code map: {} repos, {} views, {} view-file pairs, {} unique blobs, {} defs{off}",
+                self.repos, self.views, self.view_file_pairs, self.unique_blobs, self.defs
+            ),
+            format!(
+                "Queue {}, truncated views {}, views in error {}, repos never polled {}",
+                self.queue_depth,
+                self.views_truncated,
+                self.views_in_error,
+                self.repos_never_polled
+            ),
+            format!(
+                "Freshness lag: oldest poll {}, oldest scan {}",
+                lag(self.poll_lag_secs),
+                lag(self.scan_lag_secs)
+            ),
+        ]
     }
 }
 
@@ -1007,7 +1122,8 @@ pub fn handle(
     swiftbar: bool,
     deep: bool,
 ) -> Result<()> {
-    let report = gather_status(db_path, projects_dir, deep)?;
+    // The statusline refresh is a hot path and prints none of the code map.
+    let report = gather_status_with(db_path, projects_dir, deep, !compact)?;
 
     if swiftbar {
         print_swiftbar(&report);
@@ -1097,6 +1213,17 @@ fn mcp_binary_stale_from(stale: &[crate::binary_identity::StaleProcess]) -> bool
 
 /// Gather status data from SQLite and disk.
 fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
+    gather_status_with(db_path, projects_dir, deep, true)
+}
+
+/// [`gather_status`] with the code map block switchable: `--compact` passes
+/// `false` and gets the default block without touching the code map tables.
+fn gather_status_with(
+    db_path: &Path,
+    projects_dir: &Path,
+    deep: bool,
+    with_codemap: bool,
+) -> Result<StatusReport> {
     let now = chrono::Utc::now();
     let dreaming = dream_state::read_active_marker(now).map(|marker| DreamingView {
         elapsed_secs: (now - marker.started_at).num_seconds().max(0) as u64,
@@ -1128,6 +1255,10 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
             csr_hook_wrappers_scrubbed: 0,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
+            codemap: CodemapStatusBlock {
+                disabled: crate::codemap::disabled(),
+                ..Default::default()
+            },
             legacy_frontier: LegacyFrontierStatus::default(),
             queued_prompts: QueuedPromptsStatus::default(),
             contamination: ContaminationStatus::default(),
@@ -1171,6 +1302,11 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
     let csr_hook_wrappers_scrubbed = storage.get_csr_hook_wrappers_scrubbed().unwrap_or(0);
     let secrets_redacted = SecretsRedactedStatus::read(&storage);
     let mirror = MirrorStatus::read(&storage);
+    let codemap = if with_codemap {
+        CodemapStatusBlock::read(&storage)
+    } else {
+        CodemapStatusBlock::default()
+    };
     let legacy_frontier = LegacyFrontierStatus::read(&storage);
     let queued_prompts = QueuedPromptsStatus::read(&storage);
     let contamination = if deep {
@@ -1279,6 +1415,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         csr_hook_wrappers_scrubbed,
         secrets_redacted,
         mirror,
+        codemap,
         legacy_frontier,
         queued_prompts,
         contamination,
@@ -2106,6 +2243,19 @@ fn print_swiftbar(report: &StatusReport) {
         }
     }
 
+    // Section: Code map (nothing printed until the map has been filled)
+    let codemap_lines = report.codemap.text_lines();
+    if !codemap_lines.is_empty() {
+        println!("---");
+        for (i, line) in codemap_lines.iter().enumerate() {
+            if i == 0 {
+                println!("{line} | font=Menlo");
+            } else {
+                println!("--{line} | font=Menlo");
+            }
+        }
+    }
+
     // Section: Health
     println!("---");
     let health_label = match report.healthy {
@@ -2310,6 +2460,9 @@ fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
 }
 
 #[cfg(test)]
+mod codemap_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2409,6 +2562,7 @@ mod tests {
             csr_hook_wrappers_scrubbed: 0,
             secrets_redacted: SecretsRedactedStatus::default(),
             mirror: MirrorStatus::default(),
+            codemap: CodemapStatusBlock::default(),
             legacy_frontier: LegacyFrontierStatus::default(),
             queued_prompts: QueuedPromptsStatus::default(),
             contamination: ContaminationStatus::default(),
