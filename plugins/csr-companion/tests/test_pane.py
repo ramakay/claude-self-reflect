@@ -3232,6 +3232,186 @@ class CodewitnessForTheDreamer(unittest.TestCase):
         self.assertFalse(notes[0]['earlier'])
 
 
+class MergeReceipts(unittest.TestCase):
+    """A shift note named a merge instead of the commit that wrote the change. A merge receipt is asked about:
+    csr-engine says who wrote the change, the shift moves there, and a shift the engine cannot place is left out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.root = os.path.realpath(os.path.join(self.tmp, 'repo'))
+        os.makedirs(self.root)
+        self.git = lambda *a: subprocess.run(['git', '-C', self.root, *a], capture_output=True, text=True,
+                                             check=True).stdout.strip()
+        self.git('init', '-q', '-b', 'main')
+        self.git('config', 'user.email', 't@t')
+        self.git('config', 'user.name', 't')
+        self.git('config', 'commit.gpgsign', 'false')
+        self.path = os.path.join(self.root, 'a.py')
+        self.write('def f():\n    return 1\n', 'other.txt', '0\n')
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'first')
+        self.git('checkout', '-q', '-b', 'side')
+        self.write(None, 'other.txt', 'side\n')
+        self.git('commit', '-qam', 'side branch, a.py untouched')
+        self.side = self.git('rev-parse', 'HEAD')
+        self.git('checkout', '-q', 'main')
+        self.write('def f():\n    return 2\n')
+        self.git('commit', '-qam', 'change f')
+        self.author = self.git('rev-parse', 'HEAD')
+        self.git('merge', '--no-ff', '-q', '-m', 'merge side', 'side')
+        self.merge = self.git('rev-parse', 'HEAD')
+        self.log = os.path.join(self.tmp, 'engine.log')
+        con = sqlite3.connect(':memory:')
+        con.executescript("""
+          create table meta(key text primary key, value text);
+          create table witness_ledger(id integer primary key, project text, file text, symbol text, created_at text,
+            at_oid text);
+          create table witness_verdicts(id integer primary key, witness_id int, verdict text, receipt_oid text,
+            observed_head_oid text, created_at text, receipt_committed_at text);
+          create table witness_chunk_bindings(witness_id int, chunk_id text);
+          create table chunks(id text, conversation_id text, timestamp text);
+          create table episode_anchors(session_id text, file text, name text, created_at text);
+          create table code_nodes(file text, name text, last_conv_id text, last_seen text);
+          create table session_registry(session_id text, first_prompt text, first_ts text);
+          create table intent_events(kind text, file text, ts text, quote text, session_id text);
+        """)
+        con.execute('insert into witness_ledger values (1, ?, ?, ?, ?, ?)',
+                    ('repo', self.path, 'f', '2026-10-10T10:00:00Z', self.side))
+        con.execute("insert into witness_verdicts values (1, 1, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', "
+                    "'2026-10-10T11:00:00Z')", (self.merge, self.merge))
+        # an earlier session worked on f at 10:00 and ended at 10:05; the merge is dated 11:00
+        con.execute("insert into code_nodes values (?, 'f', 'sess-old', '2026-10-10T10:00:00Z')", (self.path,))
+        con.execute("insert into chunks values ('c2', 'sess-old', '2026-10-10T10:05:00Z')")
+        con.execute("insert into session_registry values ('sess-old', 'build the thing', '2026-10-10T09:00:00Z')")
+        self.con = con
+        self.addCleanup(con.close)
+        for cache in (pane._SHIFTS, pane._AUTHORS):
+            cache.clear()
+            self.addCleanup(cache.clear)
+        patcher = mock.patch.object(pane, 'first_prompts', lambda: {})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, source, other=None, other_text=None):
+        if source is not None:
+            with open(self.path, 'w') as handle:
+                handle.write(source)
+        if other:
+            with open(os.path.join(self.root, other), 'w') as handle:
+                handle.write(other_text)
+
+    def engine(self, reply, wait=0):
+        """A csr-engine stand-in that logs its arguments and prints `reply`."""
+        script = os.path.join(self.tmp, 'csr-engine')
+        with open(script, 'w') as handle:
+            handle.write(f"#!/bin/sh\necho \"$@\" >> '{self.log}'\n"
+                         + (f'sleep {wait}\n' if wait else '') + f"printf '%s' '{json.dumps(reply)}'\n")
+        os.chmod(script, 0o755)
+        patcher = mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': script})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return script
+
+    def asked(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as handle:
+            return handle.read().splitlines()
+
+    def notes(self):
+        return pane.notes_for(self.con, self.root, self.path, 'sess-now')
+
+    def test_a_merge_receipt_moves_to_the_commit_that_wrote_the_change(self):
+        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
+                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        notes = self.notes()
+        self.assertEqual([n['oid'] for n in notes], [self.author])
+        self.assertIn(f'changed in {self.author[:7]}', notes[0]['line'])
+        self.assertNotIn(self.merge[:7], notes[0]['line'] + notes[0]['text'])
+        self.assertEqual(notes[0]['symbol'], 'f')
+        # the link to the past session runs through the witness, and the re-keyed shift kept it
+        _, shifts = pane.load_shifts(self.con, self.root)
+        self.assertEqual([(s['oid'], s['wids'], s['date'], s['subject']) for s in shifts],
+                         [(self.author, [1], '2026-10-10', 'change f')])
+        self.assertEqual(self.asked(), [f'symbol change --repo {self.root} --file a.py --oid {self.merge} '
+                                        f'--from {self.side} --symbol f'])
+
+    def test_the_answer_is_kept_for_the_life_of_the_process(self):
+        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
+                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        self.notes()
+        pane._SHIFTS.clear()  # the minute is up: the shifts are read again
+        self.assertEqual(len(self.notes()), 1)
+        self.assertEqual(len(self.asked()), 1)
+
+    def test_a_merge_that_changed_the_code_itself_stays(self):
+        self.engine(dict(oid=self.merge, merge=True, authored=True, author=self.merge,
+                         author_committed_at='2026-10-10T11:00:00+00:00'))
+        self.assertEqual([n['oid'] for n in self.notes()], [self.merge])
+
+    def test_a_merge_the_engine_cannot_place_is_left_out(self):
+        for reply in (dict(oid=self.merge, merge=True, authored=False, author=None, author_committed_at=None),
+                      dict(oid=self.merge, merge=True, authored=None, author=None, author_committed_at=None),
+                      dict(error='not a commit')):
+            pane._SHIFTS.clear()
+            pane._AUTHORS.clear()
+            self.engine(reply)
+            self.assertEqual(self.notes(), [], reply)
+
+    def test_no_engine_leaves_the_merge_out_rather_than_naming_it(self):
+        with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': os.path.join(self.tmp, 'missing')}):
+            self.assertEqual(self.notes(), [])
+        pane._SHIFTS.clear()
+        pane._AUTHORS.clear()
+        with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': ''}), mock.patch.object(shutil, 'which', lambda _: None):
+            self.assertEqual(self.notes(), [])
+
+    def test_an_engine_past_its_time_leaves_the_merge_out(self):
+        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
+                         author_committed_at='2026-10-10T10:30:00+00:00'), wait=3)
+        with mock.patch.object(pane, 'ENGINE_WAIT', 0.3):
+            started = time.time()
+            self.assertEqual(self.notes(), [])
+        self.assertLess(time.time() - started, 2.5)
+
+    def test_broken_output_leaves_the_merge_out(self):
+        script = self.engine(dict())
+        with open(script, 'w') as handle:
+            handle.write('#!/bin/sh\necho "not json"\n')
+        self.assertEqual(self.notes(), [])
+
+    def test_a_receipt_that_is_not_a_merge_never_asks_the_engine(self):
+        self.con.execute('update witness_verdicts set receipt_oid=?', (self.author,))
+        self.engine(dict(oid=self.author, merge=False, authored=True, author=self.author,
+                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        self.assertEqual([n['oid'] for n in self.notes()], [self.author])
+        self.assertEqual(self.asked(), [])
+
+    def test_witnesses_with_different_starting_commits_must_agree(self):
+        self.con.execute('insert into witness_ledger values (2, ?, ?, ?, ?, ?)',
+                         ('repo', self.path, 'f', '2026-10-10T10:00:00Z', self.author))
+        self.con.execute("insert into witness_verdicts values (2, 2, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', "
+                         "'2026-10-10T11:00:00Z')", (self.merge, self.merge))
+        script = self.engine(dict())
+        with open(script, 'w') as handle:  # the witness that started on the side branch says the merge only brought it in; the other says it wrote it
+            handle.write(f"#!/bin/sh\necho \"$@\" >> '{self.log}'\ncase \"$*\" in *'--from {self.side}'*)\n"
+                         f"printf '%s' '{json.dumps(dict(oid=self.merge, merge=True, authored=False, author=self.author, author_committed_at='2026-10-10T10:30:00+00:00'))}';;\n"
+                         f"*) printf '%s' '{json.dumps(dict(oid=self.merge, merge=True, authored=True, author=self.merge, author_committed_at='2026-10-10T11:00:00+00:00'))}';;\nesac\n")
+        self.assertEqual(self.notes(), [])
+        self.assertEqual(len(self.asked()), 2)
+
+    def test_a_shift_moved_onto_a_commit_that_already_has_one_joins_it(self):
+        self.con.execute('insert into witness_ledger values (2, ?, ?, ?, ?, ?)',
+                         ('repo', self.path, 'f', '2026-10-10T10:00:00Z', self.side))
+        self.con.execute("insert into witness_verdicts values (2, 2, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', "
+                         "'2026-10-10T10:30:00Z')", (self.author, self.author))
+        self.engine(dict(oid=self.merge, merge=True, authored=False, author=self.author,
+                         author_committed_at='2026-10-10T10:30:00+00:00'))
+        _, shifts = pane.read_shifts(self.con, self.root)
+        self.assertEqual([(s['oid'], s['wids']) for s in shifts], [(self.author, [1, 2])])
+
+
 class MemoryRoot(unittest.TestCase):
     """A folder outside git gets a pane when CSR has sessions from its project, not only a repo."""
 

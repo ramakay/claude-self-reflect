@@ -166,10 +166,93 @@ def load_shifts(con, root):
     return _SHIFTS[root][1]
 
 
+ENGINE_WAIT = 5  # seconds the engine gets to say who wrote a change before the shift is left out
+_AUTHORS = {}  # (repo, commit, file, symbol, from) -> (when asked, the engine's answer or None)
+
+
+def is_merge(top, oid):
+    """Whether oid is a merge commit (git says: the commit and two or more parents)."""
+    out = subprocess.run(['git', '-C', top, 'rev-list', '--parents', '-n', '1', oid], capture_output=True, text=True)
+    return out.returncode == 0 and len(out.stdout.split()) >= 3
+
+
+def commit_author(top, rel, symbol, oid, at_oid):
+    """csr-engine's answer to "did oid author this change?" (symbol change) for the witness taken at at_oid:
+    {authored, author, author_committed_at, ...}, or None when the engine is missing, slow or unreadable.
+    An answer is kept for the life of the process; a failure only for a minute."""
+    key = (top, oid, rel, symbol, at_oid)
+    hit = _AUTHORS.get(key)
+    if hit and (hit[1] is not None or time.time() - hit[0] < 60):
+        return hit[1]
+    answer, binary = None, engine_binary()
+    if binary:
+        cmd = [binary, 'symbol', 'change', '--repo', top, '--file', rel, '--oid', oid, '--from', at_oid]
+        if symbol:
+            cmd += ['--symbol', symbol]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=ENGINE_WAIT, stdin=subprocess.DEVNULL)
+            answer = json.loads(out.stdout) if out.returncode == 0 else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            answer = None
+    if not isinstance(answer, dict) or answer.get('oid') is None:
+        answer = None
+    _AUTHORS[key] = (time.time(), answer)
+    return answer
+
+
+def author_of(top, rel, symbol, merge, at_oids):
+    """Who wrote the change a merge receipt carries, from every witness's own starting commit: 'self' when the merge
+    itself changed the code, the author's (oid, committed_at) when it only brought the change in, None when the
+    engine cannot say or its answers differ."""
+    verdicts = set()
+    for at_oid in sorted(at_oids, key=str):
+        if not at_oid:
+            return None
+        answer = commit_author(top, rel, symbol, merge, at_oid)
+        if answer is None:
+            return None
+        if answer.get('authored') is True:
+            verdicts.add('self')
+        elif answer.get('authored') is False and answer.get('author'):
+            verdicts.add((answer['author'], answer.get('author_committed_at')))
+        else:
+            return None
+    return verdicts.pop() if len(verdicts) == 1 else None
+
+
+def settle_merges(con, top, root, shifts):
+    """A merge that left the code as its first parent had it did not write the change it brought in: a shift whose
+    receipt is such a merge moves to the commit that did, and is left out when the engine cannot say which. Shifts
+    whose receipt is not a merge never ask the engine."""
+    merges = {key: shift for key, shift in shifts.items() if is_merge(top, shift['oid'])}
+    if not merges:
+        return shifts
+    wids = sorted({wid for shift in merges.values() for wid in shift['wids']})
+    try:
+        at = dict(con.execute(f"select id, at_oid from witness_ledger where id in ({','.join('?' * len(wids))})",
+                              wids).fetchall())
+    except sqlite3.Error:
+        at = {}
+    out = {key: shift for key, shift in shifts.items() if key not in merges}
+    for key, shift in merges.items():
+        rel = os.path.relpath(os.path.join(root, shift['file']), top)
+        who = author_of(top, rel, shift['symbol'], shift['oid'], {at.get(wid) for wid in shift['wids']})
+        if who == 'self':
+            out[key] = shift
+        elif who:
+            author, when = who
+            moved = (shift['file'], shift['symbol'], shift['verdict'], author)
+            home = out.setdefault(moved, dict(shift, oid=author, date=(when or '')[:10], at=epoch(when), wids=[]))
+            home['wids'] = sorted(set(home['wids']) | set(shift['wids']))
+            home['id'] = max(home['id'], shift['id'])
+    return out
+
+
 def read_shifts(con, root):
     floor = con.execute("select coalesce((select cast(value as integer) from meta "
                         "where key='witness_verdicts_v2_floor'), 0)").fetchone()[0]
-    if not repo_root(root):
+    top = repo_root(root)
+    if not top:
         return floor, []  # a folder CSR remembers but git does not: no commits to have changed anything
     rows = con.execute("""
       select l.file, l.symbol, v.verdict, v.receipt_oid,
@@ -190,6 +273,7 @@ def read_shifts(con, root):
                                             date=(when or '')[:10], at=epoch(when), id=vid, wids=[]))
         shift['wids'].append(wid)
         shift['id'] = max(shift['id'], vid)
+    shifts = settle_merges(con, top, root, shifts)
     ordered = sorted(shifts.values(), key=lambda s: (s['date'], s['id']), reverse=True)
     subjects = {}
     for shift in ordered:
