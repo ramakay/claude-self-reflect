@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use ignore::gitignore::GitignoreBuilder;
 use ignore::WalkBuilder;
 use rusqlite::Connection;
@@ -797,10 +797,7 @@ pub fn scan_repo(conn: &Connection, common_dir: &Path, opts: &ScanOpts) -> Resul
     }
     let home = opts.home();
     if is_tcc_path(common_dir, home.as_deref()) {
-        bail!(
-            "refusing {}: macOS-protected folder (Desktop, Documents, Downloads)",
-            common_dir.display()
-        );
+        return Err(identity::ProtectedPath::new(common_dir, home.as_deref()).into());
     }
     // A repo whose common dir is gone has no views left. The check resolves
     // symlinks itself: a link into a protected folder is refused, not stat'ed.

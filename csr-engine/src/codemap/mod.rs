@@ -25,9 +25,10 @@
 //!
 //! Safety rules that hold for every function here:
 //!
-//! - Nothing under `~/Desktop`, `~/Documents` or `~/Downloads` is ever stat'ed,
-//!   opened or walked: macOS pops a privacy prompt for a signed binary that
-//!   touches them. The check is lexical (`identity::is_tcc_path`) and runs
+//! - Nothing under `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive
+//!   (`~/Library/Mobile Documents`) or `/Volumes/<name>` is ever stat'ed, opened
+//!   or walked by the daemon: macOS pops a privacy prompt for a signed binary
+//!   that touches them. The check is lexical (`identity::is_tcc_path`) and runs
 //!   BEFORE any filesystem call on the path.
 //! - Repos are only read. No git command runs, and the index is never
 //!   refreshed or written.

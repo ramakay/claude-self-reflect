@@ -102,35 +102,101 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
     out
 }
 
-fn lower(p: &Path) -> String {
-    p.to_string_lossy().to_lowercase()
+/// The protected folder a path sits in: what to show in a refusal, and a
+/// case-folded key that is the same for every spelling of the folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TccRoot {
+    /// The protected folder as spelled in the path (original case).
+    pub shown: PathBuf,
+    /// Lower-cased, `/System/Volumes/Data` firmlink stripped: `/users/u/desktop`,
+    /// `/users/u/library/mobile documents`, `/volumes/<name>`.
+    pub key: String,
 }
 
-/// True when `path` is, or is inside, `~/Desktop`, `~/Documents` or
-/// `~/Downloads` of any user. Lexical only: the filesystem is not consulted, so
-/// calling this never triggers a macOS privacy prompt. Case-insensitive (APFS).
-/// `home` adds the same three folders under a non-`/Users` home.
-pub fn is_tcc_path(path: &Path, home: Option<&Path>) -> bool {
-    let norm = normalize_lexical(path);
-    let comps: Vec<String> = norm
-        .components()
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
         .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
+/// Number of leading components that are the `/System/Volumes/Data` firmlink
+/// (`/System/Volumes/Data/Users/u/Desktop` is `/Users/u/Desktop`), 0 if none.
+fn firmlink_len(comps: &[String]) -> usize {
+    if comps.len() >= 4 && comps[1] == "system" && comps[2] == "volumes" && comps[3] == "data" {
+        3
+    } else {
+        0
+    }
+}
+
+/// The protected folder `path` is, or is inside, or `None`. Protected:
+///
+/// - `<home>/Desktop`, `<home>/Documents`, `<home>/Downloads`, for `/Users/<u>`
+///   and for the given `home`;
+/// - iCloud Drive, `<home>/Library/Mobile Documents` (also spelled
+///   `/Users/<u>/Library/Mobile Documents` with no `home`);
+/// - any path at or below `/Volumes/<name>` (removable and network volumes are
+///   their own macOS privacy classes; `/Volumes` itself is not protected);
+/// - the firmlink spellings of the first two, `/System/Volumes/Data/Users/...`.
+///
+/// Lexical and case-folded (APFS): the filesystem is never consulted.
+pub fn tcc_root(path: &Path, home: Option<&Path>) -> Option<TccRoot> {
+    let norm = normalize_lexical(path);
+    let orig: Vec<String> = norm
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    // ["/", "users", "<user>", "desktop", ...]
-    if comps.len() >= 4 && comps[1] == "users" && TCC_FOLDERS.contains(&comps[3].as_str()) {
-        return true;
-    }
-    if let Some(home) = home {
-        let home = normalize_lexical(home);
-        let l = norm.to_string_lossy().to_lowercase();
-        for folder in ["Desktop", "Documents", "Downloads"] {
-            let protected = lower(&home.join(folder));
-            if l == protected || l.starts_with(&format!("{protected}/")) {
-                return true;
+    let comps = lower_components(&norm);
+    let skip = firmlink_len(&comps);
+    // Components with the firmlink removed; `at(i)` maps back to `orig`.
+    let eff: Vec<&str> = std::iter::once("/")
+        .chain(comps.iter().skip(1 + skip).map(String::as_str))
+        .collect();
+    let n = eff.len();
+    let take = if n >= 3 && eff[1] == "volumes" {
+        Some(3)
+    } else if n >= 4 && eff[1] == "users" && TCC_FOLDERS.contains(&eff[3]) {
+        Some(4)
+    } else if n >= 5 && eff[1] == "users" && eff[3] == "library" && eff[4] == "mobile documents" {
+        Some(5)
+    } else if let Some(home) = home {
+        let h = lower_components(&normalize_lexical(home));
+        let hs = firmlink_len(&h);
+        let h: Vec<&str> = std::iter::once("/")
+            .chain(h.iter().skip(1 + hs).map(String::as_str))
+            .collect();
+        let hl = h.len();
+        if n > hl && eff[..hl] == h[..] {
+            if TCC_FOLDERS.contains(&eff[hl]) {
+                Some(hl + 1)
+            } else if n > hl + 1 && eff[hl] == "library" && eff[hl + 1] == "mobile documents" {
+                Some(hl + 2)
+            } else {
+                None
             }
+        } else {
+            None
         }
+    } else {
+        None
+    }?;
+    let key = if take == 1 {
+        "/".to_string()
+    } else {
+        format!("/{}", eff[1..take].join("/"))
+    };
+    let mut shown = PathBuf::from("/");
+    for part in orig.iter().skip(1).take(skip + take - 1) {
+        shown.push(part);
     }
-    false
+    Some(TccRoot { shown, key })
+}
+
+/// True when `path` is, or is inside, a macOS-protected folder (see `tcc_root`).
+/// Lexical only: the filesystem is not consulted, so calling this never
+/// triggers a macOS privacy prompt.
+pub fn is_tcc_path(path: &Path, home: Option<&Path>) -> bool {
+    tcc_root(path, home).is_some()
 }
 
 /// True when `path` is inside a temp root (`/private/tmp`, `/tmp`,
@@ -145,14 +211,33 @@ pub fn is_temp_path(path: &Path) -> bool {
 /// The error `refuse_if_protected` and `resolve_safe` return for a protected
 /// folder. Callers tell "refused" from "missing" with `is_protected_error`.
 #[derive(Debug)]
-pub struct ProtectedPath(pub PathBuf);
+pub struct ProtectedPath {
+    pub path: PathBuf,
+    /// The protected folder it sits in, as spelled in the path.
+    pub root: PathBuf,
+}
+
+impl ProtectedPath {
+    /// The refusal for `path`, which must be protected (`tcc_root` is `Some`);
+    /// the root falls back to the path itself otherwise.
+    pub fn new(path: &Path, home: Option<&Path>) -> Self {
+        let root = tcc_root(path, home)
+            .map(|r| r.shown)
+            .unwrap_or_else(|| path.to_path_buf());
+        Self {
+            path: path.to_path_buf(),
+            root,
+        }
+    }
+}
 
 impl std::fmt::Display for ProtectedPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "refusing {}: macOS-protected folder (Desktop, Documents, Downloads)",
-            self.0.display()
+            "refusing {}: macOS-protected folder {} (Desktop, Documents, Downloads, iCloud Drive, /Volumes)",
+            self.path.display(),
+            self.root.display()
         )
     }
 }
@@ -166,7 +251,7 @@ pub fn is_protected_error(err: &anyhow::Error) -> bool {
 
 fn refuse_if_protected(path: &Path, home: Option<&Path>) -> Result<()> {
     if is_tcc_path(path, home) {
-        return Err(ProtectedPath(path.to_path_buf()).into());
+        return Err(ProtectedPath::new(path, home).into());
     }
     Ok(())
 }
@@ -690,6 +775,90 @@ mod tests {
     }
 
     #[test]
+    fn volumes_icloud_drive_and_the_data_firmlink_are_protected_too() {
+        let home = Some(Path::new("/home/z"));
+        for p in [
+            "/Volumes/Backup",
+            "/Volumes/Backup/proj/src/main.rs",
+            "/VOLUMES/backup/x",
+            "/volumes/Net Share/x",
+            "/Users/nobody-here/Library/Mobile Documents",
+            "/Users/nobody-here/Library/Mobile Documents/com~apple~CloudDocs/p",
+            "/Users/nobody-here/library/mobile documents/x",
+            "/USERS/Nobody-Here/LIBRARY/MOBILE DOCUMENTS/x",
+            "/System/Volumes/Data/Users/nobody-here/Desktop",
+            "/System/Volumes/Data/Users/nobody-here/Documents/p",
+            "/System/Volumes/Data/Users/nobody-here/Downloads/p/q",
+            "/system/volumes/data/users/nobody-here/DESKTOP/x",
+            "/System/Volumes/Data/Users/nobody-here/Library/Mobile Documents/x",
+            "/System/Volumes/Data/Volumes/Backup/x",
+            "/Users/nobody-here/projects/../Library/Mobile Documents/x",
+        ] {
+            assert!(is_tcc_path(Path::new(p), None), "{p}");
+        }
+        // Under an injected (non-/Users) home.
+        for p in [
+            "/home/z/Library/Mobile Documents/x",
+            "/home/z/library/MOBILE DOCUMENTS",
+            "/System/Volumes/Data/home/z/Documents/x",
+        ] {
+            assert!(is_tcc_path(Path::new(p), home), "{p}");
+        }
+        assert!(is_tcc_path(
+            Path::new("/home/z/Documents/x"),
+            Some(Path::new("/System/Volumes/Data/home/z"))
+        ));
+        for p in [
+            "/Volumes",
+            "/Volumes/",
+            "/VolumesX/a",
+            "/Users/nobody-here/Library",
+            "/Users/nobody-here/Library/Other",
+            "/Users/nobody-here/Library/Mobile",
+            "/Users/nobody-here/Library/Mobile Documents2/x",
+            "/Users/nobody-here/projects/Library/Mobile Documents/x",
+            "/System/Volumes/Data/Users/nobody-here/projects",
+            "/System/Volumes/Data/Volumes",
+            "/System/Volumes/Preboot/x",
+            "/System/Library/x",
+        ] {
+            assert!(!is_tcc_path(Path::new(p), None), "{p}");
+        }
+        for p in ["/home/z/Library", "/home/z/Library/Other", "/home/z"] {
+            assert!(!is_tcc_path(Path::new(p), home), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_protected_root_is_named_in_original_case_with_a_folded_key() {
+        let r = tcc_root(Path::new("/Users/Nobody/Documents/p/q"), None).unwrap();
+        assert_eq!(r.shown, Path::new("/Users/Nobody/Documents"));
+        assert_eq!(r.key, "/users/nobody/documents");
+        let r = tcc_root(
+            Path::new("/System/Volumes/Data/Users/Nobody/DESKTOP/p"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            r.shown,
+            Path::new("/System/Volumes/Data/Users/Nobody/DESKTOP")
+        );
+        assert_eq!(r.key, "/users/nobody/desktop", "firmlink and plain agree");
+        let r = tcc_root(Path::new("/Volumes/Backup/a/b"), None).unwrap();
+        assert_eq!(r.shown, Path::new("/Volumes/Backup"));
+        assert_eq!(r.key, "/volumes/backup");
+        let r = tcc_root(Path::new("/Users/u/Library/Mobile Documents/x"), None).unwrap();
+        assert_eq!(r.shown, Path::new("/Users/u/Library/Mobile Documents"));
+        assert_eq!(r.key, "/users/u/library/mobile documents");
+        assert_eq!(tcc_root(Path::new("/Users/u/projects"), None), None);
+        let err = identify_with(Path::new("/Volumes/Backup/repo/src"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/Volumes/Backup"), "{err}");
+        assert!(err.contains("macOS-protected"), "{err}");
+    }
+
+    #[test]
     fn identify_refuses_a_protected_folder_before_any_filesystem_call() {
         let err = identify_with(
             Path::new("/Users/nobody-here/Desktop/repo/src/main.rs"),
@@ -752,6 +921,46 @@ mod tests {
         // The generic /Users/<u>/Desktop spelling needs no injected home.
         let err = resolve_safe(Path::new("/Users/nobody-here/Desktop/x"), None).unwrap_err();
         assert!(is_protected_error(&err), "{err:#}");
+    }
+
+    #[test]
+    fn a_symlink_chain_into_icloud_drive_or_a_volume_is_refused_without_a_stat() {
+        let fx = Fx::new();
+        // The parent `Library` exists (it is an ordinary folder); the protected
+        // `Mobile Documents` below it does not.
+        std::fs::create_dir_all(fx.home.join("Library")).unwrap();
+        // Neither target exists. If resolve_safe lstat'ed it the error would be
+        // "not found"; it must refuse on the lexical prefix first. Nothing here
+        // creates anything under the real /Volumes.
+        let icloud = fx.home.join("Library").join("Mobile Documents").join("x");
+        let vol = PathBuf::from("/Volumes/csr-rs4-no-such-volume/x");
+        for (name, target, root) in [
+            (
+                "icloud",
+                icloud,
+                fx.home.join("Library").join("Mobile Documents"),
+            ),
+            (
+                "volume",
+                vol,
+                PathBuf::from("/Volumes/csr-rs4-no-such-volume"),
+            ),
+        ] {
+            let link2 = fx.root.join(format!("{name}2"));
+            let link1 = fx.root.join(format!("{name}1"));
+            symlink(&target, &link2).unwrap();
+            symlink(&link2, &link1).unwrap();
+            let err = resolve_safe(&link1, Some(&fx.home)).unwrap_err();
+            assert!(is_protected_error(&err), "{name}: {err:#}");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&root.display().to_string()), "{name}: {msg}");
+            let err = resolve_safe(&link1.join("deeper").join("a.rs"), Some(&fx.home)).unwrap_err();
+            assert!(is_protected_error(&err), "{name}: {err:#}");
+        }
+        assert!(
+            !fx.home.join("Library").join("Mobile Documents").exists(),
+            "nothing was created"
+        );
     }
 
     #[test]
