@@ -621,6 +621,38 @@ fn symbol_table(subject: &Subject, commit: &str, bytes: &[u8]) -> Option<SymbolT
     })
 }
 
+/// `(symbol, first line, last line)`, 1-based inclusive.
+pub(crate) type LineSpan = (String, usize, usize);
+
+/// Every symbol of `bytes` with its 1-based inclusive line span, named exactly
+/// as [`symbol_table`] names them (and so as the witness ledger does), plus the
+/// file's line count. `None` under the same conditions as `symbol_table`: an
+/// unsupported language, a parse that is not clean, or a span that does not fit
+/// the file. `commit` only labels the parse. `symbol span` prints this.
+pub(crate) fn symbol_line_spans(
+    bytes: &[u8],
+    file: &str,
+    repo_root: &str,
+    project: &str,
+    commit: &str,
+) -> Option<(usize, Vec<LineSpan>)> {
+    let derived = rederive_symbol_spans(bytes, file, repo_root, project, commit, &|_| true)?;
+    let lines = split_lines(bytes).len();
+    let mut spans = Vec::with_capacity(derived.nodes.len());
+    for (node, symbol) in derived.nodes.iter().zip(&derived.symbols) {
+        let (start, end) = (node.span_start, node.span_end);
+        if start < 0 || end < start {
+            return None;
+        }
+        let (start, end) = (usize::try_from(start).ok()?, usize::try_from(end).ok()?);
+        if end >= lines {
+            return None;
+        }
+        spans.push((symbol.clone(), start + 1, end + 1));
+    }
+    Some((lines, spans))
+}
+
 /// Committer time of `commit` (full hex oid) as RFC 3339 in the committer's
 /// OWN UTC offset (`2026-09-12T22:57:11-07:00`), read from the object
 /// database. `None` when the commit cannot be read. This is when the change

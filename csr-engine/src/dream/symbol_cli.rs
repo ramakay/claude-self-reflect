@@ -19,6 +19,12 @@
 //! `oid`, `merge`, `authored`, `author`, `author_committed_at`, `summary`.
 //! Later items may ADD keys; none of these are renamed or removed. `--batch` ([`run_batch`])
 //! answers many questions in one process, one JSON object per line.
+//!
+//! `csr-engine symbol span` ([`symbol_span`]) answers a different question:
+//! where is each symbol of a file RIGHT NOW (working-tree bytes, or the blob at
+//! `--at`, or bytes handed in with `--stdin`)? `{"file","lines","symbols":{"<ledger symbol>":[start,end]}}`, 1-based
+//! inclusive, named exactly as the witness ledger names them. The companion uses
+//! it to fire a shift note only for the symbol a tool call touches.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -28,7 +34,7 @@ use codewitness::Auditor;
 use serde_json::{json, Value};
 
 use super::change_summary::{dialect_of, summarize};
-use super::receipt::{commit_time_local, ReceiptResolver, Subject, SymbolState};
+use super::receipt::{commit_time_local, symbol_line_spans, ReceiptResolver, Subject, SymbolState};
 use crate::import::backfill::{git_at, relpath_in_repo};
 use crate::process::CommandDeadline;
 
@@ -184,6 +190,57 @@ fn change_summary(
     let before = resolver.span_text_at(subject, first)?;
     let after = resolver.span_text_at(subject, author)?;
     summarize(&before, &after, dialect_of(subject.relpath))
+}
+
+/// Where each symbol of `file` is: `{"file","lines","symbols":{name:[start,end]}}`
+/// (1-based inclusive lines), read from the working tree, from the blob at
+/// commit `at` when given, or from `text` when the caller holds the bytes (a
+/// snapshot taken before a tool changed the file). Names are the witness
+/// ledger's, from the receipt module's own derivation ([`symbol_line_spans`]).
+/// An error message for an unreadable repo, file or commit, an unsupported
+/// language or a parse that is not clean: never a guess.
+pub fn symbol_span(
+    repo: &str,
+    file: &str,
+    at: Option<&str>,
+    text: Option<Vec<u8>>,
+) -> Result<Value, String> {
+    if !Path::new(repo).is_dir() {
+        return Err(format!("repo is not a directory: {repo}"));
+    }
+    let relpath = relative_file(repo, file)
+        .ok_or_else(|| format!("file is not a path inside the repo: {file}"))?;
+    let (bytes, label) = match (text, at) {
+        (Some(bytes), _) => (bytes, "snapshot".to_string()),
+        (None, None) => {
+            let bytes = std::fs::read(Path::new(repo).join(&relpath))
+                .map_err(|e| format!("cannot read {relpath}: {e}"))?;
+            (bytes, "working-tree".to_string())
+        }
+        (None, Some(rev)) => {
+            let oid = resolve_commit(repo, rev)
+                .ok_or_else(|| format!("--at is not a commit in {repo}: {rev}"))?;
+            let auditor =
+                Auditor::discover(repo).map_err(|e| format!("cannot open repo {repo}: {e}"))?;
+            let id = oid
+                .parse::<codewitness::ObjectId>()
+                .map_err(|_| format!("--at is not a commit in {repo}: {rev}"))?;
+            let bytes = auditor
+                .file_content_at(Path::new(&relpath), id)
+                .map_err(|e| format!("cannot read {relpath} at {rev}: {e}"))?;
+            (bytes, oid)
+        }
+    };
+    let absolute = Path::new(repo).join(&relpath);
+    let (lines, spans) = symbol_line_spans(&bytes, &absolute.to_string_lossy(), repo, "", &label)
+        .ok_or_else(|| {
+        format!("no symbol spans for {relpath}: unsupported language or unparseable")
+    })?;
+    let symbols: serde_json::Map<String, Value> = spans
+        .into_iter()
+        .map(|(name, start, end)| (name, json!([start, end])))
+        .collect();
+    Ok(json!({ "file": relpath, "lines": lines, "symbols": symbols }))
 }
 
 /// One line of `--batch` input.
@@ -530,6 +587,157 @@ mod tests {
         let answer = ask(tmp.path(), &commented, None).unwrap();
         assert_eq!(answer["authored"], true);
         assert!(answer["summary"].is_null(), "{answer}");
+    }
+
+    fn spans_of(answer: &Value) -> Vec<(String, u64, u64)> {
+        let mut out: Vec<_> = answer["symbols"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v[0].as_u64().unwrap(), v[1].as_u64().unwrap()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn span_repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn alpha() {\n    1;\n}\n\nstruct Holder;\n\nimpl Holder {\n    fn beta(&self) {\n        2;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.py"),
+            "def first():\n    return 1\n\n\nclass K:\n    def method(self):\n        return 2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("c.tsx"),
+            "export function Card() {\n  return <div/>\n}\n\nexport const Other = () => {\n  return 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), "plain\n").unwrap();
+        commit(dir, "c0");
+        tmp
+    }
+
+    #[test]
+    fn span_names_the_symbols_of_a_rust_python_and_tsx_file_with_one_based_lines() {
+        let tmp = span_repo();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let rs = symbol_span(&repo, "a.rs", None, None).unwrap();
+        assert_eq!(rs["file"], "a.rs");
+        assert_eq!(rs["lines"], 11);
+        let names: Vec<String> = spans_of(&rs).into_iter().map(|s| s.0).collect();
+        assert_eq!(rs["symbols"]["alpha"], json!([1, 3]), "{names:?}");
+        let beta = names.iter().find(|n| n.ends_with("beta")).unwrap();
+        assert_eq!(rs["symbols"][beta.as_str()], json!([8, 10]), "{rs}");
+
+        let py = symbol_span(&repo, "b.py", None, None).unwrap();
+        assert_eq!(py["symbols"]["first"], json!([1, 2]), "{py}");
+        assert_eq!(py["lines"], 7);
+
+        let tsx = symbol_span(&repo, "c.tsx", None, None).unwrap();
+        assert_eq!(tsx["symbols"]["Card"], json!([1, 3]), "{tsx}");
+        assert_eq!(tsx["lines"], 7);
+    }
+
+    #[test]
+    fn span_reads_the_working_tree_by_default_and_the_blob_with_at() {
+        let tmp = span_repo();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let first = run(tmp.path(), &["rev-parse", "HEAD"]);
+        // An uncommitted edit pushes `Card` down two lines.
+        std::fs::write(
+            tmp.path().join("c.tsx"),
+            "// a\n// b\nexport function Card() {\n  return <div/>\n}\n",
+        )
+        .unwrap();
+        let now = symbol_span(&repo, "c.tsx", None, None).unwrap();
+        assert_eq!(now["symbols"]["Card"], json!([3, 5]), "{now}");
+        assert_eq!(now["lines"], 5);
+        let then = symbol_span(&repo, "c.tsx", Some(&first[..10]), None).unwrap();
+        assert_eq!(then["symbols"]["Card"], json!([1, 3]), "{then}");
+        assert_eq!(then["lines"], 7);
+        // An absolute path under the repo is accepted.
+        let abs = tmp.path().join("c.tsx");
+        assert_eq!(
+            symbol_span(&repo, &abs.to_string_lossy(), None, None).unwrap()["file"],
+            "c.tsx"
+        );
+    }
+
+    #[test]
+    fn span_of_a_held_snapshot_ignores_the_file_on_disk() {
+        let tmp = span_repo();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let held = std::fs::read(tmp.path().join("c.tsx")).unwrap();
+        std::fs::write(tmp.path().join("c.tsx"), "export const Z = 1\n").unwrap();
+        let answer = symbol_span(&repo, "c.tsx", None, Some(held)).unwrap();
+        assert_eq!(answer["symbols"]["Card"], json!([1, 3]), "{answer}");
+        assert_eq!(answer["lines"], 7);
+        // The snapshot still gets its language from the path.
+        assert!(symbol_span(&repo, "notes.txt", None, Some(b"fn x() {}\n".to_vec())).is_err());
+    }
+
+    #[test]
+    fn span_is_an_error_for_what_it_cannot_read() {
+        let tmp = span_repo();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let unsupported = symbol_span(&repo, "notes.txt", None, None).unwrap_err();
+        assert!(
+            unsupported.contains("unsupported language"),
+            "{unsupported}"
+        );
+        std::fs::write(tmp.path().join("b.py"), "def broken(:\n  ]]\n").unwrap();
+        assert!(symbol_span(&repo, "b.py", None, None).is_err());
+        assert!(symbol_span(&repo, "missing.rs", None, None).is_err());
+        assert!(symbol_span(&repo, "../a.rs", None, None).is_err());
+        assert!(symbol_span(&repo, "a.rs", Some("deadbeef"), None).is_err());
+        assert!(symbol_span(&repo, "nothere.rs", Some("HEAD"), None).is_err());
+        assert!(symbol_span("/nonexistent/csr-no-repo", "a.rs", None, None).is_err());
+    }
+
+    #[test]
+    fn span_names_a_collision_the_way_the_receipt_resolver_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q", "-b", "main"]);
+        let src = "fn dup() {\n    1;\n}\n\nfn dup() {\n    2;\n}\n";
+        std::fs::write(dir.join("lib.rs"), src).unwrap();
+        let c0 = commit(dir, "c0");
+        let repo = dir.to_string_lossy().to_string();
+        let answer = symbol_span(&repo, "lib.rs", None, None).unwrap();
+        assert_eq!(answer["symbols"]["dup"], json!([1, 3]), "{answer}");
+        assert_eq!(answer["symbols"]["dup#2"], json!([5, 7]), "{answer}");
+        // The resolver reads the very same names: the bare one heads a
+        // collision group (Unknown), the `#2` one is the span-later duplicate.
+        let auditor = Auditor::discover(&repo).unwrap();
+        let abs = dir.join("lib.rs").to_string_lossy().to_string();
+        let mut resolver = ReceiptResolver::new();
+        let subject = |symbol| Subject {
+            auditor: &auditor,
+            repo_root: &repo,
+            file: &abs,
+            relpath: "lib.rs",
+            project: "",
+            symbol: Some(symbol),
+        };
+        assert_eq!(
+            resolver.state_at(&subject("dup"), &c0),
+            SymbolState::Unknown
+        );
+        assert!(matches!(
+            resolver.state_at(&subject("dup#2"), &c0),
+            SymbolState::Present(_)
+        ));
+        assert_eq!(
+            resolver.span_text_at(&subject("dup#2"), &c0).as_deref(),
+            Some("fn dup() {\n    2;\n}")
+        );
     }
 
     #[test]

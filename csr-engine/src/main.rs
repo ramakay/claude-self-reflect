@@ -546,6 +546,26 @@ enum SymbolAction {
         #[arg(long)]
         batch: bool,
     },
+    /// Where is each symbol of a file now? Prints one JSON object
+    /// `{"file","lines","symbols":{"<ledger symbol>":[start,end]}}` (1-based
+    /// inclusive lines, named as the witness ledger names them) from the
+    /// working-tree file, or from the blob at `--at`. An unsupported language or
+    /// a file that does not parse prints `{"error":...}` and exits 1.
+    Span {
+        /// Repository root
+        #[arg(long)]
+        repo: PathBuf,
+        /// File, relative to the repository root
+        #[arg(long)]
+        file: String,
+        /// Read the file as committed at this commit, not from the working tree
+        #[arg(long, conflicts_with = "stdin")]
+        at: Option<String>,
+        /// Take the file's bytes from stdin (a snapshot the caller holds);
+        /// `--file` still names the path and so the language
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1167,6 +1187,42 @@ async fn run(
             summary: true,
         };
         return match csr_engine::dream::symbol_cli::symbol_change(&request) {
+            Ok(answer) => {
+                println!("{answer}");
+                Ok(())
+            }
+            Err(message) => {
+                println!("{}", serde_json::json!({ "error": message }));
+                std::process::exit(1);
+            }
+        };
+    }
+
+    if let Some(Commands::Symbol {
+        action:
+            SymbolAction::Span {
+                ref repo,
+                ref file,
+                ref at,
+                stdin,
+            },
+    }) = args.command
+    {
+        let repo = repo.to_string_lossy();
+        let mut held = Vec::new();
+        if stdin {
+            use std::io::Read;
+            if let Err(e) = std::io::stdin().lock().read_to_end(&mut held) {
+                println!("{}", serde_json::json!({ "error": format!("stdin: {e}") }));
+                std::process::exit(1);
+            }
+        }
+        return match csr_engine::dream::symbol_cli::symbol_span(
+            &repo,
+            file,
+            at.as_deref(),
+            stdin.then_some(held),
+        ) {
             Ok(answer) => {
                 println!("{answer}");
                 Ok(())
