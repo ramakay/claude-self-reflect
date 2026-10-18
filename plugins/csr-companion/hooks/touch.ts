@@ -68,8 +68,11 @@ export function touchDigest(touch: Touch): string {
 // is replaced by one that says so.
 export function touchPayload(touch: Touch, before?: string | null): string {
   const whole = JSON.stringify(before === undefined ? touch : { ...touch, before })
-  return byteLength(whole) <= TOUCH_MAX ? whole : JSON.stringify({ tool: touch.tool, too_big: true })
+  return byteLength(whole) <= TOUCH_MAX ? whole : tooBigPayload(touch)
 }
+
+// The payload for a call the pane is not given: its input, or the file it would change, is past TOUCH_MAX.
+export const tooBigPayload = (touch: Touch): string => JSON.stringify({ tool: touch.tool, too_big: true })
 
 // What the pane answered: the notes, and how many notes (shift and rule) there would have been for any touch.
 // An answer from before `--touch` is a plain list: every note is a candidate.

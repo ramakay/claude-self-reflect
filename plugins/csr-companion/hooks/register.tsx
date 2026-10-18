@@ -5,7 +5,7 @@ import type { AgentState, CompactView, CompletionKey, CompletionDisposition, Inf
 import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, handoffRequests, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
 import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
-import { Asked, changesFile, parseAnswer, touchDigest, touchOf, touchPayload } from './touch'
+import { Asked, changesFile, parseAnswer, TOUCH_MAX, tooBigPayload, touchDigest, touchOf, touchPayload } from './touch'
 import type { Touch } from './touch'
 import { byteLength, subagentBlock } from './subagent'
 import type { Thread } from './carry'
@@ -397,16 +397,32 @@ const asked = new Asked()
 
 // Whether the pane is due for this call, and if so the file as it was before the tool ran: a tool that changes the
 // file may be done before the pane starts, so the text is read here, before `next`. The text goes to the pane with the
-// call. null: the file was not there or could not be read.
-async function claimOffer($: EngineInterface, file: string, touch: Touch): Promise<{ before?: string | null } | null> {
+// call. null: the file was not there, was not a regular file, or could not be read. The size is asked first, so a
+// file past TOUCH_MAX is never read into memory ahead of the edit: tooBig, and the pane is told `too_big` instead.
+type Due = { before?: string | null; tooBig?: boolean }
+async function claimOffer($: EngineInterface, file: string, touch: Touch): Promise<Due | null> {
   if (!asked.claim(file, touchDigest(touch))) return null
   if (!changesFile(touch)) return {}
+  const info = await $.fs.stat(file).catch(() => null)
+  if (!info || info.kind !== 'file') return { before: null }
+  if (info.size > TOUCH_MAX) return { tooBig: true }
   return { before: await $.fs.read(file).catch(() => null) }
 }
 
-async function offerFor($: EngineInterface, file: string, tag: NoteView['tag'], touch: Touch, before?: string | null): Promise<void> {
+async function offerFor(
+  $: EngineInterface,
+  file: string,
+  tag: NoteView['tag'],
+  touch: Touch,
+  before?: string | null,
+  tooBig?: boolean,
+): Promise<void> {
   const answer = parseAnswer<Note>(
-    await json<unknown>($, ['--repo', file, '--note', file, '--sid', await $.session.id(), '--touch', '-'], touchPayload(touch, before)),
+    await json<unknown>(
+      $,
+      ['--repo', file, '--note', file, '--sid', await $.session.id(), '--touch', '-'],
+      tooBig ? tooBigPayload(touch) : touchPayload(touch, before),
+    ),
   )
   if (!answer) return
   if (answer.candidates === 0) asked.silence(file)
@@ -2048,7 +2064,7 @@ export const register: Register = (on, options) => {
       if (file) {
         const touch = touchOf(e as unknown as Record<string, unknown>)
         const due = await claimOffer($, file, touch).catch(() => null)
-        if (due) void offerFor($, file, e.tool === 'Read' ? 'You should know' : 'Heads up', touch, due.before).catch(() => undefined)
+        if (due) void offerFor($, file, e.tool === 'Read' ? 'You should know' : 'Heads up', touch, due.before, due.tooBig).catch(() => undefined)
       }
     }
     // The agents: an agent's tool is alive when it begins and counted when it ends; the main loop's writes are kept

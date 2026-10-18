@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SettingsSource } from 'claude-code'
+import { TOUCH_MAX } from '../hooks/touch'
 import { BLOCK_MAX, BRIEF_HEAD, BRIEF_TAIL, byteLength, subagentBlock } from '../hooks/subagent'
 import { canAfford, facts, freshChapter, freshPace, median, owed, paceText, spacing } from '../hooks/pace'
 const rankOfRoot = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1) // as register.tsx ranks a copy
@@ -62,6 +63,8 @@ type World = {
   coach?: unknown[]
   clock?: { now: number } // moved by a test; NOW where left out
   unreadable?: string[] // files that are there but fail to read
+  dirs?: string[] // directories that exist
+  sizes?: Record<string, number> // what `fs.stat` reports for a file, where it is not the text's own size
   box?: string
   replies?: string[]
   brief?: string
@@ -123,8 +126,9 @@ function host(on: On, world: World) {
   // a repository at /repo with the guard this repository ships, unless the test says otherwise (guard: path -> words, null: none)
   const files = new Map<string, string>(Object.entries({ '/repo/.git': 'gitdir: x', [REPO_GUARD]: JSON.stringify(GUARD_JSON), ...(world.files ?? {}) }))
   for (const [path, words] of Object.entries(world.guard ?? {})) words === null ? files.delete(path) : files.set(path, words)
-  const dirs = new Set<string>()
+  const dirs = new Set<string>(world.dirs)
   const writes: string[] = []
+  const reads: string[] = [] // every file the plugin asked `fs.read` for
   const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
   on('session.start', async (_$, e) => ({ cwd: e.cwd }))
   on('command.register', async (_$, e) => ({ value: { command: e.name } }))
@@ -173,12 +177,18 @@ function host(on: On, world: World) {
     return { value: undefined }
   })
   on('fs.read', async (_$, e) => {
+    reads.push(e.path)
     if (e.path.endsWith('/csr-companion/bin/statusline.cjs')) return { value: SHIPPED } // the plugin's own copy
     if (world.unreadable?.includes(e.path)) return { deny: `EACCES: ${e.path}` }
     const text = files.get(e.path)
     return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
   })
   on('fs.exists', async (_$, e) => ({ value: files.has(e.path) || dirs.has(e.path) }))
+  on('fs.stat', async (_$, e) => {
+    const text = files.get(e.path)
+    if (text !== undefined) return { value: { kind: 'file', size: world.sizes?.[e.path] ?? byteLength(text), mtimeMs: 0, isLink: false } } as never
+    return dirs.has(e.path) ? ({ value: { kind: 'dir', size: 0, mtimeMs: 0, isLink: false } } as never) : { deny: `ENOENT: ${e.path}` }
+  })
   on('fs.write', async (_$, e) => {
     files.set(e.path, e.text)
     writes.push(e.path)
@@ -321,7 +331,7 @@ function host(on: On, world: World) {
     opened.push(e.id)
     return { value: { isPlaced: true } }
   })
-  return { runs, touches, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock, logged }
+  return { runs, reads, touches, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock, logged }
 }
 
 async function settle(done: () => boolean | Promise<boolean>) {
@@ -474,6 +484,37 @@ test('a call whose input is past 8 MB is passed as too_big, not as the megabytes
   await $.tool.call({ tool: 'Write', file_path: '/repo/big.rs', content: 'x'.repeat(9 * 1024 * 1024) } as never)
   await settle(() => seen.touches.length >= 1)
   expect(seen.touches[0]!.stdin).toBe('{"tool":"Write","too_big":true}')
+})
+
+// The size is asked before the file is read: a Write against a huge file must not load it ahead of the edit.
+test('a file past 8 MB is never read before the edit; the pane is told too_big', async ($, on) => {
+  const BIG = '/repo/src/huge.rs'
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], files: { [BIG]: 'fn huge() {}\n' }, sizes: { [BIG]: TOUCH_MAX + 1 } })
+  await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Write', file_path: BIG, content: 'small' } as never)
+  await settle(() => seen.touches.length >= 1)
+  expect(seen.touches[0]!.stdin).toBe('{"tool":"Write","too_big":true}')
+  expect(seen.reads).not.toContain(BIG)
+})
+
+test('a file at the limit is read as before; a missing file or a directory sends before: null', async ($, on) => {
+  const EDGE = '/repo/src/edge.rs'
+  const SMALL = '/repo/src/small.rs'
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], dirs: ['/repo/src'], files: { [EDGE]: 'edge\n', [SMALL]: 'small\n' }, sizes: { [EDGE]: TOUCH_MAX } })
+  await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Write', file_path: EDGE, content: 'a' } as never)
+  await $.tool.call({ tool: 'Write', file_path: SMALL, content: 'b' } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/repo/src/missing.rs', content: 'c' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/src', old_string: 'x', new_string: 'y' } as never)
+  await settle(() => seen.touches.length >= 4)
+  expect(seen.touches.map(touch => JSON.parse(touch.stdin ?? 'null'))).toEqual([
+    { tool: 'Write', content: 'a', before: 'edge\n' },
+    { tool: 'Write', content: 'b', before: 'small\n' },
+    { tool: 'Write', content: 'c', before: null },
+    { tool: 'Edit', old_string: 'x', before: null }, // a directory is not a file to snapshot
+  ])
+  expect(seen.reads).not.toContain('/repo/src/missing.rs')
+  expect(seen.reads).not.toContain('/repo/src')
 })
 
 test('a file the pane had nothing to say about is not asked again; one with notes is asked about each new call, never the same call twice', async ($, on) => {
