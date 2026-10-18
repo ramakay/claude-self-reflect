@@ -49,6 +49,9 @@ use crate::import::{ConversationChunk, CsrSuppressionStats};
 /// value is the bundled SQLite's own ceiling (`SQLITE_MAX_MMAP_SIZE`
 /// 0x7fff0000), so the first ~2 GiB of the file are mapped and the rest is
 /// read through the cache.
+/// How long a storage connection waits for another writer before SQLITE_BUSY.
+pub(crate) const DEFAULT_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 const READ_PATH_PRAGMAS: &str = "PRAGMA cache_size=-65536; PRAGMA mmap_size=2147418112;";
 
 /// SQLite storage with FTS5 for full-text search.
@@ -233,7 +236,10 @@ impl Storage {
         // an exclusive lock, and without a busy wait a concurrent first open
         // fails at once with "database is locked".
         conn.execute_batch(
-            "PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
+            &format!(
+                "PRAGMA busy_timeout={}; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;",
+                DEFAULT_BUSY_TIMEOUT.as_millis()
+            ),
         )?;
         conn.execute_batch(READ_PATH_PRAGMAS)?;
         migrations::run(&conn)?;
@@ -250,7 +256,7 @@ impl Storage {
     /// Open an existing database without running migrations or permitting writes.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         Ok(Self {
             conn: GuardedConnection {
                 inner: Mutex::new(conn),
@@ -1632,7 +1638,7 @@ impl Storage {
             return Ok(());
         };
         let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
         let tx = conn.transaction()?;
         queries::set_meta(&tx, "integrity_ok", if ok { "1" } else { "0" })?;
         queries::set_meta(

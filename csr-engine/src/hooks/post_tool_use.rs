@@ -65,7 +65,23 @@ fn enqueue_for_codemap(input: &HookInput, engine: &Engine) -> Result<()> {
     }
     engine
         .storage()
-        .with_connection(|conn| crate::codemap::enqueue(conn, path))
+        .with_connection(|conn| enqueue_best_effort(conn, path))
+}
+
+/// How long the hook waits for the write lock before it skips the enqueue.
+const ENQUEUE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One queue INSERT under a short busy timeout. The storage default is 5 s,
+/// which would stall the hook whenever the daemon holds the write lock; the
+/// enqueue is best effort, so contention means skip. The default is restored
+/// on every path, success or error.
+fn enqueue_best_effort(conn: &rusqlite::Connection, path: &Path) -> Result<()> {
+    conn.busy_timeout(ENQUEUE_BUSY_TIMEOUT)?;
+    let result = crate::codemap::enqueue(conn, path);
+    let restored = conn.busy_timeout(crate::storage::DEFAULT_BUSY_TIMEOUT);
+    result?;
+    restored?;
+    Ok(())
 }
 
 /// Conversation id for provenance: transcript filename stem, else session id.
@@ -557,6 +573,52 @@ mod tests {
         handle(&edit_input("Write", "/w/repo/src/b.rs"), &engine, cwd)
             .await
             .expect("the hook still returns Ok when the queue table is missing");
+    }
+
+    #[test]
+    fn enqueue_for_codemap_gives_up_fast_when_the_writer_lock_is_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("csr-engine.db");
+        let storage = std::sync::Arc::new(crate::storage::Storage::open(&db).unwrap());
+        let embeddings = std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap());
+        let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::search::SearchEngine::new(100),
+        ));
+        let engine = crate::engine::Engine::from_parts(
+            storage.clone(),
+            embeddings,
+            search,
+            dir.path().to_path_buf(),
+        );
+        // Another process (the daemon) holds the write lock.
+        let holder = rusqlite::Connection::open(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = enqueue_for_codemap(&edit_input("Edit", "/w/repo/src/locked.rs"), &engine);
+        let took = started.elapsed();
+        assert!(
+            outcome.is_err(),
+            "contention must surface as a skipped enqueue"
+        );
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "enqueue waited {took:?} on a held write lock"
+        );
+
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(queue_rows(&storage).is_empty(), "the skipped row is absent");
+        let timeout_ms: i64 = storage
+            .with_connection(|c| Ok(c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(
+            timeout_ms,
+            crate::storage::DEFAULT_BUSY_TIMEOUT.as_millis() as i64,
+            "the default busy timeout is restored after the failed enqueue"
+        );
+        // And a later enqueue, with the lock free, lands.
+        enqueue_for_codemap(&edit_input("Edit", "/w/repo/src/free.rs"), &engine).unwrap();
+        assert_eq!(queue_rows(&storage), vec!["/w/repo/src/free.rs"]);
     }
 
     fn test_engine() -> (
