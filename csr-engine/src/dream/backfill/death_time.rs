@@ -1293,6 +1293,83 @@ mod tests {
         assert_eq!(death.death_oid.as_deref(), Some(c1.as_str()));
     }
 
+    fn run_git(dir: &Path, args: &[&str]) -> bool {
+        let mut cmd = Command::new("git");
+        strip_git_env(&mut cmd);
+        cmd.arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args);
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[test]
+    fn a_side_branch_witness_dies_at_the_authoring_commit_not_at_the_merge() {
+        // main: c0 -> c1 (foo 1 -> 2, authors the change) -> M (merges
+        // `side`, whose only commit s1 is the witness and left foo alone).
+        // `at_oid..HEAD` walked first-parent is [c1, M]: c1 changes foo's
+        // block digest first, and M (identical to c1 for foo) never gets the
+        // chance to be reported.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        if !init_repo(&repo) {
+            return; // git unavailable in this environment -- fail-soft skip
+        }
+        let file = repo.join("a.rs");
+        std::fs::write(&file, "fn foo() {\n    1\n}\n").unwrap();
+        std::fs::write(repo.join("other.txt"), "0\n").unwrap();
+        let Some(_c0) = commit_all(&repo) else {
+            return;
+        };
+        assert!(run_git(&repo, &["checkout", "-q", "-b", "side"]));
+        std::fs::write(repo.join("other.txt"), "side\n").unwrap();
+        let Some(s1) = commit_all(&repo) else {
+            return;
+        };
+        assert!(run_git(&repo, &["checkout", "-q", "-"]));
+        std::fs::write(&file, "fn foo() {\n    2\n}\n").unwrap();
+        let Some(c1) = commit_all(&repo) else {
+            return;
+        };
+        assert!(run_git(
+            &repo,
+            &["merge", "--no-ff", "-q", "-m", "merge", "side"]
+        ));
+        let merge = git_head_oid(&repo.to_string_lossy()).unwrap();
+        assert_ne!(merge, c1, "fixture: HEAD is a merge commit");
+
+        let stamp = StampKind::Raw
+            .compute(b"fn foo() {\n    1\n}\n")
+            .as_str()
+            .to_string();
+        let conn = open();
+        let wid = seed_witness(&conn, "proj", &file, &stamp, &s1);
+        mark(&conn, wid, None, &merge);
+        let row = witness_by_id(&conn, wid).unwrap().unwrap();
+        let verdict = WitnessVerdictRow {
+            witness_id: wid,
+            verdict: VerdictKind::AnchorObsolete,
+            successor_witness_id: None,
+            receipt_oid: None,
+            observed_head_oid: merge.clone(),
+        };
+        let death = resolve_relapse_death_time(
+            &conn,
+            Some(&row),
+            &verdict,
+            &row.file,
+            &BulkFlags::default(),
+        )
+        .unwrap();
+        assert_eq!(death.provenance, Provenance::GitVerifiedWalk);
+        assert_eq!(
+            death.death_oid.as_deref(),
+            Some(c1.as_str()),
+            "merge {merge}"
+        );
+    }
+
     #[test]
     fn span_still_alive_at_head_is_not_a_git_verified_death() {
         let tmp = tempfile::tempdir().unwrap();

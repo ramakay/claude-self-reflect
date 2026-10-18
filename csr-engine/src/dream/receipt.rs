@@ -30,6 +30,17 @@
 //! git fails or outlives its deadline (killed, [`GIT_DEADLINE`]), or an
 //! `Unknown` is met first, the caller abstains.
 //!
+//! A merge is never taken as the author of a change it did not make. When the
+//! first match is a merge commit whose first-parent diff leaves the span
+//! unchanged (the span's state at the merge equals its state at `M^1`), the
+//! change arrived through the merge but was authored on the mainline side:
+//! [`ReceiptResolver::authoring_commit`] re-searches `merge-base(from, M^1)..M^1`
+//! for the first commit satisfying the same predicate, and abstains
+//! ([`Abstain::MergeNotAuthor`]) when the witness's base state is not what the
+//! merge-base held, when the walk is unbounded or meets an `Unknown`, or when
+//! no commit matches. A merge whose state differs from `M^1` changed the span
+//! itself (a conflict-style resolution) and stays the receipt.
+//!
 //! Everything is memoized for the lifetime of one [`ReceiptResolver`] (one
 //! dream run): the parsed per-file symbol map per `(repo, path, commit)`,
 //! whole-file stamps, and the commit list per `(repo, path, from, to)`.
@@ -111,6 +122,8 @@ pub(crate) struct ReceiptResolver {
     /// Parsed `symbol -> normalized span stamp` map per commit.
     symbols: HashMap<FileKey, SymbolMap>,
     commits: HashMap<CommitsKey, Option<Rc<Vec<String>>>>,
+    /// Parent oids per `(repo, commit)`; `None` when git could not say.
+    parents: HashMap<(String, String), Option<Rc<Vec<String>>>>,
     /// `git log` invocations actually run (memo misses). Observable proof a
     /// run did or did not search.
     pub searches: usize,
@@ -260,7 +273,137 @@ impl ReceiptResolver {
         }
         None
     }
+
+    /// Parent oids of `commit` (empty for a root commit), memoized. `None`
+    /// when git fails or outlives its deadline.
+    pub(crate) fn parents_of(&mut self, repo_root: &str, commit: &str) -> Option<Rc<Vec<String>>> {
+        let key = (repo_root.to_string(), commit.to_string());
+        if let Some(hit) = self.parents.get(&key) {
+            return hit.clone();
+        }
+        let mut cmd = git_at(repo_root);
+        cmd.args(["rev-list", "--parents", "-n", "1", commit]);
+        let parsed = run_with_deadline(cmd, GIT_DEADLINE).and_then(|out| {
+            let text = String::from_utf8(out).ok()?;
+            let mut fields = text.split_whitespace();
+            fields.next()?;
+            Some(Rc::new(fields.map(str::to_string).collect::<Vec<_>>()))
+        });
+        self.parents.insert(key, parsed.clone());
+        parsed
+    }
+
+    /// Whether `commit` changed the subject relative to its FIRST parent: the
+    /// span-level states differ. A root commit is compared with nothing, so it
+    /// changed the subject exactly when the subject is present. `None` when
+    /// the parents cannot be read or either state is `Unknown`.
+    pub(crate) fn changed_vs_first_parent(
+        &mut self,
+        subject: &Subject,
+        commit: &str,
+    ) -> Option<bool> {
+        let parents = self.parents_of(subject.repo_root, commit)?;
+        let now = self.state_at(subject, commit);
+        match parents.first() {
+            None => match now {
+                SymbolState::Present(_) => Some(true),
+                SymbolState::Absent => Some(false),
+                SymbolState::Unknown => None,
+            },
+            Some(first) => {
+                let before = self.state_at(subject, first);
+                if now == SymbolState::Unknown || before == SymbolState::Unknown {
+                    return None;
+                }
+                Some(now != before)
+            }
+        }
+    }
+
+    /// The single best merge base of `a` and `b`; `None` when there is none,
+    /// more than one (criss-cross), or git fails.
+    fn unique_merge_base(&self, repo_root: &str, a: &str, b: &str) -> Option<String> {
+        let mut cmd = git_at(repo_root);
+        cmd.args(["merge-base", "--all", a, b]);
+        let out = String::from_utf8(run_with_deadline(cmd, GIT_DEADLINE)?).ok()?;
+        let mut bases = out.split_whitespace();
+        let base = bases.next()?.to_string();
+        bases.next().is_none().then_some(base)
+    }
+
+    /// [`Self::first_commit_where`] that never answers with a merge which did
+    /// not author the change (see the module doc). `pre` says which state the
+    /// merge base must hold for the search to be trusted; `pred` is the same
+    /// predicate the first search used.
+    pub(crate) fn first_authoring_commit_where(
+        &mut self,
+        subject: &Subject,
+        from: &str,
+        to: &str,
+        pre: &dyn Fn(&SymbolState) -> bool,
+        pred: &dyn Fn(&SymbolState) -> bool,
+    ) -> Result<String, Abstain> {
+        let first = self
+            .first_commit_where(subject, from, to, pred)
+            .ok_or(Abstain::NoReceipt)?;
+        self.authoring_commit(subject, from, &first, pre, pred, 0)
+    }
+
+    /// The commit that authored the change `commit` carries. `commit` itself
+    /// when it is not a merge or when it changed the span relative to its
+    /// first parent; otherwise the first commit in `merge-base(from, M^1)..M^1`
+    /// satisfying `pred`, resolved again if that commit is a merge failing the
+    /// same test ([`MERGE_RULE_DEPTH`] applications at most).
+    pub(crate) fn authoring_commit(
+        &mut self,
+        subject: &Subject,
+        from: &str,
+        commit: &str,
+        pre: &dyn Fn(&SymbolState) -> bool,
+        pred: &dyn Fn(&SymbolState) -> bool,
+        depth: usize,
+    ) -> Result<String, Abstain> {
+        let parents = self
+            .parents_of(subject.repo_root, commit)
+            .ok_or(Abstain::MergeNotAuthor)?;
+        if parents.len() < 2 {
+            return Ok(commit.to_string());
+        }
+        match self.changed_vs_first_parent(subject, commit) {
+            Some(true) => return Ok(commit.to_string()),
+            Some(false) => {}
+            None => return Err(Abstain::MergeNotAuthor),
+        }
+        if depth >= MERGE_RULE_DEPTH {
+            return Err(Abstain::MergeNotAuthor);
+        }
+        let mainline = parents[0].as_str();
+        let base_commit = self
+            .unique_merge_base(subject.repo_root, from, mainline)
+            .ok_or(Abstain::MergeNotAuthor)?;
+        if !pre(&self.state_at(subject, &base_commit)) {
+            return Err(Abstain::MergeNotAuthor);
+        }
+        let commits = self
+            .commits_touching(subject.repo_root, subject.relpath, &base_commit, mainline)
+            .ok_or(Abstain::MergeNotAuthor)?;
+        for candidate in commits.iter() {
+            let state = self.state_at(subject, candidate);
+            if state == SymbolState::Unknown {
+                return Err(Abstain::MergeNotAuthor);
+            }
+            if pred(&state) {
+                return self.authoring_commit(subject, from, candidate, pre, pred, depth + 1);
+            }
+        }
+        Err(Abstain::MergeNotAuthor)
+    }
 }
+
+/// How many times the merge rule may be applied in a row (a found author that
+/// is itself a merge failing the same test is resolved again) before the
+/// search abstains.
+const MERGE_RULE_DEPTH: usize = 3;
 
 /// Leaf name of a ledger symbol: the `#N` collision suffix stripped, then
 /// everything after the last `.` or `::` container separator
@@ -500,6 +643,12 @@ pub(crate) enum Abstain {
     /// one that made the change (empty/oversized range, git failure, or an
     /// unknown state met first).
     NoReceipt,
+    /// The first matching commit is a merge whose first-parent diff leaves
+    /// the span unchanged, so it did not author the change, and the authoring
+    /// commit could not be established (the merge base does not hold the
+    /// witness's content, an unknown state or unbounded history was met, or no
+    /// commit on the mainline side matches). Never falls back to the merge.
+    MergeNotAuthor,
 }
 
 /// What the join concluded, with the commits the receipt rules need.
@@ -549,9 +698,13 @@ pub(crate) fn resolve_receipt(
             if resolver.leaf_present_at(subject, head) == Some(true) {
                 return Err(Abstain::Moved);
             }
-            let receipt = resolver
-                .first_commit_where(subject, search_from, head, &|s| *s == SymbolState::Absent)
-                .ok_or(Abstain::NoReceipt)?;
+            let receipt = resolver.first_authoring_commit_where(
+                subject,
+                search_from,
+                head,
+                &is_base,
+                &|s| *s == SymbolState::Absent,
+            )?;
             // ... or already at the commit that dropped the qualified name.
             if resolver.leaf_present_at(subject, &receipt) == Some(true) {
                 return Err(Abstain::Moved);
@@ -568,14 +721,13 @@ pub(crate) fn resolve_receipt(
             // The change is the first commit that HAS the symbol with other
             // content; a commit where it is merely absent is a deletion, not
             // the successor's content.
-            resolver
-                .first_commit_where(
-                    subject,
-                    search_from,
-                    successor_oid,
-                    &|s| matches!(s, SymbolState::Present(p) if *p != base),
-                )
-                .ok_or(Abstain::NoReceipt)
+            resolver.first_authoring_commit_where(
+                subject,
+                search_from,
+                successor_oid,
+                &is_base,
+                &|s| matches!(s, SymbolState::Present(p) if *p != base),
+            )
         }
         Claim::Reinstated {
             head,
@@ -586,9 +738,17 @@ pub(crate) fn resolve_receipt(
                 s if !is_base(&s) => return Err(Abstain::NotAtWitness),
                 _ => {}
             }
-            resolver
-                .first_commit_where(subject, negative_observed_head, head, &is_base)
-                .ok_or(Abstain::NoReceipt)
+            // The search starts at the negative observation, so the merge
+            // base must hold what the span was THEN (not the base content).
+            let observed = resolver.state_at(subject, negative_observed_head);
+            let was_observed = |s: &SymbolState| *s == observed && observed != SymbolState::Unknown;
+            resolver.first_authoring_commit_where(
+                subject,
+                negative_observed_head,
+                head,
+                &was_observed,
+                &is_base,
+            )
         }
     }
 }

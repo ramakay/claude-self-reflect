@@ -141,6 +141,7 @@ pub mod policy;
 pub(crate) mod receipt;
 pub mod report;
 pub(crate) mod strategy;
+pub mod symbol_cli;
 pub mod threads;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -234,6 +235,11 @@ pub struct DreamStats {
     /// the one that made the change (empty or oversized history range, git
     /// failure, or an unknown state met first). Never falls back to HEAD.
     pub abstained_no_receipt: usize,
+    /// A NEW conclusion was withheld because the first commit that matched is
+    /// a merge whose first-parent diff leaves the span unchanged (it did not
+    /// author the change) and the authoring commit could not be established.
+    /// Never falls back to the merge.
+    pub abstained_merge_not_author: usize,
     /// New events whose receipt is a commit found in history.
     pub receipts_found: usize,
     /// `git log` receipt-range searches actually run (memo misses). A
@@ -270,7 +276,7 @@ impl DreamStats {
              reinstated             : {}\n\
              abstained: incomparable_ancestry={}  no_successor={}  head_behind_witness={}  head_not_forward={}  no_repo={}  positional_symbol={}\n\
              receipts: found={}  searches={}\n\
-             receipt abstained: unparseable={}  not_at_witness={}  present_at_head={}  same_content={}  successor_absent={}  moved={}  no_receipt={}\n\
+             receipt abstained: unparseable={}  not_at_witness={}  present_at_head={}  same_content={}  successor_absent={}  moved={}  no_receipt={}  merge_not_author={}\n\
              events written / deduped : {} / {}\n",
             self.stamp_spans.format_text(false),
             self.anchors_considered,
@@ -294,6 +300,7 @@ impl DreamStats {
             self.abstained_successor_absent,
             self.abstained_moved,
             self.abstained_no_receipt,
+            self.abstained_merge_not_author,
             self.events_written,
             self.events_deduped,
         )
@@ -807,6 +814,9 @@ pub(crate) fn dream_join_cancellable(
                             }
                             receipt::Abstain::Moved => stats.abstained_moved += 1,
                             receipt::Abstain::NoReceipt => stats.abstained_no_receipt += 1,
+                            receipt::Abstain::MergeNotAuthor => {
+                                stats.abstained_merge_not_author += 1
+                            }
                         }
                         continue;
                     }
@@ -1053,6 +1063,17 @@ mod tests {
 
         fn checkout(&self, name: &str) {
             self.git(&["checkout", "-q", name]);
+        }
+
+        /// `git merge --no-ff` of `branch` into the current branch; `extra`
+        /// is spliced in before the branch (e.g. `-s ours`). Returns the
+        /// merge commit.
+        fn merge_no_ff(&self, branch: &str, extra: &[&str]) -> String {
+            let mut args = vec!["merge", "--no-ff", "-q", "-m", "merge"];
+            args.extend_from_slice(extra);
+            args.push(branch);
+            self.git(&args);
+            self.head()
         }
 
         fn head(&self) -> String {
@@ -2650,5 +2671,176 @@ mod tests {
         let (committed_at, headline, _) = deliver_with_committer_date("2026-09-12T10:20:30+0000");
         assert_eq!(committed_at.as_deref(), Some("2026-09-12T10:20:30+00:00"));
         assert_eq!(headline.witnessed_date, "2026-09-12");
+    }
+
+    // ---- merge receipts: a merge that left the span unchanged vs its first
+    // parent did not author the change ----
+
+    /// `foo` with a distinct top and bottom line, so two branches can edit
+    /// it without a textual conflict.
+    fn foo_two_ends(top: &str, bottom: &str) -> String {
+        format!(
+            "fn foo() {{\n    let top = {top};\n    let a = 0;\n    let b = 0;\n    let c = 0;\n    let d = 0;\n    let e = 0;\n    let f = 0;\n    let bottom = {bottom};\n}}\n"
+        )
+    }
+
+    fn only_verdict(storage: &Storage, file: &str, oid: &str) -> WitnessVerdictRow {
+        latest(storage, file, oid).expect("a verdict was written")
+    }
+
+    /// main: c0 (`foo` = 1) -> c1 (`foo` = 2, authors the change) ->
+    /// M (merges `side`, which only touched another file).
+    /// Returns (repo, s1, c1, m).
+    fn side_branch_witness_repo() -> (TestRepo, String, String, String) {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        repo.write("other.txt", "0\n");
+        let _c0 = repo.commit("c0");
+        repo.checkout_new("side");
+        repo.write("other.txt", "side\n");
+        let s1 = repo.commit("s1: side branch, lib.rs untouched");
+        repo.checkout("main");
+        repo.write("lib.rs", &foo_src("2"));
+        let c1 = repo.commit("c1: authors the change");
+        let m = repo.merge_no_ff("side", &[]);
+        (repo, s1, c1, m)
+    }
+
+    #[test]
+    fn a_merge_that_left_the_span_unchanged_is_not_the_receipt() {
+        let (repo, s1, c1, m) = side_branch_witness_repo();
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&s1, "b3:1"), (&m, "b3:2")]);
+
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.receipts_found, 1, "{stats:?}");
+        assert_eq!(stats.abstained_merge_not_author, 0, "{stats:?}");
+        let verdict = only_verdict(&storage, &file, &s1);
+        assert_eq!(verdict.verdict, VerdictKind::SupersededBy);
+        assert_eq!(
+            verdict.receipt_oid.as_deref(),
+            Some(c1.as_str()),
+            "the authoring commit, never the merge {m}"
+        );
+    }
+
+    #[test]
+    fn an_obsolete_conclusion_through_a_merge_names_the_deleting_commit() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        repo.write("other.txt", "0\n");
+        let c0 = repo.commit("c0");
+        repo.checkout_new("side");
+        repo.write("other.txt", "side\n");
+        let s1 = repo.commit("s1");
+        repo.checkout("main");
+        repo.write("lib.rs", "fn other() {}\n");
+        let c1 = repo.commit("c1: deletes foo");
+        let _m = repo.merge_no_ff("side", &[]);
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c0, "b3:1"), (&s1, "b3:1")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.obsolete, 2, "{stats:?}");
+        assert_eq!(stats.abstained_merge_not_author, 0, "{stats:?}");
+        for oid in [&c0, &s1] {
+            let verdict = only_verdict(&storage, &file, oid);
+            assert_eq!(verdict.verdict, VerdictKind::AnchorObsolete);
+            assert_eq!(verdict.receipt_oid.as_deref(), Some(c1.as_str()), "{oid}");
+        }
+    }
+
+    #[test]
+    fn a_side_branch_that_changed_the_span_itself_abstains_instead_of_guessing() {
+        // The side branch already changed `foo` before the merge, and the
+        // merge keeps mainline's version (`-s ours`): the merge is unchanged
+        // vs ^1, but the merge base does not hold the witness's content, so
+        // the mainline search cannot be trusted.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let _c0 = repo.commit("c0");
+        repo.checkout_new("side");
+        repo.write("lib.rs", &foo_src("side"));
+        let s1 = repo.commit("s1: side branch edits foo");
+        repo.checkout("main");
+        repo.write("lib.rs", &foo_src("2"));
+        let _c1 = repo.commit("c1");
+        let m = repo.merge_no_ff("side", &["-s", "ours"]);
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&s1, "b3:side"), (&m, "b3:2")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.abstained_merge_not_author, 1, "{stats:?}");
+        assert_eq!(stats.receipts_found, 0, "{stats:?}");
+        assert_eq!(stats.events_written, 0, "{stats:?}");
+        assert!(latest(&storage, &file, &s1).is_none());
+    }
+
+    #[test]
+    fn a_merge_that_changes_the_span_vs_its_first_parent_stays_the_receipt() {
+        // mainline edits foo's top, the side branch edits its bottom; the
+        // clean merge has both, so it differs from ^1 and is the receipt.
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_two_ends("1", "1"));
+        let _c0 = repo.commit("c0");
+        repo.checkout_new("side");
+        repo.write("lib.rs", &foo_two_ends("1", "2"));
+        let s1 = repo.commit("s1: bottom edited");
+        repo.checkout("main");
+        repo.write("lib.rs", &foo_two_ends("2", "1"));
+        let _c1 = repo.commit("c1: top edited");
+        let m = repo.merge_no_ff("side", &[]);
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("lib.rs")).unwrap(),
+            foo_two_ends("2", "2"),
+            "fixture: the merge combined both edits"
+        );
+
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&s1, "b3:1"), (&m, "b3:2")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.abstained_merge_not_author, 0, "{stats:?}");
+        assert_eq!(
+            only_verdict(&storage, &file, &s1).receipt_oid.as_deref(),
+            Some(m.as_str())
+        );
+    }
+
+    #[test]
+    fn linear_history_receipts_are_unchanged_by_the_merge_rule() {
+        let repo = TestRepo::new();
+        repo.write("lib.rs", &foo_src("1"));
+        let c1 = repo.commit("c1");
+        repo.write("lib.rs", &foo_src("2"));
+        let c2 = repo.commit("c2");
+        let storage = open_storage();
+        let file = repo.file_path();
+        insert_rows(&storage, &file, &[(&c1, "b3:1"), (&c2, "b3:2")]);
+        let stats = run_join(&storage, false);
+        assert_eq!(stats.superseded, 1, "{stats:?}");
+        assert_eq!(stats.abstained_merge_not_author, 0, "{stats:?}");
+        assert_eq!(
+            only_verdict(&storage, &file, &c1).receipt_oid.as_deref(),
+            Some(c2.as_str())
+        );
+    }
+
+    #[test]
+    fn merge_not_author_shows_in_the_dream_text() {
+        let stats = DreamStats {
+            abstained_merge_not_author: 7,
+            ..DreamStats::default()
+        };
+        assert!(
+            stats.format_text(false).contains("merge_not_author=7"),
+            "{}",
+            stats.format_text(false)
+        );
     }
 }

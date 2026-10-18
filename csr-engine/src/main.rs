@@ -119,6 +119,13 @@ enum Commands {
         /// File path to analyze
         path: PathBuf,
     },
+    /// Facts about a symbol's history, read straight from git (never opens
+    /// the database): `symbol change` says whether a commit authored a
+    /// change to a symbol and, for a merge that did not, which commit did.
+    Symbol {
+        #[command(subcommand)]
+        action: SymbolAction,
+    },
     /// Reaction-judge shadow mode: `status`, `run` (one scoring pass now), or
     /// `parity` (Rust packing + probabilities vs the Python fixture)
     ReactionShadow {
@@ -508,6 +515,31 @@ enum ProvenanceAction {
 /// `dream` command's flags of the same name, and clap subcommand namespaces
 /// keep the two from colliding.
 /// `mirror` subcommands. None of them loads the embedding model or the index.
+/// `symbol` subcommands. None of them opens the database or loads the
+/// embedding model or the index.
+#[derive(Subcommand, Debug)]
+enum SymbolAction {
+    /// Did `--oid` author a change to the symbol? Prints one JSON object:
+    /// `{"oid","merge","authored","author","author_committed_at"}`.
+    Change {
+        /// Repository root
+        #[arg(long)]
+        repo: PathBuf,
+        /// File, relative to the repository root
+        #[arg(long)]
+        file: String,
+        /// Ledger symbol; omit for the whole file
+        #[arg(long)]
+        symbol: Option<String>,
+        /// The commit asked about
+        #[arg(long)]
+        oid: String,
+        /// The witness's at_oid; needed to resolve the author of a merge
+        #[arg(long)]
+        from: Option<String>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum MirrorAction {
     /// One full pass: mirror new transcript bytes, seal quiet transcripts, flag
@@ -1092,6 +1124,37 @@ async fn run(
         };
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
+    }
+
+    if let Some(Commands::Symbol {
+        action:
+            SymbolAction::Change {
+                ref repo,
+                ref file,
+                ref symbol,
+                ref oid,
+                ref from,
+            },
+    }) = args.command
+    {
+        let repo = repo.to_string_lossy();
+        let request = csr_engine::dream::symbol_cli::ChangeRequest {
+            repo: &repo,
+            file,
+            symbol: symbol.as_deref(),
+            oid,
+            from: from.as_deref(),
+        };
+        return match csr_engine::dream::symbol_cli::symbol_change(&request) {
+            Ok(answer) => {
+                println!("{answer}");
+                Ok(())
+            }
+            Err(message) => {
+                println!("{}", serde_json::json!({ "error": message }));
+                std::process::exit(1);
+            }
+        };
     }
 
     if let Some(Commands::Quality { ref path }) = args.command {
