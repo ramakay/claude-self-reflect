@@ -3,11 +3,15 @@
 //!
 //! Three signals feed it:
 //!
-//! 1. **Poll** (~60 s). For every enabled repo (capped at
-//!    `CSR_CODEMAP_MAX_REPOS`), compare the live worktree listing with the stored
-//!    views and ask `view_changed` per view. A changed, added or removed view
-//!    runs `scan_repo` (which re-parses only new blobs). Discovery (which reads
-//!    `history.jsonl`) runs on its own 10-minute cadence, first at start-up.
+//! 1. **Poll** (~60 s). For every ACTIVE repo (a session signalled from it inside
+//!    `CSR_CODEMAP_ACTIVE_HOURS`, or `codemap add` / `CSR_CODEMAP_REPOS` names it;
+//!    capped at `CSR_CODEMAP_MAX_REPOS`), compare the live worktree listing with
+//!    the stored views and ask `view_changed` per view. A changed, added or removed
+//!    view runs `scan_repo` (which re-parses only new blobs). A repo with no recent
+//!    signal is IDLE: not polled, not watched, its views, blobs and defs kept, so
+//!    the next signal rescans it warm. Discovery (which resolves the signals) runs
+//!    on its own 10-minute cadence, first at start-up, and early when a cwd is seen
+//!    for the first time.
 //! 2. **Watcher.** One `notify` watcher over the roots of the stored views. A
 //!    cheap lexical filter runs in the callback; survivors are debounced (5 s of
 //!    quiet, never held longer than 30 s) and handed to `rescan_paths`, which
@@ -41,13 +45,16 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use super::discover::{discover, max_repos_from_env, tier};
+use super::discover::{
+    active_hours_from_env, discover_with, max_repos_from_env, select_repos, Selection,
+    DEFAULT_ACTIVE_HOURS, DEFAULT_MAX_REPOS,
+};
 use super::identity::{self, is_tcc_path, ViewId};
 use super::scan::{
     dir_event_rel_ok, expand_dir_events, rel_passes_caps, rescan_paths_with, scan_repo,
     view_changed, PathScanReport, ScanOpts,
 };
-use super::store::{self, StoredRepo};
+use super::store;
 use crate::extraction::repo_scan::has_code_extension;
 use crate::storage::Storage;
 
@@ -65,7 +72,7 @@ pub struct LoopOpts {
     pub debounce: Duration,
     /// A batch is flushed after this long even under constant churn.
     pub max_wait: Duration,
-    /// How often discovery re-reads `history.jsonl` and friends.
+    /// How often discovery re-resolves the session signals and registers repos.
     pub discovery: Duration,
     /// How often the hook queue is drained.
     pub queue_tick: Duration,
@@ -76,6 +83,14 @@ pub struct LoopOpts {
     /// How long a scan waits for another scanner of the same repo
     /// (`CSR_CODEMAP_LOCK_WAIT_SECS`) before it skips the repo.
     pub lock_wait: Duration,
+    /// A repo is polled and watched while its newest session signal is younger
+    /// than this many hours, or while `cli`/`env` names it
+    /// (`CSR_CODEMAP_ACTIVE_HOURS`).
+    pub active_hours: u64,
+    /// At most this many repos are polled and watched (`CSR_CODEMAP_MAX_REPOS`).
+    pub max_repos: usize,
+    /// `CSR_CODEMAP_REPOS`: `:`-separated paths mapped whatever the signals say.
+    pub env_repos: Option<String>,
     /// Start the notify watcher (tests that only need the poller turn it off).
     pub watch: bool,
     /// Scan options; `home` is overwritten with the loop's home.
@@ -93,6 +108,9 @@ impl Default for LoopOpts {
             tick: Duration::from_secs(1),
             error_backoff: Duration::from_secs(600),
             lock_wait: super::lock::DEFAULT_WAIT,
+            active_hours: DEFAULT_ACTIVE_HOURS,
+            max_repos: DEFAULT_MAX_REPOS,
+            env_repos: None,
             watch: true,
             scan: ScanOpts::default(),
         }
@@ -100,7 +118,8 @@ impl Default for LoopOpts {
 }
 
 impl LoopOpts {
-    /// Defaults, with `CSR_CODEMAP_POLL_SECS` applied and `CSR_CODEMAP_NO_WATCH=1`
+    /// Defaults, with `CSR_CODEMAP_POLL_SECS`, `CSR_CODEMAP_ACTIVE_HOURS`,
+    /// `CSR_CODEMAP_MAX_REPOS` and `CSR_CODEMAP_REPOS` applied and `CSR_CODEMAP_NO_WATCH=1`
     /// (poll and hook queue only, no file watcher: for a host where `notify`
     /// misbehaves, and for measuring the poll path alone) honoured.
     pub fn from_env() -> Self {
@@ -108,6 +127,9 @@ impl LoopOpts {
             watch: !std::env::var("CSR_CODEMAP_NO_WATCH")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             lock_wait: super::lock::wait_from_env(),
+            active_hours: active_hours_from_env(),
+            max_repos: max_repos_from_env(),
+            env_repos: std::env::var("CSR_CODEMAP_REPOS").ok(),
             ..Self::default()
         };
         if let Some(n) = std::env::var("CSR_CODEMAP_POLL_SECS")
@@ -197,21 +219,16 @@ fn acquire_heavy(sem: Option<&Arc<Semaphore>>, shutdown: &AtomicBool) -> Gate {
     }
 }
 
-/// The repos the loop works on: enabled rows, cli first, then env, code_nodes
-/// and history (newest registration first), at most `CSR_CODEMAP_MAX_REPOS`.
-fn active_repos(conn: &Connection) -> Result<Vec<StoredRepo>> {
-    let mut rows: Vec<StoredRepo> = store::list_repos(conn)?
-        .into_iter()
-        .filter(|r| r.enabled)
-        .collect();
-    rows.sort_by(|a, b| {
-        tier(&a.source)
-            .cmp(&tier(&b.source))
-            .then(b.added_at.cmp(&a.added_at))
-            .then(a.common_dir.cmp(&b.common_dir))
-    });
-    rows.truncate(max_repos_from_env());
-    Ok(rows)
+/// The repos the loop works on, and the ones it leaves alone: see
+/// `discover::select_repos`. Stored rows and signals only; no filesystem call.
+fn selection(conn: &Connection, ctx: &Ctx<'_>) -> Result<Selection> {
+    select_repos(
+        conn,
+        ctx.home,
+        super::now_secs(),
+        ctx.opts.active_hours,
+        ctx.opts.max_repos,
+    )
 }
 
 fn short_err(e: &anyhow::Error) -> String {
@@ -223,6 +240,11 @@ fn short_err(e: &anyhow::Error) -> String {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PollOutcome {
     pub repos: usize,
+    /// Enabled repos left alone: no session signal inside the active window and
+    /// not named by `cli`/`env`.
+    pub idle: usize,
+    /// Active repos past `CSR_CODEMAP_MAX_REPOS`.
+    pub over_cap: usize,
     /// Common dirs `scan_repo` ran for.
     pub scanned: Vec<String>,
     pub views_added: Vec<String>,
@@ -242,6 +264,8 @@ pub(crate) struct Poller<'a> {
     /// index, so a worktree edit made while nothing was watching (daemon down,
     /// view not yet watched) is invisible to it.
     checked: HashSet<String>,
+    /// The common dirs active at the last poll. A change re-syncs the watcher.
+    active: Option<BTreeSet<String>>,
     last_discovery: Option<Instant>,
     last_poll: Option<Instant>,
     pub discoveries: usize,
@@ -255,6 +279,7 @@ impl<'a> Poller<'a> {
             ctx,
             retry_after: HashMap::new(),
             checked: HashSet::new(),
+            active: None,
             last_discovery: None,
             last_poll: None,
             discoveries: 0,
@@ -282,8 +307,10 @@ impl<'a> Poller<'a> {
             self.last_poll = Some(now);
             let outcome = self.poll_once(now);
             self.ctx.log(&format!(
-                "poll repos={} scanned={} views_added={} views_removed={} backed_off={} errors={}",
+                "poll repos={} idle={} over_cap={} scanned={} views_added={} views_removed={} backed_off={} errors={}",
                 outcome.repos,
+                outcome.idle,
+                outcome.over_cap,
                 outcome.scanned.len(),
                 outcome.views_added.len(),
                 outcome.views_removed.len(),
@@ -299,12 +326,20 @@ impl<'a> Poller<'a> {
     pub(crate) fn discover_now(&mut self) {
         self.discoveries += 1;
         let home = self.ctx.home;
+        let opts = &self.ctx.opts;
         let res = self.storage.with_connection(|conn| {
             if !store::tables_ready(conn) {
                 return Ok((0, 0));
             }
             let before = store::list_repos(conn)?.len();
-            let candidates = discover(conn, home);
+            let candidates = discover_with(
+                conn,
+                home,
+                opts.env_repos.as_deref(),
+                opts.max_repos,
+                opts.active_hours,
+                super::now_secs(),
+            );
             for c in &candidates {
                 store::upsert_repo(
                     conn,
@@ -338,11 +373,24 @@ impl<'a> Poller<'a> {
     pub(crate) fn poll_once(&mut self, now: Instant) -> PollOutcome {
         self.polls += 1;
         let mut out = PollOutcome::default();
-        let repos = match self.storage.with_connection(|conn| {
+        // A cwd seen for the first time cannot name a repo until discovery has
+        // resolved it: run discovery now instead of up to its interval later.
+        let since = super::now_secs()
+            .saturating_sub((self.ctx.opts.active_hours as i64).saturating_mul(3600));
+        let unresolved = self
+            .storage
+            .with_connection(|conn| store::signals_unresolved(conn, since))
+            .unwrap_or(0);
+        if unresolved > 0 && self.last_discovery != Some(now) {
+            self.last_discovery = Some(now);
+            self.discover_now();
+        }
+        let ctx = self.ctx;
+        let picked = match self.storage.with_connection(|conn| {
             if !store::tables_ready(conn) {
-                return Ok(Vec::new());
+                return Ok(Selection::default());
             }
-            active_repos(conn)
+            selection(conn, ctx)
         }) {
             Ok(r) => r,
             Err(e) => {
@@ -351,6 +399,20 @@ impl<'a> Poller<'a> {
                 return out;
             }
         };
+        out.idle = picked.idle.len();
+        out.over_cap = picked.over_cap.len();
+        // A repo that went idle is checked afresh when a signal brings it back
+        // (one warm full scan), and the watcher follows the active set.
+        let now_active: BTreeSet<String> =
+            picked.active.iter().map(|r| r.common_dir.clone()).collect();
+        self.checked.retain(|c| now_active.contains(c));
+        if self.active.as_ref() != Some(&now_active) {
+            if self.active.is_some() {
+                self.ctx.roots_version.fetch_add(1, Ordering::SeqCst);
+            }
+            self.active = Some(now_active);
+        }
+        let repos = picked.active;
         out.repos = repos.len();
         for repo in repos {
             if self.ctx.stop() {
@@ -702,6 +764,7 @@ impl<'a> Pump<'a> {
     pub(crate) fn sync_roots(&mut self, now: Instant) {
         self.last_sync = Some(now);
         let home = self.ctx.home;
+        let ctx = self.ctx;
         let roots: Vec<PathBuf> = self
             .storage
             .with_connection(|conn| {
@@ -709,7 +772,7 @@ impl<'a> Pump<'a> {
                     return Ok(Vec::new());
                 }
                 let mut roots = Vec::new();
-                for r in active_repos(conn)? {
+                for r in selection(conn, ctx)?.active {
                     for v in store::stored_views(conn, Some(&r.common_dir))? {
                         roots.push(PathBuf::from(v.worktree_path));
                     }
@@ -1003,6 +1066,32 @@ mod tests {
                 })
                 .unwrap();
         }
+        /// A repo discovery registered from a session signal `age` seconds ago, as
+        /// the daemon stores it (row `signal`, signal row resolved to the repo).
+        fn signalled(&self, repo: &Path, age: i64) {
+            let common = repo.join(".git").to_string_lossy().to_string();
+            let at = crate::codemap::now_secs() - age;
+            self.conn()
+                .with_connection(|c| {
+                    store::upsert_repo(c, &common, Some(&repo.to_string_lossy()), "signal", true)?;
+                    store::signal_upsert(c, &repo.to_string_lossy(), "session_start", at)?;
+                    store::signal_resolve(c, &repo.to_string_lossy(), Some(&common), "repo")
+                })
+                .unwrap();
+        }
+        /// Move a repo's signal to `age` seconds ago (an upsert never moves it back).
+        fn set_signal_age(&self, repo: &Path, age: i64) {
+            let at = crate::codemap::now_secs() - age;
+            self.conn()
+                .with_connection(|c| {
+                    c.execute(
+                        "UPDATE codemap_signals SET last_at = ?2 WHERE cwd = ?1",
+                        rusqlite::params![repo.to_string_lossy(), at],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
         fn conn(&self) -> Storage {
             Storage::open(&self.db_path()).unwrap()
         }
@@ -1158,12 +1247,135 @@ mod tests {
 
     #[test]
     fn repos_beyond_the_cap_are_not_polled() {
-        // active_repos truncates to CSR_CODEMAP_MAX_REPOS (default 16).
+        // The selection truncates to CSR_CODEMAP_MAX_REPOS (default 16).
         let conn = crate::codemap::testutil::db();
         for i in 0..20 {
             store::upsert_repo(&conn, &format!("/x/r{i}/.git"), None, "cli", true).unwrap();
         }
-        assert_eq!(active_repos(&conn).unwrap().len(), 16);
+        let sel = select_repos(&conn, Path::new("/home/x"), 1_800_000_000, 24, 16).unwrap();
+        assert_eq!(sel.active.len(), 16);
+        assert_eq!(sel.over_cap.len(), 4);
+    }
+
+    fn counts(rig: &Rig, sql: &str) -> i64 {
+        rig.conn()
+            .with_connection(|c| Ok(c.query_row(sql, [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    }
+
+    #[test]
+    fn an_idle_repo_is_not_polled_or_watched_keeps_its_rows_and_comes_back_warm() {
+        let rig = Rig::new();
+        let a = rig.fx.init_repo("a");
+        write(&a, "a.py", &py(&["alpha_a"]));
+        rig.fx.commit_all(&a, "one");
+        let b = rig.fx.init_repo("b");
+        write(&b, "b.py", &py(&["beta_b"]));
+        rig.fx.commit_all(&b, "one");
+        rig.signalled(&a, 3600);
+        rig.signalled(&b, 3600);
+        let ctx = rig.ctx(rig.opts());
+        let mut poller = Poller::new(&ctx).unwrap();
+        let mut pump = Pump::new(&ctx).unwrap();
+
+        let o = poller.poll_once(Instant::now());
+        assert_eq!((o.repos, o.idle, o.scanned.len()), (2, 0, 2), "{o:?}");
+        pump.tick(Instant::now());
+        assert_eq!(pump.watched.len(), 2);
+        assert_eq!((rig.hits("alpha_a"), rig.hits("beta_b")), (1, 1));
+        let blobs = counts(&rig, "SELECT COUNT(*) FROM codemap_blobs");
+        let defs = counts(&rig, "SELECT COUNT(*) FROM codemap_defs");
+        let views = counts(&rig, "SELECT COUNT(*) FROM codemap_views");
+
+        // b's last signal is now two days old: idle. An edit made meanwhile is not seen.
+        rig.set_signal_age(&b, 48 * 3600);
+        write(&b, "b.py", &py(&["beta_b", "gamma_b"]));
+        let o = poller.poll_once(Instant::now());
+        assert_eq!((o.repos, o.idle, o.scanned.len()), (1, 1, 0), "{o:?}");
+        pump.tick(Instant::now());
+        assert_eq!(pump.watched.len(), 1, "the idle repo's root is unwatched");
+        assert!(pump.watched.iter().all(|p| !p.starts_with(&b)));
+        assert_eq!(rig.hits("gamma_b"), 0, "an idle repo is not rescanned");
+        assert_eq!(rig.hits("beta_b"), 1, "its defs stay answerable");
+        assert_eq!(counts(&rig, "SELECT COUNT(*) FROM codemap_blobs"), blobs);
+        assert_eq!(counts(&rig, "SELECT COUNT(*) FROM codemap_defs"), defs);
+        assert_eq!(counts(&rig, "SELECT COUNT(*) FROM codemap_views"), views);
+        let o = poller.poll_once(Instant::now());
+        assert_eq!((o.repos, o.idle, o.scanned.len()), (1, 1, 0), "stays idle");
+
+        // A new signal brings it back: one warm scan sees the edit, the watcher follows.
+        rig.set_signal_age(&b, 5);
+        let o = poller.poll_once(Instant::now());
+        assert_eq!((o.repos, o.idle), (2, 0), "{o:?}");
+        assert_eq!(
+            o.scanned,
+            vec![b.join(".git").to_string_lossy().to_string()]
+        );
+        assert_eq!(rig.hits("gamma_b"), 1);
+        pump.tick(Instant::now());
+        assert_eq!(pump.watched.len(), 2);
+    }
+
+    #[test]
+    fn a_repo_named_by_cli_is_never_idle_and_legacy_rows_are_idle_without_a_signal() {
+        let rig = Rig::new();
+        let pinned = rig.fx.init_repo("pinned");
+        write(&pinned, "p.py", &py(&["pin_fn"]));
+        rig.fx.commit_all(&pinned, "one");
+        rig.register(&pinned);
+        let legacy = rig.fx.init_repo("legacy");
+        write(&legacy, "l.py", &py(&["legacy_fn"]));
+        rig.fx.commit_all(&legacy, "one");
+        rig.conn()
+            .with_connection(|c| {
+                store::upsert_repo(
+                    c,
+                    &legacy.join(".git").to_string_lossy(),
+                    Some(&legacy.to_string_lossy()),
+                    "history",
+                    true,
+                )
+            })
+            .unwrap();
+        let ctx = rig.ctx(rig.opts());
+        let mut poller = Poller::new(&ctx).unwrap();
+        let o = poller.poll_once(Instant::now());
+        assert_eq!((o.repos, o.idle, o.scanned.len()), (1, 1, 1), "{o:?}");
+        assert_eq!((rig.hits("pin_fn"), rig.hits("legacy_fn")), (1, 0));
+    }
+
+    #[test]
+    fn a_cwd_seen_for_the_first_time_runs_discovery_ahead_of_its_interval() {
+        let rig = Rig::new();
+        let dir = rig.fx.root.join("plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        rig.conn()
+            .with_connection(|c| {
+                store::signal_upsert(
+                    c,
+                    &dir.to_string_lossy(),
+                    "session_start",
+                    crate::codemap::now_secs() - 10,
+                )
+            })
+            .unwrap();
+        let mut opts = rig.opts();
+        opts.discovery = Duration::from_secs(3600);
+        let ctx = rig.ctx(opts);
+        let mut poller = Poller::new(&ctx).unwrap();
+        let t0 = Instant::now();
+        poller.poll_once(t0);
+        assert_eq!(
+            poller.discoveries, 1,
+            "an unresolved signal triggers discovery"
+        );
+        let status = rig
+            .conn()
+            .with_connection(|c| store::list_signals(c, 0))
+            .unwrap();
+        assert!(status[0].status.is_some(), "and it is resolved: {status:?}");
+        poller.poll_once(t0 + Duration::from_secs(60));
+        assert_eq!(poller.discoveries, 1, "a resolved signal does not");
     }
 
     #[test]
@@ -1527,7 +1739,7 @@ mod tests {
         let ctx = rig.ctx(rig.opts());
         let mut poller = Poller::new(&ctx).unwrap();
         let o = poller.step(Instant::now()).unwrap();
-        assert_eq!(o.repos, 2);
+        assert_eq!(o.repos, 1, "the protected repo is not even selected");
         assert_eq!(o.scanned.len(), 1, "the protected repo is not scanned");
         let mut pump = Pump::new(&ctx).unwrap();
         pump.tick(Instant::now());

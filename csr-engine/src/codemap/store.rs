@@ -896,6 +896,39 @@ pub fn list_signals(conn: &Connection, since: i64) -> Result<Vec<StoredSignal>> 
     Ok(rows)
 }
 
+/// The latest signal time (seconds) per repo, for signals at or after `since`
+/// whose cwd the daemon resolved to a repo. Keyed by common dir.
+pub fn signal_activity(
+    conn: &Connection,
+    since: i64,
+) -> Result<std::collections::HashMap<String, i64>> {
+    if !signals_ready(conn) {
+        return Ok(Default::default());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT common_dir, MAX(last_at) FROM codemap_signals
+         WHERE status = 'repo' AND common_dir IS NOT NULL AND last_at >= ?1
+         GROUP BY common_dir",
+    )?;
+    let rows = stmt
+        .query_map(params![since], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Signals at or after `since` the daemon has not resolved yet (a cwd seen for the
+/// first time). Discovery runs ahead of its schedule when there are any.
+pub fn signals_unresolved(conn: &Connection, since: i64) -> Result<i64> {
+    if !signals_ready(conn) {
+        return Ok(0);
+    }
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM codemap_signals WHERE status IS NULL AND last_at >= ?1",
+        params![since],
+        |r| r.get(0),
+    )?)
+}
+
 /// Record what the daemon made of a signal's cwd. Writes only when the stored
 /// answer differs, so a steady state costs no write.
 pub fn signal_resolve(

@@ -32,7 +32,7 @@ use rusqlite::Connection;
 
 use super::identity::normalize_lexical;
 use super::identity::{identify_with, is_dir_safe, is_protected_error, is_tcc_path, is_temp_path};
-use super::store;
+use super::store::{self, StoredRepo};
 
 pub const DEFAULT_MAX_REPOS: usize = 16;
 pub const DEFAULT_ACTIVE_HOURS: u64 = 24;
@@ -247,6 +247,107 @@ pub(super) fn discover_impl(
     });
     out.truncate(max_repos);
     out
+}
+
+/// Sources that keep a repo active whatever its last signal: the user (or their
+/// environment) named it.
+pub(super) fn is_pinned(source: &str) -> bool {
+    matches!(source, "cli" | "env")
+}
+
+/// Cap rank of a repo that is active: pinned ones by their source, everything else
+/// (a `signal` row, or a legacy row a signal has named again) as a signal repo.
+fn live_tier(source: &str) -> u8 {
+    if is_pinned(source) {
+        tier(source)
+    } else {
+        tier("signal")
+    }
+}
+
+/// The stored repos split by whether the poller and the watcher work on them.
+#[derive(Debug, Default)]
+pub struct Selection {
+    /// Polled and watched: pinned (`cli`, `env`) or signalled inside the window,
+    /// pinned first, then the newest signal, at most `max_repos`.
+    pub active: Vec<StoredRepo>,
+    /// Enabled, not pinned, no signal inside the window: left alone. Their views,
+    /// blobs and defs stay, so the next signal rescans them warm.
+    pub idle: Vec<IdleRepo>,
+    /// Active by signal or pin, but past the cap.
+    pub over_cap: Vec<StoredRepo>,
+    /// Inside a protected folder: only a session maps these.
+    pub protected: Vec<StoredRepo>,
+    /// Repos with an in-window signal and no stored row at all (discovery's cap
+    /// kept them out): common dir and signal time.
+    pub unregistered: Vec<(String, i64)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IdleRepo {
+    pub repo: StoredRepo,
+    /// Seconds since the epoch of the repo's latest signal, if one is on record.
+    pub last_signal: Option<i64>,
+}
+
+/// Decide, from stored rows and signals only, which repos are active. No
+/// filesystem call: the protected test is lexical.
+pub fn select_repos(
+    conn: &Connection,
+    home: &Path,
+    now_secs: i64,
+    active_hours: u64,
+    max_repos: usize,
+) -> anyhow::Result<Selection> {
+    let since = now_secs.saturating_sub((active_hours as i64).saturating_mul(3600));
+    let signalled = store::signal_activity(conn, since)?;
+    let latest = store::signal_activity(conn, 0)?;
+    let all = store::list_repos(conn)?;
+    let known: std::collections::HashSet<&str> =
+        all.iter().map(|r| r.common_dir.as_str()).collect();
+    let mut unregistered: Vec<(String, i64)> = signalled
+        .iter()
+        .filter(|(c, _)| !known.contains(c.as_str()))
+        .map(|(c, t)| (c.clone(), *t))
+        .collect();
+    unregistered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut sel = Selection {
+        unregistered,
+        ..Selection::default()
+    };
+
+    let mut live: Vec<(StoredRepo, i64)> = Vec::new();
+    for r in all.iter().filter(|r| r.enabled) {
+        if is_tcc_path(Path::new(&r.common_dir), Some(home)) {
+            sel.protected.push(r.clone());
+        } else if is_pinned(&r.source) || signalled.contains_key(&r.common_dir) {
+            let at = signalled.get(&r.common_dir).copied().unwrap_or(0);
+            live.push((r.clone(), at));
+        } else {
+            sel.idle.push(IdleRepo {
+                repo: r.clone(),
+                last_signal: latest.get(&r.common_dir).copied(),
+            });
+        }
+    }
+    live.sort_by(|(a, at), (b, bt)| {
+        live_tier(&a.source)
+            .cmp(&live_tier(&b.source))
+            .then(bt.cmp(at))
+            .then(b.added_at.cmp(&a.added_at))
+            .then(a.common_dir.cmp(&b.common_dir))
+    });
+    let mut live: Vec<StoredRepo> = live.into_iter().map(|(r, _)| r).collect();
+    if live.len() > max_repos {
+        sel.over_cap = live.split_off(max_repos);
+    }
+    sel.active = live;
+    sel.idle.sort_by(|a, b| {
+        b.last_signal
+            .cmp(&a.last_signal)
+            .then(a.repo.common_dir.cmp(&b.repo.common_dir))
+    });
+    Ok(sel)
 }
 
 /// What a signal's cwd came to.
@@ -616,6 +717,90 @@ mod tests {
         std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(got.is_empty());
         assert_eq!(status_of(&conn, &cwd).0.as_deref(), Some("protected"));
+    }
+
+    fn register(conn: &Connection, common: &str, source: &str) {
+        store::upsert_repo(conn, common, None, source, true).unwrap();
+    }
+
+    fn signalled(conn: &Connection, common: &str, source: &str, at: i64) {
+        register(conn, common, source);
+        let cwd = common.trim_end_matches("/.git");
+        store::signal_upsert(conn, cwd, "session_start", at).unwrap();
+        store::signal_resolve(conn, cwd, Some(common), "repo").unwrap();
+    }
+
+    fn commons(repos: &[StoredRepo]) -> Vec<&str> {
+        repos.iter().map(|r| r.common_dir.as_str()).collect()
+    }
+
+    #[test]
+    fn selection_splits_active_idle_capped_protected_and_unregistered_repos() {
+        let conn = db();
+        let home = Path::new("/Users/nobody");
+        // Pinned repos never idle; a signal in the window activates a signal row
+        // or a legacy row; one past the window is idle; the cap orders by pin, then
+        // newest signal.
+        register(&conn, "/w/cli/.git", "cli");
+        register(&conn, "/w/env/.git", "env");
+        signalled(&conn, "/w/new/.git", "signal", NOW - H);
+        signalled(&conn, "/w/mid/.git", "history", NOW - 5 * H);
+        signalled(&conn, "/w/old/.git", "signal", NOW - 30 * H);
+        register(&conn, "/w/legacy/.git", "code_nodes");
+        register(&conn, "/Users/nobody/Documents/p/.git", "cli");
+        // A signal for a repo with no row (discovery's cap kept it out).
+        store::signal_upsert(&conn, "/w/lost", "session_start", NOW - 2 * H).unwrap();
+        store::signal_resolve(&conn, "/w/lost", Some("/w/lost/.git"), "repo").unwrap();
+
+        let sel = select_repos(&conn, home, NOW, 24, 16).unwrap();
+        assert_eq!(
+            commons(&sel.active),
+            ["/w/cli/.git", "/w/env/.git", "/w/new/.git", "/w/mid/.git"]
+        );
+        let idle: Vec<(&str, Option<i64>)> = sel
+            .idle
+            .iter()
+            .map(|i| (i.repo.common_dir.as_str(), i.last_signal))
+            .collect();
+        assert_eq!(
+            idle,
+            [
+                ("/w/old/.git", Some(NOW - 30 * H)),
+                ("/w/legacy/.git", None)
+            ]
+        );
+        assert_eq!(commons(&sel.protected), ["/Users/nobody/Documents/p/.git"]);
+        assert_eq!(
+            sel.unregistered,
+            [("/w/lost/.git".to_string(), NOW - 2 * H)]
+        );
+        assert!(sel.over_cap.is_empty());
+
+        // Cap 3: pinned first, then the newest signal; the rest are over the cap.
+        let sel = select_repos(&conn, home, NOW, 24, 3).unwrap();
+        assert_eq!(
+            commons(&sel.active),
+            ["/w/cli/.git", "/w/env/.git", "/w/new/.git"]
+        );
+        assert_eq!(commons(&sel.over_cap), ["/w/mid/.git"]);
+
+        // A 48-hour window turns the 30-hour-old repo active.
+        let sel = select_repos(&conn, home, NOW, 48, 16).unwrap();
+        assert!(commons(&sel.active).contains(&"/w/old/.git"));
+        // A disabled row is in none of the lists.
+        store::disable_repo(&conn, "/w/new/.git", None).unwrap();
+        let sel = select_repos(&conn, home, NOW, 24, 16).unwrap();
+        assert!(!commons(&sel.active).contains(&"/w/new/.git"));
+        assert!(sel.idle.iter().all(|i| i.repo.common_dir != "/w/new/.git"));
+    }
+
+    #[test]
+    fn selection_reads_no_filesystem_and_survives_a_database_without_signals() {
+        let conn = db();
+        register(&conn, "/nonexistent/x/.git", "cli");
+        conn.execute_batch("DROP TABLE codemap_signals").unwrap();
+        let sel = select_repos(&conn, Path::new("/Users/nobody"), NOW, 24, 16).unwrap();
+        assert_eq!(commons(&sel.active), ["/nonexistent/x/.git"]);
     }
 
     #[test]
