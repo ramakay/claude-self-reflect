@@ -370,7 +370,8 @@ impl<'a> Poller<'a> {
         now: Instant,
         out: &mut PollOutcome,
     ) -> Result<()> {
-        let listing = if common.is_dir() {
+        let common_ok = identity::is_dir_safe(common, Some(self.ctx.home));
+        let listing = if common_ok {
             identity::list_views_with(common, Some(self.ctx.home))?
         } else {
             identity::ViewListing::default()
@@ -408,7 +409,7 @@ impl<'a> Poller<'a> {
             Ok((added, removed, changed))
         })?;
         if !changed {
-            let status = if common.is_dir() { "ok" } else { "missing" };
+            let status = if common_ok { "ok" } else { "missing" };
             self.storage
                 .with_connection(|c| store::record_poll(c, common_str, status))?;
             return Ok(());
@@ -638,7 +639,14 @@ impl<'a> Pump<'a> {
             })
             .unwrap_or_default()
             .into_iter()
-            .filter(|p| !is_tcc_path(p, Some(home)) && p.is_dir())
+            .filter(|p| !is_tcc_path(p, Some(home)))
+            // Resolved without stat'ing a protected folder: a stored root that
+            // is now a symlink into one is dropped, not followed.
+            .filter_map(|p| {
+                identity::resolve_safe(&p, Some(home))
+                    .ok()
+                    .filter(|real| real.is_dir())
+            })
             .collect();
         if let Ok(mut shared) = self.view_roots.write() {
             if *shared != roots {

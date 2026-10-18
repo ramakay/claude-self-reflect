@@ -428,8 +428,9 @@ fn walk_untracked(view: &ViewId, common_dir: &Path, tracked: &HashSet<String>) -
         if name.is_some_and(|n| is_hard_skip_dir(n) || UNTRACKED_SKIP_DIRS.contains(&n)) {
             return false;
         }
-        // A nested repo or worktree is somebody else's view.
-        !(is_dir && entry.path().join(".git").exists())
+        // A nested repo or worktree is somebody else's view. `lstat`, so a
+        // `.git` that is a symlink is never followed.
+        !(is_dir && std::fs::symlink_metadata(entry.path().join(".git")).is_ok())
     });
     let mut out = Vec::new();
     for entry in builder.build().flatten() {
@@ -595,11 +596,12 @@ pub fn scan_repo(conn: &Connection, common_dir: &Path, opts: &ScanOpts) -> Resul
             common_dir.display()
         );
     }
-    // A repo whose common dir is gone has no views left.
-    let listing = if common_dir.is_dir() {
-        identity::list_views_with(common_dir, home.as_deref())?
-    } else {
-        identity::ViewListing::default()
+    // A repo whose common dir is gone has no views left. The check resolves
+    // symlinks itself: a link into a protected folder is refused, not stat'ed.
+    let listing = match identity::resolve_safe(common_dir, home.as_deref()) {
+        Ok(real) if real.is_dir() => identity::list_views_with(&real, home.as_deref())?,
+        Err(e) if identity::is_protected_error(&e) => return Err(e),
+        _ => identity::ViewListing::default(),
     };
     report.stale_worktrees = listing.stale;
     let live: HashSet<String> = listing
@@ -711,7 +713,7 @@ fn untracked_excluded(root: &Path, common_dir: &Path, rel: &str) -> bool {
     let mut levels: Vec<PathBuf> = vec![dir.clone()];
     for part in &parts[..parts.len() - 1] {
         dir = dir.join(part);
-        if dir.join(".git").exists() {
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
             return true;
         }
         levels.push(dir.clone());
@@ -725,16 +727,20 @@ fn untracked_excluded(root: &Path, common_dir: &Path, rel: &str) -> bool {
         .or_else(|| identity::home_dir().map(|h| h.join(".config")))
         .map(|c| c.join("git").join("ignore"));
     let mut sources: Vec<(PathBuf, PathBuf)> = Vec::new();
-    if let Some(g) = global.filter(|g| g.is_file()) {
+    // Ignore files may be symlinks (dotfile managers): follow them only through
+    // `resolve_safe`, never into a protected folder.
+    let home = identity::home_dir();
+    let home = home.as_deref();
+    if let Some(g) = global.filter(|g| identity::is_file_safe(g, home)) {
         sources.push((root.to_path_buf(), g));
     }
     let exclude = common_dir.join("info").join("exclude");
-    if exclude.is_file() {
+    if identity::is_file_safe(&exclude, home) {
         sources.push((root.to_path_buf(), exclude));
     }
     for d in &levels {
         let gi = d.join(".gitignore");
-        if gi.is_file() {
+        if identity::is_file_safe(&gi, home) {
             sources.push((d.clone(), gi));
         }
     }
@@ -791,14 +797,11 @@ pub fn rescan_paths(conn: &Connection, abs_paths: &[PathBuf]) -> Result<PathScan
             Some((v, rel.to_string()))
         };
         // Hook paths can arrive through a symlink (/tmp, /var): retry on the
-        // real parent directory.
+        // real parent directory. `resolve_safe` never stats a protected folder.
         let hit = resolve(&abs).or_else(|| {
-            let real = std::fs::canonicalize(abs.parent()?)
+            let real = identity::resolve_safe(abs.parent()?, home.as_deref())
                 .ok()?
                 .join(abs.file_name()?);
-            if is_tcc_path(&real, home.as_deref()) {
-                return None;
-            }
             resolve(&real)
         });
         let Some((v, rel)) = hit else {
@@ -849,8 +852,19 @@ fn rescan_view_paths(
             report.skipped_caps += 1;
             continue;
         }
-        let stored = store::stored_file(conn, view.id, rel)?;
         let abs = root.join(rel);
+        // A directory inside the view can be a symlink into a protected folder
+        // (the full scan never follows one, a hook path can name one): stat
+        // nothing under it.
+        if let Some(parent) = abs.parent() {
+            if identity::resolve_safe(parent, home.as_deref())
+                .is_err_and(|e| identity::is_protected_error(&e))
+            {
+                report.skipped_protected += 1;
+                continue;
+            }
+        }
+        let stored = store::stored_file(conn, view.id, rel)?;
         let st = stat_regular(&abs).filter(|s| s.size <= MAX_FILE_BYTES);
         let bytes = st.as_ref().and_then(|_| read_capped(&abs));
         let (Some(st), Some(bytes)) = (st, bytes) else {

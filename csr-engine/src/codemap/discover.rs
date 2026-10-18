@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde::Deserialize;
 
-use super::identity::{identify_with, is_tcc_path, is_temp_path, normalize_lexical};
+use super::identity::{identify_with, is_dir_safe, is_tcc_path, is_temp_path, normalize_lexical};
 use super::store;
 
 pub const DEFAULT_MAX_REPOS: usize = 16;
@@ -162,7 +162,9 @@ pub fn discover_with(
             continue;
         }
         let common = if input.is_common_dir {
-            if !path.is_dir() {
+            // Resolved without stat'ing a protected folder: a registered common
+            // dir that is now a symlink into one is dropped.
+            if !is_dir_safe(&path, home_opt) {
                 continue;
             }
             Some(path.clone())

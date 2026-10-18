@@ -9,6 +9,7 @@
 //! mode: no user config, no environment, no hooks, nothing is written.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -141,14 +142,134 @@ pub fn is_temp_path(path: &Path) -> bool {
         .any(|root| norm == Path::new(root) || norm.starts_with(root))
 }
 
+/// The error `refuse_if_protected` and `resolve_safe` return for a protected
+/// folder. Callers tell "refused" from "missing" with `is_protected_error`.
+#[derive(Debug)]
+pub struct ProtectedPath(pub PathBuf);
+
+impl std::fmt::Display for ProtectedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing {}: macOS-protected folder (Desktop, Documents, Downloads)",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for ProtectedPath {}
+
+/// True when `err` is a protected-folder refusal.
+pub fn is_protected_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ProtectedPath>().is_some()
+}
+
 fn refuse_if_protected(path: &Path, home: Option<&Path>) -> Result<()> {
     if is_tcc_path(path, home) {
-        bail!(
-            "refusing {}: macOS-protected folder (Desktop, Documents, Downloads)",
-            path.display()
-        );
+        return Err(ProtectedPath(path.to_path_buf()).into());
     }
     Ok(())
+}
+
+/// Most symbolic links `resolve_safe` follows before it gives up.
+pub const MAX_SYMLINK_HOPS: usize = 40;
+
+/// `std::fs::canonicalize` that never touches a protected folder.
+///
+/// `canonicalize` (realpath) lstat()s every component it resolves, including a
+/// symlink's target, so a link into `~/Desktop` fires the macOS privacy prompt
+/// for the binary. This resolves the path one component at a time with
+/// `symlink_metadata` + `read_link`, and runs the lexical `is_tcc_path` check on
+/// each resolved prefix BEFORE any lstat or `read_link` under it; the first
+/// protected prefix is refused (`is_protected_error`). A relative link target
+/// resolves against the already-resolved parent, `..` pops the resolved prefix
+/// (so it is correct after a symlink, unlike a lexical collapse), more than
+/// `MAX_SYMLINK_HOPS` links (a loop included) is refused, and a missing
+/// component is an `Err` (same contract as `canonicalize`).
+///
+/// `home` is compared as given: pass a real path, not one that itself goes
+/// through a symlink. A path whose lexical form is protected is refused up front,
+/// before the walk, so a `..` that would only lexically land in a protected
+/// folder is refused too (the safe direction).
+pub fn resolve_safe(path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    refuse_if_protected(&normalize_lexical(path), home)?;
+    let anchored = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut pending: Vec<OsString> = Vec::new();
+    push_components(&mut pending, &anchored);
+    let mut cur = PathBuf::from("/");
+    let mut hops = 0usize;
+    while let Some(name) = pending.pop() {
+        if name == ".." {
+            cur.pop();
+            continue;
+        }
+        let next = cur.join(&name);
+        refuse_if_protected(&next, home)?;
+        let meta = std::fs::symlink_metadata(&next)
+            .with_context(|| format!("resolve {}", next.display()))?;
+        if !meta.file_type().is_symlink() {
+            cur = next;
+            continue;
+        }
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            bail!(
+                "refusing {}: more than {MAX_SYMLINK_HOPS} symbolic links (a loop?)",
+                path.display()
+            );
+        }
+        let target =
+            std::fs::read_link(&next).with_context(|| format!("read link {}", next.display()))?;
+        if target.is_absolute() {
+            cur = PathBuf::from("/");
+        }
+        push_components(&mut pending, &target);
+    }
+    Ok(cur)
+}
+
+/// Push the components of `path` onto a stack so that popping yields them in
+/// path order. `.` and the root are dropped; `..` is kept.
+fn push_components(stack: &mut Vec<OsString>, path: &Path) {
+    for comp in path.components().rev() {
+        match comp {
+            Component::Normal(n) => stack.push(n.to_os_string()),
+            Component::ParentDir => stack.push(OsString::from("..")),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+}
+
+/// `path.is_dir()` for a path that may sit behind symlinks: false when it is
+/// missing, not a directory, or leads into a protected folder. Never stats a
+/// protected folder.
+pub fn is_dir_safe(path: &Path, home: Option<&Path>) -> bool {
+    resolve_safe(path, home).is_ok_and(|real| real.is_dir())
+}
+
+/// `path.is_file()`, with the same guarantees as `is_dir_safe`.
+pub fn is_file_safe(path: &Path, home: Option<&Path>) -> bool {
+    resolve_safe(path, home).is_ok_and(|real| real.is_file())
+}
+
+/// `std::fs::metadata` that resolves symlinks through `resolve_safe` first.
+/// Returns the resolved path with its metadata.
+fn metadata_safe(path: &Path, home: Option<&Path>) -> Result<(PathBuf, std::fs::Metadata)> {
+    let real = resolve_safe(path, home)?;
+    let meta = std::fs::metadata(&real).with_context(|| format!("stat {}", real.display()))?;
+    Ok((real, meta))
+}
+
+/// Read a text file behind possible symlinks without touching a protected folder.
+fn read_to_string_safe(path: &Path, home: Option<&Path>) -> Result<String> {
+    let real = resolve_safe(path, home)?;
+    std::fs::read_to_string(&real).with_context(|| format!("read {}", real.display()))
 }
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -173,13 +294,20 @@ pub fn identify_with(path: &Path, home: Option<&Path>) -> Result<RepoId> {
             bail!("refusing {}: that is the home directory", abs.display());
         }
     }
-    let mut dir = abs.clone();
-    while !dir.is_dir() {
-        match dir.parent() {
-            Some(p) => dir = p.to_path_buf(),
+    // The deepest existing directory at or above `abs`, resolved without
+    // stat'ing a protected folder (a symlink into one is refused, not followed).
+    let mut probe = abs.clone();
+    let mut dir = loop {
+        match resolve_safe(&probe, home) {
+            Ok(real) if real.is_dir() => break real,
+            Err(e) if is_protected_error(&e) => return Err(e),
+            _ => {}
+        }
+        match probe.parent() {
+            Some(p) => probe = p.to_path_buf(),
             None => bail!("{} does not exist", abs.display()),
         }
-    }
+    };
     loop {
         if let Some(home) = home {
             if dir == normalize_lexical(home) {
@@ -190,15 +318,21 @@ pub fn identify_with(path: &Path, home: Option<&Path>) -> Result<RepoId> {
             }
         }
         let dot_git = dir.join(".git");
-        if let Ok(meta) = std::fs::metadata(&dot_git) {
+        let found = match metadata_safe(&dot_git, home) {
+            Ok(found) => Some(found),
+            Err(e) if is_protected_error(&e) => return Err(e),
+            Err(_) => None,
+        };
+        if let Some((dot_real, meta)) = found {
             let common = if meta.is_dir() {
-                dot_git.clone()
+                dot_real
             } else {
-                common_dir_from_pointer(&dir, &dot_git, home)?
+                common_dir_from_pointer(&dir, &dot_real, home)?
             };
-            let common_dir = std::fs::canonicalize(&common)
+            let common_dir = resolve_safe(&common, home)
                 .with_context(|| format!("resolve {}", common.display()))?;
-            let worktree_root = std::fs::canonicalize(&dir)?;
+            // `dir` came out of `resolve_safe`: it is already the real path.
+            let worktree_root = dir;
             refuse_if_protected(&common_dir, home)?;
             refuse_if_protected(&worktree_root, home)?;
             return Ok(RepoId {
@@ -213,24 +347,20 @@ pub fn identify_with(path: &Path, home: Option<&Path>) -> Result<RepoId> {
     }
 }
 
-/// Read a `.git` pointer file and return the repo's common dir.
+/// Read a `.git` pointer file and return the repo's common dir. `dir` is a
+/// resolved directory; `dot_git` its resolved `.git` file.
 fn common_dir_from_pointer(dir: &Path, dot_git: &Path, home: Option<&Path>) -> Result<PathBuf> {
-    let text =
-        std::fs::read_to_string(dot_git).with_context(|| format!("read {}", dot_git.display()))?;
+    let text = read_to_string_safe(dot_git, home)?;
     let target = text
         .lines()
         .find_map(|l| l.strip_prefix("gitdir:"))
         .map(str::trim)
         .ok_or_else(|| anyhow!("{} has no gitdir: line", dot_git.display()))?;
-    let gitdir = normalize_lexical(&dir.join(target));
-    refuse_if_protected(&gitdir, home)?;
+    let gitdir = resolve_safe(&dir.join(target), home)?;
     let commondir_file = gitdir.join("commondir");
-    match std::fs::read_to_string(&commondir_file) {
-        Ok(rel) => {
-            let common = normalize_lexical(&gitdir.join(rel.trim()));
-            refuse_if_protected(&common, home)?;
-            Ok(common)
-        }
+    match read_to_string_safe(&commondir_file, home) {
+        Ok(rel) => resolve_safe(&gitdir.join(rel.trim()), home),
+        Err(e) if is_protected_error(&e) => Err(e),
         // A submodule's pointer names its own git dir, which is its common dir.
         Err(_) => Ok(gitdir),
     }
@@ -239,37 +369,111 @@ fn common_dir_from_pointer(dir: &Path, dot_git: &Path, home: Option<&Path>) -> R
 /// The git dir that holds a worktree's HEAD and index: `<root>/.git` for a
 /// normal checkout, the `gitdir:` target for a linked worktree or submodule.
 pub fn git_dir_of_worktree(root: &Path, home: Option<&Path>) -> Result<PathBuf> {
-    refuse_if_protected(root, home)?;
+    let root = resolve_safe(root, home)?;
     let dot_git = root.join(".git");
-    let meta =
-        std::fs::metadata(&dot_git).with_context(|| format!("{} has no .git", root.display()))?;
+    let (dot_real, meta) =
+        metadata_safe(&dot_git, home).with_context(|| format!("{} has no .git", root.display()))?;
     if meta.is_dir() {
-        return Ok(dot_git);
+        return Ok(dot_real);
     }
-    let text = std::fs::read_to_string(&dot_git)?;
+    let text = read_to_string_safe(&dot_real, home)?;
     let target = text
         .lines()
         .find_map(|l| l.strip_prefix("gitdir:"))
         .map(str::trim)
         .ok_or_else(|| anyhow!("{} has no gitdir: line", dot_git.display()))?;
-    let gitdir = normalize_lexical(&root.join(target));
-    refuse_if_protected(&gitdir, home)?;
-    Ok(gitdir)
+    resolve_safe(&root.join(target), home)
 }
 
 fn isolated_open_options() -> gix::open::Options {
     gix::open::Options::isolated()
 }
 
-/// Where a repo's main worktree is, or `None` for a bare repo. Never touches a
-/// protected folder.
-fn main_worktree_path(common_dir: &Path) -> Option<PathBuf> {
-    if common_dir.file_name().is_some_and(|n| n == ".git") {
-        return common_dir.parent().map(Path::to_path_buf);
+/// What `main_worktree_path` found.
+enum MainWorktree {
+    /// Bare repo, or no worktree configured, or it does not exist.
+    None,
+    /// The configured worktree is in (or leads into) a protected folder.
+    Protected,
+    Path(PathBuf),
+}
+
+/// `core.bare` and `core.worktree` from a git dir's own `config`, read with a
+/// line scanner: `gix::open` stats the configured worktree while opening (its
+/// "is this a directory" warning and its ownership check), which would hit a
+/// protected folder before this module could look at the value.
+fn read_core_config(config_path: &Path, home: Option<&Path>) -> (bool, Option<String>) {
+    let Ok(text) = read_to_string_safe(config_path, home) else {
+        return (false, None);
+    };
+    let mut in_core = false;
+    let mut bare = false;
+    let mut worktree = None;
+    for raw in text.lines() {
+        let mut line = raw.trim();
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some((section, after)) = rest.split_once(']') else {
+                continue;
+            };
+            in_core = section.trim().eq_ignore_ascii_case("core");
+            line = after.trim();
+            if line.is_empty() {
+                continue;
+            }
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = unquote_config_value(value);
+        match key.trim().to_ascii_lowercase().as_str() {
+            "bare" => bare = value.eq_ignore_ascii_case("true"),
+            "worktree" => worktree = Some(value),
+            _ => {}
+        }
     }
-    // Submodule git dirs and unusual layouts: ask git's config (core.worktree).
-    let repo = gix::open_opts(common_dir, isolated_open_options()).ok()?;
-    repo.workdir().and_then(|w| std::fs::canonicalize(w).ok())
+    (bare, worktree)
+}
+
+/// A config value without its trailing comment and surrounding quotes.
+fn unquote_config_value(raw: &str) -> String {
+    let raw = raw.trim();
+    if let Some(inner) = raw.strip_prefix('"') {
+        if let Some(end) = inner.find('"') {
+            return inner[..end].to_string();
+        }
+    }
+    let cut = raw.find([';', '#']).unwrap_or(raw.len());
+    raw[..cut].trim().to_string()
+}
+
+/// Where a repo's main worktree is. Never stats a protected folder: the
+/// configured worktree is checked lexically, then resolved with `resolve_safe`,
+/// before anything opens or stats it.
+fn main_worktree_path(common_dir: &Path, home: Option<&Path>) -> MainWorktree {
+    let candidate = if common_dir.file_name().is_some_and(|n| n == ".git") {
+        match common_dir.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return MainWorktree::None,
+        }
+    } else {
+        // Submodule git dirs and unusual layouts: `core.worktree`, relative to
+        // the git dir. No `core.worktree` (or `core.bare = true`) means no
+        // worktree, as `gix` decides for a git dir not named `.git`.
+        let (bare, worktree) = read_core_config(&common_dir.join("config"), home);
+        match worktree.filter(|_| !bare) {
+            Some(w) => common_dir.join(w),
+            None => return MainWorktree::None,
+        }
+    };
+    let candidate = normalize_lexical(&candidate);
+    match resolve_safe(&candidate, home) {
+        Ok(real) => MainWorktree::Path(real),
+        Err(e) if is_protected_error(&e) => MainWorktree::Protected,
+        Err(_) => MainWorktree::None,
+    }
 }
 
 /// The main worktree (unless the repo is bare) plus every linked worktree whose
@@ -281,13 +485,18 @@ pub fn list_views(common_dir: &Path) -> Result<ViewListing> {
 pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewListing> {
     refuse_if_protected(common_dir, home)?;
     let mut listing = ViewListing::default();
+    let common_dir = match resolve_safe(common_dir, home) {
+        Ok(real) => real,
+        Err(e) if is_protected_error(&e) => return Err(e),
+        // A common dir that is gone has no views.
+        Err(_) => return Ok(listing),
+    };
+    let common_dir = common_dir.as_path();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
-    if let Some(main) = main_worktree_path(common_dir) {
-        if is_tcc_path(&main, home) {
-            listing.stale += 1;
-        } else if main.is_dir() {
-            let main = std::fs::canonicalize(&main).unwrap_or(main);
+    match main_worktree_path(common_dir, home) {
+        MainWorktree::Protected => listing.stale += 1,
+        MainWorktree::Path(main) if main.is_dir() => {
             seen.insert(main.clone());
             listing.views.push(ViewId {
                 worktree_path: main,
@@ -295,6 +504,7 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
                 is_main: true,
             });
         }
+        MainWorktree::Path(_) | MainWorktree::None => {}
     }
 
     let linked_root = common_dir.join("worktrees");
@@ -304,10 +514,10 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
     };
     names.sort();
     for git_dir in names {
-        if !git_dir.is_dir() {
+        if !is_dir_safe(&git_dir, home) {
             continue;
         }
-        let pointer = match std::fs::read_to_string(git_dir.join("gitdir")) {
+        let pointer = match read_to_string_safe(&git_dir.join("gitdir"), home) {
             Ok(p) => PathBuf::from(p.trim()),
             Err(_) => {
                 listing.stale += 1;
@@ -318,13 +528,13 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
             listing.stale += 1;
             continue;
         };
-        // Lexical check first: a stale pointer into ~/Desktop must not be stat'ed.
-        if is_tcc_path(&wt, home) || !wt.is_dir() || !pointer.exists() {
+        // Resolve before any stat: a stale pointer into ~/Desktop, or a symlink
+        // that leads there, is counted stale and never touched.
+        let Ok(wt) = resolve_safe(&wt, home) else {
             listing.stale += 1;
             continue;
-        }
-        let wt = std::fs::canonicalize(&wt).unwrap_or(wt);
-        if is_tcc_path(&wt, home) || !seen.insert(wt.clone()) {
+        };
+        if !wt.is_dir() || resolve_safe(&pointer, home).is_err() || !seen.insert(wt.clone()) {
             listing.stale += 1;
             continue;
         }
@@ -344,7 +554,7 @@ fn open_repo(view: &ViewId) -> Result<gix::Repository> {
 
 fn file_stat(path: &Path) -> Option<(u32, u32, u64)> {
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).ok()?;
+    let (_, meta) = metadata_safe(path, home_dir().as_deref()).ok()?;
     Some((meta.mtime() as u32, meta.mtime_nsec() as u32, meta.len()))
 }
 
@@ -511,5 +721,221 @@ mod tests {
             git_blob_oid(b"hello\n"),
             "ce013625030ba8dba906f756967f9e9ca394464a"
         );
+    }
+
+    // ---- resolve_safe: fake home in a tempdir, never the real ~/Desktop -------------
+
+    use crate::codemap::testutil::{py, write, Fx};
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_symlink_chain_into_a_protected_folder_is_refused_without_a_stat() {
+        let fx = Fx::new();
+        // The target does NOT exist: if resolve_safe lstat'ed it the error would
+        // be "not found", not "protected". It must refuse first.
+        let target = fx.home.join("Desktop").join("x");
+        let link2 = fx.root.join("link2");
+        let link1 = fx.root.join("link1");
+        symlink(&target, &link2).unwrap();
+        symlink(&link2, &link1).unwrap();
+        let err = resolve_safe(&link1, Some(&fx.home)).unwrap_err();
+        assert!(is_protected_error(&err), "{err:#}");
+        let err = resolve_safe(&link1.join("deeper").join("a.rs"), Some(&fx.home)).unwrap_err();
+        assert!(is_protected_error(&err), "{err:#}");
+        // Same answer when the protected target does exist.
+        std::fs::create_dir_all(&target).unwrap();
+        let err = resolve_safe(&link1, Some(&fx.home)).unwrap_err();
+        assert!(is_protected_error(&err), "{err:#}");
+        // And the lexical-only spelling, which never reaches the filesystem.
+        let err = resolve_safe(&target, Some(&fx.home)).unwrap_err();
+        assert!(is_protected_error(&err), "{err:#}");
+        // The generic /Users/<u>/Desktop spelling needs no injected home.
+        let err = resolve_safe(Path::new("/Users/nobody-here/Desktop/x"), None).unwrap_err();
+        assert!(is_protected_error(&err), "{err:#}");
+    }
+
+    #[test]
+    fn a_chain_that_ends_outside_resolves_like_canonicalize() {
+        let fx = Fx::new();
+        let real = fx.root.join("real").join("dir");
+        std::fs::create_dir_all(&real).unwrap();
+        let link2 = fx.root.join("link2");
+        let link1 = fx.root.join("link1");
+        symlink(&real, &link2).unwrap();
+        symlink(&link2, &link1).unwrap();
+        let got = resolve_safe(&link1, Some(&fx.home)).unwrap();
+        assert_eq!(got, std::fs::canonicalize(&link1).unwrap());
+        assert_eq!(got, real);
+        // A file below the chain, and a path that is already real.
+        write(&real, "a.rs", "fn a() {}\n");
+        assert_eq!(
+            resolve_safe(&link1.join("a.rs"), Some(&fx.home)).unwrap(),
+            real.join("a.rs")
+        );
+        assert_eq!(resolve_safe(&real, Some(&fx.home)).unwrap(), real);
+        // A relative path is anchored at the current directory, like canonicalize.
+        assert_eq!(
+            resolve_safe(Path::new("."), None).unwrap(),
+            std::fs::canonicalize(".").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_symlink_loop_and_more_than_forty_hops_are_refused() {
+        let fx = Fx::new();
+        let a = fx.root.join("a");
+        let b = fx.root.join("b");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+        let err = resolve_safe(&a, Some(&fx.home)).unwrap_err();
+        assert!(!is_protected_error(&err));
+        assert!(format!("{err:#}").contains("symbolic links"), "{err:#}");
+
+        // A chain l1 -> l2 -> ... -> lN -> dir. Exactly 40 links resolve; 41 do not.
+        let chain = |n: usize, tag: &str| -> PathBuf {
+            let dir = fx.root.join(format!("end-{tag}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let name = |i: usize| fx.root.join(format!("{tag}-{i}"));
+            symlink(&dir, name(n)).unwrap();
+            for i in (1..n).rev() {
+                symlink(name(i + 1), name(i)).unwrap();
+            }
+            name(1)
+        };
+        let ok = chain(MAX_SYMLINK_HOPS, "ok");
+        assert_eq!(
+            resolve_safe(&ok, Some(&fx.home)).unwrap(),
+            fx.root.join("end-ok")
+        );
+        let too_long = chain(MAX_SYMLINK_HOPS + 1, "long");
+        let err = resolve_safe(&too_long, Some(&fx.home)).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic links"), "{err:#}");
+    }
+
+    #[test]
+    fn relative_targets_and_dot_dot_resolve_against_the_resolved_prefix() {
+        let fx = Fx::new();
+        let r = &fx.root;
+        std::fs::create_dir_all(r.join("d1/real/inner")).unwrap();
+        std::fs::create_dir_all(r.join("d2")).unwrap();
+        // d1/link -> real (relative); d2/up -> ../d1/real; l3 -> d1/real/inner/../inner
+        symlink("real", r.join("d1/link")).unwrap();
+        symlink("../d1/real", r.join("d2/up")).unwrap();
+        symlink("d1/real/inner/../inner", r.join("l3")).unwrap();
+        let h = Some(fx.home.as_path());
+        for (given, want) in [
+            (r.join("d1/link"), r.join("d1/real")),
+            (r.join("d2/up/inner"), r.join("d1/real/inner")),
+            (r.join("l3"), r.join("d1/real/inner")),
+            // `..` after a symlink pops the RESOLVED prefix (d1/real -> d1), as
+            // canonicalize does; a lexical collapse would give d1.
+            (r.join("d2/up/.."), r.join("d1")),
+            (r.join("d1/link/inner/../.."), r.join("d1")),
+        ] {
+            let got = resolve_safe(&given, h).unwrap();
+            assert_eq!(got, want, "{}", given.display());
+            assert_eq!(got, std::fs::canonicalize(&given).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_missing_component_is_an_error_not_a_protected_refusal() {
+        let fx = Fx::new();
+        let err = resolve_safe(&fx.root.join("nope").join("x"), Some(&fx.home)).unwrap_err();
+        assert!(!is_protected_error(&err), "{err:#}");
+        // A dangling link is missing too.
+        symlink(fx.root.join("absent"), fx.root.join("dangling")).unwrap();
+        let err = resolve_safe(&fx.root.join("dangling"), Some(&fx.home)).unwrap_err();
+        assert!(!is_protected_error(&err), "{err:#}");
+        assert!(!is_dir_safe(&fx.root.join("dangling"), Some(&fx.home)));
+    }
+
+    #[test]
+    fn identify_refuses_a_symlink_into_a_protected_folder() {
+        let fx = Fx::new();
+        let target = fx.home.join("Documents").join("proj");
+        symlink(&target, fx.root.join("lk")).unwrap();
+        let err = identify_with(&fx.root.join("lk").join("src"), Some(&fx.home)).unwrap_err();
+        assert!(is_protected_error(&err), "{err:#}");
+    }
+
+    #[test]
+    fn a_linked_worktree_pointer_that_is_a_symlink_into_a_protected_folder_is_stale() {
+        let fx = Fx::new();
+        let main = fx.init_repo("a");
+        write(&main, "a.py", &py(&["alpha"]));
+        fx.commit_all(&main, "init");
+        let wt = fx.add_worktree(&main, &fx.root.join("a-wt"), "feat");
+        let ok = list_views_with(&main.join(".git"), Some(&fx.home)).unwrap();
+        assert_eq!((ok.views.len(), ok.stale), (2, 0));
+
+        // The worktree "moved" to a path that is a symlink into the fake Desktop.
+        // The Desktop target is absent on purpose: nothing may stat it.
+        std::fs::remove_dir_all(&wt).unwrap();
+        let ptr = fx.root.join("ptr");
+        symlink(fx.home.join("Desktop").join("proj"), &ptr).unwrap();
+        let admin = main.join(".git/worktrees");
+        let name = std::fs::read_dir(&admin)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(name.join("gitdir"), format!("{}/.git\n", ptr.display())).unwrap();
+
+        let listing = list_views_with(&main.join(".git"), Some(&fx.home)).unwrap();
+        assert_eq!(listing.stale, 1, "counted stale");
+        assert_eq!(listing.views.len(), 1, "and not listed");
+        assert_eq!(listing.views[0].worktree_path, main);
+    }
+
+    #[test]
+    fn a_submodule_style_git_dir_is_checked_before_its_worktree_is_opened() {
+        let fx = Fx::new();
+        let home = Some(fx.home.as_path());
+        // core.worktree names a protected folder (absolute, then via a symlink).
+        let gd = fx.root.join("modules").join("sub");
+        std::fs::create_dir_all(&gd).unwrap();
+        let desk = fx.home.join("Desktop").join("sub");
+        std::fs::write(
+            gd.join("config"),
+            format!("[core]\n\tbare = false\n\tworktree = {}\n", desk.display()),
+        )
+        .unwrap();
+        let listing = list_views_with(&gd, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (0, 1));
+        symlink(&desk, fx.root.join("deskl")).unwrap();
+        std::fs::write(
+            gd.join("config"),
+            format!("[core]\nworktree = {}\n", fx.root.join("deskl").display()),
+        )
+        .unwrap();
+        let listing = list_views_with(&gd, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (0, 1));
+
+        // A relative worktree outside protected folders is listed as the main view.
+        let real = fx.root.join("checkout");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(
+            gd.join("config"),
+            "[core]\n\tworktree = ../../checkout # the work tree\n",
+        )
+        .unwrap();
+        let listing = list_views_with(&gd, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (1, 0));
+        assert_eq!(listing.views[0].worktree_path, real);
+        assert!(listing.views[0].is_main);
+
+        // No core.worktree, or core.bare = true: no main view, nothing stale.
+        std::fs::write(
+            gd.join("config"),
+            "[core]\n\tbare = true\n\tworktree = ../../checkout\n",
+        )
+        .unwrap();
+        let listing = list_views_with(&gd, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (0, 0));
+        std::fs::write(gd.join("config"), "[remote \"o\"]\n\tworktree = /x\n").unwrap();
+        let listing = list_views_with(&gd, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (0, 0));
     }
 }
