@@ -29,6 +29,12 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
 
     // Track code evolution for Edit/Write/MultiEdit operations (v9)
     if is_acted_on_tool(input.tool_name.as_deref()) {
+        // Code map freshness: enqueue only, the daemon does the work. One
+        // INSERT, no parse, no git; a failure (missing table, locked db) is
+        // logged and never reaches Claude Code.
+        if let Err(e) = enqueue_for_codemap(input, engine) {
+            eprintln!("CSR: code map enqueue error (non-fatal): {}", e);
+        }
         if let Err(e) = track_code_evolution(input, engine).await {
             eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
         }
@@ -40,6 +46,26 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     }
 
     Ok(())
+}
+
+/// Queue the edited file for the code map's partial rescan. Skipped when the
+/// code map is off, the path is relative, not a code file, or protected.
+fn enqueue_for_codemap(input: &HookInput, engine: &Engine) -> Result<()> {
+    let Some(file_path) = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.get("file_path"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let path = Path::new(file_path);
+    if !crate::codemap::should_enqueue(path, crate::codemap::identity::home_dir().as_deref()) {
+        return Ok(());
+    }
+    engine
+        .storage()
+        .with_connection(|conn| crate::codemap::enqueue(conn, path))
 }
 
 /// Conversation id for provenance: transcript filename stem, else session id.
@@ -451,6 +477,86 @@ mod tests {
         let project = resolve_project_for_hook_with(parent, None, None);
         assert_eq!(project, "my-repo");
         assert!(!project.is_empty());
+    }
+
+    fn queue_rows(storage: &crate::storage::Storage) -> Vec<String> {
+        storage
+            .with_connection(crate::codemap::store::queue_read)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    fn edit_input(tool: &str, file_path: &str) -> crate::hooks::HookInput {
+        crate::hooks::HookInput {
+            tool_name: Some(tool.into()),
+            tool_input: Some(serde_json::json!({ "file_path": file_path })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn enqueue_for_codemap_queues_an_absolute_code_path_for_edit_write_and_multiedit() {
+        let (engine, storage) = test_engine();
+        for (i, tool) in ["Edit", "Write", "MultiEdit"].iter().enumerate() {
+            let p = format!("/w/repo/src/f{i}.rs");
+            enqueue_for_codemap(&edit_input(tool, &p), &engine).unwrap();
+        }
+        let mut rows = queue_rows(&storage);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                "/w/repo/src/f0.rs",
+                "/w/repo/src/f1.rs",
+                "/w/repo/src/f2.rs"
+            ]
+        );
+        // The same file twice stays one row.
+        enqueue_for_codemap(&edit_input("Edit", "/w/repo/src/f0.rs"), &engine).unwrap();
+        assert_eq!(queue_rows(&storage).len(), 3);
+    }
+
+    #[test]
+    fn enqueue_for_codemap_skips_markdown_relative_and_protected_paths() {
+        let (engine, storage) = test_engine();
+        for p in [
+            "/w/repo/README.md",
+            "/w/repo/notes.txt",
+            "relative/a.rs",
+            "/Users/nobody/Desktop/proj/a.rs",
+            "/Users/nobody/Documents/proj/a.py",
+            "/Users/nobody/Downloads/a.ts",
+        ] {
+            enqueue_for_codemap(&edit_input("Write", p), &engine).unwrap();
+        }
+        assert!(queue_rows(&storage).is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_enqueues_for_write_but_not_for_read_and_survives_a_missing_table() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path();
+        handle(&edit_input("Read", "/w/repo/src/a.rs"), &engine, cwd)
+            .await
+            .unwrap();
+        assert!(queue_rows(&storage).is_empty(), "Read is not an edit");
+        handle(&edit_input("Write", "/w/repo/src/a.rs"), &engine, cwd)
+            .await
+            .unwrap();
+        assert_eq!(queue_rows(&storage), vec!["/w/repo/src/a.rs"]);
+
+        storage
+            .with_connection(|c| {
+                c.execute_batch("DROP TABLE codemap_queue")?;
+                Ok(())
+            })
+            .unwrap();
+        handle(&edit_input("Write", "/w/repo/src/b.rs"), &engine, cwd)
+            .await
+            .expect("the hook still returns Ok when the queue table is missing");
     }
 
     fn test_engine() -> (

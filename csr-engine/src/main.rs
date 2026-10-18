@@ -550,6 +550,12 @@ enum CodemapAction {
         #[arg(long)]
         json: bool,
     },
+    /// Run the daemon's freshness loop (poll, file watcher, hook queue) in the foreground and log each action
+    Watch {
+        /// Stop after this many seconds (default: run until interrupted)
+        #[arg(long = "for", value_name = "SECS")]
+        for_secs: Option<u64>,
+    },
     /// Find a definition by name, signature or path; shows which worktrees hold the same blob
     Query {
         text: String,
@@ -1288,6 +1294,7 @@ async fn run(
                 cli::scan(&args.db_path, repo.as_deref(), *all, *json)
             }
             CodemapAction::Status { json } => cli::status(&args.db_path, *json),
+            CodemapAction::Watch { for_secs } => cli::watch(&args.db_path, *for_secs),
             CodemapAction::Query { text, json, limit } => {
                 cli::query(&args.db_path, text, *json, *limit)
             }

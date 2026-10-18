@@ -779,3 +779,46 @@ pub fn record_poll(conn: &Connection, common_dir: &str, status: &str) -> Result<
     )?;
     Ok(())
 }
+
+// ---- queue ----------------------------------------------------------------
+
+/// Queue one absolute path for a partial rescan. `at` is nanoseconds since the
+/// epoch. Enqueueing a path that is already queued strictly raises its
+/// `enqueued_at`, even on an equal clock reading, so a drain that deletes "rows
+/// at or below the value I read" can never delete a later re-enqueue.
+pub fn queue_push(conn: &Connection, path: &str, at: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO codemap_queue (path, enqueued_at) VALUES (?1, ?2)
+         ON CONFLICT(path) DO UPDATE SET
+            enqueued_at = MAX(excluded.enqueued_at, codemap_queue.enqueued_at + 1)",
+        params![path, at],
+    )?;
+    Ok(())
+}
+
+/// Every queued (path, enqueued_at), oldest first.
+pub fn queue_read(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT path, enqueued_at FROM codemap_queue ORDER BY enqueued_at")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Delete a queued path only if it has not been re-enqueued since `at` was read.
+pub fn queue_delete_upto(conn: &Connection, path: &str, at: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM codemap_queue WHERE path = ?1 AND enqueued_at <= ?2",
+        params![path, at],
+    )?)
+}
+
+/// Drop rows enqueued before `cutoff` (nanoseconds): a path whose rescan keeps
+/// failing must not stay queued for ever.
+pub fn queue_gc(conn: &Connection, cutoff: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM codemap_queue WHERE enqueued_at < ?1",
+        params![cutoff],
+    )?)
+}

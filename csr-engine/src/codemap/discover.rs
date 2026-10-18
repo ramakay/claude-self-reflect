@@ -39,7 +39,7 @@ pub struct Candidate {
     pub recent_ts: i64,
 }
 
-fn tier(source: &str) -> u8 {
+pub(super) fn tier(source: &str) -> u8 {
     match source {
         "cli" => 0,
         "env" => 1,
@@ -61,13 +61,19 @@ fn static_source(source: &str) -> &'static str {
 /// `CSR_CODEMAP_MAX_REPOS` from the environment.
 pub fn discover(conn: &Connection, home: &Path) -> Vec<Candidate> {
     let env_repos = std::env::var("CSR_CODEMAP_REPOS").ok();
-    let max = std::env::var("CSR_CODEMAP_MAX_REPOS")
+    let max = max_repos_from_env();
+    let now_ms = super::now_secs() * 1000;
+    discover_with(conn, home, env_repos.as_deref(), max, now_ms)
+}
+
+/// `CSR_CODEMAP_MAX_REPOS`, default 16. The freshness loop caps what it polls
+/// with the same number.
+pub fn max_repos_from_env() -> usize {
+    std::env::var("CSR_CODEMAP_MAX_REPOS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_REPOS);
-    let now_ms = super::now_secs() * 1000;
-    discover_with(conn, home, env_repos.as_deref(), max, now_ms)
+        .unwrap_or(DEFAULT_MAX_REPOS)
 }
 
 struct Input {

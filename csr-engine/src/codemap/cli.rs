@@ -1,9 +1,9 @@
-//! `csr-engine codemap ...`: add, remove, scan, status, query.
+//! `csr-engine codemap ...`: add, remove, scan, status, query, watch.
 //!
 //! The handlers print to stdout and return `Ok(())` unless the request itself is
 //! wrong. `add`, `remove` and `scan` open the database read-write; `status` and
 //! `query` open it read-only and say "code map not initialised" when the tables
-//! are missing.
+//! are missing. `watch` runs the daemon's freshness loop in the foreground.
 
 use std::path::Path;
 
@@ -279,5 +279,47 @@ pub fn query(db_path: &Path, text: &str, json: bool, limit: usize) -> Result<()>
             println!("{}", h.render());
         }
     }
+    Ok(())
+}
+
+fn stamp() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}.{:03}", d.as_secs(), d.subsec_millis())
+}
+
+/// `codemap watch [--for SECS]`: the daemon's poll + watcher + queue-drain loop
+/// in the foreground against `--db-path`, one timestamped line (epoch seconds)
+/// per action. Runs until Ctrl-C, or for SECS seconds.
+pub fn watch(db_path: &Path, for_secs: Option<u64>) -> Result<()> {
+    if super::disabled() {
+        println!("{}", disabled_notice());
+        return Ok(());
+    }
+    let home = home_dir().context("HOME is not set")?;
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(secs) = for_secs {
+        let flag = shutdown.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    let opts = super::fresh::LoopOpts::from_env();
+    println!(
+        "{} watch start db={} poll={}s debounce={}s",
+        stamp(),
+        db_path.display(),
+        opts.poll.as_secs(),
+        opts.debounce.as_secs()
+    );
+    super::fresh::run_loop(db_path, &home, shutdown, opts, None, |msg| {
+        println!("{} {msg}", stamp());
+    });
+    println!("{} watch stop", stamp());
     Ok(())
 }

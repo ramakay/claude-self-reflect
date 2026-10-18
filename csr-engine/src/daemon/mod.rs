@@ -674,6 +674,46 @@ impl Daemon {
             "transcript mirror loop started (projects dir → <data_dir>/mirror/transcripts)"
         );
 
+        // Code map freshness loop: poll every repo's worktrees (~60 s), watch
+        // their files, drain the hook queue. It runs on its own database
+        // connection (never the shared `self.storage` mutex) in one blocking
+        // task, and takes `heavy_work` only for full scans and oversized path
+        // batches. It returns within a tick of the shutdown flag.
+        let codemap_handle = {
+            let db_path = db_path.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            if crate::codemap::disabled() {
+                tracing::info!("code map loop disabled via CSR_NO_CODEMAP");
+                None
+            } else if let Some(home) = dirs::home_dir() {
+                tracing::info!(
+                    "code map loop started (poll {}s, watcher, hook queue)",
+                    crate::codemap::LoopOpts::from_env().poll.as_secs()
+                );
+                Some(tokio::task::spawn_blocking(move || {
+                    crate::codemap::run_loop(
+                        &db_path,
+                        &home,
+                        shutdown,
+                        crate::codemap::LoopOpts::from_env(),
+                        Some(heavy_work),
+                        |msg| {
+                            // Poll lines are the heartbeat; actions are news.
+                            if msg.starts_with("poll ") {
+                                tracing::debug!(target: "codemap", "{msg}");
+                            } else {
+                                tracing::info!(target: "codemap", "{msg}");
+                            }
+                        },
+                    );
+                }))
+            } else {
+                tracing::warn!("code map loop not started: no home directory");
+                None
+            }
+        };
+
         // Populate one structural-provenance batch per idle window. Parsing
         // happens before the bounded write transaction and the shared permit
         // keeps it out of the watch/import and dream critical sections.
@@ -1464,6 +1504,11 @@ impl Daemon {
         // The mirror pass checks shutdown between files; one in-flight file is
         // bounded and crash-safe (state follows the fsync), so a timeout is safe.
         let _ = tokio::time::timeout(timeout, mirror_handle).await;
+        // The code map loop wakes every second, and each rescan commits in
+        // short per-view transactions, so a timeout here loses nothing.
+        if let Some(h) = codemap_handle {
+            let _ = tokio::time::timeout(timeout, h).await;
+        }
         let _ = tokio::time::timeout(timeout, provenance_backfill_handle).await;
         // Same shape as the provenance backfill above: single-statement
         // upserts into `conversation_entrypoint`, no HNSW mutation.

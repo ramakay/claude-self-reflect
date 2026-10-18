@@ -35,6 +35,7 @@
 
 pub mod cli;
 pub mod discover;
+pub mod fresh;
 pub mod identity;
 pub mod query;
 pub mod scan;
@@ -47,6 +48,7 @@ mod tests;
 mod testutil;
 
 pub use discover::{discover, Candidate};
+pub use fresh::{run_loop, LoopOpts};
 pub use query::{query, CodemapHit};
 pub use scan::{rescan_paths, scan_repo, view_changed, PathScanReport, RepoScanReport, ScanOpts};
 pub use status::{status_report, CodemapStatus};
@@ -77,6 +79,38 @@ fn disabled_value(value: Option<&str>) -> bool {
     value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// Nanoseconds since the epoch: the `codemap_queue.enqueued_at` unit.
+pub(crate) fn now_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+/// Queue an absolute path for the daemon to rescan. A bare insert: no parse, no
+/// git, no filesystem call. `should_enqueue` is the gate callers apply first.
+pub fn enqueue(conn: &rusqlite::Connection, path: &std::path::Path) -> anyhow::Result<()> {
+    let abs = identity::normalize_lexical(path);
+    store::queue_push(conn, &abs.to_string_lossy(), now_nanos())
+}
+
+/// Should a hook enqueue this path? Absolute, a code extension, outside the
+/// protected folders (lexical check, no filesystem call), and the code map is on.
+pub fn should_enqueue(path: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    should_enqueue_with(path, home, disabled())
+}
+
+fn should_enqueue_with(
+    path: &std::path::Path,
+    home: Option<&std::path::Path>,
+    disabled: bool,
+) -> bool {
+    !disabled
+        && path.is_absolute()
+        && crate::extraction::repo_scan::has_code_extension(path)
+        && !identity::is_tcc_path(path, home)
+}
+
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -96,6 +130,37 @@ mod tests_mod {
         assert!(!disabled_value(Some("0")));
         assert!(!disabled_value(Some("")));
         assert!(!disabled_value(None));
+    }
+
+    #[test]
+    fn hook_enqueue_gate_needs_the_switch_on_an_absolute_unprotected_code_path() {
+        use std::path::Path;
+        let home = Path::new("/Users/nobody");
+        assert!(should_enqueue_with(
+            Path::new("/w/r/a.rs"),
+            Some(home),
+            false
+        ));
+        assert!(
+            !should_enqueue_with(Path::new("/w/r/a.rs"), Some(home), true),
+            "CSR_NO_CODEMAP=1: nothing is enqueued"
+        );
+        assert!(!should_enqueue_with(Path::new("a.rs"), Some(home), false));
+        assert!(!should_enqueue_with(
+            Path::new("/w/r/a.md"),
+            Some(home),
+            false
+        ));
+        assert!(!should_enqueue_with(
+            Path::new("/Users/nobody/Desktop/p/a.rs"),
+            Some(home),
+            false
+        ));
+        assert!(!should_enqueue_with(
+            Path::new("/Volumes/x/Downloads/a.rs"),
+            Some(Path::new("/Volumes/x")),
+            false
+        ));
     }
 
     #[test]

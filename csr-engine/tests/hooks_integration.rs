@@ -814,6 +814,61 @@ fn test_post_tool_use_ignores_non_edit_tools() {
     assert!(!edit_tools.contains(&input.tool_name.as_deref().unwrap()));
 }
 
+/// Code map freshness: PostToolUse only enqueues. An Edit/Write/MultiEdit of an
+/// absolute code path leaves one `codemap_queue` row; Read, a `.md` path and a
+/// protected folder leave none; the hook returns Ok every time.
+#[test]
+fn post_tool_use_enqueues_code_edits_for_the_code_map_and_nothing_else() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db_path = tmp.path().join("csr-engine.db");
+    let storage = std::sync::Arc::new(csr_engine::storage::Storage::open(&db_path).unwrap());
+    let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new().unwrap());
+    let search = std::sync::Arc::new(tokio::sync::RwLock::new(
+        csr_engine::search::SearchEngine::new(100),
+    ));
+    let engine = csr_engine::engine::Engine::from_parts(
+        storage,
+        embeddings,
+        search,
+        std::path::PathBuf::from("/tmp"),
+    );
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let fire = |tool: &str, file: &str| {
+        let input = csr_engine::hooks::HookInput {
+            cwd: Some(tmp.path().to_string_lossy().to_string()),
+            tool_name: Some(tool.into()),
+            tool_input: Some(serde_json::json!({ "file_path": file })),
+            ..Default::default()
+        };
+        rt.block_on(csr_engine::hooks::post_tool_use::handle(
+            &input,
+            &engine,
+            tmp.path(),
+        ))
+        .expect("the hook never fails");
+    };
+    fire("Edit", "/w/repo/src/a.rs");
+    fire("Write", "/w/repo/src/b.py");
+    fire("MultiEdit", "/w/repo/src/c.ts");
+    fire("Read", "/w/repo/src/d.rs");
+    fire("Write", "/w/repo/README.md");
+    fire("Edit", "/Users/nobody/Desktop/p/e.rs");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT path FROM codemap_queue ORDER BY path")
+        .unwrap();
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        vec!["/w/repo/src/a.rs", "/w/repo/src/b.py", "/w/repo/src/c.ts"]
+    );
+}
+
 /// Guards against silently missing sidechain/resumed sessions in the reinstatement graph walk.
 #[test]
 fn code_evolution_keys_by_transcript_stem_not_session_id() {
