@@ -144,12 +144,23 @@ pub struct PathScanReport {
 /// scan do not see each other's hook.
 #[cfg(test)]
 pub(super) mod test_hooks {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     type Hook = Box<dyn Fn()>;
 
     thread_local! {
         static AFTER_COLLECT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        // (files returned, entries visited, stopped) of the last full-scan
+        // untracked walk on this thread.
+        static LAST_WALK: Cell<Option<(usize, usize, bool)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record_walk(files: usize, visited: usize, stopped: bool) {
+        LAST_WALK.with(|w| w.set(Some((files, visited, stopped))));
+    }
+
+    pub(crate) fn last_walk() -> Option<(usize, usize, bool)> {
+        LAST_WALK.with(Cell::get)
     }
 
     pub(crate) fn set_after_collect(hook: impl Fn() + 'static) {
@@ -489,13 +500,27 @@ fn settle_file(
     Ok(())
 }
 
+/// Entries (files and directories, ignored-by-name ones excluded) a walk may
+/// visit, as a multiple of the file cap. A tree full of non-code files or empty
+/// directories never reaches the file cap, so the cap alone does not bound it.
+const WALK_VISIT_FACTOR: usize = 20;
+
+/// The visit budget for a walk whose file cap is `cap`.
+pub(super) fn walk_visit_budget(cap: usize) -> usize {
+    cap.saturating_mul(WALK_VISIT_FACTOR)
+}
+
 /// What a bounded walk found.
-struct WalkOutcome {
+pub(super) struct WalkOutcome {
     /// Repo-relative '/'-separated paths of code files, in path order.
-    files: Vec<String>,
+    pub(super) files: Vec<String>,
     /// The walk stopped before the end: more files than the allowance, or more
     /// entries than the visit budget.
-    stopped: bool,
+    pub(super) stopped: bool,
+    /// Entries the walk visited (the root excluded), at most the visit budget.
+    /// Read by the tests that prove the budget holds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) visited: usize,
 }
 
 /// The walker the full scan's untracked pass and the directory-event pass share:
@@ -536,19 +561,39 @@ fn untracked_walk(root: &Path, common_dir: &Path, only_under: Option<&Path>) -> 
 }
 
 /// Code files found by `untracked_walk` that `keep` accepts, in path order.
-/// Stops (`stopped`) at the first file beyond `allowance` files.
-fn collect_walk(
+/// Stops (`stopped`) at the first file beyond `allowance` files, or when the walk
+/// has visited `visit_budget` entries without finishing.
+pub(super) fn collect_walk(
     root: &Path,
     common_dir: &Path,
     only_under: Option<&Path>,
     keep: impl Fn(&str) -> bool,
     allowance: usize,
+    visit_budget: usize,
 ) -> WalkOutcome {
     let mut out = WalkOutcome {
         files: Vec::new(),
         stopped: false,
+        visited: 0,
     };
-    for entry in untracked_walk(root, common_dir, only_under).flatten() {
+    for entry in untracked_walk(root, common_dir, only_under) {
+        let Ok(entry) = entry else {
+            // An unreadable entry is still a visit.
+            if out.visited >= visit_budget {
+                out.stopped = true;
+                break;
+            }
+            out.visited += 1;
+            continue;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        if out.visited >= visit_budget {
+            out.stopped = true;
+            break;
+        }
+        out.visited += 1;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -571,16 +616,23 @@ fn collect_walk(
     out
 }
 
-/// Untracked code files of a worktree, in path order.
-fn walk_untracked(view: &ViewId, common_dir: &Path, tracked: &HashSet<String>) -> Vec<String> {
+/// Untracked code files of a worktree, in path order, at most `allowance` of
+/// them; `stopped` says the walk ended early (file allowance or visit budget).
+fn walk_untracked(
+    view: &ViewId,
+    common_dir: &Path,
+    tracked: &HashSet<String>,
+    allowance: usize,
+    visit_budget: usize,
+) -> WalkOutcome {
     collect_walk(
         &view.worktree_path,
         common_dir,
         None,
         |rel| !tracked.contains(rel),
-        usize::MAX,
+        allowance,
+        visit_budget,
     )
-    .files
 }
 
 fn collect_view(
@@ -624,7 +676,22 @@ fn collect_view(
         )?;
     }
     if !scan.truncated {
-        for rel in walk_untracked(view, common_dir, &tracked) {
+        // Only as many untracked files as the cap still has room for, and a
+        // bounded number of visited entries: a stopped walk is a truncated view.
+        let room = opts.max_files_per_view.saturating_sub(scan.files.len());
+        let walk = walk_untracked(
+            view,
+            common_dir,
+            &tracked,
+            room,
+            walk_visit_budget(opts.max_files_per_view),
+        );
+        #[cfg(test)]
+        test_hooks::record_walk(walk.files.len(), walk.visited, walk.stopped);
+        if walk.stopped {
+            scan.truncated = true;
+        }
+        for rel in walk.files {
             let abs = view.worktree_path.join(&rel);
             let Some(st) = stat_regular(&abs) else {
                 continue;
@@ -982,6 +1049,7 @@ pub(crate) fn expand_dir_events(conn: &Connection, abs_paths: &[PathBuf]) -> Res
             Some(&abs),
             |_| true,
             room,
+            walk_visit_budget(MAX_FILES_PER_PROJECT),
         );
         out.extend(found.files.iter().map(|f| root.join(f)));
     }

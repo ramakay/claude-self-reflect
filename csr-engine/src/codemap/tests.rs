@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 
 use super::identity::{self, git_blob_oid, identify_with, list_views_with, ViewId};
-use super::scan::{rescan_paths, scan_repo, view_changed, RepoScanReport, ScanOpts};
+use super::scan::{
+    collect_walk, rescan_paths, scan_repo, view_changed, walk_visit_budget, RepoScanReport,
+    ScanOpts,
+};
 use super::store;
 use super::testutil::{count, db, py, write, Fx};
 use super::{extractor_version, query};
@@ -886,6 +889,120 @@ fn a_blob_minified_by_content_is_final_and_is_not_reparsed() {
     assert_eq!(
         second.totals.blobs_parsed, 0,
         "neither the content-minified nor the no_lang blob is parsed again"
+    );
+    assert_invariants(&conn);
+}
+
+// ---- the untracked walk honours the file cap and a visit budget ----------------------
+
+#[test]
+fn the_untracked_walk_stops_at_the_file_cap_and_marks_the_view_truncated() {
+    let fx = Fx::new();
+    let main = fx.init_repo("capwalk");
+    for i in 0..10 {
+        write(&main, &format!("t{i}.py"), &py(&[&format!("tracked_{i}")]));
+    }
+    fx.commit_all(&main, "init");
+    for i in 0..300 {
+        write(
+            &main,
+            &format!("u{i:03}.py"),
+            &py(&[&format!("untracked_{i}")]),
+        );
+    }
+    let conn = db();
+    let mut o = opts(&fx);
+    o.max_files_per_view = 50;
+    let report = scan_repo(&conn, &common_of(&main), &o).unwrap();
+    assert_eq!(report.views[0].files, 50);
+    assert_eq!(report.views[0].untracked, 40);
+    assert!(report.views[0].truncated);
+    let stored = store::stored_views(&conn, None).unwrap();
+    assert_eq!(stored[0].files, 50);
+    assert!(stored[0].truncated);
+    assert_eq!(rows(&conn, &main).len(), 50);
+    assert_invariants(&conn);
+    // The scan asked the walk for the 40 places left, not for all 300 files.
+    let (walked, visited, stopped) = super::scan::test_hooks::last_walk().unwrap();
+    assert_eq!(walked, 40);
+    assert!(stopped);
+    assert!(visited <= walk_visit_budget(50), "visited {visited}");
+    assert!(visited < 300, "visited {visited}");
+
+    // The walk itself stops one file past its allowance instead of listing all
+    // 300, and never visits more entries than its budget.
+    let budget = walk_visit_budget(50);
+    let found = collect_walk(
+        &main,
+        &common_of(&main),
+        None,
+        |rel| rel.starts_with('u'),
+        40,
+        budget,
+    );
+    assert_eq!(found.files.len(), 40);
+    assert!(found.stopped);
+    assert!(found.visited <= budget, "{} > {budget}", found.visited);
+    assert!(found.visited < 300, "visited {}", found.visited);
+}
+
+#[test]
+fn a_walk_that_fits_the_cap_and_the_budget_is_not_truncated() {
+    let fx = Fx::new();
+    let main = fx.init_repo("fits");
+    write(&main, "a.py", &py(&["alpha"]));
+    fx.commit_all(&main, "init");
+    for i in 0..6 {
+        write(&main, &format!("n{i}.txt"), "not code\n");
+    }
+    write(&main, "b.py", &py(&["beta"]));
+    let conn = db();
+    let mut o = opts(&fx);
+    o.max_files_per_view = 5;
+    let report = scan_repo(&conn, &common_of(&main), &o).unwrap();
+    assert_eq!(report.views[0].files, 2);
+    assert!(!report.views[0].truncated);
+}
+
+#[test]
+fn the_visit_budget_stops_a_walk_over_many_non_code_entries_and_marks_the_view_truncated() {
+    let fx = Fx::new();
+    let main = fx.init_repo("visits");
+    write(&main, "a.py", &py(&["alpha"]));
+    fx.commit_all(&main, "init");
+    // 150 untracked entries that are walkable but never code files, spread over
+    // directories, plus a code file that sorts after all of them.
+    for d in 0..15 {
+        for f in 0..10 {
+            write(&main, &format!("docs{d:02}/n{f}.txt"), "not code\n");
+        }
+    }
+    write(&main, "zzz_late.py", &py(&["late"]));
+    let conn = db();
+    let mut o = opts(&fx);
+    o.max_files_per_view = 5;
+    let budget = walk_visit_budget(o.max_files_per_view);
+    assert_eq!(budget, 100);
+
+    let found = collect_walk(
+        &main,
+        &common_of(&main),
+        None,
+        |rel| rel != "a.py",
+        usize::MAX,
+        budget,
+    );
+    assert!(found.stopped);
+    assert_eq!(found.visited, budget);
+    assert!(found.files.is_empty(), "{:?}", found.files);
+
+    let report = scan_repo(&conn, &common_of(&main), &o).unwrap();
+    assert!(report.views[0].truncated);
+    assert_eq!(report.views[0].files, 1, "only the tracked file");
+    assert_eq!(
+        super::scan::test_hooks::last_walk(),
+        Some((0, budget, true)),
+        "the scan's own walk stopped at the budget"
     );
     assert_invariants(&conn);
 }
