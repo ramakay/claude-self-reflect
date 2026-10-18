@@ -8,6 +8,7 @@
  */
 
 import { spawn, execFileSync } from 'child_process';
+import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -60,8 +61,19 @@ function runEngine(args) {
   });
 }
 
+/** Version from the package.json this CLI ships in; empty if it cannot be read. */
+function packageVersion() {
+  try {
+    const manifest = new URL('../package.json', import.meta.url);
+    return JSON.parse(readFileSync(manifest, 'utf8')).version || '';
+  } catch {
+    return '';
+  }
+}
+
 function help() {
-  console.log('\nClaude Self-Reflect v8.0 - Perfect memory for Claude\n');
+  const version = packageVersion();
+  console.log(`\nClaude Self-Reflect${version ? ` v${version}` : ''} - Perfect memory for Claude\n`);
   console.log('Usage: claude-self-reflect <command>\n');
   console.log('Commands:');
   for (const [cmd, desc] of Object.entries(commands)) {
