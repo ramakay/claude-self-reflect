@@ -2,7 +2,7 @@
 title: MCP Tools Reference
 ---
 
-15 tools available to Claude automatically via MCP.
+16 tools available to Claude automatically via MCP.
 
 ## Search Tools
 
@@ -98,6 +98,14 @@ Retrieve complete JSONL conversation by ID.
 
 ### get_session_learnings
 Iteration-level memory for Ralph loops.
+
+### csr_transcript
+
+Structured facts from one Claude Code session transcript, without a hand-rolled `jq` or Python parser. Pick a `view`: `stats`, `prompts`, `tools`, `files`, `errors`, `slice` or `grep`. Every view shows its turn numbers, so a follow-up `slice` can zoom in. Large results end with a truncation marker and a `turns` hint to resume. The `prompts` view shows only turns you typed unless you pass `include_system: true`. Read-only.
+
+```python
+csr_transcript(session="a1b2c3d4", view="grep", grep="migration")
+```
 
 ## Storage Tools
 

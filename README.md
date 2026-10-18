@@ -73,7 +73,7 @@ Everything runs locally in a single process. No Docker, no database server, no A
 - **FastEmbed** — 384-dim local embeddings
 - **AST** — code-aware search across 6 languages
 
-**6 hooks** fire across the session lifecycle. **15 MCP tools** for explicit search — including `csr_code_graph`, linking code symbols to the conversations that shaped them.
+**6 hooks** fire across the session lifecycle. **16 MCP tools** for explicit search — including `csr_code_graph`, linking code symbols to the conversations that shaped them.
 
 <br clear="both" />
 
@@ -199,7 +199,7 @@ No special syntax. No commands. CSR finds relevant past context and injects it a
 </details>
 
 <details>
-<summary><strong>MCP Tools</strong> — 15 annotated tools available to Claude</summary>
+<summary><strong>MCP Tools</strong> — 16 annotated tools available to Claude</summary>
 
 All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/specification/2025-11-05/server/tools/#annotations) so Claude Code understands their safety characteristics.
 
@@ -220,6 +220,7 @@ All tools include [MCP tool annotations](https://spec.modelcontextprotocol.io/sp
 | `csr_code_graph` | Which conversations shaped a function or file (AST anchors) | read-only |
 | `csr_why` | Provenance chain — why does this code/decision exist | read-only |
 | `csr_resolve` | Record verified verdicts (resolved/still_open/regressed) on chunks | **writes** |
+| `csr_transcript` | Structured facts from one session transcript: stats, prompts, tools, files, errors, slices, grep | read-only |
 
 </details>
 
