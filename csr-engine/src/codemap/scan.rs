@@ -19,7 +19,7 @@
 //! therefore read as modified when its stat differs; the blob is still the bytes
 //! on disk.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -241,6 +241,37 @@ fn first_line_signature(lines: &[&str], span_start: i64) -> String {
     line.trim().chars().take(MAX_SIGNATURE_CHARS).collect()
 }
 
+/// `x.min.js`: skipped by name, whatever the content.
+fn has_min_js_name(rel: &str) -> bool {
+    Path::new(rel)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".min.js"))
+}
+
+/// The content half of `looks_minified`: a line longer than the extractor's
+/// threshold. Asked with a neutral file name so the name rule cannot fire.
+fn looks_minified_by_content(source: &str) -> bool {
+    looks_minified(Path::new("content.txt"), source)
+}
+
+/// A stored status as a static name; anything unknown reads as final (`error`).
+fn status_name(s: &str) -> &'static str {
+    match s {
+        "ok" => "ok",
+        "no_lang" => "no_lang",
+        "minified_name" => "minified_name",
+        "minified" => "minified",
+        _ => "error",
+    }
+}
+
+/// Can this path parse a blob that a different path could not? It has a parser
+/// and is not a `.min.js` name.
+fn path_can_parse(rel: &str) -> bool {
+    lang_from_path_str(rel).is_some() && !has_min_js_name(rel)
+}
+
 /// Parse one blob into definition rows. Kept kinds are everything the code-graph
 /// extractor emits as a symbol except the synthetic `module` anchor and
 /// `import`: `function`, `type` and `const`.
@@ -254,10 +285,17 @@ pub(crate) fn parse_blob(oid: &str, rel: &str, bytes: &[u8], common_dir: &str) -
     let Ok(source) = std::str::from_utf8(bytes) else {
         return blob("error", None, Vec::new());
     };
+    // Statuses `no_lang` and `minified_name` depend on the PATH this blob was
+    // first seen under, and a blob is stored once whatever paths hold it, so
+    // `BlobParser::is_known` lets a path that could do better reparse them.
+    // `minified` depends on the content alone and is final.
     if lang_from_path_str(rel).is_none() {
         return blob("no_lang", None, Vec::new());
     }
-    if looks_minified(Path::new(rel), source) {
+    if has_min_js_name(rel) {
+        return blob("minified_name", None, Vec::new());
+    }
+    if looks_minified_by_content(source) {
         return blob("minified", None, Vec::new());
     }
     let fragment = extract_graph_fragment_for_file(source, rel, common_dir, "", "", "");
@@ -304,8 +342,9 @@ pub(crate) fn parse_blob(oid: &str, rel: &str, bytes: &[u8], common_dir: &str) -
 struct BlobParser<'a> {
     conn: &'a Connection,
     common_dir: &'a str,
-    /// Blob oids known stored (current extractor version) or parsed here.
-    known: HashSet<String>,
+    /// Blob oids known stored (current extractor version) or parsed here, with
+    /// the status they hold.
+    known: HashMap<String, &'static str>,
     parsed: Vec<ParsedBlob>,
 }
 
@@ -314,26 +353,43 @@ impl<'a> BlobParser<'a> {
         Self {
             conn,
             common_dir,
-            known: HashSet::new(),
+            known: HashMap::new(),
             parsed: Vec::new(),
         }
     }
 
-    fn is_known(&mut self, oid: &str) -> Result<bool> {
-        if self.known.contains(oid) {
-            return Ok(true);
-        }
-        if store::blob_known(self.conn, oid)? {
-            self.known.insert(oid.to_string());
-            return Ok(true);
-        }
-        Ok(false)
+    /// Does this blob need no parse for `rel`? A stored `ok`, `error` or
+    /// `minified` row is final. A stored `no_lang` or `minified_name` row only
+    /// says the path it was first seen under could not parse it: a path that
+    /// can (`path_can_parse`) parses it again, and the result replaces the row
+    /// only when it is `ok`.
+    fn is_known(&mut self, oid: &str, rel: &str) -> Result<bool> {
+        let status = match self.known.get(oid) {
+            Some(s) => *s,
+            None => match store::blob_status(self.conn, oid)? {
+                Some(s) => {
+                    let s = status_name(&s);
+                    self.known.insert(oid.to_string(), s);
+                    s
+                }
+                None => return Ok(false),
+            },
+        };
+        Ok(match status {
+            "no_lang" | "minified_name" => !path_can_parse(rel),
+            _ => true,
+        })
     }
 
     fn parse(&mut self, oid: &str, rel: &str, bytes: &[u8]) {
-        self.parsed
-            .push(parse_blob(oid, rel, bytes, self.common_dir));
-        self.known.insert(oid.to_string());
+        let blob = parse_blob(oid, rel, bytes, self.common_dir);
+        // Never downgrade what is known: a path-dependent negative must not
+        // hide an `ok` this session already parsed.
+        let keep = self.known.get(oid).copied();
+        if keep != Some("ok") {
+            self.known.insert(oid.to_string(), blob.status);
+        }
+        self.parsed.push(blob);
     }
 
     /// Hand over what was parsed since the last call (the caller writes it).
@@ -394,7 +450,7 @@ fn settle_file(
         }
     };
     let first_sight = counters.seen.insert(oid.clone());
-    if parser.is_known(&oid)? {
+    if parser.is_known(&oid, rel)? {
         if first_sight {
             counters.reused += 1;
         }
@@ -418,7 +474,7 @@ fn settle_file(
             oid = h;
             counters.seen.insert(oid.clone());
         }
-        if !parser.is_known(&oid)? {
+        if !parser.is_known(&oid, rel)? {
             parser.parse(&oid, rel, &b);
             counters.parsed += 1;
         }
@@ -1086,7 +1142,7 @@ fn rescan_view_paths(
             report.unchanged += 1;
             continue;
         }
-        if !parser.is_known(&oid)? {
+        if !parser.is_known(&oid, rel)? {
             parser.parse(&oid, rel, &bytes);
         }
         if stored.is_none() {

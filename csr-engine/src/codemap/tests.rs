@@ -753,3 +753,139 @@ fn status_report_counts_what_the_scan_wrote() {
     assert_eq!(s.repos[0].views[0].files, 2);
     assert_eq!(s.totals.fts_rows, s.totals.defs);
 }
+
+// ---- blob statuses that depend on the path ---------------------------------------
+
+const TS_SRC: &str = "export function swiftie(x: number) { return x; }\n";
+const JS_SRC: &str = "function shorty(a) { return a }\n";
+
+fn hit_paths(conn: &Connection, name: &str) -> Vec<String> {
+    query(conn, name, 20)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.path)
+        .collect()
+}
+
+fn blob_status_of(conn: &Connection, bytes: &str) -> Option<String> {
+    store::blob_status(conn, &git_blob_oid(bytes.as_bytes())).unwrap()
+}
+
+fn fts_rows_for_path(conn: &Connection, path: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM codemap_fts WHERE path = ?1",
+        params![path],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn identical_bytes_first_seen_under_a_path_with_no_parser_still_give_the_ts_file_its_defs() {
+    // Both scan orders: the blob is first seen under a.swift (no parser), or
+    // under the .ts file.
+    for (first, second, ts_path) in [("a.swift", "b.ts", "b.ts"), ("x.ts", "y.swift", "x.ts")] {
+        let fx = Fx::new();
+        let main = fx.init_repo("sw");
+        write(&main, first, TS_SRC);
+        write(&main, second, TS_SRC);
+        fx.commit_all(&main, "init");
+        let conn = db();
+        let r = scan(&conn, &fx, &main);
+        assert_eq!(r.views[0].files, 2, "{first} {second}");
+        assert!(
+            hit_paths(&conn, "swiftie").contains(&ts_path.to_string()),
+            "{first}/{second}: {:?}",
+            hit_paths(&conn, "swiftie")
+        );
+        assert!(fts_rows_for_path(&conn, ts_path) > 0, "{first}/{second}");
+        assert_eq!(blob_status_of(&conn, TS_SRC).as_deref(), Some("ok"));
+        assert_invariants(&conn);
+        // Nothing is reparsed on the next scan.
+        let again = scan(&conn, &fx, &main);
+        assert_eq!(again.totals.blobs_parsed, 0, "{first}/{second}");
+    }
+}
+
+#[test]
+fn a_partial_rescan_of_a_path_with_a_parser_upgrades_a_no_lang_blob() {
+    let fx = Fx::new();
+    let main = fx.init_repo("sw2");
+    write(&main, "a.swift", TS_SRC);
+    fx.commit_all(&main, "init");
+    let conn = db();
+    scan(&conn, &fx, &main);
+    assert_eq!(blob_status_of(&conn, TS_SRC).as_deref(), Some("no_lang"));
+    assert!(hit_paths(&conn, "swiftie").is_empty());
+
+    // The same bytes under a .ts name, picked up by the watcher / hook path.
+    write(&main, "b.ts", TS_SRC);
+    let report = rescan_paths(&conn, &[main.join("b.ts")]).unwrap();
+    assert_eq!(report.updated, 1);
+    assert!(hit_paths(&conn, "swiftie").contains(&"b.ts".to_string()));
+    assert_eq!(blob_status_of(&conn, TS_SRC).as_deref(), Some("ok"));
+    assert_invariants(&conn);
+
+    // A stored ok row is never downgraded: after the .ts copy goes away the
+    // blob is still held by a.swift, still ok.
+    std::fs::remove_file(main.join("b.ts")).unwrap();
+    rescan_paths(&conn, &[main.join("b.ts")]).unwrap();
+    assert_eq!(blob_status_of(&conn, TS_SRC).as_deref(), Some("ok"));
+    assert_invariants(&conn);
+    scan(&conn, &fx, &main);
+    assert_eq!(blob_status_of(&conn, TS_SRC).as_deref(), Some("ok"));
+    assert_invariants(&conn);
+}
+
+#[test]
+fn a_min_js_name_does_not_hide_the_same_bytes_under_a_normal_name() {
+    for (first, second, js_path, parses) in [
+        ("a.min.js", "b.js", "b.js", 2),
+        ("x.js", "y.min.js", "x.js", 1),
+    ] {
+        let fx = Fx::new();
+        let main = fx.init_repo("mj");
+        write(&main, first, JS_SRC);
+        write(&main, second, JS_SRC);
+        fx.commit_all(&main, "init");
+        let conn = db();
+        let r = scan(&conn, &fx, &main);
+        assert_eq!(r.totals.blobs_parsed, parses, "{first}/{second}");
+        assert!(
+            hit_paths(&conn, "shorty").contains(&js_path.to_string()),
+            "{first}/{second}: {:?}",
+            hit_paths(&conn, "shorty")
+        );
+        assert!(fts_rows_for_path(&conn, js_path) > 0);
+        assert_eq!(blob_status_of(&conn, JS_SRC).as_deref(), Some("ok"));
+        assert_invariants(&conn);
+    }
+}
+
+#[test]
+fn a_blob_minified_by_content_is_final_and_is_not_reparsed() {
+    let fx = Fx::new();
+    let main = fx.init_repo("mc");
+    let long = format!("function f(a){{return a}}{}\n", "/*x*/".repeat(500));
+    write(&main, "c.js", &long);
+    write(&main, "d.js", &long); // same bytes, a normal name
+    write(&main, "e.swift", TS_SRC); // path-dependent no_lang, no path can do better
+    fx.commit_all(&main, "init");
+    let conn = db();
+    let first = scan(&conn, &fx, &main);
+    assert_eq!(
+        first.totals.blobs_parsed, 2,
+        "the long blob once, the swift blob once"
+    );
+    assert_eq!(blob_status_of(&conn, &long).as_deref(), Some("minified"));
+    assert_eq!(blob_status_of(&conn, TS_SRC).as_deref(), Some("no_lang"));
+    assert!(hit_paths(&conn, "f")
+        .iter()
+        .all(|p| p != "c.js" && p != "d.js"));
+    let second = scan(&conn, &fx, &main);
+    assert_eq!(
+        second.totals.blobs_parsed, 0,
+        "neither the content-minified nor the no_lang blob is parsed again"
+    );
+    assert_invariants(&conn);
+}

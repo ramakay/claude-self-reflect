@@ -50,7 +50,11 @@ pub struct DefRow {
 pub struct ParsedBlob {
     pub oid: String,
     pub lang: Option<String>,
-    /// ok | minified | too_large | no_lang | error
+    /// `ok`, `error` (not UTF-8), `minified` (a line over the threshold: by
+    /// content, final), or one of the two that depend on the path the blob was
+    /// first seen under and may be replaced by an `ok` parse from a path that
+    /// can do better: `no_lang` (that path has no parser), `minified_name`
+    /// (that path ends in `.min.js`).
     pub status: &'static str,
     pub defs: Vec<DefRow>,
 }
@@ -217,16 +221,40 @@ pub fn blob_known(conn: &Connection, oid: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
-/// Insert parsed blobs; returns (defs written, blobs actually inserted).
+/// The status stored for a blob at the current extractor version.
+pub fn blob_status(conn: &Connection, oid: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT status FROM codemap_blobs WHERE blob_oid = ?1 AND extractor_version = ?2",
+        )?
+        .query_row(params![oid, extractor_version()], |r| r.get(0))
+        .optional()?)
+}
+
+/// Insert parsed blobs; returns (defs written, blobs actually written).
+///
+/// A blob already stored is left alone, with one exception: a row whose status
+/// depends on the path it was first seen under (`no_lang`, `minified_name`) is
+/// replaced by a parse that came out `ok`. A stored row is never downgraded. A
+/// replaced row counts as written, so its defs get search rows for every
+/// (path, blob) pair a view holds.
 fn insert_parsed(conn: &Connection, parsed: &[ParsedBlob]) -> Result<(usize, HashSet<String>)> {
     let version = extractor_version();
     let now = super::now_secs();
     let mut fresh = HashSet::new();
     let mut defs_written = 0usize;
     let mut ins_blob = conn.prepare_cached(
-        "INSERT OR IGNORE INTO codemap_blobs
+        "INSERT INTO codemap_blobs
             (blob_oid, extractor_version, lang, status, defs, parsed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(blob_oid, extractor_version) DO UPDATE SET
+            lang = excluded.lang, status = excluded.status,
+            defs = excluded.defs, parsed_at = excluded.parsed_at
+         WHERE codemap_blobs.status IN ('no_lang', 'minified_name')
+           AND excluded.status = 'ok'",
+    )?;
+    let mut clear_defs = conn.prepare_cached(
+        "DELETE FROM codemap_defs WHERE blob_oid = ?1 AND extractor_version = ?2",
     )?;
     let mut ins_def = conn.prepare_cached(
         "INSERT INTO codemap_defs
@@ -244,6 +272,10 @@ fn insert_parsed(conn: &Connection, parsed: &[ParsedBlob]) -> Result<(usize, Has
         ])?;
         if inserted == 0 {
             continue;
+        }
+        if blob.status == "ok" {
+            // A replaced negative has no defs; clear any stray ones anyway.
+            clear_defs.execute(params![blob.oid, version])?;
         }
         fresh.insert(blob.oid.clone());
         for d in &blob.defs {
