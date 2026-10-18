@@ -13,7 +13,7 @@ use super::discover::discover;
 use super::identity::{self, home_dir};
 use super::lock;
 use super::scan::{rescan_paths, scan_repo, view_changed, RepoScanReport, ScanOpts};
-use super::status::{status_report, CodemapStatus};
+use super::status::{repo_path, status_report, CodemapStatus};
 use super::store;
 use crate::storage::Storage;
 
@@ -274,17 +274,38 @@ fn open_for_read(db_path: &Path) -> Result<Option<Storage>> {
 }
 
 fn print_status(s: &CodemapStatus) {
+    print!("{}", render_status(s));
+}
+
+/// The text of `codemap status`. A repo that is also on the skipped list carries
+/// its reason on its own line, next to its views; skipped entries that map to no
+/// repo row (a protected project nothing has mapped, a repo past the cap) follow.
+pub(crate) fn render_status(s: &CodemapStatus) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
     if s.disabled {
-        println!("(CSR_NO_CODEMAP=1 is set; background mapping is off)");
+        let _ = writeln!(out, "(CSR_NO_CODEMAP=1 is set; background mapping is off)");
     }
     if s.repos.is_empty() {
-        println!("no repos mapped yet");
+        let _ = writeln!(out, "no repos mapped yet");
     }
+    let mut shown: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in &s.repos {
+        let path = repo_path(&r.common_dir, r.main_path.as_deref());
+        let reason = s
+            .skipped
+            .iter()
+            .find(|k| k.path == path)
+            .inspect(|k| {
+                shown.insert(k.path.as_str());
+            })
+            .map(|k| format!("  [{}]", k.reason))
+            .unwrap_or_default();
         let off = if r.enabled { "" } else { "  [removed]" };
-        println!("repo {}  ({}){off}", r.common_dir, r.source);
+        let _ = writeln!(out, "repo {}  ({}){off}{reason}", r.common_dir, r.source);
         for v in &r.views {
-            println!(
+            let _ = writeln!(
+                out,
                 "  {:24} {:12} files {:5} dirty {:3} untracked {:3}{} scanned {} ago  {}",
                 v.branch.as_deref().unwrap_or("(detached)"),
                 v.head.as_deref().unwrap_or("-"),
@@ -297,12 +318,25 @@ fn print_status(s: &CodemapStatus) {
             );
         }
     }
+    let rest: Vec<_> = s
+        .skipped
+        .iter()
+        .filter(|k| !shown.contains(k.path.as_str()))
+        .collect();
+    if !rest.is_empty() {
+        let _ = writeln!(out, "skipped ({}):", rest.len());
+        for k in rest {
+            let _ = writeln!(out, "  {}  [{}]", k.path, k.reason);
+        }
+    }
     let t = &s.totals;
-    println!(
+    let _ = writeln!(
+        out,
         "totals: {} repos, {} views, {} view-file pairs, {} unique blobs, {} defs, {} fts rows, {} queued, extractor {}",
         t.repos, t.views, t.view_file_pairs, t.unique_blobs, t.defs, t.fts_rows, t.queue_depth,
         s.extractor_version
     );
+    out
 }
 
 /// `codemap status [--json]`.

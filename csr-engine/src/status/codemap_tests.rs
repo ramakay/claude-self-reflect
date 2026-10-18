@@ -1,7 +1,7 @@
 //! The `codemap` block of `csr-engine status`.
 
 use super::*;
-use crate::codemap::status::{CodemapStatus, RepoStatus, StatusTotals, ViewStatus};
+use crate::codemap::status::{CodemapStatus, RepoStatus, SkippedRepo, StatusTotals, ViewStatus};
 use crate::codemap::testutil::{map_fixture, scan_repo_into};
 
 fn view(scanned_at: Option<i64>, status: &str, truncated: bool) -> ViewStatus {
@@ -38,6 +38,10 @@ fn lag_is_measured_from_the_oldest_poll_of_an_enabled_repo_and_the_oldest_scan()
         initialised: true,
         disabled: false,
         extractor_version: "x".into(),
+        skipped: vec![SkippedRepo {
+            path: "/p/idle".into(),
+            reason: "idle > 24h".into(),
+        }],
         repos: vec![
             repo(
                 true,
@@ -79,6 +83,10 @@ fn lag_is_measured_from_the_oldest_poll_of_an_enabled_repo_and_the_oldest_scan()
             // The removed repo's view (scanned at 5) still counts as a view: the
             // oldest scan is over every view the map holds.
             scan_lag_secs: Some(195),
+            skipped: vec![SkippedRepo {
+                path: "/p/idle".into(),
+                reason: "idle > 24h".into(),
+            }],
         }
     );
     // A clock that ran backwards never yields a negative lag.
@@ -94,6 +102,7 @@ fn an_uninitialised_report_folds_to_the_default_block() {
         disabled: false,
         extractor_version: "x".into(),
         repos: vec![],
+        skipped: vec![],
         totals: StatusTotals::default(),
     };
     assert_eq!(
@@ -119,6 +128,7 @@ fn text_lines_show_the_counts_the_lag_and_the_kill_switch() {
         poll_lag_secs: Some(12),
         scan_lag_secs: None,
         disabled: false,
+        skipped: vec![],
     };
     assert_eq!(
         block.text_lines(),
@@ -199,6 +209,8 @@ fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
     assert_eq!(block["repos_never_polled"], 0);
     assert!(block["poll_lag_secs"].as_i64().unwrap() >= 0);
     assert!(block["scan_lag_secs"].as_i64().unwrap() >= 0);
+    // A repo named by `codemap add` is never skipped.
+    assert_eq!(block["skipped"], serde_json::json!([]));
     let mut keys: Vec<&str> = block
         .as_object()
         .unwrap()
@@ -217,6 +229,7 @@ fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
             "repos",
             "repos_never_polled",
             "scan_lag_secs",
+            "skipped",
             "unique_blobs",
             "view_file_pairs",
             "views",
@@ -255,4 +268,64 @@ fn status_reports_the_kill_switch_in_the_block() {
     let _switch = crate::codemap::test_switch::force(true);
     let report = gather_status(&db_path, &projects_dir, false);
     assert!(report.unwrap().codemap.disabled);
+}
+
+#[test]
+fn text_lines_name_each_skip_reason_once_with_at_most_three_paths() {
+    let skip = |path: &str, reason: &str| SkippedRepo {
+        path: path.into(),
+        reason: reason.into(),
+    };
+    let block = CodemapStatusBlock {
+        initialised: true,
+        skipped: vec![
+            skip(
+                "/h/Documents/probe",
+                "protected-folder: mapped by session only",
+            ),
+            skip("/w/a", "idle > 24h"),
+            skip("/w/b", "idle > 24h"),
+            skip("/w/c", "idle > 24h"),
+            skip("/w/d", "idle > 24h"),
+            skip("/w/e", "cap 16"),
+        ],
+        ..CodemapStatusBlock::default()
+    };
+    let lines = block.text_lines();
+    assert_eq!(
+        &lines[3..],
+        &[
+            "Skipped 1 (protected-folder: mapped by session only): /h/Documents/probe",
+            "Skipped 4 (idle > 24h): /w/a, /w/b, /w/c, +1 more",
+            "Skipped 1 (cap 16): /w/e",
+        ]
+    );
+    // Nothing skipped, no line.
+    let none = CodemapStatusBlock {
+        initialised: true,
+        ..CodemapStatusBlock::default()
+    };
+    assert_eq!(none.text_lines().len(), 3);
+}
+
+#[test]
+fn the_status_block_carries_the_skipped_list_from_the_report() {
+    let report = CodemapStatus {
+        initialised: true,
+        disabled: true,
+        extractor_version: "x".into(),
+        repos: vec![],
+        skipped: vec![SkippedRepo {
+            path: "/w/a".into(),
+            reason: "CSR_NO_CODEMAP".into(),
+        }],
+        totals: StatusTotals::default(),
+    };
+    let block = CodemapStatusBlock::from_report(&report, 10);
+    let value = serde_json::to_value(&block).unwrap();
+    assert_eq!(
+        value["skipped"],
+        serde_json::json!([{ "path": "/w/a", "reason": "CSR_NO_CODEMAP" }])
+    );
+    assert!(block.text_lines()[0].contains("[off: CSR_NO_CODEMAP=1]"));
 }

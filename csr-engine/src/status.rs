@@ -390,6 +390,9 @@ pub struct CodemapStatusBlock {
     pub poll_lag_secs: Option<i64>,
     /// Seconds since the least recently scanned view was scanned.
     pub scan_lag_secs: Option<i64>,
+    /// Repos the daemon leaves alone, with the reason (`protected-folder: mapped
+    /// by session only`, `idle > <N>h`, `cap <N>`, `CSR_NO_CODEMAP`).
+    pub skipped: Vec<crate::codemap::status::SkippedRepo>,
 }
 
 impl CodemapStatusBlock {
@@ -436,6 +439,7 @@ impl CodemapStatusBlock {
             repos_never_polled: enabled.iter().filter(|r| r.last_poll_at.is_none()).count() as i64,
             poll_lag_secs: oldest_poll.map(|t| (now - t).max(0)),
             scan_lag_secs: oldest_scan.map(|t| (now - t).max(0)),
+            skipped: report.skipped.clone(),
         }
     }
 
@@ -455,7 +459,7 @@ impl CodemapStatusBlock {
         } else {
             ""
         };
-        vec![
+        let mut lines = vec![
             format!(
                 "Code map: {} repos, {} views, {} view-file pairs, {} unique blobs, {} defs{off}",
                 self.repos, self.views, self.view_file_pairs, self.unique_blobs, self.defs
@@ -472,7 +476,32 @@ impl CodemapStatusBlock {
                 lag(self.poll_lag_secs),
                 lag(self.scan_lag_secs)
             ),
-        ]
+        ];
+        // One line per reason, in the order the report lists them, with at most
+        // three paths named; `codemap status` lists them all.
+        let mut reasons: Vec<&str> = Vec::new();
+        for k in &self.skipped {
+            if !reasons.contains(&k.reason.as_str()) {
+                reasons.push(k.reason.as_str());
+            }
+        }
+        for reason in reasons {
+            let paths: Vec<&str> = self
+                .skipped
+                .iter()
+                .filter(|k| k.reason == reason)
+                .map(|k| k.path.as_str())
+                .collect();
+            let more = paths.len().saturating_sub(3);
+            let named = paths[..paths.len() - more].join(", ");
+            let tail = if more > 0 {
+                format!(", +{more} more")
+            } else {
+                String::new()
+            };
+            lines.push(format!("Skipped {} ({reason}): {named}{tail}", paths.len()));
+        }
+        lines
     }
 }
 

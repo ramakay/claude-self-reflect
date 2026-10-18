@@ -165,6 +165,27 @@ fn a_plain_scan_refuses_a_protected_repo_and_a_session_scan_maps_it() {
     let status = f.run(&["codemap", "status", "--json"]);
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["repos"][0]["source"], "session", "{status}");
+    // The report lists the repo's views and, next to them, why the daemon skips it.
+    assert!(
+        !status["repos"][0]["views"].as_array().unwrap().is_empty(),
+        "{status}"
+    );
+    assert_eq!(
+        status["skipped"],
+        serde_json::json!([{
+            "path": f.probe.to_str().unwrap(),
+            "reason": "protected-folder: mapped by session only",
+        }]),
+        "{status}"
+    );
+    let text = f.run(&["codemap", "status"]);
+    let text = String::from_utf8_lossy(&text.stdout).into_owned();
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("repo ")
+                && l.ends_with("[protected-folder: mapped by session only]")),
+        "{text}"
+    );
 }
 
 #[test]
