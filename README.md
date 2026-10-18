@@ -295,7 +295,7 @@ csr-engine status --compact    One-line statusline output
 csr-engine daemon              Background enrichment daemon
 csr-engine hook install --apply Install Claude Code hooks
 csr-engine eval                Quick eval (5 tests)
-csr-engine eval --full         Full eval (20 tests)
+csr-engine eval --full         Full eval (24 results)
 csr-engine quality <file>      AST-based code quality analysis
 ```
 

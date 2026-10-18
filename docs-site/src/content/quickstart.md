@@ -44,5 +44,5 @@ You don't need to do anything for these:
 
 ```bash
 csr-engine eval        # Quick (5 tests, <1s)
-csr-engine eval --full # Full (20 tests)
+csr-engine eval --full # Full (24 results)
 ```
