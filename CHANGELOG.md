@@ -65,21 +65,52 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   max RSS; a warm rescan takes 0.06 s and parses 0 blobs. anukriti is 2 views, 1,643 pairs, 835 blobs, cold in 3.2 s.
   34.8% (claude-self-reflect) and 64.1% (anukriti) of the mapped files were never touched by a conversation
   (b2f108e8).
-- **Which repos:** repos from the conversation code graph (`code_nodes`), the last 30 days of Claude Code history
-  (`~/.claude/history.jsonl` project paths), `csr-engine codemap add` and `CSR_CODEMAP_REPOS`, capped at 16
-  (`CSR_CODEMAP_MAX_REPOS`). The map only reads those repos: no git command that writes, no index refresh. Caps: 5000
-  files per view, 512 KiB per file. Nothing under `~/Desktop`, `~/Documents` or `~/Downloads` is ever opened, so the
-  macOS privacy prompt never fires (b2f108e8).
-- **CLI:** `csr-engine codemap add | remove | scan | status | query | watch`. `status` and `query` take `--json`;
-  `query` shows, per definition, which worktrees hold the same blob and which differ (b2f108e8, 1a175565).
-- **Three freshness signals** (1a175565): a 60 s poll of every enabled repo (`CSR_CODEMAP_POLL_SECS`), a file watcher
+- **Which repos: the ones your sessions are in.** SessionStart and PostToolUse write one row per working directory
+  to `codemap_signals` (one indexed upsert, 100 ms busy timeout, never a parse). The daemon polls and watches the
+  repos with a signal in the last 24 hours (`CSR_CODEMAP_ACTIVE_HOURS`), plus repos you named with `csr-engine
+  codemap add` or `CSR_CODEMAP_REPOS`, at most 16 (`CSR_CODEMAP_MAX_REPOS`; named repos first, then the newest
+  signal). Before, it followed 30 days of Claude Code history and every `code_nodes` project, so it polled repos you
+  had not touched in weeks. A repo that goes idle is no longer polled or watched but keeps its views, blobs and defs:
+  the next signal rescans it warm (parses 0 blobs when nothing changed). Deleting idle repos is not done; garbage
+  collection is unchanged. A cwd that is your home, a temp folder or not a git repo maps nothing. The map only reads
+  repos: no git command that writes, no index refresh. Caps: 5000 files per view, 512 KiB per file (5d718598,
+  005bef70, 7d3a78b6).
+- **Repos in Desktop, Documents and Downloads are mapped by the session, never by the daemon.** The daemon still
+  never opens anything under `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or `/Volumes`, so the macOS
+  privacy prompt never fires for it; the protected-folder test is lexical (case-folded, the `/System/Volumes/Data`
+  firmlink included) and runs before any filesystem call (ff464b68). A session already working in such a folder has
+  opened it, so SessionStart there starts one detached `csr-engine codemap scan --repo <cwd> --session`, and
+  PostToolUse queues the edited file and starts one detached `codemap drain --repo <cwd>` unless one is running.
+  The drain waits out a 5 s debounce, rescans the queued files (the whole repo when HEAD or the index moved),
+  repeats while new edits arrive and exits (after nine minutes at the latest). Both children have no stdio and are never waited on, so the hook returns
+  at once; one spawn per hook call, no retries, and the in-flight check is a lock file next to the database. `--session`
+  opens only the one protected folder the cwd is in, only in those two processes. **Lag:** nothing watches a
+  protected folder, so an edit made outside Claude in a protected repo is not seen until the next session event in
+  that repo (36ad2718).
+- **One scan per repo at a time, across processes.** A per-repo file lock (heavy-scan permit first, then the lock)
+  keeps the daemon, `codemap scan` and a session drain from scanning the same repo together (a748e4d4).
+- **`codemap status` says what it skips.** Text and JSON list `skipped: [{ path, reason }]` with `protected-folder:
+  mapped by session only`, `idle > <N>h`, `cap <N>` or `CSR_NO_CODEMAP`; a protected repo a session mapped shows its
+  views and the protected reason together. `csr-engine status` carries the same list in its `codemap` block. It is
+  built from stored rows and signals with no filesystem call (04f65045).
+- **CLI:** `csr-engine codemap add | remove | scan | drain | status | query | watch`. `status` and `query` take
+  `--json`; `query` shows, per definition, which worktrees hold the same blob and which differ (b2f108e8, 1a175565).
+  `scan --session` and `drain` are what the hooks start for protected folders; you rarely run them by hand.
+- **Three freshness signals** (1a175565): a 60 s poll of every active repo (`CSR_CODEMAP_POLL_SECS`), a file watcher
   with a 5 s debounce (`CSR_CODEMAP_NO_WATCH=1` turns it off), and a queue the PostToolUse hook fills with one insert
   and no parse. A dirty edit shows in 5.1-5.4 s. A commit shows in 5.1 s with the watcher and in 36-54 s by the poll
   alone. `git worktree add` takes 33-48 s to appear and `remove` 39-42 s. 2,000 files written under `target/` caused
   0 rescans.
-- **Cost, measured with `codemap watch` on the owner's machine under real load** (7 repos, 41 views, 28 watch roots,
-  34,728 defs): the cold first map peaks at 100 MB max RSS and uses 11.0 s CPU over about 400 s; a warm watch holds
-  62.5 MB max RSS and uses 0.85 s CPU over 130 s; a `codemap status` call alone is 16.2 MB.
+- **Cost (sandbox, session scope), `codemap watch` on a clone of the owner's database with a SessionStart signal for
+  each repo worked in during the last 24 h:** 3 repos, 12 views, 4,351 view-file pairs, 1,493 unique blobs, 34,008
+  defs (the fourth cwd, `this-ai-life`, is not a git repo and maps nothing). Cold, 420 s: 96.6 MB max RSS and 15.8 s
+  CPU (14.23 s user + 1.53 s sys); the three repos mapped in 1.3 s, 5.6 s and 10.8 s. Warm, 130 s: 30.2 MB max RSS
+  and 0.77 s CPU (0.19 s user + 0.58 s sys), 0 blobs parsed. Not comparable one to one with the earlier run (7 repos, 41
+  views, live machine under load, 30-day repo set: 100 MB and 11.0 s CPU cold, 62.5 MB and 0.85 s CPU warm); the
+  repo set differs, and the cold CPU here is higher, not lower. Hook cost, 10 runs each,
+  codemap on against `CSR_NO_CODEMAP=1` on the same sandbox database: SessionStart median 304 ms against 303 ms
+  (second pass 428 against 392), PostToolUse median 4,820 ms against 4,529 ms (second pass 4,191 against 4,152);
+  the 4 s is the existing hook, the codemap share is inside the run-to-run noise.
 - **Two tools and `status` use it, with no new MCP tool (still 16).** `csr_search_by_file` appends a `<code_map>`
   section after the ledger: for each matching path (an absolute path by its worktree, else an exact repo-relative
   path, else a suffix on a `/` boundary, at most 10) the views holding it grouped by blob, such as `same blob in main,
