@@ -154,8 +154,7 @@ fn temp_db() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 
 #[test]
 fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
-    let _guard = crate::daemon::dream_cadence::env_test_guard();
-    std::env::remove_var("CSR_NO_CODEMAP");
+    let _switch = crate::codemap::test_switch::force(false);
     let (_dir, db_path, projects_dir) = temp_db();
     let storage = Storage::open(&db_path).unwrap();
 
@@ -233,8 +232,7 @@ fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
 
 #[test]
 fn status_survives_a_database_without_the_codemap_tables() {
-    let _guard = crate::daemon::dream_cadence::env_test_guard();
-    std::env::remove_var("CSR_NO_CODEMAP");
+    let _switch = crate::codemap::test_switch::force(false);
     let (_dir, db_path, projects_dir) = temp_db();
     let storage = Storage::open(&db_path).unwrap();
     storage
@@ -252,11 +250,9 @@ fn status_survives_a_database_without_the_codemap_tables() {
 
 #[test]
 fn status_reports_the_kill_switch_in_the_block() {
-    let _guard = crate::daemon::dream_cadence::env_test_guard();
     let (_dir, db_path, projects_dir) = temp_db();
     let _storage = Storage::open(&db_path).unwrap();
-    std::env::set_var("CSR_NO_CODEMAP", "1");
+    let _switch = crate::codemap::test_switch::force(true);
     let report = gather_status(&db_path, &projects_dir, false);
-    std::env::remove_var("CSR_NO_CODEMAP");
     assert!(report.unwrap().codemap.disabled);
 }

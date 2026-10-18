@@ -79,11 +79,47 @@ pub fn extractor_version() -> &'static str {
 /// Kill switch: `CSR_NO_CODEMAP=1` (or `true`). The daemon job, the watcher,
 /// the hook enqueue and the CLI all ask this one function.
 pub fn disabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = test_switch::get() {
+        return forced;
+    }
     disabled_value(std::env::var("CSR_NO_CODEMAP").ok().as_deref())
 }
 
 fn disabled_value(value: Option<&str>) -> bool {
     value.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Test-only override of the kill switch. `cargo test --lib` runs every module in
+/// one process, so a test that set `CSR_NO_CODEMAP` with `set_var` turned the map
+/// off for every scanner test running at the same moment. The override is
+/// thread-local: it is consulted first by `disabled()` on the thread that holds
+/// the guard, and no other test sees it.
+#[cfg(test)]
+pub(crate) mod test_switch {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn get() -> Option<bool> {
+        FORCED.with(Cell::get)
+    }
+
+    /// Restores the previous override when dropped.
+    pub(crate) struct Guard(Option<bool>);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCED.with(|f| f.set(self.0));
+        }
+    }
+
+    /// Force `disabled()` to `value` on this thread until the guard drops.
+    pub(crate) fn force(value: bool) -> Guard {
+        Guard(FORCED.with(|f| f.replace(Some(value))))
+    }
 }
 
 /// Nanoseconds since the epoch: the `codemap_queue.enqueued_at` unit.
@@ -137,6 +173,21 @@ mod tests_mod {
         assert!(!disabled_value(Some("0")));
         assert!(!disabled_value(Some("")));
         assert!(!disabled_value(None));
+    }
+
+    #[test]
+    fn the_test_override_is_thread_local_and_restores_on_drop() {
+        let outer = test_switch::force(true);
+        assert!(disabled(), "forced on for this thread");
+        {
+            let _inner = test_switch::force(false);
+            assert!(!disabled(), "an inner guard wins");
+        }
+        assert!(disabled(), "the outer override is back");
+        let other = std::thread::spawn(test_switch::get).join().unwrap();
+        assert_eq!(other, None, "another thread sees no override");
+        drop(outer);
+        assert_eq!(test_switch::get(), None);
     }
 
     #[test]

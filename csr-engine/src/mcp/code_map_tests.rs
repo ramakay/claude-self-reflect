@@ -271,12 +271,11 @@ fn a_file_argument_reuses_the_path_resolution() {
 /// switch.
 #[test]
 fn the_public_tools_honour_csr_no_codemap() {
-    let _guard = crate::daemon::dream_cadence::env_test_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     let (_m, storage) = scanned_storage();
-    std::env::remove_var("CSR_NO_CODEMAP");
+    let on_switch = crate::codemap::test_switch::force(false);
     let on = rt
         .block_on(super::tools::search_by_file(
             &storage,
@@ -286,7 +285,8 @@ fn the_public_tools_honour_csr_no_codemap() {
         ))
         .unwrap();
     assert!(on.contains("<code_map"), "{on}");
-    std::env::set_var("CSR_NO_CODEMAP", "1");
+    drop(on_switch);
+    let _off_switch = crate::codemap::test_switch::force(true);
     let off = rt
         .block_on(super::tools::search_by_file(
             &storage,
@@ -295,7 +295,6 @@ fn the_public_tools_honour_csr_no_codemap() {
             None,
         ))
         .unwrap();
-    std::env::remove_var("CSR_NO_CODEMAP");
     assert!(!off.contains("<code_map"), "{off}");
     assert!(off.contains("No conversations found analyzing"), "{off}");
 }
