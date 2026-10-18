@@ -5863,3 +5863,309 @@ class StoryNews(unittest.TestCase):
             ran = subprocess.run([sys.executable, '-I', script, '--repo', self.tmp.name, *argv], capture_output=True, text=True,
                                  env=env, timeout=30)
             self.assertEqual((ran.returncode, json.loads(ran.stdout)), (0, dict(story=False)), ran.stderr)
+
+
+class TouchedSymbols(unittest.TestCase):
+    """12-18: a session that edited radio.tsx's reel deep link and reverted a layout got the note about StationCard,
+    which it never touched: a shift note fired on the FILE. It now comes only when the symbol's current span meets a
+    line the call touches (a Read's offset and limit, where an Edit's old_string stands, what a Write changes), the
+    span being where csr-engine's `symbol span` says the symbol is now."""
+
+    F_SPAN = [1, 3]
+    G_SPAN = [5, 7]
+    SOURCE = ('def f():\n    a = 10\n    return a\n\ndef g():\n    b = 20\n    return b\n\n\ndef h():\n    return 0\n')
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.root = os.path.realpath(os.path.join(self.tmp, 'repo'))
+        os.makedirs(self.root)
+        self.git = lambda *a: subprocess.run(['git', '-C', self.root, *a], capture_output=True, text=True,
+                                             check=True).stdout.strip()
+        self.git('init', '-q', '-b', 'main')
+        self.git('config', 'user.email', 't@t')
+        self.git('config', 'user.name', 't')
+        self.git('config', 'commit.gpgsign', 'false')
+        self.path = os.path.join(self.root, 'a.py')
+        self.put(self.SOURCE.replace('10', '1').replace('20', '2'))
+        self.git('add', '-A')
+        self.git('commit', '-qm', 'first')
+        self.put(self.SOURCE.replace('20', '2'))
+        self.git('commit', '-qam', 'change f')
+        self.on_f = self.git('rev-parse', 'HEAD')
+        self.put(self.SOURCE)
+        self.git('commit', '-qam', 'change g')
+        self.on_g = self.git('rev-parse', 'HEAD')
+        self.home = os.path.join(self.tmp, 'home')
+        self.log = os.path.join(self.tmp, 'engine.log')
+        con = sqlite3.connect(':memory:')
+        con.executescript("""
+          create table meta(key text primary key, value text);
+          create table witness_ledger(id integer primary key, project text, file text, symbol text, created_at text,
+            at_oid text);
+          create table witness_verdicts(id integer primary key, witness_id int, verdict text, receipt_oid text,
+            observed_head_oid text, created_at text, receipt_committed_at text);
+          create table witness_chunk_bindings(witness_id int, chunk_id text);
+          create table chunks(id text, conversation_id text, timestamp text);
+          create table episode_anchors(session_id text, file text, name text, created_at text);
+          create table code_nodes(file text, name text, last_conv_id text, last_seen text);
+          create table session_registry(session_id text, first_prompt text, first_ts text);
+          create table intent_events(kind text, file text, ts text, quote text, session_id text);
+        """)
+        self.con = con
+        self.addCleanup(con.close)
+        self.shift(1, 'f', self.on_f, '2026-10-10T11:00:00Z')
+        self.shift(2, 'g', self.on_g, '2026-10-10T12:00:00Z')
+        for symbol in ('f', 'g'):
+            con.execute("insert into code_nodes values (?, ?, 'sess-old', '2026-10-10T10:00:00Z')", (self.path, symbol))
+        con.execute("insert into chunks values ('c2', 'sess-old', '2026-10-10T10:05:00Z')")
+        con.execute("insert into session_registry values ('sess-old', 'build the thing', '2026-10-10T09:00:00Z')")
+        for patched in (mock.patch.object(pane, 'AUTHOR_LOG', os.path.join(self.tmp, 'keep', 'merge-authors.jsonl')),
+                        mock.patch.object(pane, 'WHAT_LOG', os.path.join(self.tmp, 'keep', 'shift-whats.jsonl')),
+                        mock.patch.object(pane, 'KEEP', os.path.join(self.tmp, 'keep')),
+                        mock.patch.object(pane, 'first_prompts', lambda: {})):
+            patched.start()
+            self.addCleanup(patched.stop)
+        for cache in (pane._SHIFTS, pane._AUTHORS, pane._AUTHORS_READ, pane._WHATS, pane._WHATS_READ):
+            cache.clear()
+            self.addCleanup(cache.clear)
+        self.engine()
+
+    def put(self, source):
+        with open(self.path, 'w') as handle:
+            handle.write(source)
+
+    def shift(self, wid, symbol, receipt, when):
+        self.con.execute('insert into witness_ledger values (?, ?, ?, ?, ?, ?)',
+                         (wid, 'repo', self.path, symbol, '2026-10-10T10:00:00Z', receipt))
+        self.con.execute("insert into witness_verdicts values (?, ?, 'superseded_by', ?, ?, '2026-10-10T12:00:00Z', ?)",
+                         (wid, wid, receipt, receipt, when))
+
+    def rule(self):
+        self.con.execute("insert into intent_events values ('correction', 'a.py', '2026-10-09T10:00:00Z', "
+                         "'never rename f', 'sess-old')")
+
+    def engine(self, spans=None, fail=False, wait=0, summary=None):
+        """A csr-engine stand-in: `symbol span` answers `spans` (f and g where they stand now) or fails, and logs the
+        call with whatever came on stdin; `symbol change --batch` answers each question with no summary."""
+        spans = spans if spans is not None else dict(file='a.py', lines=11, symbols=dict(f=self.F_SPAN, g=self.G_SPAN, h=[10, 11]))
+        script = os.path.join(self.tmp, 'csr-engine')
+        with open(script, 'w') as handle:
+            handle.write(
+                f"#!{sys.executable}\nimport json, sys, time\nlog = open({self.log!r}, 'a')\n"
+                "if sys.argv[1:3] == ['symbol', 'span']:\n"
+                "    held = sys.stdin.read() if '--stdin' in sys.argv else None\n"
+                "    log.write(json.dumps(dict(span=sys.argv[3:], stdin=held)) + '\\n')\n"
+                "    log.flush()\n"
+                f"    time.sleep({wait})\n"
+                f"    if {fail!r}:\n        print(json.dumps(dict(error='no')))\n        sys.exit(1)\n"
+                f"    print(json.dumps({spans!r}))\n"
+                "else:\n"
+                "    log.write(json.dumps(dict(change=sys.argv[1:])) + '\\n')\n"
+                "    log.flush()\n"
+                "    for line in sys.stdin:\n        q = json.loads(line)\n"
+                "        print(json.dumps(dict(oid=q['oid'], merge=False, authored=True, author=q['oid'],"
+                f" author_committed_at='2026-10-10T10:30:00+00:00', summary={summary!r})), flush=True)\n")
+        os.chmod(script, 0o755)
+        patcher = mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': script})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return script
+
+    def span_calls(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as handle:
+            return [json.loads(line) for line in handle if '"span"' in line]
+
+    def symbols(self, touch):
+        """The symbols of the shift notes a call touching these lines gets, and the candidate count."""
+        counts = {}
+        notes = pane.notes_for(self.con, self.root, self.path, 'sess-now', touch=pane.touch_of(touch, self.path),
+                               counts=counts)
+        return [n['symbol'] for n in notes if n['kind'] == 'shift'], counts['candidates']
+
+    def test_without_a_touch_the_note_is_the_files_as_it_was(self):
+        notes = pane.notes_for(self.con, self.root, self.path, 'sess-now')
+        self.assertEqual([n['symbol'] for n in notes], ['g'])  # the latest commit's note, one per past session
+        self.assertEqual(self.span_calls(), [])  # and the engine was never asked where the symbols are
+
+    def test_a_note_that_passes_the_filter_still_says_what_the_commit_changed(self):
+        self.engine(summary='10 → 11')
+        counts = {}
+        note, = pane.notes_for(self.con, self.root, self.path, 'sess-now', counts=counts,
+                               touch=pane.touch_of(dict(tool='Edit', old_string='a = 10', new_string='a = 11'), self.path))
+        self.assertEqual((note['symbol'], note['oid'], note['what']), ('f', self.on_f, '10 → 11'))
+        self.assertTrue(note['line'].endswith(' What changed: 10 → 11.'), note['line'])
+        self.assertIn('What changed: 10 → 11.', note['text'])
+
+    def test_a_whole_file_read_names_no_symbol_but_keeps_a_rule(self):
+        self.rule()
+        notes = pane.notes_for(self.con, self.root, self.path, 'sess-now', touch=pane.touch_of(dict(tool='Read'), self.path))
+        self.assertEqual([n['kind'] for n in notes], ['rule'])
+        self.assertEqual(self.span_calls(), [])  # no lines to meet, so nobody was asked
+        _, candidates = self.symbols(dict(tool='Read'))
+        self.assertEqual(candidates, 2)  # the shift note and the rule it would have been
+
+    def test_a_read_with_a_window_names_the_symbols_in_it(self):
+        self.assertEqual(self.symbols(dict(tool='Read', offset=1, limit=3))[0], ['f'])
+        self.assertEqual(self.symbols(dict(tool='Read', offset=4, limit=3))[0], ['g'])
+        self.assertEqual(self.symbols(dict(tool='Read', offset=3, limit=3))[0], ['g'])  # both: the latest commit's note
+        self.assertEqual(self.symbols(dict(tool='Read', offset=8, limit=2))[0], [])  # between g and h
+        self.assertEqual(self.symbols(dict(tool='Read', limit=2))[0], ['f'])  # from the top
+        self.assertEqual(self.symbols(dict(tool='Read', offset=6))[0], ['g'])  # from there on (2000 lines)
+
+    def test_an_edit_fires_for_the_symbol_its_old_string_stands_in(self):
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='a = 10', new_string='a = 11'))[0], ['f'])
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='b = 20', new_string='b = 21'))[0], ['g'])
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='return 0', new_string='return 1'))[0], [])  # h: no note
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='not in the file', new_string='x'))[0], [])
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='', new_string='x'))[0], [])
+
+    def test_an_edit_takes_the_first_occurrence_unless_it_replaces_all(self):
+        first = dict(tool='Edit', old_string='    return', new_string='    yield')
+        self.assertEqual(pane.touch_of(first, self.path)['ranges'], [(3, 3)])
+        self.assertEqual(self.symbols(first)[0], ['f'])
+        every = dict(first, replace_all=True)
+        self.assertEqual(pane.touch_of(every, self.path)['ranges'], [(3, 3), (7, 7), (11, 11)])
+        self.assertEqual(self.symbols(every)[0], ['g'])  # f and g both: the latest commit's note
+
+    def test_a_multi_line_old_string_covers_its_lines(self):
+        edit = dict(tool='Edit', old_string='    return a\n\ndef g():\n', new_string='')
+        self.assertEqual(pane.touch_of(edit, self.path)['ranges'], [(3, 5)])
+        self.assertEqual(self.symbols(edit)[0], ['g'])
+
+    def test_a_multi_edit_is_the_union_and_skips_what_is_not_found(self):
+        edits = [dict(old_string='a = 10', new_string='a = 1'), dict(old_string='nowhere', new_string='x'),
+                 dict(old_string='return 0', new_string='return 5')]
+        touch = dict(tool='MultiEdit', edits=edits)
+        self.assertEqual(pane.touch_of(touch, self.path)['ranges'], [(2, 2), (11, 11)])
+        self.assertEqual(self.symbols(touch)[0], ['f'])
+        # the second edit is looked for in the ORIGINAL text, not in what the first one makes
+        chained = dict(tool='MultiEdit', edits=[dict(old_string='a = 10', new_string='z = 99'),
+                                                dict(old_string='z = 99', new_string='y')])
+        self.assertEqual(pane.touch_of(chained, self.path)['ranges'], [(2, 2)])
+
+    def test_a_write_fires_only_for_the_lines_that_differ(self):
+        same_but_g = self.SOURCE.replace('b = 20', 'b = 21')
+        self.assertEqual(pane.touch_of(dict(tool='Write', content=same_but_g), self.path)['ranges'], [(6, 6)])
+        self.assertEqual(self.symbols(dict(tool='Write', content=same_but_g))[0], ['g'])
+        self.assertEqual(self.symbols(dict(tool='Write', content=self.SOURCE.replace('a = 10', 'a = 11')))[0], ['f'])
+        self.assertEqual(self.symbols(dict(tool='Write', content=self.SOURCE))[0], [])  # nothing changed
+        grown = self.SOURCE.replace('def h():', '# new\n# lines\ndef h():')
+        self.assertEqual(pane.touch_of(dict(tool='Write', content=grown), self.path)['ranges'], [(9, 9)])  # after line 9
+        removed = self.SOURCE.replace('    a = 10\n', '')
+        self.assertEqual(pane.touch_of(dict(tool='Write', content=removed), self.path)['ranges'], [(2, 2)])
+        top = '# header\n' + self.SOURCE
+        self.assertEqual(pane.touch_of(dict(tool='Write', content=top), self.path)['ranges'], [(1, 1)])
+
+    def test_a_write_to_a_file_that_is_not_there_names_no_symbol(self):
+        gone = os.path.join(self.root, 'new.py')
+        self.assertEqual(pane.touch_of(dict(tool='Write', content='def f():\n    pass\n'), gone)['ranges'], [])
+
+    def test_other_tools_and_calls_too_big_name_no_symbol(self):
+        for touch in (dict(tool='NotebookEdit', cell_id='1', new_source='x'), dict(tool='Bash'), dict(tool='Edit', too_big=True),
+                      dict(tool='Write', too_big=True, content='x'), {}, [], None, 'Edit'):
+            with self.subTest(touch=touch):
+                self.assertEqual(pane.touch_of(touch, self.path)['ranges'], [])
+                self.assertEqual(pane.touch_of(touch, self.path)['text'], None)
+        self.assertEqual(self.span_calls(), [])
+
+    def test_the_file_as_the_tool_found_it_is_what_the_lines_and_the_engine_read(self):
+        # The tool may have run by the time the pane starts: the caller hands the file as it was.
+        was = self.SOURCE
+        self.put(self.SOURCE.replace('a = 10', 'a = 10\n    a += 1\n    a += 2\n    a += 3'))  # the tool ran
+        touch = dict(tool='Edit', old_string='b = 20', new_string='b = 21', before=was)
+        self.assertEqual(pane.touch_of(touch, self.path), dict(ranges=[(6, 6)], text=was))
+        self.assertEqual(self.symbols(touch)[0], ['g'])
+        call, = self.span_calls()
+        self.assertEqual(call, dict(span=['--repo', self.root, '--file', 'a.py', '--stdin'], stdin=was))
+        # a file that was not there, or could not be read, gives nothing to place
+        self.assertEqual(pane.touch_of(dict(tool='Edit', old_string='b = 20', before=None), self.path)['ranges'], [])
+        self.assertEqual(pane.touch_of(dict(tool='Write', content='x', before=None), self.path)['ranges'], [])
+
+    def test_without_a_snapshot_the_engine_reads_the_working_tree(self):
+        self.symbols(dict(tool='Read', offset=1, limit=3))
+        self.assertEqual(self.span_calls(), [dict(span=['--repo', self.root, '--file', 'a.py'], stdin=None)])
+
+    def test_one_engine_call_per_read_and_none_for_a_file_with_no_shift(self):
+        self.symbols(dict(tool='Edit', old_string='a = 10', new_string='x'))
+        self.assertEqual(len(self.span_calls()), 1)
+        self.con.execute('delete from witness_verdicts')
+        pane._SHIFTS.clear()
+        self.symbols(dict(tool='Edit', old_string='a = 10', new_string='x'))
+        self.assertEqual(len(self.span_calls()), 1)
+
+    def test_an_engine_that_cannot_say_drops_the_symbol_notes_and_keeps_the_rules(self):
+        self.rule()
+        touch = dict(tool='Edit', old_string='a = 10', new_string='x')
+        for how in (dict(fail=True), dict(spans=dict(file='a.py', lines='?', symbols={})), dict(spans=dict(lines=3, symbols='no'))):
+            with self.subTest(how=how):
+                self.engine(**how)
+                notes = pane.notes_for(self.con, self.root, self.path, 'sess-now', touch=pane.touch_of(touch, self.path))
+                self.assertEqual([n['kind'] for n in notes], ['rule'])
+        with mock.patch.dict(os.environ, {'CSR_ENGINE_BIN': os.path.join(self.tmp, 'no-such-engine')}):
+            notes = pane.notes_for(self.con, self.root, self.path, 'sess-now', touch=pane.touch_of(touch, self.path))
+        self.assertEqual([n['kind'] for n in notes], ['rule'])
+
+    def test_an_engine_slower_than_the_wait_drops_the_symbol_notes(self):
+        self.engine(wait=3)
+        with mock.patch.object(pane, 'ENGINE_WAIT', 0.5):
+            notes = pane.notes_for(self.con, self.root, self.path, 'sess-now',
+                                   touch=pane.touch_of(dict(tool='Edit', old_string='a = 10', new_string='x'), self.path))
+        self.assertEqual(notes, [])
+
+    def test_a_symbol_that_is_not_in_the_file_now_does_not_fire(self):
+        self.engine(spans=dict(file='a.py', lines=11, symbols=dict(g=self.G_SPAN)))  # f was renamed or removed
+        self.assertEqual(self.symbols(dict(tool='Read', offset=1, limit=11))[0], ['g'])
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='a = 10', new_string='x'))[0], [])
+
+    def test_a_whole_file_witness_stands_over_every_line(self):
+        self.con.execute('update witness_ledger set symbol = null where id = 2')
+        self.con.execute("insert into witness_chunk_bindings values (2, 'c2')")  # a whole-file witness is bound by chunk
+        pane._SHIFTS.clear()
+        self.assertEqual(self.symbols(dict(tool='Edit', old_string='return 0', new_string='x'))[0], ['a.py'])
+        self.assertEqual(self.symbols(dict(tool='Read'))[0], [])  # unless the whole file is all it asked for
+
+    def command(self, *argv, stdin=None):
+        os.makedirs(os.path.join(self.home, '.claude-self-reflect'), exist_ok=True)
+        disk = sqlite3.connect(os.path.join(self.home, '.claude-self-reflect', 'csr-engine.db'))
+        self.con.commit()  # a backup waits on a connection with a transaction still open
+        self.con.backup(disk)
+        disk.close()
+        env = {k: v for k, v in os.environ.items() if k != 'TERM_PROGRAM'}
+        env.update(HOME=self.home, CSR_NO_AI_NARRATIVES='1')
+        script = os.path.join(HERE, '..', 'bin', 'pane.py')
+        return subprocess.run([sys.executable, '-I', script, '--repo', self.root, '--note', self.path, '--sid', 'sess-now', *argv],
+                              input=stdin, capture_output=True, text=True, env=env, timeout=60)
+
+    def test_the_command_line_answers_a_list_without_a_touch_and_notes_with_candidates_with_one(self):
+        self.rule()
+        plain = self.command()
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        listed = json.loads(plain.stdout)
+        self.assertEqual([n['kind'] for n in listed], ['rule', 'shift'])
+        self.assertEqual(plain.stdout.strip(), json.dumps(listed))
+        both = self.command('--touch', '-', stdin=json.dumps(dict(tool='Edit', old_string='a = 10', new_string='x')))
+        self.assertEqual(both.returncode, 0, both.stderr)
+        answer = json.loads(both.stdout)
+        self.assertEqual(sorted(answer), ['candidates', 'notes'])
+        self.assertEqual((answer['candidates'], [(n['kind'], n['symbol']) for n in answer['notes']]),
+                         (2, [('rule', None), ('shift', 'f')]))
+        whole = json.loads(self.command('--touch', '-', stdin=json.dumps(dict(tool='Read'))).stdout)
+        self.assertEqual((whole['candidates'], [n['kind'] for n in whole['notes']]), (2, ['rule']))
+        for bad in ('not json', '', '[1]', json.dumps(dict(tool='Edit', too_big=True))):
+            with self.subTest(stdin=bad):
+                answer = json.loads(self.command('--touch', '-', stdin=bad).stdout)
+                self.assertEqual((answer['candidates'], [n['kind'] for n in answer['notes']]), (2, ['rule']))
+
+    def test_the_command_line_off_a_repo_answers_empty_in_each_shape(self):
+        os.makedirs(os.path.join(self.tmp, 'plain'))
+        stray = os.path.join(self.tmp, 'plain', 'x.py')
+        env = {k: v for k, v in os.environ.items() if k != 'TERM_PROGRAM'}
+        env.update(HOME=self.home)
+        script = os.path.join(HERE, '..', 'bin', 'pane.py')
+        for argv, want in ((['--note', stray], []), (['--note', stray, '--touch', '-'], dict(notes=[], candidates=0))):
+            ran = subprocess.run([sys.executable, '-I', script, '--repo', self.root, *argv], input='{}', capture_output=True,
+                                 text=True, env=env, timeout=60)
+            self.assertEqual(json.loads(ran.stdout), want, ran.stderr)

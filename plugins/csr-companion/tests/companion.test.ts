@@ -57,6 +57,8 @@ type World = {
   herdr: boolean
   repo: boolean
   notes?: unknown[]
+  candidates?: number // how many notes pane.py says there would be for any touch; the notes' count where left out
+  plainNotes?: boolean // pane.py answers a bare list, as before --touch
   coach?: unknown[]
   clock?: { now: number } // moved by a test; NOW where left out
   unreadable?: string[] // files that are there but fail to read
@@ -105,6 +107,7 @@ const MARKER = `${HOME}/.claude-self-reflect/csr-companion/compacting/sess-1.jso
 function host(on: On, world: World) {
   mainNext = 0
   const runs: string[][] = []
+  const touches: Array<{ argv: string[]; stdin?: string }> = [] // every `pane.py --note FILE --touch -`, with what it was given on stdin
   const statuses: Array<string | undefined> = []
   const opened: string[] = []
   const filled: string[] = []
@@ -274,7 +277,12 @@ function host(on: On, world: World) {
       if (write) files.set(path, JSON.stringify(write))
       return ok(JSON.stringify({ held: answer, lease: write ?? held }))
     }
-    if (e.argv[0] === 'python3' && e.argv.includes('--note')) return ok(JSON.stringify(world.notes ?? []))
+    if (e.argv[0] === 'python3' && e.argv.includes('--note')) {
+      if (!e.argv.includes('--touch')) return ok(JSON.stringify(world.notes ?? []))
+      touches.push({ argv: [...e.argv], stdin: e.init?.stdin }) // `--touch -`: the tool call, as JSON on stdin
+      if (world.plainNotes) return ok(JSON.stringify(world.notes ?? [])) // a pane from before --touch
+      return ok(JSON.stringify({ notes: world.notes ?? [], candidates: world.candidates ?? (world.notes ?? []).length }))
+    }
     if (e.argv[0] === 'python3' && e.argv.includes('--coach')) return ok(JSON.stringify(world.coach ?? []))
     if (e.argv[0] === 'python3' && e.argv.includes('--lost')) {
       if (world.lost === 'hangs') { // process.run rejects past timeoutMs; without the 2 s limit it 'answers' instead
@@ -313,7 +321,7 @@ function host(on: On, world: World) {
     opened.push(e.id)
     return { value: { isPlaced: true } }
   })
-  return { runs, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock, logged }
+  return { runs, touches, statuses, opened, filled, forks, kept, store, configured, files, writes, compacting, toasts, compacted, everies, clock, logged }
 }
 
 async function settle(done: () => boolean | Promise<boolean>) {
@@ -411,6 +419,101 @@ test('an edit to a file CSR remembers offers one note; Learn more opens it; Chat
   expect(seen.filled[0]).toContain(NOTE.line)
   expect(seen.filled[0]).toContain('commit ca5655a')
   expect(await band.find({ text: /changed in ca5655a/ })).toBeUndefined()
+})
+
+// A note about a symbol comes only when the call touches the symbol: the pane is given the call on stdin (never in
+// argv: a Write's content can be megabytes) and the file as it was before the tool ran.
+const EDITED = '/repo/src/touch/edited.rs'
+const argvOf = (seen: { touches: Array<{ argv: string[]; stdin?: string }> }) => seen.touches.map(touch => touch.argv.slice(3))
+
+test('an Edit reaches pane.py with its old_string and the file as it was on stdin, nothing of it in argv', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], files: { [EDITED]: 'fn a() {}\nfn b() { old }\n' } })
+  const band = await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Edit', file_path: EDITED, old_string: 'old', new_string: 'secret replacement', replace_all: true } as never)
+  await settle(async () => (await band.find({ text: /changed in ca5655a/ })) !== undefined)
+
+  expect(argvOf(seen)).toEqual([['--repo', EDITED, '--note', EDITED, '--sid', 'sess-1', '--touch', '-']])
+  expect(seen.touches[0]!.argv.join(' ')).not.toContain('old')
+  expect(JSON.parse(seen.touches[0]!.stdin ?? 'null')).toEqual({
+    tool: 'Edit',
+    old_string: 'old',
+    replace_all: true,
+    before: 'fn a() {}\nfn b() { old }\n',
+  })
+  expect(seen.touches[0]!.stdin).not.toContain('secret replacement') // what the tool writes is not the pane's business
+})
+
+test('a Read says its window, a MultiEdit only where its edits stand, a Write its content; a file that was not there is null', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], files: { '/repo/a.rs': 'x\ny\n', '/repo/b.rs': 'q\n' } })
+  await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/a.rs', offset: 70, limit: 20 } as never)
+  await $.tool.call({
+    tool: 'MultiEdit',
+    file_path: '/repo/a.rs',
+    edits: [{ old_string: 'x', new_string: 'NEW', replace_all: true }, { old_string: 'y', new_string: 'NEW2' }, { new_string: 'no old' }],
+  } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/repo/b.rs', content: 'rewritten\n' } as never)
+  await $.tool.call({ tool: 'Write', file_path: '/repo/new.rs', content: 'fresh\n' } as never)
+  await $.tool.call({ tool: 'NotebookEdit', notebook_path: '/repo/n.ipynb', new_source: 'x' } as never)
+  await settle(() => seen.touches.length >= 5)
+
+  const said = seen.touches.map(touch => JSON.parse(touch.stdin ?? 'null'))
+  expect(said).toEqual([
+    { tool: 'Read', offset: 70, limit: 20 },
+    { tool: 'MultiEdit', edits: [{ old_string: 'x', replace_all: true }, { old_string: 'y' }], before: 'x\ny\n' },
+    { tool: 'Write', content: 'rewritten\n', before: 'q\n' },
+    { tool: 'Write', content: 'fresh\n', before: null },
+    { tool: 'NotebookEdit' },
+  ])
+  expect(seen.touches.map(touch => touch.argv[4])).toEqual(['/repo/a.rs', '/repo/a.rs', '/repo/b.rs', '/repo/new.rs', '/repo/n.ipynb'])
+})
+
+test('a call whose input is past 8 MB is passed as too_big, not as the megabytes', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE] })
+  await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Write', file_path: '/repo/big.rs', content: 'x'.repeat(9 * 1024 * 1024) } as never)
+  await settle(() => seen.touches.length >= 1)
+  expect(seen.touches[0]!.stdin).toBe('{"tool":"Write","too_big":true}')
+})
+
+test('a file the pane had nothing to say about is not asked again; one with notes is asked about each new call, never the same call twice', async ($, on) => {
+  const quiet = host(on, { herdr: false, repo: true, notes: [], candidates: 0 })
+  await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/quiet.rs', old_string: 'a', new_string: 'b' } as never)
+  await settle(() => quiet.touches.length >= 1)
+  await $.tool.call({ tool: 'Edit', file_path: '/repo/quiet.rs', old_string: 'c', new_string: 'd' } as never)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/quiet.rs', offset: 3, limit: 4 } as never)
+  await settle(() => false)
+  expect(quiet.touches.length).toBe(1)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/other.rs' } as never) // another file is its own question
+  await settle(() => quiet.touches.length >= 2)
+  expect(quiet.touches.length).toBe(2)
+})
+
+test('an identical second call does not spawn the pane again; a different call on a file with candidates does', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], candidates: 1 })
+  await $.ui.mount(BAND)
+  const edit = { tool: 'Edit', file_path: '/repo/busy.rs', old_string: 'a', new_string: 'b' }
+  await $.tool.call(edit as never)
+  await settle(() => seen.touches.length >= 1)
+  await $.tool.call({ ...edit, new_string: 'something else' } as never) // the same lines asked about: the same call
+  await $.tool.call(edit as never)
+  await settle(() => false)
+  expect(seen.touches.length).toBe(1)
+
+  await $.tool.call({ ...edit, old_string: 'z' } as never)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/busy.rs', offset: 1, limit: 30 } as never)
+  await settle(() => seen.touches.length >= 3)
+  expect(seen.touches.map(touch => JSON.parse(touch.stdin ?? 'null').old_string ?? JSON.parse(touch.stdin ?? 'null').limit)).toEqual(['a', 'z', 30])
+})
+
+test('a pane from before --touch, answering a bare list, still offers its note', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, notes: [NOTE], plainNotes: true })
+  const band = await $.ui.mount(BAND)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/old-pane.rs', offset: 1, limit: 5 } as never)
+  await settle(async () => (await band.find({ text: /changed in ca5655a/ })) !== undefined)
+  expect(await band.find({ text: /changed in ca5655a/ })).toBeDefined()
+  expect(seen.touches.length).toBe(1)
 })
 
 test('a note is shown once: Knew this already keeps it away for good', async ($, on) => {

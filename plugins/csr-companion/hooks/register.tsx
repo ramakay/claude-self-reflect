@@ -5,6 +5,8 @@ import type { AgentState, CompactView, CompletionKey, CompletionDisposition, Inf
 import { admitCompletion, anyActive, claimCompletions, completionKey, completionNews, handoffRequests, parseAgentEnvelope, stripEnvelopes, emptyAgentState, isEditTool, LIST_EVERY_MS, markDisposition, normalizePath, pendingCompletions, planWrite, projectAgentsFile, reconcileAgentList, reduceAgentEvent, settleCompletions } from './agents'
 import type { AgentEvent, Envelope, Ledger, WritePlan } from './agents'
 import { carryBlock, waitingOn } from './carry'
+import { Asked, changesFile, parseAnswer, touchDigest, touchOf, touchPayload } from './touch'
+import type { Touch } from './touch'
 import { byteLength, subagentBlock } from './subagent'
 import type { Thread } from './carry'
 import { askClaude, citedCommits, citedFrom, cleanForDraft, dreamId, dreamPrompt, dreamSent, isYskOrigin, isYskPropose, leansOnOld, leaseHeld, markReceipts, nearDream, offersAnotherWay, ownPrompt, parseDream, rebuts, seenEntry, withCsrFacts, wordsBeside, yskFacts, yskLine } from './dreamer'
@@ -119,8 +121,8 @@ const view = atom({ plugin: 'csr-companion', key: 'view' } as const, null as Not
 
 type HerdrPane = { pane_id: string; tab_id?: string; workspace_id?: string; label?: string | null }
 
-async function run($: EngineInterface, argv: string[]): Promise<string | null> {
-  const ran = await $.process.run(['python3', '-I', script($), ...argv], { timeoutMs: 20_000 })
+async function run($: EngineInterface, argv: string[], stdin?: string): Promise<string | null> {
+  const ran = await $.process.run(['python3', '-I', script($), ...argv], { timeoutMs: 20_000, ...(stdin === undefined ? {} : { stdin }) })
   return ran.exitCode === 0 ? ran.stdout : null
 }
 
@@ -217,8 +219,8 @@ async function hostVariable($: EngineInterface, name: string): Promise<string | 
   return ran?.exitCode === 0 ? ran.stdout.replace(/\n$/, '') : undefined
 }
 
-async function json<T>($: EngineInterface, argv: string[]): Promise<T | null> {
-  const out = await run($, argv)
+async function json<T>($: EngineInterface, argv: string[], stdin?: string): Promise<T | null> {
+  const out = await run($, argv, stdin)
   if (out === null) return null
   try {
     return JSON.parse(out) as T
@@ -388,13 +390,28 @@ async function isBusy($: EngineInterface): Promise<boolean> {
 
 // ---------------------------------------------------------------- notes from CSR's memory
 
-const looked = new Set<string>() // files already looked up since this module loaded
+// What the pane has been asked since this module loaded. A note about a symbol comes only when the call touches the
+// symbol, so a file with something to say is asked again on each later call, but not twice about the same call; a
+// file the pane had nothing at all to say about, for any call, is not asked again.
+const asked = new Asked()
 
-async function offerFor($: EngineInterface, file: string, tag: NoteView['tag']): Promise<void> {
-  if (looked.has(file)) return
-  looked.add(file)
-  const notes = await json<Note[]>($, ['--repo', file, '--note', file, '--sid', await $.session.id()])
-  if (!notes?.length) return
+// Whether the pane is due for this call, and if so the file as it was before the tool ran: a tool that changes the
+// file may be done before the pane starts, so the text is read here, before `next`. The text goes to the pane with the
+// call. null: the file was not there or could not be read.
+async function claimOffer($: EngineInterface, file: string, touch: Touch): Promise<{ before?: string | null } | null> {
+  if (!asked.claim(file, touchDigest(touch))) return null
+  if (!changesFile(touch)) return {}
+  return { before: await $.fs.read(file).catch(() => null) }
+}
+
+async function offerFor($: EngineInterface, file: string, tag: NoteView['tag'], touch: Touch, before?: string | null): Promise<void> {
+  const answer = parseAnswer<Note>(
+    await json<unknown>($, ['--repo', file, '--note', file, '--sid', await $.session.id(), '--touch', '-'], touchPayload(touch, before)),
+  )
+  if (!answer) return
+  if (answer.candidates === 0) asked.silence(file)
+  const notes = answer.notes
+  if (!notes.length) return
   const skip = new Set([...(await strings($, 'seen')), ...(await strings($, 'known'))])
   const note = notes.find(candidate => !skip.has(candidate.id))
   if (note && (await show($, note, tag))) await remember($, 'seen', note.id)
@@ -2028,7 +2045,11 @@ export const register: Register = (on, options) => {
       const file = 'file_path' in e && typeof e.file_path === 'string'
         ? e.file_path
         : 'notebook_path' in e && typeof e.notebook_path === 'string' ? e.notebook_path : undefined
-      if (file) void offerFor($, file, e.tool === 'Read' ? 'You should know' : 'Heads up').catch(() => undefined)
+      if (file) {
+        const touch = touchOf(e as unknown as Record<string, unknown>)
+        const due = await claimOffer($, file, touch).catch(() => null)
+        if (due) void offerFor($, file, e.tool === 'Read' ? 'You should know' : 'Heads up', touch, due.before).catch(() => undefined)
+      }
     }
     // The agents: an agent's tool is alive when it begins and counted when it ends; the main loop's writes are kept
     // for the files an agent also wrote. `next` answers once, whatever these observations come to.

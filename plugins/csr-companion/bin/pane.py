@@ -15,7 +15,8 @@ report, in its own tint beside a pixel isometric icon:
       i session info, m shift map, r reads now (the legend counts down to the next read), q quits;
       a click opens a row, a second click puts it in Claude's prompt (herdr pane PANE)
   pane.py --repo PATH --png DIR [--sid ID]    write the pane's pictures, for a look
-  pane.py --repo PATH --note FILE [--sid ID]  what CSR remembers about FILE, as notes for the band
+  pane.py --repo PATH --note FILE [--sid ID] [--touch -]  what CSR remembers about FILE, as notes for the band; with
+      --touch - (the tool call as JSON on stdin) only for the symbols the call touches, as {notes, candidates}
   pane.py --repo PATH --brief --sid ID        what CSR remembers near this session, for the dreamer
   pane.py --repo PATH --keep JSON             add a dream, or an answer to one, to the dream log
   pane.py --repo PATH --compact-plan --sid ID --ctx N   the payback of compacting now at N tokens, for the mod
@@ -25,6 +26,7 @@ report, in its own tint beside a pixel isometric icon:
 import argparse
 import base64
 import bisect
+import difflib
 import fcntl
 import glob
 import hashlib
@@ -535,10 +537,154 @@ def has_commit(root, oid):
                           capture_output=True).returncode == 0
 
 
-def notes_for(con, root, path, session_id=None, before=None):
+TOUCH_MAX = 8 * 1024 * 1024  # bytes of a tool's input the pane will read from stdin; more is a call that names no symbol
+READ_LINES = 2000  # lines a Read gives when it names an offset but no limit (Claude Code's default)
+DIFF_EXACT = 8000  # lines (both sides together) up to which a Write is diffed without difflib's popular-line shortcut
+
+
+def lines_of(text):
+    """The lines of text, split on \\n alone as csr-engine counts them (no empty line after a final newline)."""
+    lines = text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
+    return lines
+
+
+def occurrences(text, needle, every):
+    """The 1-based inclusive (first, last) line of needle in text: of every occurrence when `every`, else the first."""
+    spans, at = [], 0
+    while needle:
+        found = text.find(needle, at)
+        if found < 0:
+            break
+        first = text.count('\n', 0, found) + 1
+        last = first + needle.count('\n') - (1 if needle.endswith('\n') else 0)
+        spans.append((first, max(first, last)))
+        if not every:
+            break
+        at = found + len(needle)
+    return spans
+
+
+def changed_lines(old, new):
+    """The lines of `old` that a Write of `new` replaces or removes, and the line each insertion lands after."""
+    a, b = lines_of(old), lines_of(new)
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=len(a) + len(b) > DIFF_EXACT)
+    spans = []
+    for tag, i1, i2, _, _ in matcher.get_opcodes():
+        if tag in ('replace', 'delete'):
+            spans.append((i1 + 1, i2))
+        elif tag == 'insert':
+            spans.append((max(1, i1), max(1, i1)))
+    return spans
+
+
+def int_or_none(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def touch_of(raw, path):
+    """What a tool call touches in the file at `path`, from the tool's own arguments (`raw`: Read/Edit/MultiEdit/Write/
+    NotebookEdit). {'ranges': [(first, last)], 'text': the file as the tool found it, when the caller held it}.
+    The ranges are 1-based inclusive lines of that file BEFORE the tool ran: a Read's offset and limit, where an Edit
+    or MultiEdit old_string stands (every occurrence with replace_all, else the first), the lines a Write's content
+    replaces or removes. No range, which means no symbol is touched, for a whole-file Read, a NotebookEdit, a Write to
+    a file that is not there, an old_string that is not found, a call too big to be passed, and anything unreadable.
+    The caller may hand the file as it was in `before` (a string, or null for a file that was not there): the tool
+    can run before this process reads the disk. Nothing here raises."""
+    touch = dict(ranges=[], text=None)
+    try:
+        if not isinstance(raw, dict) or raw.get('too_big'):
+            return touch
+        tool = raw.get('tool')
+        if tool == 'Read':
+            offset, limit = int_or_none(raw.get('offset')), int_or_none(raw.get('limit'))
+            if offset is None and limit is None:
+                return touch  # a whole-file Read names no symbol
+            first = max(1, offset or 1)
+            touch['ranges'] = [(first, first + max(1, limit or READ_LINES) - 1)]
+            return touch
+        if tool not in ('Edit', 'MultiEdit', 'Write'):
+            return touch
+        if 'before' in raw:
+            text = raw['before'] if isinstance(raw['before'], str) else None
+            touch['text'] = text
+        else:
+            try:
+                with open(path, 'rb') as handle:
+                    text = handle.read().decode('utf-8', 'replace')
+            except OSError:
+                text = None
+        if text is None:
+            return touch
+        if tool == 'Write':
+            if isinstance(raw.get('content'), str):
+                touch['ranges'] = changed_lines(text, raw['content'])
+            return touch
+        edits = raw.get('edits') if tool == 'MultiEdit' else [raw]
+        ranges = []
+        for edit in edits if isinstance(edits, list) else []:
+            if isinstance(edit, dict) and isinstance(edit.get('old_string'), str):
+                ranges += occurrences(text, edit['old_string'], edit.get('replace_all') is True)
+        touch['ranges'] = sorted(set(ranges))
+    except Exception:
+        touch['ranges'] = []
+    return touch
+
+
+def read_touch(spec):
+    """The tool call `--touch -` carries: one JSON object on stdin, or {} when there is none, it is too big or it is not one."""
+    if spec != '-':
+        return None
+    try:
+        text = sys.stdin.buffer.read(TOUCH_MAX + 1)
+        return json.loads(text.decode('utf-8', 'replace')) if len(text) <= TOUCH_MAX else dict(too_big=True)
+    except (OSError, ValueError):
+        return {}
+
+
+def current_spans(top, rel, text=None):
+    """Where each symbol of the file is now, from the engine's `symbol span` (named as the witness ledger names them):
+    ({symbol: (first, last)}, lines), 1-based inclusive. `text`: the file's bytes when the caller holds a snapshot, else
+    the working tree. None when there is no engine, it is slower than ENGINE_WAIT, or it cannot say (an unsupported
+    language, a file that does not parse): the symbols are then unknown, not absent."""
+    binary = engine_binary()
+    if not binary:
+        return None
+    cmd = [binary, 'symbol', 'span', '--repo', top, '--file', rel] + (['--stdin'] if text is not None else [])
+    try:
+        out = subprocess.run(cmd, input=text.encode('utf-8') if text is not None else None, capture_output=True,
+                             timeout=ENGINE_WAIT, stdin=None if text is not None else subprocess.DEVNULL)
+        answer = json.loads(out.stdout.decode('utf-8', 'replace')) if out.returncode == 0 else None
+        spans = {name: (int(a), int(b)) for name, (a, b) in answer['symbols'].items()}
+        return spans, int(answer['lines'])
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
+        return None
+
+
+def shifts_touched(shifts, ranges, spans):
+    """The shifts whose symbol now stands where the call touches: its current span meets one of the ranges. A shift
+    of the whole file (no symbol) stands over every line; a symbol that is not in the file now (removed, renamed)
+    stands nowhere. No spans, no shift."""
+    if not spans:
+        return []
+    found, lines = spans
+    kept = []
+    for shift in shifts:
+        span = found.get(shift['symbol']) if shift['symbol'] else (1, lines)
+        if span and any(first <= span[1] and span[0] <= last for first, last in ranges):
+            kept.append(shift)
+    return kept
+
+
+def notes_for(con, root, path, session_id=None, before=None, touch=None, counts=None):
     """Notes for one file, best first: a past session's work on it that a later commit changed,
     then a rule the person set for it. Each carries its receipts; no model calls. `before`: see
-    load_changes (the dreamer's brief only)."""
+    load_changes (the dreamer's brief only).
+
+    `touch` (touch_of): the call that is reading or editing the file. A symbol's note then comes only when the
+    symbol's current span meets a line the call touches; rule notes do not depend on the lines. `counts`, a dict,
+    gets 'candidates': how many shift and rule notes there would be without that filter."""
     rel = path[len(root) + 1:] if path.startswith(root + '/') else os.path.basename(path)
     name = os.path.basename(path)
     _, shifts = load_shifts(con, root)
@@ -550,16 +696,29 @@ def notes_for(con, root, path, session_id=None, before=None):
         _, theirs = load_shifts(con, main)
         mine += [shift for shift in theirs if shift['file'] == rel and has_commit(root, shift['oid'])]
     notes = []
-    chosen = []
-    for change in load_changes(con, mine, session_id, before):
-        if change['current'] and not change['earlier']:
-            continue  # this session's own work is not news to it
-        latest = max(change['shifts'], key=lambda s: s['at'])
-        same = [s for s in change['shifts'] if s['oid'] == latest['oid']]
-        chosen.append((change, latest, same))
+
+    def choose(shifts):
+        out = []
+        for change in load_changes(con, shifts, session_id, before):
+            if change['current'] and not change['earlier']:
+                continue  # this session's own work is not news to it
+            latest = max(change['shifts'], key=lambda s: s['at'])
+            same = [s for s in change['shifts'] if s['oid'] == latest['oid']]
+            out.append((change, latest, same))
+        return out
+
+    chosen = choose(mine)
+    candidates = len(chosen)
+    top = repo_root(root) if chosen else None
+    if touch is not None and chosen:
+        # Only the symbols the call touches speak: the shifts whose symbol's current span meets a touched line. One
+        # engine spawn says where the symbols are; no lines touched (a whole-file Read) asks nothing. An engine that
+        # cannot say leaves no symbol note, never all of them.
+        ranges = touch.get('ranges') or []
+        spans = current_spans(top, os.path.relpath(path, top), touch.get('text')) if top and ranges else None
+        chosen = choose(shifts_touched(mine, ranges, spans))
     # What each commit did inside its symbol: one engine spawn for all the notes below. Only a note about one
     # symbol that a commit changed is asked; for the others the engine's line would speak for one of several.
-    top = repo_root(root) if chosen else None
     picks = []
     for change, latest, same in chosen:
         symbol = same[0]['symbol']
@@ -608,6 +767,8 @@ def notes_for(con, root, path, session_id=None, before=None):
                                f"CSR keeps that correction; it has not been retracted since.",
                           sketch=[], symbol=None, oid=None, conversation=session, at=epoch(when) or 0))
     notes.sort(key=lambda n: (n['kind'] != 'rule', -n['at']))
+    if counts is not None:
+        counts['candidates'] = candidates + sum(1 for note in notes if note['kind'] == 'rule')
     return notes
 
 
@@ -8697,6 +8858,7 @@ def main():
     mode.add_argument('--coach', action='store_true', help='words you said in 2+ sessions that Claude looked up, as band notes')
     mode.add_argument('--compact-plan', action='store_true', help="the payback of compacting now, and what CSR's compactions did")
     mode.add_argument('--compact-usual', action='store_true', help='how long your own /compact takes, for the card')
+    parser.add_argument('--touch', help="with --note: '-' reads the tool call (JSON on stdin) and notes the symbols it touches")
     parser.add_argument('--ctx', type=int, help='the context now, in tokens (with --compact-plan)')
     args = parser.parse_args()
     if args.compact_plan:
@@ -8719,11 +8881,17 @@ def main():
         path = os.path.realpath(args.note)
         root = repo_root(os.path.dirname(path))
         if not root:
-            print('[]')
+            print('[]' if args.touch != '-' else '{"notes": [], "candidates": 0}')
             return
+        raw = read_touch(args.touch)
         con = connect()
         try:
-            print(json.dumps(notes_for(con, os.path.realpath(root), path, args.sid)))
+            if raw is None:
+                print(json.dumps(notes_for(con, os.path.realpath(root), path, args.sid)))
+            else:
+                counts = {}
+                notes = notes_for(con, os.path.realpath(root), path, args.sid, touch=touch_of(raw, path), counts=counts)
+                print(json.dumps(dict(notes=notes, candidates=counts.get('candidates', len(notes)))))
         finally:
             con.close()
         return
