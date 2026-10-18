@@ -29,7 +29,7 @@ pub struct ViewStatus {
 pub struct RepoStatus {
     pub common_dir: String,
     pub main_path: Option<String>,
-    /// cli | env | code_nodes | history | unregistered
+    /// cli | env | signal | (legacy) code_nodes | history | unregistered
     pub source: String,
     pub enabled: bool,
     pub status: String,

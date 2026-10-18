@@ -1,69 +1,81 @@
-//! Which repos to map.
+//! Which repos to map: the ones a session is working in.
 //!
 //! Sources, in priority order:
 //!
-//! 1. enabled rows of `codemap_repos`, ordered by how they were registered:
-//!    `cli`, `env`, `code_nodes`, `history`;
-//! 2. `CSR_CODEMAP_REPOS` (`:`-separated paths);
-//! 3. distinct `code_nodes.repo_root` values;
-//! 4. distinct `project` paths in `<home>/.claude/history.jsonl` lines from the
-//!    last 30 days (`session_registry` only keeps basenames).
+//! 1. enabled `codemap_repos` rows registered by `codemap add` (`cli`);
+//! 2. `CSR_CODEMAP_REPOS` (`:`-separated paths, `env`), and enabled rows an earlier
+//!    run registered from it;
+//! 3. **session signals** (`codemap_signals`): the cwd every SessionStart and
+//!    PostToolUse hook fire records. A signal newer than `CSR_CODEMAP_ACTIVE_HOURS`
+//!    (default 24) makes its repo a candidate (`signal`).
 //!
-//! Every path is mapped to its git common dir and deduplicated. Dropped: paths
-//! that are missing or not in git, `$HOME` itself, protected folders, temp roots
-//! (unless registered by `cli` or `env`), and any repo with an `enabled = 0` row
-//! (`codemap remove` leaves that tombstone so discovery never re-adds it). The
-//! result is capped at `CSR_CODEMAP_MAX_REPOS` (default 16), keeping priority
-//! order and then most recent activity.
+//! The old triggers are gone: nothing reads `history.jsonl` (30 days of every
+//! directory the owner ever opened) or `code_nodes` any more, and a repo row an
+//! older binary registered from them (`history`, `code_nodes`) names no repo by
+//! itself: it is mapped again only while a signal or a `cli`/`env` source names it.
+//!
+//! Every path is mapped to its git common dir and deduplicated, so a signal from
+//! any worktree, or any subdirectory, of a repo maps the whole repo (all its
+//! worktrees). Dropped: paths that are missing or not in git, `$HOME` itself,
+//! protected folders (the daemon never stats them; a session maps those, see
+//! `session.rs`), temp roots (unless registered by `cli` or `env`), and any repo
+//! with an `enabled = 0` row (`codemap remove` leaves that tombstone so discovery
+//! never re-adds it). What became of each signal's cwd is written back to its row
+//! (`status`, `common_dir`), which `select_repos` and `codemap status` read. The
+//! result is capped at `CSR_CODEMAP_MAX_REPOS` (default 16): `cli` first, then
+//! `env`, then the most recent signal.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
-use serde::Deserialize;
 
-use super::identity::{identify_with, is_dir_safe, is_tcc_path, is_temp_path, normalize_lexical};
+use super::identity::normalize_lexical;
+use super::identity::{identify_with, is_dir_safe, is_protected_error, is_tcc_path, is_temp_path};
 use super::store;
 
 pub const DEFAULT_MAX_REPOS: usize = 16;
-const HISTORY_WINDOW_MS: i64 = 30 * 24 * 3600 * 1000;
+pub const DEFAULT_ACTIVE_HOURS: u64 = 24;
+
+/// Signal rows are kept at least this long after their last fire (and never less
+/// than twice the active window), so the table does not grow with every directory a
+/// session ever started in.
+const SIGNAL_KEEP_SECS: i64 = 7 * 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub common_dir: PathBuf,
     /// The main worktree, when the common dir is a normal `<main>/.git`.
     pub main_path: Option<PathBuf>,
-    /// cli | env | code_nodes | history
+    /// cli | env | signal
     pub source: &'static str,
-    /// Latest session activity (ms since epoch) seen for the repo, 0 if none.
+    /// Latest session signal (seconds since epoch) seen for the repo, 0 if none.
     pub recent_ts: i64,
 }
 
+/// Cap order: `cli`, `env`, `signal`; anything else (a legacy `history` or
+/// `code_nodes` row) last.
 pub(super) fn tier(source: &str) -> u8 {
     match source {
         "cli" => 0,
         "env" => 1,
-        "code_nodes" => 2,
+        "signal" => 2,
         _ => 3,
     }
 }
 
-fn static_source(source: &str) -> &'static str {
-    match source {
-        "cli" => "cli",
-        "env" => "env",
-        "code_nodes" => "code_nodes",
-        _ => "history",
-    }
-}
-
-/// Discover the repos to map, reading `CSR_CODEMAP_REPOS` and
-/// `CSR_CODEMAP_MAX_REPOS` from the environment.
+/// Discover the repos to map, reading `CSR_CODEMAP_REPOS`, `CSR_CODEMAP_MAX_REPOS`
+/// and `CSR_CODEMAP_ACTIVE_HOURS` from the environment.
 pub fn discover(conn: &Connection, home: &Path) -> Vec<Candidate> {
     let env_repos = std::env::var("CSR_CODEMAP_REPOS").ok();
-    let max = max_repos_from_env();
-    let now_ms = super::now_secs() * 1000;
-    discover_with(conn, home, env_repos.as_deref(), max, now_ms)
+    discover_with(
+        conn,
+        home,
+        env_repos.as_deref(),
+        max_repos_from_env(),
+        active_hours_from_env(),
+        super::now_secs(),
+    )
 }
 
 /// `CSR_CODEMAP_MAX_REPOS`, default 16. The freshness loop caps what it polls
@@ -76,143 +88,157 @@ pub fn max_repos_from_env() -> usize {
         .unwrap_or(DEFAULT_MAX_REPOS)
 }
 
-struct Input {
+/// `CSR_CODEMAP_ACTIVE_HOURS`, default 24: how long after its last session signal
+/// a repo stays mapped.
+pub fn active_hours_from_env() -> u64 {
+    active_hours_from_value(std::env::var("CSR_CODEMAP_ACTIVE_HOURS").ok().as_deref())
+}
+
+pub fn active_hours_from_value(value: Option<&str>) -> u64 {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_ACTIVE_HOURS)
+}
+
+/// A repo found by one input, before deduplication.
+struct Found {
+    common: PathBuf,
     source: &'static str,
-    /// Registered through `cli` or `env`: exempt from the temp-root rule.
-    exempt_from_temp: bool,
-    /// A stored repo row already names the common dir.
-    path: PathBuf,
-    is_common_dir: bool,
+    /// Signal time (seconds), 0 for an input that is not a signal.
     ts: i64,
 }
 
-/// `discover` with its environment inputs passed in (testable).
+/// `discover` with its environment inputs passed in (testable). `now_secs` is
+/// seconds since the epoch, the unit signals are stored in.
 pub fn discover_with(
     conn: &Connection,
     home: &Path,
     env_repos: Option<&str>,
     max_repos: usize,
-    now_ms: i64,
+    active_hours: u64,
+    now_secs: i64,
 ) -> Vec<Candidate> {
-    let mut inputs: Vec<Input> = Vec::new();
+    discover_impl(
+        conn,
+        home,
+        env_repos,
+        max_repos,
+        active_hours,
+        now_secs,
+        &is_temp_path,
+    )
+}
+
+/// `discover_with`, with the temp-root rule injected: tests build their repos
+/// under the system temp dir, which the real rule refuses.
+pub(super) fn discover_impl(
+    conn: &Connection,
+    home: &Path,
+    env_repos: Option<&str>,
+    max_repos: usize,
+    active_hours: u64,
+    now_secs: i64,
+    is_temp: &dyn Fn(&Path) -> bool,
+) -> Vec<Candidate> {
+    let home_opt = Some(home);
+    let mut found: Vec<Found> = Vec::new();
     let mut tombstones: Vec<PathBuf> = Vec::new();
 
+    // 1. Rows the user (or CSR_CODEMAP_REPOS on an earlier run) registered. A row
+    //    an older binary registered from history or the code graph is not a source.
     if store::tables_ready(conn) {
         if let Ok(rows) = store::list_repos(conn) {
             for r in rows {
-                let common = PathBuf::from(&r.common_dir);
+                let common = normalize_lexical(Path::new(&r.common_dir));
                 if !r.enabled {
                     tombstones.push(common);
                     continue;
                 }
-                let source = static_source(&r.source);
-                inputs.push(Input {
+                let source = match r.source.as_str() {
+                    "cli" => "cli",
+                    "env" => "env",
+                    _ => continue,
+                };
+                // Resolved without stat'ing a protected folder: a registered common
+                // dir that is now a symlink into one is dropped.
+                if is_tcc_path(&common, home_opt) || !is_dir_safe(&common, home_opt) {
+                    continue;
+                }
+                found.push(Found {
+                    common,
                     source,
-                    exempt_from_temp: matches!(source, "cli" | "env"),
-                    path: common,
-                    is_common_dir: true,
                     ts: 0,
                 });
             }
         }
-    }
-    for p in env_repos.unwrap_or("").split(':').filter(|p| !p.is_empty()) {
-        inputs.push(Input {
-            source: "env",
-            exempt_from_temp: true,
-            path: PathBuf::from(p),
-            is_common_dir: false,
-            ts: 0,
-        });
-    }
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT repo_root FROM code_nodes
-         WHERE repo_root IS NOT NULL AND repo_root != ''",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for p in rows.flatten() {
-                inputs.push(Input {
-                    source: "code_nodes",
-                    exempt_from_temp: false,
-                    path: PathBuf::from(p),
-                    is_common_dir: false,
-                    ts: 0,
-                });
-            }
-        }
-    }
-    for (project, ts) in history_projects(home, now_ms) {
-        inputs.push(Input {
-            source: "history",
-            exempt_from_temp: false,
-            path: PathBuf::from(project),
-            is_common_dir: false,
-            ts,
-        });
     }
 
-    // Activity per repo from history, whichever source named it.
-    let mut by_common: HashMap<PathBuf, Candidate> = HashMap::new();
-    let mut resolved: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-    let mut activity: HashMap<PathBuf, i64> = HashMap::new();
-    let home_opt = Some(home);
-    for input in &inputs {
-        let path = normalize_lexical(&input.path);
+    // 2. CSR_CODEMAP_REPOS.
+    for p in env_repos.unwrap_or("").split(':').filter(|p| !p.is_empty()) {
+        let path = normalize_lexical(Path::new(p));
         if is_tcc_path(&path, home_opt) {
             continue;
         }
-        let common = if input.is_common_dir {
-            // Resolved without stat'ing a protected folder: a registered common
-            // dir that is now a symlink into one is dropped.
-            if !is_dir_safe(&path, home_opt) {
-                continue;
-            }
-            Some(path.clone())
-        } else {
-            resolved
-                .entry(path.clone())
-                .or_insert_with(|| identify_with(&path, home_opt).ok().map(|id| id.common_dir))
-                .clone()
+        let Ok(id) = identify_with(&path, home_opt) else {
+            continue;
         };
-        let Some(common) = common else { continue };
-        if is_tcc_path(&common, home_opt) {
+        if is_tcc_path(&id.common_dir, home_opt) {
             continue;
         }
-        // Activity counts even when this input is later dropped as a temp
-        // path: a registered repo still shows when it was last worked in.
-        let seen = activity.entry(common.clone()).or_insert(0);
-        *seen = (*seen).max(input.ts);
-        if !input.exempt_from_temp && (is_temp_path(&path) || is_temp_path(&common)) {
-            continue;
-        }
-        if tombstones.contains(&common) {
-            continue;
-        }
-        let main_path = (common.file_name().is_some_and(|n| n == ".git"))
-            .then(|| common.parent().map(Path::to_path_buf))
-            .flatten();
-        by_common
-            .entry(common.clone())
-            .and_modify(|c| {
-                if tier(input.source) < tier(c.source) {
-                    c.source = input.source;
-                }
-            })
-            .or_insert(Candidate {
-                common_dir: common,
-                main_path,
-                source: input.source,
-                recent_ts: input.ts,
-            });
+        found.push(Found {
+            common: id.common_dir,
+            source: "env",
+            ts: 0,
+        });
     }
 
-    let mut out: Vec<Candidate> = by_common
-        .into_values()
-        .map(|mut c| {
-            c.recent_ts = activity.get(&c.common_dir).copied().unwrap_or(0);
-            c
-        })
-        .collect();
+    // 3. Session signals inside the window. What each cwd came to is written back.
+    let since = now_secs.saturating_sub((active_hours as i64).saturating_mul(3600));
+    let signals = store::list_signals(conn, since).unwrap_or_default();
+    for s in &signals {
+        let resolved = resolve_signal(Path::new(&s.cwd), home, is_temp, &tombstones);
+        let (common, status) = match &resolved {
+            Resolved::Repo(common) => (Some(common.to_string_lossy().to_string()), "repo"),
+            Resolved::Dropped(why) => (None, *why),
+        };
+        let _ = store::signal_resolve(conn, &s.cwd, common.as_deref(), status);
+        if let Resolved::Repo(common) = resolved {
+            found.push(Found {
+                common,
+                source: "signal",
+                ts: s.last_at,
+            });
+        }
+    }
+    let keep = SIGNAL_KEEP_SECS.max((active_hours as i64).saturating_mul(2 * 3600));
+    let _ = store::signal_gc(conn, now_secs.saturating_sub(keep));
+
+    // Merge: one candidate per common dir, the best source, the newest signal.
+    let mut by_common: HashMap<PathBuf, Candidate> = HashMap::new();
+    for f in found {
+        if tombstones.contains(&f.common) {
+            continue;
+        }
+        let main_path = (f.common.file_name().is_some_and(|n| n == ".git"))
+            .then(|| f.common.parent().map(Path::to_path_buf))
+            .flatten();
+        by_common
+            .entry(f.common.clone())
+            .and_modify(|c| {
+                if tier(f.source) < tier(c.source) {
+                    c.source = f.source;
+                }
+                c.recent_ts = c.recent_ts.max(f.ts);
+            })
+            .or_insert(Candidate {
+                common_dir: f.common,
+                main_path,
+                source: f.source,
+                recent_ts: f.ts,
+            });
+    }
+    let mut out: Vec<Candidate> = by_common.into_values().collect();
     out.sort_by(|a, b| {
         tier(a.source)
             .cmp(&tier(b.source))
@@ -223,137 +249,381 @@ pub fn discover_with(
     out
 }
 
-#[derive(Deserialize)]
-struct HistoryLine {
-    timestamp: Option<i64>,
-    project: Option<String>,
+/// What a signal's cwd came to.
+enum Resolved {
+    Repo(PathBuf),
+    /// Why it maps nothing: `protected`, `home`, `temp`, `disabled`, `not-a-repo`
+    /// or `removed`.
+    Dropped(&'static str),
 }
 
-/// Distinct `project` paths from the last 30 days of `history.jsonl`, with the
-/// latest timestamp for each.
-fn history_projects(home: &Path, now_ms: i64) -> Vec<(String, i64)> {
-    let path = home.join(".claude").join("history.jsonl");
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let cutoff = now_ms - HISTORY_WINDOW_MS;
-    let mut latest: HashMap<String, i64> = HashMap::new();
-    for line in text.lines() {
-        let Ok(h) = serde_json::from_str::<HistoryLine>(line) else {
-            continue;
-        };
-        let (Some(ts), Some(project)) = (h.timestamp, h.project) else {
-            continue;
-        };
-        if ts < cutoff || project.is_empty() {
-            continue;
-        }
-        let e = latest.entry(project).or_insert(ts);
-        *e = (*e).max(ts);
+/// Resolve a session cwd to its repo. The protected-folder check is lexical and
+/// runs before any filesystem call; `identify_with` resolves the path one
+/// component at a time (`resolve_safe`) and refuses a symlink chain into a
+/// protected folder before it stats it.
+fn resolve_signal(
+    cwd: &Path,
+    home: &Path,
+    is_temp: &dyn Fn(&Path) -> bool,
+    tombstones: &[PathBuf],
+) -> Resolved {
+    let home_opt = Some(home);
+    let cwd = normalize_lexical(cwd);
+    if is_tcc_path(&cwd, home_opt) {
+        return Resolved::Dropped("protected");
     }
-    latest.into_iter().collect()
+    if cwd == normalize_lexical(home) {
+        return Resolved::Dropped("home");
+    }
+    if is_temp(&cwd) {
+        return Resolved::Dropped("temp");
+    }
+    match identify_with(&cwd, home_opt) {
+        Ok(id) => {
+            if is_tcc_path(&id.common_dir, home_opt) || is_tcc_path(&id.worktree_root, home_opt) {
+                Resolved::Dropped("protected")
+            } else if is_temp(&id.common_dir) || is_temp(&id.worktree_root) {
+                Resolved::Dropped("temp")
+            } else if tombstones.contains(&id.common_dir) {
+                Resolved::Dropped("disabled")
+            } else {
+                Resolved::Repo(id.common_dir)
+            }
+        }
+        Err(e) if is_protected_error(&e) => Resolved::Dropped("protected"),
+        Err(_) if is_dir_safe(&cwd, home_opt) => Resolved::Dropped("not-a-repo"),
+        Err(_) => Resolved::Dropped("removed"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codemap::testutil::{db, Fx};
 
-    fn db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::migrations::run(&conn).unwrap();
-        conn
+    const NOW: i64 = 1_800_000_000;
+    const H: i64 = 3600;
+
+    fn no_temp(_: &Path) -> bool {
+        false
     }
 
-    fn git_repo(dir: &Path) {
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
+    fn run(
+        conn: &Connection,
+        fx: &Fx,
+        env: Option<&str>,
+        max: usize,
+        hours: u64,
+        now: i64,
+    ) -> Vec<Candidate> {
+        discover_impl(conn, &fx.home, env, max, hours, now, &no_temp)
+    }
+
+    fn signal(conn: &Connection, dir: &Path, source: &str, at: i64) {
+        store::signal_upsert(conn, &dir.to_string_lossy(), source, at).unwrap();
+    }
+
+    fn status_of(conn: &Connection, dir: &Path) -> (Option<String>, Option<String>) {
+        let s = store::list_signals(conn, 0)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.cwd == dir.to_string_lossy())
+            .expect("signal row");
+        (s.status, s.common_dir)
     }
 
     #[test]
-    fn temp_root_is_refused_unless_registered_and_disabled_rows_stay_out() {
+    fn a_signal_in_the_window_makes_the_repo_a_candidate_from_any_worktree_or_subdirectory() {
+        let fx = Fx::new();
         let conn = db();
-        let home = tempfile::tempdir().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("r1");
-        git_repo(&repo);
-        let canon = std::fs::canonicalize(&repo).unwrap();
-        let now_ms = 1_800_000_000_000;
+        let main = fx.init_repo("r");
+        std::fs::create_dir_all(main.join("src/deep")).unwrap();
+        crate::codemap::testutil::write(&main, "a.py", "def a(): pass\n");
+        fx.commit_all(&main, "one");
+        let wt = fx.add_worktree(&main, &fx.root.join("r-wt"), "wt");
 
-        // A history hit in a temp root is dropped.
-        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
-        std::fs::write(
-            home.path().join(".claude/history.jsonl"),
-            format!(
-                "{{\"timestamp\":{},\"project\":\"{}\"}}\n",
-                now_ms - 1000,
-                canon.display()
+        signal(&conn, &main.join("src/deep"), "post_tool_use", NOW - 5 * H);
+        signal(&conn, &wt, "session_start", NOW - H);
+        let got = run(&conn, &fx, None, 16, 24, NOW);
+        assert_eq!(
+            got.len(),
+            1,
+            "one repo, whichever worktree signalled: {got:?}"
+        );
+        assert_eq!(got[0].source, "signal");
+        assert_eq!(got[0].common_dir, main.join(".git"));
+        assert_eq!(got[0].main_path.as_deref(), Some(main.as_path()));
+        assert_eq!(got[0].recent_ts, NOW - H, "the newest signal of the repo");
+        assert_eq!(
+            status_of(&conn, &wt),
+            (
+                Some("repo".into()),
+                Some(main.join(".git").to_string_lossy().into())
             ),
-        )
-        .unwrap();
-        assert!(discover_with(&conn, home.path(), None, 16, now_ms).is_empty());
+            "the answer is written back to the signal row"
+        );
+    }
 
-        // The same path in CSR_CODEMAP_REPOS is kept.
-        let env = canon.to_string_lossy().to_string();
-        let got = discover_with(&conn, home.path(), Some(&env), 16, now_ms);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].source, "env");
-        assert_eq!(got[0].common_dir, canon.join(".git"));
-        assert!(got[0].recent_ts > 0, "history activity is merged in");
-
-        // A cli-registered row survives without env or history.
-        std::fs::remove_file(home.path().join(".claude/history.jsonl")).unwrap();
+    #[test]
+    fn a_signal_older_than_the_window_is_not_a_candidate_and_cli_and_env_repos_always_are() {
+        let fx = Fx::new();
+        let conn = db();
+        let stale = fx.init_repo("stale");
+        let pinned_cli = fx.init_repo("cli");
+        let pinned_env = fx.init_repo("env");
+        signal(&conn, &stale, "session_start", NOW - 25 * H);
+        signal(&conn, &pinned_cli, "session_start", NOW - 900 * H);
         store::upsert_repo(
             &conn,
-            &canon.join(".git").to_string_lossy(),
-            Some(&canon.to_string_lossy()),
+            &pinned_cli.join(".git").to_string_lossy(),
+            Some(&pinned_cli.to_string_lossy()),
             "cli",
             true,
         )
         .unwrap();
-        let got = discover_with(&conn, home.path(), None, 16, now_ms);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].source, "cli");
-
-        // enabled = 0 keeps it out of every source, env included.
-        store::disable_repo(&conn, &canon.join(".git").to_string_lossy(), None).unwrap();
-        assert!(discover_with(&conn, home.path(), Some(&env), 16, now_ms).is_empty());
+        let env = pinned_env.to_string_lossy().to_string();
+        let got = run(&conn, &fx, Some(&env), 16, 24, NOW);
+        let names: Vec<(&str, &Path)> = got
+            .iter()
+            .map(|c| (c.source, c.common_dir.as_path()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("cli", pinned_cli.join(".git").as_path()),
+                ("env", pinned_env.join(".git").as_path()),
+            ],
+            "{got:?}"
+        );
+        // A window of 48 hours brings the 25-hour-old signal back.
+        let got = run(&conn, &fx, Some(&env), 16, 48, NOW);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[2].source, "signal");
+        assert_eq!(got[2].common_dir, stale.join(".git"));
     }
 
     #[test]
-    fn stale_history_protected_folders_and_home_are_dropped_and_the_cap_applies() {
+    fn the_cap_keeps_cli_then_env_then_the_most_recent_signals() {
+        let fx = Fx::new();
         let conn = db();
-        let home = tempfile::tempdir().unwrap();
-        let now_ms = 1_800_000_000_000;
-        // Repos outside temp roots are needed; /Users/... style paths under a
-        // fake home would be temp too, so exercise the filters on input paths.
-        let lines = [
-            (
-                now_ms - 40 * 24 * 3600 * 1000,
-                "/Users/nobody-here/projects/old",
-            ),
-            (now_ms - 1000, "/Users/nobody-here/Desktop/proj"),
-            (now_ms - 1000, "/Users/nobody-here/Documents/proj"),
-        ];
-        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
-        let body: String = lines
-            .iter()
-            .map(|(ts, p)| format!("{{\"timestamp\":{ts},\"project\":\"{p}\"}}\n"))
-            .collect();
-        std::fs::write(home.path().join(".claude/history.jsonl"), body).unwrap();
-        assert!(discover_with(&conn, home.path(), None, 16, now_ms).is_empty());
+        let mut sig = Vec::new();
+        for i in 0..4 {
+            let r = fx.init_repo(&format!("s{i}"));
+            // s3 is the newest signal, s0 the oldest.
+            signal(&conn, &r, "post_tool_use", NOW - (10 - i as i64) * H);
+            sig.push(r);
+        }
+        let env_repo = fx.init_repo("e");
+        let cli_repo = fx.init_repo("c");
+        store::upsert_repo(
+            &conn,
+            &cli_repo.join(".git").to_string_lossy(),
+            Some(&cli_repo.to_string_lossy()),
+            "cli",
+            true,
+        )
+        .unwrap();
+        let env = env_repo.to_string_lossy().to_string();
 
-        let tmp = tempfile::tempdir().unwrap();
-        let mut env = Vec::new();
-        for i in 0..5 {
-            let r = tmp.path().join(format!("r{i}"));
-            git_repo(&r);
-            env.push(
-                std::fs::canonicalize(&r)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string(),
+        let got = run(&conn, &fx, Some(&env), 3, 24, NOW);
+        let order: Vec<&Path> = got.iter().map(|c| c.common_dir.as_path()).collect();
+        assert_eq!(
+            order,
+            vec![
+                cli_repo.join(".git").as_path(),
+                env_repo.join(".git").as_path(),
+                sig[3].join(".git").as_path(),
+            ]
+        );
+        let got = run(&conn, &fx, Some(&env), 4, 24, NOW);
+        assert_eq!(
+            got[3].common_dir,
+            sig[2].join(".git"),
+            "then the next newest"
+        );
+    }
+
+    #[test]
+    fn rows_an_older_binary_registered_from_history_or_the_code_graph_name_no_repo() {
+        let fx = Fx::new();
+        let conn = db();
+        let hist = fx.init_repo("hist");
+        let nodes = fx.init_repo("nodes");
+        let both = fx.init_repo("both");
+        for (r, source) in [
+            (&hist, "history"),
+            (&nodes, "code_nodes"),
+            (&both, "history"),
+        ] {
+            store::upsert_repo(
+                &conn,
+                &r.join(".git").to_string_lossy(),
+                Some(&r.to_string_lossy()),
+                source,
+                true,
+            )
+            .unwrap();
+        }
+        // The same repo with a fresh signal is a candidate again, as a signal repo.
+        signal(&conn, &both, "session_start", NOW - H);
+        let got = run(&conn, &fx, None, 16, 24, NOW);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].common_dir, both.join(".git"));
+        assert_eq!(got[0].source, "signal");
+    }
+
+    #[test]
+    fn nothing_reads_history_jsonl_or_the_code_graph_any_more() {
+        let fx = Fx::new();
+        let conn = db();
+        let repo = fx.init_repo("r");
+        std::fs::create_dir_all(fx.home.join(".claude")).unwrap();
+        std::fs::write(
+            fx.home.join(".claude/history.jsonl"),
+            format!(
+                "{{\"timestamp\":{},\"project\":\"{}\"}}\n",
+                NOW * 1000 - 1000,
+                repo.display()
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_nodes (id, file, kind, name, repo_root)
+             VALUES ('n1', ?1, 'function', 'f', ?2)",
+            rusqlite::params![repo.join("a.py").to_string_lossy(), repo.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(run(&conn, &fx, None, 16, 24, NOW).is_empty());
+    }
+
+    #[test]
+    fn temp_roots_are_refused_unless_registered_and_disabled_repos_stay_out() {
+        let fx = Fx::new();
+        let conn = db();
+        let repo = fx.init_repo("r1");
+        signal(&conn, &repo, "session_start", NOW - H);
+        // The real temp rule: the fixture lives under the system temp dir.
+        let real = discover_with(&conn, &fx.home, None, 16, 24, NOW);
+        assert!(real.is_empty(), "a signal from a temp root is dropped");
+        assert_eq!(status_of(&conn, &repo).0.as_deref(), Some("temp"));
+
+        // The same path in CSR_CODEMAP_REPOS is kept.
+        let env = repo.to_string_lossy().to_string();
+        let got = discover_with(&conn, &fx.home, Some(&env), 16, 24, NOW);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].source, "env");
+        assert_eq!(got[0].common_dir, repo.join(".git"));
+
+        // A cli-registered row survives without env or signal.
+        store::upsert_repo(
+            &conn,
+            &repo.join(".git").to_string_lossy(),
+            Some(&repo.to_string_lossy()),
+            "cli",
+            true,
+        )
+        .unwrap();
+        let got = discover_with(&conn, &fx.home, None, 16, 24, NOW);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].source, "cli");
+
+        // enabled = 0 keeps it out of every source, env and signals included.
+        store::disable_repo(&conn, &repo.join(".git").to_string_lossy(), None).unwrap();
+        assert!(discover_impl(&conn, &fx.home, Some(&env), 16, 24, NOW, &no_temp).is_empty());
+        assert_eq!(status_of(&conn, &repo).0.as_deref(), Some("disabled"));
+    }
+
+    #[test]
+    fn home_missing_and_non_repo_signals_get_their_own_status_and_map_nothing() {
+        let fx = Fx::new();
+        let conn = db();
+        let plain = fx.root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let gone = fx.root.join("gone");
+        signal(&conn, &fx.home, "session_start", NOW - H);
+        signal(&conn, &plain, "session_start", NOW - H);
+        signal(&conn, &gone, "session_start", NOW - H);
+        assert!(run(&conn, &fx, None, 16, 24, NOW).is_empty());
+        assert_eq!(status_of(&conn, &fx.home).0.as_deref(), Some("home"));
+        assert_eq!(status_of(&conn, &plain).0.as_deref(), Some("not-a-repo"));
+        assert_eq!(status_of(&conn, &gone).0.as_deref(), Some("removed"));
+    }
+
+    #[test]
+    fn a_second_pass_over_unchanged_signals_writes_nothing_and_old_signals_are_dropped() {
+        let fx = Fx::new();
+        let conn = db();
+        let repo = fx.init_repo("r");
+        signal(&conn, &repo, "session_start", NOW - H);
+        signal(
+            &conn,
+            &fx.root.join("ancient"),
+            "session_start",
+            NOW - 30 * 24 * H,
+        );
+        run(&conn, &fx, None, 16, 24, NOW);
+        let before = conn.total_changes();
+        run(&conn, &fx, None, 16, 24, NOW);
+        assert_eq!(conn.total_changes(), before, "steady state costs no write");
+        let left = store::list_signals(&conn, 0).unwrap();
+        assert_eq!(left.len(), 1, "the 30-day-old signal is garbage-collected");
+        assert_eq!(left[0].cwd, repo.to_string_lossy());
+    }
+
+    #[test]
+    fn a_protected_cwd_is_skipped_with_the_protected_status_and_never_followed() {
+        let fx = Fx::new();
+        let conn = db();
+        // A real repo inside a fake ~/Documents: a stat-and-walk would find it.
+        let docs = fx.home.join("Documents");
+        let proj = docs.join("probe");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        // A symlink chain from an ordinary place into it.
+        let hop2 = fx.root.join("hop2");
+        let hop1 = fx.root.join("hop1");
+        std::os::unix::fs::symlink(&proj, &hop2).unwrap();
+        std::os::unix::fs::symlink(&hop2, &hop1).unwrap();
+        signal(&conn, &proj, "session_start", NOW - H);
+        signal(&conn, &proj.join("src"), "post_tool_use", NOW - H);
+        signal(&conn, &hop1, "session_start", NOW - H);
+        assert!(run(&conn, &fx, None, 16, 24, NOW).is_empty());
+        for cwd in [&proj, &proj.join("src"), &hop1] {
+            assert_eq!(
+                status_of(&conn, cwd),
+                (Some("protected".into()), None),
+                "{}",
+                cwd.display()
             );
         }
-        let got = discover_with(&conn, home.path(), Some(&env.join(":")), 3, now_ms);
-        assert_eq!(got.len(), 3, "CSR_CODEMAP_MAX_REPOS caps the list");
+    }
+
+    #[test]
+    fn the_daemon_resolves_a_protected_cwd_without_a_filesystem_call_under_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = Fx::new();
+        let conn = db();
+        let docs = fx.home.join("Documents");
+        std::fs::create_dir_all(docs.join("probe/.git")).unwrap();
+        // Mode 000: any stat, open or read_dir of an entry below it fails with
+        // EACCES. A resolver that touched the path would classify the cwd as
+        // `removed` or `not-a-repo` from that error; the lexical rule answers
+        // `protected` first. (This shows the classification does not depend on
+        // the filesystem; it cannot observe a stat that discards its result.)
+        std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let cwd = docs.join("probe/src");
+        signal(&conn, &cwd, "post_tool_use", NOW - H);
+        let got = run(&conn, &fx, None, 16, 24, NOW);
+        std::fs::set_permissions(&docs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(got.is_empty());
+        assert_eq!(status_of(&conn, &cwd).0.as_deref(), Some("protected"));
+    }
+
+    #[test]
+    fn active_hours_reads_a_positive_number_and_defaults_to_a_day() {
+        assert_eq!(active_hours_from_value(None), 24);
+        assert_eq!(active_hours_from_value(Some("")), 24);
+        assert_eq!(active_hours_from_value(Some("0")), 24);
+        assert_eq!(active_hours_from_value(Some("nope")), 24);
+        assert_eq!(active_hours_from_value(Some(" 72 ")), 72);
     }
 }
