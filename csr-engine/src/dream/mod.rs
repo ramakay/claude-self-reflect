@@ -136,6 +136,7 @@
 //! nothing (see that module's idempotency doc).
 
 pub mod backfill;
+pub(crate) mod change_summary;
 pub mod cli;
 pub mod policy;
 pub(crate) mod receipt;

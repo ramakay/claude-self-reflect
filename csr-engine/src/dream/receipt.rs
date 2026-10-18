@@ -111,7 +111,15 @@ enum SymbolMap {
     /// `symbol -> normalized span stamp`; `None` marks a name whose span
     /// cannot be told apart from a neighbour's at this commit (see
     /// [`ambiguous_symbols`]), which reads as [`SymbolState::Unknown`].
-    Map(Rc<HashMap<String, Option<String>>>),
+    Map(Rc<SymbolTable>),
+}
+
+/// What one parse says about the symbols of a file: the span stamps the
+/// receipt rules compare, and the line spans the change summary reads.
+struct SymbolTable {
+    stamps: HashMap<String, Option<String>>,
+    /// `symbol -> (first row, last row)`, 0-based inclusive.
+    spans: HashMap<String, (usize, usize)>,
 }
 
 /// Per-run memo + counters.
@@ -179,7 +187,7 @@ impl ReceiptResolver {
 
         match self.symbol_map(subject, commit) {
             SymbolMap::FileAbsent => SymbolState::Absent,
-            SymbolMap::Map(map) => match map.get(symbol) {
+            SymbolMap::Map(map) => match map.stamps.get(symbol) {
                 Some(Some(stamp)) => SymbolState::Present(stamp.clone()),
                 Some(None) => SymbolState::Unknown,
                 None => SymbolState::Absent,
@@ -216,8 +224,8 @@ impl ReceiptResolver {
                     hit.clone()
                 } else {
                     self.parses += 1;
-                    let map = match symbol_stamps(subject, commit, &bytes) {
-                        Some(map) => SymbolMap::Map(Rc::new(map)),
+                    let map = match symbol_table(subject, commit, &bytes) {
+                        Some(table) => SymbolMap::Map(Rc::new(table)),
                         None => SymbolMap::Unknown,
                     };
                     self.by_content.insert(content_key, map.clone());
@@ -229,6 +237,36 @@ impl ReceiptResolver {
         parsed
     }
 
+    /// The lines of the subject symbol's span at `commit`, joined with `\n`,
+    /// located by the same naming and span as the ledger. `None` for a
+    /// whole-file subject, for a symbol that is absent or whose span cannot be
+    /// told apart from a neighbour's ([`SymbolState::Unknown`]), and for an
+    /// unreadable or unparseable file. The parse is the memoized one; the blob
+    /// is read once more because the memo keeps stamps, not bytes.
+    pub(crate) fn span_text_at(&mut self, subject: &Subject, commit: &str) -> Option<String> {
+        let symbol = subject.symbol?;
+        let SymbolMap::Map(table) = self.symbol_map(subject, commit) else {
+            return None;
+        };
+        if !matches!(table.stamps.get(symbol), Some(Some(_))) {
+            return None;
+        }
+        let (start, end) = *table.spans.get(symbol)?;
+        let FileRead::Bytes(bytes) = self.read(subject, commit) else {
+            return None;
+        };
+        let lines = split_lines(&bytes);
+        let rows = lines.get(start..=end)?;
+        let mut text = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                text.push(b'\n');
+            }
+            text.extend_from_slice(row);
+        }
+        String::from_utf8(text).ok()
+    }
+
     /// Whether the file at `commit` still has a symbol whose leaf name
     /// equals the subject symbol's leaf, under ANY qualification (see
     /// [`symbol_leaf`]). `Some(false)` when the file is not in the commit's
@@ -238,7 +276,7 @@ impl ReceiptResolver {
         let leaf = symbol_leaf(subject.symbol?);
         match self.symbol_map(subject, commit) {
             SymbolMap::FileAbsent => Some(false),
-            SymbolMap::Map(map) => Some(map.keys().any(|name| symbol_leaf(name) == leaf)),
+            SymbolMap::Map(map) => Some(map.stamps.keys().any(|name| symbol_leaf(name) == leaf)),
             SymbolMap::Unknown => None,
         }
     }
@@ -503,6 +541,19 @@ fn ambiguous_spans(spans: &[(usize, usize)]) -> Vec<bool> {
     flagged
 }
 
+/// The lines of `bytes` (split on `\n`, no trailing empty line).
+fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut lines: Vec<&[u8]> = if bytes.is_empty() {
+        Vec::new()
+    } else {
+        bytes.split(|&b| b == b'\n').collect()
+    };
+    if bytes.ends_with(b"\n") {
+        lines.pop();
+    }
+    lines
+}
+
 /// Normalized stamp of every symbol span in `bytes`, named exactly as the
 /// HEAD pass names them. `None` when the parse is not clean, the language is
 /// unsupported, or a span does not fit the file (all of which are Unknown).
@@ -512,11 +563,7 @@ fn ambiguous_spans(spans: &[(usize, usize)]) -> Vec<bool> {
 /// - it heads a collision group (`foo` while `foo#2` exists): the bare name
 ///   goes to the span-earliest duplicate, so a same-named definition added
 ///   above an unchanged `foo` silently renames the original to `foo#2`.
-fn symbol_stamps(
-    subject: &Subject,
-    commit: &str,
-    bytes: &[u8],
-) -> Option<HashMap<String, Option<String>>> {
+fn symbol_table(subject: &Subject, commit: &str, bytes: &[u8]) -> Option<SymbolTable> {
     let derived = rederive_symbol_spans(
         bytes,
         subject.file,
@@ -525,17 +572,7 @@ fn symbol_stamps(
         commit,
         &|_| true,
     )?;
-    let lines: Vec<&[u8]> = {
-        let mut lines: Vec<&[u8]> = if bytes.is_empty() {
-            Vec::new()
-        } else {
-            bytes.split(|&b| b == b'\n').collect()
-        };
-        if bytes.ends_with(b"\n") {
-            lines.pop();
-        }
-        lines
-    };
+    let lines = split_lines(bytes);
     let mut spans = Vec::with_capacity(derived.nodes.len());
     let mut stamps = Vec::with_capacity(derived.nodes.len());
     for node in &derived.nodes {
@@ -559,8 +596,17 @@ fn symbol_stamps(
     }
     let overlapping = ambiguous_spans(&spans);
     let mut out: HashMap<String, Option<String>> = HashMap::with_capacity(derived.symbols.len());
-    for ((symbol, stamp), overlaps) in derived.symbols.iter().zip(stamps).zip(overlapping) {
+    let mut by_name: HashMap<String, (usize, usize)> =
+        HashMap::with_capacity(derived.symbols.len());
+    for (((symbol, stamp), overlaps), span) in derived
+        .symbols
+        .iter()
+        .zip(stamps)
+        .zip(overlapping)
+        .zip(spans.iter().copied())
+    {
         out.insert(symbol.clone(), (!overlaps).then_some(stamp));
+        by_name.insert(symbol.clone(), span);
     }
     for symbol in &derived.symbols {
         if let Some(base) = collision_base(symbol) {
@@ -569,7 +615,10 @@ fn symbol_stamps(
             }
         }
     }
-    Some(out)
+    Some(SymbolTable {
+        stamps: out,
+        spans: by_name,
+    })
 }
 
 /// Committer time of `commit` (full hex oid) as RFC 3339 in the committer's

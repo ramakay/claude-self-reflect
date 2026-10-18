@@ -8,9 +8,16 @@
 //! applies ("a merge whose first-parent diff leaves the span unchanged did not
 //! author the change"). It reads git only; it never opens the database.
 //!
+//! `summary` is [`super::change_summary`]'s one-line "what changed" for the
+//! AUTHOR commit's diff of the symbol's span (author vs its first parent), or
+//! `null`: no author, a root author, a whole-file question, a symbol absent or
+//! ambiguous on either side, an unreadable file, or no clean summary. A batch
+//! line may carry `"summary": false` to skip it (the answer still has the key,
+//! `null`).
+//!
 //! The command prints exactly one JSON object with stable keys:
-//! `oid`, `merge`, `authored`, `author`, `author_committed_at`. Later items may
-//! ADD keys; none of these are renamed or removed. `--batch` ([`run_batch`])
+//! `oid`, `merge`, `authored`, `author`, `author_committed_at`, `summary`.
+//! Later items may ADD keys; none of these are renamed or removed. `--batch` ([`run_batch`])
 //! answers many questions in one process, one JSON object per line.
 
 use std::collections::HashMap;
@@ -20,6 +27,7 @@ use std::path::Path;
 use codewitness::Auditor;
 use serde_json::{json, Value};
 
+use super::change_summary::{dialect_of, summarize};
 use super::receipt::{commit_time_local, ReceiptResolver, Subject, SymbolState};
 use crate::import::backfill::{git_at, relpath_in_repo};
 use crate::process::CommandDeadline;
@@ -36,6 +44,8 @@ pub struct ChangeRequest<'a> {
     pub oid: &'a str,
     /// The witness's `at_oid`, needed to resolve the author of a merge.
     pub from: Option<&'a str>,
+    /// Compute `summary` (otherwise it is `null`).
+    pub summary: bool,
 }
 
 /// Full hex oid of the commit `rev` names, or `None`.
@@ -146,13 +156,34 @@ pub fn symbol_change_in(session: &mut Session, req: &ChangeRequest) -> Result<Va
     let author_committed_at = author
         .as_deref()
         .and_then(|a| commit_time_local(auditor, a));
+    let summary = match author.as_deref() {
+        Some(author) if req.summary => change_summary(resolver, &subject, author),
+        _ => None,
+    };
     Ok(json!({
         "oid": oid,
         "merge": merge,
         "authored": authored,
         "author": author,
         "author_committed_at": author_committed_at,
+        "summary": summary,
     }))
+}
+
+/// What `author` changed inside the subject symbol: its span at the first
+/// parent against its span at `author`. `None` when either side is not a clean
+/// read, `author` is a root commit, or there is no clean one-line summary.
+fn change_summary(
+    resolver: &mut ReceiptResolver,
+    subject: &Subject,
+    author: &str,
+) -> Option<String> {
+    subject.symbol?;
+    let parents = resolver.parents_of(subject.auditor, subject.repo_root, author)?;
+    let first = parents.first()?;
+    let before = resolver.span_text_at(subject, first)?;
+    let after = resolver.span_text_at(subject, author)?;
+    summarize(&before, &after, dialect_of(subject.relpath))
 }
 
 /// One line of `--batch` input.
@@ -165,6 +196,12 @@ struct BatchLine {
     oid: String,
     #[serde(default)]
     from: Option<String>,
+    #[serde(default = "yes")]
+    summary: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// `symbol change --batch`: one JSON question per input line, one JSON answer
@@ -188,6 +225,7 @@ pub fn run_batch<R: BufRead, W: Write>(input: R, mut output: W) -> std::io::Resu
                     symbol: q.symbol.as_deref(),
                     oid: &q.oid,
                     from: q.from.as_deref(),
+                    summary: q.summary,
                 },
             )
             .unwrap_or_else(|message| json!({ "error": message })),
@@ -278,6 +316,7 @@ mod tests {
             symbol: Some("foo"),
             oid,
             from,
+            summary: true,
         })
     }
 
@@ -396,6 +435,103 @@ mod tests {
         assert_eq!(batch(&line.to_string()), vec![single]);
     }
 
+    /// main: c0 (`foo` calls `old_call`) -> c1 (`foo` calls `new_call`) -> m
+    /// (merges `side`, which only touched other.txt). Returns (dir, s1, c0, c1, m).
+    fn summary_fixture() -> (tempfile::TempDir, String, String, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(
+            dir.join("lib.rs"),
+            "fn foo() {\n    old_call();\n    keep();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("other.txt"), "0\n").unwrap();
+        let c0 = commit(dir, "c0");
+        run(dir, &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.join("other.txt"), "side\n").unwrap();
+        let s1 = commit(dir, "s1");
+        run(dir, &["checkout", "-q", "main"]);
+        std::fs::write(
+            dir.join("lib.rs"),
+            "fn foo() {\n    new_call();\n    keep();\n}\n",
+        )
+        .unwrap();
+        let c1 = commit(dir, "c1");
+        run(dir, &["merge", "--no-ff", "-q", "-m", "merge", "side"]);
+        let m = run(dir, &["rev-parse", "HEAD"]);
+        (tmp, s1, c0, c1, m)
+    }
+
+    #[test]
+    fn the_answer_says_what_the_authoring_commit_changed() {
+        let (tmp, s1, c0, c1, m) = summary_fixture();
+        let authored = ask(tmp.path(), &c1, Some(&s1)).unwrap();
+        assert_eq!(authored["summary"], "old_call → new_call");
+        // A merge that did not author the change carries the AUTHOR's diff.
+        let merged = ask(tmp.path(), &m, Some(&s1)).unwrap();
+        assert_eq!(merged["authored"], false);
+        assert_eq!(merged["author"], c1.as_str());
+        assert_eq!(merged["summary"], "old_call → new_call");
+        // No author: no summary. A root author has no parent to diff against.
+        assert!(ask(tmp.path(), &m, None).unwrap()["summary"].is_null());
+        assert!(ask(tmp.path(), &s1, None).unwrap()["summary"].is_null());
+        let root = ask(tmp.path(), &c0, None).unwrap();
+        assert_eq!(root["authored"], true);
+        assert!(root["summary"].is_null());
+        // A whole-file question has no symbol span to summarise.
+        let whole = symbol_change(&ChangeRequest {
+            repo: &tmp.path().to_string_lossy(),
+            file: "lib.rs",
+            symbol: None,
+            oid: &c1,
+            from: None,
+            summary: true,
+        })
+        .unwrap();
+        assert_eq!(whole["authored"], true);
+        assert!(whole["summary"].is_null());
+    }
+
+    #[test]
+    fn a_batch_carries_the_same_summaries_and_can_skip_them() {
+        let (tmp, s1, _c0, c1, m) = summary_fixture();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let q = |oid: &str, from: Option<&str>, summary: bool| {
+            json!({"repo": repo, "file": "lib.rs", "symbol": "foo", "oid": oid, "from": from,
+                   "summary": summary})
+            .to_string()
+        };
+        let answers = batch(
+            &[
+                q(&m, Some(&s1), true),
+                q(&c1, None, true),
+                q(&c1, None, false),
+            ]
+            .join("\n"),
+        );
+        assert_eq!(answers.len(), 3, "{answers:?}");
+        assert_eq!(answers[0]["summary"], "old_call → new_call");
+        assert_eq!(answers[1]["summary"], "old_call → new_call");
+        assert!(answers[2]["summary"].is_null());
+        assert_eq!(answers[2]["authored"], true);
+        assert_eq!(answers[1], ask(tmp.path(), &c1, None).unwrap());
+    }
+
+    #[test]
+    fn an_edit_with_no_identifier_change_has_a_null_summary() {
+        let (tmp, ..) = fixture();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn foo() {\n    // hi\n    2\n}\n",
+        )
+        .unwrap();
+        let commented = commit(tmp.path(), "comment");
+        let answer = ask(tmp.path(), &commented, None).unwrap();
+        assert_eq!(answer["authored"], true);
+        assert!(answer["summary"].is_null(), "{answer}");
+    }
+
     #[test]
     fn an_empty_batch_prints_nothing() {
         assert!(batch("").is_empty());
@@ -413,6 +549,7 @@ mod tests {
             symbol: None,
             oid: "HEAD",
             from: None,
+            summary: true,
         });
         assert!(escape.is_err());
         assert!(ask(Path::new("/nonexistent/csr-no-repo"), "HEAD", None).is_err());

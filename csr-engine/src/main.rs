@@ -520,9 +520,11 @@ enum ProvenanceAction {
 #[derive(Subcommand, Debug)]
 enum SymbolAction {
     /// Did `--oid` author a change to the symbol? Prints one JSON object:
-    /// `{"oid","merge","authored","author","author_committed_at"}`.
+    /// `{"oid","merge","authored","author","author_committed_at","summary"}`
+    /// (`summary`: one line saying what the author commit changed inside the
+    /// symbol, or null).
     /// With `--batch`, reads one JSON question per stdin line
-    /// (`{"repo","file","symbol","oid","from"}`) and prints one answer per
+    /// (`{"repo","file","symbol","oid","from"}`, optionally `"summary":false`) and prints one answer per
     /// line, in order; a bad line answers `{"error":...}` and the batch goes on.
     Change {
         /// Repository root
@@ -1162,6 +1164,7 @@ async fn run(
             symbol: symbol.as_deref(),
             oid,
             from: from.as_deref(),
+            summary: true,
         };
         return match csr_engine::dream::symbol_cli::symbol_change(&request) {
             Ok(answer) => {
