@@ -138,6 +138,33 @@ pub struct PathScanReport {
     pub ms: u64,
 }
 
+/// Test-only seam: a closure run on the scanning thread between reading a
+/// view's files and writing them, so a test can interleave an edit and a
+/// partial rescan at exactly that point. Thread-local, so parallel tests that
+/// scan do not see each other's hook.
+#[cfg(test)]
+pub(super) mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn Fn()>;
+
+    thread_local! {
+        static AFTER_COLLECT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set_after_collect(hook: impl Fn() + 'static) {
+        AFTER_COLLECT.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_collect() {
+        AFTER_COLLECT.with(|h| {
+            if let Some(f) = h.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+}
+
 // ---- caps and file facts ----------------------------------------------------
 
 /// True when a repo-relative '/'-separated path is a scannable code file: a code
@@ -538,6 +565,8 @@ fn scan_view(
     let state = identity::view_state(view)?;
     let mut parser = BlobParser::new(conn, &common_str);
     let scan = collect_view(view, common_dir, opts, &mut parser, counters)?;
+    #[cfg(test)]
+    test_hooks::after_collect();
     let parsed = parser.take();
     let ms = t0.elapsed().as_millis() as u64;
     let outcome = store::write_view(

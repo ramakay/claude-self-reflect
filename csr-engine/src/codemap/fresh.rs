@@ -19,8 +19,10 @@
 //! mutex: the *poller* (discovery, poll, full scans, which wait for the daemon's
 //! heavy-work permit) and the *pump* (watcher batches and the queue, which never
 //! wait for it unless a batch is larger than `SMALL_BATCH`). A path edit
-//! therefore lands in seconds even while a dream holds the permit or a cold scan
-//! runs.
+//! therefore lands in seconds even while a dream holds the permit. The two
+//! threads do share one scan lock (`Ctx::scan_lock`): a path batch waits for a
+//! full scan in progress, so a scan that read an older blob can never commit it
+//! over a newer partial rescan.
 //!
 //! Nothing here busy-loops: both threads wake once a second to compare clocks,
 //! and an idle wake does no I/O except the pump's 5 s queue probe (one SELECT on
@@ -30,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -123,6 +125,16 @@ pub(crate) struct Ctx<'a> {
     /// Bumped by the poller whenever the set of stored views may have changed;
     /// the pump re-syncs its watched roots when it sees a new value.
     roots_version: AtomicU64,
+    /// Serialises the poller's full `scan_repo` and the pump's `rescan_paths`.
+    /// Without it a full scan can read a file's blob A, a dirty edit then be
+    /// committed as blob B by the pump, and the scan commit A over it: a dirty
+    /// edit moves neither HEAD nor the index, so `view_changed` never notices
+    /// and A stays until the next edit. Lock order is heavy permit first, then
+    /// this lock; the heavy permit is never taken while this lock is held.
+    ///
+    /// Covers the two threads of this loop only. A separate `csr-engine codemap
+    /// scan` process (or a second daemon) has its own lock and is not covered.
+    scan_lock: Mutex<()>,
 }
 
 impl<'a> Ctx<'a> {
@@ -143,11 +155,30 @@ impl<'a> Ctx<'a> {
             heavy,
             log,
             roots_version: AtomicU64::new(0),
+            scan_lock: Mutex::new(()),
         }
     }
 
     fn stop(&self) -> bool {
         self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Take `scan_lock`, polling so a shutdown is noticed while a long full scan
+    /// holds it. `None` means shutdown was requested first. A poisoned lock (a
+    /// scan thread panicked) is recovered, never a panic: it guards no data.
+    fn lock_scan(&self) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            match self.scan_lock.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    if self.stop() {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
     }
 
     fn log(&self, msg: &str) {
@@ -419,10 +450,15 @@ impl<'a> Poller<'a> {
         if matches!(gate, Gate::Shutdown) {
             return Ok(());
         }
+        // Heavy permit first (taken above), then the scan lock.
+        let Some(scan_guard) = self.ctx.lock_scan() else {
+            return Ok(());
+        };
         let opts = self.ctx.opts.scan.clone();
         let report = self
             .storage
             .with_connection(|conn| scan_repo(conn, common, &opts))?;
+        drop(scan_guard);
         drop(gate);
 
         self.checked.insert(common_str.to_string());
@@ -534,6 +570,10 @@ fn rescan_gated(ctx: &Ctx<'_>, conn: &Connection, paths: &[PathBuf]) -> Result<P
             ..Default::default()
         });
     }
+    // After the heavy permit, never before it. An Err keeps the queue rows.
+    let Some(_scan) = ctx.lock_scan() else {
+        anyhow::bail!("code map loop is shutting down");
+    };
     rescan_paths(conn, paths)
 }
 
@@ -1266,6 +1306,122 @@ mod tests {
             .unwrap()
             .iter()
             .all(|p| !p.starts_with(tcc_root)));
+    }
+
+    fn repo_with_alpha(rig: &Rig) -> PathBuf {
+        let repo = rig.fx.init_repo("r");
+        write(&repo, "a.py", &py(&["alpha"]));
+        rig.fx.commit_all(&repo, "one");
+        rig.register(&repo);
+        repo
+    }
+
+    #[test]
+    fn a_pump_flush_waits_for_the_scan_lock_and_then_writes() {
+        let rig = Rig::new();
+        let repo = repo_with_alpha(&rig);
+        let mut opts = rig.opts();
+        opts.watch = false;
+        let ctx = rig.ctx(opts);
+        Poller::new(&ctx).unwrap().step(Instant::now()).unwrap();
+        write(&repo, "a.py", &py(&["alpha", "newest_fn"]));
+
+        let guard = ctx.lock_scan().expect("lock is free");
+        std::thread::scope(|s| {
+            let flusher = s.spawn(|| {
+                let mut pump = Pump::new(&ctx).unwrap();
+                pump.add_pending(repo.join("a.py"), Instant::now());
+                pump.flush();
+            });
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(!flusher.is_finished(), "the flush waits for the lock");
+            assert_eq!(rig.hits("newest_fn"), 0, "and writes nothing meanwhile");
+            drop(guard);
+            flusher.join().unwrap();
+        });
+        assert_eq!(rig.hits("newest_fn"), 1, "it writes once the lock is free");
+    }
+
+    #[test]
+    fn a_full_scan_cannot_overwrite_a_newer_partial_rescan() {
+        let rig = Rig::new();
+        let repo = repo_with_alpha(&rig);
+        let mut opts = rig.opts();
+        opts.watch = false;
+        let ctx = rig.ctx(opts);
+        let t0 = Instant::now();
+        Poller::new(&ctx).unwrap().step(t0).unwrap();
+        // Blob A: a dirty edit that neither HEAD nor the index will ever show.
+        write(&repo, "a.py", &py(&["alpha", "zeta_older"]));
+
+        let (collected_tx, collected_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            // A fresh poller runs a full scan. The hook parks it after it has
+            // read blob A and before it writes.
+            let scanner = s.spawn(|| {
+                let mut p = Poller::new(&ctx).unwrap();
+                crate::codemap::scan::test_hooks::set_after_collect(move || {
+                    collected_tx.send(()).unwrap();
+                    // Bounded: a failing run must end, not hang the scope.
+                    let _ = go_rx.recv_timeout(Duration::from_secs(20));
+                });
+                let o = p.step(t0 + Duration::from_secs(61)).unwrap();
+                assert_eq!(o.scanned.len(), 1, "the full scan ran");
+            });
+            collected_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the scan reached the hook");
+            // Blob B lands, and the pump is asked to rescan the path.
+            write(&repo, "a.py", &py(&["alpha", "omega_newer"]));
+            let flusher = s.spawn(|| {
+                let mut pump = Pump::new(&ctx).unwrap();
+                pump.add_pending(repo.join("a.py"), Instant::now());
+                pump.flush();
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            let waited = !flusher.is_finished();
+            go_tx.send(()).unwrap();
+            scanner.join().unwrap();
+            flusher.join().unwrap();
+            assert!(
+                waited,
+                "the pump rescan waits while the scan holds the lock"
+            );
+        });
+        assert_eq!(
+            rig.hits("omega_newer"),
+            1,
+            "the newest blob is what the map holds"
+        );
+        assert_eq!(
+            rig.hits("zeta_older"),
+            0,
+            "the older scan did not overwrite it"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_scan_lock_is_recovered_and_a_shutdown_ends_the_wait() {
+        let rig = Rig::new();
+        let ctx = rig.ctx(rig.opts());
+        let joined = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = ctx.scan_lock.lock().unwrap();
+                panic!("a scan thread died holding the lock");
+            })
+            .join()
+        });
+        assert!(joined.is_err());
+        assert!(ctx.scan_lock.is_poisoned());
+        assert!(ctx.lock_scan().is_some(), "recovered with into_inner");
+
+        let held = ctx.lock_scan().unwrap();
+        rig.shutdown.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        assert!(ctx.lock_scan().is_none(), "shutdown ends the wait");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        drop(held);
     }
 
     #[test]
