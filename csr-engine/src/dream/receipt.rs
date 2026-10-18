@@ -121,6 +121,11 @@ pub(crate) struct ReceiptResolver {
     whole: HashMap<FileKey, SymbolState>,
     /// Parsed `symbol -> normalized span stamp` map per commit.
     symbols: HashMap<FileKey, SymbolMap>,
+    /// The same parse keyed by the file's content (`relpath`, BLAKE3 of the
+    /// bytes): the symbol names and span stamps depend on nothing else, and a
+    /// merge usually holds the very blob its first parent does, so the commits
+    /// of one question share one parse.
+    by_content: HashMap<(String, [u8; 32]), SymbolMap>,
     commits: HashMap<CommitsKey, Option<Rc<Vec<String>>>>,
     /// Parent oids per `(repo, commit)`; `None` when git could not say.
     parents: HashMap<(String, String), Option<Rc<Vec<String>>>>,
@@ -200,10 +205,23 @@ impl ReceiptResolver {
             FileRead::Absent => SymbolMap::FileAbsent,
             FileRead::Unknown => SymbolMap::Unknown,
             FileRead::Bytes(bytes) => {
-                self.parses += 1;
-                match symbol_stamps(subject, commit, &bytes) {
-                    Some(map) => SymbolMap::Map(Rc::new(map)),
-                    None => SymbolMap::Unknown,
+                if self.by_content.len() >= MAX_MEMOIZED_FILES {
+                    self.by_content.clear();
+                }
+                let content_key = (
+                    subject.relpath.to_string(),
+                    *blake3::hash(&bytes).as_bytes(),
+                );
+                if let Some(hit) = self.by_content.get(&content_key) {
+                    hit.clone()
+                } else {
+                    self.parses += 1;
+                    let map = match symbol_stamps(subject, commit, &bytes) {
+                        Some(map) => SymbolMap::Map(Rc::new(map)),
+                        None => SymbolMap::Unknown,
+                    };
+                    self.by_content.insert(content_key, map.clone());
+                    map
                 }
             }
         };
@@ -274,12 +292,31 @@ impl ReceiptResolver {
         None
     }
 
-    /// Parent oids of `commit` (empty for a root commit), memoized. `None`
-    /// when git fails or outlives its deadline.
-    pub(crate) fn parents_of(&mut self, repo_root: &str, commit: &str) -> Option<Rc<Vec<String>>> {
+    /// Parent oids of `commit` (empty for a root commit), memoized. Read from
+    /// the object database; if that fails, from `git rev-list --parents`.
+    /// `None` when neither can say or git outlives its deadline.
+    pub(crate) fn parents_of(
+        &mut self,
+        auditor: &Auditor,
+        repo_root: &str,
+        commit: &str,
+    ) -> Option<Rc<Vec<String>>> {
         let key = (repo_root.to_string(), commit.to_string());
         if let Some(hit) = self.parents.get(&key) {
             return hit.clone();
+        }
+        let direct = commit.parse::<ObjectId>().ok().and_then(|oid| {
+            let found = auditor.repo().find_commit(oid).ok()?;
+            Some(Rc::new(
+                found
+                    .parent_ids()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>(),
+            ))
+        });
+        if direct.is_some() {
+            self.parents.insert(key, direct.clone());
+            return direct;
         }
         let mut cmd = git_at(repo_root);
         cmd.args(["rev-list", "--parents", "-n", "1", commit]);
@@ -302,7 +339,7 @@ impl ReceiptResolver {
         subject: &Subject,
         commit: &str,
     ) -> Option<bool> {
-        let parents = self.parents_of(subject.repo_root, commit)?;
+        let parents = self.parents_of(subject.auditor, subject.repo_root, commit)?;
         let now = self.state_at(subject, commit);
         match parents.first() {
             None => match now {
@@ -364,7 +401,7 @@ impl ReceiptResolver {
         depth: usize,
     ) -> Result<String, Abstain> {
         let parents = self
-            .parents_of(subject.repo_root, commit)
+            .parents_of(subject.auditor, subject.repo_root, commit)
             .ok_or(Abstain::MergeNotAuthor)?;
         if parents.len() < 2 {
             return Ok(commit.to_string());

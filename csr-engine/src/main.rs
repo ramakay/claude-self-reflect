@@ -521,22 +521,28 @@ enum ProvenanceAction {
 enum SymbolAction {
     /// Did `--oid` author a change to the symbol? Prints one JSON object:
     /// `{"oid","merge","authored","author","author_committed_at"}`.
+    /// With `--batch`, reads one JSON question per stdin line
+    /// (`{"repo","file","symbol","oid","from"}`) and prints one answer per
+    /// line, in order; a bad line answers `{"error":...}` and the batch goes on.
     Change {
         /// Repository root
-        #[arg(long)]
-        repo: PathBuf,
+        #[arg(long, required_unless_present = "batch", conflicts_with = "batch")]
+        repo: Option<PathBuf>,
         /// File, relative to the repository root
-        #[arg(long)]
-        file: String,
+        #[arg(long, required_unless_present = "batch", conflicts_with = "batch")]
+        file: Option<String>,
         /// Ledger symbol; omit for the whole file
-        #[arg(long)]
+        #[arg(long, conflicts_with = "batch")]
         symbol: Option<String>,
         /// The commit asked about
-        #[arg(long)]
-        oid: String,
+        #[arg(long, required_unless_present = "batch", conflicts_with = "batch")]
+        oid: Option<String>,
         /// The witness's at_oid; needed to resolve the author of a merge
-        #[arg(long)]
+        #[arg(long, conflicts_with = "batch")]
         from: Option<String>,
+        /// Read the questions from stdin, one JSON object per line
+        #[arg(long)]
+        batch: bool,
     },
 }
 
@@ -1134,9 +1140,21 @@ async fn run(
                 ref symbol,
                 ref oid,
                 ref from,
+                batch,
             },
     }) = args.command
     {
+        if batch {
+            csr_engine::dream::symbol_cli::run_batch(
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )?;
+            return Ok(());
+        }
+        let (Some(repo), Some(file), Some(oid)) = (repo, file, oid) else {
+            eprintln!("error: --repo, --file and --oid are required without --batch");
+            std::process::exit(2);
+        };
         let repo = repo.to_string_lossy();
         let request = csr_engine::dream::symbol_cli::ChangeRequest {
             repo: &repo,

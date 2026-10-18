@@ -10,8 +10,11 @@
 //!
 //! The command prints exactly one JSON object with stable keys:
 //! `oid`, `merge`, `authored`, `author`, `author_committed_at`. Later items may
-//! ADD keys; none of these are renamed or removed.
+//! ADD keys; none of these are renamed or removed. `--batch` ([`run_batch`])
+//! answers many questions in one process, one JSON object per line.
 
+use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::path::Path;
 
 use codewitness::Auditor;
@@ -40,6 +43,11 @@ fn resolve_commit(repo: &str, rev: &str) -> Option<String> {
     if rev.is_empty() || rev.starts_with('-') {
         return None;
     }
+    // A full oid names itself; a commit that does not exist fails at the first
+    // read of its parents. Saves two process spawns per question in a batch.
+    if matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(rev.to_ascii_lowercase());
+    }
     let out = git_at(repo)
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("{rev}^{{commit}}"))
@@ -66,9 +74,29 @@ fn relative_file(repo: &str, file: &str) -> Option<String> {
     (!rel.is_empty() && !escapes).then_some(rel)
 }
 
+/// Repositories opened and parsed state shared by every question of one run
+/// (the single form asks one question; `--batch` asks many).
+#[derive(Default)]
+pub struct Session {
+    resolver: ReceiptResolver,
+    auditors: HashMap<String, Result<Auditor, String>>,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Answer one `symbol change` question as the JSON object described in the
 /// module doc, or an error message for an unreadable repository / commit.
 pub fn symbol_change(req: &ChangeRequest) -> Result<Value, String> {
+    symbol_change_in(&mut Session::new(), req)
+}
+
+/// [`symbol_change`] on a shared [`Session`]: parsed symbol maps, commit
+/// lists and opened repositories are reused across questions.
+pub fn symbol_change_in(session: &mut Session, req: &ChangeRequest) -> Result<Value, String> {
     if !Path::new(req.repo).is_dir() {
         return Err(format!("repo is not a directory: {}", req.repo));
     }
@@ -83,21 +111,28 @@ pub fn symbol_change(req: &ChangeRequest) -> Result<Value, String> {
         ),
         None => None,
     };
-    let auditor =
-        Auditor::discover(req.repo).map_err(|e| format!("cannot open repo {}: {e}", req.repo))?;
+    let Session {
+        resolver, auditors, ..
+    } = session;
+    let auditor = auditors
+        .entry(req.repo.to_string())
+        .or_insert_with(|| {
+            Auditor::discover(req.repo).map_err(|e| format!("cannot open repo {}: {e}", req.repo))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
     let absolute = Path::new(req.repo).join(&relpath);
     let absolute = absolute.to_string_lossy();
     let subject = Subject {
-        auditor: &auditor,
+        auditor,
         repo_root: req.repo,
         file: &absolute,
         relpath: &relpath,
         project: "",
         symbol: req.symbol,
     };
-    let mut resolver = ReceiptResolver::new();
     let parents = resolver
-        .parents_of(req.repo, &oid)
+        .parents_of(auditor, req.repo, &oid)
         .ok_or_else(|| format!("cannot read the parents of {oid}"))?;
     let merge = parents.len() >= 2;
     let authored = resolver.changed_vs_first_parent(&subject, &oid);
@@ -105,12 +140,12 @@ pub fn symbol_change(req: &ChangeRequest) -> Result<Value, String> {
         Some(true) => Some(oid.clone()),
         Some(false) if merge => from
             .as_deref()
-            .and_then(|from| merge_author(&mut resolver, &subject, from, &oid)),
+            .and_then(|from| merge_author(resolver, &subject, from, &oid)),
         _ => None,
     };
     let author_committed_at = author
         .as_deref()
-        .and_then(|a| commit_time_local(&auditor, a));
+        .and_then(|a| commit_time_local(auditor, a));
     Ok(json!({
         "oid": oid,
         "merge": merge,
@@ -118,6 +153,50 @@ pub fn symbol_change(req: &ChangeRequest) -> Result<Value, String> {
         "author": author,
         "author_committed_at": author_committed_at,
     }))
+}
+
+/// One line of `--batch` input.
+#[derive(serde::Deserialize)]
+struct BatchLine {
+    repo: String,
+    file: String,
+    #[serde(default)]
+    symbol: Option<String>,
+    oid: String,
+    #[serde(default)]
+    from: Option<String>,
+}
+
+/// `symbol change --batch`: one JSON question per input line, one JSON answer
+/// per output line, in the same order. A blank line is skipped; a line that is
+/// not a valid question, or whose question cannot be answered, gets
+/// `{"error":...}` in its place and never stops the batch. One [`Session`]
+/// serves the whole batch, so a file parsed at a commit is parsed once.
+pub fn run_batch<R: BufRead, W: Write>(input: R, mut output: W) -> std::io::Result<()> {
+    let mut session = Session::new();
+    for line in input.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let answer = match serde_json::from_str::<BatchLine>(&line) {
+            Ok(q) => symbol_change_in(
+                &mut session,
+                &ChangeRequest {
+                    repo: &q.repo,
+                    file: &q.file,
+                    symbol: q.symbol.as_deref(),
+                    oid: &q.oid,
+                    from: q.from.as_deref(),
+                },
+            )
+            .unwrap_or_else(|message| json!({ "error": message })),
+            Err(e) => json!({ "error": format!("bad batch line: {e}") }),
+        };
+        writeln!(output, "{answer}")?;
+        output.flush()?;
+    }
+    Ok(())
 }
 
 /// The commit that authored the change merge `merge` carries, judged from the
@@ -260,6 +339,67 @@ mod tests {
         let answer = ask(tmp.path(), &bad, None).unwrap();
         assert!(answer["authored"].is_null(), "{answer}");
         assert!(answer["author"].is_null());
+    }
+
+    fn batch(input: &str) -> Vec<Value> {
+        let mut out = Vec::new();
+        run_batch(input.as_bytes(), &mut out).unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_batch_answers_every_line_in_order_and_a_bad_line_does_not_stop_it() {
+        let (tmp, s1, c1, m) = fixture();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let q = |oid: &str, from: Option<&str>| {
+            json!({"repo": repo, "file": "lib.rs", "symbol": "foo", "oid": oid, "from": from})
+                .to_string()
+        };
+        let input = [
+            q(&m, Some(&s1)),
+            "this is not json".to_string(),
+            q("deadbeef", None),
+            String::new(),
+            q(&c1, None),
+            json!({"repo": "/nonexistent/csr-no-repo", "file": "lib.rs", "oid": "HEAD"})
+                .to_string(),
+            q(&s1, None),
+        ]
+        .join("\n");
+        let answers = batch(&input);
+        assert_eq!(answers.len(), 6, "{answers:?}");
+        assert_eq!(answers[0]["oid"], m.as_str());
+        assert_eq!(answers[0]["merge"], true);
+        assert_eq!(answers[0]["author"], c1.as_str());
+        assert!(answers[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("bad batch line"));
+        assert!(answers[2]["error"].is_string());
+        assert_eq!(answers[3]["oid"], c1.as_str());
+        assert_eq!(answers[3]["authored"], true);
+        assert!(answers[4]["error"].is_string());
+        assert_eq!(answers[5]["oid"], s1.as_str());
+        assert_eq!(answers[5]["authored"], false);
+    }
+
+    #[test]
+    fn a_batch_answer_equals_the_single_answer() {
+        let (tmp, s1, _c1, m) = fixture();
+        let repo = tmp.path().to_string_lossy().to_string();
+        let single = ask(tmp.path(), &m, Some(&s1)).unwrap();
+        let line = json!({"repo": repo, "file": "lib.rs", "symbol": "foo", "oid": m, "from": s1});
+        assert_eq!(batch(&line.to_string()), vec![single]);
+    }
+
+    #[test]
+    fn an_empty_batch_prints_nothing() {
+        assert!(batch("").is_empty());
+        assert!(batch("\n  \n").is_empty());
     }
 
     #[test]
