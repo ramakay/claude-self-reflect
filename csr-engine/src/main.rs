@@ -57,11 +57,14 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// One-shot setup: import, register MCP, install hooks
+    /// One-shot setup: import, register MCP, install hooks, install the companion plugin
     Setup {
         /// Anthropic API key for AI narrative enrichment (optional)
         #[arg(long)]
         anthropic_key: Option<String>,
+        /// Do not install the csr-companion plugin through Claude Code's plugin CLI
+        #[arg(long)]
+        no_companion: bool,
     },
     /// Show system status (JSON by default, --compact for statusline, --swiftbar for menu bar)
     Status {
@@ -900,8 +903,18 @@ async fn run(
         .init();
 
     // Handle subcommands that don't need Engine::new()
-    if let Some(Commands::Setup { anthropic_key }) = args.command {
-        return csr_engine::setup::handle(&args.db_path, &args.projects_dir, anthropic_key).await;
+    if let Some(Commands::Setup {
+        anthropic_key,
+        no_companion,
+    }) = args.command
+    {
+        return csr_engine::setup::handle(
+            &args.db_path,
+            &args.projects_dir,
+            anthropic_key,
+            !no_companion,
+        )
+        .await;
     }
 
     if let Some(Commands::Status {

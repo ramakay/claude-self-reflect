@@ -206,8 +206,9 @@ function findExpectedChecksum(checksumData, filename) {
 // --- Activation ---
 
 // Activation is a separate consent event: setup writes hooks into
-// ~/.claude/settings.json, registers the MCP server, and imports
-// conversation transcripts. Never do that from a package manager
+// ~/.claude/settings.json, registers the MCP server, imports
+// conversation transcripts, and installs the csr-companion plugin through
+// Claude Code's plugin CLI. Never do that from a package manager
 // lifecycle script unless the user explicitly opted in.
 function runOrExplainActivation(destPath, pathBinary) {
   // Bare `csr-engine` is only safe advice when PATH really resolves to the
@@ -216,7 +217,8 @@ function runOrExplainActivation(destPath, pathBinary) {
 
   if (process.env.CSR_AUTO_SETUP !== '1') {
     console.log('\n  \x1b[1mTo activate\x1b[0m (registers the MCP server, installs hooks,');
-    console.log('  and imports your conversations), run:');
+    console.log("  imports your conversations, and installs the csr-companion plugin");
+    console.log("  through Claude Code's plugin CLI), run:");
     console.log(`\n    \x1b[1;32m${command} setup\x1b[0m\n`);
     console.log('  Then restart Claude Code.\n');
     return;

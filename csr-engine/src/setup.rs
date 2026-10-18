@@ -10,9 +10,15 @@
 //! 5. Installs hooks
 //! 6. Optionally saves Anthropic API key
 //! 7. Prints summary
+//!
+//! After those steps succeed, setup installs the csr-companion plugin through
+//! Claude Code's own plugin CLI (`--no-companion` skips it). A failure there is
+//! reported with the two manual `/plugin` lines and never fails setup.
 
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Read};
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -28,6 +34,7 @@ pub async fn handle(
     db_path: &Path,
     projects_dir: &Path,
     anthropic_key: Option<String>,
+    companion: bool,
 ) -> Result<()> {
     eprintln!("\n=== Claude Self-Reflect Setup ===\n");
 
@@ -252,12 +259,33 @@ pub async fn handle(
         return Err(anyhow::anyhow!("MCP server not registered"));
     }
 
+    // The engine steps all succeeded: now the companion. Not part of the numbered
+    // steps above because it is the one that can fail without failing setup.
+    let marketplace = companion_marketplace();
+    let companion_outcome = tokio::task::spawn_blocking(move || {
+        companion_step(
+            companion,
+            Path::new("claude"),
+            &marketplace,
+            COMPANION_TIMEOUT,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Some(CompanionOutcome::Failed {
+            reason: format!("the install task did not finish: {e}"),
+        })
+    });
+
     eprintln!("\n=== Setup Complete ===\n");
     eprintln!("  Conversations: {}", conversations);
     eprintln!("  Reflections:   {}", reflections);
     eprintln!("  Projects:      {}", projects);
     eprintln!();
-    eprint!("{}", next_steps(anthropic_key.is_some()));
+    eprint!(
+        "{}",
+        next_steps(anthropic_key.is_some(), companion_outcome.as_ref())
+    );
 
     Ok(())
 }
@@ -265,23 +293,290 @@ pub async fn handle(
 /// The two commands that install the companion plugin (the pane, and the dreamer's
 /// "what if...?"). The plugin reaches users through this repository's marketplace
 /// (`.claude-plugin/marketplace.json`, name `claude-self-reflect`, plugin
-/// `csr-companion`). Setup prints them and installs nothing: adding a plugin is the
-/// user's own consent step, in Claude Code. They are the last two lines of a
-/// successful setup.
+/// `csr-companion`). Setup installs the plugin itself (`install_companion`); these
+/// are the manual fallback it prints, as the last two lines of the output, when it
+/// was skipped (`--no-companion`) or could not install.
 fn companion_install_instructions() -> &'static str {
     "/plugin marketplace add ramakay/claude-self-reflect\n/plugin install csr-companion@claude-self-reflect"
 }
 
-/// What a successful setup ends with: the next steps, then the companion's install lines.
-fn next_steps(has_anthropic_key: bool) -> String {
+/// The marketplace source handed to `claude plugin install --marketplace`.
+const DEFAULT_COMPANION_MARKETPLACE: &str = "ramakay/claude-self-reflect";
+
+/// Hard stop for each `claude plugin` call. Only that child is killed.
+const COMPANION_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn companion_marketplace() -> String {
+    match std::env::var("CSR_COMPANION_MARKETPLACE") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => DEFAULT_COMPANION_MARKETPLACE.to_string(),
+    }
+}
+
+/// What `claude plugin` reports about the installed plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionInfo {
+    pub plugin: String,
+    pub version: String,
+    pub marketplace: String,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompanionOutcome {
+    Installed(CompanionInfo),
+    AlreadyInstalled(CompanionInfo),
+    Failed { reason: String },
+}
+
+const COMPANION_PLUGIN: &str = "csr-companion";
+
+/// Captured result of one `claude` call.
+struct ClaudeRun {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `claude <args>` with stdin closed, output captured and a hard timeout.
+/// On timeout only the child we spawned is killed (and reaped); a grandchild that
+/// keeps the pipes open is left alone and its output abandoned.
+fn run_with_timeout(claude: &Path, args: &[&str], timeout: Duration) -> Result<ClaudeRun, String> {
+    let shown = format!("claude plugin {}", args.get(1).copied().unwrap_or(""));
+    let mut child = Command::new(claude)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run `{}`: {e}", claude.display()))?;
+
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let _ = tx.send(buf);
+        });
+        rx
+    }
+    let out_rx = drain(child.stdout.take());
+    let err_rx = drain(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`{shown}` did not finish within {} s and was stopped",
+                    timeout.as_secs_f32().round()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("could not wait for `{shown}`: {e}"));
+            }
+        }
+    };
+
+    let grace = Duration::from_secs(2);
+    let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(grace).unwrap_or_default();
+    Ok(ClaudeRun {
+        success: status.success(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
+}
+
+/// The first JSON value in `text`: the whole text if it parses (`plugin list
+/// --json` pretty-prints an array), else the first line that does.
+fn first_json(
+    text: &str,
+    accept: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        if accept(&v) {
+            return Some(v);
+        }
+    }
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+        .find(|v| accept(v))
+}
+
+/// `csr-companion@claude-self-reflect` -> ("csr-companion", "claude-self-reflect").
+fn split_plugin_id(id: &str) -> (String, String) {
+    match id.split_once('@') {
+        Some((p, m)) => (p.to_string(), m.to_string()),
+        None => (id.to_string(), "unknown".to_string()),
+    }
+}
+
+fn info_from(entry: &serde_json::Value) -> Option<CompanionInfo> {
+    let id = entry
+        .get("id")
+        .or_else(|| entry.get("pluginId"))
+        .or_else(|| entry.get("plugin"))?
+        .as_str()?;
+    let (plugin, marketplace) = split_plugin_id(id);
+    let text = |key: &str| entry.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    Some(CompanionInfo {
+        plugin,
+        version: text("version").unwrap_or_else(|| "unknown".to_string()),
+        marketplace,
+        scope: text("scope").unwrap_or_else(|| "unknown".to_string()),
+    })
+}
+
+/// The installed csr-companion entry in `claude plugin list --json`, if any.
+fn find_listed(run: &ClaudeRun) -> Option<CompanionInfo> {
+    let list = first_json(&run.stdout, |v| v.is_array())?;
+    list.as_array()?
+        .iter()
+        .filter_map(info_from)
+        .find(|i| i.plugin == COMPANION_PLUGIN)
+}
+
+/// Install csr-companion through Claude Code's plugin CLI. The binary path, the
+/// marketplace source and the timeout are parameters so tests never touch PATH or
+/// the process environment. Never panics and never returns an error: every
+/// problem is a `Failed { reason }` with a one-line reason.
+pub fn install_companion(claude: &Path, marketplace: &str, timeout: Duration) -> CompanionOutcome {
+    let fail = |reason: String| CompanionOutcome::Failed { reason };
+
+    // Already there? A list that cannot be read is not fatal: try the install.
+    match run_with_timeout(claude, &["plugin", "list", "--json"], timeout) {
+        Ok(run) if run.success => {
+            if let Some(info) = find_listed(&run) {
+                return CompanionOutcome::AlreadyInstalled(info);
+            }
+        }
+        Ok(_) => {}
+        Err(reason) => return fail(reason),
+    }
+
+    let run = match run_with_timeout(
+        claude,
+        &[
+            "plugin",
+            "install",
+            COMPANION_PLUGIN,
+            "--marketplace",
+            marketplace,
+            "--json",
+        ],
+        timeout,
+    ) {
+        Ok(run) => run,
+        Err(reason) => return fail(reason),
+    };
+
+    let result = first_json(&run.stdout, |v| v.is_object());
+    if !run.success {
+        let detail = result
+            .as_ref()
+            .and_then(|v| v.get("message"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| run.stderr.trim().to_string());
+        return fail(format!(
+            "`claude plugin install` failed: {}",
+            one_line(&detail)
+        ));
+    }
+    let Some(result) = result else {
+        return fail("`claude plugin install` returned no JSON result".to_string());
+    };
+    if result.get("outcome").and_then(|o| o.as_str()) != Some("ok") {
+        let message = result
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("outcome was not ok");
+        return fail(format!(
+            "`claude plugin install` did not succeed: {}",
+            one_line(message)
+        ));
+    }
+    let Some(mut info) = info_from(&result) else {
+        return fail("`claude plugin install` JSON named no plugin".to_string());
+    };
+
+    // The install result carries no version; the list does. Ask once more, and
+    // say "unknown" rather than guess if that fails too.
+    if info.version == "unknown" {
+        if let Ok(list) = run_with_timeout(claude, &["plugin", "list", "--json"], timeout) {
+            if let Some(listed) = find_listed(&list) {
+                info.version = listed.version;
+            }
+        }
+    }
+    CompanionOutcome::Installed(info)
+}
+
+/// The companion step of setup. `enabled == false` (`--no-companion`) makes no
+/// `claude` call at all and returns `None`.
+fn companion_step(
+    enabled: bool,
+    claude: &Path,
+    marketplace: &str,
+    timeout: Duration,
+) -> Option<CompanionOutcome> {
+    if !enabled {
+        return None;
+    }
+    eprintln!("Installing the csr-companion plugin through `claude plugin`...");
+    Some(install_companion(claude, marketplace, timeout))
+}
+
+fn one_line(text: &str) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let line = line.trim();
+    if line.is_empty() {
+        "no detail from claude".to_string()
+    } else {
+        line.chars().take(240).collect()
+    }
+}
+
+/// What a successful setup ends with: the next steps, then the companion's
+/// receipt, or its manual install lines when it was skipped or failed.
+/// `companion` is `None` when `--no-companion` skipped the install.
+fn next_steps(has_anthropic_key: bool, companion: Option<&CompanionOutcome>) -> String {
     let narratives = if has_anthropic_key {
         "  3. Run `csr-engine daemon` for AI-powered narrative enrichment"
     } else {
         "  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives"
     };
+    let manual = |lead: String| {
+        format!(
+            "{lead}\nOptional: the CSR companion pane. In Claude Code, run:\n{}\n",
+            companion_install_instructions()
+        )
+    };
+    let companion_text = match companion {
+        Some(CompanionOutcome::Installed(i)) => format!(
+            "companion: {} {} from {}, scope {}\nRun /reload-plugins in Claude Code (or restart it) to load it.\n",
+            i.plugin, i.version, i.marketplace, i.scope
+        ),
+        Some(CompanionOutcome::AlreadyInstalled(i)) => format!(
+            "companion: {} {} from {}, scope {} (already installed)\nRun /reload-plugins in Claude Code (or restart it) if it is not loaded.\n",
+            i.plugin, i.version, i.marketplace, i.scope
+        ),
+        Some(CompanionOutcome::Failed { reason }) => {
+            manual(format!("companion: not installed: {reason}"))
+        }
+        None => manual("companion: skipped (--no-companion)".to_string()),
+    };
     format!(
-        "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Try: reflect_on_past(\"what did we work on?\")\n{narratives}\n\nOptional: the CSR companion pane. Setup installs nothing for it; in Claude Code, run:\n{}\n",
-        companion_install_instructions()
+        "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Try: reflect_on_past(\"what did we work on?\")\n{narratives}\n\n{companion_text}"
     )
 }
 
@@ -872,10 +1167,238 @@ mod tests {
             .is_file());
     }
 
+    // ── companion install (fake `claude`, injected path; no env or PATH mutation) ──
+
+    const TWO_LINES: [&str; 2] = [
+        "/plugin marketplace add ramakay/claude-self-reflect",
+        "/plugin install csr-companion@claude-self-reflect",
+    ];
+    const LIST_ENTRY: &str = r#"[{"id":"csr-companion@claude-self-reflect","version":"0.5.0","scope":"user","enabled":true}]"#;
+    const INSTALL_OK: &str = r#"{"command":"install","outcome":"ok","plugin":"csr-companion@claude-self-reflect","pluginId":"csr-companion@claude-self-reflect","scope":"user","message":"Successfully installed"}"#;
+
+    struct Fake {
+        _dir: tempfile::TempDir,
+        bin: std::path::PathBuf,
+        log: std::path::PathBuf,
+        pid: std::path::PathBuf,
+    }
+
+    impl Fake {
+        /// `list_body` / `install_body` are shell snippets run for the matching
+        /// subcommand. Every call appends its argv to the log first.
+        fn new(list_body: &str, install_body: &str) -> Fake {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let bin = dir.path().join("claude");
+            let log = dir.path().join("argv.log");
+            let pid = dir.path().join("pid");
+            let script = format!(
+                "#!/bin/sh\necho \"$@\" >> '{log}'\necho $$ > '{pid}'\ncase \"$2\" in\n  list) {list_body} ;;\n  install) {install_body} ;;\nesac\n",
+                log = log.display(),
+                pid = pid.display(),
+            );
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Fake {
+                _dir: dir,
+                bin,
+                log,
+                pid,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn tail_two(text: &str) -> Vec<&str> {
+        let mut t: Vec<&str> = text.lines().rev().take(2).collect();
+        t.reverse();
+        t
+    }
+
+    fn stateful_fake() -> Fake {
+        // list shows the plugin only after install has run (marker file next to the log)
+        let fake = Fake::new("true", "true");
+        let marker = fake.log.with_file_name("installed");
+        let script = std::fs::read_to_string(&fake.bin).unwrap().replace(
+            "  list) true ;;\n  install) true ;;",
+            &format!(
+                "  list) if [ -f '{m}' ]; then echo '{LIST_ENTRY}'; else echo '[]'; fi ;;\n  install) touch '{m}'; echo 'warming up'; echo '{INSTALL_OK}' ;;",
+                m = marker.display()
+            ),
+        );
+        std::fs::write(&fake.bin, script).unwrap();
+        fake
+    }
+
+    #[test]
+    fn companion_install_success_parses_the_json_line_and_prints_the_receipt() {
+        let fake = stateful_fake();
+        let outcome = install_companion(&fake.bin, "/some/marketplace", Duration::from_secs(10));
+        let CompanionOutcome::Installed(info) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            info,
+            &CompanionInfo {
+                plugin: "csr-companion".into(),
+                version: "0.5.0".into(),
+                marketplace: "claude-self-reflect".into(),
+                scope: "user".into(),
+            }
+        );
+        let calls = fake.calls();
+        assert_eq!(calls[0], "plugin list --json");
+        assert_eq!(
+            calls[1],
+            "plugin install csr-companion --marketplace /some/marketplace --json"
+        );
+        let text = next_steps(false, Some(&outcome));
+        assert!(
+            text.contains("companion: csr-companion 0.5.0 from claude-self-reflect, scope user\nRun /reload-plugins in Claude Code (or restart it) to load it.\n"),
+            "{text}"
+        );
+        assert!(!text.contains("installs nothing"), "{text}");
+        assert!(!text.contains("/plugin install"), "{text}");
+    }
+
+    #[test]
+    fn companion_already_installed_never_calls_install() {
+        let fake = Fake::new(&format!("echo '{LIST_ENTRY}'"), "exit 9");
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, CompanionOutcome::AlreadyInstalled(i) if i.version == "0.5.0" && i.scope == "user" && i.marketplace == "claude-self-reflect"),
+            "{outcome:?}"
+        );
+        assert_eq!(fake.calls(), vec!["plugin list --json".to_string()]);
+        let text = next_steps(true, Some(&outcome));
+        assert!(
+            text.contains("companion: csr-companion 0.5.0 from claude-self-reflect, scope user (already installed)"),
+            "{text}"
+        );
+        assert!(!text.contains("/plugin install"), "{text}");
+    }
+
+    #[test]
+    fn companion_multiline_pretty_list_is_parsed() {
+        let pretty = "[\\n  {\\n    \"id\": \"other@m\",\\n    \"version\": \"1\"\\n  },\\n  {\\n    \"id\": \"csr-companion@claude-self-reflect\",\\n    \"version\": \"0.5.0\",\\n    \"scope\": \"user\"\\n  }\\n]";
+        let fake = Fake::new(&format!("printf '{pretty}'"), "exit 9");
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(10));
+        assert!(
+            matches!(&outcome, CompanionOutcome::AlreadyInstalled(i) if i.version == "0.5.0"),
+            "{outcome:?}"
+        );
+    }
+
+    fn assert_failed_with_manual_lines(outcome: &CompanionOutcome, needle: &str) {
+        let CompanionOutcome::Failed { reason } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(reason.contains(needle), "{reason}");
+        assert_eq!(reason.lines().count(), 1, "one line: {reason}");
+        for key in [true, false] {
+            let text = next_steps(key, Some(outcome));
+            assert!(
+                text.contains(&format!("companion: not installed: {reason}\n")),
+                "{text}"
+            );
+            assert_eq!(tail_two(&text), TWO_LINES, "{text}");
+        }
+    }
+
+    #[test]
+    fn companion_missing_binary_fails_soft_with_the_manual_lines() {
+        let outcome = install_companion(
+            Path::new("/nonexistent-csr-test-dir/claude"),
+            "x",
+            Duration::from_secs(5),
+        );
+        assert_failed_with_manual_lines(&outcome, "could not run");
+    }
+
+    #[test]
+    fn companion_nonzero_exit_fails_soft_with_the_manual_lines() {
+        let fake = Fake::new(
+            "echo '[]'",
+            r#"echo '{"command":"install","outcome":"failed","message":"Plugin not found in marketplace"}'; echo 'boom' >&2; exit 1"#,
+        );
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(10));
+        assert_failed_with_manual_lines(&outcome, "Plugin not found in marketplace");
+    }
+
+    #[test]
+    fn companion_bad_json_fails_soft_with_the_manual_lines() {
+        let fake = Fake::new("echo '[]'", "echo 'this is not json'");
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(10));
+        assert_failed_with_manual_lines(&outcome, "no JSON result");
+    }
+
+    #[test]
+    fn companion_outcome_not_ok_fails_soft() {
+        let fake = Fake::new(
+            "echo '[]'",
+            r#"echo '{"command":"install","outcome":"failed","message":"nope"}'"#,
+        );
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(10));
+        assert_failed_with_manual_lines(&outcome, "nope");
+    }
+
+    #[test]
+    fn companion_timeout_kills_only_the_child_and_fails_soft() {
+        // `exec sleep` keeps the recorded pid equal to the process we spawned
+        let fake = Fake::new("exec sleep 5", "exec sleep 5");
+        let started = Instant::now();
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(1));
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(4),
+            "did not stop at the timeout: {waited:?}"
+        );
+        assert_failed_with_manual_lines(&outcome, "did not finish within");
+        let pid: i32 = std::fs::read_to_string(&fake.pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only probes for the pid's existence.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "child {pid} is still running after the timeout");
+    }
+
+    #[test]
+    fn no_companion_flag_calls_neither_list_nor_install() {
+        let fake = stateful_fake();
+        let outcome = companion_step(false, &fake.bin, "x", Duration::from_secs(5));
+        assert_eq!(outcome, None);
+        assert!(
+            fake.calls().is_empty(),
+            "claude was called: {:?}",
+            fake.calls()
+        );
+        let text = next_steps(false, outcome.as_ref());
+        assert!(
+            text.contains("companion: skipped (--no-companion)"),
+            "{text}"
+        );
+        assert_eq!(tail_two(&text), TWO_LINES);
+        // and enabled does call it
+        let ran = companion_step(true, &fake.bin, "x", Duration::from_secs(10));
+        assert!(
+            matches!(ran, Some(CompanionOutcome::Installed(_))),
+            "{ran:?}"
+        );
+    }
+
     #[test]
     fn setup_next_steps_end_with_companion_install_lines() {
         for key in [true, false] {
-            let text = next_steps(key);
+            let text = next_steps(key, None);
             assert!(text.starts_with("Next steps:\n  1. Restart Claude Code"));
             assert!(text.ends_with(&format!("{}\n", companion_install_instructions())));
             let tail: Vec<&str> = text.lines().rev().take(2).collect();

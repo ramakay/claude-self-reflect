@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 import { findEngineBinary, whichBinary } from './lib.js';
 
 const commands = {
-  setup: 'Import conversations, register MCP server, install hooks',
+  setup: 'Import conversations, register MCP server, install hooks, install the csr-companion plugin',
   status: 'Show system status (JSON)',
   statusline: 'Configure Claude Code statusline integration',
   help: 'Show this help message'

@@ -668,7 +668,8 @@ Build from source instead:
     check_shadow
 
     # Setup writes hooks into ~/.claude/settings.json, registers the MCP
-    # server, and imports conversation transcripts — that needs explicit
+    # server, imports conversation transcripts, and installs the csr-companion
+    # plugin through Claude Code's plugin CLI — that needs explicit
     # consent. Prompt when a terminal is available; otherwise (CI, piped
     # non-interactive shells) leave activation to the user.
     RUN_SETUP=no
@@ -681,8 +682,9 @@ Build from source instead:
     # it for real in a subshell: a failure there is just a false condition.
     elif [ -r /dev/tty ] && ( : > /dev/tty ) 2>/dev/null; then
         printf '\n  Setup registers the MCP server, installs 6 Claude Code hooks\n' > /dev/tty
-        printf '  into ~/.claude/settings.json, and imports your conversations\n' > /dev/tty
-        printf '  from ~/.claude/projects/ into a local index.\n\n' > /dev/tty
+        printf '  into ~/.claude/settings.json, imports your conversations\n' > /dev/tty
+        printf '  from ~/.claude/projects/ into a local index, and installs the\n' > /dev/tty
+        printf "  csr-companion plugin through Claude Code's plugin CLI.\n\n" > /dev/tty
         printf '  \033[1mRun setup now? [Y/n]\033[0m ' > /dev/tty
         answer=""
         # A failed read is not consent — only a successful (possibly empty)

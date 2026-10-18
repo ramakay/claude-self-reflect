@@ -400,6 +400,12 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   relative source path). Install with `/plugin marketplace add ramakay/claude-self-reflect` then
   `/plugin install csr-companion@claude-self-reflect`. `csr-engine setup` ends by printing those two lines and
   installs nothing; the npm package does not install it either (7e697466).
+- **`csr-engine setup` now installs the companion** through Claude Code's plugin CLI
+  (`claude plugin install csr-companion --marketplace ramakay/claude-self-reflect`), under the same single consent that
+  runs setup. It skips a plugin that is already installed, `csr-engine setup --no-companion` skips it, and a missing
+  `claude`, a nonzero exit, a 120 s timeout or an unreadable result prints the reason plus the two `/plugin` lines
+  and still exits 0. `CSR_COMPANION_MARKETPLACE` overrides the source. The default GitHub marketplace works only
+  after this release merges to `main`, because `.claude-plugin/marketplace.json` is not on `main` yet.
 - **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
   "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
   last told it. It reads the csr-engine database read-only
