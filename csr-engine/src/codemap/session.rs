@@ -27,6 +27,13 @@
 //! Lag, stated plainly: an edit made OUTSIDE Claude in a protected repo is not
 //! seen until the next session event (a SessionStart or a Claude edit in that
 //! cwd), because nothing watches the folder.
+//!
+//! An ordinary git repo is mapped by the daemon's loop. A fresh install has no
+//! daemon (setup never starts one), so with NO live daemon the session maps an
+//! ordinary repo the same way, through the same two children
+//! (`on_session_start_ordinary`, `on_post_tool_use_ordinary`). A live daemon
+//! keeps ownership: the hooks do nothing there. The scan child registers such a
+//! repo with source `signal`, as the daemon would.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -440,6 +447,115 @@ pub fn on_post_tool_use(
     if let Err(e) = super::with_hook_busy_timeout(conn, || super::enqueue(conn, edited)) {
         eprintln!("CSR: code map session enqueue skipped (non-fatal): {e}");
         return Drained::Failed;
+    }
+    let lock = match try_take(&lock_path(db_path, &cwd), now, alive) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Drained::InFlight,
+        Err(e) => {
+            eprintln!("CSR: code map session lock failed (non-fatal): {e}");
+            return Drained::Failed;
+        }
+    };
+    match spawner.spawn(&drain_argv(db_path, &cwd)) {
+        Ok(pid) => {
+            lock.set_pid(pid, now);
+            Drained::Spawned(pid)
+        }
+        Err(e) => {
+            eprintln!("CSR: code map session drain not started (non-fatal): {e}");
+            lock.release();
+            Drained::Failed
+        }
+    }
+}
+
+// ---- ordinary repos, no daemon -------------------------------------------------------
+
+/// `cwd`, normalised, when the session itself should map it: absolute, NOT in a
+/// protected folder (the functions above own those), inside a git repo, the code
+/// map on, and no live daemon (`daemon_live`) to do it. The repo check walks up
+/// from `cwd`, which is safe: `identify_with` refuses a protected path before any
+/// filesystem call.
+fn ordinary_repo_cwd(
+    cwd: &Path,
+    home: Option<&Path>,
+    disabled: bool,
+    daemon_live: bool,
+) -> Option<PathBuf> {
+    if disabled || daemon_live || !cwd.is_absolute() {
+        return None;
+    }
+    let cwd = normalize_lexical(cwd);
+    if identity::protected_class(&cwd, home).is_some() {
+        return None;
+    }
+    identity::identify_with(&cwd, home).ok()?;
+    Some(cwd)
+}
+
+/// SessionStart in an ordinary git repo while no daemon runs: spawn the detached
+/// session scan, exactly as for a protected folder. Returns the child's pid.
+/// Nothing when the map is off, a daemon is live, `cwd` is relative, protected
+/// (`on_session_start`'s case) or not in a git repo.
+pub fn on_session_start_ordinary(
+    cwd: &Path,
+    db_path: &Path,
+    home: Option<&Path>,
+    disabled: bool,
+    daemon_live: bool,
+    spawner: &dyn Spawner,
+) -> Option<u32> {
+    let cwd = ordinary_repo_cwd(cwd, home, disabled, daemon_live)?;
+    match spawner.spawn(&scan_argv(db_path, &cwd)) {
+        Ok(pid) => Some(pid),
+        Err(e) => {
+            eprintln!("CSR: code map session scan not started (non-fatal): {e}");
+            None
+        }
+    }
+}
+
+/// PostToolUse after an edit in an ordinary git repo while no daemon runs. The
+/// generic hook has already queued the edited file (the daemon would have drained
+/// it), so this only starts the child: a detached `codemap drain` unless one is
+/// in flight, or, for a repo the map does not know yet (the SessionStart scan
+/// never ran), a detached `codemap scan --session` that registers it. One spawn
+/// per call at most, no retries.
+#[allow(clippy::too_many_arguments)]
+pub fn on_post_tool_use_ordinary(
+    conn: &Connection,
+    cwd: &Path,
+    edited: Option<&Path>,
+    db_path: &Path,
+    home: Option<&Path>,
+    disabled: bool,
+    daemon_live: bool,
+    now: i64,
+    alive: &dyn Fn(u32) -> bool,
+    spawner: &dyn Spawner,
+) -> Drained {
+    // The cheap gate first: most PostToolUse calls are not code edits.
+    if !edited.is_some_and(|p| p.is_absolute() && has_code_extension(p)) {
+        return Drained::NotQueued;
+    }
+    let Some(cwd) = ordinary_repo_cwd(cwd, home, disabled, daemon_live) else {
+        return Drained::NotProtected;
+    };
+    let Ok(id) = identity::identify_with(&cwd, home) else {
+        return Drained::NotQueued;
+    };
+    let common = id.common_dir.to_string_lossy().to_string();
+    let known = super::store::list_repos(conn)
+        .map(|repos| repos.iter().any(|r| r.common_dir == common))
+        .unwrap_or(false);
+    if !known {
+        return match spawner.spawn(&scan_argv(db_path, &cwd)) {
+            Ok(pid) => Drained::Spawned(pid),
+            Err(e) => {
+                eprintln!("CSR: code map session scan not started (non-fatal): {e}");
+                Drained::Failed
+            }
+        };
     }
     let lock = match try_take(&lock_path(db_path, &cwd), now, alive) {
         Ok(Some(lock)) => lock,
@@ -942,6 +1058,140 @@ mod tests {
             assert_eq!(out, Drained::NotQueued, "{}", edited.display());
         }
         assert!(store::queue_read(&conn).unwrap().is_empty());
+        assert!(rec.args().is_empty());
+    }
+
+    // ---- ordinary repos, no daemon ----
+
+    /// An ordinary git repo (a bare `.git` directory is enough for `identify`).
+    fn ordinary_repo(f: &Fake) -> PathBuf {
+        let repo = f.db.parent().unwrap().join("work/proj");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        repo
+    }
+
+    #[test]
+    fn ordinary_session_start_spawns_the_scan_argv_when_no_daemon_is_live() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let rec = Recorder::new();
+        let cwd = repo.join("src");
+        let pid = on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &rec);
+        assert_eq!(pid, Some(4242));
+        let want = vec![
+            "--db-path".to_string(),
+            f.db.to_string_lossy().to_string(),
+            "codemap".into(),
+            "scan".into(),
+            "--repo".into(),
+            cwd.to_string_lossy().to_string(),
+            "--session".into(),
+        ];
+        assert_eq!(
+            rec.args(),
+            vec![want],
+            "the same argv a protected folder gets"
+        );
+    }
+
+    #[test]
+    fn ordinary_session_start_leaves_a_live_daemon_in_charge() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let rec = Recorder::new();
+        assert_eq!(
+            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, true, &rec),
+            None
+        );
+        assert!(rec.args().is_empty());
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_off_relative_non_git_and_protected_cwds() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let rec = Recorder::new();
+        let plain = f.db.parent().unwrap().join("not-a-repo");
+        std::fs::create_dir_all(&plain).unwrap();
+        let protected = f.home.join("Documents/probe");
+        std::fs::create_dir_all(protected.join(".git")).unwrap();
+        // the home directory itself is never mapped
+        for (cwd, disabled) in [
+            (repo.clone(), true),
+            (PathBuf::from("proj/src"), false),
+            (plain, false),
+            (protected, false),
+            (f.home.clone(), false),
+        ] {
+            let out = on_session_start_ordinary(&cwd, &f.db, Some(&f.home), disabled, false, &rec);
+            assert_eq!(out, None, "{}", cwd.display());
+        }
+        assert!(rec.args().is_empty());
+    }
+
+    fn ordinary_edit(
+        f: &Fake,
+        conn: &Connection,
+        rec: &Recorder,
+        file: &str,
+        daemon_live: bool,
+        now: i64,
+    ) -> Drained {
+        let repo = ordinary_repo(f);
+        on_post_tool_use_ordinary(
+            conn,
+            &repo,
+            Some(&repo.join(file)),
+            &f.db,
+            Some(&f.home),
+            false,
+            daemon_live,
+            now,
+            &|_| true,
+            rec,
+        )
+    }
+
+    #[test]
+    fn ordinary_post_tool_use_scans_an_unknown_repo_then_drains_a_known_one_once() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let conn = db();
+        let rec = Recorder::new();
+
+        // not registered yet: the first edit starts the session scan
+        let out = ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000);
+        assert_eq!(out, Drained::Spawned(4242));
+        assert_eq!(rec.args()[0][3], "scan");
+
+        // registered: the edit starts one drain, a second finds it in flight
+        let common = repo.join(".git");
+        store::upsert_repo(&conn, &common.to_string_lossy(), None, "signal", false).unwrap();
+        let out = ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_001);
+        assert_eq!(out, Drained::Spawned(4243));
+        assert_eq!(rec.args()[1][3], "drain");
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/b.rs", false, 1_002),
+            Drained::InFlight
+        );
+        assert_eq!(rec.args().len(), 2, "no third spawn");
+    }
+
+    #[test]
+    fn ordinary_post_tool_use_ignores_non_code_edits_and_a_live_daemon() {
+        let f = fake();
+        ordinary_repo(&f);
+        let conn = db();
+        let rec = Recorder::new();
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "README.txt", false, 5),
+            Drained::NotQueued
+        );
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/a.rs", true, 5),
+            Drained::NotProtected
+        );
         assert!(rec.args().is_empty());
     }
 }

@@ -263,6 +263,7 @@ pub(crate) fn codemap_session_start(input: &HookInput, engine: &Engine) {
         return;
     }
     let Some(cwd) = protected_hook_cwd(input) else {
+        codemap_session_start_ordinary(input, engine);
         return;
     };
     let Some(db) = engine_db_path(engine) else {
@@ -281,21 +282,13 @@ pub(crate) fn codemap_session_start(input: &HookInput, engine: &Engine) {
 /// detached drain unless one is in flight. Nothing for an ordinary cwd.
 pub(crate) fn codemap_session_post_tool_use(input: &HookInput, engine: &Engine) {
     let Some(cwd) = protected_hook_cwd(input) else {
+        codemap_session_post_tool_use_ordinary(input, engine);
         return;
     };
     let Some(db) = engine_db_path(engine) else {
         return;
     };
-    let edited = if post_tool_use::is_acted_on_tool(input.tool_name.as_deref()) {
-        input
-            .tool_input
-            .as_ref()
-            .and_then(|t| t.get("file_path"))
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-    } else {
-        None
-    };
+    let edited = edited_file(input);
     let home = crate::codemap::identity::home_dir();
     let _ = engine.storage().with_connection(|conn| {
         crate::codemap::session::on_post_tool_use(
@@ -305,6 +298,81 @@ pub(crate) fn codemap_session_post_tool_use(input: &HookInput, engine: &Engine) 
             &db,
             home.as_deref(),
             crate::codemap::disabled(),
+            crate::codemap::now_secs(),
+            &crate::codemap::session::pid_alive,
+            &crate::codemap::session::DetachedSpawner,
+        );
+        Ok(())
+    });
+}
+
+/// The file an Edit/Write/MultiEdit hook touched, as sent.
+fn edited_file(input: &HookInput) -> Option<std::path::PathBuf> {
+    if post_tool_use::is_acted_on_tool(input.tool_name.as_deref()) {
+        input
+            .tool_input
+            .as_ref()
+            .and_then(|t| t.get("file_path"))
+            .and_then(|v| v.as_str())
+            .map(std::path::PathBuf::from)
+    } else {
+        None
+    }
+}
+
+/// The absolute cwd of a hook for the ordinary-repo session map, or `None` when
+/// the code map is off, a daemon is live (it owns the map) or the cwd is blank
+/// or relative. Whether it is a git repo is the session module's call.
+fn ordinary_hook_cwd(input: &HookInput) -> Option<std::path::PathBuf> {
+    if crate::codemap::disabled() {
+        return None;
+    }
+    let cwd = std::path::PathBuf::from(input.cwd.as_deref().filter(|c| !c.trim().is_empty())?);
+    cwd.is_absolute().then_some(cwd)
+}
+
+/// SessionStart in an ordinary git repo with no live daemon: the session starts
+/// the detached scan itself (see `codemap::session`). A fresh install has no
+/// daemon, so without this a repo is never mapped. Best effort, like the
+/// protected-folder path.
+fn codemap_session_start_ordinary(input: &HookInput, engine: &Engine) {
+    let Some(cwd) = ordinary_hook_cwd(input) else {
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    crate::codemap::session::on_session_start_ordinary(
+        &cwd,
+        &db,
+        crate::codemap::identity::home_dir().as_deref(),
+        crate::codemap::disabled(),
+        crate::daemon::Daemon::daemon_lock_live(),
+        &crate::codemap::session::DetachedSpawner,
+    );
+}
+
+/// PostToolUse after an edit in an ordinary git repo with no live daemon: start
+/// the detached drain (or the first scan). The edit itself is queued by the
+/// generic PostToolUse enqueue.
+fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
+    let Some(cwd) = ordinary_hook_cwd(input) else {
+        return;
+    };
+    let Some(db) = engine_db_path(engine) else {
+        return;
+    };
+    let edited = edited_file(input);
+    let home = crate::codemap::identity::home_dir();
+    let _ = engine.storage().with_connection(|conn| {
+        crate::codemap::session::on_post_tool_use_ordinary(
+            conn,
+            &cwd,
+            edited.as_deref(),
+            &db,
+            home.as_deref(),
+            crate::codemap::disabled(),
+            crate::daemon::Daemon::daemon_lock_live(),
             crate::codemap::now_secs(),
             &crate::codemap::session::pid_alive,
             &crate::codemap::session::DetachedSpawner,

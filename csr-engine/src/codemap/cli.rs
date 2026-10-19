@@ -216,7 +216,17 @@ pub fn scan(
                     source,
                     force,
                 )?;
-                scan_repo(conn, &id.common_dir, &opts).map(SessionScan::Done)
+                let report = scan_repo(conn, &id.common_dir, &opts)?;
+                if session && !protected {
+                    // An ordinary repo mapped by a session, not by the daemon: the
+                    // session's signal row is what keeps the repo active in
+                    // `status` (and in a daemon that starts later), and only the
+                    // daemon's poll resolves it. Best effort.
+                    let cwd = identity::normalize_lexical(path);
+                    let _ =
+                        store::signal_resolve(conn, &cwd.to_string_lossy(), Some(&common), "repo");
+                }
+                Ok(SessionScan::Done(report))
             })
         })?;
         match report {
@@ -671,6 +681,31 @@ mod tests {
             "no row is left stranded"
         );
         assert!(!lock.exists(), "the drain's lock goes on the way out");
+    }
+
+    #[test]
+    fn a_session_scan_of_an_ordinary_repo_registers_it_and_resolves_its_signal() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| super::super::record_signal(conn, &repo, "session_start"))
+            .unwrap();
+
+        scan(&db_path, Some(&repo), false, true, true).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let repos = store::list_repos(&conn).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].source, "signal");
+        let signals = store::list_signals(&conn, 0).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(
+            signals[0].common_dir.as_deref(),
+            Some(repos[0].common_dir.as_str())
+        );
+        assert_eq!(signals[0].status.as_deref(), Some("repo"));
+        assert_eq!(defs_named(&db_path, "alpha"), 1);
     }
 
     #[test]
