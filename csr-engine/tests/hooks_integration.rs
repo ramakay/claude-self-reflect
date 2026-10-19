@@ -83,8 +83,14 @@ mod subagent_compaction {
     #[test]
     fn main_session_compact_still_injects_and_spawns_the_story() {
         let run = session_start_compact(serde_json::json!({}));
+        // The temp db is empty: the header must not promise sessions it lacks.
         assert!(
-            run.stdout.contains("CSR ENDLESS MEMORY ACTIVE"),
+            run.stdout.contains("No history yet. CSR captures"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains("CSR ENDLESS MEMORY ACTIVE"),
             "{}",
             run.stdout
         );

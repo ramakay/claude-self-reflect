@@ -324,7 +324,7 @@ pub static REGISTRY: &[Formatter] = &[
         "the two-line Deeper context footer",
         Matcher::Block(m_deeper_context)),
     formatter!("empty_status", Engine, EmptyStatus,
-        "CSR: <N> chunks, <N> reflections indexed. No recent sessions for this project.",
+        "CSR: <N> chunks, <N> reflections indexed. No recent sessions for this project. | No history yet. CSR captures this project's sessions as you work.",
         Matcher::Block(m_empty_status)),
     formatter!("degraded_status", Engine, DegradedStatus,
         "CSR engine ready (degraded mode).",
@@ -926,7 +926,9 @@ fn m_recent_sessions(doc: &Doc<'_>, at: usize) -> Option<usize> {
 }
 
 fn m_empty_status(doc: &Doc<'_>, at: usize) -> Option<usize> {
-    EMPTY_STATUS_RE.is_match(doc.line(at)).then_some(at + 1)
+    (EMPTY_STATUS_RE.is_match(doc.line(at))
+        || doc.line(at) == crate::hooks::session_start::NO_HISTORY_NOTE)
+        .then_some(at + 1)
 }
 
 fn m_degraded_status(doc: &Doc<'_>, at: usize) -> Option<usize> {
