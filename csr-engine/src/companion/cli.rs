@@ -37,6 +37,9 @@ pub enum PluginCmd {
         #[arg(long)]
         engine: Option<PathBuf>,
     },
+    /// Write the local marketplace under `~/.claude-self-reflect/csr-companion/marketplace`
+    /// and install the plugin from it through `claude plugin`.
+    Install,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -187,6 +190,9 @@ pub fn run(args: &CompanionArgs) -> i32 {
         }),
         CompanionCmd::Private { command } => run_private(command),
         CompanionCmd::Serve(args) => super::relay::serve(args),
+        CompanionCmd::Plugin {
+            command: PluginCmd::Install,
+        } => return crate::setup::relay_install_command(),
         CompanionCmd::Plugin { command } => run_plugin(command),
     };
     match result {
@@ -213,6 +219,7 @@ fn run_plugin(command: &PluginCmd) -> anyhow::Result<()> {
             println!("sockets {}", out.sock_dir.display());
             Ok(())
         }
+        PluginCmd::Install => unreachable!("run() sends install to setup"),
     }
 }
 

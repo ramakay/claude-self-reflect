@@ -317,31 +317,32 @@ fn plugin_agents_production_fixture_digest_matches() {
     }
     assert_eq!(document.source_digest.len(), 64);
 
-    // With the plugin beside the crate, the engine's copy is the plugin's file
-    // and the plugin's own check passes: the fixture is what bin/agents.py
-    // writes now.
-    let plugin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/csr-companion");
-    let copy = plugin.join("tests/fixtures/emissions/agents-v1.json");
-    let Ok(plugin_text) = std::fs::read_to_string(&copy) else {
-        return; // packaged without the plugin beside it
-    };
-    assert_eq!(
-        plugin_text,
-        include_str!("../../../tests/fixtures/contamination/agents-v1.json"),
-        "the engine's copy of agents-v1.json differs from the plugin's"
-    );
-    let output = std::process::Command::new("python3")
-        .args(["-I", "-B"])
-        .arg(plugin.join("tests/export-agent-emissions.py"))
-        .arg("--check")
-        .output();
-    match output {
-        Ok(output) => assert!(
-            output.status.success(),
-            "agents-v1.json is not what bin/agents.py writes now: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ),
-        Err(error) => eprintln!("python3 unavailable, digest check skipped: {error}"),
+    // The oracle is the Rust formatter, `companion::agents::format_agents_context`: it
+    // writes each fixture's recorded payload to exactly the fixture's text. (The Python
+    // formatter that first wrote the fixture is gone; `source_digest` is its source's
+    // digest, kept as recorded.)
+    let raw: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/contamination/agents-v1.json"
+    ))
+    .unwrap();
+    for (name, fixture) in &document.fixtures {
+        let payload = &raw["fixtures"][name]["payload"];
+        assert!(payload.is_object(), "{name}: no recorded payload");
+        assert_eq!(
+            crate::companion::agents::format_agents_context(payload).unwrap(),
+            fixture.text,
+            "agents-v1.json {name} is not what the Rust formatter writes now"
+        );
+    }
+    // While the plugin is beside the crate, its copy of the fixture is the same file.
+    let copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../plugins/csr-companion/tests/fixtures/emissions/agents-v1.json");
+    if let Ok(plugin_text) = std::fs::read_to_string(&copy) {
+        assert_eq!(
+            plugin_text,
+            include_str!("../../../tests/fixtures/contamination/agents-v1.json"),
+            "the engine's copy of agents-v1.json differs from the plugin's"
+        );
     }
 }
 

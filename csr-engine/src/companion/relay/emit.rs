@@ -1,11 +1,18 @@
 //! Writes the plugin the relay runs as: `plugin.json`, `hooks.json` and the generated
-//! `register.js`.
+//! `register.js`, and the local marketplace `csr-engine companion plugin install` hands to
+//! Claude Code.
 
 use super::manifest::{Shape, HOOKS};
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
 const TEMPLATE: &str = include_str!("register.js.j2");
+const PLUGIN_TEMPLATE: &str = include_str!("plugin.json.j2");
+const MARKETPLACE_TEMPLATE: &str = include_str!("marketplace.json.j2");
+
+/// The marketplace's name, and so the id suffix of the plugin: `csr-companion@claude-self-reflect`.
+pub const MARKETPLACE_NAME: &str = "claude-self-reflect";
+pub const PLUGIN_NAME: &str = "csr-companion";
 
 /// A Unix socket path may be 104 bytes (macOS) or 108 (Linux); the Mods docs say near 100.
 const SOCKET_PATH_LIMIT: usize = 90;
@@ -116,49 +123,115 @@ fn write_file(path: &Path, text: &str) -> Result<()> {
     })
 }
 
+/// A template whose only hole is `{{ version }}`.
+fn fill_version(name: &str, template: &str, version: &str) -> String {
+    let mut env = minijinja::Environment::new();
+    env.set_keep_trailing_newline(true);
+    env.add_template(name, template).expect("a fixed template");
+    env.get_template(name)
+        .and_then(|t| t.render(minijinja::context! { version => version }))
+        .expect("a fixed template")
+}
+
 pub fn plugin_json(version: &str) -> String {
-    let value = serde_json::json!({
-        "name": "csr-companion",
-        "version": version,
-        "description": "Claude Self-Reflect beside Claude, run by the csr-engine binary",
-        "author": { "name": "Rama Annaswamy" },
-        "homepage": "https://github.com/ramakay/claude-self-reflect",
-        "repository": "https://github.com/ramakay/claude-self-reflect",
-        "license": "MIT",
-        "keywords": ["memory", "side-pane", "dreams", "claude-self-reflect"],
-    });
-    serde_json::to_string_pretty(&value).expect("plain data") + "\n"
+    fill_version("plugin.json", PLUGIN_TEMPLATE, version)
+}
+
+pub fn marketplace_json(version: &str) -> String {
+    fill_version("marketplace.json", MARKETPLACE_TEMPLATE, version)
 }
 
 pub const HOOKS_JSON: &str = "{ \"modules\": [\"./register.js\"] }\n";
 
-pub fn emit(dir: &Path, sock_dir: Option<&Path>, engine: Option<&Path>) -> Result<Emitted> {
-    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let sock_dir = socket_dir(sock_dir, &home);
-    let engine = match engine {
-        Some(path) => path.to_path_buf(),
-        None => std::env::current_exe().context("finding this binary")?,
-    };
-    let engine = std::path::absolute(engine)?;
+/// The plugin's files, by path inside the plugin folder.
+fn plugin_files(
+    engine: &Path,
+    sock_dir: &Path,
+    version: &str,
+) -> Result<Vec<(&'static str, String)>> {
     let text = |p: &Path| {
         p.to_str()
             .map(str::to_owned)
             .ok_or_else(|| anyhow!("{} is not UTF-8", p.display()))
     };
-    let version = env!("CARGO_PKG_VERSION");
-    let relay = render(&text(&engine)?, &text(&sock_dir)?, version)?;
-    let files = vec![
-        (dir.join(".claude-plugin/plugin.json"), plugin_json(version)),
-        (dir.join("hooks/hooks.json"), HOOKS_JSON.to_string()),
-        (dir.join("hooks/register.js"), relay),
-    ];
-    for (path, body) in &files {
-        write_file(path, body)?;
+    Ok(vec![
+        (".claude-plugin/plugin.json", plugin_json(version)),
+        ("hooks/hooks.json", HOOKS_JSON.to_string()),
+        (
+            "hooks/register.js",
+            render(&text(engine)?, &text(sock_dir)?, version)?,
+        ),
+    ])
+}
+
+fn engine_path(engine: Option<&Path>) -> Result<PathBuf> {
+    let engine = match engine {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe().context("finding this binary")?,
+    };
+    Ok(std::path::absolute(engine)?)
+}
+
+pub fn emit(dir: &Path, sock_dir: Option<&Path>, engine: Option<&Path>) -> Result<Emitted> {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let sock_dir = socket_dir(sock_dir, &home);
+    let engine = engine_path(engine)?;
+    let files = plugin_files(&engine, &sock_dir, env!("CARGO_PKG_VERSION"))?;
+    for (rel, body) in &files {
+        write_file(&dir.join(rel), body)?;
     }
     Ok(Emitted {
-        files: files.into_iter().map(|(path, _)| path).collect(),
+        files: files.into_iter().map(|(rel, _)| dir.join(rel)).collect(),
         sock_dir,
         engine,
+    })
+}
+
+fn marketplace_root(home: &Path) -> PathBuf {
+    home.join(".claude-self-reflect/csr-companion")
+}
+
+/// Where the local marketplace lives for one user.
+pub fn marketplace_dir(home: &Path) -> PathBuf {
+    marketplace_root(home).join("marketplace")
+}
+
+pub struct Marketplace {
+    pub dir: PathBuf,
+    pub plugin_dir: PathBuf,
+    /// The `register.js` text the plugin folder now holds.
+    pub relay: String,
+}
+
+/// Write the local marketplace under `home`: `.claude-plugin/marketplace.json` and the one
+/// plugin, `plugins/csr-companion`, at the engine's version. Each file goes in atomically,
+/// and the folders are private (0700).
+pub fn write_marketplace(home: &Path, engine: Option<&Path>) -> Result<Marketplace> {
+    let root = marketplace_root(home);
+    let dir = marketplace_dir(home);
+    let plugin_dir = dir.join("plugins").join(PLUGIN_NAME);
+    let engine = engine_path(engine)?;
+    let version = env!("CARGO_PKG_VERSION");
+    let mut relay = String::new();
+    let mut files = Vec::new();
+    for (rel, body) in plugin_files(&engine, &socket_dir(None, home), version)? {
+        if rel == "hooks/register.js" {
+            relay = body.clone();
+        }
+        files.push((plugin_dir.join(rel), body));
+    }
+    files.push((
+        dir.join(".claude-plugin/marketplace.json"),
+        marketplace_json(version),
+    ));
+    for (path, body) in &files {
+        super::super::private::write_atomic(path, body, &root)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(Marketplace {
+        dir,
+        plugin_dir,
+        relay,
     })
 }
 
@@ -187,6 +260,114 @@ mod tests {
                 "rerun with CSR_BLESS_RELAY=1 if the change is meant"
             );
         }
+    }
+
+    fn bless_or_compare(got: &str, fixture: &str, name: &str) {
+        if std::env::var_os("CSR_BLESS_RELAY").is_some() {
+            let path = format!("{}/tests/fixtures/relay/{name}", env!("CARGO_MANIFEST_DIR"));
+            std::fs::write(path, got).unwrap();
+        } else {
+            assert_eq!(
+                got, fixture,
+                "{name}: rerun with CSR_BLESS_RELAY=1 if the change is meant"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_json_is_byte_equal_to_the_fixture() {
+        let fixture = include_str!("../../../tests/fixtures/relay/plugin.json");
+        bless_or_compare(&plugin_json("0.0.0-fixture"), fixture, "plugin.json");
+    }
+
+    #[test]
+    fn marketplace_json_is_byte_equal_to_the_fixture() {
+        let fixture = include_str!("../../../tests/fixtures/relay/marketplace.json");
+        bless_or_compare(
+            &marketplace_json("0.0.0-fixture"),
+            fixture,
+            "marketplace.json",
+        );
+    }
+
+    #[test]
+    fn plugin_json_keeps_the_ts_plugins_fields_and_drops_types() {
+        let got: serde_json::Value = serde_json::from_str(&plugin_json("1.2.3")).unwrap();
+        assert_eq!(got["version"], "1.2.3");
+        assert!(got.get("types").is_none());
+        // The TS plugin's manifest goes at the cutover; until then every other field must match.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../plugins/csr-companion/.claude-plugin/plugin.json"
+        );
+        let Ok(ts) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let mut ts: serde_json::Value = serde_json::from_str(&ts).unwrap();
+        let ts = ts.as_object_mut().unwrap();
+        ts.remove("types");
+        ts.remove("version");
+        let mut got = got;
+        got.as_object_mut().unwrap().remove("version");
+        assert_eq!(&got, &serde_json::Value::Object(ts.clone()));
+    }
+
+    #[test]
+    fn marketplace_json_names_the_one_plugin_at_the_engine_version() {
+        let got: serde_json::Value = serde_json::from_str(&marketplace_json("1.2.3")).unwrap();
+        assert_eq!(got["name"], MARKETPLACE_NAME);
+        assert_eq!(got["plugins"].as_array().unwrap().len(), 1);
+        assert_eq!(got["plugins"][0]["name"], PLUGIN_NAME);
+        assert_eq!(got["plugins"][0]["source"], "./plugins/csr-companion");
+        assert_eq!(got["plugins"][0]["version"], "1.2.3");
+    }
+
+    #[test]
+    fn write_marketplace_lays_out_the_marketplace_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let engine = Path::new("/opt/csr-engine");
+        let out = write_marketplace(home.path(), Some(engine)).unwrap();
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(out.dir, marketplace_dir(home.path()));
+        let read = |rel: &str| std::fs::read_to_string(out.dir.join(rel)).unwrap();
+        assert_eq!(
+            read(".claude-plugin/marketplace.json"),
+            marketplace_json(version)
+        );
+        let plugin = "plugins/csr-companion";
+        assert_eq!(
+            read(&format!("{plugin}/.claude-plugin/plugin.json")),
+            plugin_json(version)
+        );
+        assert_eq!(read(&format!("{plugin}/hooks/hooks.json")), HOOKS_JSON);
+        assert_eq!(read(&format!("{plugin}/hooks/register.js")), out.relay);
+        assert!(out.relay.contains("const ENGINE = '/opt/csr-engine'"));
+        for folder in [
+            out.dir.clone(),
+            out.dir.join(".claude-plugin"),
+            out.dir.join(plugin),
+            out.dir.join(plugin).join("hooks"),
+        ] {
+            let mode = std::fs::metadata(&folder).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", folder.display());
+        }
+        // A second write replaces the files and leaves no temporary behind.
+        write_marketplace(home.path(), Some(Path::new("/opt/moved"))).unwrap();
+        assert!(
+            read(&format!("{plugin}/hooks/register.js")).contains("const ENGINE = '/opt/moved'")
+        );
+        let leftovers = std::fs::read_dir(out.dir.join(plugin).join("hooks"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

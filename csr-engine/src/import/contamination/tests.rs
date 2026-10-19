@@ -260,30 +260,38 @@ fn every_send_the_panes_own_formatters_write_is_detected_whole() {
     }
 }
 
+/// SHA-256 of `tests/fixtures/contamination/pane-v1.json`, the 66 sends the Python pane wrote
+/// from invented inputs. `bin/pane.py` and the exporter's inputs are gone, so no code in the
+/// tree can write this file again; it is frozen, and any edit to it must be on purpose.
+/// The Rust producers (`companion::send::closed_send` and the page and action code in
+/// `companion::pane`) are what later packages hold these sends to; re-pin then.
+const PANE_FIXTURE_SHA256: &str =
+    "4492910528e6a08b0650dac560178251c2f4d675a685347638ac31fe3cb4c147";
+
 #[test]
-fn the_pane_fixture_is_the_one_pane_py_would_write_now() {
-    let document = pane_document();
-    let pane = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../plugins/csr-companion/bin/pane.py");
-    let Ok(bytes) = std::fs::read(&pane) else {
-        return; // packaged without the plugin beside it
-    };
+fn the_pane_fixture_is_the_frozen_file_the_grammar_was_written_from() {
     use sha2::{Digest, Sha256};
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let hex = |bytes: &[u8]| -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    let engine_copy = include_bytes!("../../../tests/fixtures/contamination/pane-v1.json");
     assert_eq!(
-        document.source.sha256, digest,
-        "pane.py changed: run `python3 -I plugins/csr-companion/tests/export-emissions.py --write` and review the grammar"
+        hex(engine_copy),
+        PANE_FIXTURE_SHA256,
+        "pane-v1.json changed; if that was meant, re-pin PANE_FIXTURE_SHA256 and review the grammar"
     );
+    let document = pane_document();
+    assert_eq!(document.cases.len(), 66);
+    // the digest of the Python source the sends came from, as recorded
+    assert_eq!(document.source.sha256.len(), 64);
+    // While the plugin is beside the crate, its copy of the fixture is the same file.
     let plugin_copy = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../plugins/csr-companion/tests/fixtures/emissions/pane-v1.json");
-    if let Ok(copy) = std::fs::read_to_string(plugin_copy) {
-        assert_eq!(
-            copy,
-            include_str!("../../../tests/fixtures/contamination/pane-v1.json")
-        );
+    if let Ok(copy) = std::fs::read(plugin_copy) {
+        assert_eq!(hex(&copy), PANE_FIXTURE_SHA256);
     }
 }
 

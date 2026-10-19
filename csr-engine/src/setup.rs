@@ -14,6 +14,11 @@
 //! After those steps succeed, setup installs the csr-companion plugin through
 //! Claude Code's own plugin CLI (`--no-companion` skips it). A failure there is
 //! reported with the two manual `/plugin` lines and never fails setup.
+//!
+//! `--relay` takes another path: the binary writes the plugin as a local marketplace under
+//! `~/.claude-self-reflect/csr-companion/marketplace` and installs it from there
+//! (`install_relay`, also `csr-engine companion plugin install`), so the plugin's version is
+//! always the engine's.
 
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::Path;
@@ -22,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use crate::companion::relay::emit;
 use crate::daemon::dream_cadence;
 use crate::dream::policy::{self, EffortTier, NightEstimate};
 use crate::engine::Engine;
@@ -35,6 +41,7 @@ pub async fn handle(
     projects_dir: &Path,
     anthropic_key: Option<String>,
     companion: bool,
+    relay: bool,
 ) -> Result<()> {
     eprintln!("\n=== Claude Self-Reflect Setup ===\n");
 
@@ -265,6 +272,36 @@ pub async fn handle(
 
     // The engine steps all succeeded: now the companion. Not part of the numbered
     // steps above because it is the one that can fail without failing setup.
+    if relay {
+        let report = tokio::task::spawn_blocking(move || {
+            let home = dirs::home_dir().unwrap_or_default();
+            let engine = std::env::current_exe().unwrap_or_default();
+            relay_step(
+                companion,
+                Path::new("claude"),
+                &home,
+                &engine,
+                COMPANION_TIMEOUT,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Some(RelayReport {
+                outcome: CompanionOutcome::Failed {
+                    reason: format!("the install task did not finish: {e}"),
+                },
+                changed: false,
+                steps: Vec::new(),
+            })
+        });
+        eprintln!("\n=== Setup Complete ===\n");
+        eprintln!("  Conversations: {}", conversations);
+        eprintln!("  Reflections:   {}", reflections);
+        eprintln!("  Projects:      {}", projects);
+        eprintln!();
+        eprint!("{}", next_steps_relay(report.as_ref()));
+        return Ok(());
+    }
     let marketplace = companion_marketplace();
     let companion_outcome = tokio::task::spawn_blocking(move || {
         companion_step(
@@ -568,6 +605,364 @@ pub fn install_companion(claude: &Path, marketplace: &str, timeout: Duration) ->
     CompanionOutcome::Installed(info)
 }
 
+// ── the relay plugin: written by this binary, installed from a local marketplace ──
+
+/// The plugin id Claude Code lists: `csr-companion@claude-self-reflect`.
+fn relay_plugin_id() -> String {
+    format!("{}@{}", emit::PLUGIN_NAME, emit::MARKETPLACE_NAME)
+}
+
+/// What `companion plugin install` and `setup --relay` did, step by step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayReport {
+    pub outcome: CompanionOutcome,
+    /// The marketplace registration or the plugin changed, so open Claude Code sessions
+    /// need `/reload-plugins`.
+    pub changed: bool,
+    /// One line per step that ran, in order.
+    pub steps: Vec<String>,
+}
+
+pub const RELOAD_LINE: &str = "run /reload-plugins in open Claude Code sessions";
+
+/// Where the marketplace Claude Code knows as `claude-self-reflect` stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarketState {
+    Absent,
+    Here,
+    /// Registered with another source: a GitHub repo, or some other folder.
+    Elsewhere(String),
+}
+
+fn same_folder(a: &str, b: &Path) -> bool {
+    let a = Path::new(a);
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Read `claude plugin marketplace list --json`.
+fn market_state(list: &serde_json::Value, dir: &Path) -> MarketState {
+    let Some(entry) = list
+        .as_array()
+        .and_then(|l| l.iter().find(|e| e["name"] == emit::MARKETPLACE_NAME))
+    else {
+        return MarketState::Absent;
+    };
+    let text = |key: &str| entry.get(key).and_then(|v| v.as_str());
+    let path = text("path");
+    if text("source") == Some("directory") && path.is_some_and(|p| same_folder(p, dir)) {
+        return MarketState::Here;
+    }
+    let was = [text("source"), text("repo"), text("url"), path]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    MarketState::Elsewhere(was)
+}
+
+/// `claude <args>` that must exit 0. The error names the step and the first line of detail.
+fn run_ok(
+    claude: &Path,
+    args: &[&str],
+    timeout: Duration,
+    what: &str,
+) -> Result<ClaudeRun, String> {
+    let run = run_with_timeout(claude, args, timeout)?;
+    if run.success {
+        return Ok(run);
+    }
+    let detail = first_json(&run.stdout, |v| v.is_object())
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| run.stderr.trim().to_string());
+    Err(format!(
+        "`claude plugin {what}` failed: {}",
+        one_line(&detail)
+    ))
+}
+
+/// `run_ok`, and a `--json` result that says `outcome: ok`.
+fn run_outcome_ok(
+    claude: &Path,
+    args: &[&str],
+    timeout: Duration,
+    what: &str,
+) -> Result<ClaudeRun, String> {
+    let run = run_ok(claude, args, timeout, what)?;
+    let Some(result) = first_json(&run.stdout, |v| v.is_object()) else {
+        return Err(format!("`claude plugin {what}` returned no JSON result"));
+    };
+    if result.get("outcome").and_then(|o| o.as_str()) != Some("ok") {
+        let message = result
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("outcome was not ok");
+        return Err(format!(
+            "`claude plugin {what}` did not succeed: {}",
+            one_line(message)
+        ));
+    }
+    Ok(run)
+}
+
+/// `claude plugin list --json` as entries.
+fn list_plugins(claude: &Path, timeout: Duration) -> Result<Vec<serde_json::Value>, String> {
+    let run = run_ok(claude, &["plugin", "list", "--json"], timeout, "list")?;
+    first_json(&run.stdout, |v| v.is_array())
+        .and_then(|v| v.as_array().cloned())
+        .ok_or_else(|| "`claude plugin list` returned no JSON list".to_string())
+}
+
+fn relay_entry(list: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    let id = relay_plugin_id();
+    list.iter()
+        .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+}
+
+/// The cache holds this engine's version and the `register.js` this engine emits. A moved
+/// binary changes `register.js` without a version bump, so the text counts as well.
+fn relay_is_current(entry: &serde_json::Value, relay: &str) -> bool {
+    let text = |key: &str| entry.get(key).and_then(|v| v.as_str());
+    text("version") == Some(env!("CARGO_PKG_VERSION"))
+        && text("installPath").is_some_and(|dir| {
+            std::fs::read_to_string(Path::new(dir).join("hooks/register.js"))
+                .is_ok_and(|cached| cached == relay)
+        })
+}
+
+/// The options the user set on the plugin, as `(key, value)`. Removing a marketplace or
+/// uninstalling a plugin deletes them, so they are read first and given back at install.
+fn configured_options(claude: &Path, timeout: Duration) -> Vec<(String, String)> {
+    let id = relay_plugin_id();
+    let args = ["plugin", "configure", id.as_str(), "--json"];
+    let Ok(run) = run_ok(claude, &args, timeout, "configure") else {
+        return Vec::new();
+    };
+    let Some(info) = first_json(&run.stdout, |v| v.is_object()) else {
+        return Vec::new();
+    };
+    info["configured"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|key| {
+            let key = key.as_str()?;
+            Some((key.to_string(), info["inputs"][key].as_str()?.to_string()))
+        })
+        .collect()
+}
+
+/// `claude plugin install` with the saved options. An install enables the plugin, so one
+/// the user had switched off (`enabled == false`) is disabled again.
+fn install_relay_plugin(
+    claude: &Path,
+    options: &[(String, String)],
+    enabled: bool,
+    timeout: Duration,
+) -> Result<(), String> {
+    let id = relay_plugin_id();
+    let pairs: Vec<String> = options.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let mut args = vec!["plugin", "install", id.as_str(), "--json"];
+    for pair in &pairs {
+        args.extend(["--config", pair.as_str()]);
+    }
+    run_outcome_ok(claude, &args, timeout, "install")?;
+    if !enabled {
+        let disable = ["plugin", "disable", id.as_str(), "--json"];
+        run_outcome_ok(claude, &disable, timeout, "disable").map_err(|e| {
+            format!("{e}; the plugin is installed and enabled, run `claude plugin disable {id}`")
+        })?;
+    }
+    Ok(())
+}
+
+/// Is the plugin listed as switched on? Unknown counts as on.
+fn relay_enabled(entry: Option<&serde_json::Value>) -> bool {
+    entry.and_then(|e| e["enabled"].as_bool()).unwrap_or(true)
+}
+
+struct RelayState {
+    steps: Vec<String>,
+    changed: bool,
+    /// The plugin step installed, updated or reinstalled something.
+    plugin_changed: bool,
+}
+
+fn relay_steps(
+    claude: &Path,
+    home: &Path,
+    engine: &Path,
+    timeout: Duration,
+    st: &mut RelayState,
+) -> Result<CompanionInfo, String> {
+    // a. the marketplace, written from this binary
+    let market = emit::write_marketplace(home, Some(engine))
+        .map_err(|e| format!("could not write the marketplace: {e:#}"))?;
+    st.steps
+        .push(format!("marketplace written: {}", market.dir.display()));
+    let dir = market
+        .dir
+        .to_str()
+        .ok_or_else(|| "the marketplace folder is not UTF-8".to_string())?;
+
+    // b. the registration
+    let run = run_ok(
+        claude,
+        &["plugin", "marketplace", "list", "--json"],
+        timeout,
+        "marketplace list",
+    )?;
+    let list = first_json(&run.stdout, |v| v.is_array())
+        .ok_or_else(|| "`claude plugin marketplace list` returned no JSON list".to_string())?;
+    let add = ["plugin", "marketplace", "add", dir];
+    let mut options = Vec::new();
+    let mut enabled = true;
+    match market_state(&list, &market.dir) {
+        MarketState::Here => st.steps.push("marketplace already registered".into()),
+        MarketState::Absent => {
+            run_ok(claude, &add, timeout, "marketplace add")?;
+            st.changed = true;
+            st.steps.push("marketplace registered".into());
+        }
+        MarketState::Elsewhere(was) => {
+            // `add` over the same name repoints it and keeps the plugin and its options.
+            // Older Claude Code may refuse; then remove, add and give the options back.
+            if let Err(refused) = run_ok(claude, &add, timeout, "marketplace add") {
+                options = configured_options(claude, timeout);
+                // Removing the marketplace uninstalls the plugin; remember if it was off.
+                enabled = relay_enabled(
+                    list_plugins(claude, timeout)?
+                        .iter()
+                        .find(|e| e["id"].as_str() == Some(relay_plugin_id().as_str())),
+                );
+                let remove = ["plugin", "marketplace", "remove", emit::MARKETPLACE_NAME];
+                run_ok(claude, &remove, timeout, "marketplace remove")
+                    .map_err(|e| format!("{refused}; {e}"))?;
+                run_ok(claude, &add, timeout, "marketplace add")?;
+            }
+            st.changed = true;
+            st.steps
+                .push(format!("marketplace moved here (was: {was})"));
+        }
+    }
+
+    // c. the plugin
+    let id = relay_plugin_id();
+    let version = env!("CARGO_PKG_VERSION");
+    let listed = list_plugins(claude, timeout)?;
+    match relay_entry(&listed) {
+        None => {
+            install_relay_plugin(claude, &options, enabled, timeout)?;
+            st.changed = true;
+            st.plugin_changed = true;
+            st.steps.push(format!("plugin installed: {version}"));
+        }
+        Some(entry) if relay_is_current(entry, &market.relay) => {
+            st.steps.push(format!("plugin already current: {version}"));
+        }
+        Some(entry) => {
+            let was = entry["version"].as_str().unwrap_or("unknown").to_string();
+            let update = ["plugin", "update", id.as_str(), "--json"];
+            run_outcome_ok(claude, &update, timeout, "update")?;
+            st.changed = true;
+            st.plugin_changed = true;
+            let refreshed = list_plugins(claude, timeout)?;
+            if relay_entry(&refreshed).is_some_and(|e| relay_is_current(e, &market.relay)) {
+                st.steps.push(format!("plugin updated: {was} -> {version}"));
+            } else {
+                // The update kept the old cache. Uninstall and install put the new one in.
+                if options.is_empty() {
+                    options = configured_options(claude, timeout);
+                }
+                let enabled = relay_enabled(Some(entry));
+                let uninstall = ["plugin", "uninstall", id.as_str(), "--keep-data", "--json"];
+                run_outcome_ok(claude, &uninstall, timeout, "uninstall")?;
+                install_relay_plugin(claude, &options, enabled, timeout)?;
+                st.steps
+                    .push(format!("plugin reinstalled: {was} -> {version}"));
+            }
+        }
+    }
+
+    let listed = list_plugins(claude, timeout)?;
+    let entry = relay_entry(&listed)
+        .ok_or_else(|| format!("`claude plugin list` does not show {id} after the install"))?;
+    if !relay_is_current(entry, &market.relay) {
+        return Err(format!(
+            "{id} is installed but its cache is not this engine's plugin; \
+             run `claude plugin uninstall {id}` and then this again"
+        ));
+    }
+    info_from(entry).ok_or_else(|| "`claude plugin list` named no plugin".to_string())
+}
+
+/// Write the local marketplace and install the plugin from it through Claude Code's plugin
+/// CLI. `engine` is the binary the relay will start. Never panics and never returns an
+/// error: a failure is a `Failed` outcome with the steps that ran before it.
+pub fn install_relay(claude: &Path, home: &Path, engine: &Path, timeout: Duration) -> RelayReport {
+    let mut st = RelayState {
+        steps: Vec::new(),
+        changed: false,
+        plugin_changed: false,
+    };
+    let outcome = match relay_steps(claude, home, engine, timeout, &mut st) {
+        Ok(info) if st.plugin_changed => CompanionOutcome::Installed(info),
+        Ok(info) => CompanionOutcome::AlreadyInstalled(info),
+        Err(reason) => CompanionOutcome::Failed { reason },
+    };
+    RelayReport {
+        outcome,
+        changed: st.changed,
+        steps: st.steps,
+    }
+}
+
+/// The relay companion step of setup. `enabled == false` (`--no-companion`) makes no `claude`
+/// call and writes nothing.
+fn relay_step(
+    enabled: bool,
+    claude: &Path,
+    home: &Path,
+    engine: &Path,
+    timeout: Duration,
+) -> Option<RelayReport> {
+    if !enabled {
+        return None;
+    }
+    eprintln!("Installing the csr-companion plugin from this binary through `claude plugin`...");
+    let report = install_relay(claude, home, engine, timeout);
+    for step in &report.steps {
+        eprintln!("  {step}");
+    }
+    Some(report)
+}
+
+/// What `csr-engine companion plugin install` prints; the exit code is non-zero on failure.
+pub fn relay_install_command() -> i32 {
+    let (Some(home), Ok(engine)) = (dirs::home_dir(), std::env::current_exe()) else {
+        eprintln!("companion: cannot find the home folder or this binary");
+        return 1;
+    };
+    let report = install_relay(Path::new("claude"), &home, &engine, COMPANION_TIMEOUT);
+    for step in &report.steps {
+        println!("{step}");
+    }
+    if report.changed {
+        println!("{RELOAD_LINE}");
+    }
+    if let CompanionOutcome::Failed { reason } = &report.outcome {
+        eprintln!("companion: not installed: {reason}");
+        return 1;
+    }
+    0
+}
+
 /// The companion step of setup. `enabled == false` (`--no-companion`) makes no
 /// `claude` call at all and returns `None`.
 fn companion_step(
@@ -617,9 +1012,37 @@ fn next_steps(companion: Option<&CompanionOutcome>) -> String {
         }
         None => manual("companion: skipped (--no-companion)".to_string()),
     };
+    next_steps_text(&companion_text)
+}
+
+fn next_steps_text(companion_text: &str) -> String {
     format!(
         "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Open Claude Code in a project you have worked in; its first line recaps where you left off\n  3. Ask in plain words, e.g. \"what did we work on last week?\"\n\n{companion_text}"
     )
+}
+
+/// `next_steps` for `setup --relay`: the receipt, `/reload-plugins` when something changed,
+/// and the one command that retries the install. `None` is `--no-companion`.
+fn next_steps_relay(report: Option<&RelayReport>) -> String {
+    let retry = "To install it, run: csr-engine companion plugin install\n";
+    let companion_text = match report.map(|r| (&r.outcome, r.changed)) {
+        Some((CompanionOutcome::Installed(i) | CompanionOutcome::AlreadyInstalled(i), changed)) => {
+            let reload = if changed {
+                format!("{RELOAD_LINE}\n")
+            } else {
+                String::new()
+            };
+            format!(
+                "companion: {} {} from {}, scope {}\n{reload}",
+                i.plugin, i.version, i.marketplace, i.scope
+            )
+        }
+        Some((CompanionOutcome::Failed { reason }, _)) => {
+            format!("companion: not installed: {reason}\n{retry}")
+        }
+        None => format!("companion: skipped (--no-companion)\n{retry}"),
+    };
+    next_steps_text(&companion_text)
 }
 
 /// Is this run allowed to ask an interactive question? `CSR_AUTO_SETUP=1`
@@ -1391,13 +1814,15 @@ mod tests {
 
     #[test]
     fn companion_timeout_kills_only_the_child_and_fails_soft() {
-        // `exec sleep` keeps the recorded pid equal to the process we spawned
-        let fake = Fake::new("exec sleep 5", "exec sleep 5");
+        // `exec sleep` keeps the recorded pid equal to the process we spawned. The
+        // timeout leaves a fresh script time to start and write its pid on a loaded
+        // machine; at 1 s a busy build host killed it before its first line.
+        let fake = Fake::new("exec sleep 30", "exec sleep 30");
         let started = Instant::now();
-        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(1));
+        let outcome = install_companion(&fake.bin, "x", Duration::from_secs(3));
         let waited = started.elapsed();
         assert!(
-            waited < Duration::from_secs(4),
+            waited < Duration::from_secs(10),
             "did not stop at the timeout: {waited:?}"
         );
         assert_failed_with_manual_lines(&outcome, "did not finish within");
@@ -1950,5 +2375,370 @@ mod tests {
         });
         assert_eq!(entry_command(&entry), Some("/old/csr-engine".to_string()));
         assert_eq!(entry_command(&serde_json::json!({})), None);
+    }
+
+    // ── the relay plugin (fake `claude` with a little state; a temp HOME) ──
+
+    const ENGINE: &str = "/opt/csr/bin/csr-engine";
+
+    /// A fake `claude plugin` that keeps the marketplace listing and the plugin's state in
+    /// files next to it. Every call appends its argv to `argv.log`.
+    struct RelayFake {
+        dir: tempfile::TempDir,
+        home: tempfile::TempDir,
+        bin: std::path::PathBuf,
+    }
+
+    impl RelayFake {
+        /// `market` is what `marketplace list --json` prints; `plugin` is `absent`, `stale`
+        /// (an older version, cached text that is not the relay) or `current`.
+        fn new(market: &str, plugin: &str, update_refreshes: bool, refuses_add: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let d = dir.path();
+            let built = emit::write_marketplace(home.path(), Some(Path::new(ENGINE))).unwrap();
+            let fresh = d.join("cache-current");
+            std::fs::create_dir_all(fresh.join("hooks")).unwrap();
+            std::fs::write(fresh.join("hooks/register.js"), &built.relay).unwrap();
+            let old = d.join("cache-stale");
+            std::fs::create_dir_all(old.join("hooks")).unwrap();
+            std::fs::write(old.join("hooks/register.js"), "// an older relay\n").unwrap();
+            std::fs::write(
+                d.join("market"),
+                market.replace("DIR", built.dir.to_str().unwrap()),
+            )
+            .unwrap();
+            std::fs::write(d.join("plugin"), plugin).unwrap();
+            std::fs::write(d.join("update_refreshes"), update_refreshes.to_string()).unwrap();
+            std::fs::write(d.join("refuses_add"), refuses_add.to_string()).unwrap();
+            std::fs::write(d.join("enabled"), "true").unwrap();
+            let id = "csr-companion@claude-self-reflect";
+            let version = env!("CARGO_PKG_VERSION");
+            let script = format!(
+                r#"#!/bin/sh
+D='{d}'
+echo "$@" >> "$D/argv.log"
+case "$2" in
+  marketplace)
+    case "$3" in
+      list) cat "$D/market" ;;
+      add)
+        if grep -q github "$D/market" && [ "$(cat "$D/refuses_add")" = true ]; then
+          echo "already exists" >&2; exit 1
+        fi ;;
+      remove) echo '[]' > "$D/market"; echo absent > "$D/plugin" ;;
+    esac ;;
+  list)
+    E=$(cat "$D/enabled")
+    case "$(cat "$D/plugin")" in
+      absent) echo '[]' ;;
+      stale) echo '[{{"id":"{id}","version":"0.5.0","scope":"user","enabled":'$E',"installPath":"{d}/cache-stale"}}]' ;;
+      current) echo '[{{"id":"{id}","version":"{version}","scope":"user","enabled":'$E',"installPath":"{d}/cache-current"}}]' ;;
+    esac ;;
+  disable) echo false > "$D/enabled"
+    if [ -f "$D/disable_fails" ]; then echo "settings are read-only" >&2; exit 1; fi
+    echo '{{"command":"disable","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  install) echo current > "$D/plugin"; echo true > "$D/enabled"
+    echo '{{"command":"install","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  update)
+    if [ "$(cat "$D/update_refreshes")" = true ]; then echo current > "$D/plugin"; fi
+    echo '{{"command":"update","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  uninstall) echo absent > "$D/plugin"
+    echo '{{"command":"uninstall","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
+  configure)
+    echo '{{"configured":["dreams"],"inputs":{{"dreams":"false","autoCompact":"suggest"}}}}' ;;
+esac
+"#,
+                d = d.display()
+            );
+            let bin = d.join("claude");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            RelayFake { dir, home, bin }
+        }
+
+        /// The user had switched the plugin off.
+        fn disabled(self) -> Self {
+            std::fs::write(self.dir.path().join("enabled"), "false").unwrap();
+            self
+        }
+
+        fn enabled(&self) -> String {
+            std::fs::read_to_string(self.dir.path().join("enabled")).unwrap()
+        }
+
+        fn run(&self) -> RelayReport {
+            install_relay(
+                &self.bin,
+                self.home.path(),
+                Path::new(ENGINE),
+                Duration::from_secs(10),
+            )
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("argv.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    const NONE_REGISTERED: &str = "[]";
+    const HERE: &str = r#"[{"name":"claude-self-reflect","source":"directory","path":"DIR"}]"#;
+    const ON_GITHUB: &str = r#"[{"name":"claude-self-reflect","source":"github","repo":"ramakay/claude-self-reflect"}]"#;
+
+    #[test]
+    fn market_state_reads_the_listing() {
+        let dir = Path::new("/private/tmp/csr-sbx/nowhere");
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(market_state(&json("[]"), dir), MarketState::Absent);
+        assert_eq!(
+            market_state(&json(r#"[{"name":"other","source":"github"}]"#), dir),
+            MarketState::Absent
+        );
+        assert_eq!(
+            market_state(
+                &json(
+                    r#"[{"name":"claude-self-reflect","source":"directory","path":"/private/tmp/csr-sbx/nowhere"}]"#
+                ),
+                dir
+            ),
+            MarketState::Here
+        );
+        assert_eq!(
+            market_state(&json(ON_GITHUB), dir),
+            MarketState::Elsewhere("github ramakay/claude-self-reflect".into())
+        );
+        assert!(matches!(
+            market_state(
+                &json(
+                    r#"[{"name":"claude-self-reflect","source":"directory","path":"/elsewhere"}]"#
+                ),
+                dir
+            ),
+            MarketState::Elsewhere(_)
+        ));
+    }
+
+    #[test]
+    fn relay_install_on_a_fresh_machine_adds_the_marketplace_and_installs() {
+        let fake = RelayFake::new(NONE_REGISTERED, "absent", true, false);
+        let report = fake.run();
+        let CompanionOutcome::Installed(info) = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+        assert!(report.changed);
+        let dir = emit::marketplace_dir(fake.home.path());
+        let calls = fake.calls();
+        assert_eq!(calls[0], "plugin marketplace list --json");
+        assert_eq!(
+            calls[1],
+            format!("plugin marketplace add {}", dir.display())
+        );
+        assert_eq!(calls[2], "plugin list --json");
+        assert_eq!(
+            calls[3],
+            "plugin install csr-companion@claude-self-reflect --json"
+        );
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("remove") || c.contains("update")));
+        let text = next_steps_relay(Some(&report));
+        assert!(text.contains(RELOAD_LINE), "{text}");
+    }
+
+    #[test]
+    fn relay_install_changes_nothing_when_it_is_current() {
+        let fake = RelayFake::new(HERE, "current", true, false);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::AlreadyInstalled(_)),
+            "{report:?}"
+        );
+        assert!(!report.changed);
+        let calls = fake.calls();
+        assert!(
+            calls.iter().all(|c| c.ends_with("list --json")),
+            "something other than a listing ran: {calls:?}"
+        );
+        assert!(!next_steps_relay(Some(&report)).contains("/reload-plugins"));
+    }
+
+    #[test]
+    fn relay_install_moves_a_github_marketplace_and_updates_the_plugin() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, false);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        assert!(report.changed);
+        let calls = fake.calls();
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin marketplace add ")));
+        assert!(!calls.iter().any(|c| c.contains("marketplace remove")));
+        assert!(calls.contains(&"plugin update csr-companion@claude-self-reflect --json".into()));
+        assert!(!calls.iter().any(|c| c.contains("uninstall")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.starts_with("marketplace moved here (was: github")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.starts_with("plugin updated: 0.5.0 -> ")));
+    }
+
+    #[test]
+    fn relay_install_reinstalls_when_the_update_keeps_the_old_cache() {
+        let fake = RelayFake::new(HERE, "stale", false, false);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("plugin update") < at("plugin uninstall"));
+        assert!(calls.iter().any(|c| c.ends_with("--keep-data --json")));
+        assert!(at("plugin uninstall") < at("plugin install"));
+        // the option the user had set goes back in at install
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|s| s.starts_with("plugin reinstalled")));
+    }
+
+    #[test]
+    fn a_reinstall_keeps_a_plugin_the_user_had_disabled_disabled() {
+        let fake = RelayFake::new(HERE, "stale", false, false).disabled();
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("plugin install") < at("plugin disable"));
+        assert!(calls.contains(&"plugin disable csr-companion@claude-self-reflect --json".into()));
+        assert_eq!(fake.enabled().trim(), "false");
+        // an enabled plugin is never disabled
+        let on = RelayFake::new(HERE, "stale", false, false);
+        on.run();
+        assert!(!on.calls().iter().any(|c| c.contains("plugin disable")));
+        assert_eq!(on.enabled().trim(), "true");
+    }
+
+    #[test]
+    fn a_removed_marketplace_also_keeps_a_disabled_plugin_disabled() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true).disabled();
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("marketplace remove") < at("plugin install"));
+        assert!(at("plugin install") < at("plugin disable"));
+        assert_eq!(fake.enabled().trim(), "false");
+    }
+
+    #[test]
+    fn a_failed_disable_is_reported_in_setups_style() {
+        let fake = RelayFake::new(HERE, "stale", false, false).disabled();
+        std::fs::write(fake.dir.path().join("disable_fails"), "").unwrap();
+        let report = fake.run();
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(
+            reason.contains("`claude plugin disable` failed"),
+            "{reason}"
+        );
+        assert!(reason.contains("settings are read-only"), "{reason}");
+        assert!(reason.contains("claude plugin disable csr-companion@claude-self-reflect"));
+        let text = next_steps_relay(Some(&report));
+        assert!(text.contains("companion: not installed:"), "{text}");
+    }
+
+    #[test]
+    fn relay_install_removes_and_adds_when_add_over_the_name_is_refused() {
+        let fake = RelayFake::new(ON_GITHUB, "absent", true, true);
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        let at = |needle: &str| calls.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("plugin configure") < at("marketplace remove"));
+        assert!(at("marketplace remove") < at("plugin install"));
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+    }
+
+    #[test]
+    fn relay_install_reports_a_failed_step_and_stops() {
+        let fake = RelayFake::new(ON_GITHUB, "absent", true, true);
+        // `remove` also fails: make the fake's market file unwritable by replacing it with a dir
+        let market = fake.dir.path().join("market");
+        std::fs::remove_file(&market).unwrap();
+        std::fs::create_dir(&market).unwrap();
+        let report = fake.run();
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(reason.contains("marketplace list"), "{reason}");
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let text = next_steps_relay(Some(&report));
+        assert!(text.contains("companion: not installed:"), "{text}");
+        assert!(
+            text.contains("csr-engine companion plugin install"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn relay_install_with_no_claude_on_hand_fails_with_one_line() {
+        let home = tempfile::tempdir().unwrap();
+        let report = install_relay(
+            Path::new("/nonexistent/claude"),
+            home.path(),
+            Path::new(ENGINE),
+            Duration::from_secs(5),
+        );
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(reason.contains("could not run"), "{reason}");
+        assert!(!report.changed);
+    }
+
+    #[test]
+    fn no_companion_with_relay_writes_nothing_and_calls_nothing() {
+        let fake = RelayFake::new(NONE_REGISTERED, "absent", true, false);
+        let before = std::fs::read_dir(fake.home.path()).unwrap().count();
+        let report = relay_step(
+            false,
+            &fake.bin,
+            fake.home.path(),
+            Path::new(ENGINE),
+            Duration::from_secs(5),
+        );
+        assert_eq!(report, None);
+        assert!(fake.calls().is_empty());
+        assert_eq!(std::fs::read_dir(fake.home.path()).unwrap().count(), before);
+        assert!(next_steps_relay(None).contains("companion: skipped (--no-companion)"));
     }
 }

@@ -35,7 +35,7 @@ jobs:
       - name: Prepare home
         # The plugin's tests write under $HOME/.claude-self-reflect; keep that off the runner's real home. The
         # `runner` context is not available in a job-level `env:`, so HOME is set for the steps below from here.
-        # pip --user and `claude plugin test` both resolve under it.
+        # `claude plugin test` and cargo both resolve under it.
         run: |
           mkdir -p "$RUNNER_TEMP/plugin-home"
           echo "HOME=$RUNNER_TEMP/plugin-home" >> "$GITHUB_ENV"
@@ -43,14 +43,6 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - name: Plugin Python tests
-        # tests/test_r5.py and test_r6.py run the hooks through a TypeScript compiler. A pinned one is installed
-        # here, and with CI set they fail, not skip, when it is missing: a skip would pass a job that ran none of them.
-        # -s: test_guard drives the pane loop on the real stdin, which pytest's capture replaces.
-        run: |
-          npm install -g typescript@5.9.3
-          python3 -m pip install --user pytest pillow
-          cd plugins/csr-companion && python3 -m pytest tests -q -s < /dev/null
       - name: Plugin TypeScript tests
         run: |
           npm install -g @anthropic-ai/claude-code
@@ -59,3 +51,15 @@ jobs:
         run: |
           claude plugin validate "$GITHUB_WORKSPACE/plugins/csr-companion"
           claude plugin validate "$GITHUB_WORKSPACE/.claude-plugin/marketplace.json"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: csr-engine
+      - name: Validate the plugin the binary writes
+        # `csr-engine companion plugin emit` writes the relay plugin (plugin.json, hooks.json, register.js)
+        # that `csr-engine companion plugin install` hands to Claude Code. Claude validates what the binary
+        # emits, with the claude CLI the TypeScript step above installed.
+        run: |
+          cargo run --manifest-path "$GITHUB_WORKSPACE/csr-engine/Cargo.toml" --locked -- \
+            companion plugin emit "$RUNNER_TEMP/emitted-plugin"
+          claude plugin validate "$RUNNER_TEMP/emitted-plugin"
