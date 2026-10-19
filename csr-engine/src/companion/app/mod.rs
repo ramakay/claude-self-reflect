@@ -123,21 +123,30 @@ mod tests {
                 "{key}: {got:?} is not in the order {want:?}"
             );
         }
-        let ported = [
-            ("start", "pane_cmd"),
-            ("start", "usage"),
-            ("start", "setup_walk"),
-            ("csr", "pane_cmd"),
-            ("tool", "touch"),
-            ("carry", "carry"),
-            ("edit", "setup_walk"),
-            ("digit", "setup_walk"),
-            ("press", "setup_walk"),
-            ("measure", "usage"),
+        // A finished feature holds every entry the map gives it, each key exactly.
+        let finished = [
+            "usage",
+            "touch",
+            "setup_walk",
+            "carry",
+            "fleet",
+            "compactor",
+            "pace",
+            "story",
+            "subagent",
         ];
-        for (key, feature) in ported {
-            assert!(t.features(key).contains(&feature), "{feature} left {key}");
+        for (key, want) in TARGET {
+            let only = |list: &[&str]| -> Vec<String> {
+                list.iter()
+                    .filter(|f| finished.contains(f))
+                    .map(|f| f.to_string())
+                    .collect()
+            };
+            assert_eq!(only(&t.features(key)), only(want), "{key}");
         }
+        // pane_cmd is part-way: its first start entry and its csr answer.
+        assert_eq!(t.features("start")[0], "pane_cmd");
+        assert_eq!(t.features("csr"), ["pane_cmd"]);
     }
 
     #[test]

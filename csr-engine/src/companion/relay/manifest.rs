@@ -129,7 +129,7 @@ pub const HOOKS: &[Hook] = &[
         Shape::Render,
         true,
     ),
-    hook("config", "config", "config.set", None, Shape::Notify, true),
+    hook("config", "config", "config.set", None, Shape::Gate, true),
     hook("start", "start", "session.start", None, Shape::Start, false),
     hook(
         "csr",
@@ -212,7 +212,7 @@ mod tests {
         const HELPERS: &[&str] = &[
             "post", "act", "settle", "run", "tree", "pushed", "spawn", "gated", "told", "drawn",
             "pass", "register", "ENGINE", "SOCK_DIR", "V", "sock", "gen", "SOON", "LONG", "TRIES",
-            "fails",
+            "fails", "bytes", "BIG",
         ];
         for h in HOOKS {
             assert!(!HELPERS.contains(&h.name), "{}", h.name);

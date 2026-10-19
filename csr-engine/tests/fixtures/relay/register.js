@@ -5,8 +5,24 @@ const SOCK_DIR = '/run/csr'
 const V = '0.0.0-fixture'
 let sock = null
 let gen = 0
+// $.http.fetch refuses a body over 4 MiB. A conversation sent whole (a compaction's `messages`) that would
+// pass BIG bytes is left out and the event says so: the engine reads what it needs from disk instead.
+const BIG = 3670016
+function bytes(text) {
+  let n = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    n += c < 0x80 ? 1 : c < 0x800 ? 2 : c >= 0xd800 && c < 0xdc00 ? (i++, 4) : 3
+  }
+  return n
+}
 async function post($, path, body) {
-  const r = await $.http.fetch('http://csr' + path, { method: 'POST', body: JSON.stringify({ v: V, ...body }), socketPath: sock })
+  let text = JSON.stringify({ v: V, ...body })
+  if (text.length * 3 > BIG && bytes(text) > BIG && body.e && body.e.messages) {
+    const { messages, ...rest } = body.e
+    text = JSON.stringify({ v: V, ...body, e: { ...rest, messagesOmitted: true } })
+  }
+  const r = await $.http.fetch('http://csr' + path, { method: 'POST', body: text, socketPath: sock })
   if (!r.ok) throw new Error('csr ' + path + ' ' + r.status)
   return JSON.parse(r.text)
 }
@@ -100,7 +116,19 @@ async function spawn($, e, again) {
 async function gated($, k, e, next) {
   const r = await run($, '/event', { k, e })
   if (r.answer !== undefined) return r.answer
-  const out = await next(r.next === undefined ? e : r.next)
+  let sent = r.next === undefined ? e : r.next
+  if (e && e.messages && sent.messages === undefined) {
+    const { messagesOmitted, ...rest } = sent
+    sent = { ...rest, messages: e.messages }
+  }
+  let out
+  try {
+    out = await next(sent)
+  } catch (error) {
+    // The call failed: the engine still hears of it (a marker it left must go), then it fails as before.
+    await run($, '/after', { k, id: r.id, result: { deny: String(error) } }).catch(() => undefined)
+    throw error
+  }
   const after = await run($, '/after', { k, id: r.id, result: out }).catch(() => ({}))
   return after.result === undefined ? out : after.result
 }
@@ -136,7 +164,7 @@ function tool($, e, next) { return gated($, 'tool', e, next) }
 function digit($, e, next) { return gated($, 'digit', e, next) }
 function marker($, e, next) { return gated($, 'marker', e, next) }
 function band($, e, next) { return drawn($, 'band', e, next) }
-function config($, e, next) { return told($, 'config', e, next) }
+function config($, e, next) { return gated($, 'config', e, next) }
 async function csr($, e) { return (await run($, '/event', { k: 'csr', e })).answer }
 function carry($, e, next) { return gated($, 'carry', e, next) }
 function keep($, e, next) { return gated($, 'keep', e, next) }

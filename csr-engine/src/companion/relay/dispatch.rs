@@ -1605,6 +1605,6 @@ mod tests {
         let t = default_table();
         assert_eq!(t.features("start")[0], "pane_cmd");
         assert_eq!(t.features("csr"), ["pane_cmd"]);
-        assert_eq!(t.features("tool"), ["touch"]);
+        assert_eq!(t.features("tool")[0], "touch");
     }
 }

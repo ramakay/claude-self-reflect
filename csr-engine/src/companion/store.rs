@@ -129,6 +129,15 @@ impl Store {
             rows.collect()
         })
     }
+
+    /// Every sid that has a row, in order; the machine's own rows show as `MACHINE`.
+    pub fn sids(&self) -> Result<Vec<String>> {
+        self.with(|conn| {
+            let mut ask = conn.prepare("SELECT DISTINCT sid FROM kv ORDER BY sid")?;
+            let rows = ask.query_map([], |row| row.get(0))?;
+            rows.collect()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +202,20 @@ mod tests {
         store.delete("s", "never-set").unwrap();
         assert_eq!(store.get("s", "setup:dreams").unwrap(), None);
         assert_eq!(store.keys("t", "").unwrap(), ["setup:other"]);
+    }
+
+    #[test]
+    fn sids_lists_each_sid_with_a_row_once_and_forgets_one_with_none_left() {
+        let (_dir, path) = path();
+        let store = Store::at(&path);
+        assert!(store.sids().unwrap().is_empty());
+        store.set("b", "pace", &json!(1)).unwrap();
+        store.set("b", "chapter", &json!(2)).unwrap();
+        store.set("a", "pace", &json!(3)).unwrap();
+        store.set(MACHINE, "seenDreams", &json!([])).unwrap();
+        assert_eq!(store.sids().unwrap(), [MACHINE, "a", "b"]);
+        store.delete("a", "pace").unwrap();
+        assert_eq!(store.sids().unwrap(), [MACHINE, "b"]);
     }
 
     #[test]

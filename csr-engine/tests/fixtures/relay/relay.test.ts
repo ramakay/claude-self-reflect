@@ -230,3 +230,40 @@ test('with the engine unreachable every hook lets the call through', async ($, o
   expect(seen.seen.tools).toBe(1)
   expect(JSON.stringify(result)).toContain('file text')
 })
+
+test('a conversation too big for one body is left out of the post, and a small one is sent whole', async ($, on) => {
+  const seen = world(on, () => ({}))
+  const compacted: Array<{ messages?: unknown[] }> = []
+  on('session.compact', async (_$, e) => {
+    compacted.push(e as never)
+    return { messages: [{ role: 'user', text: 'kept', toolUses: [] }] } as never
+  })
+  await $.session.start(START as never)
+  const small = [{ role: 'user', text: 'one', toolUses: [] }]
+  const big = [{ role: 'user', text: 'x'.repeat(4_000_000), toolUses: [] }]
+  await $.session.compact({ trigger: 'auto', agentId: 'sub-1', messages: small } as never)
+  await $.session.compact({ trigger: 'auto', agentId: 'sub-1', messages: big } as never)
+  const asked = only(seen.posts, '/event').filter(p => p.body.k === 'keep')
+  expect(asked).toHaveLength(2)
+  expect(asked[0]?.body.e.messages).toEqual(small)
+  expect(asked[0]?.body.e.messagesOmitted).toBeUndefined()
+  expect(asked[1]?.body.e.messages).toBeUndefined()
+  expect(asked[1]?.body.e.messagesOmitted).toBe(true)
+  expect(asked[1]?.body.e.agentId).toBe('sub-1')
+  // the compaction itself still gets its conversation, and is not told it was left out
+  expect(compacted).toHaveLength(2)
+  expect(compacted[1]?.messages).toHaveLength(1)
+  expect('messagesOmitted' in (compacted[1] ?? {})).toBe(false)
+})
+
+test('a gated call that fails is still told to the engine, as a deny, and then fails as before', async ($, on) => {
+  const seen = world(on, () => ({}))
+  on('session.compact', async () => {
+    throw new Error('summary failed')
+  })
+  await $.session.start(START as never)
+  const failed = await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'one', toolUses: [] }] } as never).then(() => false, () => true)
+  expect(failed).toBe(true)
+  const after = only(seen.posts, '/after').find(p => p.body.k === 'marker')
+  expect(typeof after?.body.result.deny).toBe('string')
+})
