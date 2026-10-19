@@ -650,3 +650,96 @@ mod tests {
         }
     }
 }
+
+/// The companion's private-file grammar, kept separate from corpus redaction.
+pub fn redact_private(text: &str) -> Cow<'_, str> {
+    static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        [
+            r"(?s)-----BEGIN [A-Z0-9 ]+-----.*?(?:-----END [A-Z0-9 ]+-----|\z)",
+            r"\bsk-[A-Za-z0-9_\-]{16,}",
+            r"\bxai-[A-Za-z0-9]{16,}",
+            r"\bgh[pousr]_[A-Za-z0-9]{20,}",
+            r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+            r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+            r"\bxox[abposr]-[A-Za-z0-9\-]{10,}",
+            r"\bAIza[0-9A-Za-z_\-]{35}",
+            r"\b(?:hf|npm)_[A-Za-z0-9]{30,}",
+            r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
+        ]
+        .iter()
+        .map(|p| Regex::new(p).unwrap())
+        .collect()
+    });
+    static AUTH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+        r#"(?i)\b(authorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=\-]{8,}"#).unwrap()
+    });
+    static BEARER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\b(bearer\s+)([A-Za-z0-9._~+/=\-]{8,})").unwrap());
+    static KEYED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+        r#"(?i)(\b[A-Za-z0-9_.\-]*?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret)["']?\s*[=:]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;&"'`)\]}]+)"#).unwrap()
+    });
+    let mut out = Cow::Borrowed(text);
+    for pattern in PATTERNS.iter() {
+        if pattern.is_match(&out) {
+            out = Cow::Owned(pattern.replace_all(&out, "[redacted]").into_owned());
+        }
+    }
+    if AUTH.is_match(&out) {
+        out = Cow::Owned(AUTH.replace_all(&out, "${1}[redacted]").into_owned());
+    }
+    if BEARER.is_match(&out) {
+        out = Cow::Owned(
+            BEARER
+                .replace_all(&out, |c: &Captures<'_>| {
+                    if c[2]
+                        .chars()
+                        .any(|c| c.is_ascii_digit() || "_~+/=".contains(c))
+                    {
+                        format!("{}[redacted]", &c[1])
+                    } else {
+                        c[0].to_owned()
+                    }
+                })
+                .into_owned(),
+        );
+    }
+    if KEYED.is_match(&out) {
+        out = Cow::Owned(
+            KEYED
+                .replace_all(&out, |c: &Captures<'_>| {
+                    let value = &c[2];
+                    if value.starts_with('"') || value.starts_with('\'') {
+                        format!("{}{}[redacted]{}", &c[1], &value[..1], &value[..1])
+                    } else if !value.starts_with("[redacted]")
+                        && value.chars().count() >= 6
+                        && value
+                            .chars()
+                            .any(|c| c.is_ascii_digit() || "@#$%^*!~+=".contains(c))
+                    {
+                        format!("{}[redacted]", &c[1])
+                    } else {
+                        c[0].to_owned()
+                    }
+                })
+                .into_owned(),
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod private_tests {
+    #[test]
+    fn test_table() {
+        let pairs: Vec<[String; 2]> = serde_json::from_str(include_str!(
+            "../tests/fixtures/companion/redaction_table.json"
+        ))
+        .unwrap();
+        for [said, kept] in pairs {
+            assert_eq!(super::redact_private(&said), kept, "{said}");
+            assert_eq!(super::redact_private(&kept), kept, "idempotence: {said}");
+        }
+    }
+}

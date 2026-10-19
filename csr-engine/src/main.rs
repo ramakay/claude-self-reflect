@@ -57,6 +57,8 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Companion pane and private file writer
+    Companion(csr_engine::companion::cli::CompanionArgs),
     /// One-shot setup: import, register MCP, install hooks, install the companion plugin
     Setup {
         /// Anthropic API key for AI narrative enrichment (optional)
@@ -826,6 +828,9 @@ fn main() -> Result<()> {
         );
     }
     let args = Args::parse();
+    if let Some(Commands::Companion(action)) = &args.command {
+        std::process::exit(csr_engine::companion::cli::run(action));
+    }
     // Retired hooks still named by older settings.json files: exit before the
     // maintenance lock, stdin, storage or runtime so they cost only the spawn.
     if matches!(&args.command, Some(Commands::Hook { name, .. }) if csr_engine::hooks::is_retired_hook(name))
