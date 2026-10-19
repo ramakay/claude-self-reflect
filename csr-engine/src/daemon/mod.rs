@@ -50,6 +50,26 @@ pub fn codex_import_disabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Is `path` a lock file some process holds exclusively? Opens it without
+/// creating it and probes with a shared lock, released at once. A missing
+/// file, or any error but contention, is "not held". Called through the fs2
+/// trait: std's inherent `File::try_lock_shared` would win a method call and
+/// report a different error type.
+fn lock_file_held(path: &std::path::Path) -> bool {
+    use fs2::FileExt;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(e) => e.kind() == fs2::lock_contended_error().kind(),
+    }
+}
+
 /// Conservative poll cadence for `codex_harness_strip_handle`'s loop: not
 /// idle, nothing to do, the batch just drained the backlog, or the run
 /// errored/panicked. Same order as every other daemon loop's idle-poll here.
@@ -173,6 +193,17 @@ impl Daemon {
             self.projects_dir.clone(),
             self.index_dir.clone(),
         )
+    }
+
+    /// Does a live daemon hold `<home>/.claude-self-reflect/daemon.lock`?
+    /// The hooks ask before they map a repo themselves: a live daemon owns the
+    /// code map, and a hook must not run a second scanner beside it. Opens the
+    /// file without creating it and probes with a shared lock, released at
+    /// once; a missing file, or any error but contention, means no daemon.
+    pub fn daemon_lock_live() -> bool {
+        dirs::home_dir().is_some_and(|home| {
+            lock_file_held(&home.join(".claude-self-reflect").join("daemon.lock"))
+        })
     }
 
     /// Acquire a lockfile to prevent multiple daemon instances.
@@ -4891,5 +4922,24 @@ mod r8_batch_regressions {
             .await
             .unwrap();
         assert_eq!(p.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod lock_probe_tests {
+    use super::lock_file_held;
+    use fs2::FileExt;
+
+    #[test]
+    fn a_held_daemon_lock_reads_live_and_a_free_or_missing_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        assert!(!lock_file_held(&path), "missing file");
+        let file = std::fs::File::create(&path).unwrap();
+        assert!(!lock_file_held(&path), "present but unlocked");
+        FileExt::try_lock_exclusive(&file).unwrap();
+        assert!(lock_file_held(&path), "held exclusively");
+        FileExt::unlock(&file).unwrap();
+        assert!(!lock_file_held(&path), "released");
     }
 }
