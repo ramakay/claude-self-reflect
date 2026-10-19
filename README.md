@@ -243,10 +243,10 @@ Non-interactive installs never activate on their own: set `CSR_AUTO_SETUP=1` to 
 
 ```bash
 npm install -g claude-self-reflect
-csr-engine setup   # activation is a separate, explicit step
+claude-self-reflect setup   # activation is a separate, explicit step
 ```
 
-By default `npm install` only downloads the checksummed binary — it does not touch `~/.claude` or index conversations. Activation happens when you run `csr-engine setup`, or set `CSR_AUTO_SETUP=1` during install to opt in.
+By default `npm install` only downloads the checksummed binary — it does not touch `~/.claude` or index conversations. Activation happens when you run `claude-self-reflect setup`, or set `CSR_AUTO_SETUP=1` during install to opt in. That command runs the binary npm downloaded, so it works before `~/.local/bin` is on your PATH.
 
 </details>
 
