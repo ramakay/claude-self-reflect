@@ -517,10 +517,10 @@ export type LeaseStep = 'take' | 'renew' | 'release'
 // lease.py's answer: whether this copy holds the lease. Only an exit 0 whose JSON says held grants it: a helper that
 // crashed, was killed (a signal reads as a nonzero exit), timed out waiting for the lock, or answered what is no JSON
 // does not (astra r4 #8: a killed helper's copy looked unleased beside the one that then took the lease). One case
-// stays open, on purpose: python3 cannot start at all (`failure`, the run's rejection), so no lease can be kept on
+// stays open, on purpose: the engine cannot start at all (`failure`, the run's rejection), so no lease can be kept on
 // this machine; a missing HOME is the caller's.
 export function leaseHeld(ran: { exitCode?: number; stdout: string } | null, failure = ''): boolean {
-  if (!ran) return /\bENOENT\b|not found|no such file/i.test(failure) // python3 missing: never stops a look
+  if (!ran) return /\bENOENT\b|not found|no such file/i.test(failure) // engine missing: never stops a look
   if (ran.exitCode !== 0) return false
   try {
     return (JSON.parse(ran.stdout) as { held?: unknown }).held === true

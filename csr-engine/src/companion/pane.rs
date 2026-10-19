@@ -444,46 +444,8 @@ impl Pane {
         let Some(mine) = mine else {
             return Value::Null;
         };
-        let mut previous = super::session::lineage_paths(&self.paths, &self.sid)
-            .get(1)
-            .cloned();
-        if previous.is_none() {
-            let started = num(&s["started"]);
-            let mut candidates: Vec<_> = super::paths::folders(mine.parent().unwrap())
-                .into_iter()
-                .filter_map(|path| {
-                    if path == mine
-                        || path.extension().is_none_or(|s| s != "jsonl")
-                        || path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .is_none_or(|id| self.paths.transcript(id).is_none())
-                    {
-                        return None;
-                    }
-                    let t = std::fs::metadata(&path)
-                        .ok()?
-                        .modified()
-                        .ok()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()?
-                        .as_secs_f64();
-                    (t <= started && t > started - 7. * 86400.).then_some((t, path))
-                })
-                .collect();
-            candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
-            use std::io::Read;
-            previous = candidates.into_iter().take(200).find_map(|(_, path)| {
-                let file = std::fs::File::open(&path).ok()?;
-                let mut bytes = Vec::new();
-                file.take(65536).read_to_end(&mut bytes).ok()?;
-                regex::Regex::new(r#""entrypoint"\s*:\s*"cli""#)
-                    .unwrap()
-                    .is_match(&String::from_utf8_lossy(&bytes))
-                    .then_some(path)
-            });
-        }
-        let Some(path) = previous else {
+        let Some(path) = super::sources::previous_session(&self.paths, &mine, num(&s["started"]))
+        else {
             return json!({});
         };
         let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");

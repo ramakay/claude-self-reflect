@@ -107,6 +107,29 @@ pub fn csr_project(path: &str) -> Option<&str> {
         .map(|p| p[1])
         .or_else(|| parts.last().copied())
 }
+
+pub fn realpath(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.into());
+    let mut result = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => (),
+            part => {
+                result.push(part);
+                if let Ok(resolved) = result.canonicalize() {
+                    result = resolved;
+                }
+            }
+        }
+    }
+    result
+}
 #[cfg(test)]
 mod tests {
     use super::*;

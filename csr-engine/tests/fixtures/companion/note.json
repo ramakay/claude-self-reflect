@@ -1,0 +1,18 @@
+{
+  "notes": [
+    {
+      "id": "rule:csr-engine/src/main.rs:2026-10-17T07:50:00",
+      "kind": "rule",
+      "file": "csr-engine/src/main.rs",
+      "line": "On 10-17 you told the agent about main.rs: \u201cKeep input bounded.\u201d",
+      "title": "You set a rule for main.rs",
+      "text": "On 10-17, in session past-ses, you corrected the agent about csr-engine/src/main.rs: \u201cKeep input bounded.\u201d CSR keeps that correction; it has not been retracted since.",
+      "sketch": [],
+      "symbol": null,
+      "oid": null,
+      "conversation": "past-session",
+      "at": 1792223400.0
+    }
+  ],
+  "candidates": 1
+}

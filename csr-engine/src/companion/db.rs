@@ -7,6 +7,8 @@ use std::path::Path;
 
 pub struct Db {
     storage: Storage,
+    shifts: std::cell::RefCell<BTreeMap<std::path::PathBuf, (std::time::Instant, Vec<Value>)>>,
+
     #[cfg(test)]
     pub(super) queries: std::sync::atomic::AtomicUsize,
 }
@@ -14,6 +16,7 @@ impl Db {
     pub fn open(paths: &Paths) -> anyhow::Result<Self> {
         let storage = Storage::open_read_only(&paths.db)?;
         storage.with_connection(|con| {
+            con.set_prepared_statement_cache_capacity(128);
             let _: i64 = con.pragma_query_value(None, "schema_version", |row| row.get(0))?;
             // One frame runs about 21 distinct statements; rusqlite keeps 16 by default.
             con.set_prepared_statement_cache_capacity(64);
@@ -21,49 +24,51 @@ impl Db {
         })?;
         Ok(Self {
             storage,
+            shifts: Default::default(),
             #[cfg(test)]
             queries: std::sync::atomic::AtomicUsize::new(0),
         })
     }
     pub fn query(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+        self.try_query(sql, params).unwrap_or_default()
+    }
+    pub fn try_query(&self, sql: &str, params: &[Value]) -> anyhow::Result<Vec<Vec<Value>>> {
         #[cfg(test)]
         self.queries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.storage
-            .with_connection(|con| {
-                let values: Vec<rusqlite::types::Value> = params
-                    .iter()
-                    .map(|v| match v {
-                        Value::String(s) => rusqlite::types::Value::Text(s.clone()),
-                        Value::Number(n) if n.is_i64() => {
-                            rusqlite::types::Value::Integer(n.as_i64().unwrap())
-                        }
-                        Value::Number(n) => rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.)),
-                        _ => rusqlite::types::Value::Null,
-                    })
-                    .collect();
-                let mut stmt = con.prepare_cached(sql)?;
-                let n = stmt.column_count();
-                let rows = stmt
-                    .query_map(params_from_iter(values), |row| {
-                        (0..n)
-                            .map(|i| {
-                                Ok(match row.get_ref(i)? {
-                                    ValueRef::Null => Value::Null,
-                                    ValueRef::Integer(n) => json!(n),
-                                    ValueRef::Real(n) => json!(n),
-                                    ValueRef::Text(s) => {
-                                        json!(String::from_utf8_lossy(s))
-                                    }
-                                    ValueRef::Blob(_) => Value::Null,
-                                })
+        self.storage.with_connection(|con| {
+            let values: Vec<rusqlite::types::Value> = params
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => rusqlite::types::Value::Text(s.clone()),
+                    Value::Number(n) if n.is_i64() => {
+                        rusqlite::types::Value::Integer(n.as_i64().unwrap())
+                    }
+                    Value::Number(n) => rusqlite::types::Value::Real(n.as_f64().unwrap_or(0.)),
+                    _ => rusqlite::types::Value::Null,
+                })
+                .collect();
+            let mut stmt = con.prepare_cached(sql)?;
+            let n = stmt.column_count();
+            let rows = stmt
+                .query_map(params_from_iter(values), |row| {
+                    (0..n)
+                        .map(|i| {
+                            Ok(match row.get_ref(i)? {
+                                ValueRef::Null => Value::Null,
+                                ValueRef::Integer(n) => json!(n),
+                                ValueRef::Real(n) => json!(n),
+                                ValueRef::Text(s) => {
+                                    json!(String::from_utf8_lossy(s))
+                                }
+                                ValueRef::Blob(_) => Value::Null,
                             })
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .unwrap_or_default()
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
     }
     pub fn scalar(&self, sql: &str, params: &[Value]) -> Value {
         self.query(sql, params)
@@ -86,6 +91,31 @@ impl Db {
             })
     }
     pub fn shifts(&self, root: &Path, limit: usize) -> Vec<Value> {
+        if let Some((at, rows)) = self.shifts.borrow().get(root) {
+            if at.elapsed().as_secs() < 60 {
+                return rows.iter().take(limit).cloned().collect();
+            }
+        }
+        let rows = self.read_shifts(root, None);
+        let result = rows.iter().take(limit).cloned().collect();
+        self.shifts
+            .borrow_mut()
+            .insert(root.into(), (std::time::Instant::now(), rows));
+        result
+    }
+    pub fn shifts_for_file(&self, root: &Path, file: &Path) -> Vec<Value> {
+        if let Some((at, rows)) = self.shifts.borrow().get(root) {
+            if at.elapsed().as_secs() < 60 {
+                return rows
+                    .iter()
+                    .filter(|s| s["path"] == file.to_string_lossy().as_ref())
+                    .cloned()
+                    .collect();
+            }
+        }
+        self.read_shifts(root, Some(file))
+    }
+    fn read_shifts(&self, root: &Path, file: Option<&Path>) -> Vec<Value> {
         if git(root, &["rev-parse", "--show-toplevel"]).is_none() {
             return vec![];
         }
@@ -94,16 +124,21 @@ impl Db {
                 key='witness_verdicts_v2_floor'),0)",
             &[],
         );
-        let rows = self.query(
+        let (predicate, target) = if let Some(file) = file {
+            ("l.file=?2", file.to_string_lossy().into_owned())
+        } else {
+            ("l.file like ?2", format!("{}/%", root.display()))
+        };
+        let sql = format!(
             "select l.file,l.symbol,v.verdict,v.receipt_oid,\
                 coalesce(v.receipt_committed_at,v.created_at),v.id,v.witness_id \
                 from witness_verdicts v join witness_ledger l on \
                 l.id=v.witness_id where v.id>?1 and v.receipt_oid is not null \
-                and trim(v.receipt_oid)!='' and l.file like ?2 and v.id=(select \
+                and trim(v.receipt_oid)!='' and {predicate} and v.id=(select \
                 max(v2.id) from witness_verdicts v2 where \
-                v2.witness_id=v.witness_id)",
-            &[floor, json!(format!("{}/%", root.display()))],
+                v2.witness_id=v.witness_id)"
         );
+        let rows = self.query(&sql, &[floor, json!(target)]);
         let mut grouped = BTreeMap::<String, Value>::new();
         for r in rows {
             let path = r[0].as_str().unwrap_or("");
@@ -135,6 +170,7 @@ impl Db {
                     "verb": verb,
                     "oid": r[3],
                     "date": date,
+                    "at": super::paths::epoch(r[4].as_str().unwrap_or("")),
                     "id": r[5],
                     "wids": [],
                 })
@@ -145,15 +181,16 @@ impl Db {
             }
         }
         let mut rows: Vec<_> = grouped.into_values().collect();
-        let mut commits = BTreeMap::new();
+        let oids: Vec<_> = rows
+            .iter()
+            .map(|s| s["oid"].as_str().unwrap_or("").to_owned())
+            .collect();
+        let mut commits = super::sources::commit_infos(root, &oids);
         let mut symbols = crate::dream::symbol_cli::Session::new();
         // A merge receipt may only carry another commit's change. Ask the engine in process.
         rows.retain_mut(|s| {
             let oid = s["oid"].as_str().unwrap_or("").to_owned();
-            let merging = commits
-                .entry(oid.clone())
-                .or_insert_with(|| commit_info(root, &oid))
-                .0;
+            let merging = commits.get(&oid).is_some_and(|r| r.0);
             if merging {
                 let mut verdicts = Vec::new();
                 for wid in s["wids"].as_array().unwrap() {
@@ -177,7 +214,7 @@ impl Db {
                         return false;
                     };
                     let author = if answer["authored"] == true {
-                        json!([oid, s["date"]])
+                        json!([oid, s["date"], s["at"]])
                     } else if answer["authored"] == false && answer["author"].is_string() {
                         json!([
                             answer["author"],
@@ -187,6 +224,9 @@ impl Db {
                                 .chars()
                                 .take(10)
                                 .collect::<String>(),
+                            super::paths::epoch(
+                                answer["author_committed_at"].as_str().unwrap_or("")
+                            ),
                         ])
                     } else {
                         return false;
@@ -198,16 +238,23 @@ impl Db {
                 }
                 s["oid"] = verdicts[0][0].clone();
                 s["date"] = verdicts[0][1].clone();
+                s["at"] = verdicts[0][2].clone();
             }
-            let oid = s["oid"].as_str().unwrap_or("").to_owned();
-            s["subject"] = json!(
-                commits
-                    .entry(oid.clone())
-                    .or_insert_with(|| commit_info(root, &oid))
-                    .1
-            );
             true
         });
+        let unknown: Vec<_> = rows
+            .iter()
+            .map(|s| s["oid"].as_str().unwrap_or(""))
+            .filter(|oid| !commits.contains_key(*oid))
+            .map(str::to_owned)
+            .collect();
+        commits.extend(super::sources::commit_infos(root, &unknown));
+        for s in &mut rows {
+            s["subject"] = json!(commits
+                .get(s["oid"].as_str().unwrap_or(""))
+                .map(|r| r.1.as_str())
+                .unwrap_or(""));
+        }
         let mut settled = BTreeMap::<String, Value>::new();
         for s in rows {
             let key = json!([s["file"], s["symbol"], s["verdict"], s["oid"]]).to_string();
@@ -229,20 +276,49 @@ impl Db {
         rows.sort_by(|a, b| {
             (b["date"].as_str(), b["id"].as_i64()).cmp(&(a["date"].as_str(), a["id"].as_i64()))
         });
-        rows.truncate(limit);
         rows
     }
 }
-fn commit_info(root: &Path, oid: &str) -> (bool, String) {
-    if !(4..=64).contains(&oid.len()) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return (false, String::new());
+impl Db {
+    pub fn embeddings(&self, sid: &str, part: Option<&str>) -> Vec<Vec<f64>> {
+        self.storage
+            .with_connection(|con| {
+                let sql = if part.is_some() {
+                    "select e.embedding from chunks c join chunk_embeddings e on e.chunk_id=c.id \
+                 where c.conversation_id=?1 and instr(c.content,?2)>0 limit 1"
+                } else {
+                    "select e.embedding from chunks c join chunk_embeddings e on e.chunk_id=c.id \
+                 where c.conversation_id=?1 order by c.timestamp desc limit 8"
+                };
+                let mut statement = con.prepare_cached(sql)?;
+                let params: Vec<&dyn rusqlite::ToSql> = if let Some(ref part) = part {
+                    vec![&sid, part]
+                } else {
+                    vec![&sid]
+                };
+                let vectors = statement
+                    .query_map(params.as_slice(), |row| {
+                        let bytes: Vec<u8> = row.get(0)?;
+                        let mut vector: Vec<_> = bytes
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_ne_bytes(*b) as f64)
+                            .collect();
+                        let norm = vector.iter().map(|n| n * n).sum::<f64>().sqrt();
+                        let norm = if norm == 0. { 1. } else { norm };
+                        for n in &mut vector {
+                            *n /= norm;
+                        }
+                        Ok(vector)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(vectors)
+            })
+            .unwrap_or_default()
     }
-    let out = git(root, &["show", "-s", "--format=%H%x00%P%x00%s", oid]).unwrap_or_default();
-    let mut fields = out.split('\0');
-    fields.next();
-    let merging = fields.next().unwrap_or("").split_whitespace().count() > 1;
-    (merging, fields.next().unwrap_or("").to_owned())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

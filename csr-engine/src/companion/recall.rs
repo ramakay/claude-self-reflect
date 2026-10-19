@@ -286,6 +286,190 @@ pub fn remembered(db: &Db, s: &Value) -> Vec<Value> {
     recalled
 }
 
+#[derive(Debug)]
+pub struct Change {
+    pub conversation: String,
+    pub talked: f64,
+    pub shifts: Vec<Value>,
+    pub title: String,
+    pub started: Option<f64>,
+    pub current: bool,
+    pub earlier: Option<f64>,
+    pub changed: f64,
+    pub commits: usize,
+}
+
+pub fn date(at: f64, format: &str) -> String {
+    Local
+        .timestamp_opt(at as i64, 0)
+        .single()
+        .map(|t| t.format(format).to_string())
+        .unwrap_or_default()
+}
+
+pub fn quoted(text: &str, width: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = if text.chars().count() > width {
+        format!(
+            "{}…",
+            text.chars()
+                .take(width.saturating_sub(1))
+                .collect::<String>()
+                .trim_end()
+        )
+    } else {
+        text
+    };
+    format!("“{text}”")
+}
+
+pub fn tidy_what(text: &str) -> Option<String> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty() && text.chars().count() <= 120).then_some(text)
+}
+
+pub fn title_of(prompt: &str) -> String {
+    let pasted = regex::Regex::new(r"\[Pasted text #\d+[^\]]*\]").unwrap();
+    let url = regex::Regex::new(r"https?://(\S+)").unwrap();
+    let prompt = pasted.replace_all(prompt, " ");
+    url.replace_all(&prompt, |c: &regex::Captures| {
+        let s = &c[1];
+        if s.bytes().filter(|b| *b == b'/').count() > 1 {
+            format!(
+                "{}/…/{}",
+                s.split('/').next().unwrap_or(""),
+                s.trim_end_matches('/').rsplit('/').next().unwrap_or("")
+            )
+        } else {
+            s.to_string()
+        }
+    })
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+pub fn load_changes(
+    db: &Db,
+    paths: &Paths,
+    shifts: &[Value],
+    sid: &str,
+    before: Option<f64>,
+) -> Vec<Change> {
+    use std::collections::{HashMap, HashSet};
+    let mut ends = HashMap::<String, Option<f64>>::new();
+    let mut changes = Vec::<Change>::new();
+    for shift in shifts {
+        let Some(at) = shift["at"].as_f64() else {
+            continue;
+        };
+        let mut found = vec![];
+        if !string(&shift["symbol"]).is_empty() {
+            let params = [shift["path"].clone(), shift["symbol"].clone()];
+            found.extend(db.query(
+                "select session_id,created_at from episode_anchors \
+                where file=? and name=?",
+                &params,
+            ));
+            found.extend(db.query(
+                "select last_conv_id,last_seen from code_nodes \
+                where file=? and name=?",
+                &params,
+            ));
+        }
+        for wid in array(&shift["wids"]) {
+            found.extend(db.query(
+                "select c.conversation_id,c.timestamp from \
+                witness_chunk_bindings w join chunks c on c.id=w.chunk_id \
+                where w.witness_id=?",
+                std::slice::from_ref(wid),
+            ));
+        }
+        let mut talks = vec![];
+        for row in found {
+            let conv = string(&row[0]);
+            let Some(talked) = epoch(string(&row[1])).filter(|t| *t != 0. && *t <= at) else {
+                continue;
+            };
+            if conv.is_empty() {
+                continue;
+            }
+            let end = *ends.entry(conv.into()).or_insert_with(|| {
+                epoch(string(&db.scalar(
+                    "select max(timestamp) from chunks \
+                    where conversation_id=?",
+                    &[json!(conv)],
+                )))
+            });
+            if end.unwrap_or(at) < at || (conv == sid && before.is_some_and(|b| talked < b)) {
+                talks.push((talked, conv.to_owned()));
+            }
+        }
+        let Some((mut talked, conv)) = talks
+            .into_iter()
+            .max_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+        else {
+            continue;
+        };
+        if conv != sid {
+            talked = talked.min(ends[&conv].unwrap_or(talked));
+        }
+        if let Some(change) = changes.iter_mut().find(|c| c.conversation == conv) {
+            change.talked = change.talked.max(talked);
+            change.shifts.push(shift.clone());
+        } else {
+            changes.push(Change {
+                conversation: conv,
+                talked,
+                shifts: vec![shift.clone()],
+                title: String::new(),
+                started: None,
+                current: false,
+                earlier: None,
+                changed: 0.,
+                commits: 0,
+            });
+        }
+    }
+    if changes.is_empty() {
+        return changes;
+    }
+    let titles = super::sources::first_prompts(paths);
+    for c in &mut changes {
+        let rows = db.query(
+            "select first_prompt,first_ts from session_registry where session_id=?",
+            &[json!(c.conversation)],
+        );
+        let seen = rows.first();
+        let prompt = titles.get(&c.conversation).map(String::as_str).or_else(|| {
+            seen.and_then(|r| r[0].as_str())
+                .filter(|s| !s.is_empty() && !s.starts_with('/'))
+        });
+        c.title = prompt.map(title_of).unwrap_or_else(|| {
+            format!(
+                "session {}",
+                c.conversation.chars().take(8).collect::<String>()
+            )
+        });
+        c.started = seen.and_then(|r| epoch(string(&r[1])));
+        c.current = c.conversation == sid;
+        c.earlier = if c.current { before } else { None };
+        c.changed = c.shifts.iter().map(|s| num(&s["at"])).fold(0., f64::max);
+        c.commits = c
+            .shifts
+            .iter()
+            .map(|s| string(&s["oid"]))
+            .collect::<HashSet<_>>()
+            .len();
+    }
+    changes.sort_by(|a, b| {
+        b.changed
+            .total_cmp(&a.changed)
+            .then(b.talked.total_cmp(&a.talked))
+    });
+    changes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

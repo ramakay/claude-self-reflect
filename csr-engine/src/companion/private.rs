@@ -192,6 +192,20 @@ pub fn dumps(value: &serde_json::Value) -> String {
     value.to_string()
 }
 
+pub fn dumps_record(value: &serde_json::Value) -> String {
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) => *s = crate::redact::redact_private(s).into_owned(),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(redact),
+            serde_json::Value::Object(o) => o.values_mut().for_each(redact),
+            _ => (),
+        }
+    }
+    let mut value = value.clone();
+    redact(&mut value);
+    value.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

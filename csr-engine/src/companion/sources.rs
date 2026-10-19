@@ -251,3 +251,195 @@ pub fn picture_fonts() -> &'static super::render::raster::Fonts {
     });
     &FONTS
 }
+
+pub fn mtime(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|t| t.as_nanos() as u64)
+}
+pub fn newest_transcripts(paths: &Paths, newest: usize) -> Vec<(u64, std::path::PathBuf)> {
+    let mut found: Vec<_> = folders(&paths.projects)
+        .iter()
+        .flat_map(|p| folders(p))
+        .filter(|p| p.extension().is_some_and(|s| s == "jsonl"))
+        .map(|p| (mtime(&p).unwrap_or(0), p))
+        .collect();
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
+    found.truncate(newest);
+    found
+}
+
+pub fn continued_from_at(
+    paths: &Paths,
+    sid: &str,
+    given: Option<&std::path::Path>,
+    now: f64,
+) -> Option<String> {
+    if !super::paths::valid_id(sid)
+        || std::env::var("CSR_NO_CONTINUED")
+            .is_ok_and(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true"))
+    {
+        return None;
+    }
+    type Seen = std::collections::HashMap<(std::path::PathBuf, String), (Option<String>, f64)>;
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<Seen>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Seen::new()));
+    let key = (paths.home.clone(), sid.to_owned());
+    if let Ok(seen) = SEEN.lock() {
+        if let Some((found, at)) = seen.get(&key) {
+            if found.is_some() || now - at < 60. {
+                return found.clone();
+            }
+        }
+    }
+    let mine = if let Some(given) = given {
+        given.is_file().then(|| given.to_owned())
+    } else {
+        paths.transcript(sid)
+    }?;
+    let folder = mine.parent()?;
+    std::fs::read_dir(folder).ok()?;
+    let found = crate::hooks::resume_lineage::pane_predecessor(&mine, sid);
+    if !mine.is_file() || std::fs::read_dir(folder).is_err() {
+        return None;
+    }
+    if let Ok(mut seen) = SEEN.lock() {
+        seen.insert(key, (found.clone(), now));
+    }
+    found
+}
+
+pub fn previous_session(
+    paths: &Paths,
+    mine: &std::path::Path,
+    started: f64,
+) -> Option<std::path::PathBuf> {
+    if started == 0. || !mine.is_file() {
+        return None;
+    }
+    let sid = mine.file_stem()?.to_str()?;
+    if let Some(old) = continued_from_at(paths, sid, Some(mine), super::paths::now()) {
+        let sibling = mine.parent()?.join(format!("{old}.jsonl"));
+        if sibling.is_file() && paths.transcript(&old).is_some() {
+            return Some(sibling);
+        }
+    }
+    let mut candidates: Vec<_> = folders(mine.parent()?)
+        .into_iter()
+        .filter_map(|path| {
+            if path == mine
+                || path.extension().is_none_or(|e| e != "jsonl")
+                || path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_none_or(|id| paths.transcript(id).is_none())
+            {
+                return None;
+            }
+            let at = mtime(&path)? as f64 / 1e9;
+            (started - 7. * 86400. < at && at <= started).then_some((at, path))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
+    let cli = regex::Regex::new(r#""entrypoint"\s*:\s*"cli""#).unwrap();
+    candidates.into_iter().take(200).find_map(|(_, path)| {
+        let head = super::tail::head(&path, 65536).ok()?;
+        cli.is_match(&String::from_utf8_lossy(&head))
+            .then_some(path)
+    })
+}
+
+pub fn first_prompts(paths: &Paths) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+    type Titles = std::sync::Arc<std::collections::HashMap<String, String>>;
+    type Cache = std::collections::HashMap<std::path::PathBuf, (u64, Titles)>;
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<Cache>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Cache::new()));
+    let path = paths.home.join(".claude/history.jsonl");
+    let Some(modified) = mtime(&path) else {
+        return Titles::default();
+    };
+    let Ok(mut cache) = CACHE.lock() else {
+        return Titles::default();
+    };
+    if let Some((old, titles)) = cache.get(&path) {
+        if *old == modified {
+            return titles.clone();
+        }
+    }
+    let mut titles = std::collections::HashMap::new();
+    super::tail::scan(&path, |entry| {
+        let sid = super::string(&entry["sessionId"]);
+        let text = super::string(&entry["display"]).trim();
+        if !sid.is_empty() && !text.is_empty() && !text.starts_with('/') {
+            titles
+                .entry(sid.to_owned())
+                .or_insert_with(|| text.to_owned());
+        }
+    });
+    let titles = std::sync::Arc::new(titles);
+    cache.insert(path, (modified, titles.clone()));
+    titles
+}
+
+pub fn commit_infos(
+    root: &std::path::Path,
+    oids: &[String],
+) -> std::collections::BTreeMap<String, (bool, String)> {
+    let ids: std::collections::BTreeSet<_> = oids
+        .iter()
+        .filter(|s| (4..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(String::as_str)
+        .collect();
+    let ids: Vec<_> = ids.into_iter().collect();
+    let mut out = std::collections::BTreeMap::new();
+    for chunk in ids.chunks(400) {
+        let mut args = vec!["show", "-s", "--format=%H%x00%P%x00%s%x00"];
+        args.extend_from_slice(chunk);
+        let Some(text) = super::paths::git(root, &args) else {
+            for id in chunk {
+                out.insert((*id).to_owned(), commit_info(root, id));
+            }
+            continue;
+        };
+        let fields: Vec<_> = text.split('\0').collect();
+        let records: Vec<_> = fields
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|r| {
+                (
+                    r[0].trim(),
+                    r[1].split_whitespace().count() > 1,
+                    r[2].trim().to_owned(),
+                )
+            })
+            .collect();
+        for id in chunk {
+            let found = records.iter().find(|(full, _, _)| {
+                full.get(..id.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(id))
+            });
+            out.insert(
+                (*id).to_owned(),
+                found
+                    .map(|(_, merge, subject)| (*merge, subject.clone()))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    out
+}
+fn commit_info(root: &std::path::Path, oid: &str) -> (bool, String) {
+    let text = super::paths::git(root, &["show", "-s", "--format=%H%x00%P%x00%s", oid])
+        .unwrap_or_default();
+    let mut fields = text.split('\0');
+    fields.next();
+    (
+        fields.next().unwrap_or("").split_whitespace().count() > 1,
+        fields.next().unwrap_or("").to_owned(),
+    )
+}

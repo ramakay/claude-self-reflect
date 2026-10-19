@@ -11,6 +11,7 @@ pub struct CompanionArgs {
 #[derive(Subcommand, Debug)]
 pub enum CompanionCmd {
     Pane(Box<PaneArgs>),
+    Lease(super::lease::LeaseArgs),
     Private {
         #[command(subcommand)]
         command: PrivateCmd,
@@ -91,6 +92,24 @@ pub enum PrivateCmd {
 pub fn run(args: &CompanionArgs) -> i32 {
     let result = match &args.command {
         CompanionCmd::Pane(args) => {
+            if args.keep.is_some()
+                || args.note.is_some()
+                || args.json
+                || args.lost
+                || args.compact_plan
+                || args.compact_usual
+                || args.brief
+                || args.coach
+                || args.story_news
+            {
+                return match run_hook(args) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("companion: {error:#}");
+                        1
+                    }
+                };
+            }
             if !(args.watch || args.frame || args.png.is_some())
                 || !matches!(args.page.as_str(), "main" | "log")
             {
@@ -141,6 +160,10 @@ pub fn run(args: &CompanionArgs) -> i32 {
                 Ok(())
             }
         }
+        CompanionCmd::Lease(args) => super::lease::step_under_lock(args).and_then(|out| {
+            println!("{}", serde_json::to_string(&out)?);
+            Ok(())
+        }),
         CompanionCmd::Private { command } => run_private(command),
     };
     match result {
@@ -175,6 +198,121 @@ fn run_private(command: &PrivateCmd) -> anyhow::Result<()> {
             }
             super::private::write_atomic(path, &text, &root)?;
         }
+    }
+    Ok(())
+}
+
+fn run_hook(args: &PaneArgs) -> anyhow::Result<()> {
+    let paths = super::paths::Paths::from_env();
+    let sid = args.sid.as_deref().unwrap_or("");
+    let now = args
+        .now
+        .or_else(|| {
+            std::env::var("CSR_COMPANION_NOW")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or_else(super::paths::now);
+    if args.coach {
+        println!(
+            "{}",
+            serde_json::to_string(&super::coach::coach_terms(&paths, now))?
+        );
+    } else if args.story_news {
+        let db = super::db::Db::open(&paths).ok();
+        let news = if let Some(db) = &db {
+            let root = db.pane_root(&args.repo);
+            super::story::story_news_in(db, &paths, root.as_deref(), sid, now)
+        } else {
+            super::story::News::Absent { story: false }
+        };
+        println!("{}", serde_json::to_string(&news)?);
+    } else if args.brief {
+        if !sid.is_empty() {
+            let db = super::db::Db::open(&paths).ok();
+            let root = super::paths::git(&args.repo, &["rev-parse", "--show-toplevel"])
+                .map(std::path::PathBuf::from)
+                .or_else(|| db.as_ref().and_then(|db| db.pane_root(&args.repo)));
+            if let Some(root) = root {
+                let db = db.ok_or_else(|| anyhow::anyhow!("could not read csr-engine"))?;
+                println!("{}", super::brief::brief(&db, &paths, &root, sid, now));
+            }
+        }
+    } else if args.lost {
+        println!(
+            "{}",
+            serde_json::to_string(&super::lost::lost_json(&paths, sid))?
+        );
+    } else if args.compact_plan {
+        println!(
+            "{}",
+            serde_json::to_string(&super::compact::compact_plan_json(
+                &paths,
+                sid,
+                args.ctx.unwrap_or(0),
+            ))?
+        );
+    } else if args.compact_usual {
+        println!(
+            "{}",
+            serde_json::to_string(&super::compact::keep_compact_usual(&paths, now))?
+        );
+    } else if let Some(record) = &args.keep {
+        let mut record: serde_json::Value = serde_json::from_str(record)?;
+        if ["dream", "look", "chapter", "ysk", "compact"].contains(&super::string(&record["kind"]))
+        {
+            let root = super::paths::git(&args.repo, &["rev-parse", "--show-toplevel"])
+                .map(std::path::PathBuf::from)
+                .or_else(|| super::db::Db::open(&paths).ok()?.pane_root(&args.repo));
+            record["repo"] = serde_json::to_value(root)?;
+        }
+        super::dreams::keep(&paths, &record)?;
+        println!("{{}}");
+    } else if let Some(path) = &args.note {
+        let path = super::paths::realpath(path);
+        let root = path
+            .parent()
+            .and_then(|p| super::paths::git(p, &["rev-parse", "--show-toplevel"]));
+        let touched = args.touch.as_deref() == Some("-");
+        let mut output = super::note::NotesOutput::default();
+        if let Some(root) = root {
+            let db = super::db::Db::open(&paths)?;
+            let touch = if touched {
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .take(super::note::TOUCH_MAX + 1)
+                    .read_to_end(&mut bytes)?;
+                let raw = if bytes.len() as u64 > super::note::TOUCH_MAX {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap_or_default()
+                };
+                Some(super::note::touch_of(&raw, &path))
+            } else {
+                None
+            };
+            output = super::note::notes_for(
+                &db,
+                &paths,
+                std::path::Path::new(&root),
+                &path,
+                sid,
+                None,
+                touch.as_ref(),
+            );
+        }
+        if touched {
+            println!("{}", serde_json::to_string(&output)?);
+        } else {
+            println!("{}", serde_json::to_string(&output.notes)?);
+        }
+    } else if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&super::hook_json::pane_json(
+                &paths, &args.repo, sid, args.limit, now,
+            ))?
+        );
     }
     Ok(())
 }

@@ -1,0 +1,66 @@
+{
+  "repo": "<REPO>",
+  "total": 2,
+  "dreams_on": true,
+  "recalled": 0,
+  "changes_total": 0,
+  "dreams_7d": 2,
+  "dream_tokens_7d": 0,
+  "corrections_carried_7d": 0,
+  "shifts_told_7d": 0,
+  "reminded_7d": 0,
+  "status": "\u263e CSR remembered 0\u00d7 this session \u00b7 2 dreams this week",
+  "git": true,
+  "sample": {
+    "line": "What if every read stayed bounded?",
+    "at": 1792319500.0,
+    "answer": "helpful",
+    "project": null
+  },
+  "shift_map": {
+    "title": "Shift Map \u00b7 as of 2 messages ago",
+    "rows": [
+      "shift \u00b7 reader.rs:read",
+      "Before: The reader loaded a whole",
+      "        transcript.",
+      "After:  The reader streams chunks.",
+      "Haiku's words \u00b7 names match",
+      "commit 8e4e3f2"
+    ]
+  },
+  "shifts": [
+    {
+      "file": "csr-engine/src/lib.rs",
+      "symbol": "",
+      "verb": "removed",
+      "oid": "8e4e3f27",
+      "date": "2026-10-18",
+      "subject": "fix(hooks): a scratch file takes its session's project, not its folder name"
+    },
+    {
+      "file": "csr-engine/src/main.rs",
+      "symbol": "main",
+      "verb": "changed",
+      "oid": "8e4e3f27",
+      "date": "2026-10-18",
+      "subject": "fix(hooks): a scratch file takes its session's project, not its folder name"
+    }
+  ],
+  "changes": [],
+  "dreams": [
+    {
+      "id": "newest",
+      "at": 1792319940.0,
+      "line": "What if a frame failed while the agent was busy?",
+      "title": "Keep the pane alive",
+      "answer": null
+    },
+    {
+      "id": "older",
+      "at": 1792319500.0,
+      "line": "What if every read stayed bounded?",
+      "title": "A small reader",
+      "answer": "helpful"
+    }
+  ]
+}

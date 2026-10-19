@@ -14,7 +14,17 @@ fn home() -> (tempfile::TempDir, Paths) {
             if e.file_type().unwrap().is_dir() {
                 copy(&e.path(), &to.join(e.file_name()));
             } else {
-                fs::copy(e.path(), to.join(e.file_name())).unwrap();
+                let bytes = fs::read(e.path()).unwrap();
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .parent()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    fs::write(to.join(e.file_name()), text.replace("<REPO>", &repo)).unwrap();
+                } else {
+                    fs::write(to.join(e.file_name()), &bytes).unwrap();
+                }
             }
         }
     }
@@ -104,7 +114,15 @@ fn cli_rejects_unported_modes_with_exit_two() {
     let (_home, paths) = home();
     let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
         .env("HOME", paths.home)
-        .args(["companion", "pane", "--repo", "/fixture", "--brief"])
+        .args([
+            "companion",
+            "pane",
+            "--repo",
+            "/fixture",
+            "--frame",
+            "--page",
+            "summary",
+        ])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -606,4 +624,726 @@ fn disabling_pixels_keeps_text_strips_even_in_kitty() {
         out.stdout,
         fs::read(fixture().join("main-46x30.txt")).unwrap()
     );
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use csr_engine::companion::lease::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn args(step: Step, root: &str, rank: i64, now: f64, busy: bool) -> LeaseArgs {
+        LeaseArgs {
+            step,
+            folder: PathBuf::new(),
+            session: "s".into(),
+            root: root.into(),
+            rank,
+            now,
+            busy,
+        }
+    }
+
+    #[test]
+    fn test_a_fresh_lease_another_copy_holds_is_kept_from_equal_or_lower_rank_and_from_anyone_while_busy(
+    ) {
+        let now = 1_760_000_000_000.;
+        let mut held = json!({"root":"installed","rank":0,"at":now});
+        assert!(decide(&args(Step::Take, "installed", 0, now + 1., false), &held).0);
+        assert!(decide(&args(Step::Take, "dev", 1, now + 1., false), &held).0);
+        held["rank"] = 1.into();
+        assert_eq!(
+            decide(&args(Step::Take, "dev", 1, now + 1., false), &held),
+            (false, None)
+        );
+        held["rank"] = 0.into();
+        held["busy"] = true.into();
+        assert!(!decide(&args(Step::Take, "dev", 1, now + 1., false), &held).0);
+        held["at"] = (now - 900_000. - 1.).into();
+        assert!(decide(&args(Step::Take, "dev", 1, now, true), &held).0);
+        assert!(decide(&args(Step::Take, "dev", 1, now, false), &json!("garbled")).0);
+    }
+
+    #[test]
+    fn test_release_keeps_the_lease_and_drops_busy_renew_keeps_busy_neither_touches_another_copys()
+    {
+        let held = json!({"root":"dev","rank":1,"at":1000,"busy":true});
+        let release = decide(&args(Step::Release, "dev", 1, 1005., false), &held);
+        assert_eq!(
+            release,
+            (true, Some(json!({"root":"dev","rank":1,"at":1000})))
+        );
+        let renew = decide(&args(Step::Renew, "dev", 1, 1005., false), &held);
+        assert_eq!(renew.1.unwrap()["busy"], true);
+        for step in [Step::Renew, Step::Release] {
+            assert_eq!(
+                decide(&args(step, "other", 1, 1005., false), &held),
+                (false, None)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lease_process_tests {
+    use super::*;
+    use csr_engine::companion::lease::{decide, LeaseArgs, LeaseOutput, Step};
+    use serde_json::Value;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    fn start(folder: &std::path::Path, root: &str, pause: &str) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", folder)
+            .env("CSR_LEASE_PAUSE_MS", pause)
+            .args(["companion", "lease", "take", "--folder"])
+            .arg(folder)
+            .args([
+                "--session",
+                "s",
+                "--root",
+                root,
+                "--rank",
+                "1",
+                "--now",
+                "1760000000000",
+                "--busy",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn lease_oracle_is_parse_equal() {
+        let rows: Vec<Value> =
+            serde_json::from_str(include_str!("fixtures/companion/lease.json")).unwrap();
+        for row in rows {
+            let args = LeaseArgs {
+                step: match row["step"].as_str().unwrap() {
+                    "take" => Step::Take,
+                    "renew" => Step::Renew,
+                    _ => Step::Release,
+                },
+                folder: PathBuf::new(),
+                session: "s".into(),
+                root: row["root"].as_str().unwrap().into(),
+                rank: row["rank"].as_i64().unwrap(),
+                now: 1792320000001.,
+                busy: row["busy"].as_bool().unwrap(),
+            };
+            let (held, lease) = decide(&args, &row["held"]);
+            let output = LeaseOutput {
+                held,
+                lease: lease.unwrap_or(row["held"].clone()),
+            };
+            assert_eq!(serde_json::to_value(output).unwrap(), row["output"]);
+        }
+    }
+
+    #[test]
+    fn test_of_n_copies_that_ask_at_once_exactly_one_holds_the_lease() {
+        for n in [2, 3, 8] {
+            let folder = tempfile::tempdir().unwrap();
+            let runs: Vec<_> = (0..n)
+                .map(|i| start(folder.path(), &format!("/copy/{i}"), "150"))
+                .collect();
+            let answers: Vec<LeaseOutput> = runs
+                .into_iter()
+                .map(|run| {
+                    let out = run.wait_with_output().unwrap();
+                    assert!(out.status.success());
+                    serde_json::from_slice(&out.stdout).unwrap()
+                })
+                .collect();
+            assert_eq!(answers.iter().filter(|a| a.held).count(), 1);
+            let kept: Value =
+                serde_json::from_slice(&fs::read(folder.path().join("s.json")).unwrap()).unwrap();
+            assert_eq!(kept, answers.iter().find(|a| a.held).unwrap().lease);
+        }
+    }
+
+    #[test]
+    fn test_a_copy_killed_holding_the_lock_leaves_nothing_to_reclaim() {
+        use fs2::FileExt;
+        let folder = tempfile::tempdir().unwrap();
+        let mut dead = start(folder.path(), "/copy/dead", "5000");
+        let path = folder.path().join("s.lease.lock");
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+                if file.try_lock_exclusive().is_err() {
+                    break;
+                }
+            }
+            assert!(Instant::now() < until, "child never acquired its lock");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        dead.kill().unwrap();
+        dead.wait().unwrap();
+        let began = Instant::now();
+        let out = start(folder.path(), "/copy/alive", "0")
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            serde_json::from_slice::<LeaseOutput>(&out.stdout)
+                .unwrap()
+                .held
+        );
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(path.exists());
+    }
+}
+
+fn normalized(mut value: serde_json::Value, paths: &Paths) -> serde_json::Value {
+    fn visit(v: &mut serde_json::Value, replacements: &[(&str, &str)]) {
+        match v {
+            serde_json::Value::Number(n) => *v = serde_json::Value::from(n.as_f64().unwrap()),
+            serde_json::Value::String(s) => {
+                for (from, to) in replacements {
+                    *s = s.replace(from, to);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|v| visit(v, replacements)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|v| visit(v, replacements)),
+            _ => (),
+        }
+    }
+    let repo = args("main", 46, 30).repo;
+    visit(
+        &mut value,
+        &[
+            (paths.home.to_str().unwrap(), "<HOME>"),
+            (repo.to_str().unwrap(), "<REPO>"),
+        ],
+    );
+    value
+}
+
+fn hook(paths: &Paths, argv: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .env("HOME", &paths.home)
+        .env("CSR_COMPANION_NOW", "1792320000")
+        .args(["companion", "pane", "--repo"])
+        .arg(args("main", 46, 30).repo)
+        .args(argv)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn json_and_note_hook_goldens_are_parse_equal() {
+    for (name, argv, stdin) in [
+        (
+            "json",
+            vec!["--json", "--limit", "60", "--sid", "sess-now"],
+            "",
+        ),
+        (
+            "note",
+            vec![
+                "--note",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"),
+                "--touch",
+                "-",
+            ],
+            r#"{"tool":"Read","offset":1,"limit":20}"#,
+        ),
+    ] {
+        let (_home, paths) = home();
+        let out = hook(&paths, &argv, stdin);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let actual = normalized(serde_json::from_slice(&out.stdout).unwrap(), &paths);
+        let expected = normalized(
+            serde_json::from_slice(&fs::read(fixture().join(format!("{name}.json"))).unwrap())
+                .unwrap(),
+            &paths,
+        );
+        assert_eq!(actual, expected, "{name}");
+    }
+}
+
+#[test]
+fn test_the_dream_log_takes_kind_compact_with_its_repo() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_home, paths) = home();
+    let out = hook(
+        &paths,
+        &[
+            "--keep",
+            r#"{"kind":"compact","session":"sess-now","at":1792320000,"event":"plan","token":"abc"}"#,
+        ],
+        "",
+    );
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"{}\n");
+    let text = fs::read_to_string(paths.keep.join("dreams.jsonl")).unwrap();
+    let actual = normalized(
+        serde_json::from_str(text.lines().last().unwrap()).unwrap(),
+        &paths,
+    );
+    let expected = normalized(
+        serde_json::from_str(include_str!("fixtures/companion/keep-record.json")).unwrap(),
+        &paths,
+    );
+    assert_eq!(actual, expected);
+    assert_eq!(
+        fs::metadata(paths.keep.join("dreams.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn lost_and_compact_hook_goldens_are_parse_equal() {
+    for (name, argv) in [
+        ("lost", vec!["--lost", "--sid", "sess-lost"]),
+        (
+            "compact-plan",
+            vec!["--compact-plan", "--sid", "sess-now", "--ctx", "300000"],
+        ),
+        ("compact-usual", vec!["--compact-usual"]),
+    ] {
+        let (_home, paths) = home();
+        let out = hook(&paths, &argv, "");
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            normalized(serde_json::from_slice(&out.stdout).unwrap(), &paths),
+            normalized(
+                serde_json::from_slice(&fs::read(fixture().join(format!("{name}.json"))).unwrap())
+                    .unwrap(),
+                &paths
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn brief_is_byte_equal_and_coach_and_story_news_are_parse_equal() {
+    let (_home, paths) = home();
+    let out = hook(&paths, &["--brief", "--sid", "sess-now"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let actual = normalized(
+        serde_json::Value::String(String::from_utf8(out.stdout).unwrap()),
+        &paths,
+    );
+    assert_eq!(
+        actual.as_str().unwrap(),
+        include_str!("fixtures/companion/brief.txt")
+    );
+    for (name, mode) in [("coach", "--coach"), ("story-news", "--story-news")] {
+        let out = hook(&paths, &[mode, "--sid", "sess-now"], "");
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            normalized(serde_json::from_slice(&out.stdout).unwrap(), &paths),
+            normalized(
+                serde_json::from_slice(&fs::read(fixture().join(format!("{name}.json"))).unwrap())
+                    .unwrap(),
+                &paths
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "support/companion_python_cases.rs"]
+mod python_cases;
+
+#[cfg(test)]
+mod continued_tests {
+    use super::*;
+    use csr_engine::companion::{session, sources};
+    fn transcripts() -> (tempfile::TempDir, Paths, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let folder = paths.projects.join("p");
+        fs::create_dir_all(&folder).unwrap();
+        let old = folder.join("old.jsonl");
+        let new = folder.join("new.jsonl");
+        fs::write(
+            &old,
+            concat!("{\"type\":\"user\",\"entrypoint\":\"cli\"}\n",
+            "{\"type\":\"continued-in\",\"sessionId\":\"old\",\"continuedInSessionId\":\"new\"}\n",
+            "{\"type\":\"last-prompt\",\"sessionId\":\"old\"}\n"),
+        )
+        .unwrap();
+        fs::write(&new, "{}\n").unwrap();
+        (d, paths, old, new)
+    }
+    #[test]
+    fn test_continued_from_finds_the_session_this_one_continues() {
+        let (_d, paths, _, _) = transcripts();
+        assert_eq!(
+            sources::continued_from_at(&paths, "new", None, 1000.).as_deref(),
+            Some("old")
+        );
+        assert!(sources::continued_from_at(&paths, "old", None, 1000.).is_none());
+        assert_eq!(session::lineage(&paths, "new"), ["new", "old"]);
+    }
+    #[test]
+    fn test_a_row_naming_another_session_or_an_odd_id_is_not_followed() {
+        for row in [
+            "{\"type\":\"continued-in\",\"sessionId\":\"old\",\"continuedInSessionId\":\"other\"}\n",
+            "{\"type\":\"continued-in\",\"sessionId\":\"../x y\",\"continuedInSessionId\":\"new\"}\n",
+        ] {
+            let (_d,paths,old,_) = transcripts(); fs::write(old,row).unwrap();
+            assert!(sources::continued_from_at(&paths,"new",None,1000.).is_none());
+        }
+    }
+    #[test]
+    fn test_none_is_looked_for_again_after_a_minute_and_a_find_is_kept() {
+        let (_d, paths, old, _) = transcripts();
+        let rows = fs::read(&old).unwrap();
+        fs::write(&old, "").unwrap();
+        assert!(sources::continued_from_at(&paths, "new", None, 1000.).is_none());
+        fs::write(&old, rows).unwrap();
+        assert!(sources::continued_from_at(&paths, "new", None, 1059.).is_none());
+        assert_eq!(
+            sources::continued_from_at(&paths, "new", None, 1061.).as_deref(),
+            Some("old")
+        );
+        fs::remove_file(old).unwrap();
+        assert_eq!(
+            sources::continued_from_at(&paths, "new", None, 4661.).as_deref(),
+            Some("old")
+        );
+    }
+    #[test]
+    fn test_a_row_speaks_only_for_the_file_it_is_in() {
+        let (_d, paths, old, new) = transcripts();
+        let stranger = new.parent().unwrap().join("stranger.jsonl");
+        fs::write(
+            &stranger,
+            concat!(
+                "{\"type\":\"continued-in\",\"sessionId\":\"forged\",",
+                "\"continuedInSessionId\":\"new\"}\n"
+            ),
+        )
+        .unwrap();
+        fs::remove_file(old).unwrap();
+        assert!(sources::continued_from_at(&paths, "new", None, 1000.).is_none());
+    }
+    #[test]
+    fn test_a_miss_is_not_kept_while_the_own_transcript_is_missing() {
+        let (_d, paths, old, new) = transcripts();
+        let parked = new.with_extension("parked");
+        fs::rename(&new, &parked).unwrap();
+        assert!(sources::continued_from_at(&paths, "new", None, 1000.).is_none());
+        fs::rename(parked, &new).unwrap();
+        assert!(old.exists());
+        assert_eq!(
+            sources::continued_from_at(&paths, "new", None, 1000.).as_deref(),
+            Some("old")
+        );
+    }
+    #[test]
+    fn test_an_explicit_path_that_is_not_there_yet_is_not_a_scan_and_is_not_kept() {
+        let (_d, paths, _, new) = transcripts();
+        let parked = new.with_extension("parked");
+        fs::rename(&new, &parked).unwrap();
+        assert!(sources::continued_from_at(&paths, "new", Some(&new), 1000.).is_none());
+        assert!(sources::previous_session(&paths, &new, 4000.).is_none());
+        fs::rename(parked, &new).unwrap();
+        assert_eq!(
+            sources::continued_from_at(&paths, "new", Some(&new), 1000.).as_deref(),
+            Some("old")
+        );
+    }
+    #[test]
+    fn test_a_transcript_that_vanishes_during_the_scan_is_not_kept_as_a_miss() {
+        let (_d, paths, _, new) = transcripts();
+        let parked = paths.home.join("parked");
+        fs::rename(new.parent().unwrap(), &parked).unwrap();
+        assert!(sources::continued_from_at(&paths, "new", Some(&new), 1000.).is_none());
+        fs::rename(parked, new.parent().unwrap()).unwrap();
+        assert_eq!(
+            sources::continued_from_at(&paths, "new", Some(&new), 1000.).as_deref(),
+            Some("old")
+        );
+    }
+    #[test]
+    fn test_a_cycle_ends_the_lineage() {
+        let (_d, paths, old, new) = transcripts();
+        fs::write(
+            new,
+            concat!(
+                "{\"type\":\"continued-in\",\"sessionId\":\"new\",",
+                "\"continuedInSessionId\":\"old\"}\n"
+            ),
+        )
+        .unwrap();
+        assert!(old.exists());
+        assert_eq!(session::lineage(&paths, "new"), ["new", "old"]);
+    }
+    #[test]
+    fn test_previous_session_returns_the_continued_from_file_though_it_was_written_after_this_began(
+    ) {
+        let (_d, paths, old, new) = transcripts();
+        assert_eq!(sources::previous_session(&paths, &new, 4000.), Some(old));
+    }
+    #[test]
+    fn test_the_kill_switch_returns_none() {
+        let (_d, paths, _, _) = transcripts();
+        fs::create_dir_all(paths.db.parent().unwrap()).unwrap();
+        let con = rusqlite::Connection::open(&paths.db).unwrap();
+        con.execute_batch(include_str!("fixtures/companion/home.sql"))
+            .unwrap();
+        for id in ["old", "old", "old", "new"] {
+            con.execute("insert into retrieval_events(session_id) values(?)", [id])
+                .unwrap();
+        }
+        drop(con);
+        let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", &paths.home)
+            .env("CSR_NO_CONTINUED", "1")
+            .args([
+                "companion",
+                "pane",
+                "--repo",
+                args("main", 46, 30).repo.to_str().unwrap(),
+                "--json",
+                "--sid",
+                "new",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["recalled"],
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod continued_memory_tests {
+    use super::*;
+    use csr_engine::companion::{coach, db::Db, hook_json, pages, recall, session, story};
+    use serde_json::{json, Value};
+    fn fixture_memory() -> (tempfile::TempDir, Paths, rusqlite::Connection) {
+        let (d, paths) = home();
+        let folder = paths.projects.join("continued");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("new.jsonl"), "{}\n").unwrap();
+        fs::write(
+            folder.join("old.jsonl"),
+            concat!(
+                "{\"type\":\"continued-in\",",
+                "\"sessionId\":\"old\",\"continuedInSessionId\":\"new\"}\n"
+            ),
+        )
+        .unwrap();
+        let con = rusqlite::Connection::open(&paths.db).unwrap();
+        (d, paths, con)
+    }
+    fn tell(con: &rusqlite::Connection, sid: &str, rev: usize) {
+        con.execute(
+            "insert into reflections values(?1,?2,?3,'2026-10-15T01:00:00Z')",
+            rusqlite::params![
+                format!("story_{sid}"),
+                format!("Story of {sid}. Where it stands: done."),
+                json!([
+                    "session_story",
+                    format!("conv_{sid}"),
+                    format!("story_rev_{rev}")
+                ])
+                .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    fn map(con: &rusqlite::Connection, sid: &str) {
+        con.execute(
+            "insert into meta values(?1,?2)",
+            rusqlite::params![
+                format!("story_map:{sid}"),
+                json!({"v":1,"current":{"rev":3,"at":1000,"by":"Haiku","covered_msgs":5,
+                "entries":[{"kind":"shift","claim":"Added a thing","before":[],
+                "after":[{"scope":"a.py","sym":"f","mark":"+","tier":"verified"}],
+                "receipts":["oid:abcdef0"],"grounded":true}]}})
+                .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    #[test]
+    fn test_session_story_own_wins_and_the_fallback_names_where_it_came_from() {
+        let (_d, paths, con) = fixture_memory();
+        tell(&con, "old", 39);
+        let db = Db::open(&paths).unwrap();
+        let old = recall::session_story(&db, &paths, "new");
+        assert_eq!(
+            (old["rev"].clone(), old["from_sid"].clone()),
+            (json!(39), json!("old"))
+        );
+        assert!(recall::session_story(&db, &paths, "old")
+            .get("from_sid")
+            .is_none());
+        tell(&con, "new", 1);
+        let own = recall::session_story(&db, &paths, "new");
+        assert_eq!(own["rev"], 1);
+        assert!(own.get("from_sid").is_none());
+    }
+    #[test]
+    fn test_the_story_heading_says_where_an_inherited_story_is_from() {
+        let (_d, paths, con) = fixture_memory();
+        tell(&con, "old", 39);
+        let db = Db::open(&paths).unwrap();
+        for (sid, inherited) in [("new", true), ("old", false)] {
+            let story = recall::session_story(&db, &paths, sid);
+            let data = json!({"repo":"/fixture","story":story,"dreams":[],"dreams_on":false});
+            let s = json!({"id":sid,"turn_end":1});
+            let page = pages::page_main(&data, &s, 0., &Value::Null, None);
+            let right = page["sections"][0]["right"].as_str().unwrap();
+            assert_eq!(right.contains("from old"), inherited);
+        }
+    }
+    #[test]
+    fn test_display_story_map_prefers_its_own_map_then_the_predecessors() {
+        let (_d, paths, con) = fixture_memory();
+        let db = Db::open(&paths).unwrap();
+        assert!(story::display_story_map(&db, &paths, "new").is_none());
+        map(&con, "old");
+        assert_eq!(
+            story::display_story_map(&db, &paths, "new").unwrap().1,
+            "old"
+        );
+        map(&con, "new");
+        assert_eq!(
+            story::display_story_map(&db, &paths, "new").unwrap().1,
+            "new"
+        );
+    }
+    #[test]
+    fn test_the_map_title_carries_from_only_when_inherited() {
+        let (_d, paths, con) = fixture_memory();
+        map(&con, "old");
+        let db = Db::open(&paths).unwrap();
+        assert!(hook_json::shift_map_json(&db, &paths, "new")
+            .unwrap()
+            .title
+            .ends_with(" · from old"));
+        assert!(!hook_json::shift_map_json(&db, &paths, "old")
+            .unwrap()
+            .title
+            .contains("from"));
+    }
+    #[test]
+    fn test_recalled_sums_the_lineage() {
+        let (_d, paths, con) = fixture_memory();
+        for (id, n) in [("old", 174), ("new", 2), ("someone-else", 9)] {
+            for _ in 0..n {
+                con.execute("insert into retrieval_events(session_id) values(?)", [id])
+                    .unwrap();
+            }
+        }
+        assert_eq!(session::lineage(&paths, "new"), ["new", "old"]);
+        for (id, n) in [("new", 176), ("old", 174), ("", 0)] {
+            assert_eq!(
+                hook_json::pane_json(&paths, &args("main", 46, 30).repo, id, 10, 0.).recalled,
+                n
+            );
+        }
+    }
+    #[test]
+    fn test_story_news_stays_on_the_own_session() {
+        let (_d, paths, con) = fixture_memory();
+        map(&con, "old");
+        assert_eq!(
+            serde_json::to_value(story::story_news(&paths, None, "new", 0.)).unwrap(),
+            json!({"story":false})
+        );
+    }
+    #[test]
+    fn test_how_claude_read_falls_back_to_the_predecessor_that_has_readings() {
+        let (_d, paths, _con) = fixture_memory();
+        let old = paths.projects.join("continued/old.jsonl");
+        let continued = fs::read_to_string(&old).unwrap();
+        fs::write(
+            old,
+            json!({"type":"user","isCompactSummary":true,
+            "timestamp":"2026-10-15T01:10:00Z","message":{
+                "content":"Interpreted as: \"dknr\" meant \"done\"."}})
+            .to_string()
+                + "\n"
+                + &continued,
+        )
+        .unwrap();
+        let found = coach::how_claude_read(&paths, "new", 2);
+        assert!(!found.is_empty());
+        assert_eq!(
+            serde_json::to_value(found).unwrap(),
+            serde_json::to_value(coach::how_claude_read(&paths, "old", 2)).unwrap()
+        );
+        assert!(coach::how_claude_read(&paths, "not-a-session", 2).is_empty());
+    }
+}
+
+#[test]
+fn test_old_failure_does_not_reopen_retry() {
+    use csr_engine::companion::agents;
+    use serde_json::json;
+    let d = tempfile::tempdir().unwrap();
+    let state = d.path().join("s.json");
+    let drafts = d.path().join("s.drafts.jsonl");
+    let row = |request: &str, outcome: &str, at: f64| {
+        json!({"request":request,"session":"s",
+        "thread":"0123456789ab","drafted_at":at-10.,"submitted_at":at*1000.,
+        "spawn_tool_use_id":"u1","agent_id":"a1","turn_id":"t1","outcome":outcome,
+        "ended_at":(at+10.)*1000.,"reason":null})
+    };
+    fs::write(
+        &state,
+        json!({"version":1,"session":"s","handoffs":[
+        row("req-1","failed",1000.),row("req-2","succeeded",1100.)]})
+        .to_string(),
+    )
+    .unwrap();
+    // A final draft without LF is read too; an existing request is not duplicated.
+    fs::write(
+        &drafts,
+        concat!(
+            "{\"request\":\"req-1\",\"thread\":\"0123456789ab\",\"drafted_at\":990}\n",
+            "not json\n{\"request\":\"req-3\",\"thread\":\"0123456789ab\",\"drafted_at\":1200}"
+        ),
+    )
+    .unwrap();
+    let found = agents::read_handoffs(&state, &drafts, "s");
+    assert_eq!(found.len(), 3);
+    assert_eq!(agents::decide(&found).unwrap().0, "handed");
+    assert_eq!(agents::decide(&found).unwrap().1.request, "req-2");
+    assert_eq!(found[2].outcome, "draft");
+    assert!(agents::read_handoffs(&state, &drafts, "../x").is_empty());
 }
