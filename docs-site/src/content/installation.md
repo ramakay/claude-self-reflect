@@ -29,10 +29,10 @@ Non-interactive installs (CI, scripts) never activate automatically. Control the
 
 ```bash
 npm install -g claude-self-reflect
-csr-engine setup
+claude-self-reflect setup
 ```
 
-By default `npm install` only downloads the checksummed binary — it does not modify `~/.claude/settings.json`, register MCP servers, or index conversations. Activation is the separate, explicit `csr-engine setup` step, or set `CSR_AUTO_SETUP=1` during install to opt in.
+By default `npm install` only downloads the checksummed binary — it does not modify `~/.claude/settings.json`, register MCP servers, or index conversations. Activation is the separate, explicit `claude-self-reflect setup` step, or set `CSR_AUTO_SETUP=1` during install to opt in. That command runs the binary npm downloaded, so it works before `~/.local/bin` is on your PATH.
 
 ### The companion plugin
 
