@@ -309,7 +309,7 @@ fn incomplete_report(mcp: Option<&McpFailure>, hook_error: Option<&str>) -> Stri
     let mut out = String::new();
     if let Some(error) = hook_error {
         out.push_str(&format!(
-            "  Hooks are NOT installed: {error}\n  Automatic recall is inactive until they are. Run: csr-engine hook install --apply\n"
+            "  Hook install failed: {error}\n  Hooks from an earlier install, if any, are unchanged. Run: csr-engine hook install --apply\n"
         ));
     }
     if let Some(failure) = mcp {
@@ -331,9 +331,9 @@ fn incomplete_report(mcp: Option<&McpFailure>, hook_error: Option<&str>) -> Stri
 /// The short error `handle` returns for an incomplete setup (non-zero exit).
 fn incomplete_error(mcp_failed: bool, hooks_failed: bool) -> &'static str {
     match (mcp_failed, hooks_failed) {
-        (true, true) => "MCP server not registered and hooks not installed",
+        (true, true) => "MCP server not registered and hook install failed",
         (true, false) => "MCP server not registered",
-        _ => "hooks not installed",
+        _ => "hook install failed",
     }
 }
 
@@ -1442,12 +1442,14 @@ mod tests {
         assert_eq!(hook_install_step(|| Ok(())), None);
 
         let report = incomplete_report(None, carried.as_deref());
-        assert!(report.contains("Hooks are NOT installed: settings.json is not valid JSON"));
-        assert!(report.contains("Automatic recall is inactive"));
+        assert!(report.contains("Hook install failed: settings.json is not valid JSON"));
+        assert!(report.contains("Hooks from an earlier install, if any, are unchanged."));
+        assert!(!report.contains("NOT installed"), "{report}");
+        assert!(!report.contains("inactive"), "{report}");
         assert!(report.contains("csr-engine hook install --apply"));
         assert!(report.contains("MCP registration are done"), "{report}");
         // the same non-zero status the MCP failure path returns
-        assert_eq!(incomplete_error(false, true), "hooks not installed");
+        assert_eq!(incomplete_error(false, true), "hook install failed");
         assert_eq!(incomplete_error(true, false), "MCP server not registered");
     }
 
@@ -1458,15 +1460,15 @@ mod tests {
         assert!(
             only_mcp.starts_with("  Hooks and import are done. The MCP server is NOT registered:")
         );
-        assert!(!only_mcp.contains("Hooks are NOT installed"));
+        assert!(!only_mcp.contains("Hook install failed"));
 
         let both = incomplete_report(Some(&mcp), Some("disk full"));
-        assert!(both.contains("Hooks are NOT installed: disk full"));
+        assert!(both.contains("Hook install failed: disk full"));
         assert!(both.contains("  The import is done. The MCP server is NOT registered:"));
         assert!(!both.contains("Hooks and import are done"));
         assert_eq!(
             incomplete_error(true, true),
-            "MCP server not registered and hooks not installed"
+            "MCP server not registered and hook install failed"
         );
     }
 
