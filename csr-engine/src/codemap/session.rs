@@ -321,9 +321,11 @@ pub fn release_and_recheck(
     }
 }
 
-/// Test-only seam: a closure run by `cli::drain` right after a pass found
-/// nothing, before it releases its lock, so a test can queue an edit in the
-/// window the exit sequence has to cover. Thread-local.
+/// Test-only seams, run by `cli::drain` while it still holds its lock, so a test
+/// can queue an edit in the window the exit sequence has to cover. Thread-local.
+/// `after_idle` runs right after a pass found nothing; `before_handoff` runs just
+/// before the shared `release_and_recheck`, whether the pass was idle or at the
+/// time limit.
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use std::cell::RefCell;
@@ -332,6 +334,7 @@ pub(crate) mod test_hooks {
 
     thread_local! {
         static AFTER_IDLE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_HANDOFF: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn set_after_idle(hook: impl FnMut() + 'static) {
@@ -341,6 +344,17 @@ pub(crate) mod test_hooks {
     pub(crate) fn after_idle() {
         // Taken out first so the hook may itself call back into this module.
         let hook = AFTER_IDLE.with(|h| h.borrow_mut().take());
+        if let Some(mut f) = hook {
+            f();
+        }
+    }
+
+    pub(crate) fn set_before_handoff(hook: impl FnMut() + 'static) {
+        BEFORE_HANDOFF.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn before_handoff() {
+        let hook = BEFORE_HANDOFF.with(|h| h.borrow_mut().take());
         if let Some(mut f) = hook {
             f();
         }
@@ -485,7 +499,14 @@ pub fn on_post_tool_use(
 /// itself, a cwd or repo under a temp root (`is_temp`; `CSR_CODEMAP_ALLOW_TEMP=1`
 /// lifts it), a repo whose worktree root is the home folder, a protected folder's
 /// ancestor (`identity::contains_tcc_root`), and a repo none of whose views survive
-/// that exclusion (`identity::only_excluded_views`): a scan would walk all of `$HOME`.
+/// that exclusion: a scan would walk all of `$HOME`. The last of these is NOT
+/// checked here (`identity::only_excluded_views` lists every worktree: a `read_dir`
+/// and a `read_to_string` per `.git/worktrees/*/gitdir`, which can block on a FIFO
+/// and grows with the worktree count, inside a synchronous hook). It is redundant:
+/// the cwd's own worktree is one of the views, and once `contains_tcc_root` passes
+/// for its root that view survives the exclusion, so the listing cannot come up
+/// empty for that reason alone. The detached child (`register_session_repo`) keeps
+/// the check.
 fn ordinary_repo_cwd(
     cwd: &Path,
     home: Option<&Path>,
@@ -507,7 +528,6 @@ fn ordinary_repo_cwd(
     if is_temp(&id.common_dir)
         || is_temp(&id.worktree_root)
         || identity::contains_tcc_root(&id.worktree_root, home)
-        || identity::only_excluded_views(&id.common_dir, home)
     {
         return None;
     }

@@ -546,6 +546,8 @@ fn drain_with(
             }
         };
         if handoff {
+            #[cfg(test)]
+            super::session::test_hooks::before_handoff();
             // At the limit exactly as when idle: release the lock, then look at the
             // queue again. An edit queued during the last debounce saw our live
             // lock, so its hook spawned nothing; the recheck finds its row.
@@ -1106,6 +1108,15 @@ mod tests {
             .unwrap();
         drop(storage);
 
+        // What a hook does during the first pass's handoff: the file changes, the
+        // row is queued, and the lock is still ours, so the hook spawns nothing.
+        let (r, d) = (repo.clone(), db_path.clone());
+        test_hooks::set_before_handoff(move || {
+            write(&r, "a.py", &py(&["alpha", "delta_last", "epsilon_late"]));
+            let conn = rusqlite::Connection::open(&d).unwrap();
+            super::super::enqueue(&conn, &r.join("a.py")).unwrap();
+        });
+
         // A zero limit: the time check fires on the first pass.
         drain_with(
             &db_path,
@@ -1119,6 +1130,11 @@ mod tests {
             defs_named(&db_path, "delta_last"),
             1,
             "the last edit was mapped, not dropped"
+        );
+        assert_eq!(
+            defs_named(&db_path, "epsilon_late"),
+            1,
+            "the edit queued during the at-limit handoff was mapped by the same drain"
         );
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         assert!(
