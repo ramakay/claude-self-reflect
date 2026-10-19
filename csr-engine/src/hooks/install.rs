@@ -5,6 +5,8 @@
 
 use anyhow::Result;
 
+use super::statusline_retire;
+
 /// Handle the install subcommand.
 pub fn handle(apply: bool) -> Result<()> {
     let binary_path = std::env::current_exe()?;
@@ -13,13 +15,19 @@ pub fn handle(apply: bool) -> Result<()> {
     let config = generate_hook_config(&binary_str);
 
     if apply {
-        apply_to_settings(&config)?;
+        let notes = apply_to_settings(&config)?;
         println!("CSR: Hooks installed to ~/.claude/settings.json");
+        for note in notes {
+            println!("{note}");
+        }
         println!("{}", serde_json::to_string_pretty(&config)?);
     } else {
         println!("Add the following to your ~/.claude/settings.json:\n");
         println!("{}", serde_json::to_string_pretty(&config)?);
         println!("\nOr run with --apply to auto-patch settings.json.");
+        if let Some(note) = statusline_preview() {
+            println!("\n{note}");
+        }
     }
 
     Ok(())
@@ -283,14 +291,33 @@ fn merge_hook_config(
     Ok(())
 }
 
+/// The path of the user settings file under `home`.
+fn settings_path_in(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".claude").join("settings.json")
+}
+
+/// What `--apply` would do to a retired CSR status line wrapper, for the dry run.
+/// Reads only; an unreadable or non-JSON settings file says nothing here.
+fn statusline_preview() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let path = settings_path_in(&home);
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    let outcome = statusline_retire::restore_in_place(&mut settings, &home);
+    statusline_retire::report(&outcome, &path, true)
+}
+
 /// Apply hook config to ~/.claude/settings.json.
 /// Merges new hooks into existing config (does not clobber user hooks).
 /// Uses atomic write (write to .tmp then rename) and creates a .bak backup.
-fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
-    let settings_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
-        .join(".claude")
-        .join("settings.json");
+///
+/// The same read and write also puts a retired CSR status line wrapper's original
+/// command back; the leftovers are deleted only once that write has succeeded.
+/// Returns the lines to print about the status line.
+fn apply_to_settings(config: &serde_json::Value) -> Result<Vec<String>> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let settings_path = settings_path_in(&home);
 
     // Ensure parent directory exists
     if let Some(parent) = settings_path.parent() {
@@ -312,12 +339,25 @@ fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
     // Deep-merge hooks: add CSR hooks without clobbering existing user hooks
     merge_hook_config(&mut settings, config)?;
 
+    // Put the original status line command back if the retired wrapper is still set
+    let outcome = statusline_retire::restore_in_place(&mut settings, &home);
+
     // Atomic write: write to temp file then rename
     let tmp_path = settings_path.with_extension("json.tmp");
     std::fs::write(&tmp_path, serde_json::to_string_pretty(&settings)?)?;
     std::fs::rename(&tmp_path, &settings_path)?;
 
-    Ok(())
+    let mut notes: Vec<String> = statusline_retire::report(&outcome, &settings_path, false)
+        .into_iter()
+        .collect();
+    if matches!(outcome, statusline_retire::Outcome::Restored(_)) {
+        notes.extend(
+            statusline_retire::delete_leftovers(&home)
+                .into_iter()
+                .map(|failure| format!("CSR: {failure}")),
+        );
+    }
+    Ok(notes)
 }
 
 #[cfg(test)]
