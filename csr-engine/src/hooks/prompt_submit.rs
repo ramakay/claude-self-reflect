@@ -2210,9 +2210,10 @@ fn extract_file_paths_from_prompt(prompt: &str) -> Vec<String> {
     ];
     let mut files = Vec::new();
     for word in prompt.split_whitespace() {
-        // Strip common surrounding punctuation (quotes, backticks, parens)
+        // Strip common surrounding punctuation (quotes, backticks, parens) and
+        // the `@` of an `@path` mention
         let cleaned = word.trim_matches(|c: char| {
-            c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == ','
+            c == '`' || c == '"' || c == '\'' || c == '(' || c == ')' || c == ',' || c == '@'
         });
         if cleaned.contains('/') || cleaned.contains('.') {
             for ext in &extensions {
@@ -2451,6 +2452,12 @@ fn handoff_label(result: &crate::injection::predictor::ScoredResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_path_mention_yields_the_bare_path() {
+        let files = extract_file_paths_from_prompt("why does @src/auth.rs reject tokens?");
+        assert_eq!(files, vec!["src/auth.rs".to_string()]);
+    }
 
     fn handed(conversation_id: Option<&str>) -> crate::injection::predictor::ScoredResult {
         crate::injection::predictor::ScoredResult {
