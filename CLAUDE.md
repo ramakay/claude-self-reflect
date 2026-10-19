@@ -2,8 +2,8 @@
 
 ## Version reality — read before claiming anything is shipped
 
-**Shipped/live series is 9.5.x. As of 2026-09-14 the latest published version is `9.5.6`**
-(npm `claude-self-reflect`, highest git tag `v9.5.6`, cut from `release/v9.5.6`). **10.x has never been released — zero
+**Shipped/live series is 9.5.x. As of 2026-10-18 the latest published version is `9.5.8`**
+(npm `claude-self-reflect`, highest git tag `v9.5.8`, GitHub release `v9.5.8` marked Latest). **10.x has never been released — zero
 `v10*` tags exist.** `csr-engine/Cargo.toml` reads `10.1.0` because that is the *in-development*
 version on unreleased feature branches, NOT a shipped product.
 
@@ -14,7 +14,7 @@ Rules that follow from this:
    documents under a "(v10)" / "(v10.1)" heading is unreleased work-in-progress on branches.
    When you describe them, say "in development for 10.x", not "CSR does X".
 2. **This guide documents the 10.x development target, not the shipped 9.5.x binary.** The
-   binary a user has installed via npm is 9.5.6 and does not have these features unless they
+   binary a user has installed via npm is 9.5.8 and does not have these features unless they
    built from a feature branch. Check `csr-engine --version` / `npm view claude-self-reflect
    version` before telling a user what their install can do — pulled fresh, never from memory.
 3. Do not conflate the two series in user-facing text, release notes, or status claims. If you
@@ -43,7 +43,7 @@ csr-engine (~78MB release build)
   ├── Search (HNSW, <1ms p95)
   ├── Storage (SQLite)
   ├── AST analysis (ast-grep, 6 languages)
-  ├── 7 Claude Code hooks
+  ├── 6 hook events (7 commands; SessionStart runs two)
   └── 3-layer enrichment pipeline
 ```
 
@@ -64,7 +64,7 @@ csr-engine (~78MB release build)
 
 ## Dreaming (v10)
 
-Evidence-grounded forgetting: append-preferring event log (`witness_ledger` — no SQL trigger enforces immutability; span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); demote+annotate consumption gated behind `CSR_DREAM_CONSUMPTION=1` (opt-in, off by default — this one flag gates all verdict consumption, not just demote; no demote-only switch exists), `[stale anchor]`/`[evolved]` with commit receipts in search when enabled. Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic and provenance-stamped, but it does not execute the production dream algorithm (`dream::find_successor`); it predicts from sampled tag maps only. The `codewitness` crate's `Auditor::audit_against_successor` — not the production `dream::find_successor` path, which never emits this field — tags supersession receipts with their basis (`GraphOrdered` vs `ContentOnly`); a squash/rebase successor's receipt there is labeled `ContentOnly`, not presented as graph-proven. Dogfood corpus: 482 anchors observed at 2 HEAD commits — existence evidence, not accuracy.
+Evidence-grounded forgetting: append-preferring event log (`witness_ledger` — no SQL trigger enforces immutability; span-level BLAKE3 stamps at commit OIDs) + `witness_generations` publication manifests; deterministic abstention-first verdicts (no LLM); verdict consumption is set by `CSR_DREAM_CONSUMPTION`: unset or `annotate` (the default) shows `[stale anchor]`/`[evolved]` search notes with commit receipts plus the status counters and never changes a rank; `full`/`1`/`true` adds the rank sink and the recap retired clause; `off`/`0`/`false` hides all of it (this one flag gates all verdict consumption; no demote-only switch exists). Daemon dream cadence 6h (`CSR_DREAM_INTERVAL_SECS` override), kill switch `CSR_NO_DREAMING=1`; TAD v2 decays by release ancestry (`conversation_ancestry_cache`, hourly refresh, fail-open to neutral). Benchmark: `codewitness labels` + `codewitness bench` (eval-kit/t4) — deterministic and provenance-stamped, but it does not execute the production dream algorithm (`dream::find_successor`); it predicts from sampled tag maps only. The `codewitness` crate's `Auditor::audit_against_successor` — not the production `dream::find_successor` path, which never emits this field — tags supersession receipts with their basis (`GraphOrdered` vs `ContentOnly`); a squash/rebase successor's receipt there is labeled `ContentOnly`, not presented as graph-proven. Dogfood corpus: 482 anchors observed at 2 HEAD commits — existence evidence, not accuracy.
 
 ## Recap (v10.1)
 

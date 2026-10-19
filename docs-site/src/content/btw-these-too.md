@@ -13,7 +13,7 @@ Smaller features that ship in this release. Each line says what you get.
 - **Dream line at prompt time:** when your prompt names a symbol or file a dream concluded on, one line appears. The same dream never repeats.
 - **File history on mention:** name a file in your prompt and its edit history comes along.
 - **Trust labels:** model-written context is labelled `[briefing: model-derived, trust=...]`, so Claude knows what is a guess.
-- **No self-echo:** CSR strips its own pasted output before it indexes anything. `csr-engine status` counts what it suppressed.
+- **No self-echo:** CSR text that comes back as input is labeled `[CSR text]`. It stays searchable, ranks below your own words, and is kept out of recaps and briefings. `csr-engine status` counts what it labeled.
 
 ## It keeps what Claude Code throws away
 

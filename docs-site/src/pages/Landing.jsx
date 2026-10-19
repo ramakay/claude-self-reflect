@@ -598,7 +598,7 @@ function ArchCard() {
           <TechBadge name="ast-grep" abbr="6-language AST parser" color="var(--color-purple)" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 4v4M12 8l-5 4M12 8l5 4M7 12v4M17 12v4M7 16l-2 3M7 16l2 3M17 16l-2 3M17 16l2 3" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></svg>
           } />
-          <TechBadge name="rmcp" abbr="MCP protocol (12 tools)" color="#5b7b95" icon={
+          <TechBadge name="rmcp" abbr="MCP protocol (16 tools)" color="#5b7b95" icon={
             <svg viewBox="0 0 24 24" width="22" height="22"><rect x="3" y="9" width="7" height="6" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" /><rect x="14" y="9" width="7" height="6" rx="1.5" fill="none" stroke="currentColor" strokeWidth="1.3" /><line x1="10" y1="12" x2="14" y2="12" stroke="currentColor" strokeWidth="1.3" /><circle cx="12" cy="12" r="1.2" fill="currentColor" /></svg>
           } />
         </div>
