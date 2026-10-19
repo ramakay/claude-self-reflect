@@ -1,4 +1,6 @@
+use super::render::pictures::{Picture, Wanted};
 use super::{array, db::Db, dreams, masthead, num, render::text::*, send, string};
+const PIC: &str = "\x1b[8m\x1b[28m";
 use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -8,6 +10,7 @@ pub struct Lines {
     pub rows: Vec<String>,
     pub acts: BTreeMap<usize, Value>,
     pub heads: Vec<(usize, String)>,
+    pub pictures: Vec<Wanted>,
 }
 impl Lines {
     fn put(&mut self, rows: Vec<String>, act: Option<&Value>) {
@@ -280,7 +283,8 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
         "sections": sections,
     });
     if default_view(&page, s) {
-        page = page_default(page, data, s, now);
+        let rows = ui["rows"].as_u64().unwrap_or(30) as usize;
+        page = page_default(page, data, s, now, rows);
     }
     page
 }
@@ -306,7 +310,7 @@ pub fn default_view(page: &Value, s: &Value) -> bool {
         })
         .all(|t| t["state"] == "carried")
 }
-fn page_default(mut page: Value, data: &Value, s: &Value, now: f64) -> Value {
+fn page_default(mut page: Value, data: &Value, s: &Value, now: f64, rows: usize) -> Value {
     let mut sections = vec![];
     let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], string(&s["id"]));
     if !fed["star"].is_null() {
@@ -320,7 +324,7 @@ fn page_default(mut page: Value, data: &Value, s: &Value, now: f64) -> Value {
     if let Some(told) = told_section(s) {
         sections.push(told);
     }
-    if let Some(last) = last_section(s, now) {
+    if let Some(last) = last_section(s, now, rows) {
         sections.push(last);
     }
     let todos: Vec<_> = array(&s["todos"])
@@ -418,7 +422,7 @@ fn last_sparkline(facts: &Value, width: usize) -> String {
         })
         .collect()
 }
-fn last_section(s: &Value, now: f64) -> Option<Value> {
+fn last_section(s: &Value, now: f64, rows: usize) -> Option<Value> {
     let f = &s["last_session"];
     let id = f["id"].as_str()?;
     let id8 = id.chars().take(8).collect::<String>();
@@ -521,7 +525,7 @@ fn last_section(s: &Value, now: f64) -> Option<Value> {
         "fit_body": true,
         "picture": {
             "facts": f,
-            "rows": 3,
+            "rows": if rows >= 30 { 4 } else { 3 },
         },
         "body": [first, second],
         "detail": detail,
@@ -865,6 +869,9 @@ pub fn page_log(data: &Value) -> Value {
     })
 }
 pub fn heading(s: &Value, width: usize, at: usize) -> String {
+    heading_mode(s, width, at, false)
+}
+fn heading_mode(s: &Value, width: usize, at: usize, pixels: bool) -> String {
     let name = string(&s["name"]);
     let title = string(&s["title"]);
     let tape = s["life"]
@@ -879,7 +886,7 @@ pub fn heading(s: &Value, width: usize, at: usize) -> String {
         .find(|r| room as isize - len(title) as isize - len(r) as isize > 1)
         .unwrap_or("");
     let gap = room.saturating_sub(len(title) + len(right) + 1).max(1);
-    let lead = if at < 6 {
+    let lead = if at < 6 || pixels {
         " ".repeat(at)
     } else {
         format!(
@@ -909,6 +916,18 @@ pub fn item_rows(
     heart: Option<bool>,
     sent: &Value,
 ) -> Vec<String> {
+    item_rows_mode(item, name, width, is_open, at, heart, (sent, false))
+}
+fn item_rows_mode(
+    item: &Value,
+    name: &str,
+    width: usize,
+    is_open: bool,
+    at: usize,
+    heart: Option<bool>,
+    mode: (&Value, bool),
+) -> Vec<String> {
+    let (sent, pixels) = mode;
     let room = width.saturating_sub(at);
     let flag = string(&item["flag"]);
     let meta = string(&item["meta"]);
@@ -941,8 +960,23 @@ pub fn item_rows(
     .into_iter()
     .map(|l| format!("{pad}{voice}{l}{OFF}"))
     .collect();
-    let picture = &item["picture"];
-    if picture.is_object() && room >= 8 && picture["kind"].as_str().unwrap_or("last") == "last" {
+    for line in array(&item["lede"]) {
+        rows.push(format!("{pad}{voice}{}{OFF}", fit(string(line), room)));
+    }
+    let picture = if is_open && item["open_picture"].is_object() {
+        &item["open_picture"]
+    } else {
+        &item["picture"]
+    };
+    if picture.is_object() && pixels && room >= 24 {
+        rows.extend(vec![
+            format!("{pad}\x1b[8m\x1b[28m");
+            picture["rows"].as_u64().unwrap_or(0).min(1000) as usize
+        ]);
+    } else if picture.is_object()
+        && room >= 8
+        && picture["kind"].as_str().unwrap_or("last") == "last"
+    {
         rows.push(format!(
             "{pad}{}{}{OFF}",
             ink("ctx"),
@@ -1062,16 +1096,64 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     let width = cols.saturating_sub(1).max(24);
     let at = if ui["phone"] == true { 2 } else { 6 };
     let head = &page["head"];
-    let top = if head["gauges"].is_object() {
-        cockpit(&head["gauges"], width)
+    let pixels = ui["pixels"] == true;
+    let logo = pixels && head["gauges"].is_object();
+    let mut top = if head["gauges"].is_object() {
+        let mut top = cockpit(&head["gauges"], width);
+        if logo {
+            let label = slot("CTX ", "normal");
+            top[0] = top[0].replacen(&label, &slot("    ", "normal"), 1);
+        }
+        top
     } else {
         vec![
             format!(" {BOLD}{}{OFF}", fit(string(&head["title"]), width - 1)),
             format!(" {}", fit_pieces(string(&head["facts"]), width - 1)),
         ]
     };
+    let lanes = if !head["gauges"].is_object() && head["session"].is_object() {
+        let start = top.len();
+        if pixels && width > 17 {
+            let label = fg(blend([238, 245, 250], [47, 58, 72], 0.45));
+            top.extend(
+                ["you", "context", "memory"]
+                    .into_iter()
+                    .map(|name| format!(" {label}{name:<8}{OFF}")),
+            );
+        }
+        top.push(format!(
+            "  {}",
+            lanes_legend(&head["session"], width - 2, true)
+        ));
+        (pixels && width > 17).then_some(start)
+    } else {
+        None
+    };
     let grounds = dark_steps(top.len());
     let mut out = Lines::default();
+    if let Some(row) = lanes {
+        out.pictures.push(Wanted {
+            row,
+            col: 9,
+            cols: width - 9,
+            rows: 3,
+            picture: Picture::Session(super::render::raster::SessionFacts::from_value(
+                &head["session"],
+                num(&ui["now"]),
+            )),
+            backs: grounds[row..row + 3].to_vec(),
+        });
+    }
+    if logo {
+        out.pictures.push(Wanted {
+            row: 0,
+            col: 1,
+            cols: 4,
+            rows: 1,
+            picture: Picture::Logo,
+            backs: vec![grounds[0]],
+        });
+    }
     for (row, (text, ground)) in top.iter().zip(grounds).enumerate() {
         out.rows.push(on_dark(text, ground));
         out.acts.insert(
@@ -1095,7 +1177,8 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                     && !string(&item["key"]).starts_with("fold:"))
                 .then(|| likes.get(key).and_then(Value::as_bool).unwrap_or(false))
             });
-            let item_rows = item_rows(item, name, width, is_open, at, heart, &ui["sent"]);
+            let item_rows =
+                item_rows_mode(item, name, width, is_open, at, heart, (&ui["sent"], pixels));
             blocks.push((item_rows, item.clone()));
             if item["answers"] == true {
                 let half = width.saturating_sub(at) / 2;
@@ -1171,7 +1254,7 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     for (k, (s, blocks, _, _)) in built.into_iter().enumerate() {
         let name = string(&s["name"]);
         let mut part = Lines::default();
-        part.rows.push(heading(s, width, at));
+        part.rows.push(heading_mode(s, width, at, pixels));
         let room = rooms[&k] - 1;
         let opened_at = blocks.iter().position(|(_, a)| a["key"] == ui["open"]);
         let mut first = 0;
@@ -1219,6 +1302,62 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
         }
         out.heads.push((out.rows.len(), name.into()));
         let start = out.rows.len();
+        if pixels && at >= 5 && start + 2 <= rows.saturating_sub(1) {
+            out.pictures.push(Wanted {
+                row: start,
+                col: 0,
+                cols: 5,
+                rows: 2,
+                picture: Picture::Iso(name.into()),
+                backs: vec![
+                    tint(name, 0.10),
+                    tint(
+                        name,
+                        if part
+                            .rows
+                            .get(1)
+                            .is_some_and(|r| r.starts_with(&bg(tint(name, 0.15))))
+                        {
+                            0.15
+                        } else {
+                            0.07
+                        },
+                    ),
+                ],
+            });
+        }
+        let mut i = 0;
+        while pixels && i < part.rows.len() {
+            if !part.rows[i].contains(PIC) {
+                i += 1;
+                continue;
+            }
+            let mut j = i;
+            while j + 1 < part.rows.len() && part.rows[j + 1].contains(PIC) {
+                j += 1;
+            }
+            if let Some(act) = part.acts.get(&i) {
+                let picture = if ui["open"] == act["key"] && act["open_picture"].is_object() {
+                    &act["open_picture"]
+                } else {
+                    &act["picture"]
+                };
+                if picture["rows"].as_u64() == Some((j - i + 1) as u64) {
+                    out.pictures.push(Wanted {
+                        row: start + i,
+                        col: at,
+                        cols: width - at,
+                        rows: j - i + 1,
+                        picture: Picture::from_item(picture),
+                        backs: vec![tint(
+                            name,
+                            if ui["open"] == act["key"] { 0.15 } else { 0.07 },
+                        )],
+                    });
+                }
+            }
+            i = j + 1;
+        }
         out.rows.extend(part.rows);
         out.acts
             .extend(part.acts.into_iter().map(|(r, a)| (r + start, a)));
@@ -1370,6 +1509,7 @@ mod default_tests {
                 "last_session": facts(),
             }),
             1800003600.,
+            30,
         )
         .unwrap();
         let rows = item_rows(&last["items"][0], "last", 44, false, 6, None, &Value::Null);
@@ -1383,6 +1523,7 @@ mod default_tests {
                 "last_session": facts(),
             }),
             1800003600.,
+            30,
         )
         .unwrap();
         let item = &last["items"][0];
@@ -1460,5 +1601,145 @@ mod source_regressions {
         ] {
             assert!(!math.contains(&format!("pub fn {name}(")));
         }
+    }
+}
+
+pub fn lanes_legend(s: &Value, width: usize, dark: bool) -> String {
+    let counts = [
+        array(&s["learned"]["chunks"]).len(),
+        array(&s["gave"]["recalls"])
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(|n| n as i64)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            + array(&s["gave"]["carried"]).len(),
+        array(&s["asked"]).len(),
+    ];
+    let color = |name: &str| {
+        if dark {
+            fg(match name {
+                "learn" | "recall" => [36, 163, 114],
+                "asked" => [154, 123, 232],
+                _ => [238, 245, 250],
+            })
+        } else {
+            ink(name)
+        }
+    };
+    let mut parts = vec![];
+    for (i, (name, mark, said)) in [
+        (
+            "learn",
+            "▮",
+            format!("{} learned", super::pyfmt::short(counts[0] as f64)),
+        ),
+        ("recall", "↑", format!("{} handed to Claude", counts[1])),
+        ("asked", "●", format!("{} asked", counts[2])),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if counts[i] > 0 {
+            parts.push((name, mark, said));
+        }
+    }
+    while parts.len() > 1 && parts.iter().map(|(_, _, s)| 4 + len(s)).sum::<usize>() - 2 > width {
+        parts.pop();
+    }
+    parts
+        .iter()
+        .map(|(name, mark, said)| {
+            format!(
+                "{}{mark}{OFF}{}{said}{OFF}",
+                color(name),
+                format_args!(" {}", if dark { color("text") } else { ink("quiet") })
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+#[cfg(test)]
+mod picture_tests {
+    use super::*;
+    #[test]
+    fn last_session_picture_height_tracks_screen_rows() {
+        let data = json!({"repo":"/fixture","dreams":[],"dreams_on":true});
+        let s = json!({"id":"fresh","turn_end":0,"last_session":{
+            "id":"previous","title":"A small previous session","last":1800000000.,
+            "active":0,"prompts":1,"compacts":0,"learned":8,"handed":1,"peak":75000,
+            "series":[[100,70000],[110,75000]]
+        }});
+        for (cols, rows, height) in [(46, 30, 4), (100, 40, 4), (46, 29, 3)] {
+            let ui = json!({"pixels":true,"rows":rows});
+            let page = page_main(&data, &s, 1800000060., &ui, None);
+            let lines = draw_page(&page, cols, rows, &ui);
+            let picture = lines
+                .pictures
+                .iter()
+                .find(|p| matches!(p.picture, Picture::Last(_)))
+                .unwrap();
+            assert_eq!(picture.rows, height, "{cols}x{rows}");
+            assert_eq!(picture.row, 4);
+            assert!(lines.rows[picture.row..picture.row + height]
+                .iter()
+                .all(|line| line.contains(PIC)));
+            assert!(plain(&lines.rows[picture.row + height]).contains("0m active · 1 prompts"));
+            assert!(plain(&lines.rows[picture.row + height + 1])
+                .contains("CSR learned 8 · handed 1× · peak 75k"));
+        }
+    }
+    #[test]
+    fn pixel_items_reserve_the_chart_and_icons_match_opened_row_grounds() {
+        let page = json!({"head":{"title":"Session","facts":"A figure"},"sections":[{
+        "name":"last","title":"Last session","right":"","items":[{
+            "key":"last:one","title":"One session","picture":{"kind":"last","rows":3,
+            "facts":{"series":[[100,100000],[200,190000]],"floor":65000}}
+        }]}]});
+        let lines = draw_page(&page, 46, 30, &json!({"pixels":true,"open":"last:one"}));
+        let icon = lines
+            .pictures
+            .iter()
+            .find(|p| matches!(p.picture, Picture::Iso(_)))
+            .unwrap();
+        assert_eq!(icon.backs, vec![tint("last", 0.10), tint("last", 0.15)]);
+        let figure = lines
+            .pictures
+            .iter()
+            .find(|p| matches!(p.picture, Picture::Last(_)))
+            .unwrap();
+        assert_eq!((figure.col, figure.cols, figure.rows), (6, 39, 3));
+        assert!(lines.rows[figure.row..figure.row + 3]
+            .iter()
+            .all(|r| r.contains(PIC)));
+        assert_eq!(figure.backs, vec![tint("last", 0.15)]);
+        let phone = draw_page(&page, 46, 30, &json!({"pixels":true,"phone":true}));
+        assert!(phone
+            .pictures
+            .iter()
+            .all(|p| !matches!(p.picture, Picture::Iso(_))));
+        let narrow = draw_page(&page, 26, 30, &json!({"pixels":true}));
+        assert!(narrow
+            .pictures
+            .iter()
+            .all(|p| !matches!(p.picture, Picture::Last(_))));
+        assert!(narrow.rows.iter().any(|r| plain(r).contains('█')));
+    }
+    #[test]
+    fn session_lanes_reserve_three_rows_and_keep_their_ramp_grounds() {
+        let page = json!({"head":{"title":"Session","facts":"Four prompts","session":{
+            "prompts":[100,200],"replies":[[110,100000],[210,190000]]}},"sections":[]});
+        let lines = draw_page(&page, 46, 30, &json!({"pixels":true,"now":220}));
+        let lanes = lines
+            .pictures
+            .iter()
+            .find(|p| matches!(p.picture, Picture::Session(_)))
+            .unwrap();
+        assert_eq!(
+            (lanes.row, lanes.col, lanes.cols, lanes.rows),
+            (2, 9, 36, 3)
+        );
+        assert_eq!(lanes.backs, dark_steps(6)[2..5]);
     }
 }

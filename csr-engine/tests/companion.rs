@@ -80,6 +80,7 @@ fn frame_goldens_are_byte_equal() {
         for page in ["main", "log"] {
             let (_home, paths) = home();
             let mut pane = Pane::new(paths, &args(page, cols, rows));
+            pane.pixels = false;
             let actual = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
             let expected =
                 fs::read_to_string(fixture().join(format!("{page}-{cols}x{rows}.txt"))).unwrap();
@@ -264,6 +265,8 @@ fn terminal_session(reload: bool) {
     };
     let child = Command::new(executable)
         .env("HOME", &paths.home)
+        .env("TERM_PROGRAM", "kitty")
+        .env_remove("CSR_COMPANION_PIXELS")
         .args([
             "companion",
             "pane",
@@ -348,6 +351,11 @@ fn terminal_session(reload: bool) {
     let out = String::from_utf8_lossy(&output);
     assert!(out.contains("\x1b[?25h"));
     assert!(out.contains("\x1b]111"));
+    assert!(
+        out.contains("a=T,f=100,q=2,C=1"),
+        "watch sends its PNG pictures"
+    );
+    assert!(out.contains(csr_engine::companion::render::kitty::DELETE_ALL));
 }
 
 #[test]
@@ -378,5 +386,224 @@ fn engine_probe_identifies_the_companion_subcommand() {
     assert_eq!(
         String::from_utf8(out.stdout).unwrap(),
         format!("csr-engine-companion {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn pixel_frames_are_byte_equal_to_pillow_layouts() {
+    for (cols, rows) in [(46, 30), (100, 40)] {
+        for page in ["main", "log"] {
+            let (_home, paths) = home();
+            let mut pane = Pane::new(paths, &args(page, cols, rows));
+            pane.pixels = true;
+            let actual = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
+            let expected =
+                fs::read_to_string(fixture().join(format!("pixels-{page}-{cols}x{rows}.txt")))
+                    .unwrap();
+            for (i, (a, b)) in actual.lines().zip(expected.lines()).enumerate() {
+                assert_eq!(a, b, "pixels {page} {cols}x{rows}, row {}", i + 1);
+            }
+            assert_eq!(actual, expected);
+            assert!(!pane.placed.is_empty());
+            assert!(pane.placed.iter().all(|p| p.row + p.rows < rows));
+            if page == "main" {
+                assert!(pane.placed.iter().any(|p| p.cols == 4 && p.rows == 1));
+            }
+            eprintln!("text parity: {page} {cols}x{rows}: {rows} rows byte equal");
+        }
+    }
+}
+
+fn assert_picture(name: &str, pixmap: tiny_skia::Pixmap) {
+    use csr_engine::companion::render::raster;
+    let expected = image::open(fixture().join("pictures").join(format!("{name}.png")))
+        .unwrap()
+        .to_rgba8();
+    let actual = image::load_from_memory(&raster::png(&pixmap).unwrap())
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(
+        actual.dimensions(),
+        expected.dimensions(),
+        "{name} dimensions"
+    );
+    let difference: f64 = actual
+        .as_raw()
+        .iter()
+        .zip(expected.as_raw())
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .sum::<f64>()
+        / actual.as_raw().len() as f64;
+    // 4/255 allows 1x AA versus Pillow's 2x Lanczos edges, and font hinting,
+    // while rejecting missing shapes, wrong grounds and misplaced chart data.
+    let threshold = 4.;
+    eprintln!("pixel difference: {name}: {difference:.4}, threshold {threshold}");
+    assert!(
+        difference < threshold,
+        "{name}: {difference:.4} >= {threshold}"
+    );
+}
+#[test]
+fn pictures_match_pillow_dimensions_and_pixels() {
+    use csr_engine::companion::render::{raster::*, text};
+    let facts: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/companion/pictures.json")).unwrap();
+    let cell = (16, 34);
+    let backs = text::dark_steps(3);
+    let ground = text::tint("last", 0.07);
+    let fonts = csr_engine::companion::sources::picture_fonts();
+    let f = SessionFacts::from_value(&facts["session"], 2030.);
+    assert_picture("session-rich", session(&f, 40, cell, &backs).unwrap());
+    assert_picture("session-light", session(&f, 40, cell, &[]).unwrap());
+    assert_picture(
+        "last-rich",
+        last(&LastFacts::from_value(&facts["last"]), 43, 3, cell, ground).unwrap(),
+    );
+    // These three draw text. Their goldens are in the Mac's Menlo, as pane.py draws
+    // them; where Menlo is missing (Linux CI) the text comes from another font.
+    let menlo = std::path::Path::new("/System/Library/Fonts/Menlo.ttc").exists();
+    if !menlo {
+        eprintln!("pixel difference: payback, paid, context: skipped, no Menlo");
+    }
+    for name in ["payback", "paid"].into_iter().filter(|_| menlo) {
+        assert_picture(
+            name,
+            payback(
+                &PaybackFacts::from_value(&facts[name]),
+                40,
+                5,
+                cell,
+                ground,
+                fonts,
+            )
+            .unwrap(),
+        );
+    }
+    if menlo {
+        assert_picture(
+            "context",
+            context(
+                &ContextFacts::from_value(&facts["context"]),
+                40,
+                3,
+                cell,
+                &backs,
+                fonts,
+            )
+            .unwrap(),
+        );
+    }
+    for name in [
+        "session",
+        "touching",
+        "risk",
+        "rules",
+        "dreams",
+        "memory",
+        "changed",
+        "remembered",
+        "kept",
+        "story",
+        "coach",
+        "told",
+        "last",
+        "todos",
+        "compacted",
+        "flight",
+        "earlier",
+        "lost",
+    ] {
+        assert_picture(
+            &format!("iso-{name}"),
+            iso(name, cell, [text::tint(name, 0.10), text::tint(name, 0.07)]).unwrap(),
+        );
+    }
+    assert_picture("emblem", emblem(cell, [backs[0], backs[1]]).unwrap());
+    assert_picture("logo", logo(cell, backs[0]).unwrap());
+}
+
+#[test]
+fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
+    let (_home, paths) = home();
+    let output = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .env("HOME", &paths.home)
+        .env("TERM_PROGRAM", "kitty")
+        .env_remove("CSR_COMPANION_PIXELS")
+        .env("CSR_COMPANION_NOW", "1792320000")
+        .args([
+            "companion",
+            "pane",
+            "--repo",
+            args("main", 46, 30).repo.to_str().unwrap(),
+            "--sid",
+            "sess-now",
+            "--png",
+            output.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("{}\n", output.path().display())
+    );
+    let actual = fs::read_to_string(output.path().join("screen.txt")).unwrap();
+    let expected = fs::read_to_string(fixture().join("pictures/screen.txt")).unwrap();
+    assert_eq!(actual, expected);
+    let actual = image::open(output.path().join("session.png"))
+        .unwrap()
+        .to_rgba8();
+    let expected = image::open(fixture().join("pictures/session.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(actual.dimensions(), expected.dimensions());
+    let difference = actual
+        .as_raw()
+        .iter()
+        .zip(expected.as_raw())
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .sum::<f64>()
+        / actual.as_raw().len() as f64;
+    eprintln!("pixel difference: session-export: {difference:.4}, threshold 4");
+    assert!(difference < 4.);
+    assert!(!paths.keep.join("seen").exists());
+    assert!(!paths.keep.join("previous").exists());
+    assert!(!paths.keep.join("panes").exists());
+    assert!(!output.path().join("last.png").exists());
+}
+
+#[test]
+fn disabling_pixels_keeps_text_strips_even_in_kitty() {
+    let (_home, paths) = home();
+    let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .env("HOME", paths.home)
+        .env("TERM_PROGRAM", "kitty")
+        .env("CSR_COMPANION_PIXELS", "0")
+        .args([
+            "companion",
+            "pane",
+            "--repo",
+            args("main", 46, 30).repo.to_str().unwrap(),
+            "--sid",
+            "sess-now",
+            "--frame",
+            "--cols",
+            "46",
+            "--rows",
+            "30",
+            "--now",
+            "1792320000",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        out.stdout,
+        fs::read(fixture().join("main-46x30.txt")).unwrap()
     );
 }

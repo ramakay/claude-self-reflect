@@ -25,7 +25,7 @@ pub enum CompanionCmd {
     ])
 ))]
 pub struct PaneArgs {
-    #[arg(long)]
+    #[arg(long, default_value = ".")]
     pub repo: PathBuf,
     #[arg(long, default_value_t = 120)]
     pub limit: usize,
@@ -91,7 +91,9 @@ pub enum PrivateCmd {
 pub fn run(args: &CompanionArgs) -> i32 {
     let result = match &args.command {
         CompanionCmd::Pane(args) => {
-            if !(args.watch || args.frame) || !matches!(args.page.as_str(), "main" | "log") {
+            if !(args.watch || args.frame || args.png.is_some())
+                || !matches!(args.page.as_str(), "main" | "log")
+            {
                 eprintln!("companion pane: not yet ported");
                 return 2;
             }
@@ -102,6 +104,8 @@ pub fn run(args: &CompanionArgs) -> i32 {
                     args.sid = super::send::attached_session(&paths, agent).or(args.sid);
                 }
                 super::watch::watch(paths, &args)
+            } else if args.png.is_some() {
+                super::png::export(paths, args)
             } else {
                 let now = args
                     .now
