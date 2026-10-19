@@ -1,3 +1,4 @@
+use crate::process::CommandDeadline;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -66,11 +67,18 @@ pub fn epoch(text: &str) -> Option<f64> {
     let parsed = chrono::DateTime::parse_from_rfc3339(&text)
         .ok()
         .map(|v| v.timestamp_micros() as f64 / 1e6);
-    parsed.or_else(|| {
-        chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.f")
-            .ok()
-            .map(|v| v.and_utc().timestamp_micros() as f64 / 1e6)
-    })
+    parsed
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d")
+                .ok()
+                .and_then(|v| v.and_hms_opt(0, 0, 0))
+                .map(|v| v.and_utc().timestamp() as f64)
+        })
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .map(|v| v.and_utc().timestamp_micros() as f64 / 1e6)
+        })
 }
 pub fn now() -> f64 {
     std::time::SystemTime::now()
@@ -83,7 +91,7 @@ pub fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .arg("-C")
         .arg(repo)
         .args(args)
-        .output()
+        .output_with_deadline(crate::process::GIT_TIMEOUT)
         .ok()?;
     out.status
         .success()

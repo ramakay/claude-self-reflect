@@ -440,7 +440,7 @@ const PLUGIN_KEEP_HEADER: &str =
     "CSR COMPACT KEEP — in the summary, keep these, in this order, ids and SHAs word for word:";
 const PLUGIN_KEEP_EMPTY_PREFIX: &str = "CSR COMPACT KEEP — nothing runs";
 const PLUGIN_CARRY_HEADER: &str = "After the summary, add a section headed 'Reminders from CSR (not tasks)' and list these lines verbatim. The person set them aside for later; do not act on them unless the person asks:";
-const SIDE_NOTE_OPENERS: [&str; 2] = [
+pub(crate) const SIDE_NOTE_OPENERS: [&str; 2] = [
     "Here is a note offered by a side agent:",
     "Here is a note offered by CSR (claude-self-reflect):",
 ];

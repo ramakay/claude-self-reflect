@@ -17,8 +17,13 @@ pub enum CompanionCmd {
     },
 }
 
-#[derive(Args, Debug)]
-#[command(group(clap::ArgGroup::new("mode").required(true).args(["watch", "frame", "json", "png", "note", "brief", "story_news", "lost", "keep", "coach", "compact_plan", "compact_usual"])))]
+#[derive(Args, Debug, Clone)]
+#[command(group(
+    clap::ArgGroup::new("mode").required(true).args([
+        "watch", "frame", "json", "png", "note", "brief", "story_news",
+        "lost", "keep", "coach", "compact_plan", "compact_usual"
+    ])
+))]
 pub struct PaneArgs {
     #[arg(long)]
     pub repo: PathBuf,
@@ -32,6 +37,11 @@ pub struct PaneArgs {
     pub watch: bool,
     #[arg(long, hide = true)]
     pub frame: bool,
+    #[arg(
+        long, hide = true, default_value_t = 1, requires = "frame",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub repeat: u32,
     #[arg(long, hide = true, default_value_t = 60)]
     pub cols: usize,
     #[arg(long, hide = true, default_value_t = 30)]
@@ -80,9 +90,52 @@ pub enum PrivateCmd {
 
 pub fn run(args: &CompanionArgs) -> i32 {
     let result = match &args.command {
-        CompanionCmd::Pane(_) => {
-            eprintln!("companion pane: not yet ported");
-            return 2;
+        CompanionCmd::Pane(args) => {
+            if !(args.watch || args.frame) || !matches!(args.page.as_str(), "main" | "log") {
+                eprintln!("companion pane: not yet ported");
+                return 2;
+            }
+            let paths = super::paths::Paths::from_env();
+            if args.watch {
+                let mut args = args.as_ref().clone();
+                if let Some(agent) = args.agent.as_deref() {
+                    args.sid = super::send::attached_session(&paths, agent).or(args.sid);
+                }
+                super::watch::watch(paths, &args)
+            } else {
+                let now = args
+                    .now
+                    .or_else(|| {
+                        std::env::var("CSR_COMPANION_NOW")
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                    })
+                    .unwrap_or_else(super::paths::now);
+                let mut pane = super::pane::Pane::new(paths, args);
+                let mut times = Vec::with_capacity(args.repeat as usize);
+                let mut first = Vec::new();
+                for index in 0..args.repeat {
+                    let start = std::time::Instant::now();
+                    let frame = pane.frame(args.cols, args.rows, now);
+                    times.push(start.elapsed().as_secs_f64() * 1000.);
+                    if index == 0 {
+                        first = frame;
+                    }
+                }
+                println!("{}", first.join("\n"));
+                if args.repeat > 1 {
+                    let first = times.remove(0);
+                    times.sort_by(f64::total_cmp);
+                    let middle = times.len() / 2;
+                    let median = if times.len() % 2 == 0 {
+                        (times[middle - 1] + times[middle]) / 2.
+                    } else {
+                        times[middle]
+                    };
+                    eprintln!("first frame: {first:.3} ms; subsequent median: {median:.3} ms");
+                }
+                Ok(())
+            }
         }
         CompanionCmd::Private { command } => run_private(command),
     };

@@ -1,11 +1,25 @@
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub fn default_root() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
         .join(".claude-self-reflect/csr-companion")
+}
+
+fn absolute(path: &Path) -> io::Result<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in std::path::absolute(path)?.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => (),
+            part => out.push(part),
+        }
+    }
+    Ok(out)
 }
 
 fn refuse_link(path: &Path) -> io::Result<()> {
@@ -26,8 +40,8 @@ fn chmod(path: &Path, mode: u32, directory: bool) -> io::Result<()> {
 }
 
 pub fn ensure_dir(path: &Path, root: &Path) -> io::Result<()> {
-    let path = std::path::absolute(path)?;
-    let root = std::path::absolute(root)?;
+    let path = absolute(path)?;
+    let root = absolute(root)?;
     let inside = path.starts_with(&root);
     let first = if inside {
         root.as_path()
@@ -37,7 +51,7 @@ pub fn ensure_dir(path: &Path, root: &Path) -> io::Result<()> {
     if let Some(parent) = first.parent() {
         fs::create_dir_all(parent)?;
     }
-    match fs::create_dir(first) {
+    match fs::DirBuilder::new().mode(0o700).create(first) {
         Ok(()) => (),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
         Err(error) => return Err(error),
@@ -48,7 +62,7 @@ pub fn ensure_dir(path: &Path, root: &Path) -> io::Result<()> {
         for part in path.strip_prefix(&root).unwrap().components() {
             folder.push(part);
             refuse_link(&folder)?;
-            match fs::create_dir(&folder) {
+            match fs::DirBuilder::new().mode(0o700).create(&folder) {
                 Ok(()) => (),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
                 Err(error) => return Err(error),
@@ -98,7 +112,7 @@ pub fn tighten(root: &Path) -> io::Result<()> {
 }
 
 pub fn open_private(path: &Path, append: bool, root: &Path) -> io::Result<File> {
-    let path = std::path::absolute(path)?;
+    let path = absolute(path)?;
     ensure_dir(path.parent().unwrap(), root)?;
     let file = OpenOptions::new()
         .write(true)
@@ -117,7 +131,7 @@ pub fn append(path: &Path, text: &str, root: &Path) -> io::Result<()> {
 }
 
 pub fn write_atomic(path: &Path, text: &str, root: &Path) -> io::Result<()> {
-    let path = std::path::absolute(path)?;
+    let path = absolute(path)?;
     ensure_dir(path.parent().unwrap(), root)?;
     refuse_link(&path)?;
     let mut name = path.as_os_str().to_os_string();
@@ -249,11 +263,108 @@ mod tests {
     }
     #[test]
     fn test_every_string_in_json_shaped_data_but_not_its_keys() {
-        let mut v = serde_json::json!({"password":"sk-0123456789abcdefghij","n":3,"xs":["token=abc123",null]});
+        let mut v = serde_json::json!({
+            "password": "sk-0123456789abcdefghij",
+            "n": 3,
+            "xs": ["token=abc123", null],
+        });
         redact_value(&mut v);
         assert_eq!(
             v,
-            serde_json::json!({"password":"[redacted]","n":3,"xs":["token=[redacted]",null]})
+            serde_json::json!({
+                "password": "[redacted]",
+                "n": 3,
+                "xs": ["token=[redacted]", null]
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+    #[test]
+    fn test_a_0644_file_and_a_0755_folder_made_earlier_are_tightened_on_the_next_write() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir_all(root.join("compacting")).unwrap();
+        let old = root.join("dreams.jsonl");
+        let replaced = root.join("compacting/mine.json");
+        for p in [&old, &replaced] {
+            fs::write(p, "old\n").unwrap();
+            fs::set_permissions(p, Permissions::from_mode(0o644)).unwrap();
+        }
+        fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap();
+        append(&old, "new\n", &root).unwrap();
+        write_atomic(&replaced, "new", &root).unwrap();
+        assert_eq!(fs::read_to_string(&old).unwrap(), "old\nnew\n");
+        for p in [&root, &root.join("compacting")] {
+            assert_eq!(mode(p), 0o700);
+        }
+        for p in [&old, &replaced] {
+            assert_eq!(mode(p), 0o600);
+        }
+    }
+    #[test]
+    fn test_a_path_outside_the_root_makes_only_its_own_folder_private() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        let parent = d.path().join("elsewhere");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, Permissions::from_mode(0o755)).unwrap();
+        let out = parent.join("lease");
+        let p = out.join("x.json");
+        write_atomic(&p, "{}", &root).unwrap();
+        assert_eq!(mode(&parent), 0o755);
+        assert_eq!(mode(&out), 0o700);
+        assert_eq!(mode(&p), 0o600);
+    }
+    #[test]
+    fn test_the_first_touch_and_the_script_leave_it_alone_too() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let p = d.path().join("exe");
+        fs::write(&p, "keep").unwrap();
+        fs::set_permissions(&p, Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&p, root.join("link")).unwrap();
+        ensure_dir(&root, &root).unwrap();
+        tighten(&root).unwrap();
+        assert_eq!(mode(&p), 0o755);
+    }
+    #[test]
+    fn test_the_root_can_be_a_link_to_another_disk() {
+        let d = tempfile::tempdir().unwrap();
+        let actual = d.path().join("actual");
+        fs::create_dir(&actual).unwrap();
+        let root = d.path().join("root");
+        std::os::unix::fs::symlink(&actual, &root).unwrap();
+        write_atomic(&root.join("carry/s.json"), "{}", &root).unwrap();
+        assert_eq!(mode(&actual), 0o700);
+        assert_eq!(mode(&actual.join("carry/s.json")), 0o600);
+    }
+}
+
+#[cfg(test)]
+mod normalized_paths {
+    use super::*;
+    #[test]
+    fn test_parent_segments_are_normalized_before_tightening() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap();
+        write_atomic(&root.join("../elsewhere/x"), "x", &root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_to_string(d.path().join("elsewhere/x")).unwrap(),
+            "x"
         );
     }
 }

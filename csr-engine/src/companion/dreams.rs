@@ -76,11 +76,30 @@ pub fn last_chapter(records: &[Value], root: &str, sid: &str) -> Value {
                 && r["session"] == sid
                 && (r["repo"].is_null() || r["repo"] == root)
         })
-        .map(|r| json!({"at":num(&r["at"]),"of":r["of"].as_u64().filter(|n|*n>0).unwrap_or(5)}))
+        .map(|r| {
+            json!({
+                "at": num(&r["at"]),
+                "of": r["of"].as_u64().filter(|n| *n > 0).unwrap_or(5),
+            })
+        })
         .unwrap_or(Value::Null)
 }
 pub fn last_look(records: &[Value], root: &str) -> Value {
-    records.iter().rev().find(|r|matches!(string(&r["kind"]),"look"|"dream")&&(r["repo"].is_null()||r["repo"]==root)).map(|r|json!({"at":num(&r["at"]),"outcome":r["outcome"].as_str().unwrap_or("dream"),"every":r["every"]})).unwrap_or(Value::Null)
+    records
+        .iter()
+        .rev()
+        .find(|r| {
+            matches!(string(&r["kind"]), "look" | "dream")
+                && (r["repo"].is_null() || r["repo"] == root)
+        })
+        .map(|r| {
+            json!({
+                "at": num(&r["at"]),
+                "outcome": r["outcome"].as_str().unwrap_or("dream"),
+                "every": r["every"],
+            })
+        })
+        .unwrap_or(Value::Null)
 }
 pub fn dreams_on(paths: &Paths) -> bool {
     let settings = read_json(&paths.home.join(".claude/settings.json"));
@@ -126,7 +145,14 @@ pub fn feed(dreams: &[Value], chapter: &Value, sid: &str) -> Value {
         .filter(|d| !ADOPTED.contains(&string(&d["answer"])))
         .cloned()
         .collect();
-    json!({"left":(of+count).saturating_sub(current.len()),"of":of+count,"star":star,"adopted":adopted,"folded":folded,"passed":passed})
+    json!({
+        "left": (of + count).saturating_sub(current.len()),
+        "of": of + count,
+        "star": star,
+        "adopted": adopted,
+        "folded": folded,
+        "passed": passed,
+    })
 }
 pub fn answer_word(word: &str) -> &str {
     match word {
@@ -148,7 +174,13 @@ mod tests {
     use super::super::array;
     use super::*;
     fn d(at: f64, answer: Value) -> Value {
-        json!({"id":at.to_string(),"at":at,"answer":answer,"session":"s","line":"What if?"})
+        json!({
+            "id": at.to_string(),
+            "at": at,
+            "answer": answer,
+            "session": "s",
+            "line": "What if?",
+        })
     }
     #[test]
     fn test_left_counts_this_chapter_and_an_adopted_dream_gives_its_place_back() {
@@ -158,7 +190,10 @@ mod tests {
                 d(1200., json!("ignored")),
                 d(900., json!("not_relevant")),
             ],
-            &json!({"at":1000,"of":5}),
+            &json!({
+                "at": 1000,
+                "of": 5,
+            }),
             "s",
         );
         assert_eq!((f["left"].clone(), f["of"].clone()), (json!(4), json!(6)));
@@ -166,7 +201,10 @@ mod tests {
     }
     #[test]
     fn test_the_star_is_the_newest_dream_still_open_in_this_chapter() {
-        let c = json!({"at":1000,"of":5});
+        let c = json!({
+            "at": 1000,
+            "of": 5,
+        });
         assert_eq!(feed(&[d(1500., Value::Null)], &c, "s")["star"]["at"], 1500.);
         assert!(feed(&[d(900., Value::Null)], &c, "s")["star"].is_null());
     }
@@ -190,7 +228,10 @@ mod tests {
                 d(800., json!("ask_claude")),
                 d(700., json!("ignored")),
             ],
-            &json!({"at":1000,"of":5}),
+            &json!({
+                "at": 1000,
+                "of": 5,
+            }),
             "s",
         );
         assert_eq!(array(&f["passed"]).len(), 1);

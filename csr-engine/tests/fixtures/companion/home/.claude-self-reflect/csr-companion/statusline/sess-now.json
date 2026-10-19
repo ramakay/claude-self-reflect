@@ -1,0 +1,1 @@
+{"at": 1792319970.0, "line": "fixture status", "fields": {"context_window": {"total_input_tokens": 155000, "context_window_size": 1000000}, "prompt_cache": {"warm": true, "ttl": "1h", "expires_at": 1792321800.0}, "rate_limits": {"five_hour": {"used_percentage": 12.5, "resets_at": 1792323600.0}, "seven_day": {"used_percentage": 34, "resets_at": 1792720000.0}}}}

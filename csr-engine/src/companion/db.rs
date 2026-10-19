@@ -10,9 +10,12 @@ pub struct Db {
 }
 impl Db {
     pub fn open(paths: &Paths) -> anyhow::Result<Self> {
-        Ok(Self {
-            storage: Storage::open_read_only(&paths.db)?,
-        })
+        let storage = Storage::open_read_only(&paths.db)?;
+        storage.with_connection(|con| {
+            let _: i64 = con.pragma_query_value(None, "schema_version", |row| row.get(0))?;
+            Ok(())
+        })?;
+        Ok(Self { storage })
     }
     pub fn query(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
         self.storage
@@ -38,7 +41,9 @@ impl Db {
                                     ValueRef::Null => Value::Null,
                                     ValueRef::Integer(n) => json!(n),
                                     ValueRef::Real(n) => json!(n),
-                                    ValueRef::Text(s) => json!(String::from_utf8_lossy(s)),
+                                    ValueRef::Text(s) => {
+                                        json!(String::from_utf8_lossy(s))
+                                    }
                                     ValueRef::Blob(_) => Value::Null,
                                 })
                             })
@@ -73,8 +78,21 @@ impl Db {
         if git(root, &["rev-parse", "--show-toplevel"]).is_none() {
             return vec![];
         }
-        let floor=self.scalar("select coalesce((select cast(value as integer) from meta where key='witness_verdicts_v2_floor'),0)",&[]);
-        let rows=self.query("select l.file,l.symbol,v.verdict,v.receipt_oid,coalesce(v.receipt_committed_at,v.created_at),v.id,v.witness_id from witness_verdicts v join witness_ledger l on l.id=v.witness_id where v.id>?1 and v.receipt_oid is not null and trim(v.receipt_oid)!='' and l.file like ?2 and v.id=(select max(v2.id) from witness_verdicts v2 where v2.witness_id=v.witness_id)",&[floor,json!(format!("{}/%",root.display()))]);
+        let floor = self.scalar(
+            "select coalesce((select cast(value as integer) from meta where \
+                key='witness_verdicts_v2_floor'),0)",
+            &[],
+        );
+        let rows = self.query(
+            "select l.file,l.symbol,v.verdict,v.receipt_oid,\
+                coalesce(v.receipt_committed_at,v.created_at),v.id,v.witness_id \
+                from witness_verdicts v join witness_ledger l on \
+                l.id=v.witness_id where v.id>?1 and v.receipt_oid is not null \
+                and trim(v.receipt_oid)!='' and l.file like ?2 and v.id=(select \
+                max(v2.id) from witness_verdicts v2 where \
+                v2.witness_id=v.witness_id)",
+            &[floor, json!(format!("{}/%", root.display()))],
+        );
         let mut grouped = BTreeMap::<String, Value>::new();
         for r in rows {
             let path = r[0].as_str().unwrap_or("");
@@ -97,18 +115,35 @@ impl Db {
                 .chars()
                 .take(10)
                 .collect::<String>();
-            let e=grouped.entry(key).or_insert_with(||json!({"file":rel,"path":path,"symbol":r[1],"verdict":r[2],"verb":verb,"oid":r[3],"date":date,"id":r[5],"wids":[]}));
+            let e = grouped.entry(key).or_insert_with(|| {
+                json!({
+                    "file": rel,
+                    "path": path,
+                    "symbol": r[1],
+                    "verdict": r[2],
+                    "verb": verb,
+                    "oid": r[3],
+                    "date": date,
+                    "id": r[5],
+                    "wids": [],
+                })
+            });
             e["wids"].as_array_mut().unwrap().push(r[6].clone());
             if r[5].as_i64() > e["id"].as_i64() {
                 e["id"] = r[5].clone();
             }
         }
         let mut rows: Vec<_> = grouped.into_values().collect();
+        let mut commits = BTreeMap::new();
+        let mut symbols = crate::dream::symbol_cli::Session::new();
         // A merge receipt may only carry another commit's change. Ask the engine in process.
         rows.retain_mut(|s| {
             let oid = s["oid"].as_str().unwrap_or("").to_owned();
-            let parents = git(root, &["show", "-s", "--format=%P", &oid]).unwrap_or_default();
-            if parents.split_whitespace().count() > 1 {
+            let merging = commits
+                .entry(oid.clone())
+                .or_insert_with(|| commit_info(root, &oid))
+                .0;
+            if merging {
                 let mut verdicts = Vec::new();
                 for wid in s["wids"].as_array().unwrap() {
                     let from = self.scalar(
@@ -126,7 +161,8 @@ impl Db {
                         from: Some(from),
                         summary: false,
                     };
-                    let Ok(answer) = crate::dream::symbol_cli::symbol_change(&req) else {
+                    let Ok(answer) = crate::dream::symbol_cli::symbol_change_in(&mut symbols, &req)
+                    else {
                         return false;
                     };
                     let author = if answer["authored"] == true {
@@ -139,7 +175,7 @@ impl Db {
                                 .unwrap_or("")
                                 .chars()
                                 .take(10)
-                                .collect::<String>()
+                                .collect::<String>(),
                         ])
                     } else {
                         return false;
@@ -152,19 +188,49 @@ impl Db {
                 s["oid"] = verdicts[0][0].clone();
                 s["date"] = verdicts[0][1].clone();
             }
-            s["subject"] = json!(git(
-                root,
-                &["log", "-1", "--format=%s", s["oid"].as_str().unwrap_or("")]
-            )
-            .unwrap_or_default());
+            let oid = s["oid"].as_str().unwrap_or("").to_owned();
+            s["subject"] = json!(
+                commits
+                    .entry(oid.clone())
+                    .or_insert_with(|| commit_info(root, &oid))
+                    .1
+            );
             true
         });
+        let mut settled = BTreeMap::<String, Value>::new();
+        for s in rows {
+            let key = json!([s["file"], s["symbol"], s["verdict"], s["oid"]]).to_string();
+            let e = settled.entry(key).or_insert_with(|| {
+                let mut value = s.clone();
+                value["wids"] = json!([]);
+                value
+            });
+            for wid in s["wids"].as_array().unwrap() {
+                if !e["wids"].as_array().unwrap().contains(wid) {
+                    e["wids"].as_array_mut().unwrap().push(wid.clone());
+                }
+            }
+            if s["id"].as_i64() > e["id"].as_i64() {
+                e["id"] = s["id"].clone();
+            }
+        }
+        let mut rows: Vec<_> = settled.into_values().collect();
         rows.sort_by(|a, b| {
             (b["date"].as_str(), b["id"].as_i64()).cmp(&(a["date"].as_str(), a["id"].as_i64()))
         });
         rows.truncate(limit);
         rows
     }
+}
+fn commit_info(root: &Path, oid: &str) -> (bool, String) {
+    if !(4..=64).contains(&oid.len()) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return (false, String::new());
+    }
+    let out = git(root, &["show", "-s", "--format=%H%x00%P%x00%s", oid]).unwrap_or_default();
+    let mut fields = out.split('\0');
+    fields.next();
+    let merging = fields.next().unwrap_or("").split_whitespace().count() > 1;
+    (merging, fields.next().unwrap_or("").to_owned())
 }
 #[cfg(test)]
 mod tests {
@@ -185,5 +251,19 @@ mod tests {
         assert_eq!(db.scalar("select n from tiny", &[]), 7);
         assert!(db.query("insert into tiny values(8)", &[]).is_empty());
         assert_eq!(std::fs::read(&p.db).unwrap(), before);
+    }
+}
+
+#[cfg(test)]
+mod malformed_tests {
+    use super::*;
+    #[test]
+    fn test_a_malformed_database_is_refused_without_writing_it() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        std::fs::create_dir_all(paths.db.parent().unwrap()).unwrap();
+        std::fs::write(&paths.db, b"not a database").unwrap();
+        assert!(Db::open(&paths).is_err());
+        assert_eq!(std::fs::read(&paths.db).unwrap(), b"not a database");
     }
 }

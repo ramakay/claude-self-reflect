@@ -67,9 +67,49 @@ fn resume_predecessor_at(
         .find_map(|(_, path)| continued_in_target(path, current_sid))
 }
 
+/// A pane may be opened long after SessionStart. Keep its birth-time window
+/// rather than the hook's fifteen-minute budget, using the same bounded reader.
+pub(crate) fn pane_predecessor(mine: &Path, current_sid: &str) -> Option<String> {
+    let since = mine
+        .metadata()
+        .ok()?
+        .created()
+        .ok()
+        .and_then(|t| t.checked_sub(Duration::from_secs(120)));
+    let mut files: Vec<_> = std::fs::read_dir(mine.parent()?)
+        .ok()?
+        .take(MAX_DIR_ENTRIES)
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path == mine || path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let modified = metadata.modified().ok()?;
+            if since.is_some_and(|t| modified < t) {
+                return None;
+            }
+            Some((modified, path))
+        })
+        .collect();
+    files.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    files
+        .into_iter()
+        .take(200)
+        .find_map(|(_, path)| continued_in_target_checked(&path, current_sid, true))
+}
+
 /// The `sessionId` of a `continued-in` row in the tail of `path` whose
 /// `continuedInSessionId` is `current_sid`.
 fn continued_in_target(path: &Path, current_sid: &str) -> Option<String> {
+    continued_in_target_checked(path, current_sid, false)
+}
+
+fn continued_in_target_checked(path: &Path, current_sid: &str, owner: bool) -> Option<String> {
     let tail = read_tail(path)?;
     let text = String::from_utf8_lossy(&tail);
     text.lines()
@@ -81,7 +121,16 @@ fn continued_in_target(path: &Path, current_sid: &str) -> Option<String> {
             let names_us =
                 row.get("continuedInSessionId").and_then(|v| v.as_str()) == Some(current_sid);
             let old = row.get("sessionId").and_then(|v| v.as_str())?;
-            (is_row && names_us && !old.is_empty() && old != current_sid).then(|| old.to_string())
+            (is_row
+                && names_us
+                && !old.is_empty()
+                && old != current_sid
+                && (!owner
+                    || (path.file_stem().and_then(|s| s.to_str()) == Some(old)
+                        && old
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-'))))
+            .then(|| old.to_string())
         })
 }
 
@@ -268,5 +317,38 @@ mod tests {
             resume_predecessor_at(dir.path(), "new-1", now).as_deref(),
             Some("target")
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use super::*;
+    #[test]
+    fn the_pane_can_follow_a_resume_after_the_hooks_recent_window() {
+        let d = tempfile::tempdir().unwrap();
+        let mine = d.path().join("new.jsonl");
+        std::fs::write(&mine, "{}\n").unwrap();
+        std::fs::write(
+            d.path().join("old.jsonl"),
+            "{\"type\":\"continued-in\",\"sessionId\":\"old\",\"continuedInSessionId\":\"new\"}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resume_predecessor_at(
+                d.path(),
+                "new",
+                SystemTime::now() + Duration::from_secs(3600)
+            ),
+            None
+        );
+        assert_eq!(pane_predecessor(&mine, "new").as_deref(), Some("old"));
+    }
+    #[test]
+    fn a_continued_row_can_only_speak_for_its_own_file() {
+        let d = tempfile::tempdir().unwrap();
+        let mine = d.path().join("new.jsonl");
+        std::fs::write(&mine, "{}\n").unwrap();
+        std::fs::write(d.path().join("old.jsonl"),"{\"type\":\"continued-in\",\"sessionId\":\"forged\",\"continuedInSessionId\":\"new\"}\n").unwrap();
+        assert_eq!(pane_predecessor(&mine, "new"), None);
     }
 }

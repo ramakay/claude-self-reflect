@@ -429,6 +429,11 @@ pub fn strip_csr_forwards(text: &str) -> Option<String> {
     scan_forwards(text, true).map(|found| found.own)
 }
 
+/// Strip pane forwards, including side notes, retaining its paragraph separators.
+pub fn strip_companion_forwards(text: &str) -> Option<String> {
+    scan_companion_forwards(text, true).map(|found| found.own)
+}
+
 /// What [`scan_forwards`] found: the person's own words and where the first forward starts.
 struct Forwards {
     /// The person's paragraphs, trimmed, blank ones dropped, joined by a blank line.
@@ -682,6 +687,120 @@ fn scan_forwards(text: &str, others: bool) -> Option<Forwards> {
             }
         };
         kept[from..to].fill(None);
+    }
+    let mut left: Vec<String> = Vec::with_capacity(lines.len());
+    for (index, line) in kept.iter().enumerate() {
+        let Some(line) = line else { continue };
+        match strip_one_line_forwards(line, others) {
+            Some((own, at)) => {
+                mark(starts[index] + at, &mut first);
+                if !own.is_empty() {
+                    left.push(own);
+                }
+            }
+            None => left.push((*line).to_string()),
+        }
+    }
+    let first = first?;
+    // Paragraphs of what is left: a cut line vanishes, a blank line still parts two paragraphs.
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    for line in left.into_iter().chain([String::new()]) {
+        if !blank(&line) {
+            current.push(line);
+        } else if !current.is_empty() {
+            paragraphs.push(current.join("\n").trim().to_string());
+            current.clear();
+        }
+    }
+    Some(Forwards {
+        own: paragraphs.join("\n\n"),
+        first,
+    })
+}
+
+// The pane follows its displayed prompt grammar without changing import classification.
+fn scan_companion_forwards(text: &str, others: bool) -> Option<Forwards> {
+    if !text.contains(DREAMER_ATTRIBUTION)
+        && !(others
+            && (text.contains(COMPACTION_CARD_OPEN)
+                || text.contains(STORY_OPEN)
+                || crate::import::contamination::SIDE_NOTE_OPENERS
+                    .iter()
+                    .any(|opener| text.contains(opener))))
+    {
+        return None;
+    }
+    let normalized = text.replace("\r\n", "\n");
+    let body = normalized.trim();
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut offset = 0;
+    for line in &lines {
+        starts.push(offset);
+        offset += line.len() + 1;
+    }
+    let blank = |line: &str| line.trim().is_empty();
+    let asks = |line: &str| line.trim().ends_with(['?', '\u{ff1f}', '\u{61f}']);
+    let quoted = |line: &str| line.trim_start().starts_with('>');
+    // `None`: the line is cut whole; `Some(text)`: what is left of it.
+    let mut kept: Vec<Option<&str>> = lines.iter().map(|line| Some(*line)).collect();
+    let mut first: Option<usize> = None;
+    let mark = |at: usize, first: &mut Option<usize>| {
+        *first = Some(first.map_or(at, |seen| seen.min(at)));
+    };
+    for at in 0..lines.len() {
+        let note =
+            others && crate::import::contamination::SIDE_NOTE_OPENERS.contains(&lines[at].trim());
+        if kept[at].is_none() || !(is_band_attribution(lines[at]) || note) {
+            continue;
+        }
+        let v2 = lines[at].trim() == DREAMER_BAND_QUOTED;
+        // The question: the nearest nonblank line above the attribution.
+        let mut above = at;
+        while above > 0 && blank(lines[above - 1]) {
+            above -= 1;
+        }
+        let question = (!note && above > 0 && kept[above - 1] == Some(lines[above - 1]))
+            .then(|| above - 1)
+            .and_then(|line| {
+                let text = lines[line].trim_end();
+                if v2 {
+                    // The `“…”` span that ends the line, from its last “: what is before it stays.
+                    let open = text
+                        .ends_with('\u{201d}')
+                        .then(|| text.rfind('\u{201c}'))
+                        .flatten()?;
+                    Some((line, open))
+                } else {
+                    asks(text).then_some((line, 0))
+                }
+            });
+        // The reasoning: the run of `>` lines below, past any blank lines.
+        let mut below = at + 1;
+        while below < lines.len() && blank(lines[below]) {
+            below += 1;
+        }
+        let mut end = below;
+        while end < lines.len() && quoted(lines[end]) {
+            end += 1;
+        }
+        let reasoning = end > below;
+        if question.is_none() && !reasoning {
+            continue;
+        }
+        if let Some((line, open)) = question {
+            let before = lines[line][..open].trim_end();
+            kept[line] = (!before
+                .chars()
+                .all(|c| c.is_ascii_digit() || c.is_whitespace() || c == '>'))
+            .then_some(before);
+            mark(starts[line] + open, &mut first);
+        } else {
+            mark(starts[at], &mut first);
+        }
+        kept[at] = None;
+        kept[below..end].fill(None);
     }
     let mut left: Vec<String> = Vec::with_capacity(lines.len());
     for (index, line) in kept.iter().enumerate() {
@@ -2132,4 +2251,19 @@ pub(crate) fn ordered_forward_prefix_cases() -> Vec<(String, String)> {
         ));
     }
     cases
+}
+
+#[cfg(test)]
+mod companion_tests {
+    use super::*;
+
+    #[test]
+    fn companion_side_note_does_not_change_the_import_grammar() {
+        let text = "My own words.\n\nHere is a note offered by CSR (claude-self-reflect):\n> A side note.\n\nMy reply.";
+        assert_eq!(strip_csr_forwards(text), None);
+        assert_eq!(
+            strip_companion_forwards(text),
+            Some("My own words.\n\nMy reply.".into())
+        );
+    }
 }

@@ -341,7 +341,12 @@ pub fn ctx_row(g: &Value, width: usize) -> String {
         (Some(t), _) => vec![short(t)],
     };
     let pay = &g["payback"];
-    let pays = if array(&pay["forms"]).is_empty() {
+    let pays = if g["compacting"].is_object() {
+        [(true, true), (true, false), (false, true)]
+            .into_iter()
+            .map(|(bar, range)| masthead::compacting_slot(&g["compacting"], bar, range).0)
+            .collect::<Vec<_>>()
+    } else if array(&pay["forms"]).is_empty() {
         vec![string(&pay["text"]).to_owned()]
     } else {
         array(&pay["forms"])
@@ -527,10 +532,179 @@ pub fn fill_levels(share: f64, height: usize) -> Vec<usize> {
 mod tests {
     use super::*;
     use serde_json::json;
+    fn cockpit_fixture() -> Value {
+        let now = 1792320000.;
+        let fields = json!({
+            "context_window": {
+                "total_input_tokens": 87724,
+                "context_window_size": 1000000,
+            },
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 95,
+                    "resets_at": now + 7200.,
+                },
+                "seven_day": {
+                    "used_percentage": 75,
+                    "resets_at": now + 259200.,
+                },
+            },
+        });
+        let main: Vec<_> = (1..5)
+            .map(|k| json!([105 + 100 * k, 60000 + 12000 * k]))
+            .collect();
+        masthead::gauges(
+            &fields,
+            Some(now),
+            &json!({
+                "main": main,
+                "prompts": [200, 300, 400, 500],
+            }),
+            now,
+            &Value::Null,
+            &json!({
+                "sev": "amber",
+                "inop": [],
+            }),
+        )
+    }
+    #[test]
+    fn test_rows_that_cannot_hold_everything_shrink_in_a_fixed_order() {
+        let g = cockpit_fixture();
+        assert_eq!(
+            plain(&ctx_row(&g, 60)),
+            format!(" CTX {}▁▂▂▂ 88k/1M ▲12k/t", " ".repeat(20))
+        );
+        assert_eq!(plain(&ctx_row(&g, 21)), " CTX      ▁▂▂▂ 88k/1M");
+        assert_eq!(plain(&ctx_row(&g, 17)), " CTX 88k/1M");
+        let big = masthead::gauges(
+            &json!({
+                "context_window": {
+                    "total_input_tokens": 1200000,
+                    "context_window_size": 10000000,
+                },
+            }),
+            None,
+            &Value::Null,
+            1792320000.,
+            &Value::Null,
+            &Value::Null,
+        );
+        for (width, want) in [
+            (40, " CTX 1.2M/10M  ♻ ~3 calls"),
+            (21, " CTX 1.2M  ♻ ~3 calls"),
+            (18, " CTX 1.2M"),
+        ] {
+            assert_eq!(plain(&ctx_row(&big, width)), want);
+        }
+        let first = paced(&g["quotas"][0]);
+        let second = paced(&g["quotas"][1]);
+        let full = 1 + len(&first) + 2 + len(&second) + 2 + len("CACHE --") + len(" STS");
+        assert_eq!(
+            plain(&status_row(&g, full)),
+            format!(" {first}  {second}  CACHE -- STS")
+        );
+        assert_eq!(
+            plain(&status_row(&g, full - 1)),
+            format!(" {first}  {second}  ◷--     STS")
+        );
+        let glyph = 1 + len(&first) + 2 + len("◷--") + len(" STS");
+        assert_eq!(plain(&status_row(&g, glyph)), format!(" {first}  ◷-- STS"));
+        assert_eq!(
+            plain(&status_row(&g, glyph - 1)),
+            format!(" 5H 95%»  ◷--{}STS", " ".repeat(glyph - 17))
+        );
+        assert_eq!(plain(&status_row(&g, 16)), " 5H 95%»     STS");
+        assert_eq!(plain(&status_row(&g, 11)), " 95%»   STS");
+    }
+    #[test]
+    fn test_the_pace_mark_outlasts_every_other_piece_of_row_two() {
+        let mut g = cockpit_fixture();
+        for sts in [
+            json!({
+                "sev": "amber",
+            }),
+            Value::Null,
+        ] {
+            g["sts"] = sts;
+            for width in 9..70 {
+                let row = plain(&status_row(&g, width));
+                assert!(len(&row) <= width, "{width}: {row}");
+                assert!(row.contains("95%»"), "{width}: {row}");
+            }
+        }
+    }
+    #[test]
+    fn test_a_dark_cockpit_lights_only_what_deviates() {
+        let now = 1792320000.;
+        for (cache, want, sev) in [
+            (
+                json!({
+                    "warm": true,
+                    "ttl": "1h",
+                    "expires_at": now + 2480.,
+                }),
+                "CACHE 41m",
+                "normal",
+            ),
+            (
+                json!({
+                    "warm": true,
+                    "ttl": "1h",
+                    "expires_at": now + 250.,
+                }),
+                "CACHE 4m",
+                "amber",
+            ),
+            (
+                json!({
+                    "warm": true,
+                    "ttl": "1h",
+                    "expires_at": now + 30.,
+                }),
+                "CACHE <1m",
+                "amber",
+            ),
+            (
+                json!({
+                    "warm": false,
+                    "expires_at": now - 10.,
+                    "recache_tokens_if_cold": 152300,
+                }),
+                "CACHE COLD ~152k",
+                "amber",
+            ),
+            (Value::Null, "CACHE --", "normal"),
+            (
+                json!({
+                    "warm": true,
+                    "ttl": "5m",
+                }),
+                "CACHE 5m",
+                "normal",
+            ),
+        ] {
+            let g = masthead::gauges(
+                &json!({
+                    "prompt_cache": cache,
+                }),
+                Some(now),
+                &Value::Null,
+                now,
+                &Value::Null,
+                &Value::Null,
+            );
+            assert!(status_row(&g, 100).contains(&slot(want, sev)));
+        }
+    }
     #[test]
     fn test_a_phone_draws_the_same_two_rows() {
         let g = masthead::gauges(
-            &json!({"context_window":{"total_input_tokens":155000}}),
+            &json!({
+                "context_window": {
+                    "total_input_tokens": 155000,
+                },
+            }),
             None,
             &Value::Null,
             10000.,

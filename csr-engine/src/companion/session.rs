@@ -14,17 +14,31 @@ pub fn session_record(paths: &Paths, sid: &str) -> Option<Value> {
     if !valid_id(sid) {
         return None;
     }
-    folders(&paths.home.join(".claude/sessions")).iter().find_map(|p| {
-        let v=read_json(p);
-        if v["sessionId"]!=sid || v["cwd"].as_str().is_none_or(str::is_empty) {return None;}
-        if let Some(pid)=v["pid"].as_i64() {
-            let pid=i32::try_from(pid).ok()?;
-            if pid<=1 {return None;}
-            // kill(0) probes liveness, including a process owned by someone else.
-            if unsafe {libc::kill(pid,0)}!=0 && std::io::Error::last_os_error().raw_os_error()!=Some(libc::EPERM) {return None;}
-        }
-        Some(json!({"cwd":v["cwd"],"started":v["startedAt"].as_f64()?/1000.,"busy":v["status"]=="busy"}))
-    })
+    folders(&paths.home.join(".claude/sessions"))
+        .iter()
+        .find_map(|p| {
+            let v = read_json(p);
+            if v["sessionId"] != sid || v["cwd"].as_str().is_none_or(str::is_empty) {
+                return None;
+            }
+            if let Some(pid) = v["pid"].as_i64() {
+                let pid = i32::try_from(pid).ok()?;
+                if pid <= 1 {
+                    return None;
+                }
+                // kill(0) probes liveness, including a process owned by someone else.
+                if unsafe { libc::kill(pid, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+                {
+                    return None;
+                }
+            }
+            Some(json!({
+                "cwd": v["cwd"],
+                "started": v["startedAt"].as_f64()? / 1000.,
+                "busy": v["status"] == "busy",
+            }))
+        })
 }
 
 pub fn lineage(paths: &Paths, sid: &str) -> Vec<String> {
@@ -38,10 +52,8 @@ pub fn lineage(paths: &Paths, sid: &str) -> Vec<String> {
         let Some(path) = paths.transcript(ids.last().unwrap()) else {
             break;
         };
-        let Some(old) = crate::hooks::resume_lineage::resume_predecessor(
-            path.parent().unwrap(),
-            ids.last().unwrap(),
-        ) else {
+        let Some(old) = crate::hooks::resume_lineage::pane_predecessor(&path, ids.last().unwrap())
+        else {
             break;
         };
         if !valid_id(&old) || ids.contains(&old) {
@@ -56,6 +68,7 @@ pub struct Session {
     pub id: String,
     pub path: Option<PathBuf>,
     offset: u64,
+    looked: f64,
     main_id: Option<String>,
     measuring: Option<usize>,
     pub data: Value,
@@ -67,19 +80,63 @@ impl Session {
             id: sid.into(),
             path: None,
             offset: 0,
+            looked: 0.,
             main_id: None,
             measuring: None,
             replies: BTreeMap::new(),
-            data: json!({"id":sid,"title":null,"main":[],"prompts":[],"compacts":[],"compact_sizes":[],"summary_sizes":[],"asked":[],"questions":[],"tools":{},"files":{},"edited":[],"shell":{},"last":{},"talk":[],"typed":[],"summaries":[],"started":0.,"turn_end":0.,"messages":0,"model":null,"told":null,"last_session":null,"todos":[],"lost":[],"remembered":[]}),
+            data: json!({
+                "id": sid,
+                "title": null,
+                "main": [],
+                "prompts": [],
+                "compacts": [],
+                "compact_sizes": [],
+                "summary_sizes": [],
+                "asked": [],
+                "questions": [],
+                "tools": {},
+                "files": {},
+                "edited": [],
+                "shell": {},
+                "last": {},
+                "talk": [],
+                "typed": [],
+                "summaries": [],
+                "started": 0.,
+                "turn_end": 0.,
+                "messages": 0,
+                "model": null,
+                "told": null,
+                "last_session": null,
+                "todos": [],
+                "lost": [],
+                "remembered": [],
+            }),
         }
     }
     fn push(&mut self, key: &str, v: Value) {
         self.data[key].as_array_mut().unwrap().push(v);
     }
-    pub fn read_transcript(&mut self, paths: &Paths) {
-        if self.path.is_none() {
+    fn locate(&mut self, paths: &Paths, now: f64) {
+        if self.path.is_some() {
+            return;
+        }
+        if let Some(record) = session_record(paths, &self.id) {
+            let guess = paths
+                .project_folder(record["cwd"].as_str().unwrap_or(""))
+                .join(format!("{}.jsonl", self.id));
+            if guess.is_file() {
+                self.path = Some(guess);
+                return;
+            }
+        }
+        if now - self.looked >= 10. {
+            self.looked = now;
             self.path = paths.transcript(&self.id);
         }
+    }
+    pub fn read_transcript(&mut self, paths: &Paths) {
+        self.locate(paths, super::paths::now());
         let Some(path) = self.path.as_ref() else {
             return;
         };
@@ -117,6 +174,9 @@ impl Session {
                 self.data["messages"] = json!(self.data["messages"].as_u64().unwrap_or(0) + 1);
             }
             let side = e["isSidechain"] == true;
+            if kind == "ai-title" && e["aiTitle"].is_string() {
+                self.data["title"] = e["aiTitle"].clone();
+            }
             let Some(t) = when else {
                 if kind == "ai-title" && e["aiTitle"].is_string() {
                     self.data["title"] = e["aiTitle"].clone();
@@ -143,7 +203,7 @@ impl Session {
                             m["usage"]["output_tokens"].as_u64().unwrap_or(0),
                             m["usage"]["cache_creation_input_tokens"]
                                 .as_u64()
-                                .unwrap_or(0)
+                                .unwrap_or(0),
                         ]),
                     );
                 }
@@ -202,14 +262,33 @@ impl Session {
                             self.push("edited", json!(path));
                         }
                     }
+                    if name == "Bash" {
+                        static NAMED: std::sync::LazyLock<regex::Regex> =
+                            std::sync::LazyLock::new(|| {
+                                regex::Regex::new(r"(/(?:Users|home)/[\w./@+-]+)").unwrap()
+                            });
+                        let command = part["input"]["command"].as_str().unwrap_or("");
+                        let names: std::collections::BTreeSet<_> = NAMED
+                            .find_iter(command)
+                            .map(|m| m.as_str().trim_end_matches(['.', ',', ';', ':']))
+                            .collect();
+                        for named in names {
+                            let count = self.data["shell"][named].as_u64().unwrap_or(0) + 1;
+                            self.data["shell"][named] = json!(count);
+                            self.data["last"][named] = json!(t);
+                        }
+                    }
                     if let Some(tool) = name.strip_prefix("mcp__claude-self-reflect__") {
                         self.push("asked", json!(t));
                         let args = &part["input"];
                         let ask = [
                             "query",
                             "concept",
+                            "topic",
                             "file_path",
-                            "session_id",
+                            "symbol",
+                            "target",
+                            "pattern",
                             "conversation_id",
                         ]
                         .iter()
@@ -225,18 +304,30 @@ impl Session {
                 }
             } else if kind == "user" && e["isMeta"] != true {
                 let text = message_text(m);
-                if text
-                    .lines()
-                    .any(|s| !s.trim().is_empty() && !s.trim_start().starts_with(['<', '/']))
-                {
+                let content = &m["content"];
+                let parts: Vec<_> = if let Some(text) = content.as_str() {
+                    vec![text]
+                } else {
+                    content
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|p| p["type"] == "text")
+                        .filter_map(|p| p["text"].as_str())
+                        .collect()
+                };
+                if parts.iter().any(|text| {
+                    !text.trim().is_empty() && !text.trim_start().starts_with(['<', '/'])
+                }) {
                     self.push("prompts", json!(t));
                     if !side
                         && !text
                             .trim_start()
                             .starts_with("[Request interrupted by user")
                     {
-                        self.push("talk", json!([t, text]));
-                        self.push("typed", json!([t, text]));
+                        let own = super::send::own_words(&text);
+                        self.push("talk", json!([t, own]));
+                        self.push("typed", json!([t, own]));
                     }
                 }
             } else if kind == "attachment" {
@@ -261,7 +352,11 @@ impl Session {
                         .and_then(|s| s.split_once(':'))
                         .map(|(_, s)| s)
                         .unwrap_or("startup");
-                    self.data["told"] = json!({"at":t,"source":source,"text":a["content"]});
+                    self.data["told"] = json!({
+                        "at": t,
+                        "source": source,
+                        "text": a["content"],
+                    });
                 }
             } else if kind == "system" && e["subtype"] == "compact_boundary" {
                 self.push("compacts", json!(t));
@@ -290,6 +385,11 @@ impl Session {
         });
         s["replies"] = json!(replies);
         let record = session_record(paths, &self.id);
+        if s["started"] == 0. {
+            if let Some(record) = &record {
+                s["started"] = record["started"].clone();
+            }
+        }
         s["busy"] = json!(record.as_ref().is_some_and(|r| r["busy"] == true));
         s["cwd"] = record
             .as_ref()
@@ -304,8 +404,39 @@ impl Session {
                     .filter_map(|r| r[0].as_str().and_then(epoch))
                     .collect::<Vec<_>>()
             };
-            s["learned"] = json!({"chunks":times("select created_at from chunks where conversation_id=?"),"anchors":db.query("select created_at,name,file from episode_anchors where session_id=? order by created_at",&sid),"symbols":db.scalar("select count(*) from code_nodes where last_session_id=?",&sid),"turns":db.query("select ts,kind,quote from intent_events where session_id=? order by ts",&sid),"memories":db.query("select slug from memory_registry where origin_session_id=?",&sid)});
-            s["gave"] = json!({"dreams":times("select delivered_at from dream_deliveries where session_id=?"),"recalls":times("select retrieved_at from retrieval_events where session_id=?"),"carried":times("select delivered_at from correction_deliveries where target_session_id=?")});
+            s["learned"] = json!({
+                "chunks": times(
+                    "select created_at from chunks where conversation_id=?",
+                ),
+                "anchors": db.query(
+                    "select created_at,name,file from episode_anchors where \
+                        session_id=? order by created_at",
+                    &sid,
+                ),
+                "symbols": db.scalar(
+                    "select count(*) from code_nodes where last_session_id=?",
+                    &sid,
+                ),
+                "turns": db.query(
+                    "select ts,kind,quote from intent_events where session_id=? \
+                        order by ts",
+                    &sid,
+                ),
+                "memories": db.query(
+                    "select slug from memory_registry where origin_session_id=?",
+                    &sid,
+                ),
+            });
+            s["gave"] = json!({
+                "dreams": times(
+                    "select delivered_at from dream_deliveries where session_id=?",
+                ),
+                "recalls": times(
+                    "select retrieved_at from retrieval_events where session_id=?",
+                ),
+                "carried": times("select delivered_at from correction_deliveries where \
+                    target_session_id=?"),
+            });
             s["project"] = db.scalar(
                 "select project from session_registry where session_id=?",
                 &sid,
@@ -391,7 +522,11 @@ mod tests {
         let p = Paths::new(d.path().into());
         let f = p.projects.join("p/s.jsonl");
         std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        let line = r#"{"type":"assistant","timestamp":"2026-10-08T10:00:00Z","message":{"id":"m","usage":{"input_tokens":100}}}"#;
+        let line = concat!(
+            r#"{"type":"assistant","timestamp":"2026-10-08T10:0"#,
+            r#"0:00Z","message":{"id":"m","usage":{"input_token"#,
+            r#"s":100}}}"#
+        );
         std::fs::write(&f, line).unwrap();
         let mut s = Session::new("s");
         s.read_transcript(&p);
@@ -424,5 +559,348 @@ mod tests {
         assert_eq!(c.total, 240.);
         assert_eq!(c.at(160.), 0.25);
         assert_eq!(c.at(3000.), 0.25);
+    }
+}
+
+#[cfg(test)]
+mod locating_tests {
+    use super::*;
+    #[test]
+    fn test_without_a_record_the_folders_are_searched_at_most_every_ten_seconds() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let mut s = Session::new("s");
+        s.locate(&paths, 1000.);
+        let p = paths.projects.join("p/s.jsonl");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{}\n").unwrap();
+        s.locate(&paths, 1001.);
+        assert!(s.path.is_none());
+        s.locate(&paths, 1010.);
+        assert_eq!(s.path, Some(p));
+    }
+    #[test]
+    fn test_a_live_sessions_record_gives_its_cwd_start_and_whether_it_is_busy() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let dir = paths.home.join(".claude/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("mine.json");
+        std::fs::write(
+            &p,
+            json!({
+                "sessionId": "s",
+                "cwd": "/fixture/repo",
+                "startedAt": 1000000,
+                "status": "busy",
+                "pid": std::process::id(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let record = session_record(&paths, "s").unwrap();
+        assert_eq!(record["cwd"], "/fixture/repo");
+        assert_eq!(record["started"], 1000.);
+        assert_eq!(record["busy"], true);
+        assert!(session_record(&paths, "someone-else").is_none());
+    }
+    #[test]
+    fn test_a_pane_opened_before_the_first_prompt_reads_the_transcript_once_it_exists() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let dir = paths.home.join(".claude/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mine.json"),
+            json!({
+                "sessionId": "s",
+                "cwd": "/fixture/repo",
+                "startedAt": 1000000,
+                "status": "idle",
+                "pid": std::process::id(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut s = Session::new("s");
+        s.locate(&paths, 1000.);
+        assert!(s.path.is_none());
+        let p = paths.project_folder("/fixture/repo").join("s.jsonl");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{}\n").unwrap();
+        s.locate(&paths, 1001.);
+        assert_eq!(s.path, Some(p));
+    }
+}
+
+pub fn left_todos(paths: &Paths, sid: &str, db: Option<&Db>) -> Vec<Value> {
+    if !valid_id(sid) {
+        return vec![];
+    }
+    let mut found = vec![];
+    for path in folders(&paths.home.join(".claude/tasks").join(sid)) {
+        if path.extension().is_none_or(|s| s != "json") {
+            continue;
+        }
+        let Some(n) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let task = read_json(&path);
+        if matches!(task["status"].as_str(), Some("in_progress" | "pending")) {
+            if let Some(subject) = task["subject"].as_str().filter(|s| !s.trim().is_empty()) {
+                found.push((
+                    n,
+                    json!({
+                        "subject": super::render::text::one_line(subject, 300),
+                        "status": task["status"],
+                    }),
+                ));
+            }
+        }
+    }
+    if found.is_empty() {
+        if let Some(db) = db {
+            let raw = db.scalar(
+                "select content from reflections where tags like \
+                    '%session_episode%' and tags like ? order by timestamp desc \
+                    limit 1",
+                &[json!(format!("%conv_{sid}%"))],
+            );
+            if let Ok(value) = serde_json::from_str::<Value>(raw.as_str().unwrap_or("")) {
+                for (i, task) in super::array(&value["todos"]).iter().enumerate() {
+                    if matches!(task["status"].as_str(), Some("in_progress" | "pending")) {
+                        if let Some(content) =
+                            task["content"].as_str().filter(|s| !s.trim().is_empty())
+                        {
+                            found.push((
+                                i as u64,
+                                json!({
+                                    "subject": super::render::text::one_line(
+                                        content, 300,
+                                    ),
+                                    "status": task["status"],
+                                }),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(n, t)| (t["status"] != "in_progress", *n));
+    found.into_iter().map(|(_, task)| task).collect()
+}
+pub fn thin_series(points: &[Value], cuts: &[f64], limit: usize) -> Vec<Value> {
+    if points.len() <= limit || limit == 0 {
+        return points.to_vec();
+    }
+    let step = points.len().div_ceil(limit);
+    let mut keep: std::collections::BTreeSet<_> = (0..points.len()).step_by(step).collect();
+    let mut cuts = cuts.to_vec();
+    cuts.sort_by(f64::total_cmp);
+    let mut edges = vec![0];
+    edges.extend(
+        cuts.iter()
+            .map(|c| points.partition_point(|p| super::num(&p[0]) < *c)),
+    );
+    edges.push(points.len());
+    for w in edges.windows(2) {
+        if w[1] > w[0] {
+            keep.insert(w[0]);
+            keep.insert(w[1] - 1);
+        }
+    }
+    keep.into_iter().map(|i| points[i].clone()).collect()
+}
+pub fn previous_facts(paths: &Paths, prev: &Session, db: Option<&Db>) -> Value {
+    use super::{array, num};
+    let p = &prev.data;
+    let mut main = array(&p["main"]).to_vec();
+    main.sort_by(|a, b| {
+        num(&a[0])
+            .total_cmp(&num(&b[0]))
+            .then(num(&a[1]).total_cmp(&num(&b[1])))
+    });
+    let prompts = array(&p["prompts"]);
+    let compacts = array(&p["compacts"]);
+    let times: Vec<_> = main
+        .iter()
+        .map(|r| num(&r[0]))
+        .chain(prompts.iter().map(num))
+        .collect();
+    let last = times
+        .iter()
+        .copied()
+        .chain(compacts.iter().map(num))
+        .chain([
+            num(&p["said"][0]),
+            array(&p["typed"]).last().map(|r| num(&r[0])).unwrap_or(0.),
+        ])
+        .fold(0., f64::max);
+    let (floor, measured) = super::masthead::floor_of(&p["compact_sizes"]);
+    let (learned, handed) = db
+        .map(|db| {
+            let sid = [json!(prev.id)];
+            let recalls = db.query(
+                "select retrieved_at from retrieval_events where session_id=?",
+                &sid,
+            );
+            let seconds: std::collections::BTreeSet<_> = recalls
+                .iter()
+                .filter_map(|r| r[0].as_str().and_then(epoch))
+                .filter(|t| *t != 0.)
+                .map(|t| t as i64)
+                .collect();
+            (
+                db.scalar("select count(*) from chunks where conversation_id=?", &sid),
+                json!(
+                    seconds.len()
+                        + db.scalar(
+                            "select count(*) from correction_deliveries where target_session_id=?",
+                            &sid,
+                        )
+                        .as_u64()
+                        .unwrap_or(0) as usize
+                ),
+            )
+        })
+        .unwrap_or((Value::Null, Value::Null));
+    let cuts: Vec<_> = compacts.iter().map(num).collect();
+    let series = thin_series(&main, &cuts, 2000);
+    let cut = |pair: &Value| {
+        if let (Some(at), Some(text)) = (pair[0].as_f64(), pair[1].as_str()) {
+            json!([at, super::render::text::one_line(text, 400)])
+        } else {
+            Value::Null
+        }
+    };
+    json!({
+        "id": prev.id,
+        "path": prev.path,
+        "mtime": prev
+            .path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| t.as_secs_f64())
+            .unwrap_or(0.),
+        "title": p["title"],
+        "first": p["started"],
+        "last": last,
+        "active": Clock::new(&times, last).total,
+        "prompts": prompts.len(),
+        "compacts": compacts.len(),
+        "peak": main.iter().map(|r| num(&r[1])).fold(0., f64::max),
+        "floor": if measured {
+            json!(floor)
+        } else {
+            Value::Null
+        },
+        "learned": learned,
+        "handed": handed,
+        "asked": array(&p["asked"]).len(),
+        "series": series,
+        "prompt_times": prompts,
+        "compactions": compacts
+            .iter()
+            .zip(array(&p["compact_sizes"]))
+            .map(|(t, size)| json!([t, size[0], size[1]]))
+            .collect::<Vec<_>>(),
+        "todos": left_todos(paths, &prev.id, db),
+        "said": cut(&p["said"]),
+        "typed": cut(array(&p["typed"]).last().unwrap_or(&Value::Null)),
+    })
+}
+
+#[cfg(test)]
+mod previous_tests {
+    use super::*;
+    #[test]
+    fn test_the_todos_a_session_left_open_come_in_progress_first_then_by_number() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let folder = paths.home.join(".claude/tasks/s");
+        std::fs::create_dir_all(&folder).unwrap();
+        for (n, status, subject) in [
+            (1, "pending", "later"),
+            (2, "in_progress", "working"),
+            (3, "completed", "done"),
+            (4, "pending", ""),
+        ] {
+            std::fs::write(
+                folder.join(format!("{n}.json")),
+                json!({
+                    "status": status,
+                    "subject": subject,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            left_todos(&paths, "s", None),
+            vec![
+                json!({
+                    "subject": "working",
+                    "status": "in_progress"
+                }),
+                json!({
+                    "subject": "later",
+                    "status": "pending"
+                })
+            ]
+        );
+        assert!(left_todos(&paths, "../s", None).is_empty());
+    }
+    #[test]
+    fn test_a_long_series_is_thinned_but_keeps_the_ends_of_every_stretch() {
+        let points = serde_json::json!([
+            [10, 1],
+            [20, 2],
+            [30, 3],
+            [40, 4],
+            [50, 5],
+            [60, 6],
+            [70, 7],
+        ]);
+        let points = points.as_array().unwrap();
+        let kept = thin_series(points, &[25., 45.], 3);
+        for i in [0, 1, 2, 3, 4, 6] {
+            assert!(kept.contains(&points[i]));
+        }
+        assert!(kept.len() < points.len());
+        assert!(kept.len() <= 3 + 2 * 3);
+        assert_eq!(thin_series(points, &[25., 45.], 100), *points);
+    }
+    #[test]
+    fn test_the_facts_about_the_last_session_are_counted_once() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let mut prev = Session::new("old");
+        prev.data["started"] = json!(1000.);
+        prev.data["title"] = json!("Build the thing");
+        prev.data["main"] = json!([[1010, 100000], [1100, 120000], [1200, 60000], [1410, 70000],]);
+        prev.data["prompts"] = json!([1000, 1100, 1200, 1300, 1400]);
+        prev.data["compacts"] = json!([1150, 1350]);
+        prev.data["compact_sizes"] = json!([[100000, 60000, 2000], [120000, 70000, 3000]]);
+        prev.data["said"] = json!([1410, "words"]);
+        prev.data["typed"] = json!([[1400, "the last words I typed"]]);
+        let facts = previous_facts(&paths, &prev, None);
+        assert_eq!(facts["id"], "old");
+        assert_eq!(facts["prompts"], 5);
+        assert_eq!(facts["compacts"], 2);
+        assert_eq!(facts["peak"], 120000.);
+        assert_eq!(facts["floor"], 65000.);
+        assert_eq!(facts["active"], 410.);
+        assert_eq!(facts["last"], 1410.);
+        assert!(facts["learned"].is_null());
+        assert!(facts["handed"].is_null());
+        assert_eq!(facts["typed"][1], "the last words I typed");
+        assert_eq!(facts["said"][1], "words");
     }
 }
