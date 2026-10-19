@@ -362,7 +362,7 @@ async function main() {
 
   if (pythonSignals.length > 0) {
     console.log('\n  \x1b[1;33mUpgrading from Python CSR to v8.0 (Rust)\x1b[0m');
-    console.log('  v8.0 replaces Docker + Python + Qdrant with a single 44MB binary.');
+    console.log('  v8.0 replaces Docker + Python + Qdrant with a single 78MB binary.');
     console.log('  Your conversation data is preserved.\n');
   }
 

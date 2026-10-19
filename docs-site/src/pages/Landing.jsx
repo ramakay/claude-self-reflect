@@ -212,7 +212,7 @@ function BinaryDiagram() {
     <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is forty four megabytes">
       <circle cx="75" cy="75" r="58" fill="rgba(246,230,169,0.20)" stroke="rgba(26,26,46,0.62)" strokeWidth="2.4" />
       <circle cx="75" cy="75" r="45" fill="none" stroke="rgba(26,26,46,0.13)" strokeDasharray="4 6" />
-      <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">44MB</text>
+      <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">78MB</text>
       <text x="75" y="94" textAnchor="middle" className="binary-diagram__label">local</text>
     </svg>
   )
@@ -284,7 +284,7 @@ function ActiveMemoryCard() {
       <CardKicker number="02" />
       <h2 className="type-hl-md">Active Memory</h2>
       <p className="type-dateline mt-3">Context appears when you need it</p>
-      <p className="type-body-sm active-copy">Six hooks across the session lifecycle. Context injected at start, on prompt, after edits, on stop, before compaction, and at end. 12 MCP tools for explicit search.</p>
+      <p className="type-body-sm active-copy">Six hooks across the session lifecycle. Context injected at start, on prompt, after edits, on stop, before compaction, and at end. 16 MCP tools for explicit search.</p>
       <HookTimeline />
       <div className="rule mt-4 pt-4">
         <p className="active-metric">&lt; 50ms — you never notice</p>
@@ -349,7 +349,7 @@ function OneBinaryCard() {
       <CardKicker number="05" />
       <h2 className="type-hl-sm">One Binary</h2>
       <PostIt className="binary-note" bg="var(--color-amber-paper)" rot="-2deg">
-        44MB CSR<br />(single binary)
+        78MB CSR<br />(single binary)
       </PostIt>
       <BinaryDiagram />
       <div className="competitor-box">
@@ -527,7 +527,7 @@ function InstallCard() {
           </div>
           <p className="type-caption mt-2">One command. Downloads binary, then asks before activating hooks + MCP. Restart Claude Code.</p>
           <div className="install-tabs-inline">
-            {['44MB binary', 'zero deps', '6 hooks', '16 MCP tools'].map((label, index) => (
+            {['78MB binary', 'zero deps', '6 hooks', '16 MCP tools'].map((label, index) => (
               <span key={label} className="tear-tab" style={{ animationDelay: `${720 + index * 70}ms` }}>{label}</span>
             ))}
           </div>

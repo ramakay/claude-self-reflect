@@ -5,7 +5,7 @@
 Single Rust binary (`csr-engine`). No Python, no Docker, no Qdrant.
 
 ```
-csr-engine (44MB)
+csr-engine (78MB)
   ├── MCP server (rmcp, 13 tools)
   ├── Embeddings (FastEmbed, 384-dim, local)
   ├── Search (HNSW, <1ms p95)

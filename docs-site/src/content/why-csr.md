@@ -12,7 +12,7 @@ Claude Code has no persistent memory. Every session starts from zero. Architectu
 
 Most memory tools require multiple services: vector databases, Python runtimes, Docker containers, background daemons, web UI servers.
 
-CSR is a single 44MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP server, and all 6 hooks — compiled into one executable.
+CSR is a single 78MB binary. SQLite, HNSW search, FastEmbed embeddings, MCP server, and all 6 hooks — compiled into one executable.
 
 | | CSR | Typical Memory Tool |
 |--|-----|---------------------|
