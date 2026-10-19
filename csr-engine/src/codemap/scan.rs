@@ -1055,7 +1055,7 @@ pub fn view_changed(conn: &Connection, view: &ViewId) -> Result<bool> {
 
 // ---- partial rescan ---------------------------------------------------------------
 
-fn longest_view_for<'a>(views: &'a [StoredView], abs: &Path) -> Option<&'a StoredView> {
+pub(super) fn longest_view_for<'a>(views: &'a [StoredView], abs: &Path) -> Option<&'a StoredView> {
     views
         .iter()
         .filter(|v| abs.starts_with(&v.worktree_path))

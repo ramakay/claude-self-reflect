@@ -596,6 +596,76 @@ pub fn rows_under(conn: &Connection, roots: &[PathBuf]) -> anyhow::Result<Vec<(S
         .collect())
 }
 
+/// The queued rows THIS repo's drain owns, each with the path to rescan it by.
+///
+/// A row `(path, stamp)` is owned when
+///
+/// 1. `path` lies under one of `roots` (the repo's view roots), or else its parent
+///    resolves (`identity::resolve_safe`, never a stat inside a protected folder;
+///    a protected or failing resolve means "not owned") to a directory that does
+///    and the file name joined on lies under one: an edit made through a symlinked
+///    spelling (`/work/current -> /work/project`) still belongs to the repo; AND
+/// 2. the longest stored view of ANY repo that contains that path belongs to
+///    `common_dir`, or no stored view contains it. A repo nested inside this one
+///    keeps its rows: they are not this drain's to rescan, and this drain holds no
+///    lock on that repo.
+///
+/// The parent resolve is memoised per directory for the call. The third element
+/// is the path that matched (the resolved spelling when the raw one did not lie
+/// under a root): hand it, not the queued string, to the rescan.
+pub(super) fn owned_rows(
+    conn: &Connection,
+    common_dir: &str,
+    roots: &[PathBuf],
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<(String, i64, PathBuf)>> {
+    let views = super::store::stored_views(conn, None)?;
+    let mut resolved: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let under_roots = |p: &Path| roots.iter().any(|r| p.starts_with(r));
+    let mut out = Vec::new();
+    for (queued, stamp) in super::store::queue_read(conn)? {
+        let raw = PathBuf::from(&queued);
+        let matched = if under_roots(&raw) {
+            Some(raw)
+        } else {
+            let real = raw
+                .parent()
+                .zip(raw.file_name())
+                .and_then(|(parent, name)| {
+                    resolved
+                        .entry(parent.to_path_buf())
+                        .or_insert_with(|| identity::resolve_safe(parent, home).ok())
+                        .as_ref()
+                        .map(|p| p.join(name))
+                });
+            real.filter(|p| under_roots(p))
+        };
+        let Some(matched) = matched else {
+            continue;
+        };
+        let foreign = super::scan::longest_view_for(&views, &matched)
+            .is_some_and(|v| v.common_dir != common_dir);
+        if !foreign {
+            out.push((queued, stamp, matched));
+        }
+    }
+    Ok(out)
+}
+
+/// The queued `(path, stamp)` rows this repo's drain owns (see `owned_rows`).
+pub fn rows_owned(
+    conn: &Connection,
+    common_dir: &str,
+    roots: &[PathBuf],
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<(String, i64)>> {
+    Ok(owned_rows(conn, common_dir, roots, home)?
+        .into_iter()
+        .map(|(p, s, _)| (p, s))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

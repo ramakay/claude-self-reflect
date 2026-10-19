@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use super::discover::discover;
 use super::identity::{self, home_dir};
 use super::lock;
-use super::scan::{rescan_paths, scan_repo, view_changed, RepoScanReport, ScanOpts};
+use super::scan::{rescan_paths_with, scan_repo, view_changed, RepoScanReport, ScanOpts};
 use super::status::{repo_path, status_report, CodemapStatus};
 use super::store;
 use crate::storage::Storage;
@@ -480,18 +480,26 @@ pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Resu
             Pass::Idle => {
                 #[cfg(test)]
                 super::session::test_hooks::after_idle();
-                let mut rows_left = || {
-                    storage
-                        .with_connection(|conn| {
-                            let (_, live, stored) =
-                                view_roots(conn, &id.common_dir, home.as_deref())?;
-                            let roots: Vec<std::path::PathBuf> =
-                                live.union(&stored).map(Into::into).collect();
-                            Ok(!super::session::rows_under(conn, &roots)?.is_empty())
-                        })
-                        // Unknown counts as "rows left": better one more look.
-                        .unwrap_or(true)
-                };
+                let mut rows_left =
+                    || {
+                        storage
+                            .with_connection(|conn| {
+                                let (_, live, stored) =
+                                    view_roots(conn, &id.common_dir, home.as_deref())?;
+                                let roots: Vec<std::path::PathBuf> =
+                                    live.union(&stored).map(Into::into).collect();
+                                let common = id.common_dir.to_string_lossy();
+                                Ok(!super::session::rows_owned(
+                                    conn,
+                                    &common,
+                                    &roots,
+                                    home.as_deref(),
+                                )?
+                                .is_empty())
+                            })
+                            // Unknown counts as "rows left": better one more look.
+                            .unwrap_or(true)
+                    };
                 match super::session::release_and_recheck(
                     &mut hold,
                     super::now_secs(),
@@ -569,8 +577,10 @@ fn drain_pass(
         }
     }
     let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
-    let rows = super::session::rows_under(conn, &roots)?;
-    if rows.is_empty() && !changed {
+    // Only the rows this repo owns: not a nested repo's, and an edit made through
+    // a symlinked spelling of a root counts (see `session::owned_rows`).
+    let owned = super::session::owned_rows(conn, &common_str, &roots, home)?;
+    if owned.is_empty() && !changed {
         return Ok(Pass::Idle);
     }
     let held = lock::acquire(db_path, &common_str, lock::wait_from_env(), &|| false)?;
@@ -602,18 +612,20 @@ fn drain_pass(
             report.totals.defs_written
         );
     } else {
-        let paths: Vec<std::path::PathBuf> = rows
-            .iter()
-            .map(|(p, _)| std::path::PathBuf::from(p))
-            .collect();
-        let report = rescan_paths(conn, &paths)?;
+        let paths: Vec<std::path::PathBuf> = owned.iter().map(|(_, _, m)| m.clone()).collect();
+        // This repo's flock is already held: its paths may be rescanned. Any other
+        // repo's views are left alone (no lock on them).
+        let own = |c: &str| -> Option<Box<dyn std::any::Any>> {
+            (c == common_str).then(|| Box::new(()) as Box<dyn std::any::Any>)
+        };
+        let report = rescan_paths_with(conn, &paths, &own)?;
         println!(
             "drain: {} paths, {} updated, {} removed, {} unchanged",
             report.paths, report.updated, report.removed, report.unchanged
         );
     }
     // Only the rows this pass saw: one re-enqueued meanwhile keeps its newer stamp.
-    for (p, at) in &rows {
+    for (p, at, _) in &owned {
         store::queue_delete_upto(conn, p, *at)?;
     }
     Ok(Pass::Worked)
@@ -780,6 +792,152 @@ mod tests {
             Some(repos[0].common_dir.as_str())
         );
         assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    /// Scan a repo with the fixture's home, as the drain's repo already is.
+    fn scan_with_home(conn: &rusqlite::Connection, fx: &Fx, repo: &Path) {
+        scan_repo(
+            conn,
+            &repo.join(".git"),
+            &ScanOpts {
+                home: Some(fx.home.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn queued_paths(db_path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        store::queue_read(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    #[test]
+    fn a_drain_pass_rescans_only_its_own_repo_and_leaves_a_nested_repos_row() {
+        let fx = Fx::new();
+        let a = fx.init_repo("a");
+        write(&a, "src/a.py", &py(&["alpha"]));
+        fx.commit_all(&a, "init a");
+        // B is a repo of its own, nested inside A's tree.
+        let b = a.join("inner");
+        std::fs::create_dir_all(&b).unwrap();
+        fx.git(&b, &["init", "-q", "-b", "main"]);
+        write(&b, "src/lib.py", &py(&["beta"]));
+        fx.commit_all(&b, "init b");
+        let b = std::fs::canonicalize(&b).unwrap();
+        let data = fx.home.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let db_path = data.join("csr-engine.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &a);
+                scan_with_home(conn, &fx, &b);
+                // both files change, both edits are queued
+                write(&a, "src/a.py", &py(&["alpha", "alpha_new"]));
+                write(&b, "src/lib.py", &py(&["beta", "beta_new"]));
+                super::super::enqueue(conn, &b.join("src/lib.py"))?;
+                super::super::enqueue(conn, &a.join("src/a.py"))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let pass = storage
+            .with_connection(|conn| {
+                drain_pass(conn, &db_path, &a.join(".git"), &a, false, Some(&fx.home))
+            })
+            .unwrap();
+
+        assert_eq!(pass, Pass::Worked);
+        assert_eq!(
+            defs_named(&db_path, "alpha_new"),
+            1,
+            "A's file was rescanned"
+        );
+        assert_eq!(defs_named(&db_path, "beta_new"), 0, "B's view is untouched");
+        assert_eq!(defs_named(&db_path, "beta"), 1);
+        assert_eq!(
+            queued_paths(&db_path),
+            vec![b.join("src/lib.py").to_string_lossy().to_string()],
+            "A's row is gone, B's stays for B's own drain"
+        );
+    }
+
+    #[test]
+    fn a_drain_pass_applies_an_edit_queued_through_a_symlinked_spelling_of_the_repo() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let alias = fx.root.join("alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &repo);
+                write(&repo, "a.py", &py(&["alpha", "via_alias"]));
+                super::super::enqueue(conn, &alias.join("a.py"))
+            })
+            .unwrap();
+
+        let pass = storage
+            .with_connection(|conn| {
+                drain_pass(
+                    conn,
+                    &db_path,
+                    &repo.join(".git"),
+                    &repo,
+                    false,
+                    Some(&fx.home),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(pass, Pass::Worked);
+        assert_eq!(defs_named(&db_path, "via_alias"), 1);
+        assert!(queued_paths(&db_path).is_empty(), "the row is deleted");
+    }
+
+    #[test]
+    fn a_row_whose_parent_is_a_link_into_a_protected_folder_is_not_owned() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let desktop = fx.home.join("Desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let link = fx.root.join("deskalias");
+        std::os::unix::fs::symlink(&desktop, &link).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &repo);
+                super::super::enqueue(conn, &link.join("x.py"))
+            })
+            .unwrap();
+        let (pass, owned) = storage
+            .with_connection(|conn| {
+                let roots = vec![repo.clone()];
+                let owned = session::rows_owned(
+                    conn,
+                    &repo.join(".git").to_string_lossy(),
+                    &roots,
+                    Some(&fx.home),
+                )?;
+                let pass = drain_pass(
+                    conn,
+                    &db_path,
+                    &repo.join(".git"),
+                    &repo,
+                    false,
+                    Some(&fx.home),
+                )?;
+                Ok((pass, owned))
+            })
+            .unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(pass, Pass::Idle, "nothing to do, and no failure");
+        assert_eq!(queued_paths(&db_path).len(), 1, "the row is left alone");
     }
 
     #[test]
