@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 pub use super::sources::{
     account_limits, compacting_info, csr_status, csr_status_at, kept_status, threshold,
+    usage_fields,
 };
 
 pub fn seconds_of(value: &Value) -> Option<f64> {
@@ -459,6 +460,15 @@ pub fn gauges(
         "compacting": null,
     })
 }
+/// A usage file as `usage::measure` writes it.
+#[cfg(test)]
+fn kept_usage(p: &Paths, sid: &str, at: f64, usage: Value) {
+    let mut body = usage;
+    body["at"] = json!(at);
+    let f = p.kept_file(super::usage::FOLDER, sid).unwrap();
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(f, body.to_string()).unwrap();
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,28 +718,19 @@ mod parity_tests {
     fn test_the_account_limits_come_from_another_session_within_a_day() {
         let d = tempfile::tempdir().unwrap();
         let p = Paths::new(d.path().into());
-        let dir = p.keep.join("statusline");
-        std::fs::create_dir_all(&dir).unwrap();
         for (id, at, used) in [("a", 9990, 12), ("b", 9995, 34), ("c", 0, 99)] {
-            std::fs::write(
-                dir.join(format!("{id}.json")),
+            kept_usage(
+                &p,
+                id,
+                at as f64,
                 json!({
-                    "at": at,
-                    "fields": {
-                        "rate_limits": {
-                            "five_hour": {
-                                "used_percentage": used,
-                            },
-                        },
-                    },
-                })
-                .to_string(),
-            )
-            .unwrap();
+                    "rateLimits": [{ "kind": "five_hour", "percentUsed": used }],
+                }),
+            );
         }
         assert_eq!(
             account_limits(&p, 10000.)["five_hour"]["used_percentage"],
-            34
+            34.
         );
         assert_eq!(account_limits(&p, 100000.), json!({}));
     }
@@ -784,24 +785,21 @@ mod parity_tests {
     fn test_fields_come_back_from_the_kept_file_and_not_when_a_day_old() {
         let d = tempfile::tempdir().unwrap();
         let p = Paths::new(d.path().into());
-        let f = p.kept_file("statusline", "s").unwrap();
-        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
-        std::fs::write(
-            f,
-            json!({
-                "at": 1000,
-                "fields": {
-                    "context_window": {
-                        "total_input_tokens": 40000,
-                    },
-                },
-            })
-            .to_string(),
-        )
-        .unwrap();
+        kept_usage(
+            &p,
+            "s",
+            1000.,
+            json!({ "context": { "tokens": 40000, "window": 1000000 } }),
+        );
+        let kept = kept_status(&p, "s", 1100.);
+        assert_eq!(kept["at"], 1000.);
         assert_eq!(
-            kept_status(&p, "s", 1100.)["fields"]["context_window"]["total_input_tokens"],
-            40000
+            kept["fields"]["context_window"]["total_input_tokens"],
+            40000.
+        );
+        assert_eq!(
+            kept["fields"]["context_window"]["context_window_size"],
+            1000000.
         );
         assert!(kept_status(&p, "s", 87400.).is_null());
     }
@@ -867,37 +865,16 @@ mod quota_cache_tests {
     fn test_an_empty_newer_status_does_not_hide_account_quotas() {
         let d = tempfile::tempdir().unwrap();
         let paths = Paths::new(d.path().into());
-        let dir = paths.keep.join("statusline");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("a.json"),
+        let usage = |used: f64| {
             json!({
-                "at": 9990,
-                "fields": {
-                    "rate_limits": {
-                        "five_hour": {
-                            "used_percentage": 34,
-                        },
-                    },
-                },
+                "rateLimits": [{ "kind": "five_hour", "percentUsed": used }],
             })
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("b.json"),
-            json!({
-                "at": 9995,
-                "fields": {
-                    "rate_limits": {},
-                },
-            })
-            .to_string(),
-        )
-        .unwrap();
+        };
+        kept_usage(&paths, "a", 9990., usage(34.));
+        kept_usage(&paths, "b", 9995., json!({ "rateLimits": [] }));
         assert_eq!(
             account_limits(&paths, 10000.)["five_hour"]["used_percentage"],
-            34
+            34.
         );
     }
     #[test]
@@ -1234,5 +1211,343 @@ mod timer_tests {
         );
         assert!(compacting_info(&paths, "s", 1800000601., false).is_null());
         assert!(!paths.keep.join("compaction-times.json").exists());
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::super::render::text::{cockpit, plain};
+    use super::*;
+
+    const T0: f64 = 1792320000.;
+
+    /// What `session.measure` carried in Claude Code 2.1.303 (WP0).
+    fn wp0() -> Value {
+        json!({
+            "context": { "percent": 3, "tokens": 34581, "window": 1000000 },
+            "cost": { "usd": 0.00381693 },
+            "rateLimits": [
+                { "kind": "five_hour", "percentUsed": 11, "resetsAt": "2026-10-19T19:00:00.000Z" },
+                { "kind": "seven_day", "percentUsed": 25, "resetsAt": "2026-10-25T14:00:00.000Z" }
+            ]
+        })
+    }
+    fn gauges_of(fields: &Value, now: f64) -> Value {
+        gauges(
+            fields,
+            Some(now),
+            &Value::Null,
+            now,
+            &Value::Null,
+            &Value::Null,
+        )
+    }
+    fn rows(g: &Value) -> Vec<String> {
+        cockpit(g, 49).iter().map(|r| plain(r)).collect()
+    }
+
+    #[test]
+    fn test_the_masthead_from_the_wp0_body_reads_as_the_status_line_figures_did() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        let now = 1792400000.;
+        kept_usage(&p, "s", now - 10., wp0());
+        let kept = kept_status(&p, "s", now);
+        let old = json!({
+            "context_window": {
+                "total_input_tokens": 34581,
+                "context_window_size": 1000000,
+            },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 11, "resets_at": 1792436400. },
+                "seven_day": { "used_percentage": 25, "resets_at": 1792936800. },
+            },
+        });
+        let new = gauges_of(&kept["fields"], now);
+        let before = gauges_of(&old, now);
+        assert_eq!(new, before);
+        assert_eq!(rows(&new), rows(&before));
+        assert_eq!(
+            rows(&new),
+            vec![" CTX 35k/1M", " 7D 25%»  5H 11%  CACHE --"]
+        );
+    }
+    #[test]
+    fn test_resets_at_is_an_iso_time_and_comes_out_as_epoch_seconds() {
+        let fields = usage_fields(&wp0());
+        assert_eq!(fields["rate_limits"]["five_hour"]["resets_at"], 1792436400.);
+        assert_eq!(fields["rate_limits"]["seven_day"]["resets_at"], 1792936800.);
+        let bare = usage_fields(&json!({
+            "rateLimits": [
+                { "kind": "five_hour", "percentUsed": 80, "resetsAt": "not a time" },
+            ],
+        }));
+        assert_eq!(
+            bare["rate_limits"]["five_hour"],
+            json!({ "used_percentage": 80. })
+        );
+        let q = quota_slot("5H", &fields["rate_limits"]["five_hour"], 1792436000.);
+        assert_eq!(q["resets"], 1792436400.);
+    }
+    #[test]
+    fn test_a_window_that_is_over_70_percent_names_its_reset() {
+        let fields = usage_fields(&json!({
+            "rateLimits": [
+                { "kind": "five_hour", "percentUsed": 80, "resetsAt": "2026-10-19T19:00:00Z" },
+            ],
+        }));
+        let q = quota_slot("5H", &fields["rate_limits"]["five_hour"], 1792436000.);
+        assert!(string(&q["text"]).starts_with("5H 80% ↻"));
+    }
+    #[test]
+    fn test_a_kind_the_masthead_has_no_cell_for_is_kept_apart_and_never_shown() {
+        let fields = usage_fields(&json!({
+            "rateLimits": [
+                { "kind": "spend_limit", "percentUsed": 120 },
+                { "kind": "five_hour", "percentUsed": 40 },
+            ],
+        }));
+        assert_eq!(
+            fields["rate_limits"]["spend_limit"]["used_percentage"],
+            120.
+        );
+        let g = gauges_of(&fields, 10000.);
+        let codes: Vec<_> = array(&g["quotas"])
+            .iter()
+            .map(|q| string(&q["code"]))
+            .collect();
+        assert_eq!(codes, ["5H", "7D"]);
+        assert_eq!(g["quotas"][0]["used"], 40.);
+        assert_eq!(g["quotas"][1]["text"], "7D --");
+    }
+    #[test]
+    fn test_an_empty_rate_limits_leaves_the_cells_to_the_account_figures() {
+        let fields = usage_fields(&json!({
+            "context": { "tokens": 50000, "window": 200000 },
+            "rateLimits": [],
+        }));
+        assert_eq!(fields["rate_limits"], json!({}));
+        let account = json!({ "five_hour": { "used_percentage": 61. } });
+        let g = gauges(
+            &fields,
+            Some(9990.),
+            &Value::Null,
+            10000.,
+            &account,
+            &Value::Null,
+        );
+        assert_eq!(g["quotas"][0]["text"], "5H 61%");
+        assert_eq!(g["ctx"]["tokens"], 50000.);
+        let off = gauges(
+            &fields,
+            Some(9990.),
+            &Value::Null,
+            10000.,
+            &json!({}),
+            &Value::Null,
+        );
+        assert_eq!(off["quotas"][0]["text"], "5H --");
+        assert_eq!(off["quotas"][1]["text"], "7D --");
+    }
+    #[test]
+    fn test_a_context_with_no_tokens_yet_is_the_percent_of_its_window_or_nothing() {
+        let by_percent = usage_fields(&json!({ "context": { "window": 200000, "percent": 5 } }));
+        assert_eq!(by_percent["context_window"]["total_input_tokens"], 10000.);
+        let none = usage_fields(&json!({ "context": { "window": 200000 } }));
+        assert!(none["context_window"]["total_input_tokens"].is_null());
+        assert_eq!(none["context_window"]["context_window_size"], 200000.);
+        assert_eq!(usage_fields(&json!({})), json!({ "rate_limits": {} }));
+    }
+    #[test]
+    fn test_the_newest_reply_beats_a_usage_file_older_than_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        kept_usage(
+            &p,
+            "s",
+            9940.,
+            json!({ "context": { "tokens": 80000, "window": 1000000 } }),
+        );
+        let kept = kept_status(&p, "s", 10000.);
+        let s = json!({ "main": [[9990, 91000]] });
+        assert_eq!(
+            ctx_now(&kept["fields"], kept["at"].as_f64(), &s),
+            (Some(91000.), Some(1000000.))
+        );
+        kept_usage(
+            &p,
+            "s",
+            9988.,
+            json!({ "context": { "tokens": 80000, "window": 1000000 } }),
+        );
+        let kept = kept_status(&p, "s", 10000.);
+        assert_eq!(
+            ctx_now(&kept["fields"], kept["at"].as_f64(), &s),
+            (Some(80000.), Some(1000000.))
+        );
+    }
+
+    fn stamp(t: f64) -> String {
+        chrono::DateTime::from_timestamp(t as i64, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    }
+    fn reply(t: f64, usage: Value, side: bool) -> String {
+        json!({
+            "type": "assistant",
+            "timestamp": stamp(t),
+            "isSidechain": side,
+            "message": { "id": format!("m{t}"), "usage": usage },
+        })
+        .to_string()
+    }
+    fn transcript(p: &Paths, sid: &str, lines: &[String]) {
+        let f = p.projects.join("proj").join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, lines.join("\n") + "\n").unwrap();
+    }
+    fn cache_at(p: &Paths, sid: &str, now: f64) -> Value {
+        let kept = kept_status(p, sid, now);
+        cache_info(&kept["fields"]["prompt_cache"], now)
+    }
+    fn five_minute() -> Value {
+        json!({
+            "input_tokens": 4,
+            "cache_read_input_tokens": 30000,
+            "cache_creation_input_tokens": 4000,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 4000,
+                "ephemeral_1h_input_tokens": 0,
+            },
+        })
+    }
+    fn one_hour() -> Value {
+        json!({
+            "input_tokens": 4,
+            "cache_read_input_tokens": 30000,
+            "cache_creation_input_tokens": 4000,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 0,
+                "ephemeral_1h_input_tokens": 4000,
+            },
+        })
+    }
+    #[test]
+    fn test_a_five_minute_cache_is_warm_at_4_minutes_and_cold_at_6() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        transcript(&p, "s", &[reply(T0, five_minute(), false)]);
+        let warm = cache_at(&p, "s", T0 + 240.);
+        assert_eq!(warm["text"], "CACHE 1m");
+        assert_eq!(warm["sev"], "amber");
+        assert_eq!(warm["cold"], false);
+        let cold = cache_at(&p, "s", T0 + 360.);
+        assert_eq!(cold["text"], "CACHE COLD ~34k");
+        assert_eq!(cold["cold"], true);
+    }
+    #[test]
+    fn test_an_hour_cache_is_warm_at_50_minutes_and_cold_at_61() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        transcript(&p, "s", &[reply(T0, one_hour(), false)]);
+        let warm = cache_at(&p, "s", T0 + 3000.);
+        assert_eq!(warm["text"], "CACHE 10m");
+        assert_eq!(warm["sev"], "normal");
+        assert_eq!(warm["ttl"], 3600.);
+        let cold = cache_at(&p, "s", T0 + 3660.);
+        assert_eq!(cold["text"], "CACHE COLD ~34k");
+    }
+    #[test]
+    fn test_no_reply_in_the_transcript_is_a_dashed_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        assert_eq!(cache_at(&p, "none", T0)["text"], "CACHE --");
+        transcript(
+            &p,
+            "bare",
+            &[json!({ "type": "user", "timestamp": stamp(T0) }).to_string()],
+        );
+        assert_eq!(cache_at(&p, "bare", T0 + 10.)["text"], "CACHE --");
+    }
+    #[test]
+    fn test_the_cache_reads_the_last_main_thread_reply_and_not_a_side_agents() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        let empty = json!({
+            "type": "assistant",
+            "timestamp": stamp(T0 + 250.),
+            "message": { "usage": { "input_tokens": 0, "output_tokens": 0 } },
+        });
+        transcript(
+            &p,
+            "s",
+            &[
+                reply(T0 - 4000., one_hour(), false),
+                reply(T0, five_minute(), false),
+                reply(T0 + 200., one_hour(), true),
+                empty.to_string(),
+            ],
+        );
+        let kept = kept_status(&p, "s", T0 + 100.);
+        assert_eq!(kept["fields"]["prompt_cache"]["ttl"], "5m");
+        assert_eq!(kept["fields"]["prompt_cache"]["expires_at"], T0 + 300.);
+    }
+    #[test]
+    fn test_the_recache_cost_is_the_usage_files_context_else_the_replys_input() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        transcript(&p, "s", &[reply(T0, five_minute(), false)]);
+        let bare = kept_status(&p, "s", T0 + 400.);
+        let cost = &bare["fields"]["prompt_cache"]["recache_tokens_if_cold"];
+        assert_eq!(*cost, 34004.);
+        assert!(bare["at"].is_null());
+        kept_usage(
+            &p,
+            "s",
+            T0 + 390.,
+            json!({ "context": { "tokens": 120000, "window": 1000000 } }),
+        );
+        let kept = kept_status(&p, "s", T0 + 400.);
+        let cache = &kept["fields"]["prompt_cache"];
+        assert_eq!(cache["recache_tokens_if_cold"], 120000.);
+        assert_eq!(cache_info(cache, T0 + 400.)["text"], "CACHE COLD ~120k");
+    }
+    #[test]
+    fn test_a_long_tool_result_after_the_last_reply_does_not_hide_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        let big = json!({
+            "type": "user",
+            "timestamp": stamp(T0 + 1.),
+            "message": { "content": "x".repeat(600 * 1024) },
+        });
+        transcript(&p, "s", &[reply(T0, one_hour(), false), big.to_string()]);
+        let kept = kept_status(&p, "s", T0 + 60.);
+        assert_eq!(kept["fields"]["prompt_cache"]["expires_at"], T0 + 3600.);
+    }
+    #[test]
+    fn test_nothing_reads_or_writes_a_retired_status_line_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Paths::new(d.path().into());
+        let old = p.keep.join(concat!("status", "line"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(
+            old.join("s.json"),
+            json!({
+                "at": 9990,
+                "fields": {
+                    "context_window": { "total_input_tokens": 1 },
+                    "rate_limits": { "five_hour": { "used_percentage": 9 } },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(kept_status(&p, "s", 10000.).is_null());
+        assert_eq!(account_limits(&p, 10000.), json!({}));
+        let mut names: Vec<_> = std::fs::read_dir(&p.keep).unwrap().collect();
+        assert_eq!(names.len(), 1);
+        assert!(names.pop().unwrap().unwrap().path().ends_with(old));
     }
 }

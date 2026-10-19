@@ -1,11 +1,13 @@
-//! The session's usage, written to the relay log once at each start: the measurement WP0 made.
-//! It is the engine's own, not a feature of the TypeScript plugin, so it has no handler there; it
-//! runs after `pane_cmd`'s start and asks apart from the start so a slow answer holds nothing up.
+//! The session's usage. At each start it is written to the relay log once: the measurement WP0
+//! made, run after `pane_cmd`'s start and apart from it so a slow answer holds nothing up. On
+//! each `measure` the figures are kept for the pane's masthead (`companion::usage`). Both are the
+//! engine's own, not features of the TypeScript plugin, so neither has a handler there.
 
 use crate::companion::relay::dispatch::{handler, Reply, Table};
 use serde_json::json;
 
 pub fn register(t: &mut Table) {
+    t.on("measure", "usage", crate::companion::usage::measure());
     t.on(
         "start",
         "usage",

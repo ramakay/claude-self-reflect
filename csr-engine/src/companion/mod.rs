@@ -29,6 +29,7 @@ pub mod sources;
 pub mod store;
 pub mod story;
 mod tail;
+pub mod usage;
 pub mod watch;
 /// Borrow an array, treating missing or differently typed values as empty.
 fn array(v: &serde_json::Value) -> &[serde_json::Value] {

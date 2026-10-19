@@ -1,4 +1,4 @@
-// Captured by fixtures/companion/cases.py from the original pytest cases.
+// Captured once from the original pytest cases, before the Python companion was removed.
 #[cfg(test)]
 mod cases {
     include!("companion_cases.rs");
