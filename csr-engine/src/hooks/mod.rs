@@ -352,9 +352,11 @@ fn codemap_session_start_ordinary(input: &HookInput, engine: &Engine) {
     );
 }
 
-/// PostToolUse after an edit in an ordinary git repo with no live daemon: start
-/// the detached drain (or the first scan). The edit itself is queued by the
-/// generic PostToolUse enqueue.
+/// PostToolUse after an edit in an ordinary git repo with no live daemon: queue
+/// the edit, then start the detached drain (its first full pass registers a repo
+/// the map does not know yet). The queue write comes first and before the slow
+/// transcript import, so the drain never starts on an empty queue. The generic
+/// PostToolUse enqueue later pushes the same path again; that is harmless.
 fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
     let Some(cwd) = ordinary_hook_cwd(input) else {
         return;

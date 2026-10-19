@@ -32,8 +32,9 @@
 //! daemon (setup never starts one), so with NO live daemon the session maps an
 //! ordinary repo the same way, through the same two children
 //! (`on_session_start_ordinary`, `on_post_tool_use_ordinary`). A live daemon
-//! keeps ownership: the hooks do nothing there. The scan child registers such a
-//! repo with source `signal`, as the daemon would.
+//! keeps ownership: the hooks do nothing there. The scan child (and a drain's first
+//! full pass, for a repo the first edit meets before any SessionStart scan)
+//! registers such a repo with source `signal`, as the daemon would.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -515,12 +516,14 @@ pub fn on_session_start_ordinary(
     }
 }
 
-/// PostToolUse after an edit in an ordinary git repo while no daemon runs. The
-/// generic hook has already queued the edited file (the daemon would have drained
-/// it), so this only starts the child: a detached `codemap drain` unless one is
-/// in flight, or, for a repo the map does not know yet (the SessionStart scan
-/// never ran), a detached `codemap scan --session` that registers it. One spawn
-/// per call at most, no retries.
+/// PostToolUse after an edit in an ordinary git repo while no daemon runs. Does
+/// the two things of the lock protocol in order (`release_and_recheck`): it
+/// ENQUEUES the edited file itself, then tries the session lock and spawns a
+/// detached `codemap drain` unless one is in flight. The drain, not a scan,
+/// serves a repo the map does not know yet too: its first full pass registers the
+/// repo. A repo that `codemap remove` tombstoned is left alone. One spawn per call
+/// at most, no retries. (The generic PostToolUse enqueue runs later and pushes the
+/// same path again; that is harmless, the newer stamp just earns one more pass.)
 #[allow(clippy::too_many_arguments)]
 pub fn on_post_tool_use_ordinary(
     conn: &Connection,
@@ -535,9 +538,9 @@ pub fn on_post_tool_use_ordinary(
     spawner: &dyn Spawner,
 ) -> Drained {
     // The cheap gate first: most PostToolUse calls are not code edits.
-    if !edited.is_some_and(|p| p.is_absolute() && has_code_extension(p)) {
+    let Some(edited) = edited.filter(|p| p.is_absolute() && has_code_extension(p)) else {
         return Drained::NotQueued;
-    }
+    };
     let Some(cwd) = ordinary_repo_cwd(cwd, home, disabled, daemon_live) else {
         return Drained::NotProtected;
     };
@@ -545,17 +548,21 @@ pub fn on_post_tool_use_ordinary(
         return Drained::NotQueued;
     };
     let common = id.common_dir.to_string_lossy().to_string();
-    let known = super::store::list_repos(conn)
-        .map(|repos| repos.iter().any(|r| r.common_dir == common))
-        .unwrap_or(false);
-    if !known {
-        return match spawner.spawn(&scan_argv(db_path, &cwd)) {
-            Ok(pid) => Drained::Spawned(pid),
-            Err(e) => {
-                eprintln!("CSR: code map session scan not started (non-fatal): {e}");
-                Drained::Failed
-            }
-        };
+    // A `codemap remove` tombstone: no row, no child.
+    if super::store::list_repos(conn)
+        .map(|repos| repos.iter().any(|r| r.common_dir == common && !r.enabled))
+        .unwrap_or(false)
+    {
+        return Drained::NotQueued;
+    }
+    if !super::should_enqueue(edited, home) {
+        return Drained::NotQueued;
+    }
+    // Enqueue first, lock second: a drain that is about to exit rechecks the
+    // queue after releasing the lock and so sees this row.
+    if let Err(e) = super::with_hook_busy_timeout(conn, || super::enqueue(conn, edited)) {
+        eprintln!("CSR: code map session enqueue skipped (non-fatal): {e}");
+        return Drained::Failed;
     }
     let lock = match try_take(&lock_path(db_path, &cwd), now, alive) {
         Ok(Some(lock)) => lock,
@@ -1154,28 +1161,118 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_post_tool_use_scans_an_unknown_repo_then_drains_a_known_one_once() {
+    fn ordinary_post_tool_use_drains_a_known_repo_once() {
         let f = fake();
         let repo = ordinary_repo(&f);
         let conn = db();
         let rec = Recorder::new();
-
-        // not registered yet: the first edit starts the session scan
-        let out = ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000);
-        assert_eq!(out, Drained::Spawned(4242));
-        assert_eq!(rec.args()[0][3], "scan");
-
-        // registered: the edit starts one drain, a second finds it in flight
         let common = repo.join(".git");
         store::upsert_repo(&conn, &common.to_string_lossy(), None, "signal", false).unwrap();
         let out = ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_001);
-        assert_eq!(out, Drained::Spawned(4243));
-        assert_eq!(rec.args()[1][3], "drain");
+        assert_eq!(out, Drained::Spawned(4242));
+        assert_eq!(rec.args()[0][3], "drain");
         assert_eq!(
             ordinary_edit(&f, &conn, &rec, "src/b.rs", false, 1_002),
             Drained::InFlight
         );
-        assert_eq!(rec.args().len(), 2, "no third spawn");
+        assert_eq!(rec.args().len(), 1, "no second spawn");
+    }
+
+    /// A spawner that looks at the queue at the moment the child would start.
+    struct QueueProbe<'a> {
+        conn: &'a Connection,
+        queued_at_spawn: RefCell<Vec<Vec<String>>>,
+        argv: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl Spawner for QueueProbe<'_> {
+        fn spawn(&self, argv: &[OsString]) -> std::io::Result<u32> {
+            let rows = store::queue_read(self.conn).unwrap();
+            self.queued_at_spawn
+                .borrow_mut()
+                .push(rows.into_iter().map(|(p, _)| p).collect());
+            self.argv.borrow_mut().push(
+                argv.iter()
+                    .map(|a| a.to_string_lossy().to_string())
+                    .collect(),
+            );
+            Ok(5000)
+        }
+    }
+
+    #[test]
+    fn the_edit_is_queued_before_the_drain_is_spawned() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let conn = db();
+        let probe = QueueProbe {
+            conn: &conn,
+            queued_at_spawn: RefCell::new(Vec::new()),
+            argv: RefCell::new(Vec::new()),
+        };
+        let out = on_post_tool_use_ordinary(
+            &conn,
+            &repo,
+            Some(&repo.join("src/a.rs")),
+            &f.db,
+            Some(&f.home),
+            false,
+            false,
+            1_000,
+            &|_| true,
+            &probe,
+        );
+        assert_eq!(out, Drained::Spawned(5000));
+        let want = repo.join("src/a.rs").to_string_lossy().to_string();
+        assert_eq!(
+            *probe.queued_at_spawn.borrow(),
+            vec![vec![want]],
+            "the row was there when the child started"
+        );
+        assert_eq!(probe.argv.borrow()[0][3], "drain");
+        assert_eq!(
+            probe.argv.borrow()[0][5],
+            repo.to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn a_burst_of_edits_in_an_unknown_repo_starts_one_drain_and_queues_every_row() {
+        let f = fake();
+        ordinary_repo(&f);
+        let conn = db();
+        let rec = Recorder::new();
+        // The repo is not registered: the drain argv, never the scan argv.
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000),
+            Drained::Spawned(4242)
+        );
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/b.rs", false, 1_001),
+            Drained::InFlight
+        );
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/c.rs", false, 1_002),
+            Drained::InFlight
+        );
+        assert_eq!(rec.args().len(), 1, "one child for the burst");
+        assert_eq!(rec.args()[0][3], "drain");
+        assert_eq!(store::queue_read(&conn).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_removed_repo_gets_no_row_and_no_child() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let conn = db();
+        let rec = Recorder::new();
+        store::disable_repo(&conn, &repo.join(".git").to_string_lossy(), None).unwrap();
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000),
+            Drained::NotQueued
+        );
+        assert!(rec.args().is_empty());
+        assert!(store::queue_read(&conn).unwrap().is_empty());
     }
 
     #[test]

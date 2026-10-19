@@ -35,9 +35,7 @@ fn age(secs: i64) -> String {
 /// `codemap add <path>`: register a repo and list its views.
 pub fn add(db_path: &Path, path: &Path) -> Result<()> {
     let id = identity::identify(path)?;
-    let main = (id.common_dir.file_name().is_some_and(|n| n == ".git"))
-        .then(|| id.common_dir.parent().map(Path::to_path_buf))
-        .flatten();
+    let main = main_path_of(&id.common_dir);
     let storage = Storage::open(db_path)?;
     storage.with_connection(|conn| {
         store::upsert_repo(
@@ -152,6 +150,42 @@ enum SessionScan {
     Done(RepoScanReport),
 }
 
+/// The main checkout of a repo whose common dir is `<main>/.git`.
+fn main_path_of(common_dir: &Path) -> Option<std::path::PathBuf> {
+    (common_dir.file_name().is_some_and(|n| n == ".git"))
+        .then(|| common_dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+/// Register a repo for a SESSION (`scan --session`, and a drain's first full pass):
+/// source `session` for a protected folder, `signal` otherwise, never forcing a
+/// tombstoned repo back on. For an ordinary repo it also resolves the session's
+/// signal row: that row keeps the repo active in `status` (and in a daemon that
+/// starts later), and only the daemon's poll would resolve it. Best effort.
+/// Call it under the repo lock, after the `repo_removed` check.
+fn register_session_repo(
+    conn: &rusqlite::Connection,
+    common_dir: &Path,
+    cwd: &Path,
+    protected: bool,
+) -> Result<()> {
+    let common = common_dir.to_string_lossy().to_string();
+    let main = main_path_of(common_dir);
+    let source = if protected { "session" } else { "signal" };
+    store::upsert_repo(
+        conn,
+        &common,
+        main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
+        source,
+        false,
+    )?;
+    if !protected {
+        let cwd = identity::normalize_lexical(cwd);
+        let _ = store::signal_resolve(conn, &cwd.to_string_lossy(), Some(&common), "repo");
+    }
+    Ok(())
+}
+
 /// Has `codemap remove` tombstoned this repo (a row with `enabled = 0`)?
 fn repo_removed(conn: &rusqlite::Connection, common: &str) -> Result<bool> {
     Ok(store::list_repos(conn)?
@@ -193,15 +227,7 @@ pub fn scan(
         let protected = scope.as_ref().is_some_and(|s| s.root.is_some());
         let id = identity::identify(path)?;
         let common = id.common_dir.to_string_lossy().to_string();
-        let (source, force) = match (session, protected) {
-            (false, _) => ("cli", true),
-            (true, true) => ("session", false),
-            (true, false) => ("signal", false),
-        };
         let report = storage.with_connection(|conn| {
-            let main = (id.common_dir.file_name().is_some_and(|n| n == ".git"))
-                .then(|| id.common_dir.parent().map(Path::to_path_buf))
-                .flatten();
             scan_locked(db_path, &common, || {
                 // Under the repo lock, which `codemap remove` holds while it
                 // writes the tombstone: a check made before the lock could
@@ -209,23 +235,19 @@ pub fn scan(
                 if session && repo_removed(conn, &common)? {
                     return Ok(SessionScan::Removed);
                 }
-                store::upsert_repo(
-                    conn,
-                    &common,
-                    main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
-                    source,
-                    force,
-                )?;
-                let report = scan_repo(conn, &id.common_dir, &opts)?;
-                if session && !protected {
-                    // An ordinary repo mapped by a session, not by the daemon: the
-                    // session's signal row is what keeps the repo active in
-                    // `status` (and in a daemon that starts later), and only the
-                    // daemon's poll resolves it. Best effort.
-                    let cwd = identity::normalize_lexical(path);
-                    let _ =
-                        store::signal_resolve(conn, &cwd.to_string_lossy(), Some(&common), "repo");
+                if session {
+                    register_session_repo(conn, &id.common_dir, path, protected)?;
+                } else {
+                    let main = main_path_of(&id.common_dir);
+                    store::upsert_repo(
+                        conn,
+                        &common,
+                        main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
+                        "cli",
+                        true,
+                    )?;
                 }
+                let report = scan_repo(conn, &id.common_dir, &opts)?;
                 Ok(SessionScan::Done(report))
             })
         })?;
@@ -431,7 +453,8 @@ pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Resu
     // hand it over (see `release_and_recheck`).
     let mut hold = super::session::LockHold::new(super::session::lock_path(db_path, repo));
     let home = home_dir();
-    let _scope = identity::session_scope(repo, home.as_deref());
+    let scope = identity::session_scope(repo, home.as_deref());
+    let protected = scope.root.is_some();
     let id = identity::identify(repo)?;
     let storage = Storage::open(db_path)?;
     let started = std::time::Instant::now();
@@ -442,9 +465,16 @@ pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Resu
             println!("drain: time limit after {passes} passes");
             break;
         }
-        match storage
-            .with_connection(|conn| drain_pass(conn, db_path, &id.common_dir, home.as_deref()))?
-        {
+        match storage.with_connection(|conn| {
+            drain_pass(
+                conn,
+                db_path,
+                &id.common_dir,
+                repo,
+                protected,
+                home.as_deref(),
+            )
+        })? {
             Pass::Worked => passes += 1,
             Pass::Removed => break,
             Pass::Idle => {
@@ -516,11 +546,15 @@ fn view_roots(
     Ok((listing, live, stored))
 }
 
-/// One drain pass.
+/// One drain pass. `cwd` is the path the drain was started for and `protected`
+/// says whether it lies in a macOS-protected folder: a repo the map does not
+/// know yet is registered by the first full pass, as `scan --session` would.
 fn drain_pass(
     conn: &rusqlite::Connection,
     db_path: &Path,
     common: &Path,
+    cwd: &Path,
+    protected: bool,
     home: Option<&Path>,
 ) -> Result<Pass> {
     let common_str = common.to_string_lossy().to_string();
@@ -553,6 +587,14 @@ fn drain_pass(
         return Ok(Pass::Removed);
     }
     if changed {
+        // A repo the map has no row for (the first edit of a session with no
+        // daemon) is registered here, under the lock and after the tombstone check.
+        if !store::list_repos(conn)?
+            .iter()
+            .any(|r| r.common_dir == common_str)
+        {
+            register_session_repo(conn, common, cwd, protected)?;
+        }
         let report = scan_repo(conn, common, &ScanOpts::default())?;
         println!(
             "drain: full scan {} views, {} defs written",
@@ -709,6 +751,38 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_of_an_unregistered_ordinary_repo_registers_maps_and_resolves_it() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                super::super::record_signal(conn, &repo, "post_tool_use")?;
+                // the edit the hook queued
+                super::super::enqueue(conn, &repo.join("a.py"))
+            })
+            .unwrap();
+        drop(storage);
+
+        drain(&db_path, &repo, std::time::Duration::ZERO).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let repos = store::list_repos(&conn).unwrap();
+        assert_eq!(repos.len(), 1, "the drain registered the repo");
+        assert_eq!(repos[0].source, "signal");
+        assert!(repos[0].enabled);
+        assert_eq!(defs_named(&db_path, "alpha"), 1, "and mapped its defs");
+        let signals = store::list_signals(&conn, 0).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].status.as_deref(), Some("repo"));
+        assert_eq!(
+            signals[0].common_dir.as_deref(),
+            Some(repos[0].common_dir.as_str())
+        );
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    #[test]
     fn a_drain_pass_on_a_removed_repo_writes_nothing() {
         let fx = Fx::new();
         let (repo, db_path) = repo_with_db(&fx);
@@ -745,7 +819,9 @@ mod tests {
             .unwrap();
 
         let pass = storage
-            .with_connection(|conn| drain_pass(conn, &db_path, &common, Some(&fx.home)))
+            .with_connection(|conn| {
+                drain_pass(conn, &db_path, &common, &repo, false, Some(&fx.home))
+            })
             .unwrap();
 
         assert_eq!(pass, Pass::Removed);
