@@ -2961,3 +2961,269 @@ mod session_start_learnt {
         assert!(!lines[0].contains("(aaaa1111, "), "{}", lines[0]);
     }
 }
+
+// ─── hook install: the retired CSR status line wrapper ───
+
+/// `hook install` run for real against a temp HOME, never the live settings.
+mod statusline_unwrap {
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use tempfile::TempDir;
+
+    const ORIGINAL: &str = "bash -c 'echo \"a b\" | tr a A'";
+
+    /// What `/csr statusline on` wrote: `wrapCommand` in the companion's register.tsx.
+    fn wrapped(home: &Path, original: &str) -> String {
+        let wrapper = home.join(".claude-self-reflect/csr-companion/statusline.cjs");
+        format!(
+            "node \"{}\" --sh '{}'",
+            wrapper.display(),
+            original.replace('\'', "'\\''")
+        )
+    }
+
+    /// A wrapped command whose `--sh` word does not read back (two words).
+    fn unreadable(home: &Path) -> String {
+        format!(
+            "node \"{}/.claude-self-reflect/csr-companion/statusline.cjs\" --sh a b",
+            home.display()
+        )
+    }
+
+    fn install(home: &Path, apply: bool) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        command.args(["hook", "install"]).env("HOME", home);
+        if apply {
+            command.arg("--apply");
+        }
+        command.output().unwrap()
+    }
+
+    fn settings_file(home: &Path) -> PathBuf {
+        home.join(".claude/settings.json")
+    }
+
+    fn write_settings(home: &Path, settings: &Value) {
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(settings_file(home), settings.to_string()).unwrap();
+    }
+
+    fn read_settings(home: &Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(settings_file(home)).unwrap()).unwrap()
+    }
+
+    /// The files "on" leaves behind, plus a foreign file in the companion folder.
+    fn leave_on_files(home: &Path) {
+        let base = home.join(".claude-self-reflect");
+        for dir in [
+            base.join("csr-companion/statusline"),
+            base.join("csr-shifts/statusline"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("s1.json"), "{}").unwrap();
+        }
+        std::fs::write(base.join("csr-companion/statusline.cjs"), "// wrapper").unwrap();
+        std::fs::write(
+            base.join("csr-companion/settings.before-statusline.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(base.join("csr-companion/other.txt"), "mine").unwrap();
+    }
+
+    fn stdout(out: &Output) -> String {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn apply_puts_the_original_back_in_one_write_and_deletes_the_leftovers() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({
+                "model": "opus",
+                "statusLine": {
+                    "type": "command",
+                    "padding": 1,
+                    "command": wrapped(home.path(), ORIGINAL),
+                },
+            }),
+        );
+        leave_on_files(home.path());
+        let before = std::fs::read_to_string(settings_file(home.path())).unwrap();
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout(&out).contains(&format!(
+                "CSR: status line restored to your own command (the CSR wrapper is retired): {ORIGINAL}"
+            )),
+            "{}",
+            stdout(&out)
+        );
+
+        let after = read_settings(home.path());
+        assert_eq!(
+            after["statusLine"],
+            json!({"type": "command", "padding": 1, "command": ORIGINAL})
+        );
+        assert_eq!(after["model"], "opus");
+        assert!(
+            after["hooks"]["Stop"].is_array(),
+            "hooks merged in the same write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".claude/settings.json.bak")).unwrap(),
+            before,
+            "one .bak, holding the settings as they were"
+        );
+
+        let base = home.path().join(".claude-self-reflect");
+        assert!(!base.join("csr-companion/statusline.cjs").exists());
+        assert!(!base
+            .join("csr-companion/settings.before-statusline.json")
+            .exists());
+        assert!(!base.join("csr-companion/statusline").exists());
+        assert!(!base.join("csr-shifts/statusline").exists());
+        assert!(
+            base.join("csr-companion/other.txt").exists(),
+            "foreign files stay"
+        );
+
+        // Second run: nothing about the status line, settings unchanged.
+        let once = read_settings(home.path());
+        let again = install(home.path(), true);
+        assert!(again.status.success());
+        assert!(
+            !stdout(&again).contains("status line"),
+            "{}",
+            stdout(&again)
+        );
+        assert_eq!(read_settings(home.path()), once);
+    }
+
+    #[test]
+    fn apply_takes_the_kept_settings_when_the_command_does_not_read_back() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": unreadable(home.path())}}),
+        );
+        leave_on_files(home.path());
+        let kept = home
+            .path()
+            .join(".claude-self-reflect/csr-companion/settings.before-statusline.json");
+        std::fs::write(
+            &kept,
+            json!({"statusLine": {"command": "my-line"}}).to_string(),
+        )
+        .unwrap();
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            read_settings(home.path())["statusLine"]["command"],
+            "my-line"
+        );
+        assert!(!kept.exists());
+    }
+
+    #[test]
+    fn apply_without_an_original_changes_and_deletes_nothing_and_says_so() {
+        let home = TempDir::new().unwrap();
+        let odd = unreadable(home.path());
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": odd}}),
+        );
+        leave_on_files(home.path());
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = stdout(&out);
+        assert!(text.contains("by hand"), "{text}");
+        assert!(text.contains(".claude/settings.json"), "{text}");
+        assert_eq!(
+            read_settings(home.path())["statusLine"]["command"],
+            odd.as_str()
+        );
+        let base = home.path().join(".claude-self-reflect/csr-companion");
+        assert!(base.join("statusline.cjs").exists());
+        assert!(base.join("settings.before-statusline.json").exists());
+        assert!(base.join("statusline/s1.json").exists());
+    }
+
+    #[test]
+    fn an_unwrapped_status_line_is_left_exactly_as_it_is() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": "ccstatusline"}}),
+        );
+        leave_on_files(home.path());
+
+        let out = install(home.path(), true);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!stdout(&out).contains("status line"), "{}", stdout(&out));
+        assert_eq!(
+            read_settings(home.path())["statusLine"]["command"],
+            "ccstatusline"
+        );
+        assert!(
+            home.path()
+                .join(".claude-self-reflect/csr-companion/statusline.cjs")
+                .exists(),
+            "nothing is deleted unless a wrapped line was restored"
+        );
+    }
+
+    #[test]
+    fn the_dry_run_says_what_would_change_and_writes_nothing() {
+        let home = TempDir::new().unwrap();
+        write_settings(
+            home.path(),
+            &json!({"statusLine": {"type": "command", "command": wrapped(home.path(), ORIGINAL)}}),
+        );
+        leave_on_files(home.path());
+        let before = std::fs::read_to_string(settings_file(home.path())).unwrap();
+
+        let out = install(home.path(), false);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout(&out).contains("would restore your status line"),
+            "{}",
+            stdout(&out)
+        );
+        assert!(stdout(&out).contains(ORIGINAL), "{}", stdout(&out));
+        assert_eq!(
+            std::fs::read_to_string(settings_file(home.path())).unwrap(),
+            before
+        );
+        assert!(!home.path().join(".claude/settings.json.bak").exists());
+        assert!(home
+            .path()
+            .join(".claude-self-reflect/csr-companion/statusline.cjs")
+            .exists());
+    }
+}

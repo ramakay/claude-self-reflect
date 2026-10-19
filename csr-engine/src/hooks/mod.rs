@@ -22,6 +22,7 @@ mod scope_folder;
 pub mod session_briefing;
 pub mod session_end;
 pub mod session_start;
+pub mod statusline_retire;
 pub mod stop;
 
 use std::io::Read;
