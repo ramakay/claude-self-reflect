@@ -558,9 +558,23 @@ fn read_core_config(config_path: &Path, home: Option<&Path>) -> (bool, Option<St
     let Ok(text) = read_to_string_safe(config_path, home) else {
         return (false, None);
     };
-    let mut in_core = false;
     let mut bare = false;
     let mut worktree = None;
+    for (key, value) in core_entries(&text) {
+        match key.as_str() {
+            "bare" => bare = value.eq_ignore_ascii_case("true"),
+            "worktree" => worktree = Some(value),
+            _ => {}
+        }
+    }
+    (bare, worktree)
+}
+
+/// The `key = value` lines of every `[core]` section of a git config text, keys
+/// lower-cased, in file order. No include handling, no subsections.
+fn core_entries(text: &str) -> Vec<(String, String)> {
+    let mut in_core = false;
+    let mut out = Vec::new();
     for raw in text.lines() {
         let mut line = raw.trim();
         if let Some(rest) = line.strip_prefix('[') {
@@ -579,14 +593,46 @@ fn read_core_config(config_path: &Path, home: Option<&Path>) -> (bool, Option<St
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let value = unquote_config_value(value);
-        match key.trim().to_ascii_lowercase().as_str() {
-            "bare" => bare = value.eq_ignore_ascii_case("true"),
-            "worktree" => worktree = Some(value),
-            _ => {}
-        }
+        out.push((key.trim().to_ascii_lowercase(), unquote_config_value(value)));
     }
-    (bare, worktree)
+    out
+}
+
+/// The user's global excludes file, if it is safe to read: `core.excludesfile`
+/// from a plain `<home>/.gitconfig` (no includes; `~/` expanded; an absolute
+/// path only), else the XDG default `$XDG_CONFIG_HOME/git/ignore` or
+/// `<home>/.config/git/ignore`, as git decides. The path is run through
+/// `resolve_safe`: one that leads into a protected folder is dropped, and
+/// nothing protected is opened. This replaces the `ignore` crate's own global
+/// loading (`git_global`), which reads those files with plain opens. No git
+/// command runs.
+pub(crate) fn global_excludes_file(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    let configured = read_to_string_safe(&home.join(".gitconfig"), Some(home))
+        .ok()
+        .and_then(|text| {
+            core_entries(&text)
+                .into_iter()
+                .rfind(|(k, _)| k == "excludesfile")
+                .map(|(_, v)| v)
+        });
+    let path = match configured {
+        Some(v) => match v.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(v),
+        },
+        None => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|x| !x.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("git")
+            .join("ignore"),
+    };
+    if !path.is_absolute() {
+        return None;
+    }
+    let real = resolve_safe(&path, Some(home)).ok()?;
+    real.is_file().then_some(real)
 }
 
 /// A config value without its trailing comment and surrounding quotes.

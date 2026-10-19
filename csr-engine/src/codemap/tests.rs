@@ -937,6 +937,7 @@ fn the_untracked_walk_stops_at_the_file_cap_and_marks_the_view_truncated() {
         &main,
         &common_of(&main),
         None,
+        Some(&fx.home),
         |rel| rel.starts_with('u'),
         40,
         budget,
@@ -989,6 +990,7 @@ fn the_visit_budget_stops_a_walk_over_many_non_code_entries_and_marks_the_view_t
         &main,
         &common_of(&main),
         None,
+        Some(&fx.home),
         |rel| rel != "a.py",
         usize::MAX,
         budget,
@@ -1098,6 +1100,173 @@ fn a_directory_event_is_resolved_before_it_is_stat_ed() {
     );
     // The stored row below it is still handed on, so rescan_paths drops it.
     assert_eq!(got.paths, vec![main.join("src/lib/x.py")]);
+}
+
+// ---- ignore files that link into a protected folder are never opened --------------------
+
+fn walk_all(fx: &Fx, main: &Path) -> super::scan::WalkOutcome {
+    collect_walk(
+        main,
+        &common_of(main),
+        None,
+        Some(&fx.home),
+        |rel| rel != "a.py",
+        1000,
+        10_000,
+    )
+}
+
+/// A readable file in the fake `<home>/Documents`, to link an ignore file to.
+fn protected_file(fx: &Fx, name: &str, body: &str) -> PathBuf {
+    let docs = fx.home.join("Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    let p = docs.join(name);
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+fn link(target: &Path, at: &Path) {
+    let _ = std::fs::remove_file(at);
+    std::os::unix::fs::symlink(target, at).unwrap();
+}
+
+#[test]
+fn an_info_exclude_that_links_into_a_protected_folder_is_not_opened() {
+    let fx = Fx::new();
+    let main = fx.init_repo("ig-excl");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    write(&main, "secret_x.py", &py(&["sx"]));
+    write(&main, "plain_y.py", &py(&["py"]));
+    let exclude = main.join(".git/info/exclude");
+
+    // Control: a regular file applies.
+    std::fs::write(&exclude, "secret_*.py\n").unwrap();
+    assert_eq!(walk_all(&fx, &main).files, vec!["plain_y.py"]);
+    // A link to an ordinary place applies too.
+    let ordinary = fx.root.join("excl-elsewhere");
+    std::fs::write(&ordinary, "secret_*.py\n").unwrap();
+    link(&ordinary, &exclude);
+    assert_eq!(walk_all(&fx, &main).files, vec!["plain_y.py"]);
+
+    // A link into Documents: readable, its content must still not apply.
+    let target = protected_file(&fx, "exclude", "secret_*.py\n");
+    link(&target, &exclude);
+    let out = walk_all(&fx, &main);
+    assert_eq!(out.files, vec!["plain_y.py", "secret_x.py"]);
+    assert!(!out.stopped);
+    // Locked: the walk completes the same way, with nothing opened.
+    let lock = super::testutil::Locked::new(&fx.home.join("Documents"));
+    let out = walk_all(&fx, &main);
+    assert_eq!(out.files, vec!["plain_y.py", "secret_x.py"]);
+    assert!(!out.stopped);
+    // `info` itself a link into Documents: the same.
+    std::fs::remove_file(&exclude).unwrap();
+    let docs_info = fx.home.join("Documents").join("info");
+    drop(lock);
+    std::fs::create_dir_all(&docs_info).unwrap();
+    std::fs::write(docs_info.join("exclude"), "secret_*.py\n").unwrap();
+    std::fs::remove_dir_all(main.join(".git/info")).unwrap();
+    link(&docs_info, &main.join(".git/info"));
+    let out = walk_all(&fx, &main);
+    assert_eq!(out.files, vec!["plain_y.py", "secret_x.py"]);
+}
+
+#[test]
+fn a_nested_ignore_file_that_links_into_a_protected_folder_keeps_the_walk_out_of_that_directory() {
+    let fx = Fx::new();
+    let main = fx.init_repo("ig-nested");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    write(&main, "top.py", &py(&["top"]));
+    write(&main, "sub/keep.py", &py(&["keep"]));
+    write(&main, "sub2/keep2.py", &py(&["keep2"]));
+    write(&main, "fine/ok.py", &py(&["ok"]));
+    let gi = protected_file(&fx, "gi", "keep_*.py\n");
+    link(&gi, &main.join("sub/.gitignore"));
+    link(&gi, &main.join("sub2/.ignore"));
+    // A directory whose ignore file is an ordinary regular file is still walked.
+    write(&main, "fine/.gitignore", "nothing_here.py\n");
+
+    // Readable on purpose: the old walk opened both links and went on.
+    let out = walk_all(&fx, &main);
+    assert_eq!(out.files, vec!["fine/ok.py", "top.py"], "{:?}", out.files);
+    assert!(!out.stopped);
+    let _lock = super::testutil::Locked::new(&fx.home.join("Documents"));
+    let out = walk_all(&fx, &main);
+    assert_eq!(out.files, vec!["fine/ok.py", "top.py"]);
+    assert!(!out.stopped);
+}
+
+#[test]
+fn a_root_or_ancestor_ignore_file_that_links_into_a_protected_folder_stops_the_walk() {
+    let fx = Fx::new();
+    let main = fx.init_repo("ig-root");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    write(&main, "u.py", &py(&["untracked"]));
+    let gi = protected_file(&fx, "rootgi", "u.py\n");
+
+    link(&gi, &main.join(".gitignore"));
+    let out = walk_all(&fx, &main);
+    assert!(out.files.is_empty(), "{:?}", out.files);
+    assert!(out.stopped, "marked stopped");
+    // The full scan: the tracked file is mapped, the view is truncated.
+    let conn = db();
+    let report = scan(&conn, &fx, &main);
+    assert_eq!(report.views[0].files, 1);
+    assert!(report.views[0].truncated);
+    // Locked: no error either.
+    let lock = super::testutil::Locked::new(&fx.home.join("Documents"));
+    let out = walk_all(&fx, &main);
+    assert!(out.files.is_empty() && out.stopped);
+    drop(lock);
+
+    // An ancestor's `.gitignore`, which the crate reads for every parent.
+    std::fs::remove_file(main.join(".gitignore")).unwrap();
+    assert_eq!(walk_all(&fx, &main).files, vec!["u.py"], "control");
+    link(&gi, &fx.root.join(".gitignore"));
+    let out = walk_all(&fx, &main);
+    assert!(out.files.is_empty() && out.stopped, "{:?}", out.files);
+    std::fs::remove_file(fx.root.join(".gitignore")).unwrap();
+    assert_eq!(walk_all(&fx, &main).files, vec!["u.py"]);
+}
+
+#[test]
+fn global_excludes_come_from_the_given_home_and_never_from_a_protected_link() {
+    let fx = Fx::new();
+    let main = fx.init_repo("ig-global");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    write(&main, "glob_a.py", &py(&["ga"]));
+    write(&main, "conf_b.py", &py(&["cb"]));
+    write(&main, "other_c.py", &py(&["oc"]));
+    let all = || walk_all(&fx, &main).files;
+    assert_eq!(all(), vec!["conf_b.py", "glob_a.py", "other_c.py"]);
+
+    // The XDG default applies.
+    write(&fx.home, ".config/git/ignore", "glob_*.py\n");
+    assert_eq!(all(), vec!["conf_b.py", "other_c.py"]);
+    // A plain core.excludesfile takes over from it, `~/` expanded.
+    write(&fx.home, "myignore", "conf_*.py\n");
+    std::fs::write(
+        fx.home.join(".gitconfig"),
+        "[user]\n\tname = t\n[core]\n\texcludesfile = ~/myignore\n",
+    )
+    .unwrap();
+    assert_eq!(all(), vec!["glob_a.py", "other_c.py"]);
+    // The same name as a link into Documents is not read (readable, then locked).
+    let target = protected_file(&fx, "gex", "other_*.py\nconf_*.py\nglob_*.py\n");
+    std::fs::remove_file(fx.home.join("myignore")).unwrap();
+    link(&target, &fx.home.join("myignore"));
+    assert_eq!(all(), vec!["conf_b.py", "glob_a.py", "other_c.py"]);
+    let _lock = super::testutil::Locked::new(&fx.home.join("Documents"));
+    assert_eq!(all(), vec!["conf_b.py", "glob_a.py", "other_c.py"]);
+    // And an XDG default that is such a link.
+    std::fs::remove_file(fx.home.join(".gitconfig")).unwrap();
+    std::fs::remove_file(fx.home.join(".config/git/ignore")).unwrap();
+    link(&target, &fx.home.join(".config/git/ignore"));
+    assert_eq!(all(), vec!["conf_b.py", "glob_a.py", "other_c.py"]);
 }
 
 // ---- session signals --------------------------------------------------------------------

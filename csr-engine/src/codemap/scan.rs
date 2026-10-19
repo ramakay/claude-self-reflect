@@ -541,16 +541,57 @@ pub(super) struct WalkOutcome {
 /// dot directories and any directory with its own `.git` are not entered.
 /// `only_under` restricts the walk to that directory (plus the ancestors that
 /// lead to it, so their `.gitignore` files still apply).
-fn untracked_walk(root: &Path, common_dir: &Path, only_under: Option<&Path>) -> ignore::Walk {
+///
+/// The `ignore` crate opens ignore files with plain opens, which follow a
+/// symlink wherever it leads, so no ignore file is left to the crate unless it
+/// has been checked (`ignore_file_is_protected_link`):
+///
+/// - `.git/info/exclude` and the global excludes are added here, after
+///   `resolve_safe` (`git_global(false)` turns the crate's own loading off);
+/// - a directory's `.gitignore` / `.ignore` are read by the crate when it
+///   descends (`ignore-0.4.32` `walk.rs` `Walk::next`: `skip_entry`, which runs
+///   `filter_entry`, comes first at line 1228, and `add_child`, which opens
+///   them, only after it at line 1242; a skipped directory gets
+///   `add_child_with_entries(path, &[])`, which reads nothing). `filter_entry`
+///   therefore refuses a directory whose ignore file is a protected link;
+/// - the root's own `.gitignore` / `.ignore`, and those of its ancestors (the
+///   crate's `add_parents`, `dir.rs` line 192, reads every ancestor's even with
+///   `parents(false)`), are checked before the walker exists.
+///
+/// `None` means the walk cannot be made safely: it yields nothing and the caller
+/// marks it stopped.
+fn untracked_walk(
+    root: &Path,
+    common_dir: &Path,
+    only_under: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<ignore::Walk> {
+    if root
+        .ancestors()
+        .any(|a| ignore_dir_has_protected_link(a, home))
+    {
+        return None;
+    }
     let mut builder = WalkBuilder::new(root);
     builder
         .require_git(false)
         .hidden(false)
         .parents(false)
         .git_exclude(false)
+        .git_global(false)
+        // Explicit ignore files are matched relative to this directory: the
+        // repo root, as git does, not the daemon's working directory.
+        .current_dir(root)
         .sort_by_file_path(|a, b| a.cmp(b));
-    let _ = builder.add_ignore(common_dir.join("info").join("exclude"));
+    if let Some(global) = identity::global_excludes_file(home) {
+        let _ = builder.add_ignore(global);
+    }
+    // `info/exclude` and whatever leads to it (`info` can be a link too).
+    if let Ok(exclude) = identity::resolve_safe(&common_dir.join("info").join("exclude"), home) {
+        let _ = builder.add_ignore(exclude);
+    }
     let only = only_under.map(Path::to_path_buf);
+    let home = home.map(Path::to_path_buf);
     builder.filter_entry(move |entry| {
         if entry.depth() == 0 {
             return true;
@@ -566,11 +607,32 @@ fn untracked_walk(root: &Path, common_dir: &Path, only_under: Option<&Path>) -> 
         if name.is_some_and(|n| is_hard_skip_dir(n) || UNTRACKED_SKIP_DIRS.contains(&n)) {
             return false;
         }
+        if !is_dir {
+            return true;
+        }
+        // The crate opens this directory's `.gitignore` / `.ignore` once it
+        // descends: a directory with one that links into a protected folder is
+        // not entered.
+        if ignore_dir_has_protected_link(entry.path(), home.as_deref()) {
+            return false;
+        }
         // A nested repo or worktree is somebody else's view. `lstat`, so a
         // `.git` that is a symlink is never followed.
-        !(is_dir && std::fs::symlink_metadata(entry.path().join(".git")).is_ok())
+        std::fs::symlink_metadata(entry.path().join(".git")).is_err()
     });
-    builder.build()
+    Some(builder.build())
+}
+
+/// Is `dir/.gitignore` or `dir/.ignore` a symlink that leads into a protected
+/// folder? One `lstat` each; `resolve_safe` only for an actual symlink. A
+/// missing file, a regular file, or a link to an ordinary place is fine: the
+/// crate may open those.
+fn ignore_dir_has_protected_link(dir: &Path, home: Option<&Path>) -> bool {
+    [".gitignore", ".ignore"].iter().any(|name| {
+        let file = dir.join(name);
+        std::fs::symlink_metadata(&file).is_ok_and(|m| m.file_type().is_symlink())
+            && identity::resolve_safe(&file, home).is_err_and(|e| identity::is_protected_error(&e))
+    })
 }
 
 /// Code files found by `untracked_walk` that `keep` accepts, in path order.
@@ -580,6 +642,7 @@ pub(super) fn collect_walk(
     root: &Path,
     common_dir: &Path,
     only_under: Option<&Path>,
+    home: Option<&Path>,
     keep: impl Fn(&str) -> bool,
     allowance: usize,
     visit_budget: usize,
@@ -589,7 +652,14 @@ pub(super) fn collect_walk(
         stopped: false,
         visited: 0,
     };
-    for entry in untracked_walk(root, common_dir, only_under) {
+    let Some(walk) = untracked_walk(root, common_dir, only_under, home) else {
+        // An ignore file of the root or an ancestor links into a protected
+        // folder: no safe walk exists, so nothing is walked and the view is
+        // marked truncated.
+        out.stopped = true;
+        return out;
+    };
+    for entry in walk {
         let Ok(entry) = entry else {
             // An unreadable entry is still a visit.
             if out.visited >= visit_budget {
@@ -635,6 +705,7 @@ fn walk_untracked(
     view: &ViewId,
     common_dir: &Path,
     tracked: &HashSet<String>,
+    home: Option<&Path>,
     allowance: usize,
     visit_budget: usize,
 ) -> WalkOutcome {
@@ -642,6 +713,7 @@ fn walk_untracked(
         &view.worktree_path,
         common_dir,
         None,
+        home,
         |rel| !tracked.contains(rel),
         allowance,
         visit_budget,
@@ -743,6 +815,7 @@ fn collect_view(
             view,
             common_dir,
             &tracked,
+            home.as_deref(),
             room,
             walk_visit_budget(opts.max_files_per_view),
         );
@@ -1126,6 +1199,7 @@ pub(crate) fn expand_dir_events_with(
             &root,
             Path::new(&view.common_dir),
             Some(&abs),
+            home.as_deref(),
             |_| true,
             room,
             walk_visit_budget(MAX_FILES_PER_PROJECT),
