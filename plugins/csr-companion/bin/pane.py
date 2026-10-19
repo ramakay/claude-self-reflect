@@ -4000,14 +4000,21 @@ def attached_session(agent):
     """The session id a `claude attach <id>` in Claude's herdr pane shows, from that background job's state.json; None
     when what runs there is not an attach client, or on any doubt. That client runs the plugin under a session id of its
     own, which names no transcript and gets no status line, so the pane follows the attached session instead
-    (2026-10-17: every gauge blank beside `claude attach eda7fbcf`)."""
+    (2026-10-17: every gauge blank beside `claude attach eda7fbcf`). `claude agents` names no job in its argv: the job
+    it shows is the session herdr reports for the pane, believed only when a job's state.json names it (2026-10-18)."""
     try:
         info = json.loads(herdr('pane', 'process-info', '--pane', agent) or '')['result']['process_info']
         leader = next(p for p in info['foreground_processes'] if p['pid'] == info['foreground_process_group_id'])
         argv = [str(word) for word in leader.get('argv') or ()]
-        if len(argv) < 3 or os.path.basename(argv[0]) != 'claude' or argv[1] != 'attach':
+        if len(argv) < 2 or os.path.basename(argv[0]) != 'claude' or argv[1] not in ('attach', 'agents'):
             return None
-        job = next(word for word in argv[2:] if not word.startswith('-'))
+        if argv[1] == 'agents':
+            shown = json.loads(herdr('pane', 'get', agent) or '')['result']['pane'].get('agent_session') or {}
+            job = shown.get('value') if shown.get('kind') == 'id' else None
+        else:
+            job = next(word for word in argv[2:] if not word.startswith('-'))
+        if not isinstance(job, str):
+            return None
         if not re.fullmatch(r'[0-9a-f-]+', job):
             return None
         with open(os.path.join(JOBS, job[:8], 'state.json'), encoding='utf-8') as handle:

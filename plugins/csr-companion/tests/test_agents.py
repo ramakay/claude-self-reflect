@@ -1019,3 +1019,17 @@ class AttachedSession(unittest.TestCase):
         for said in (None, '', 'not json', '{}'):
             pane.herdr = lambda *args, said=said: said
             self.assertIsNone(pane.attached_session('w2:p1'), repr(said))
+
+    def agents_view(self, session, kind='id'):
+        """Claude's pane runs `claude agents`, and herdr reports session for that pane."""
+        got = json.dumps(dict(result=dict(pane=dict(agent='claude', agent_session=dict(kind=kind, value=session)))))
+        info = process_info('claude', argv=['/Users/me/.local/bin/claude', 'agents'])
+        pane.herdr = lambda *args: info if args[1] == 'process-info' else got if args[1] == 'get' else ''
+
+    def test_the_agents_view_names_the_job_herdr_reports_for_its_pane(self):
+        """10-18: `claude agents` showed job 3dc113f0; the pane kept the client's own id and every gauge read --."""
+        self.agents_view(self.FULL)
+        self.assertEqual(pane.attached_session('w2:p1'), self.FULL)
+        for session, kind in ((self.FULL, 'name'), ('deadbeef-0000', 'id'), ('../../etc', 'id'), (None, 'id'), (7, 'id')):
+            self.agents_view(session, kind)
+            self.assertIsNone(pane.attached_session('w2:p1'), (session, kind))  # no job names it: the mod's own id
