@@ -2,7 +2,7 @@
 title: Quick Start
 ---
 
-> Everything below assumes CSR is activated — you've run `csr-engine setup` and restarted Claude Code. Setup also installed the csr-companion plugin unless you passed `--no-companion`; if so, run `/plugin marketplace add ramakay/claude-self-reflect` and `/plugin install csr-companion@claude-self-reflect` in Claude Code. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
+> Everything below assumes CSR is activated — you've run `csr-engine setup` (`claude-self-reflect setup` for an npm install) and restarted Claude Code. Setup also installed the csr-companion plugin unless you passed `--no-companion`; if so, run `/plugin marketplace add ramakay/claude-self-reflect` and `/plugin install csr-companion@claude-self-reflect` in Claude Code. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
 
 ## Your First Search
 
@@ -34,11 +34,14 @@ Claude uses `csr_reflect_on_past` for semantic search across all history.
 
 You don't need to do anything for these:
 
-- **Session start**: Past context injected before you ask
-- **Every prompt**: Context predicted and provided proactively
-- **Session end**: Session summarized and indexed
-- **Context compaction**: Transcript imported and recap anchor refreshed before trim
-- **File edits**: Tracked for future file-based search
+- **Session start**: one recap line on where you left off, and one learnt line on what CSR stored for your last session
+- **File mentions**: name a file in your prompt, or write `@path`, and its edit history comes along
+- **Worktrees and subfolders**: start Claude in either and you get the repo's history, not an empty memory
+- **Subagent runs**: imported and searchable like any other session
+- **After compaction**: the recap names the task you were on
+- **Resume**: after `claude -c` or a resume, CSR names the session you continued
+
+CSR also maps the repo you work in, so it can answer where a function lives even if no conversation touched it.
 
 ## Run Evaluation
 
