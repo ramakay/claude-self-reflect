@@ -610,6 +610,12 @@ pub fn engine_outputs() -> Vec<Output> {
         session_start::format_empty_status(100, 7),
     ));
     out.push(output(
+        "no-history",
+        "empty_status",
+        R::EmptyStatus,
+        session_start::NO_HISTORY_NOTE.to_string(),
+    ));
+    out.push(output(
         "degraded-status",
         "degraded_status",
         R::DegradedStatus,
