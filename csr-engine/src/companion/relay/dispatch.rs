@@ -184,7 +184,11 @@ pub fn default_table() -> Table {
         event: Some(h),
         after: None,
     };
-    HashMap::from([("start", only(start())), ("csr", only(csr()))])
+    HashMap::from([
+        ("start", only(start())),
+        ("csr", only(csr())),
+        ("measure", only(crate::companion::usage::measure())),
+    ])
 }
 
 pub struct App {

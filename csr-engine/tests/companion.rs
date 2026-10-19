@@ -30,7 +30,7 @@ fn home() -> (tempfile::TempDir, Paths) {
     }
     copy(&source, d.path());
     let paths = Paths::new(d.path().into());
-    // *.db is gitignored, so the DB is built from oracle.py's dump, never copied.
+    // *.db is gitignored, so the DB is built from home.sql, never copied.
     let _ = fs::remove_file(&paths.db);
     let con = rusqlite::Connection::open(&paths.db).unwrap();
     con.execute_batch(include_str!("fixtures/companion/home.sql"))

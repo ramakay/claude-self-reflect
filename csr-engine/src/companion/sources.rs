@@ -1,20 +1,83 @@
 use super::{
-    num,
+    array, num,
     paths::{folders, read_json, Paths},
 };
 use serde_json::{json, Value};
 
+/// How old a kept usage file may be and still be read.
+const KEPT_FOR: f64 = 86400.;
+
+/// The masthead's status fields (`context_window`, `rate_limits`) from one usage file, which is
+/// what `usage::measure` wrote: the mod's `context`, `rateLimits` and `cost`. A window it has no
+/// figure for is left out, never zeroed.
+pub fn usage_fields(usage: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let context = &usage["context"];
+    let size = context["window"]
+        .as_f64()
+        .filter(|n| n.is_finite() && *n > 0.);
+    let tokens = context["tokens"]
+        .as_f64()
+        .filter(|n| n.is_finite() && *n >= 0.)
+        .or_else(|| {
+            let percent = context["percent"].as_f64().filter(|n| n.is_finite())?;
+            Some((size? * percent / 100.).round())
+        });
+    if size.is_some() || tokens.is_some() {
+        let mut window = serde_json::Map::new();
+        if let Some(tokens) = tokens {
+            window.insert("total_input_tokens".into(), json!(tokens));
+        }
+        if let Some(size) = size {
+            window.insert("context_window_size".into(), json!(size));
+        }
+        out.insert("context_window".into(), Value::Object(window));
+    }
+    let mut limits = serde_json::Map::new();
+    for row in array(&usage["rateLimits"]) {
+        let (Some(kind), Some(used)) = (
+            row["kind"].as_str().filter(|k| !k.is_empty()),
+            row["percentUsed"].as_f64().filter(|n| n.is_finite()),
+        ) else {
+            continue;
+        };
+        let mut window = serde_json::Map::new();
+        window.insert("used_percentage".into(), json!(used));
+        if let Some(resets) = row["resetsAt"].as_str().and_then(super::paths::epoch) {
+            window.insert("resets_at".into(), json!(resets));
+        }
+        limits.insert(kind.to_owned(), Value::Object(window));
+    }
+    out.insert("rate_limits".into(), Value::Object(limits));
+    Value::Object(out)
+}
+
+/// One session's masthead fields: its usage file when a fresh one exists, plus `prompt_cache`
+/// from the newest reply in its transcript. Null when there is neither.
 pub fn kept_status(paths: &Paths, sid: &str, now: f64) -> Value {
-    let v = paths
-        .kept_file("statusline", sid)
+    let usage = paths
+        .kept_file(super::usage::FOLDER, sid)
         .map(|p| read_json(&p))
         .unwrap_or(Value::Null);
-    if v["fields"].is_object() && now - num(&v["at"]) < 86400. {
-        v
+    let fresh = usage.is_object() && now - num(&usage["at"]) < KEPT_FOR;
+    let mut fields = if fresh {
+        usage_fields(&usage)
     } else {
-        Value::Null
+        json!({})
+    };
+    let tokens = fields["context_window"]["total_input_tokens"]
+        .as_f64()
+        .filter(|n| *n > 0.);
+    if let Some(cache) = prompt_cache(paths, sid, now, tokens) {
+        fields["prompt_cache"] = cache;
     }
+    if fields.as_object().is_some_and(|v| v.is_empty()) {
+        return Value::Null;
+    }
+    json!({ "at": if fresh { usage["at"].clone() } else { Value::Null }, "fields": fields })
 }
+
+/// The account's rate-limit windows, from the newest usage file of any session.
 pub fn account_limits(paths: &Paths, now: f64) -> Value {
     type Hit = (std::time::SystemTime, u64, f64, Value);
     static CACHE: std::sync::LazyLock<
@@ -24,7 +87,7 @@ pub fn account_limits(paths: &Paths, now: f64) -> Value {
         return json!({});
     };
     let mut best: Option<(f64, Value)> = None;
-    for path in folders(&paths.keep.join("statusline")) {
+    for path in folders(&paths.keep.join(super::usage::FOLDER)) {
         if path.extension().is_none_or(|s| s != "json") {
             continue;
         }
@@ -39,7 +102,7 @@ pub fn account_limits(paths: &Paths, now: f64) -> Value {
             .is_none_or(|hit| hit.0 != modified || hit.1 != stat.len())
         {
             let kept = read_json(&path);
-            let limits = &kept["fields"]["rate_limits"];
+            let limits = &usage_fields(&kept)["rate_limits"];
             cache.insert(
                 path.clone(),
                 (
@@ -56,13 +119,155 @@ pub fn account_limits(paths: &Paths, now: f64) -> Value {
         }
         let hit = &cache[&path];
         if hit.3.as_object().is_some_and(|v| !v.is_empty())
-            && now - hit.2 < 86400.
+            && now - hit.2 < KEPT_FOR
             && best.as_ref().is_none_or(|(at, _)| hit.2 > *at)
         {
             best = Some((hit.2, hit.3.clone()));
         }
     }
     best.map(|(_, v)| v).unwrap_or(json!({}))
+}
+
+/// How long the prompt cache holds after a reply: an hour once the reply wrote 1 h entries.
+const CACHE_TTL: f64 = 300.;
+const CACHE_TTL_LONG: f64 = 3600.;
+
+/// The newest main-thread reply of a transcript that reported usage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reply {
+    pub at: f64,
+    pub long: bool,
+    pub tokens: f64,
+}
+
+/// The newest reply in `text`, a run of whole transcript lines. A reply with no input at all is
+/// not one: it is an error notice, not a response.
+pub fn newest_reply(text: &[u8]) -> Option<Reply> {
+    text.rsplit(|b| *b == b'\n').find_map(|line| {
+        if !contains(line, b"\"usage\"") || !contains(line, b"assistant") {
+            return None;
+        }
+        let e = sonic_rs::from_slice::<Value>(line).ok()?;
+        if e["type"] != "assistant" || e["isSidechain"] == true {
+            return None;
+        }
+        let usage = &e["message"]["usage"];
+        if !usage.is_object() {
+            return None;
+        }
+        let tokens: f64 = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .map(|k| num(&usage[k]))
+        .sum();
+        let at = e["timestamp"].as_str().and_then(super::paths::epoch)?;
+        (tokens > 0.).then(|| Reply {
+            at,
+            long: num(&usage["cache_creation"]["ephemeral_1h_input_tokens"]) > 0.,
+            tokens,
+        })
+    })
+}
+
+fn contains(line: &[u8], needle: &[u8]) -> bool {
+    line.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The tail of `path` that holds a reply: 256 KiB first, up to 16 MiB for long tool results.
+fn reply_in(path: &std::path::Path) -> Option<Reply> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut want = 256 * 1024_u64;
+    loop {
+        let from = len.saturating_sub(want);
+        file.seek(SeekFrom::Start(from)).ok()?;
+        let mut bytes = vec![];
+        file.by_ref()
+            .take(len - from)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        let whole = if from == 0 {
+            &bytes[..]
+        } else {
+            let line = bytes.iter().position(|b| *b == b'\n');
+            &bytes[line.map_or(bytes.len(), |i| i + 1)..]
+        };
+        if let Some(reply) = newest_reply(whole) {
+            return Some(reply);
+        }
+        if from == 0 || want >= 16 * 1024 * 1024 {
+            return None;
+        }
+        want *= 4;
+    }
+}
+
+/// A transcript's newest reply, read again only when the file changed; the file is looked for
+/// again every ten seconds until it is found.
+fn transcript_reply(paths: &Paths, sid: &str, now: f64) -> Option<Reply> {
+    type Seen = (
+        f64,
+        Option<std::path::PathBuf>,
+        Option<(std::time::SystemTime, u64)>,
+        Option<Reply>,
+    );
+    static CACHE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<(std::path::PathBuf, String), Seen>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if !super::paths::valid_id(sid) {
+        return None;
+    }
+    let mut cache = CACHE.lock().ok()?;
+    let seen = cache
+        .entry((paths.home.clone(), sid.to_owned()))
+        .or_insert((f64::MIN, None, None, None));
+    if seen.1.as_ref().is_none_or(|p| !p.is_file()) {
+        if now >= seen.0 && now - seen.0 < 10. {
+            return None;
+        }
+        seen.0 = now;
+        seen.1 = super::session::session_record(paths, sid)
+            .map(|record| {
+                paths
+                    .project_folder(record["cwd"].as_str().unwrap_or(""))
+                    .join(format!("{sid}.jsonl"))
+            })
+            .filter(|p| p.is_file())
+            .or_else(|| paths.transcript(sid));
+        seen.2 = None;
+        seen.3 = None;
+    }
+    let path = seen.1.clone()?;
+    let stat = std::fs::metadata(&path).ok()?;
+    let mark = (stat.modified().ok()?, stat.len());
+    if seen.2 != Some(mark) {
+        seen.3 = reply_in(&path);
+        seen.2 = Some(mark);
+    }
+    seen.3
+}
+
+/// The `prompt_cache` the masthead reads, from the newest reply of the session's transcript: the
+/// cache holds for an hour after a reply that wrote 1 h entries, five minutes otherwise. `tokens`
+/// is the context the usage file reports; the reply's own input stands in without it.
+pub fn prompt_cache(paths: &Paths, sid: &str, now: f64, tokens: Option<f64>) -> Option<Value> {
+    let reply = transcript_reply(paths, sid, now)?;
+    let ttl = if reply.long {
+        CACHE_TTL_LONG
+    } else {
+        CACHE_TTL
+    };
+    let expires = reply.at + ttl;
+    Some(json!({
+        "warm": now < expires,
+        "ttl": if reply.long { "1h" } else { "5m" },
+        "expires_at": expires,
+        "recache_tokens_if_cold": tokens.unwrap_or(reply.tokens),
+    }))
 }
 
 pub fn csr_status(paths: &Paths) -> Value {
