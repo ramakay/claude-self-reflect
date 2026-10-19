@@ -57,5 +57,5 @@ The other model calls go through `claude -p` and use your Claude Code login, not
 
 ## Help
 
-- `csr-engine eval --full` — 20 diagnostic tests
+- `csr-engine eval --full` — 24 diagnostic tests
 - [GitHub Issues](https://github.com/ramakay/claude-self-reflect/issues)

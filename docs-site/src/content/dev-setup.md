@@ -4,7 +4,7 @@ title: Development Setup
 
 ## Prerequisites
 
-- Rust 1.73+
+- Current stable Rust (built and tested on 1.98.1)
 - macOS (Apple Silicon) or Linux
 - Git
 

@@ -6,7 +6,7 @@ title: Installation
 
 - **macOS** (Apple Silicon) or **Linux** (x86_64 / ARM64)
 - **Claude Code** CLI installed
-- ~50MB disk for binary, ~100MB for database
+- ~78 MB disk for the binary, ~87 MB for the embedding model (downloaded on first run); the database grows with your history
 - For the optional companion pane: Claude Code 2.1.296 or later, and `python3` 3.9 or later on your PATH (the macOS system `python3` is 3.9)
 
 No Docker and no API keys. The engine needs no Python. Only the companion pane runs `python3`.
