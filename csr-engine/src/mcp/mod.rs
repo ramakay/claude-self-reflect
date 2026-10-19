@@ -1070,6 +1070,17 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2025_11_25,
 ];
 
+/// What the server tells the host about itself. The routing lines describe
+/// which tool answers which kind of question; they are not instructions to
+/// call a tool on every turn.
+const SERVER_INSTRUCTIONS: &str = "\
+Claude Self-Reflect: Search past conversations and store reflections with semantic search and time-based memory decay.
+Why a piece of code or a decision exists: csr_why.
+Who touched a file: csr_search_by_file.
+What we worked on lately: get_recent_work.
+\"Remember this\": store_reflection.
+The SessionStart recap is history, not a task list.";
+
 impl ServerHandler for CsrServer {
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
@@ -1084,13 +1095,8 @@ impl ServerHandler for CsrServer {
                 .enable_tasks()
                 .build(),
         )
-        .with_instructions(
-            "Claude Self-Reflect: Search past conversations and store reflections with semantic search and time-based memory decay.",
-        )
-        .with_server_info(Implementation::new(
-            "csr-engine",
-            env!("CARGO_PKG_VERSION"),
-        ))
+        .with_instructions(SERVER_INSTRUCTIONS)
+        .with_server_info(Implementation::new("csr-engine", env!("CARGO_PKG_VERSION")))
     }
 
     async fn complete(
@@ -1340,6 +1346,21 @@ mod tests {
         // The cap must still include the newest revision rmcp does serve,
         // so we don't silently downgrade below it.
         assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2025_11_25));
+    }
+
+    #[test]
+    fn server_instructions_route_to_tools_that_exist() {
+        let names = CsrServer::tool_names();
+        for tool in [
+            "csr_why",
+            "csr_search_by_file",
+            "get_recent_work",
+            "store_reflection",
+        ] {
+            assert!(SERVER_INSTRUCTIONS.contains(tool), "{tool} not routed");
+            assert!(names.iter().any(|n| n == tool), "{tool} is not a tool");
+        }
+        assert!(SERVER_INSTRUCTIONS.contains("history, not a task list"));
     }
 
     #[test]
