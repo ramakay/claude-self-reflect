@@ -282,10 +282,7 @@ pub async fn handle(
     eprintln!("  Reflections:   {}", reflections);
     eprintln!("  Projects:      {}", projects);
     eprintln!();
-    eprint!(
-        "{}",
-        next_steps(anthropic_key.is_some(), companion_outcome.as_ref())
-    );
+    eprint!("{}", next_steps(companion_outcome.as_ref()));
 
     Ok(())
 }
@@ -549,12 +546,7 @@ fn one_line(text: &str) -> String {
 /// What a successful setup ends with: the next steps, then the companion's
 /// receipt, or its manual install lines when it was skipped or failed.
 /// `companion` is `None` when `--no-companion` skipped the install.
-fn next_steps(has_anthropic_key: bool, companion: Option<&CompanionOutcome>) -> String {
-    let narratives = if has_anthropic_key {
-        "  3. Run `csr-engine daemon` for AI-powered narrative enrichment"
-    } else {
-        "  3. Optional: `csr-engine setup --anthropic-key=sk-ant-...` for AI narratives"
-    };
+fn next_steps(companion: Option<&CompanionOutcome>) -> String {
     let manual = |lead: String| {
         format!(
             "{lead}\nOptional: the CSR companion pane. In Claude Code, run:\n{}\n",
@@ -576,7 +568,7 @@ fn next_steps(has_anthropic_key: bool, companion: Option<&CompanionOutcome>) -> 
         None => manual("companion: skipped (--no-companion)".to_string()),
     };
     format!(
-        "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Try: reflect_on_past(\"what did we work on?\")\n{narratives}\n\n{companion_text}"
+        "Next steps:\n  1. Restart Claude Code to activate MCP tools\n  2. Open Claude Code in a project you have worked in; its first line recaps where you left off\n  3. Ask in plain words, e.g. \"what did we work on last week?\"\n\n{companion_text}"
     )
 }
 
@@ -1259,7 +1251,7 @@ mod tests {
             calls[1],
             "plugin install csr-companion --marketplace /some/marketplace --json"
         );
-        let text = next_steps(false, Some(&outcome));
+        let text = next_steps(Some(&outcome));
         assert!(
             text.contains("companion: csr-companion 0.5.0 from claude-self-reflect, scope user\nRun /reload-plugins in Claude Code (or restart it) to load it.\n"),
             "{text}"
@@ -1277,7 +1269,7 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(fake.calls(), vec!["plugin list --json".to_string()]);
-        let text = next_steps(true, Some(&outcome));
+        let text = next_steps(Some(&outcome));
         assert!(
             text.contains("companion: csr-companion 0.5.0 from claude-self-reflect, scope user (already installed)"),
             "{text}"
@@ -1302,14 +1294,12 @@ mod tests {
         };
         assert!(reason.contains(needle), "{reason}");
         assert_eq!(reason.lines().count(), 1, "one line: {reason}");
-        for key in [true, false] {
-            let text = next_steps(key, Some(outcome));
-            assert!(
-                text.contains(&format!("companion: not installed: {reason}\n")),
-                "{text}"
-            );
-            assert_eq!(tail_two(&text), TWO_LINES, "{text}");
-        }
+        let text = next_steps(Some(outcome));
+        assert!(
+            text.contains(&format!("companion: not installed: {reason}\n")),
+            "{text}"
+        );
+        assert_eq!(tail_two(&text), TWO_LINES, "{text}");
     }
 
     #[test]
@@ -1381,7 +1371,7 @@ mod tests {
             "claude was called: {:?}",
             fake.calls()
         );
-        let text = next_steps(false, outcome.as_ref());
+        let text = next_steps(outcome.as_ref());
         assert!(
             text.contains("companion: skipped (--no-companion)"),
             "{text}"
@@ -1397,22 +1387,23 @@ mod tests {
 
     #[test]
     fn setup_next_steps_end_with_companion_install_lines() {
-        for key in [true, false] {
-            let text = next_steps(key, None);
-            assert!(text.starts_with("Next steps:\n  1. Restart Claude Code"));
-            assert!(text.ends_with(&format!("{}\n", companion_install_instructions())));
-            let tail: Vec<&str> = text.lines().rev().take(2).collect();
-            assert_eq!(
-                tail,
-                [
-                    "/plugin install csr-companion@claude-self-reflect",
-                    "/plugin marketplace add ramakay/claude-self-reflect"
-                ]
-            );
-            // and the earlier steps are as they were
-            assert_eq!(text.contains("csr-engine daemon"), key);
-            assert_eq!(text.contains("--anthropic-key=sk-ant-"), !key);
-        }
+        let text = next_steps(None);
+        assert!(text.starts_with("Next steps:\n  1. Restart Claude Code"));
+        assert!(text.ends_with(&format!("{}\n", companion_install_instructions())));
+        let tail: Vec<&str> = text.lines().rev().take(2).collect();
+        assert_eq!(
+            tail,
+            [
+                "/plugin install csr-companion@claude-self-reflect",
+                "/plugin marketplace add ramakay/claude-self-reflect"
+            ]
+        );
+        // the steps name a recap and a plain-words question, not a tool or a key
+        assert!(text.contains("its first line recaps where you left off"));
+        assert!(text.contains("\"what did we work on last week?\""));
+        assert!(!text.contains("reflect_on_past"), "{text}");
+        assert!(!text.contains("--anthropic-key"), "{text}");
+        assert!(!text.contains("csr-engine daemon"), "{text}");
     }
 
     #[test]
