@@ -49,38 +49,53 @@ function tree($, e, node, beneath) {
   const T = $.ui.resolve(e)
   const props = { ...node.props }
   if (node.type === 'Button') props.onPress = () => void run($, '/press', { key: node.props.key, requestId: e.requestId }).catch(() => undefined)
-  return T[node.type](props, ...(node.children || []).map(k => tree($, e, k, beneath)))
+  return T[node.type]({ ...props, children: (node.children || []).map(k => tree($, e, k, beneath)) })
 }
 function pushed($, line) {
   let r
   try { r = JSON.parse(line) } catch { return }
   void settle($, r).catch(() => undefined)
 }
-async function spawn($) {
+// A child that ends before it is ready, or within SOON of it, counts against the engine; TRIES of
+// those in a row stop the respawning. A child that lives LONG clears the count.
+const SOON = 10000
+const LONG = 60000
+const TRIES = 3
+let fails = 0
+async function spawn($, e, again) {
   const g = ++gen
-  sock = SOCK_DIR + '/' + (await $.session.id()).slice(0, 8) + '.sock'
-  const child = $.process.spawn({ argv: [ENGINE, 'companion', 'serve', '--sock', sock, '--relay', V] })
-  let ready
+  const born = await $.clock.now()
+  const mine = SOCK_DIR + '/' + (await $.session.id()).slice(0, 8) + '-' + Math.floor(born).toString(36) + '.sock'
+  sock = mine
+  let ready, readyAt = 0, heard = false, failed = false
   const up = new Promise(res => { ready = res })
   $.clock.after(5000, () => ready())
   void (async () => {
     let rest = ''
     try {
-      for await (const { stream, text } of child) {
+      for await (const { stream, text } of $.process.spawn({ argv: [ENGINE, 'companion', 'serve', '--sock', mine, '--relay', V] })) {
         if (g !== gen) return
+        heard = true
         if (stream !== 'stdout') continue
         rest += text
         for (let nl; (nl = rest.indexOf('\n')) >= 0; rest = rest.slice(nl + 1)) {
           const line = rest.slice(0, nl)
-          if (line === 'ready') ready()
+          if (line === 'ready') { readyAt = await $.clock.now(); ready() }
           else pushed($, line)
         }
       }
-    } catch {}
+    } catch { failed = !heard }
     ready()
-    if (g === gen) { sock = null; $.clock.after(2000, () => void spawn($)) }
+    if (g !== gen) return
+    sock = null
+    const ended = await $.clock.now()
+    if (ended - born >= LONG) fails = 0
+    else if (!readyAt || ended - readyAt < SOON) fails++
+    if (fails < TRIES) $.clock.after(2000, () => void spawn($, e, true))
+    else if (fails++ === TRIES) void $.ui.toast(failed ? 'CSR engine missing: npx claude-self-reflect setup' : 'CSR engine keeps stopping: run csr-engine setup')
   })()
   await up
+  if (sock === mine) await run($, '/event', again ? { k: 'start', e, respawn: true } : { k: 'start', e }).catch(() => undefined)
 }
 async function gated($, k, e, next) {
   const r = await run($, '/event', { k, e })
@@ -99,8 +114,7 @@ async function drawn($, k, e, next) {
 function pass(_$, e, next) { return next(e) }
 async function start($, e, next) {
   const started = await next(e)
-  await spawn($)
-  await run($, '/event', { k: 'start', e }).catch(() => undefined)
+  await spawn($, e, false)
   return started
 }
 function stop($, e, next) { return told($, 'stop', e, next) }

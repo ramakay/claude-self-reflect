@@ -1581,15 +1581,83 @@ mod relay {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(rows.len(), 4);
+        // boot, the start request, the first step, what the usage call came back with, its step.
+        assert_eq!(rows.len(), 5);
         assert_eq!(rows[0]["k"], "boot");
         assert_eq!(rows[0]["pid"], serve.child.id());
         assert_eq!(rows[1]["k"], "start");
         assert_eq!(rows[1]["sid"], "s1");
         assert_eq!(rows[1]["pid"], serve.child.id());
+        assert_eq!(rows[1]["e"], json!({ "cwd": "/r" }));
         assert!(rows[1]["bytes"].as_u64().unwrap() > 0);
         assert!(rows[1]["handle_us"].is_u64());
-        assert_eq!(rows[3]["usage"][0]["v"], json!({ "x": 1 }));
+        assert_eq!(rows[3]["k"], "usage");
+        assert_eq!(rows[3]["usage"], json!({ "x": 1 }));
+    }
+
+    #[test]
+    fn a_step_for_an_id_nobody_waits_for_replies_empty() {
+        let serve = start("1", &[]);
+        for body in [
+            json!({ "v": "1", "id": "e404", "results": [] }),
+            json!({ "v": "1", "results": [{ "id": "c1", "v": 1 }] }),
+        ] {
+            assert_eq!(post(&serve.sock, "/step", &body), json!({}));
+        }
+    }
+
+    #[test]
+    fn a_respawned_start_does_not_ask_for_the_command_again() {
+        let serve = start("1", &[]);
+        let first = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "sid": "s1", "cwd": "/r", "k": "start",
+                "e": { "isInteractive": true } }),
+        );
+        assert_eq!(first["calls"][0]["m"], "command.register");
+        let again = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "sid": "s1", "cwd": "/r", "k": "start", "respawn": true,
+                "e": { "isInteractive": true } }),
+        );
+        assert_eq!(again, json!({}));
+    }
+
+    #[test]
+    fn serve_clears_stale_sockets_from_its_folder_and_leaves_the_rest() {
+        let dir = tempfile::Builder::new()
+            .prefix("csr-t")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let dead = run.join("old-1a.sock");
+        drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+        let live = run.join("live-1a.sock");
+        let _live = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let note = run.join("note.txt");
+        std::fs::write(&note, "keep").unwrap();
+        // A socket younger than two seconds may belong to a child still starting up.
+        std::thread::sleep(Duration::from_millis(2200));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", dir.path())
+            .args(["companion", "serve", "--sock"])
+            .arg(run.join("new-1a.sock"))
+            .args(["--relay", "1"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        let kept = (dead.exists(), live.exists(), note.exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(kept, (false, true, true));
     }
 
     #[test]
@@ -1639,6 +1707,50 @@ mod relay {
             );
             assert!(p95 < 15., "{name} p95 {p95} ms");
         }
+    }
+
+    /// The relay alone, under `claude plugin test`: `$.http.fetch` and `$.process.spawn` are
+    /// scripted by the test kit, so the transport runs with no engine behind it.
+    #[test]
+    fn the_relay_passes_its_plugin_test_cases() {
+        let Ok(found) = Command::new("claude").arg("--version").output() else {
+            eprintln!("claude is not on PATH: relay cases skipped");
+            return;
+        };
+        if !found.status.success() {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let emit = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", home.path())
+            .args(["companion", "plugin", "emit"])
+            .arg(out.path())
+            .output()
+            .unwrap();
+        assert!(emit.status.success());
+        std::fs::create_dir(out.path().join("tests")).unwrap();
+        std::fs::write(
+            out.path().join("tests/relay.test.ts"),
+            include_str!("fixtures/relay/relay.test.ts"),
+        )
+        .unwrap();
+        let ran = Command::new("claude")
+            .env("HOME", home.path())
+            .args(["plugin", "test"])
+            .arg(out.path())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&ran.stdout).to_string()
+            + &String::from_utf8_lossy(&ran.stderr);
+        assert!(ran.status.success(), "{text}");
+        assert!(text.contains(" 0 fail"), "{text}");
+        let passed: usize = text
+            .lines()
+            .find_map(|l| l.trim().strip_suffix(" pass"))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0);
+        assert_eq!(passed, 11, "{text}");
     }
 
     #[test]

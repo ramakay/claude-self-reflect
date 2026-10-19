@@ -173,6 +173,11 @@ pub const HOOKS: &[Hook] = &[
     ),
 ];
 
+/// The hook the dispatcher knows by `key`.
+pub fn find(key: &str) -> Option<&'static Hook> {
+    HOOKS.iter().find(|h| h.key == key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,7 +211,8 @@ mod tests {
     fn no_handler_takes_the_name_of_a_relay_helper() {
         const HELPERS: &[&str] = &[
             "post", "act", "settle", "run", "tree", "pushed", "spawn", "gated", "told", "drawn",
-            "pass", "register", "ENGINE", "SOCK_DIR", "V", "sock", "gen",
+            "pass", "register", "ENGINE", "SOCK_DIR", "V", "sock", "gen", "SOON", "LONG", "TRIES",
+            "fails",
         ];
         for h in HOOKS {
             assert!(!HELPERS.contains(&h.name), "{}", h.name);

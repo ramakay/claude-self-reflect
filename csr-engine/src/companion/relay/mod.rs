@@ -3,24 +3,26 @@
 //! One child per Claude Code process. The generated `register.js` starts it with
 //! `$.process.spawn` and talks to it over a Unix socket (`POST /event|/after|/step|/press`);
 //! the child talks back by writing JSON lines on stdout, which the relay runs as `$` calls and
-//! answers on `/step`. The dispatcher here is a stub: WP1 replaces it.
+//! answers on `/step`. `host` is that trampoline, `session` and `store` are what handlers
+//! remember, `dispatch` routes a request to the handler for its hook key.
 
+pub mod dispatch;
 pub mod emit;
+pub mod host;
 pub mod manifest;
+pub mod session;
 
 use anyhow::{bail, Context, Result};
 use axum::{body::Bytes, extract::State, http::StatusCode, routing::post, Router};
+use dispatch::{default_table, App, Log};
+use host::{Hub, SystemClock};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
     fs::OpenOptions,
     io::Write,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -38,105 +40,9 @@ pub struct ServeArgs {
     pub relay: String,
 }
 
-const TOAST: &str = "CSR updated: run /reload-plugins";
-
-/// Why a pushed call was made: what the stub does with the answer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pending {
-    Registered,
-    Usage,
-}
-
-struct Shared {
-    relay: String,
-    pid: u32,
-    log: Option<Mutex<std::fs::File>>,
-    push: mpsc::UnboundedSender<String>,
-    events: AtomicU64,
-    seq: AtomicU64,
-    warned: AtomicBool,
-    pending: Mutex<HashMap<String, Pending>>,
-}
-
-impl Shared {
-    fn next_id(&self, prefix: &str) -> String {
-        format!("{prefix}{}", self.seq.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-
-    /// One `$` call, pushed to the relay.
-    fn push_call(&self, id: &str, method: &str, args: Value) {
-        let line = json!({ "id": id, "calls": [{ "id": "c1", "m": method, "a": args }] });
-        let _ = self.push.send(line.to_string());
-    }
-
-    fn log(&self, row: Value) {
-        if let Some(file) = &self.log {
-            if let Ok(mut file) = file.lock() {
-                let _ = writeln!(file, "{row}");
-            }
-        }
-    }
-
-    /// The stub dispatcher. Returns the reply and anything extra worth logging.
-    fn dispatch(&self, path: &str, body: &Value) -> (Value, Value) {
-        let sent = body.get("v").and_then(Value::as_str);
-        if sent != Some(self.relay.as_str()) && !self.warned.swap(true, Ordering::Relaxed) {
-            self.push_call(&self.next_id("p"), "ui.toast", json!([TOAST]));
-        }
-        match path {
-            "/event" => {
-                let events = self.events.fetch_add(1, Ordering::Relaxed) + 1;
-                match body.get("k").and_then(Value::as_str) {
-                    Some("start") => {
-                        let id = self.next_id("s");
-                        self.pending
-                            .lock()
-                            .unwrap()
-                            .insert(id.clone(), Pending::Registered);
-                        let reply = json!({ "id": id, "calls": [{
-                            "id": "c1", "m": "command.register", "a": [{
-                                "name": "csr",
-                                "description": "Open the CSR pane beside Claude; \
-                                    \"/csr dreams\" says how the dreamer is pacing itself",
-                            }],
-                        }] });
-                        (reply, json!({ "e": body.get("e") }))
-                    }
-                    Some("csr") => {
-                        let text = format!("csr relay ok pid={} events={events}", self.pid);
-                        (json!({ "answer": { "text": text } }), Value::Null)
-                    }
-                    Some("measure") => (json!({}), json!({ "e": body.get("e") })),
-                    _ => (json!({}), Value::Null),
-                }
-            }
-            "/step" => {
-                let id = body.get("id").and_then(Value::as_str).unwrap_or("");
-                let kind = self.pending.lock().unwrap().remove(id);
-                match kind {
-                    Some(Pending::Registered) => {
-                        let next = self.next_id("u");
-                        self.pending
-                            .lock()
-                            .unwrap()
-                            .insert(next.clone(), Pending::Usage);
-                        self.push_call(&next, "session.usage", json!([]));
-                        (
-                            json!({}),
-                            json!({ "step": "registered", "results": body.get("results") }),
-                        )
-                    }
-                    Some(Pending::Usage) => (
-                        json!({}),
-                        json!({ "step": "usage", "usage": body.get("results") }),
-                    ),
-                    None => (json!({}), Value::Null),
-                }
-            }
-            _ => (json!({}), Value::Null),
-        }
-    }
-}
+/// A socket younger than this is left alone by the stale sweep: its owner may be between `bind`
+/// and `listen`.
+const STALE_AFTER: Duration = Duration::from_secs(2);
 
 fn now_ms() -> f64 {
     SystemTime::now()
@@ -146,7 +52,7 @@ fn now_ms() -> f64 {
 }
 
 async fn endpoint(
-    shared: Arc<Shared>,
+    app: Arc<App>,
     path: &'static str,
     body: Bytes,
 ) -> (StatusCode, axum::Json<Value>) {
@@ -157,9 +63,9 @@ async fn endpoint(
             axum::Json(json!({ "error": "not JSON" })),
         );
     };
-    let (reply, extra) = shared.dispatch(path, &parsed);
+    let reply = app.handle(path, &parsed).await;
     let handle_us = started.elapsed().as_micros() as u64;
-    if shared.log.is_some() {
+    if app.log().enabled() {
         let mut row = json!({
             "at": now_ms(),
             "k": parsed.get("k"),
@@ -167,26 +73,32 @@ async fn endpoint(
             "sid": parsed.get("sid"),
             "bytes": body.len(),
             "handle_us": handle_us,
-            "pid": shared.pid,
+            "pid": std::process::id(),
         });
-        if let (Some(row), Some(extra)) = (row.as_object_mut(), extra.as_object()) {
-            row.extend(extra.clone());
+        if matches!(
+            parsed.get("k").and_then(Value::as_str),
+            Some("start" | "measure")
+        ) {
+            row["e"] = parsed.get("e").cloned().unwrap_or(Value::Null);
         }
-        shared.log(row);
+        if let Some(respawn) = parsed.get("respawn") {
+            row["respawn"] = respawn.clone();
+        }
+        app.log().row(row);
     }
     (StatusCode::OK, axum::Json(reply))
 }
 
-fn router(shared: Arc<Shared>) -> Router {
+fn router(app: Arc<App>) -> Router {
     let route = |path: &'static str| {
-        post(move |State(shared): State<Arc<Shared>>, body: Bytes| endpoint(shared, path, body))
+        post(move |State(app): State<Arc<App>>, body: Bytes| endpoint(app, path, body))
     };
     Router::new()
         .route("/event", route("/event"))
         .route("/after", route("/after"))
         .route("/step", route("/step"))
         .route("/press", route("/press"))
-        .with_state(shared)
+        .with_state(app)
 }
 
 /// A listener that hands the router only connections from this user.
@@ -219,12 +131,42 @@ impl axum::serve::Listener for OwnerOnly {
     }
 }
 
-/// Make the socket's folder private and clear a dead socket from the path.
+/// Remove sockets in `dir` that this user owns, that are at least `older_than` old, and that
+/// refuse a connection: what a child that was killed left behind. Anything else in the folder is
+/// left alone.
+fn sweep_stale(dir: &Path, older_than: Duration) {
+    let uid = unsafe { libc::getuid() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if meta.file_type().is_socket() && meta.uid() == uid && old {
+            let refused = std::os::unix::net::UnixStream::connect(&path)
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused);
+            if refused {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Make the socket's folder private, clear stale sockets from it, and clear a dead socket from
+/// the path itself.
 fn prepare(sock: &Path) -> Result<()> {
     let parent = sock.parent().context("the socket path has no folder")?;
     let root = super::private::default_root();
     super::private::ensure_dir(parent, &root)
         .with_context(|| format!("preparing {}", parent.display()))?;
+    sweep_stale(parent, STALE_AFTER);
     match std::fs::symlink_metadata(sock) {
         Ok(meta) if meta.file_type().is_socket() => {
             if std::os::unix::net::UnixStream::connect(sock).is_ok() {
@@ -304,19 +246,18 @@ async fn run(args: &ServeArgs) -> Result<()> {
     let log = std::env::var_os("CSR_RELAY_LOG")
         .filter(|path| !path.is_empty())
         .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
-        .map(Mutex::new);
+        .map_or_else(Log::default, Log::to);
     let (push, lines) = mpsc::unbounded_channel();
     let gone = Arc::new(Notify::new());
-    let shared = Arc::new(Shared {
-        relay: args.relay.clone(),
-        pid: std::process::id(),
-        log,
-        push,
-        events: AtomicU64::new(0),
-        seq: AtomicU64::new(0),
-        warned: AtomicBool::new(false),
-        pending: Mutex::new(HashMap::new()),
-    });
+    // The store opens on the first handler that asks for it, not here.
+    let app = App::new(
+        &args.relay,
+        Hub::new(push),
+        Arc::new(super::store::Store::at(super::store::default_path())),
+        Arc::new(SystemClock),
+        Arc::new(log),
+        default_table(),
+    );
 
     let stopped = stop_signals()?;
     {
@@ -325,13 +266,14 @@ async fn run(args: &ServeArgs) -> Result<()> {
         out.flush()?;
     }
     spawn_writer(lines, gone.clone());
-    shared.log(json!({ "at": now_ms(), "k": "boot", "path": "", "pid": shared.pid }));
+    app.log()
+        .row(json!({ "at": now_ms(), "k": "boot", "path": "", "pid": std::process::id() }));
 
     let listener = OwnerOnly {
         inner: listener,
         uid: unsafe { libc::getuid() },
     };
-    let served = axum::serve(listener, router(shared));
+    let served = axum::serve(listener, router(app));
     let result = tokio::select! {
         served = served => served.map_err(anyhow::Error::from),
         () = stopped => Ok(()),
@@ -353,80 +295,6 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn shared(relay: &str) -> (Arc<Shared>, mpsc::UnboundedReceiver<String>) {
-        let (push, lines) = mpsc::unbounded_channel();
-        let shared = Arc::new(Shared {
-            relay: relay.into(),
-            pid: 7,
-            log: None,
-            push,
-            events: AtomicU64::new(0),
-            seq: AtomicU64::new(0),
-            warned: AtomicBool::new(false),
-            pending: Mutex::new(HashMap::new()),
-        });
-        (shared, lines)
-    }
-
-    #[test]
-    fn start_asks_for_the_csr_command_and_the_answer_asks_for_usage() {
-        let (shared, mut lines) = shared("1");
-        let (reply, _) = shared.dispatch("/event", &json!({ "v": "1", "k": "start", "e": {} }));
-        let call = &reply["calls"][0];
-        assert_eq!(call["m"], "command.register");
-        assert_eq!(call["a"][0]["name"], "csr");
-        assert!(lines.try_recv().is_err());
-        let id = reply["id"].as_str().unwrap();
-        let (done, _) = shared.dispatch(
-            "/step",
-            &json!({ "v": "1", "id": id, "results": [{ "id": "c1", "v": { "command": "csr" } }] }),
-        );
-        assert_eq!(done, json!({}));
-        let pushed: Value = serde_json::from_str(&lines.try_recv().unwrap()).unwrap();
-        assert_eq!(pushed["calls"][0]["m"], "session.usage");
-        let (done, extra) = shared.dispatch(
-            "/step",
-            &json!({ "v": "1", "id": pushed["id"], "results": [{ "id": "c1", "v": { "a": 1 } }] }),
-        );
-        assert_eq!(done, json!({}));
-        assert_eq!(extra["usage"][0]["v"]["a"], 1);
-    }
-
-    #[test]
-    fn csr_answers_with_pid_and_the_running_event_count() {
-        let (shared, _lines) = shared("1");
-        shared.dispatch("/event", &json!({ "v": "1", "k": "tool" }));
-        let (reply, _) = shared.dispatch("/event", &json!({ "v": "1", "k": "csr" }));
-        assert_eq!(reply["answer"]["text"], "csr relay ok pid=7 events=2");
-    }
-
-    #[test]
-    fn everything_else_passes_through() {
-        let (shared, _lines) = shared("1");
-        for path in ["/event", "/after", "/press"] {
-            let (reply, _) = shared.dispatch(path, &json!({ "v": "1", "k": "guard" }));
-            assert_eq!(reply, json!({}));
-        }
-    }
-
-    #[test]
-    fn a_different_relay_version_toasts_once() {
-        let (shared, mut lines) = shared("2");
-        shared.dispatch("/event", &json!({ "v": "1", "k": "tool" }));
-        shared.dispatch("/event", &json!({ "v": "1", "k": "tool" }));
-        let pushed: Value = serde_json::from_str(&lines.try_recv().unwrap()).unwrap();
-        assert_eq!(pushed["calls"][0]["m"], "ui.toast");
-        assert_eq!(pushed["calls"][0]["a"][0], TOAST);
-        assert!(lines.try_recv().is_err());
-    }
-
-    #[test]
-    fn the_same_relay_version_never_toasts() {
-        let (shared, mut lines) = shared("2");
-        shared.dispatch("/event", &json!({ "v": "2", "k": "tool" }));
-        assert!(lines.try_recv().is_err());
-    }
 
     #[test]
     fn only_the_same_user_gets_through() {
@@ -478,5 +346,31 @@ mod tests {
         let _live = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(prepare(&sock).is_err());
         assert!(sock.exists());
+    }
+
+    #[test]
+    fn the_sweep_removes_dead_sockets_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let dead = dir.path().join("dead-1.sock");
+        drop(std::os::unix::net::UnixListener::bind(&dead).unwrap());
+        let live = dir.path().join("live-1.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "keep").unwrap();
+        let folder = dir.path().join("inner.sock");
+        std::fs::create_dir(&folder).unwrap();
+        let link = dir.path().join("link.sock");
+        std::os::unix::fs::symlink(&dead, &link).unwrap();
+        // A fresh socket is spared while its owner may still be starting up.
+        sweep_stale(dir.path(), Duration::from_secs(3600));
+        assert!(dead.exists());
+        sweep_stale(dir.path(), Duration::ZERO);
+        assert!(!dead.exists(), "a dead socket goes");
+        assert!(live.exists(), "a socket that answers stays");
+        assert!(file.exists() && folder.exists(), "other things stay");
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "a link to a socket is not a socket"
+        );
     }
 }

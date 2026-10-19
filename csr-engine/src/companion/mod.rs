@@ -25,6 +25,7 @@ pub mod render;
 pub mod send;
 pub mod session;
 pub mod sources;
+pub mod store;
 pub mod story;
 mod tail;
 pub mod watch;
