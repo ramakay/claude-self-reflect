@@ -134,57 +134,225 @@ where
     Arc::new(move |cx, e| Box::pin(f(cx, e)))
 }
 
-/// What the engine does for one hook key.
-#[derive(Clone, Default)]
+/// What one feature does for one hook key.
+#[derive(Clone)]
 pub struct Entry {
+    /// The feature module that registered it (`touch`, `carry`, ...), for logs and tests.
+    pub feature: &'static str,
     /// `/event`: `e` is the event as Claude Code gave it.
     pub event: Option<Handler>,
     /// `/after`: `e` is what `next` returned.
     pub after: Option<Handler>,
 }
 
-pub type Table = HashMap<&'static str, Entry>;
+/// The entries of every hook key, in the order they run.
+///
+/// Several features may act in one hook; `app::table()` registers them in the order the
+/// TypeScript's handler runs its statement groups. How they compose depends on the hook's shape:
+///
+/// - Notify: `/event` runs every entry, in order; a failure is logged and the next one still
+///   runs. No `/after`.
+/// - Gate: `/event` runs the entries in order. The first `answer` ends the chain. A `next` is the
+///   event of the entries after it, and the last one goes back. An entry's `left` reaches its own
+///   `/after`, which runs every entry in order, each seeing the `result` the one before replaced.
+/// - Render, Answer: exactly one entry per key (a second one panics in tests); its reply goes
+///   back. No `/after`.
+/// - Start, press: every entry, in order.
+/// - Stream: no `/event` (the relay posts only `/after`); every entry runs, with `{ e, result }`.
+#[derive(Default)]
+pub struct Table {
+    rows: HashMap<&'static str, Vec<Entry>>,
+}
+
+impl Table {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add `entry` after the ones `key` has.
+    pub fn add(&mut self, key: &'static str, entry: Entry) {
+        #[cfg(test)]
+        {
+            let one = matches!(
+                manifest::find(key).map(|hook| hook.shape),
+                Some(Shape::Render | Shape::Answer)
+            );
+            if one && self.rows.get(key).is_some_and(|row| !row.is_empty()) {
+                panic!("{key} takes one entry; {} is a second", entry.feature);
+            }
+        }
+        self.rows.entry(key).or_default().push(entry);
+    }
+
+    /// An entry that has an `/event` handler only.
+    pub fn on(&mut self, key: &'static str, feature: &'static str, event: Handler) {
+        self.add(
+            key,
+            Entry {
+                feature,
+                event: Some(event),
+                after: None,
+            },
+        );
+    }
+
+    /// An entry that has both.
+    pub fn gate(
+        &mut self,
+        key: &'static str,
+        feature: &'static str,
+        event: Handler,
+        after: Handler,
+    ) {
+        self.add(
+            key,
+            Entry {
+                feature,
+                event: Some(event),
+                after: Some(after),
+            },
+        );
+    }
+
+    /// An entry that has an `/after` handler only.
+    pub fn after(&mut self, key: &'static str, feature: &'static str, after: Handler) {
+        self.add(
+            key,
+            Entry {
+                feature,
+                event: None,
+                after: Some(after),
+            },
+        );
+    }
+
+    /// The entries of `key`, in the order they run.
+    pub fn entries(&self, key: &str) -> &[Entry] {
+        self.rows.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// The features that act in `key`, in the order they run.
+    pub fn features(&self, key: &str) -> Vec<&'static str> {
+        self.entries(key)
+            .iter()
+            .map(|entry| entry.feature)
+            .collect()
+    }
+}
 
 /// The key a button press is routed by; it is not a hook, so the manifest does not list it.
 pub const PRESS: &str = "press";
 
-fn start() -> Handler {
-    handler(|cx, _e| async move {
-        if cx.respawn {
-            // The registration lives in the module, not in the child that died.
-            return Ok(Reply::none());
-        }
-        let command = json!({
-            "name": "csr",
-            "description": "Open the CSR pane beside Claude; \
-                \"/csr dreams\" says how the dreamer is pacing itself",
-        });
-        let _ = cx.host.call("command.register", vec![command]).await;
-        let log = cx.log.clone();
-        cx.host.detach(Box::new(move |host| {
-            Box::pin(async move {
-                let usage = host.call("session.usage", vec![]).await.ok();
-                log.row(json!({ "k": "usage", "usage": usage }));
-            })
-        }));
-        Ok(Reply::none())
-    })
-}
-
-fn csr() -> Handler {
-    handler(|cx, _e| async move {
-        let text = format!("csr relay ok pid={} events={}", cx.pid, cx.events);
-        Ok(Reply::answer(json!({ "text": text })))
-    })
-}
-
-/// What the engine does today: the WP0 behaviour, nothing ported yet.
+/// What the engine does: every feature's entries, in `app::table()`'s order.
 pub fn default_table() -> Table {
-    let only = |h: Handler| Entry {
-        event: Some(h),
-        after: None,
+    crate::companion::app::table()
+}
+
+/// Run one entry's handler apart, so a panic in it is one entry's failure, not the chain's.
+async fn guarded(
+    key: &str,
+    feature: &str,
+    log: &Log,
+    run: &Handler,
+    cx: Ctx,
+    e: Value,
+) -> Option<Reply> {
+    let work = tokio::spawn(run(cx, e));
+    let failed = match work.await {
+        Ok(Ok(reply)) => return Some(reply),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(error) => format!("panicked: {error}"),
     };
-    HashMap::from([("start", only(start())), ("csr", only(csr()))])
+    log.row(json!({ "k": "error", "for": key, "feature": feature, "error": failed }));
+    None
+}
+
+/// What each entry of a gate left, as the one value `Session::leave` keeps: `[[index, left]]`.
+fn pack(lefts: Vec<(usize, Value)>) -> Option<Value> {
+    if lefts.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        lefts
+            .into_iter()
+            .map(|(at, left)| json!([at, left]))
+            .collect(),
+    ))
+}
+
+/// What entry number `at` left, out of what `pack` made.
+fn unpack(packed: &Option<Value>, at: usize) -> Option<Value> {
+    let rows = packed.as_ref()?.as_array()?;
+    let row = rows.iter().find(|row| row[0].as_u64() == Some(at as u64))?;
+    Some(row[1].clone())
+}
+
+/// `/event` for every entry of `key`, by the hook's shape.
+async fn chain_event(key: &str, shape: Shape, entries: &[Entry], cx: Ctx, e: Value) -> Reply {
+    let mut current = e;
+    let mut rewritten = false;
+    let mut lefts = Vec::new();
+    for (at, entry) in entries.iter().enumerate() {
+        let Some(run) = &entry.event else { continue };
+        let own = Ctx {
+            left: None,
+            ..cx.clone()
+        };
+        let Some(reply) = guarded(key, entry.feature, &cx.log, run, own, current.clone()).await
+        else {
+            continue;
+        };
+        if !matches!(shape, Shape::Gate | Shape::Render | Shape::Answer) {
+            continue;
+        }
+        if reply.answer.is_some() || reply.tree.is_some() {
+            return reply;
+        }
+        if let Some(next) = reply.next {
+            current = next;
+            rewritten = true;
+        }
+        if let Some(left) = reply.left {
+            lefts.push((at, left));
+        }
+    }
+    Reply {
+        next: rewritten.then_some(current),
+        left: pack(lefts),
+        ..Reply::none()
+    }
+}
+
+/// `/after` for every entry of `key`: each one sees the result the one before replaced.
+async fn chain_after(
+    key: &str,
+    shape: Shape,
+    entries: &[Entry],
+    cx: Ctx,
+    result: Value,
+    left: Option<Value>,
+) -> Reply {
+    let mut current = result;
+    let mut replaced = false;
+    for (at, entry) in entries.iter().enumerate() {
+        let Some(run) = &entry.after else { continue };
+        let own = Ctx {
+            left: unpack(&left, at),
+            ..cx.clone()
+        };
+        let Some(reply) = guarded(key, entry.feature, &cx.log, run, own, current.clone()).await
+        else {
+            continue;
+        };
+        if let (Shape::Gate, Some(result)) = (shape, reply.result) {
+            current = result;
+            replaced = true;
+        }
+    }
+    Reply {
+        result: replaced.then_some(current),
+        ..Reply::none()
+    }
 }
 
 pub struct App {
@@ -273,13 +441,13 @@ impl App {
             "/after" => {
                 let id = body.get("id").and_then(Value::as_str).unwrap_or("");
                 let left = at.session.lock().map_or(None, |mut s| s.take_left(id));
-                self.after(
-                    &key,
-                    body.get("result").cloned().unwrap_or(Value::Null),
-                    left,
-                    at,
-                )
-                .await
+                let result = body.get("result").cloned().unwrap_or(Value::Null);
+                // A stream's `/after` names what went in beside what came out.
+                let told = match manifest::find(&key).map(|hook| hook.shape) {
+                    Some(Shape::Stream) => json!({ "e": e, "result": result }),
+                    _ => result,
+                };
+                self.after(&key, told, left, at).await
             }
             "/press" => self.press(e, at).await,
             _ => json!({}),
@@ -324,23 +492,24 @@ impl App {
                 session.interactive = e.get("isInteractive").and_then(Value::as_bool);
             }
         }
-        let Some(run) = self.table.get(key).and_then(|entry| entry.event.clone()) else {
+        let entries: Vec<Entry> = (self.table.entries(key).iter())
+            .filter(|entry| entry.event.is_some())
+            .cloned()
+            .collect();
+        if entries.is_empty() {
             return json!({});
-        };
+        }
         if hook.shape == Shape::Notify {
-            let (cx_of, log) = (self.cx_maker(at), self.log.clone());
+            let cx_of = self.cx_maker(at);
             self.hub.detach(move |host| {
                 Box::pin(async move {
-                    if let Err(error) = run(cx_of(host, ""), e).await {
-                        log.row(
-                            json!({ "k": "error", "for": hook.key, "error": format!("{error:#}") }),
-                        );
-                    }
+                    // One host for the whole chain: its calls go out in the order the entries ran.
+                    chain_event(hook.key, hook.shape, &entries, cx_of(host, ""), e).await;
                 })
             });
             return json!({});
         }
-        self.converse(hook.key, hook.shape, false, run, e, None, at)
+        self.converse(hook.key, hook.shape, false, entries, e, None, at)
             .await
     }
 
@@ -348,18 +517,23 @@ impl App {
         let Some(hook) = manifest::find(key) else {
             return json!({});
         };
-        let Some(run) = self.table.get(key).and_then(|entry| entry.after.clone()) else {
+        let entries: Vec<Entry> = self.table.entries(key).to_vec();
+        if entries.iter().all(|entry| entry.after.is_none()) {
             return json!({});
-        };
-        self.converse(hook.key, hook.shape, true, run, result, left, at)
+        }
+        self.converse(hook.key, hook.shape, true, entries, result, left, at)
             .await
     }
 
     async fn press(&self, e: Value, at: Request) -> Value {
-        let Some(run) = self.table.get(PRESS).and_then(|entry| entry.event.clone()) else {
+        let entries: Vec<Entry> = (self.table.entries(PRESS).iter())
+            .filter(|entry| entry.event.is_some())
+            .cloned()
+            .collect();
+        if entries.is_empty() {
             return json!({});
-        };
-        self.converse(PRESS, Shape::Start, false, run, e, None, at)
+        }
+        self.converse(PRESS, Shape::Start, false, entries, e, None, at)
             .await
     }
 
@@ -372,44 +546,37 @@ impl App {
         }
     }
 
-    /// Run a handler as a conversation: its host calls become `{ id, calls }` replies.
+    /// Run a key's entries as one conversation: their host calls become `{ id, calls }` replies.
     #[allow(clippy::too_many_arguments)]
     async fn converse(
         &self,
         key: &'static str,
         shape: Shape,
         after: bool,
-        run: Handler,
+        entries: Vec<Entry>,
         e: Value,
         left: Option<Value>,
         at: Request,
     ) -> Value {
         let cx_of = self.cx_maker(at);
-        let log = self.log.clone();
         self.hub
             .converse(move |host| {
                 Box::pin(async move {
                     let id = host.id().to_string();
-                    let mut cx = cx_of(host, &id);
-                    cx.left = left;
+                    let cx = cx_of(host, &id);
                     let session = cx.session.clone();
-                    match run(cx, e).await {
-                        Ok(reply) => {
-                            let keep = shape == Shape::Gate && !after && reply.answer.is_none();
-                            if let (true, Some(value), Ok(mut session)) =
-                                (keep, reply.left.clone(), session.lock())
-                            {
-                                session.leave(&id, value);
-                            }
-                            shaped(shape, after, &reply, &id)
-                        }
-                        Err(error) => {
-                            log.row(
-                                json!({ "k": "error", "for": key, "error": format!("{error:#}") }),
-                            );
-                            json!({})
-                        }
+                    let reply = if after {
+                        chain_after(key, shape, &entries, cx, e, left).await
+                    } else {
+                        chain_event(key, shape, &entries, cx, e).await
+                    };
+                    let keep = shape == Shape::Gate && !after && reply.answer.is_none();
+                    if let (true, Some(value), Ok(mut session)) =
+                        (keep, reply.left.clone(), session.lock())
+                    {
+                        session.leave(&id, value);
                     }
+                    shaped(shape, after, &reply, &id)
                 })
             })
             .await
@@ -465,6 +632,72 @@ impl Host for NoHost {
     fn detach(&self, _work: super::host::Detached) {}
 }
 
+/// A `Ctx` on the scripted `FakeHost`, for feature tests.
+#[cfg(test)]
+pub mod testing {
+    use super::super::host::fake::{FakeClock, FakeHost, World};
+    use super::*;
+
+    pub struct Fixture {
+        pub cx: Ctx,
+        pub host: FakeHost,
+        pub clock: Arc<FakeClock>,
+        pub dir: tempfile::TempDir,
+    }
+
+    /// A context in session `s` at `/repo`, with a store in a temp folder of its own.
+    pub fn fixture(world: World) -> Fixture {
+        fixture_in(world, "s")
+    }
+
+    /// The same, in session `sid`.
+    pub fn fixture_in(world: World, sid: &str) -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let host = FakeHost::new(world);
+        let clock = host.clock.clone();
+        let session = Sessions::default().touch(sid, "/repo", clock.now()).0;
+        session.lock().unwrap().interactive = Some(true);
+        let cx = Ctx {
+            host: Arc::new(host.clone()),
+            session,
+            store: Arc::new(Store::at(dir.path().join("csr-companion/companion.db"))),
+            clock: clock.clone(),
+            log: Arc::new(Log::default()),
+            sid: sid.into(),
+            cwd: "/repo".into(),
+            id: "e1".into(),
+            left: None,
+            respawn: false,
+            pid: 1,
+            events: 1,
+        };
+        Fixture {
+            cx,
+            host,
+            clock,
+            dir,
+        }
+    }
+
+    /// `/event` for `key` through the entries `table` holds, as the app runs them; a key that is
+    /// not a hook (a press) runs as a start does.
+    pub async fn run(table: &Table, key: &str, cx: &Ctx, e: Value) -> Reply {
+        let shape = manifest::find(key).map_or(Shape::Start, |hook| hook.shape);
+        chain_event(key, shape, table.entries(key), cx.clone(), e).await
+    }
+
+    /// Let tasks the runtime holds run until `done` holds, or give up after a second.
+    pub async fn until(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..1000 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        done()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::host::fake::FakeClock;
@@ -507,11 +740,16 @@ mod tests {
     }
 
     fn table(rows: Vec<(&'static str, Entry)>) -> Table {
-        rows.into_iter().collect()
+        let mut table = Table::new();
+        for (key, entry) in rows {
+            table.add(key, entry);
+        }
+        table
     }
 
     fn event(h: Handler) -> Entry {
         Entry {
+            feature: "test",
             event: Some(h),
             after: None,
         }
@@ -616,6 +854,7 @@ mod tests {
         let rig = rig(table(vec![(
             "guard",
             Entry {
+                feature: "test",
                 event: Some(handler(|_, e| async move {
                     Ok(Reply {
                         next: Some(json!({ "rewritten": e["n"] })),
@@ -945,5 +1184,328 @@ mod tests {
         )
         .await;
         assert_eq!(done, json!({}));
+    }
+
+    // The registry: several features in one hook, on the scripted FakeHost.
+
+    use super::super::host::fake::World;
+    use super::testing::fixture;
+
+    fn entry(feature: &'static str, event: Option<Handler>, after: Option<Handler>) -> Entry {
+        Entry {
+            feature,
+            event,
+            after,
+        }
+    }
+
+    /// An `/event` handler that records its feature and the event it saw into `trail`.
+    fn noting(trail: &Arc<Mutex<Vec<String>>>, feature: &'static str, reply: Reply) -> Handler {
+        let trail = trail.clone();
+        handler(move |_, e| {
+            let (trail, reply) = (trail.clone(), reply.clone());
+            async move {
+                trail.lock().unwrap().push(format!("{feature} saw {e}"));
+                Ok(reply)
+            }
+        })
+    }
+
+    fn entries_of(table: &Table, key: &str) -> Vec<Entry> {
+        table.entries(key).to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_first_gate_entry_to_answer_ends_the_chain() {
+        let trail = Arc::new(Mutex::new(Vec::new()));
+        let mut t = Table::new();
+        t.on("guard", "a", noting(&trail, "a", Reply::none()));
+        t.on(
+            "guard",
+            "b",
+            noting(&trail, "b", Reply::answer(json!({ "deny": "b" }))),
+        );
+        t.on(
+            "guard",
+            "c",
+            noting(&trail, "c", Reply::answer(json!({ "deny": "c" }))),
+        );
+        let fx = fixture(World::default());
+        let reply = chain_event(
+            "guard",
+            Shape::Gate,
+            &entries_of(&t, "guard"),
+            fx.cx,
+            json!(1),
+        )
+        .await;
+        assert_eq!(reply.answer, Some(json!({ "deny": "b" })));
+        assert_eq!(*trail.lock().unwrap(), ["a saw 1", "b saw 1"]);
+        assert_eq!(t.features("guard"), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_becomes_the_event_of_the_entries_after_it_and_the_last_one_goes_back() {
+        let trail = Arc::new(Mutex::new(Vec::new()));
+        let mut t = Table::new();
+        t.on(
+            "tool",
+            "a",
+            noting(&trail, "a", Reply::next(json!({ "n": 2 }))),
+        );
+        t.on("tool", "b", noting(&trail, "b", Reply::none()));
+        t.on(
+            "tool",
+            "c",
+            noting(&trail, "c", Reply::next(json!({ "n": 3 }))),
+        );
+        let fx = fixture(World::default());
+        let reply = chain_event(
+            "tool",
+            Shape::Gate,
+            &entries_of(&t, "tool"),
+            fx.cx,
+            json!({ "n": 1 }),
+        )
+        .await;
+        assert_eq!(reply.next, Some(json!({ "n": 3 })));
+        assert_eq!(
+            *trail.lock().unwrap(),
+            [r#"a saw {"n":1}"#, r#"b saw {"n":2}"#, r#"c saw {"n":2}"#]
+        );
+        let quiet = table(vec![("tool", event(noting(&trail, "q", Reply::none())))]);
+        let fx = fixture(World::default());
+        let reply = chain_event("tool", Shape::Gate, quiet.entries("tool"), fx.cx, json!(1)).await;
+        assert_eq!(reply.next, None, "no rewrite, no next");
+    }
+
+    #[tokio::test]
+    async fn each_entrys_left_reaches_its_own_after_and_no_other() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let leaves = |feature: &'static str, left: Option<Value>| {
+            handler(move |_, _| {
+                let left = left.clone();
+                async move {
+                    let _ = feature;
+                    Ok(Reply {
+                        left,
+                        ..Reply::none()
+                    })
+                }
+            })
+        };
+        let reads = |feature: &'static str| {
+            let seen = seen.clone();
+            handler(move |cx, _| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((feature, cx.left.clone()));
+                    Ok(Reply::none())
+                }
+            })
+        };
+        let mut t = Table::new();
+        t.add(
+            "tool",
+            entry(
+                "a",
+                Some(leaves("a", Some(json!("from a")))),
+                Some(reads("a")),
+            ),
+        );
+        t.add(
+            "tool",
+            entry("b", Some(leaves("b", None)), Some(reads("b"))),
+        );
+        t.add(
+            "tool",
+            entry(
+                "c",
+                Some(leaves("c", Some(json!({ "c": 1 })))),
+                Some(reads("c")),
+            ),
+        );
+        let fx = fixture(World::default());
+        let entries = entries_of(&t, "tool");
+        let first = chain_event("tool", Shape::Gate, &entries, fx.cx.clone(), json!({})).await;
+        assert_eq!(shaped(Shape::Gate, false, &first, "e7")["id"], "e7");
+        chain_after("tool", Shape::Gate, &entries, fx.cx, json!({}), first.left).await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("a", Some(json!("from a"))),
+                ("b", None),
+                ("c", Some(json!({ "c": 1 })))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn after_runs_every_entry_in_order_and_each_sees_the_result_the_one_before_replaced() {
+        let trail = Arc::new(Mutex::new(Vec::new()));
+        let replacing = |feature: &'static str, with: Option<Value>| {
+            let trail = trail.clone();
+            handler(move |_, result| {
+                let (trail, with) = (trail.clone(), with.clone());
+                async move {
+                    trail
+                        .lock()
+                        .unwrap()
+                        .push(format!("{feature} saw {result}"));
+                    Ok(Reply {
+                        result: with,
+                        ..Reply::none()
+                    })
+                }
+            })
+        };
+        let mut t = Table::new();
+        t.after("tool", "a", replacing("a", Some(json!("A"))));
+        t.after("tool", "b", replacing("b", None));
+        t.after("tool", "c", replacing("c", Some(json!("C"))));
+        t.after("tool", "d", replacing("d", None));
+        let fx = fixture(World::default());
+        let reply = chain_after(
+            "tool",
+            Shape::Gate,
+            &entries_of(&t, "tool"),
+            fx.cx,
+            json!("raw"),
+            None,
+        )
+        .await;
+        assert_eq!(reply.result, Some(json!("C")));
+        assert_eq!(
+            *trail.lock().unwrap(),
+            [
+                r#"a saw "raw""#,
+                r#"b saw "A""#,
+                r#"c saw "A""#,
+                r#"d saw "C""#
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_panicking_notify_entry_does_not_stop_the_next_one() {
+        let mut t = Table::new();
+        t.on(
+            "stop",
+            "fails",
+            handler(|_, _| async { anyhow::bail!("boom") }),
+        );
+        t.on("stop", "panics", handler(|_, _| async { panic!("worse") }));
+        t.on(
+            "stop",
+            "last",
+            handler(|cx, _| async move {
+                cx.host.call("ui.invalidate", vec![]).await?;
+                Ok(Reply::none())
+            }),
+        );
+        let fx = fixture(World::default());
+        chain_event(
+            "stop",
+            Shape::Notify,
+            &entries_of(&t, "stop"),
+            fx.cx,
+            json!({}),
+        )
+        .await;
+        assert_eq!(fx.host.seen.lock().unwrap().invalidated, 1);
+    }
+
+    #[tokio::test]
+    async fn a_notify_chain_through_the_app_runs_one_conversation_in_order() {
+        let mut t = Table::new();
+        t.on(
+            "stop",
+            "fails",
+            handler(|_, _| async { anyhow::bail!("boom") }),
+        );
+        for (feature, method) in [("one", "ui.invalidate"), ("two", "ui.toast")] {
+            t.on(
+                "stop",
+                feature,
+                handler(move |cx, _| async move {
+                    cx.host.call(method, vec![]).await?;
+                    Ok(Reply::none())
+                }),
+            );
+        }
+        let mut rig = rig(t);
+        assert_eq!(
+            post(&rig.app, "/event", ev("s", "stop", json!({}))).await,
+            json!({})
+        );
+        let first: Value = serde_json::from_str(&rig.lines.recv().await.unwrap()).unwrap();
+        assert_eq!(first["calls"][0]["m"], "ui.invalidate");
+        let id = first["id"].clone();
+        let next = post(
+            &rig.app,
+            "/step",
+            json!({ "id": id, "results": [{ "id": "c1", "v": null }] }),
+        )
+        .await;
+        assert_eq!(next["calls"][0]["m"], "ui.toast");
+        assert_eq!(next["id"], id, "the same conversation goes on");
+    }
+
+    #[tokio::test]
+    async fn a_start_runs_every_entry_and_a_stream_after_names_what_went_in_and_came_out() {
+        let trail = Arc::new(Mutex::new(Vec::new()));
+        let mut t = Table::new();
+        for feature in ["a", "b"] {
+            t.on(
+                "start",
+                feature,
+                noting(&trail, feature, Reply::answer(json!("x"))),
+            );
+            t.after("step", feature, noting(&trail, feature, Reply::none()));
+        }
+        let rig = rig(t);
+        let started = post(
+            &rig.app,
+            "/event",
+            ev("s", "start", json!({ "isInteractive": true })),
+        )
+        .await;
+        assert_eq!(started, json!({}), "a start answers nothing");
+        let body = json!({ "sid": "s", "k": "step", "e": { "n": 1 }, "result": { "m": 2 } });
+        assert_eq!(post(&rig.app, "/after", body).await, json!({}));
+        let trail = trail.lock().unwrap();
+        assert_eq!(
+            trail[..2],
+            [
+                r#"a saw {"isInteractive":true}"#,
+                r#"b saw {"isInteractive":true}"#
+            ]
+        );
+        assert_eq!(trail[2], r#"a saw {"e":{"n":1},"result":{"m":2}}"#);
+        assert_eq!(trail.len(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "takes one entry")]
+    fn a_second_entry_for_a_render_key_panics() {
+        let mut t = Table::new();
+        t.on("band", "a", handler(|_, _| async { Ok(Reply::none()) }));
+        t.on("band", "b", handler(|_, _| async { Ok(Reply::none()) }));
+    }
+
+    #[test]
+    #[should_panic(expected = "takes one entry")]
+    fn a_second_entry_for_an_answer_key_panics() {
+        let mut t = Table::new();
+        t.on("csr", "a", handler(|_, _| async { Ok(Reply::none()) }));
+        t.on("csr", "b", handler(|_, _| async { Ok(Reply::none()) }));
+    }
+
+    #[test]
+    fn the_app_table_keeps_the_wp0_start_and_csr_as_the_first_entries() {
+        let t = default_table();
+        assert_eq!(t.features("start")[0], "pane_cmd");
+        assert_eq!(t.features("csr"), ["pane_cmd"]);
+        assert_eq!(t.features("tool"), ["touch"]);
     }
 }

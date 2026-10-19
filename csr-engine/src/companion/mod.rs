@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod app;
 pub mod brief;
 pub mod cli;
 pub mod coach;

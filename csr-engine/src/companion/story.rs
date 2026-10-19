@@ -294,3 +294,421 @@ pub fn story_news_in(db: &Db, paths: &Paths, root: Option<&Path>, sid: &str, now
         transcript: session.path,
     })
 }
+
+// ---- When the story may be told again on its own (port of `hooks/story.ts`) ----
+//
+// The Shift Map's automatic refresh, off unless CSR_STORY_REWRITES=1. One model call each time, so
+// four gates, each decided without a model call from what `story_news` reads:
+//  1. News. At least 4 new receipts (2 a file your edits touched, 1 a symbol they added or
+//     removed, 3 a commit) and at least 2 prompts of yours since the map's current telling.
+//  2. Spacing. A 2 hour chapter allows 3 refreshes, 1 more for each shift you liked in it, 6 at
+//     most. The messages since the last telling must reach what the news earns: 80 usual messages
+//     to a chapter, shared over the refreshes left, more when the news is thin (never under 12).
+//  3. A share of the work. What story calls spent in the chapter, plus the guess for the next (the
+//     last one, else 1600 tokens), stays within 2 tokens for every 100 Claude spends. Where
+//     Claude's tokens were not counted (dreams off), this gate has nothing to compare and the
+//     caps below stand alone.
+//  4. Caps. 60 seconds between tellings, 40 calls and $0.10 in a day. A day's spend that is
+//     unknown stops the refresh; the person's own button is unchanged.
+// The first reason a gate fails is the answer, so a test (and a person asking why) can read it.
+//
+// The caller (the `turn.complete` group of the pace package) keeps `starts`, when each automatic
+// refresh began, and `claude`, the tokens it counted Claude spending.
+
+pub const NEWS_RECEIPTS: f64 = 4.;
+pub const NEWS_PROMPTS: f64 = 2.;
+pub const CHAPTER_MS: f64 = 2. * 60. * 60. * 1000.;
+pub const BASE_REFRESHES: f64 = 3.;
+pub const MOST_REFRESHES: f64 = 6.;
+pub const USUAL_MESSAGES: f64 = 80.;
+pub const LEAST_MESSAGES: f64 = 12.;
+pub const STORY_SHARE: f64 = 0.02;
+pub const FIRST_GUESS: f64 = 1600.;
+pub const COOLDOWN_MS: f64 = 60_000.;
+pub const DAY_CALLS: f64 = 40.;
+pub const DAY_USD: f64 = 0.1;
+
+/// What `story_news` says, as `decide` reads it: every count is zero where it is missing, as the
+/// TypeScript's `count` reads one.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Facts {
+    /// False: no map yet (or the kill switch), so nothing to refresh.
+    pub story: bool,
+    /// Seconds: when the current telling was written.
+    pub at: Option<f64>,
+    pub messages_since: f64,
+    pub prompts_since: f64,
+    pub receipts: f64,
+    pub calls_24h: f64,
+    /// None: a call's model has no price.
+    pub usd_24h: Option<f64>,
+    /// What story calls spent in the last two hours.
+    pub tokens_2h: f64,
+    pub last_tokens: f64,
+    pub liked_2h: f64,
+    pub has_transcript: bool,
+}
+
+/// Why `decide` said what it did: `Go`, or the first gate that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    Go,
+    NoStory,
+    NoTranscript,
+    NoNews,
+    Cooldown,
+    ChapterCap,
+    Spacing,
+    Share,
+    SpendUnknown,
+    DayCap,
+}
+
+impl Why {
+    /// The reason as the TypeScript names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Why::Go => "go",
+            Why::NoStory => "no-story",
+            Why::NoTranscript => "no-transcript",
+            Why::NoNews => "no-news",
+            Why::Cooldown => "cooldown",
+            Why::ChapterCap => "chapter-cap",
+            Why::Spacing => "spacing",
+            Why::Share => "share",
+            Why::SpendUnknown => "spend-unknown",
+            Why::DayCap => "day-cap",
+        }
+    }
+}
+
+fn count(value: &Value) -> f64 {
+    value
+        .as_f64()
+        .filter(|n| n.is_finite() && *n > 0.)
+        .unwrap_or(0.)
+}
+
+/// What `story_news` printed (or any text that is not one): no story unless it says `story: true`.
+pub fn parse_news(text: Option<&str>) -> Facts {
+    let value: Value = text
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or(Value::Null);
+    if value["story"] != true {
+        return Facts::default();
+    }
+    Facts {
+        story: true,
+        at: value["at"].as_f64(),
+        messages_since: count(&value["messages_since"]),
+        prompts_since: count(&value["prompts_since"]),
+        receipts: count(&value["receipts"]),
+        calls_24h: count(&value["calls_24h"]),
+        usd_24h: value["usd_24h"].as_f64().filter(|n| n.is_finite()),
+        tokens_2h: count(&value["tokens_2h"]),
+        last_tokens: count(&value["last_tokens"]),
+        liked_2h: count(&value["liked_2h"]),
+        has_transcript: value["transcript"].as_str().is_some_and(|t| !t.is_empty()),
+    }
+}
+
+impl Facts {
+    /// What the engine's own `story_news` found, in the shape `decide` reads.
+    pub fn of(news: &News) -> Self {
+        match news {
+            News::Absent { .. } => Self::default(),
+            News::Present(news) => Self {
+                story: news.story,
+                at: Some(news.at),
+                messages_since: news.messages_since as f64,
+                prompts_since: news.prompts_since as f64,
+                receipts: news.receipts as f64,
+                calls_24h: news.spend.calls_24h as f64,
+                usd_24h: news.spend.usd_24h.filter(|n| n.is_finite()),
+                tokens_2h: news.spend.tokens_2h.max(0) as f64,
+                last_tokens: news.spend.last_tokens.unwrap_or(0).max(0) as f64,
+                liked_2h: news.liked_2h as f64,
+                has_transcript: news.transcript.is_some(),
+            },
+        }
+    }
+}
+
+/// How many refreshes a chapter allows: 3, and 1 more for each shift you liked in it, 6 at most.
+pub fn allowance(liked: f64) -> f64 {
+    let liked = liked.max(0.);
+    MOST_REFRESHES.min(BASE_REFRESHES + (MOST_REFRESHES - BASE_REFRESHES).min(liked))
+}
+
+/// Messages since the last telling that the news earns a refresh at: the usual chapter over the
+/// refreshes left, scaled by how thin the news is (4 receipts: the most; 12 or more: the least).
+pub fn messages_due(receipts: f64, left: f64) -> f64 {
+    let thin = 6. / receipts.clamp(1., 12.);
+    LEAST_MESSAGES.max((USUAL_MESSAGES / left.max(1.) * thin).round())
+}
+
+/// May the story be told again now? `starts`: when (ms) each automatic refresh was started this
+/// session. `claude`: tokens counted Claude spending (0 when they were not counted).
+pub fn decide(news: &Facts, starts: &[f64], now: f64, claude: f64) -> Why {
+    let Some(at) = news.at.filter(|_| news.story) else {
+        return Why::NoStory;
+    };
+    if !news.has_transcript {
+        return Why::NoTranscript;
+    }
+    if news.receipts < NEWS_RECEIPTS || news.prompts_since < NEWS_PROMPTS {
+        return Why::NoNews;
+    }
+    if starts.iter().any(|s| now - s < COOLDOWN_MS) || now - at * 1000. < COOLDOWN_MS {
+        return Why::Cooldown;
+    }
+    let recent = starts.iter().filter(|s| now - **s < CHAPTER_MS).count() as f64;
+    let left = allowance(news.liked_2h) - recent;
+    if left <= 0. {
+        return Why::ChapterCap;
+    }
+    if news.messages_since < messages_due(news.receipts, left) {
+        return Why::Spacing;
+    }
+    if claude > 0. {
+        let next = if news.last_tokens > 0. {
+            news.last_tokens
+        } else {
+            FIRST_GUESS
+        };
+        if news.tokens_2h + next > STORY_SHARE * claude {
+            return Why::Share;
+        }
+    }
+    // Spend that cannot be known is not free: an unpriced model, or a ledger that could not be
+    // read, holds the refresh back.
+    let Some(usd) = news.usd_24h else {
+        return Why::SpendUnknown;
+    };
+    if news.calls_24h >= DAY_CALLS || usd >= DAY_USD {
+        return Why::DayCap;
+    }
+    Why::Go
+}
+
+/// The refresh as an argv list: csr-engine tells this conversation's story again, and skips it
+/// itself when nothing was asked since the last telling.
+pub fn refresh_argv(transcript: &str, cwd: &str) -> Vec<String> {
+    let argv = [
+        "csr-engine",
+        "generate-story",
+        "--transcript",
+        transcript,
+        "--cwd",
+        cwd,
+        "--rewrite",
+    ];
+    argv.iter().map(|s| s.to_string()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: f64 = 1_000_000_000.;
+
+    /// A telling an hour old with the news for a refresh, a quiet day, and the room to spend.
+    fn news() -> Facts {
+        Facts {
+            story: true,
+            at: Some(NOW / 1000. - 3600.),
+            messages_since: 80.,
+            prompts_since: 3.,
+            receipts: 6.,
+            usd_24h: Some(0.),
+            has_transcript: true,
+            ..Facts::default()
+        }
+    }
+
+    #[test]
+    fn news_that_is_not_a_story_is_no_story() {
+        assert_eq!(parse_news(None), Facts::default());
+        assert_eq!(parse_news(Some("")), Facts::default());
+        assert_eq!(parse_news(Some("Traceback")), Facts::default());
+        assert_eq!(parse_news(Some(r#"{"story":false}"#)), Facts::default());
+        let said = r#"{"story":true,"at":5,"receipts":"x","transcript":"/t.jsonl","usd_24h":null}"#;
+        let got = parse_news(Some(said));
+        assert_eq!(
+            (got.story, got.at, got.receipts, got.usd_24h),
+            (true, Some(5.), 0., None)
+        );
+        assert!(got.has_transcript);
+    }
+
+    #[test]
+    fn the_first_gate_that_fails_is_the_reason_in_the_gates_order() {
+        let go = |news: &Facts| decide(news, &[], NOW, 0.);
+        assert_eq!(go(&news()), Why::Go);
+        assert_eq!(go(&Facts::default()), Why::NoStory);
+        assert_eq!(go(&Facts { at: None, ..news() }), Why::NoStory);
+        let no_transcript = Facts {
+            has_transcript: false,
+            ..news()
+        };
+        assert_eq!(go(&no_transcript), Why::NoTranscript);
+        assert_eq!(
+            go(&Facts {
+                receipts: 3.,
+                ..news()
+            }),
+            Why::NoNews
+        );
+        assert_eq!(
+            go(&Facts {
+                prompts_since: 1.,
+                ..news()
+            }),
+            Why::NoNews
+        );
+        let fresh = Facts {
+            at: Some(NOW / 1000. - 30.),
+            ..news()
+        };
+        assert_eq!(go(&fresh), Why::Cooldown);
+        assert_eq!(
+            go(&Facts {
+                messages_since: 20.,
+                ..news()
+            }),
+            Why::Spacing
+        );
+        assert_eq!(
+            go(&Facts {
+                usd_24h: None,
+                ..news()
+            }),
+            Why::SpendUnknown
+        );
+        assert_eq!(
+            go(&Facts {
+                calls_24h: 40.,
+                ..news()
+            }),
+            Why::DayCap
+        );
+        assert_eq!(
+            go(&Facts {
+                usd_24h: Some(0.1),
+                ..news()
+            }),
+            Why::DayCap
+        );
+    }
+
+    #[test]
+    fn a_refresh_started_a_minute_ago_waits_and_a_full_chapter_stops() {
+        let recent = [NOW - 30_000.];
+        assert_eq!(decide(&news(), &recent, NOW, 0.), Why::Cooldown);
+        let three = [NOW - 3_000_000., NOW - 2_000_000., NOW - 1_000_000.];
+        assert_eq!(decide(&news(), &three, NOW, 0.), Why::ChapterCap);
+        let liked = Facts {
+            liked_2h: 2.,
+            ..news()
+        };
+        assert_eq!(
+            decide(&liked, &three, NOW, 0.),
+            Why::Go,
+            "2 liked earn 2 more"
+        );
+        let old = [NOW - CHAPTER_MS - 1., NOW - CHAPTER_MS - 2.];
+        assert_eq!(
+            decide(&news(), &old, NOW, 0.),
+            Why::Go,
+            "past the chapter: not counted"
+        );
+    }
+
+    #[test]
+    fn the_share_gate_compares_spend_and_the_guess_with_two_in_a_hundred_of_claude() {
+        let spent = Facts {
+            tokens_2h: 3000.,
+            last_tokens: 1000.,
+            ..news()
+        };
+        assert_eq!(
+            decide(&spent, &[], NOW, 200_000.),
+            Why::Go,
+            "4000 is exactly 2%"
+        );
+        assert_eq!(decide(&spent, &[], NOW, 199_000.), Why::Share);
+        assert_eq!(
+            decide(&news(), &[], NOW, 70_000.),
+            Why::Share,
+            "no last call: 1600"
+        );
+        assert_eq!(decide(&news(), &[], NOW, 80_000.), Why::Go);
+        assert_eq!(
+            decide(&spent, &[], NOW, 0.),
+            Why::Go,
+            "Claude not counted: no share"
+        );
+    }
+
+    #[test]
+    fn the_allowance_and_the_messages_due_follow_the_news() {
+        assert_eq!(allowance(0.), 3.);
+        assert_eq!(allowance(2.), 5.);
+        assert_eq!(allowance(99.), 6.);
+        assert_eq!(allowance(-4.), 3.);
+        assert_eq!(messages_due(4., 3.), 40.); // 80 / 3 * 6 / 4
+        assert_eq!(messages_due(12., 3.), 13.); // 80 / 3 * 0.5
+        assert_eq!(messages_due(40., 6.), 12., "never under 12");
+        assert_eq!(
+            messages_due(0., 0.),
+            480.,
+            "no receipts and no refresh left count as 1"
+        );
+    }
+
+    #[test]
+    fn the_refresh_is_the_engines_own_generate_story_with_the_rewrite_flag() {
+        assert_eq!(
+            refresh_argv("/t/a.jsonl", "/repo"),
+            [
+                "csr-engine",
+                "generate-story",
+                "--transcript",
+                "/t/a.jsonl",
+                "--cwd",
+                "/repo",
+                "--rewrite"
+            ]
+        );
+        assert_eq!(Why::DayCap.name(), "day-cap");
+        assert_eq!(Why::Go.name(), "go");
+    }
+
+    #[test]
+    fn the_engines_own_news_reads_as_facts() {
+        assert_eq!(Facts::of(&News::Absent { story: false }), Facts::default());
+        let present = News::Present(StoryNews {
+            story: true,
+            at: 7.,
+            covered: Some(3),
+            messages: 90,
+            messages_since: 80,
+            prompts_since: 3,
+            receipts: 6,
+            spend: Spend {
+                calls_24h: 2,
+                usd_24h: Some(0.02),
+                tokens_2h: 900,
+                last_tokens: Some(450),
+            },
+            liked_2h: 1,
+            transcript: Some("/t.jsonl".into()),
+        });
+        let facts = Facts::of(&present);
+        assert_eq!(
+            (facts.at, facts.receipts, facts.last_tokens),
+            (Some(7.), 6., 450.)
+        );
+        assert!(facts.has_transcript && facts.story);
+    }
+}
