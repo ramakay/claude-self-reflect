@@ -601,11 +601,47 @@ fn unquote_config_value(raw: &str) -> String {
     raw[..cut].trim().to_string()
 }
 
+/// The worktree `core.worktree` in `config_path` names, as an absolute lexical
+/// path, or `None` when the file sets none (or `core.bare = true`). A relative
+/// value is relative to `git_dir`, as git reads it; `~/` is the home directory.
+fn configured_worktree(config_path: &Path, git_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let (bare, worktree) = read_core_config(config_path, home);
+    let w = worktree.filter(|_| !bare)?;
+    let w = match (w.strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => h.join(rest),
+        _ => PathBuf::from(w),
+    };
+    Some(normalize_lexical(&git_dir.join(w)))
+}
+
+/// True when the worktree `gix` would take from this git dir's own config is in
+/// (or leads into) a protected folder. `gix::open` stats that directory (its "is
+/// this a directory" warning and its ownership check), so a view for which this
+/// is true must never be opened.
+///
+/// `gix` honours `core.worktree` only from a config file inside the git dir it
+/// opens (gix 0.86 `open/repository.rs`, `assure_config_is_from_current_repo`):
+/// `config` for a standard checkout and `config.worktree` for a linked one. Both
+/// files are checked for every git dir (the other one is simply absent): the
+/// safe direction.
+fn configured_worktree_protected(git_dir: &Path, home: Option<&Path>) -> bool {
+    ["config", "config.worktree"].iter().any(|name| {
+        configured_worktree(&git_dir.join(name), git_dir, home)
+            .is_some_and(|wt| matches!(resolve_safe(&wt, home), Err(e) if is_protected_error(&e)))
+    })
+}
+
 /// Where a repo's main worktree is. Never stats a protected folder: the
 /// configured worktree is checked lexically, then resolved with `resolve_safe`,
 /// before anything opens or stats it.
 fn main_worktree_path(common_dir: &Path, home: Option<&Path>) -> MainWorktree {
     let candidate = if common_dir.file_name().is_some_and(|n| n == ".git") {
+        // A standard `<main>/.git` still honours `core.worktree`: `gix` opens the
+        // repo at the configured worktree, so a value in a protected folder makes
+        // the whole view protected. Any other value keeps the parent as the view.
+        if configured_worktree_protected(common_dir, home) {
+            return MainWorktree::Protected;
+        }
         match common_dir.parent() {
             Some(p) => p.to_path_buf(),
             None => return MainWorktree::None,
@@ -614,9 +650,8 @@ fn main_worktree_path(common_dir: &Path, home: Option<&Path>) -> MainWorktree {
         // Submodule git dirs and unusual layouts: `core.worktree`, relative to
         // the git dir. No `core.worktree` (or `core.bare = true`) means no
         // worktree, as `gix` decides for a git dir not named `.git`.
-        let (bare, worktree) = read_core_config(&common_dir.join("config"), home);
-        match worktree.filter(|_| !bare) {
-            Some(w) => common_dir.join(w),
+        match configured_worktree(&common_dir.join("config"), common_dir, home) {
+            Some(w) => w,
             None => return MainWorktree::None,
         }
     };
@@ -659,14 +694,28 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
         MainWorktree::Path(_) | MainWorktree::None => {}
     }
 
-    let linked_root = common_dir.join("worktrees");
-    let mut names: Vec<PathBuf> = match std::fs::read_dir(&linked_root) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
-        Err(_) => Vec::new(),
+    // `worktrees` may itself be a symlink: resolve it before it is read, so a
+    // link into a protected folder is counted stale and never opened. A missing
+    // directory has no linked views. The resolved directory is read, not the link.
+    let linked_root = match resolve_safe(&common_dir.join("worktrees"), home) {
+        Ok(real) => Some(real),
+        Err(e) if is_protected_error(&e) => {
+            listing.stale += 1;
+            None
+        }
+        Err(_) => None,
+    };
+    let mut names: Vec<PathBuf> = match linked_root.as_deref().map(std::fs::read_dir) {
+        Some(Ok(rd)) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+        _ => Vec::new(),
     };
     names.sort();
     for git_dir in names {
-        if !is_dir_safe(&git_dir, home) {
+        // An entry may itself be a link: use where it leads, never the link.
+        let Ok(git_dir) = resolve_safe(&git_dir, home) else {
+            continue;
+        };
+        if !git_dir.is_dir() {
             continue;
         }
         let pointer = match read_to_string_safe(&git_dir.join("gitdir"), home) {
@@ -690,6 +739,12 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
             listing.stale += 1;
             continue;
         }
+        // `config.worktree` can name a protected worktree that `gix` would stat
+        // when it opens this view.
+        if configured_worktree_protected(&git_dir, home) {
+            listing.stale += 1;
+            continue;
+        }
         listing.views.push(ViewId {
             worktree_path: wt,
             git_dir,
@@ -699,7 +754,20 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
     Ok(listing)
 }
 
+/// The one place a repository is opened with `gix` (`head_of` and
+/// `LiveIndex::read`, so `view_state`, `view_changed` and every scan go through
+/// it). `gix` stats the worktree that `core.worktree` names while it opens, so
+/// the git dir's own config is checked first, whatever produced the `ViewId`; a
+/// view whose configured worktree is protected is refused (`is_protected_error`).
 fn open_repo(view: &ViewId) -> Result<gix::Repository> {
+    open_repo_with(view, home_dir().as_deref())
+}
+
+fn open_repo_with(view: &ViewId, home: Option<&Path>) -> Result<gix::Repository> {
+    refuse_if_protected(&view.worktree_path, home)?;
+    if configured_worktree_protected(&view.git_dir, home) {
+        return Err(ProtectedPath::new(&view.git_dir, home).into());
+    }
     gix::open_opts(&view.worktree_path, isolated_open_options())
         .with_context(|| format!("open {}", view.worktree_path.display()))
 }
@@ -961,7 +1029,7 @@ mod tests {
 
     // ---- resolve_safe: fake home in a tempdir, never the real ~/Desktop -------------
 
-    use crate::codemap::testutil::{py, write, Fx};
+    use crate::codemap::testutil::{py, write, Fx, Locked};
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -1163,6 +1231,145 @@ mod tests {
         assert_eq!(listing.stale, 1, "counted stale");
         assert_eq!(listing.views.len(), 1, "and not listed");
         assert_eq!(listing.views[0].worktree_path, main);
+    }
+
+    fn repo_with_worktree(fx: &Fx) -> (PathBuf, PathBuf) {
+        let main = fx.init_repo("a");
+        write(&main, "a.py", &py(&["alpha"]));
+        fx.commit_all(&main, "init");
+        let wt = fx.add_worktree(&main, &fx.root.join("a-wt"), "feat");
+        (main, wt)
+    }
+
+    #[test]
+    fn a_worktrees_dir_that_links_into_a_protected_folder_is_never_opened() {
+        let fx = Fx::new();
+        let home = Some(fx.home.as_path());
+        let (main, _wt) = repo_with_worktree(&fx);
+        let common = main.join(".git");
+        // The admin dir moves into the fake Documents and `.git/worktrees`
+        // becomes a link to it. Readable on purpose: before the fix the daemon
+        // would open it, and this shows what it would have found.
+        let moved = fx.home.join("Documents").join("wtadmin");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(common.join("worktrees"), &moved).unwrap();
+        symlink(&moved, common.join("worktrees")).unwrap();
+        let listing = list_views_with(&common, home).unwrap();
+        assert_eq!(listing.views.len(), 1, "only the main view");
+        assert_eq!(listing.stale, 1, "the protected link is counted stale");
+
+        // The same with the folder locked: no read error, same answer.
+        let _lock = Locked::new(&fx.home.join("Documents"));
+        let listing = list_views_with(&common, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (1, 1));
+
+        // A dangling link is "missing": no linked views, nothing stale.
+        std::fs::remove_file(common.join("worktrees")).unwrap();
+        symlink(fx.root.join("absent"), common.join("worktrees")).unwrap();
+        let listing = list_views_with(&common, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (1, 0));
+    }
+
+    #[test]
+    fn a_worktrees_dir_that_links_outside_a_protected_folder_is_read_through_the_link() {
+        let fx = Fx::new();
+        let (main, _wt) = repo_with_worktree(&fx);
+        let common = main.join(".git");
+        let moved = fx.root.join("wtadmin");
+        std::fs::rename(common.join("worktrees"), &moved).unwrap();
+        symlink(&moved, common.join("worktrees")).unwrap();
+        let listing = list_views_with(&common, Some(&fx.home)).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (2, 0));
+    }
+
+    #[test]
+    fn core_worktree_in_a_standard_git_dir_is_checked_like_any_other_layout() {
+        let fx = Fx::new();
+        let home = Some(fx.home.as_path());
+        let (main, _wt) = repo_with_worktree(&fx);
+        let common = main.join(".git");
+        let config = common.join("config");
+        let base = std::fs::read_to_string(&config).unwrap();
+        let _lock = Locked::new(&fx.home.join("Documents"));
+        let docs = fx.home.join("Documents").join("project");
+
+        // Absolute, then relative to the git dir, then through a symlink.
+        symlink(&docs, fx.root.join("docs-link")).unwrap();
+        let rel = "../../../home/Documents/project".to_string();
+        for value in [
+            docs.display().to_string(),
+            rel,
+            fx.root.join("docs-link").display().to_string(),
+        ] {
+            std::fs::write(&config, format!("{base}[core]\n\tworktree = {value}\n")).unwrap();
+            let listing = list_views_with(&common, home).unwrap();
+            assert_eq!(
+                (listing.views.len(), listing.stale),
+                (1, 1),
+                "{value}: the main view is protected, the linked worktree still lists"
+            );
+            assert!(
+                listing.views.iter().all(|v| !v.is_main),
+                "{value}: no main view"
+            );
+            // And a ViewId built by hand is never handed to gix either.
+            let view = ViewId {
+                worktree_path: main.clone(),
+                git_dir: common.clone(),
+                is_main: true,
+            };
+            let err = open_repo_with(&view, home).expect_err("refused");
+            assert!(is_protected_error(&err), "{value}: {err:#}");
+        }
+
+        // A value outside the protected folders keeps today's behaviour.
+        std::fs::write(&config, format!("{base}[core]\n\tworktree = ..\n")).unwrap();
+        let listing = list_views_with(&common, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (2, 0));
+        assert_eq!(listing.views[0].worktree_path, main);
+        // core.bare = true cancels it, as it does in git.
+        std::fs::write(
+            &config,
+            format!(
+                "{base}[core]\n\tbare = true\n\tworktree = {}\n",
+                docs.display()
+            ),
+        )
+        .unwrap();
+        assert!(!configured_worktree_protected(&common, home));
+    }
+
+    #[test]
+    fn a_linked_worktrees_config_worktree_into_a_protected_folder_makes_it_stale() {
+        let fx = Fx::new();
+        let home = Some(fx.home.as_path());
+        let (main, wt) = repo_with_worktree(&fx);
+        let common = main.join(".git");
+        let admin = std::fs::read_dir(common.join("worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let _lock = Locked::new(&fx.home.join("Documents"));
+        std::fs::write(
+            admin.join("config.worktree"),
+            format!(
+                "[core]\n\tworktree = {}\n",
+                fx.home.join("Documents").join("lw").display()
+            ),
+        )
+        .unwrap();
+        let listing = list_views_with(&common, home).unwrap();
+        assert_eq!((listing.views.len(), listing.stale), (1, 1));
+        assert_eq!(listing.views[0].worktree_path, main);
+        let view = ViewId {
+            worktree_path: wt,
+            git_dir: admin,
+            is_main: false,
+        };
+        let err = open_repo_with(&view, home).expect_err("refused");
+        assert!(is_protected_error(&err), "{err:#}");
     }
 
     #[test]

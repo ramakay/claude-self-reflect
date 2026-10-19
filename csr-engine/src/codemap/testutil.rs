@@ -155,6 +155,31 @@ pub(crate) fn scan_repo_into(conn: &Connection, fx: &Fx, repo: &Path) {
     .unwrap();
 }
 
+/// Makes a directory unreadable (mode 000) until dropped, so a test proves a
+/// protected folder was not opened: any read of it fails loudly. The mode is
+/// restored on drop so tempdir cleanup works.
+pub(crate) struct Locked {
+    path: PathBuf,
+}
+
+impl Locked {
+    pub fn new(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 /// A Python source defining the given functions.
 pub(crate) fn py(defs: &[&str]) -> String {
     defs.iter()
