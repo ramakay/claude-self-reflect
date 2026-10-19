@@ -538,6 +538,6 @@
  "schema": "pane-emissions-v1",
  "source": {
   "file": "plugins/csr-companion/bin/pane.py",
-  "sha256": "94d5897fa12a21b03bad17127c53adc8adff6f5d1222d7c2d7062eaf4f68a41a"
+  "sha256": "b8c43bd5ae2331356f0971f73589a7f35b3aaab8d786b3bd16ab636ebe564dba"
  }
 }

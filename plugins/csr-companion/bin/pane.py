@@ -7367,7 +7367,12 @@ def draw_column_main(data, s, width, rows, now, ui):
         if len(out) > len(stack):  # a strip of paper between counts; the first sits right under the values
             out.put([''])
         out.put([tinted(BOLD * bool(section.get('star')) + ink(SECTION[name]) + text + OFF, band(name, HEAD))])
+    if ui.get('phone'):  # herdr keeps a phone's split, too narrow to read in: a tap fills the screen with the page
+        out.put(['', ink('faint') + next((t for t in TAP_FORMS if len(t) <= width), fit(TAP_FORMS[-1], max(1, width))) + OFF])
     return out
+
+
+TAP_FORMS = ('tap to open', 'tap: open', 'tap')  # what a phone's column says under its counts, longest that fits
 
 
 def draw_column_info(data, s, width, rows, top=0):
@@ -7482,11 +7487,11 @@ def legend(view, width, held=None, phone=False, column=False, reload=None):
     return legend_parts(view, width, held, phone, column, reload)[0]
 
 
-def legend_parts(view, width, held=None, phone=False, column=False, reload=None):
+def legend_parts(view, width, held=None, phone=False, column=False, reload=None, zoomed=False):
     """The bottom row, and where each label sits on it: (text, [(first col, past last col, key)]). On a phone the
-    main page's keys start short, one word each, and f (every lost thread, also a click on its heading) goes.
-    In column mode, the keys alone. reload, the seconds to the next read, puts 'r ↻ 42s' before close on the
-    main page: r reads now."""
+    main page's keys start short, one word each, and f (every lost thread, also a click on its heading) goes;
+    zoomed, z 'split' gives the screen back to Claude. In column mode, the keys alone. reload, the seconds to
+    the next read, puts 'r ↻ 42s' before close on the main page: r reads now."""
     if held:
         return ' ' + ink('turn') + fit(f'edit not loaded: {held}', width - 1) + OFF, []
     if column:
@@ -7500,7 +7505,7 @@ def legend_parts(view, width, held=None, phone=False, column=False, reload=None)
             at += len(key) + 1
         return ' ' + ' '.join(f'{BOLD}{ink("you")}{key}{OFF}' for key in keys), spans
     if view == 'main' and phone:
-        keys = [('l', 'changes'), ('s', 'summary'), ('i', 'info'), ('q', 'close')]
+        keys = [('l', 'changes'), ('s', 'summary'), ('i', 'info')] + [('z', 'split')] * bool(zoomed) + [('q', 'close')]
     elif view == 'main':
         keys = [('l', 'changes since your sessions'), ('s', 'compaction summary'), ('f', 'every lost thread'),
                 ('i', 'session info'), ('q', 'close')]
@@ -7579,6 +7584,28 @@ def press(pane, key):
         threads_keys(pane, 'f')
     elif key == 'i':
         info_keys(pane, 'i')
+    elif key == 'z':
+        zoom_key(pane)
+
+
+def zoom_key(pane):
+    """z, or a tap on a phone's narrow column: the pane fills the phone's screen, laid out for the phone; again,
+    the split is back and the keys go to Claude. A desktop keeps its split. True when the layout changed."""
+    if getattr(pane, 'zoomed', False):
+        pane.zoomed = False
+        zoom(False)
+        focus_back()
+        return True
+    if (getattr(pane, 'seen_phone', None) or (None, None, False))[2] and zoom(True):
+        pane.zoomed = True
+        return True
+    return False
+
+
+def zoom(on):
+    """herdr's zoom on this pane: on, it fills its tab; off, the tab's split is back. True when herdr did it."""
+    me = os.environ.get('HERDR_PANE_ID')
+    return bool(me) and herdr('pane', 'zoom', '--pane', me, '--on' if on else '--off') is not None
 
 
 def herdr(*argv):
@@ -7659,6 +7686,7 @@ class Pane:
         self.tall = False  # the main page keeps its scrolled layout until Esc or another page
         self.drawn = None  # (cols, rows, rows written, pictures placed): what is on the screen now
         self.seen_phone = None  # ((cols, rows), when, on a phone): the last read of herdr's layout
+        self.zoomed = False  # this pane zoomed itself on a phone: z undoes it, and so does a desktop taking the tab
         self.tape_s = None  # the session as the tape last read it, for the pages that load none
         self.edge = None  # (first tape column, rows it runs): a click there is on the tape, not a row
         self.foot = None  # (on a phone, in column mode): what the legend row was last drawn for
@@ -7699,6 +7727,10 @@ class Pane:
         now = time.time()
         phone = fail_open(self.phone, False, cols, rows, now)
         column = cols < COLUMN_UNDER  # a pane this narrow (a phone's split) is its gauge strip and a column of values
+        if self.zoomed and (column or not phone):  # herdr's own key split it again, or a desktop has the tab now
+            if not column:
+                zoom(False)
+            self.zoomed = False
         tapes = strip_tapes(cols, rows, column)
         body = cols - strip_width(tapes)  # the pages draw left of the strip
         try:
@@ -7823,7 +7855,8 @@ class Pane:
         self.acts = {row: act for row, act in getattr(lines, 'acts', {}).items() if row < room - 1}
         if value:  # the value row: a click opens the i page, which says it in words
             self.acts[room - 1] = dict(key='view:info')
-        foot, spans = legend_parts(self.view, cols - 1, self.held, phone, column, self.countdown(now, column))
+        foot, spans = legend_parts(self.view, cols - 1, self.held, phone, column, self.countdown(now, column),
+                                   self.zoomed)
         self.acts[rows - 1] = dict(key='legend', keys=spans) if spans else \
             dict(key='view:log' if self.view == 'main' else 'view:main')
         grounds = getattr(lines, 'grounds', ())  # the masthead's, for the strip beside it (a slice drops them)
@@ -7876,7 +7909,7 @@ class Pane:
         left = self.countdown(now, column)
         if left == 0:
             return True
-        foot, spans = legend_parts(self.view, cols - 1, self.held, phone, column, left)
+        foot, spans = legend_parts(self.view, cols - 1, self.held, phone, column, left, getattr(self, 'zoomed', False))
         if foot == written[-1]:
             return False
         written = written[:-1] + [foot]
@@ -7921,12 +7954,18 @@ class Pane:
     def click(self, row, col=0):
         """One click opens a row; a second click on it puts it in Claude's prompt, unsent. On a dream's
         answers, the half clicked is the answer: kept in the dream log, and "ask Claude" also typed in. A click
-        on the tape is on no row."""
+        on the tape is on no row. On a phone's narrow column, a tap anywhere but the legend and the masthead (the i
+        page) fills the screen."""
+        act = self.acts.get(row)
+        legend = bool(act and act.get('keys') is not None)
+        page = bool(act and str(act.get('key', '')).startswith('view:'))
+        if getattr(self, 'foot', None) == (True, True) and self.view == 'main' and not legend and not page:
+            zoom_key(self)
+            return
         edge = getattr(self, 'edge', None)
         if edge and col >= edge[0] and row < edge[1]:
             return
-        act = self.acts.get(row)
-        if act and act.get('keys') is not None:  # the legend: the label clicked, as if its key were pressed
+        if legend:  # the legend: the label clicked, as if its key were pressed
             pressed = next((key for start, end, key in act['keys'] if start <= col < end), None)
             if pressed:
                 press(self, pressed)
@@ -8821,6 +8860,9 @@ def watch(root, limit, session_id, agent=None):
                 elif key == 'r':  # read now; the countdown starts again
                     reload_now(pane)
                     redraw['now'] = True
+                elif key == 'z':  # on a phone: the whole screen, or the split again
+                    if fail_open(zoom_key, False, pane):
+                        redraw['now'] = True
     except KeyboardInterrupt:
         pass
     finally:

@@ -2825,6 +2825,52 @@ class StripAndPhone(unittest.TestCase):
         column.click(3, 8)  # on a tape: no row
         self.assertIsNone(column.open)
 
+    def herdr_calls(self, area, rows):
+        """herdr stood in, its tab area wide: every call kept, each answered."""
+        calls = []
+        layout = json.dumps(dict(result=dict(layout=dict(area=dict(width=area, height=rows)))))
+        self.patch(herdr=lambda *argv: calls.append(argv) or (layout if argv[:2] == ('pane', 'layout') else '{}'))
+        return calls
+
+    def test_on_a_phones_narrow_split_a_tap_fills_the_screen_and_z_gives_it_back(self):
+        """10-18: herdr 0.9.3 keeps a phone's split, so the pane had 17 columns: three counts over blank paper."""
+        self.sized(17, 46, 50)
+        calls = self.herdr_calls(50, 46)
+        box = self.busy()
+        screen, past = lay(self.frame(box), 17, 46, 12)
+        self.assertEqual(past, [])
+        self.assertTrue(any(row[:12].rstrip() == 'tap to open' for row in screen), screen)
+        box.click(30, 2)  # on the blank paper
+        self.assertIn(('pane', 'zoom', '--pane', 'w9:p9', '--on'), calls)
+        self.assertTrue(box.zoomed)
+        self.sized(50, 46, 50)  # zoomed: the pane is the whole tab
+        calls = self.herdr_calls(50, 46)
+        screen, past = lay(self.frame(box), 50, 46)
+        self.assertEqual(past, [])
+        self.assertIn('z split', screen[45])
+        self.assertIn('q close', screen[45])
+        self.assertGreater(sum('Thread ' in row for row in screen), 3)  # the phone's page: more of each section
+        box.click(45, screen[45].index('z split'))  # the legend's z
+        self.assertIn(('pane', 'zoom', '--pane', 'w9:p9', '--off'), calls)
+        self.assertIn(('pane', 'focus', '--pane', 'w9:p9', '--direction', 'left'), calls)  # the keys go to Claude
+        self.assertFalse(box.zoomed)
+
+    def test_a_desktop_never_zooms_and_taking_the_tab_undoes_a_phones_zoom(self):
+        self.sized(17, 46, 122)  # a narrow split on a desktop: column mode, not a phone
+        calls = self.herdr_calls(122, 46)
+        box = self.busy()
+        screen, _ = lay(self.frame(box), 17, 46, 12)
+        self.assertFalse(any('tap' in row[:12] for row in screen))
+        box.click(30, 2)
+        self.assertFalse(box.zoomed)
+        self.assertFalse(any(argv[:2] == ('pane', 'zoom') for argv in calls))
+        box.zoomed = True  # zoomed on the phone, then the desktop's client took the tab
+        self.sized(150, 30, 150)
+        calls = self.herdr_calls(150, 30)
+        self.frame(box)
+        self.assertIn(('pane', 'zoom', '--pane', 'w9:p9', '--off'), calls)
+        self.assertFalse(box.zoomed)
+
 
 class Phone(unittest.TestCase):
     """herdr's phone layout, read from its layout and its config."""
