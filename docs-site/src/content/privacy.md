@@ -18,6 +18,10 @@ title: Privacy & Security
 
 Installing CSR does not activate it. Nothing is written to `~/.claude/settings.json`, no MCP server is registered, and no conversations are indexed until you explicitly run `csr-engine setup` (or approve the installer's prompt). npm postinstall is download-only, so sandboxed evaluation (`npm install --prefix`) leaves your live Claude Code configuration untouched. See [Installation](#/docs/installation) for the `CSR_AUTO_SETUP` / `CSR_SKIP_SETUP` controls.
 
+## Code Map
+
+The code map only reads your repos: it runs no git command that writes and refreshes no index. It is stored in the local SQLite database. The daemon never opens `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or `/Volumes`, so the macOS privacy prompt never fires for it; a session working in one of those folders maps its own repo. `CSR_NO_CODEMAP=1` turns the code map off.
+
 ## Optional Cloud: AI Narratives
 
 Only Layer 3 sends text to a cloud model. It runs through `claude -p`, so it uses your existing Claude Code login and no API key. Running `csr-engine daemon` starts it. Set `CSR_NO_AI_NARRATIVES=1` to turn it off.
