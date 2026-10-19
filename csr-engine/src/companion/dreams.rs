@@ -22,7 +22,7 @@ pub const ADOPTED: &[&str] = &["helpful", "ask_claude", "sent"];
 pub fn keep(paths: &Paths, record: &Value) -> std::io::Result<()> {
     private::append(
         &paths.keep.join("dreams.jsonl"),
-        &(private::dumps(record) + "\n"),
+        &(private::dumps_record(record) + "\n"),
         &paths.keep,
     )
 }
@@ -62,7 +62,11 @@ impl DreamIndex {
                     || (next == "sent" && matches!(a, "ask_claude" | "expired"))
                 {
                     d["answer"] = r["answer"].clone();
-                    d["said"] = r["said"].clone();
+                    d["said"] = if super::truthy(&r["said"]) {
+                        json!(super::render::text::one_line(string(&r["said"]), 300))
+                    } else {
+                        Value::Null
+                    };
                 }
             }
         }

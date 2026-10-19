@@ -3,4 +3,4 @@
 {"type": "system", "timestamp": "2026-10-18T07:52:00Z", "subtype": "compact_boundary", "compactMetadata": {"preTokens": 190000, "postTokens": 21000, "durationMs": 42000}}
 {"type": "user", "timestamp": "2026-10-18T07:53:00Z", "isCompactSummary": true, "message": {"content": "## Decisions\nRead the database through Storage."}}
 {"type": "user", "timestamp": "2026-10-18T07:54:00Z", "message": {"content": "Now verify the frame."}}
-{"type": "assistant", "timestamp": "2026-10-18T07:55:00Z", "message": {"id": "m2", "stop_reason": "end_turn", "usage": {"input_tokens": 70000}, "content": [{"type": "text", "text": "The text frame is ready."}]}}
+{"type": "assistant", "timestamp": "2026-10-18T07:55:00Z", "message": {"id": "m2", "stop_reason": "end_turn", "usage": {"input_tokens": 70000}, "content": [{"type": "text", "text": "The text frame is ready."}, {"type": "tool_use", "name": "Read", "input": {"file_path": "<REPO>/csr-engine/src/main.rs"}}]}}

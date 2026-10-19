@@ -48,8 +48,12 @@ pub fn lineage_paths(paths: &Paths, sid: &str) -> Vec<PathBuf> {
         return result;
     }
     while result.len() <= 5 {
-        let Some(old) = crate::hooks::resume_lineage::pane_predecessor(&path, ids.last().unwrap())
-        else {
+        let Some(old) = super::sources::continued_from_at(
+            paths,
+            ids.last().unwrap(),
+            Some(&path),
+            super::paths::now(),
+        ) else {
             break;
         };
         if !valid_id(&old) || ids.contains(&old) || paths.transcript(&old).is_none() {
@@ -85,6 +89,10 @@ pub struct Session {
     main_id: Option<String>,
     measuring: Option<usize>,
     pub data: Value,
+    pub file_order: Vec<String>,
+    pub readings: Vec<super::coach::Reading>,
+    reading_waiting: bool,
+    track_readings: bool,
     replies: BTreeMap<String, Value>,
 }
 impl Session {
@@ -98,6 +106,10 @@ impl Session {
             main_id: None,
             measuring: None,
             replies: BTreeMap::new(),
+            file_order: vec![],
+            readings: vec![],
+            reading_waiting: false,
+            track_readings: false,
             data: json!({
                 "id": sid,
                 "title": null,
@@ -126,6 +138,12 @@ impl Session {
                 "lost": [],
                 "remembered": [],
             }),
+        }
+    }
+    pub fn with_readings(sid: &str) -> Self {
+        Self {
+            track_readings: true,
+            ..Self::new(sid)
         }
     }
     fn push(&mut self, key: &str, v: Value) {
@@ -163,8 +181,10 @@ impl Session {
             |raw| {
                 let Some(raw) = raw else {
                     let path = self.path.clone();
+                    let tracking = self.track_readings;
                     *self = Self::new(&self.id);
                     self.path = path;
+                    self.track_readings = tracking;
                     return;
                 };
                 self.read_line(raw);
@@ -194,6 +214,9 @@ impl Session {
         let side = e["isSidechain"] == true;
         if kind == "ai-title" && e["aiTitle"].is_string() {
             self.data["title"] = e["aiTitle"].clone();
+        }
+        if self.track_readings {
+            self.read_readings(raw, &e, when.unwrap_or(0.));
         }
         let Some(t) = when else {
             if kind == "ai-title" && e["aiTitle"].is_string() {
@@ -267,6 +290,9 @@ impl Session {
                 {
                     let path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
                     let path = path.to_string_lossy();
+                    if !self.file_order.iter().any(|p| p == path.as_ref()) {
+                        self.file_order.push(path.to_string());
+                    }
                     let count = self.data["files"][path.as_ref()].as_u64().unwrap_or(0) + 1;
                     self.data["files"][path.as_ref()] = json!(count);
                     self.data["last"][path.as_ref()] = json!(t);
@@ -352,12 +378,14 @@ impl Session {
             }
         } else if kind == "attachment" {
             let a = &e["attachment"];
-            let text = a["prompt"].as_str().unwrap_or("").trim();
-            if a["type"] == "queued_command"
-                && a["humanTurn"] == true
-                && !text.is_empty()
-                && !text.starts_with(['<', '/'])
-            {
+            let typed = a["prompt"]
+                .as_str()
+                .map(|s| {
+                    let s = s.trim();
+                    !s.is_empty() && !s.starts_with(['<', '/'])
+                })
+                .unwrap_or_else(|| super::truthy(&a["prompt"]));
+            if a["type"] == "queued_command" && super::truthy(&a["humanTurn"]) && typed {
                 self.push("prompts", json!(t));
             }
             if a["type"] == "hook_success"
@@ -388,6 +416,48 @@ impl Session {
             self.push("summary_sizes", meta["postTokens"].clone());
             self.measuring = Some(self.data["compact_sizes"].as_array().unwrap().len() - 1);
         }
+    }
+
+    fn read_readings(&mut self, raw: &[u8], e: &Value, when: f64) {
+        let has = |s: &[u8]| memchr::memmem::find(raw, s).is_some();
+        if !(has(b"\"isCompactSummary\":true")
+            || (has(b"\"type\":\"user\"") && !has(b"\"tool_use_id\""))
+            || (self.reading_waiting && has(b"\"type\":\"assistant\"")))
+        {
+            return;
+        }
+        if !e["message"].is_object() {
+            return;
+        }
+        let kind = e["type"].as_str().unwrap_or("");
+        let text = message_text(&e["message"]);
+        if kind == "user" && e["isCompactSummary"] == true {
+            for line in text.lines() {
+                if let Some(mut row) = super::coach::reading_in(line, false) {
+                    if !self.readings.iter().any(|r| r.line == row.line) {
+                        row.when = when;
+                        row.source = "compaction".into();
+                        self.readings.push(row);
+                    }
+                }
+            }
+        } else if kind == "user" && e["isMeta"] != true && e["isSidechain"] != true {
+            self.reading_waiting =
+                !text.trim().is_empty() && !text.trim_start().starts_with(['<', '/']);
+        } else if kind == "assistant" && e["isSidechain"] != true && !text.trim().is_empty() {
+            self.reading_waiting = false;
+            let first = super::coach::sentences(text.trim())
+                .into_iter()
+                .next()
+                .unwrap_or("");
+            if let Some(mut row) = super::coach::reading_in(first, true) {
+                row.when = when;
+                row.source = "reply".into();
+                self.readings.push(row);
+            }
+        }
+        self.readings
+            .drain(..self.readings.len().saturating_sub(20));
     }
     pub fn load(&mut self, paths: &Paths, db: Option<&Db>) -> &mut Value {
         self.read_transcript(paths);
@@ -1014,5 +1084,19 @@ mod typed_regressions {
             "message":{"content":envelope}});
         session.read_line(row.to_string().as_bytes());
         assert!(session.data["typed"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn queued_commands_with_images_still_count_as_prompts() {
+        let mut s = Session::new("s");
+        s.read_line(
+            json!({"type":"attachment","timestamp":"2026-10-18T00:00:00Z",
+            "attachment":{"type":"queued_command","humanTurn":true,"prompt":[
+                {"type":"text","text":"Check this image"},
+                {"type":"image","source":{"type":"base64","data":"x"}}
+            ]}})
+            .to_string()
+            .as_bytes(),
+        );
+        assert_eq!(super::super::array(&s.data["prompts"]).len(), 1);
     }
 }

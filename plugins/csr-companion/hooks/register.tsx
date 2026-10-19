@@ -37,7 +37,6 @@ import { CHOICES, dueSteps, heading, LINES, refusedText, STEPS } from './setup'
 //
 // The pane: this session live, the dreams by date, and code that changed since
 // your past sessions, in a herdr split beside Claude.
-const script = ($: EngineInterface) => `${$.plugin.root}/bin/pane.py`
 
 const engines = new Map<string, Promise<string | null>>()
 async function engine($: EngineInterface): Promise<string | null> {
@@ -152,7 +151,9 @@ const view = atom({ plugin: 'csr-companion', key: 'view' } as const, null as Not
 type HerdrPane = { pane_id: string; tab_id?: string; workspace_id?: string; label?: string | null }
 
 async function run($: EngineInterface, argv: string[], stdin?: string): Promise<string | null> {
-  const ran = await $.process.run(['python3', '-I', script($), ...argv], { timeoutMs: 20_000, ...(stdin === undefined ? {} : { stdin }) })
+  const binary = await engine($)
+  if (!binary) return null
+  const ran = await $.process.run([binary, 'companion', 'pane', ...argv], { timeoutMs: 20_000, ...(stdin === undefined ? {} : { stdin }) })
   return ran.exitCode === 0 ? ran.stdout : null
 }
 
@@ -627,7 +628,9 @@ const rankOf = (root: string) => (/\/\.claude\/plugins\//.test(root) ? 0 : 1)
 async function lease($: EngineInterface, step: LeaseStep, busy = false): Promise<boolean> {
   const home = await $.env.get('HOME')
   if (!home) return step !== 'renew'
-  const argv = ['python3', '-I', `${$.plugin.root}/bin/lease.py`, step, '--folder', `${home}/${LEASES}`, '--session', await $.session.id(),
+  const binary = await engine($)
+  if (!binary) return step !== 'renew'
+  const argv = [binary, 'companion', 'lease', step, '--folder', `${home}/${LEASES}`, '--session', await $.session.id(),
     '--root', $.plugin.root, '--rank', String(rankOf($.plugin.root)), '--now', String(await $.clock.now()), ...(busy ? ['--busy'] : [])]
   let failure = ''
   const ran = await $.process.run(argv, { timeoutMs: 2_000 }).catch((error: unknown) => {
@@ -1324,7 +1327,9 @@ async function refreshStory($: EngineInterface): Promise<StoryWhy | 'off' | 'bus
 
 // bin/pane.py, within a time limit: a run that overruns it, or fails, reads as no answer.
 async function paneWithin($: EngineInterface, argv: string[], timeoutMs = 20_000): Promise<string | null> {
-  const ran = await $.process.run(['python3', '-I', `${$.plugin.root}/bin/pane.py`, ...argv], { timeoutMs }).catch(() => null)
+  const binary = await engine($)
+  if (!binary) return null
+  const ran = await $.process.run([binary, 'companion', 'pane', ...argv], { timeoutMs }).catch(() => null)
   return ran && ran.exitCode === 0 ? ran.stdout : null
 }
 
@@ -2432,8 +2437,10 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return next(e)
     let block: string | null = null
     try {
+      const binary = await engine($)
+      if (!binary) return next(e)
       const ran = await $.process.run(
-        ['python3', '-I', script($), '--repo', await $.session.cwd(), '--lost', '--sid', await $.session.id()],
+        [binary, 'companion', 'pane', '--repo', await $.session.cwd(), '--lost', '--sid', await $.session.id()],
         { timeoutMs: 2000 }, // past it the call rejects: the compaction goes on as it was
       )
       block = ran.exitCode === 0 ? carryBlock(JSON.parse(ran.stdout) as Thread[]) : null
@@ -2719,7 +2726,7 @@ async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> 
 
 async function openPane($: EngineInterface, cwd: string): Promise<'herdr' | 'pane'> {
   if (await openHerdrPane($, cwd)) return 'herdr'
-  void $.ui.open({ id: PANE, title: LABEL })
+  void $.ui.open({ id: PANE, title: LABEL }).catch(() => undefined)
   return 'pane'
 }
 

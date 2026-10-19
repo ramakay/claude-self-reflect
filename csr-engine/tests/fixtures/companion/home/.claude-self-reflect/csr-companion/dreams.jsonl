@@ -1,3 +1,4 @@
+{"kind": "compact", "event": "compact", "outcome": "compacted", "session": "sess-now", "at": 1792319520.0, "ctx_before": 190000, "ctx_after": 21000}
 {"kind": "chapter", "session": "sess-now", "at": 1792316400.0, "of": 5}
 {"kind": "dream", "id": "older", "session": "sess-now", "at": 1792319500.0, "line": "What if every read stayed bounded?", "title": "A small reader", "text": "- Bound the tail before parsing."}
 {"kind": "answer", "id": "older", "answer": "helpful", "at": 1792319550.0}

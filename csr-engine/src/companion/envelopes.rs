@@ -19,7 +19,7 @@ fn text(value: &Value, limit: usize) -> bool {
         .as_str()
         .is_some_and(|s| s.chars().count() <= limit && !s.chars().any(control))
 }
-fn valid(value: &Value) -> bool {
+pub(super) fn valid(value: &Value) -> bool {
     if !id(&value["session"], "_-") {
         return false;
     }
@@ -86,20 +86,26 @@ fn valid(value: &Value) -> bool {
                 })
         })
 }
-pub fn strip(text: &str) -> String {
+
+pub(super) struct Envelope {
+    pub start: usize,
+    pub end: usize,
+    pub payload: Value,
+}
+pub(super) fn parse(text: &str) -> Vec<Envelope> {
     if !text.contains("[[CSR:AGENTS:v1]]") {
-        return text.to_owned();
+        return vec![];
     }
     let lines: Vec<_> = text.split_inclusive('\n').collect();
     let line = |i: usize| {
         let line = lines[i].strip_suffix('\n').unwrap_or(lines[i]);
         line.strip_suffix('\r').unwrap_or(line)
     };
-    let mut out = String::new();
-    let mut i = 0;
+    let mut found = vec![];
+    let (mut i, mut start) = (0, 0);
     while i < lines.len() {
         let head = if i == 0 {
-            line(i).trim_start_matches('\u{feff}')
+            line(i).strip_prefix('\u{feff}').unwrap_or(line(i))
         } else {
             line(i)
         };
@@ -108,17 +114,36 @@ pub fn strip(text: &str) -> String {
             && line(i + 2) == "[[/CSR:AGENTS:v1]]"
             && !line(i + 1).contains('\r')
         {
-            let bytes: usize = lines[i..i + 3].iter().map(|s| s.len()).sum::<usize>()
-                + usize::from(!lines[i + 2].ends_with('\n'));
-            if bytes <= 16384 && serde_json::from_str::<Value>(line(i + 1)).is_ok_and(|v| valid(&v))
-            {
-                i += 3;
-                continue;
+            let bytes = lines[i..i + 3].iter().map(|s| s.len()).sum::<usize>();
+            let size = bytes + usize::from(!lines[i + 2].ends_with('\n'));
+            if size <= 16384 {
+                if let Ok(payload) = serde_json::from_str::<Value>(line(i + 1)) {
+                    if valid(&payload) {
+                        found.push(Envelope {
+                            start,
+                            end: start + bytes,
+                            payload,
+                        });
+                        start += bytes;
+                        i += 3;
+                        continue;
+                    }
+                }
             }
         }
-        out.push_str(lines[i]);
+        start += lines[i].len();
         i += 1;
     }
+    found
+}
+pub fn strip(text: &str) -> String {
+    let mut out = String::new();
+    let mut at = 0;
+    for e in parse(text) {
+        out.push_str(&text[at..e.start]);
+        at = e.end;
+    }
+    out.push_str(&text[at..]);
     out
 }
 #[cfg(test)]

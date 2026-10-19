@@ -1,0 +1,15 @@
+Files Claude handled lately, newest first: csr-engine/src/main.rs (1×).
+
+Rules the person set for these files:
+* On 10-17 you told the agent about main.rs: “Keep input bounded.” [session past-ses]
+
+Lines the person typed in past sessions, in their own words, that sit close to this work (a line older than 30 days is context only: never the main reason to ask):
+- 10-17 (fixture): “What if the importer always kept a bounded reader?” [session past-voi]
+
+Dreams already offered here, and what the person answered (where they said why, their own words):
+- 10-18: “What if a frame failed while the agent was busy?” [no answer]
+- 10-18: “What if every read stayed bounded?” [helpful]
+
+[[CSR:AGENTS:v1]]
+{"kind":"context","session":"sess-now","at":1792320000000,"agents":[{"id":"a1","parent":null,"type":"Explore","model":"claude-sonnet-4-5","status":"completed","edits":["<REPO>/csr-engine/src/main.rs"],"overlaps":[],"completion":{"turn_id":"turn-1","reason":"answer","answer":"Bounded \u005breader\u005d\nReady."}}]}
+[[/CSR:AGENTS:v1]]

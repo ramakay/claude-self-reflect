@@ -280,7 +280,7 @@ function host(on: On, world: World) {
       writes.push(e.argv[4] as string)
       return ok('')
     }
-    if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/lease.py')) { // a stand-in: lease.py's decide, on these files
+    if (e.argv[1] === 'companion' && e.argv[2] === 'lease') { // a stand-in: lease.py's decide, on these files
       const arg = (name: string) => e.argv[e.argv.indexOf(name) + 1] as string
       const path = `${arg('--folder')}/${arg('--session')}.json`
       const [root, rank, now, busy] = [arg('--root'), Number(arg('--rank')), Number(arg('--now')), e.argv.includes('--busy')]
@@ -297,14 +297,14 @@ function host(on: On, world: World) {
       if (write) files.set(path, JSON.stringify(write))
       return ok(JSON.stringify({ held: answer, lease: write ?? held }))
     }
-    if (e.argv[0] === 'python3' && e.argv.includes('--note')) {
+    if (e.argv[1] === 'companion' && e.argv[2] === 'pane' && e.argv.includes('--note')) {
       if (!e.argv.includes('--touch')) return ok(JSON.stringify(world.notes ?? []))
       touches.push({ argv: [...e.argv], stdin: e.init?.stdin }) // `--touch -`: the tool call, as JSON on stdin
       if (world.plainNotes) return ok(JSON.stringify(world.notes ?? [])) // a pane from before --touch
       return ok(JSON.stringify({ notes: world.notes ?? [], candidates: world.candidates ?? (world.notes ?? []).length }))
     }
-    if (e.argv[0] === 'python3' && e.argv.includes('--coach')) return ok(JSON.stringify(world.coach ?? []))
-    if (e.argv[0] === 'python3' && e.argv.includes('--lost')) {
+    if (e.argv[1] === 'companion' && e.argv[2] === 'pane' && e.argv.includes('--coach')) return ok(JSON.stringify(world.coach ?? []))
+    if (e.argv[1] === 'companion' && e.argv[2] === 'pane' && e.argv.includes('--lost')) {
       if (world.lost === 'hangs') { // process.run rejects past timeoutMs; without the 2 s limit it 'answers' instead
         if (e.init?.timeoutMs !== 2000) return ok(JSON.stringify([{ text: 'no time limit passed', state: 'lost' }]))
         return { deny: 'timed out after 2000 ms' }
@@ -312,12 +312,12 @@ function host(on: On, world: World) {
       if (typeof world.lost === 'string') return ok(world.lost)
       return world.lost ? ok(JSON.stringify(world.lost)) : { value: { exitCode: 1, stdout: '', stderr: 'boom', isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    if (e.argv[0] === 'python3' && e.argv.includes('--brief')) return ok(world.brief ?? BRIEF)
-    if (e.argv[0] === 'python3' && e.argv.includes('--keep')) {
+    if (e.argv[1] === 'companion' && e.argv[2] === 'pane' && e.argv.includes('--brief')) return ok(world.brief ?? BRIEF)
+    if (e.argv[1] === 'companion' && e.argv[2] === 'pane' && e.argv.includes('--keep')) {
       kept.push(JSON.parse(e.argv[e.argv.indexOf('--keep') + 1] ?? '{}'))
       return ok('{}')
     }
-    if (e.argv[0] === 'python3') {
+    if (e.argv[1] === 'companion' && e.argv[2] === 'pane') {
       if (world.jsonHangs && e.argv.includes('--json')) return { deny: 'timed out after 20000 ms' } // process.run rejects
       if (world.json) return ok(JSON.stringify(world.json))
       return ok(JSON.stringify(world.repo ? SHIFTS : { repo: null, total: 0, shifts: [], changes: [], changes_total: 0, dreams: [], status: null }))
@@ -393,7 +393,7 @@ test('session start in herdr: no status line, old pane closed, new split watches
   expect(watcher?.slice(0, 4)).toEqual(['/bin/herdr', 'pane', 'run', 'w2:p9'])
   expect(watcher?.slice(4, 7)).toEqual([`${HOME}/.local/bin/csr-engine`, 'companion', 'pane'])
   expect(watcher?.slice(-4)).toEqual(['--sid', 'sess-1', '--agent', 'w2:p1']) // a second click on a row types into Claude's pane
-  expect(seen.runs.find(argv => argv[0] === 'python3')).toEqual(expect.arrayContaining(['--json', '--sid', 'sess-1']))
+  expect(seen.runs.find(argv => argv[1] === 'companion' && argv[2] === 'pane')).toEqual(expect.arrayContaining(['--json', '--sid', 'sess-1']))
   expect(seen.opened).toEqual([])
 })
 
@@ -552,6 +552,7 @@ test('a file the pane had nothing to say about is not asked again; one with note
   await $.ui.mount(BAND)
   await $.tool.call({ tool: 'Edit', file_path: '/repo/quiet.rs', old_string: 'a', new_string: 'b' } as never)
   await settle(() => quiet.touches.length >= 1)
+  await settle(() => false) // the process request was observed; let its answer mark the file quiet
   await $.tool.call({ tool: 'Edit', file_path: '/repo/quiet.rs', old_string: 'c', new_string: 'd' } as never)
   await $.tool.call({ tool: 'Read', file_path: '/repo/quiet.rs', offset: 3, limit: 4 } as never)
   await settle(() => false)
@@ -890,12 +891,12 @@ test('one dreamer per session: a lease is taken under a lock, marked busy while 
   await steps($, 12)
   await settle(() => seen.forks.length >= 1)
   expect(JSON.parse(seen.files.get(LEASE) ?? '{}')).toEqual(expect.objectContaining({ rank: 1, busy: true })) // ours, running
-  const taken = seen.runs.find(run => (run[2] ?? '').endsWith('/bin/lease.py') && run[3] === 'take')
+  const taken = seen.runs.find(run => run[1] === 'companion' && run[2] === 'lease' && run[3] === 'take')
   expect(taken).toEqual(expect.arrayContaining(['--folder', `${HOME}/.claude-self-reflect/csr-companion/dreamer-lease`, '--session', 'sess-1', '--busy']))
   open()
   await settle(() => !JSON.parse(seen.files.get(LEASE) ?? '{}').busy)
   expect(JSON.parse(seen.files.get(LEASE) ?? '{}')).not.toHaveProperty('busy')
-  expect(seen.runs.some(run => (run[2] ?? '').endsWith('/bin/lease.py') && run[3] === 'release')).toBe(true) // the look ended
+  expect(seen.runs.some(run => run[1] === 'companion' && run[2] === 'lease' && run[3] === 'release')).toBe(true) // the look ended
 })
 
 test('one dreamer per session: a lease older than 15 minutes is taken, whoever held it', ON, async ($, on) => {
@@ -2260,7 +2261,7 @@ test('prep-compact hands the summary only what you set aside for later, as remin
   expect(told).not.toContain('Fix the importer')
   expect(told).not.toContain('Pending Tasks')
   const asked = seen.runs.find(run => run.includes('--lost'))
-  expect(asked).toEqual(expect.arrayContaining(['python3', '-I', '--repo', '/repo', '--lost', '--sid', 'sess-1']))
+  expect(asked).toEqual(expect.arrayContaining(['companion', 'pane', '--repo', '/repo', '--lost', '--sid', 'sess-1']))
 })
 
 test('prep-compact holds the block to eight threads and 1200 characters', async ($, on) => {

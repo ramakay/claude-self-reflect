@@ -1,0 +1,8 @@
+{
+  "kind": "compact",
+  "session": "sess-now",
+  "at": 1792320000.0,
+  "event": "plan",
+  "token": "abc",
+  "repo": "<REPO>"
+}
