@@ -96,7 +96,3 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 - **Dream timing:** `CSR_DREAM_INTERVAL_SECS`, `CSR_DREAM_IDLE_MINS` (default 30), `CSR_DREAM_FLOOR_HOUR` (default 3).
 - **Search path:** `CSR_SEARCH_MODE=hybrid|vector|fts`.
 - **CPU caps:** `CSR_EMBED_THREADS`, `CSR_TOKIO_WORKERS`.
-
-## Coming in this release
-
-<!-- TODO-CODEMAP: live code map of main + worktrees; fill after it lands -->

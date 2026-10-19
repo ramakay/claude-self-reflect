@@ -16,6 +16,7 @@ Single 44MB binary. No databases. No containers. No API keys required.
 > Each session starts with one recap paragraph (intent, what got done, what was settled, what is open, the next step) instead of a pile of fragments, plus a `learnt` line of what CSR stored last time. Every clause carries a receipt or drops out.
 > Dreaming checks old conclusions against your git history and marks a stale anchor with the commit that changed it. No LLM in that check.
 > CSR also reads plans, task state, Codex sessions, subagent transcripts, memory-file metadata and the session registry, and ships a companion plugin with a pane beside the session.
+> A live code map covers every definition in the repos your sessions work in, across main and every worktree, so CSR can answer for code no conversation touched.
 > Sub-millisecond search, ~150ms cached startup, 1150+ tests (lib, verified at commit ff4ad3f), zero external dependencies.
 > [Release notes](CHANGELOG.md)
 
@@ -218,10 +219,6 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 - **Search path:** `CSR_SEARCH_MODE=hybrid|vector|fts`.
 - **CPU caps:** `CSR_EMBED_THREADS`, `CSR_TOKIO_WORKERS`.
 
-### Coming in this release
-
-<!-- TODO-CODEMAP: live code map of main + worktrees; fill after it lands -->
-
 ---
 
 ## Install
@@ -230,7 +227,7 @@ Open `http://127.0.0.1:7373/`. `CSR_JOURNAL_PORT` moves the port and `CSR_NO_JOU
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary (SHA256-verified), then asks before activating. Setup — which registers the MCP server, installs 6 hooks, and imports your conversations — only runs with your consent. Restart Claude Code after.
+Downloads the binary (SHA256-verified), then asks before activating. Setup registers the MCP server, installs 6 hooks, imports your conversations and installs the companion plugin, and it only runs with your consent. Restart Claude Code after.
 
 Non-interactive installs never activate on their own: set `CSR_AUTO_SETUP=1` to opt in, or run `csr-engine setup` yourself.
 
@@ -268,7 +265,7 @@ csr-engine setup
 
 ### The companion pane (optional)
 
-A Claude Code plugin that sits beside the session: what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. It is not bundled with the binary and setup does not install it: adding a plugin is your own step, in Claude Code (2.1.296 or later).
+A Claude Code plugin that sits beside the session: what your memory handed Claude, the agents and Codex runs in flight, the dreamer's "what if...?", and a compaction coach. Setup installs it after the same consent, through Claude Code's own plugin CLI (Claude Code 2.1.296 or later). `csr-engine setup --no-companion` skips it. If setup cannot install it, it prints why, and you can add it yourself in Claude Code:
 
 ```
 /plugin marketplace add ramakay/claude-self-reflect

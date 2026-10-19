@@ -527,7 +527,7 @@ function InstallCard() {
           </div>
           <p className="type-caption mt-2">One command. Downloads binary, then asks before activating hooks + MCP. Restart Claude Code.</p>
           <div className="install-tabs-inline">
-            {['44MB binary', 'zero deps', '6 hooks', '12 MCP tools'].map((label, index) => (
+            {['44MB binary', 'zero deps', '6 hooks', '16 MCP tools'].map((label, index) => (
               <span key={label} className="tear-tab" style={{ animationDelay: `${720 + index * 70}ms` }}>{label}</span>
             ))}
           </div>
