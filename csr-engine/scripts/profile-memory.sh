@@ -122,7 +122,7 @@ for probe in intent_probes.json reaction_probes.json; do
     fi
 done
 # A real file for the Edit hook to track — the installed PostToolUse matcher
-# (Edit|Write|MultiEdit|NotebookEdit) is what fires this hook in production.
+# (Edit|Write|MultiEdit|NotebookEdit|Bash) is what fires this hook in production.
 printf 'fn probe() -> u32 {\n    42\n}\n' >"$HOOK_CWD/probe.rs"
 
 # Isolation receipts. The operator's own Claude Code session keeps appending

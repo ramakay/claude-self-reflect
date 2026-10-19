@@ -461,6 +461,19 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   status line, so every gauge was blank. It now asks herdr what runs beside it and follows the attached job's session.
   A failed narrative call stored with model `unknown` and no tokens hid the week's cost figure; a call with no tokens
   now costs $0 whatever model it names.
+- **A file written through Bash now reaches file history** (`csr_search_by_file`, `csr_code_graph`, the `csr_why`
+  file hop), as an Edit or Write does. The PostToolUse matcher named only the edit tools: over 14 days of the owner's
+  corpus, `csr_search_by_file` found the editing session for 1 of 574 Bash-only (file, session) pairs, against 390 of
+  408 edit-tool pairs. One parser (`hooks/bash_writes.rs`) reads `sed -i`, `perl -pi`, redirects, `tee`, Python
+  `open`/`write_text` and the read-replace-write idiom; `$`, glob, `/dev/*`, directory and computed paths are skipped,
+  and a literal `W=/abs/path; cd $W && ...` resolves. The matcher gains `Bash` (`hook install --apply` upgrades the
+  entry in place); a Bash call that wrote nothing exits before the engine opens (p95 7.1 ms). Rows carry
+  `tool_name='Bash'` and empty symbol lists. A one-time replay (`coedit_bash_backfill_v1`, daemon and `setup`) covers
+  existing transcripts, subagent ones under their parent session, skips what the live hook already recorded and keeps
+  only what the hook would keep. Checked against git, not command text, on a copy of the owner's DB: of 189 (session,
+  file) pairs committed during a session and touched by no edit tool, CSR held 0 before and 131 after (83 at the
+  worktree path, 48 under the main checkout path every worktree edit is stored at). The full-text fallback of
+  `csr_search_by_file` matches a path as a phrase of its tokens; it had recovered 0 of 441.
 
 ### Known limitations
 

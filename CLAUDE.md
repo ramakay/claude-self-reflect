@@ -169,7 +169,7 @@ cargo bench --bench spike_bench
 |------|------|------|
 | SessionStart | Session begins | Injects the recap paragraph (framed as history, not instructions); falls back to fragments when feeds are empty |
 | UserPromptSubmit | Every prompt | Predictive context injection |
-| PostToolUse | After Edit/Write | Tracks file changes |
+| PostToolUse | After Edit/Write, and after a Bash call that wrote a file (`sed -i`, `perl -pi`, redirects, `tee`, Python writes) | Tracks file changes; a Bash call that wrote nothing exits before any other work |
 | Stop | Every response | Stores iteration learnings |
 | PreCompact | Before compaction | Backs up state |
 | SessionEnd | Session ends | Stores narrative |

@@ -1977,6 +1977,28 @@ pub fn fts5_match_expr(query: &str) -> Option<String> {
     Some(fts5_or_expr(&words))
 }
 
+/// FTS5 MATCH expression for a file path: ONE quoted phrase of the path's
+/// tokens, split where the index's `unicode61` tokenizer splits (every
+/// non-alphanumeric character), so `csr-engine/src/storage/mod.rs` becomes
+/// `"csr engine src storage mod rs"`. A chunk that names the path matches; one
+/// that holds the same words apart does not.
+///
+/// This is not [`fts5_query_words`], which deletes every character but
+/// alphanumerics, `_` and `-` and so turned a path into one token
+/// (`csr-enginesrcstoragemodrs`) that no chunk holds. That function stays as it
+/// is for free-text callers (prompts, MCP search), where words OR together.
+/// `None` when the path holds no token.
+pub fn fts5_path_expr(path: &str) -> Option<String> {
+    let tokens: Vec<&str> = path
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(format!("\"{}\"", tokens.join(" ")))
+}
+
 /// The words of a free-text query that survive FTS5 sanitizing: whitespace
 /// split, only alphanumerics, `_` and `-` kept, at least two characters.
 pub fn fts5_query_words(query: &str) -> Vec<String> {
@@ -4271,6 +4293,19 @@ pub fn code_evolution_id_exists(conn: &Connection, id: &str) -> Result<bool> {
     .map_err(Into::into)
 }
 
+/// `(session_id, file_path, tool_name)` of every `code_evolution` row the live
+/// hook wrote, that is every row whose id is not a backfill `bf-` id.
+pub fn code_evolution_live_triples(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT session_id, file_path, tool_name FROM code_evolution
+         WHERE id NOT LIKE 'bf-%'",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+}
+
 /// Get recent code evolution for a file (most recent N entries).
 /// Scoped by project_name to prevent cross-project leakage (Codex M-3).
 /// Returns (session_id, timestamp, functions_added, functions_removed, tool_name).
@@ -5867,6 +5902,52 @@ mod tests {
             fts5_search_expr(&conn, &fts5_or_expr(&["raretoken".to_string()]), 5, None).unwrap();
         assert_eq!(by_text.len(), 1);
         assert_eq!(by_text[0].0.id, by_expr[0].0.id);
+    }
+
+    #[test]
+    fn a_path_is_one_phrase_that_a_chunk_naming_it_matches_and_scattered_words_do_not() {
+        let conn = mem();
+        let path = "csr-engine/src/storage/mod.rs";
+        for (id, text) in [
+            (
+                "named",
+                "I edited csr-engine/src/storage/mod.rs to add a column",
+            ),
+            (
+                "scattered",
+                "the storage engine in src of csr, a mod for rs files",
+            ),
+            ("other", "csr-engine/src/storage/queries.rs changed instead"),
+        ] {
+            insert_chunk(&conn, &test_chunk(id, text), &[0.1; 4]).unwrap();
+        }
+
+        // The old free-text route folds the path into one token no chunk holds.
+        assert!(fts5_search(&conn, path, 10, None).unwrap().is_empty());
+
+        let expr = fts5_path_expr(path).unwrap();
+        assert_eq!(expr, "\"csr engine src storage mod rs\"");
+        let ids: Vec<String> = fts5_search_expr(&conn, &expr, 10, None)
+            .unwrap()
+            .into_iter()
+            .map(|(chunk, _, _)| chunk.id)
+            .collect();
+        assert_eq!(ids, ["named"]);
+
+        let abs = fts5_path_expr("/Users/me/projects/app/src/a_b.rs").unwrap();
+        assert_eq!(abs, "\"Users me projects app src a b rs\"");
+        assert_eq!(fts5_path_expr("///"), None);
+        assert_eq!(fts5_path_expr(""), None);
+    }
+
+    #[test]
+    fn free_text_words_still_drop_everything_but_alphanumerics_underscore_and_hyphen() {
+        // fts5_query_words is shared with prompts and MCP search; the path fix
+        // must not change it.
+        assert_eq!(
+            fts5_query_words("csr-engine/src/mod.rs a hello_world"),
+            ["csr-enginesrcmodrs", "hello_world"]
+        );
     }
 
     #[test]

@@ -4,9 +4,15 @@
 //! so new content becomes searchable. For Edit/Write operations, tracks
 //! structural code changes (functions/types/imports added/removed).
 //!
+//! A Bash call is read first (`hooks::bash_writes`): one that wrote no file
+//! returns before the engine is built, so the most frequent tool costs a
+//! process start and a parse. One that wrote files takes the same path an Edit
+//! takes, once per file, with `tool_name = 'Bash'` and no symbol diff (a shell
+//! command carries no before/after text, and a diff is never invented).
+//!
 //! Always returns Ok(()) — never blocks Claude Code (C-2 fix).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -15,15 +21,59 @@ use crate::engine::Engine;
 
 /// Tool names whose edits this hook tracks (code evolution + code graph).
 /// The transcript sync above the gate runs for every fire regardless; the
-/// installer's PostToolUse matcher (`Edit|Write|MultiEdit|NotebookEdit`,
-/// see `hooks::install`) is deliberately a superset of this list.
+/// installer's PostToolUse matcher (`Edit|Write|MultiEdit|NotebookEdit|Bash`,
+/// see `hooks::install`) is deliberately a superset of this list. `Bash` is
+/// not here: it names no file in `tool_input`, so it has its own path through
+/// [`bash_written_files`].
 pub fn is_acted_on_tool(tool_name: Option<&str>) -> bool {
     matches!(tool_name, Some("Edit") | Some("Write") | Some("MultiEdit"))
+}
+
+/// Most files one Bash call may add to the file history. A script that rewrites
+/// a whole tree would otherwise make one hook run parse and store all of it.
+const MAX_BASH_FILES: usize = 16;
+
+/// The existing files a Bash call wrote, by reading its command. Empty for any
+/// other tool and for a Bash call that wrote nothing. Paths resolve against the
+/// cwd Claude Code sent, else the process cwd.
+pub fn bash_written_files(input: &HookInput) -> Vec<PathBuf> {
+    if input.tool_name.as_deref() != Some("Bash") {
+        return Vec::new();
+    }
+    let Some(command) = input
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.get("command"))
+        .and_then(|v| v.as_str())
+    else {
+        return Vec::new();
+    };
+    let cwd = match input.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    let mut files = super::bash_writes::bash_writes(command, &cwd);
+    files.retain(|f| f.is_file());
+    files.truncate(MAX_BASH_FILES);
+    files
+}
+
+/// Whether this hook run has nothing to do and can exit before the engine is
+/// built: a Bash PostToolUse that wrote no file. Everything else, including a
+/// Bash call that did write, goes on to [`handle`].
+pub fn exits_before_engine(hook_name: &str, input: &HookInput) -> bool {
+    hook_name == "post-tool-use"
+        && input.tool_name.as_deref() == Some("Bash")
+        && bash_written_files(input).is_empty()
 }
 
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
 pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+    let bash_files = bash_written_files(input);
+    if input.tool_name.as_deref() == Some("Bash") && bash_files.is_empty() {
+        return Ok(());
+    }
     // Code map session signal: this cwd has a live session. One upsert, first,
     // so the slow transcript import below cannot delay or starve it.
     super::record_codemap_signal(input, engine, "post_tool_use");
@@ -34,20 +84,34 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     // Import growing transcript (real-time searchability)
     super::import_current_transcript(input, engine, cwd).await;
 
-    // Track code evolution for Edit/Write/MultiEdit operations (v9)
-    if is_acted_on_tool(input.tool_name.as_deref()) {
+    // Track code evolution for Edit/Write/MultiEdit operations (v9) and for
+    // the files a Bash call wrote.
+    let touched: Vec<String> = if is_acted_on_tool(input.tool_name.as_deref()) {
+        tool_file_path(input)
+            .map(str::to_string)
+            .into_iter()
+            .collect()
+    } else {
+        bash_files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect()
+    };
+    for file_path in &touched {
         // Code map freshness: enqueue only, the daemon does the work. One
         // INSERT, no parse, no git; a failure (missing table, locked db) is
         // logged and never reaches Claude Code.
-        if let Err(e) = enqueue_for_codemap(input, engine) {
+        if let Err(e) = enqueue_path_for_codemap(engine, file_path) {
             eprintln!("CSR: code map enqueue error (non-fatal): {}", e);
         }
-        if let Err(e) = track_code_evolution(input, engine).await {
+        if let Err(e) =
+            track_code_evolution_for(input, engine, file_path, resolve_project_for_hook).await
+        {
             eprintln!("CSR: code evolution tracking error (non-fatal): {}", e);
         }
         // v9.4 liveness path: re-extract the touched file into the code graph
         // so callers/callees/ledger reflect the edit immediately.
-        if let Err(e) = update_code_graph(input, engine) {
+        if let Err(e) = update_code_graph_for(input, engine, file_path, resolve_project_for_hook) {
             eprintln!("CSR: code graph update error (non-fatal): {}", e);
         }
     }
@@ -55,17 +119,26 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     Ok(())
 }
 
-/// Queue the edited file for the code map's partial rescan. Skipped when the
-/// code map is off, the path is relative, not a code file, or protected.
-fn enqueue_for_codemap(input: &HookInput, engine: &Engine) -> Result<()> {
-    let Some(file_path) = input
+/// The `file_path` an Edit/Write/MultiEdit sent.
+fn tool_file_path(input: &HookInput) -> Option<&str> {
+    input
         .tool_input
         .as_ref()
         .and_then(|t| t.get("file_path"))
         .and_then(|v| v.as_str())
-    else {
-        return Ok(());
-    };
+}
+
+/// Queue the edited file for the code map's partial rescan. Skipped when the
+/// code map is off, the path is relative, not a code file, or protected.
+#[cfg(test)]
+fn enqueue_for_codemap(input: &HookInput, engine: &Engine) -> Result<()> {
+    match tool_file_path(input) {
+        Some(file_path) => enqueue_path_for_codemap(engine, file_path),
+        None => Ok(()),
+    }
+}
+
+fn enqueue_path_for_codemap(engine: &Engine, file_path: &str) -> Result<()> {
     let path = Path::new(file_path);
     if !crate::codemap::should_enqueue(path, crate::codemap::identity::home_dir().as_deref()) {
         return Ok(());
@@ -101,27 +174,33 @@ const MAX_GRAPH_FILE_BYTES: u64 = 256 * 1024;
 /// Re-extract the edited file into the code graph (v9.4 liveness path).
 /// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
 /// marks file state, then re-resolves + re-ranks the project.
+#[cfg(test)]
 fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     update_code_graph_with(input, engine, resolve_project_for_hook)
 }
 
-/// Core of `update_code_graph` with the project resolver passed in, so tests
-/// drive it without mutating process-global env vars. `resolve` takes the edited
-/// file's parent and the hook input's session cwd.
+/// `update_code_graph` with the project resolver passed in, so tests drive it
+/// without mutating process-global env vars. `resolve` takes the edited file's
+/// parent and the hook input's session cwd.
+#[cfg(test)]
 fn update_code_graph_with(
     input: &HookInput,
     engine: &Engine,
     resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
 ) -> Result<()> {
-    let tool_input = input
-        .tool_input
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no tool_input"))?;
-    let file_path = tool_input
-        .get("file_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
+    let file_path =
+        tool_file_path(input).ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
+    update_code_graph_for(input, engine, file_path, resolve)
+}
 
+/// Core of `update_code_graph` for one file: an Edit's `file_path` or one of
+/// the files a Bash call wrote.
+fn update_code_graph_for(
+    input: &HookInput,
+    engine: &Engine,
+    file_path: &str,
+    resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
+) -> Result<()> {
     // Repo/project identity is derivable from `file_path` alone (no lang
     // needed), so compute it before the language gate — WP2 Stage 3 (H8
     // innovation, receipt R4) wants an honest file-level row even for
@@ -237,7 +316,7 @@ fn update_code_graph_with(
 /// credential cases the stored path is itself a disclosure. Only consulted for
 /// the unsupported-extension "touch row" branch — the AST path is already
 /// bounded by the language allowlist.
-fn is_unrecordable_path(path: &str) -> bool {
+pub(crate) fn is_unrecordable_path(path: &str) -> bool {
     const NOISE_DIRS: [&str; 9] = [
         "/node_modules/",
         "/target/",
@@ -280,28 +359,44 @@ pub(crate) fn detect_language(file_path: &str) -> &'static str {
 const MAX_AST_DIFF_BYTES: usize = 50_000;
 
 /// Track structural code changes from Edit/Write operations.
+#[cfg(test)]
 async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> {
     track_code_evolution_with(input, engine, resolve_project_for_hook).await
 }
 
-/// Core of `track_code_evolution` with the project resolver passed in (see
+/// `track_code_evolution` with the project resolver passed in (see
 /// `update_code_graph_with`).
+#[cfg(test)]
 async fn track_code_evolution_with(
     input: &HookInput,
     engine: &Engine,
+    resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
+) -> Result<()> {
+    if input.tool_input.is_none() {
+        return Err(anyhow::anyhow!("no tool_input"));
+    }
+    let file_path =
+        tool_file_path(input).ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
+    track_code_evolution_for(input, engine, file_path, resolve).await
+}
+
+/// Core of `track_code_evolution` for one file: an Edit's `file_path` or one of
+/// the files a Bash call wrote. A Bash row always lands (the call did write the
+/// file) with empty symbol lists: the command carries no before/after text.
+async fn track_code_evolution_for(
+    input: &HookInput,
+    engine: &Engine,
+    file_path: &str,
     resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
 ) -> Result<()> {
     let tool_input = input
         .tool_input
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no tool_input"))?;
-    let file_path = tool_input
-        .get("file_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no file_path in tool_input"))?;
 
     let language = detect_language(file_path);
     let tool_name = input.tool_name.as_deref().unwrap_or("unknown");
+    let is_bash = tool_name == "Bash";
 
     // Mirrors the code-graph policy at update_code_graph (lines 68–88):
     // record an honest file-level presence row instead of silently dropping.
@@ -341,7 +436,10 @@ async fn track_code_evolution_with(
     }
 
     // Build before/after pairs depending on tool type (Codex M-2: handle MultiEdit edits array)
-    let edit_pairs: Vec<(String, String)> = if tool_name == "Edit" {
+    let edit_pairs: Vec<(String, String)> = if is_bash {
+        // No before/after text: nothing to diff, and none is invented.
+        Vec::new()
+    } else if tool_name == "Edit" {
         let old = tool_input
             .get("old_string")
             .and_then(|v| v.as_str())
@@ -391,8 +489,9 @@ async fn track_code_evolution_with(
         diff.imports_removed.extend(d.imports_removed);
     }
 
-    // Only store if something structural changed
-    if diff.is_empty() {
+    // Only store if something structural changed; a Bash write is stored
+    // regardless, as the record that this session wrote the file.
+    if diff.is_empty() && !is_bash {
         return Ok(());
     }
 
@@ -414,6 +513,10 @@ async fn track_code_evolution_with(
     // paths that already canonicalize before storing).
     let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
     let stored_path_str = stored_path.to_string_lossy();
+    // A shell redirect reaches paths an edit tool never names (`> node_modules/x.js`).
+    if is_bash && is_unrecordable_path(&stored_path_str) {
+        return Ok(());
+    }
 
     // Serialize to JSON arrays
     let fa = serde_json::to_string(&diff.functions_added).unwrap_or_default();
@@ -1282,5 +1385,194 @@ mod tests {
             Some(&Some("chunk-1".into())),
             "an unchanged sibling must not inherit the later edit chunk"
         );
+    }
+
+    fn bash_input(command: &str, cwd: Option<&str>) -> crate::hooks::HookInput {
+        crate::hooks::HookInput {
+            transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
+            session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            cwd: cwd.map(str::to_string),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": command})),
+            ..Default::default()
+        }
+    }
+
+    fn evolution_rows(storage: &crate::storage::Storage) -> Vec<(String, String, String, String)> {
+        storage
+            .with_connection(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT tool_name, file_path, functions_added, language FROM code_evolution",
+                )?;
+                let rows =
+                    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+                rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+            })
+            .unwrap()
+    }
+
+    /// A temp directory that counts as a repository for the presence-row bound.
+    fn repo_dir() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn bash_written_files_lists_only_existing_files_a_bash_call_wrote() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let input = bash_input(
+            "sed -i '' 's/a/b/' a.rs && echo x > not-made.txt",
+            Some(&cwd),
+        );
+        assert_eq!(bash_written_files(&input), [tmp.path().join("a.rs")]);
+
+        // Another tool never goes through the command reader.
+        let mut other = input.clone();
+        other.tool_name = Some("Read".into());
+        assert!(bash_written_files(&other).is_empty());
+        // No command, no files.
+        let mut bare = input;
+        bare.tool_input = None;
+        assert!(bash_written_files(&bare).is_empty());
+    }
+
+    #[test]
+    fn bash_written_files_is_capped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let mut command = String::new();
+        for n in 0..(MAX_BASH_FILES + 4) {
+            std::fs::write(tmp.path().join(format!("f{n}.txt")), "x").unwrap();
+            command.push_str(&format!("echo y > f{n}.txt; "));
+        }
+        let files = bash_written_files(&bash_input(&command, Some(&cwd)));
+        assert_eq!(files.len(), MAX_BASH_FILES);
+    }
+
+    #[test]
+    fn only_a_bash_call_that_wrote_nothing_exits_before_the_engine() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        std::fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let reads = bash_input("git status && ls -la", Some(&cwd));
+        let writes = bash_input("echo x > a.rs", Some(&cwd));
+        assert!(exits_before_engine("post-tool-use", &reads));
+        assert!(!exits_before_engine("post-tool-use", &writes));
+        // Not Bash, not this hook: always on to the engine.
+        assert!(!exits_before_engine(
+            "post-tool-use",
+            &edit_input("Edit", "/w/a.rs")
+        ));
+        assert!(!exits_before_engine("stop", &reads));
+    }
+
+    #[tokio::test]
+    async fn a_bash_call_that_wrote_nothing_leaves_every_table_alone() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_string_lossy().to_string();
+        let before = graph_rows(&storage);
+        handle(
+            &bash_input("git status && cargo test", Some(&cwd)),
+            &engine,
+            tmp.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(graph_rows(&storage), before);
+        assert!(queue_rows(&storage).is_empty());
+        assert!(
+            signal_rows(&storage).is_empty(),
+            "not even the code map signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bash_write_takes_the_path_an_edit_takes_with_tool_name_bash() {
+        let (engine, storage) = test_engine();
+        let tmp = repo_dir();
+        let rs = tmp.path().join("lib.rs");
+        let yml = tmp.path().join("ci.yml");
+        std::fs::write(&rs, "fn fresh_fn() { helper(); }\nfn helper() {}\n").unwrap();
+        std::fs::write(&yml, "name: x\n").unwrap();
+        let command = format!(
+            "sed -i '' 's/a/b/' {} && echo y >> {}",
+            rs.display(),
+            yml.display()
+        );
+        let input = bash_input(&command, Some("/Users/x/projects/my-repo"));
+
+        handle(&input, &engine, tmp.path()).await.unwrap();
+
+        let rows = evolution_rows(&storage);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|r| r.0 == "Bash"));
+        let by_file = |name: &str| rows.iter().find(|r| r.1.ends_with(name)).unwrap();
+        // A supported language gets its language and EMPTY symbol lists: no
+        // diff is invented for a command that carries no before/after text.
+        assert_eq!(by_file("lib.rs").2, "[]");
+        assert_eq!(by_file("lib.rs").3, "rust");
+        assert_eq!(by_file("ci.yml").3, "text");
+        // The code graph was re-extracted from the file as it is on disk.
+        let graph = graph_rows(&storage);
+        let n = |t: &str| graph.iter().find(|(name, _)| name == t).unwrap().1;
+        assert!(n("code_nodes") >= 2, "{graph:?}");
+        assert!(n("code_graph_file_state") >= 1, "{graph:?}");
+        // The signal ran for this call, as it does for an edit.
+        assert_eq!(signal_rows(&storage).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bash_scratch_file_takes_its_session_project_or_writes_nothing() {
+        let (engine, storage) = test_engine();
+        let tmp = repo_dir();
+        let file = tmp.path().join("scratch.rs");
+        let path = file.to_string_lossy().to_string();
+        std::fs::write(&file, "fn scratch_fn() { helper(); }\nfn helper() {}\n").unwrap();
+        let command = format!("echo y > {path}");
+
+        // No session project: the file history and the graph stay empty.
+        let no_project = bash_input(&command, None);
+        track_code_evolution_for(&no_project, &engine, &path, resolve_without_env)
+            .await
+            .unwrap();
+        update_code_graph_for(&no_project, &engine, &path, resolve_without_env).unwrap();
+        assert!(graph_rows(&storage).iter().all(|(_, n)| *n == 0));
+
+        // With one, the row lands under it.
+        let with_project = bash_input(&command, Some("/Users/x/projects/my-repo"));
+        track_code_evolution_for(&with_project, &engine, &path, resolve_without_env)
+            .await
+            .unwrap();
+        let projects: Vec<String> = storage
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT DISTINCT project_name FROM code_evolution")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(projects, vec!["my-repo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_bash_write_to_a_vendored_path_is_not_recorded() {
+        let (engine, storage) = test_engine();
+        let tmp = repo_dir();
+        let vendored = tmp.path().join("node_modules").join("pkg").join("index.js");
+        std::fs::create_dir_all(vendored.parent().unwrap()).unwrap();
+        std::fs::write(&vendored, "function a() {}\n").unwrap();
+        let input = bash_input("echo y", Some("/Users/x/projects/my-repo"));
+        track_code_evolution_for(
+            &input,
+            &engine,
+            &vendored.to_string_lossy(),
+            resolve_without_env,
+        )
+        .await
+        .unwrap();
+        assert!(evolution_rows(&storage).is_empty());
     }
 }

@@ -1288,7 +1288,7 @@ fn test_install_config_post_tool_use_has_matcher() {
     let config = serde_json::json!({
         "hooks": {
             "PostToolUse": [{
-                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
                 "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook post-tool-use"}]
             }]
         }
@@ -1298,7 +1298,7 @@ fn test_install_config_post_tool_use_has_matcher() {
     let ptu = hooks.get("PostToolUse").unwrap();
     assert_eq!(
         ptu[0]["matcher"].as_str().unwrap(),
-        "Edit|Write|MultiEdit|NotebookEdit"
+        "Edit|Write|MultiEdit|NotebookEdit|Bash"
     );
 }
 

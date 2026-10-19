@@ -50,31 +50,49 @@ pub fn canonical_repo_path(path: &Path) -> PathBuf {
     }
 
     // Cache miss: walk ancestors looking for `.git`.
-    let mut dir = parent_key.clone();
+    let (out, entry) = lookup_uncached(path);
+    if let Some(entry) = entry {
+        if let Ok(mut guard) = cache().lock() {
+            guard.insert(parent_key, entry);
+        }
+    }
+    out
+}
+
+/// What `canonical_repo_path` returns for `path` in a process that has not
+/// seen its directory before, which is the hook's case: every hook run is a
+/// fresh process. The cache never touches it, so a long replay (the co-edit
+/// backfill) spells a path the way the hook stored it, whatever it replayed
+/// before. A path with no `.git` above it comes back as given on a
+/// directory's first call and symlink-resolved on later ones, which would
+/// give the same file two ids and break the match against the hook's rows.
+pub fn canonical_repo_path_cold(path: &Path) -> PathBuf {
+    lookup_uncached(path).0
+}
+
+/// Walk the ancestors of `path` looking for `.git`. Returns the canonical
+/// path and the cache entry to keep for its parent directory, if any.
+fn lookup_uncached(path: &Path) -> (PathBuf, Option<WorktreeRewrite>) {
+    let Some(parent) = path.parent() else {
+        return (path.to_path_buf(), None);
+    };
+    let mut dir = parent.to_path_buf();
     loop {
         let git_entry = dir.join(".git");
         if git_entry.exists() {
             if git_entry.is_dir() {
                 // Normal (main) worktree.
-                if let Ok(mut guard) = cache().lock() {
-                    guard.insert(parent_key, None);
-                }
-                return canonicalize_stable(path);
+                return (canonicalize_stable(path), Some(None));
             }
             if git_entry.is_file() {
                 // Linked worktree: parse gitdir and recover main repo root.
                 if let Some(main_repo_root) = parse_worktree_main_root(&git_entry) {
                     let worktree_root = dir.clone();
-                    if let Ok(mut guard) = cache().lock() {
-                        guard.insert(
-                            parent_key,
-                            Some((worktree_root.clone(), main_repo_root.clone())),
-                        );
-                    }
-                    return rewrite_worktree_path(path, &worktree_root, &main_repo_root);
+                    let out = rewrite_worktree_path(path, &worktree_root, &main_repo_root);
+                    return (out, Some(Some((worktree_root, main_repo_root))));
                 }
                 // Malformed gitdir — leave path alone, do not poison the cache.
-                return path.to_path_buf();
+                return (path.to_path_buf(), None);
             }
         }
 
@@ -85,10 +103,7 @@ pub fn canonical_repo_path(path: &Path) -> PathBuf {
     }
 
     // No `.git` found — cache as plain so we don't re-walk, return input as-is.
-    if let Ok(mut guard) = cache().lock() {
-        guard.insert(parent_key, None);
-    }
-    path.to_path_buf()
+    (path.to_path_buf(), Some(None))
 }
 
 /// Canonicalize with a stable fallback for missing files (CodeRabbit PR

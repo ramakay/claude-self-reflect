@@ -217,6 +217,32 @@ pub async fn handle(
         }
     }
 
+    // File history for the files Bash calls wrote (`sed -i`, heredocs, short
+    // scripts), replayed once from the transcripts just imported; the daemon
+    // does the same for an install that never reruns setup. Meta-guarded.
+    {
+        let storage = eng.storage().clone();
+        let projects_root = projects_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || {
+            crate::import::coedit_backfill::backfill_coedit_once(&storage, &projects_root)
+        })
+        .await
+        {
+            Ok(Ok(Some(stats))) => {
+                let (_, inserted, _) = stats.totals();
+                eprintln!(
+                    "  File history: {} edits recorded from {} transcripts ({} already live)",
+                    inserted,
+                    stats.files_scanned,
+                    stats.already_live_total()
+                );
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => eprintln!("  Warning: file-history backfill failed: {e}"),
+            Err(e) => eprintln!("  Warning: file-history backfill failed: {e}"),
+        }
+    }
+
     // Step 5: Run enrichment
     eprintln!("[5/7] Running heuristic enrichment...");
     let (backfilled, enriched) = eng.backfill_and_enrich().await?;
@@ -1401,11 +1427,13 @@ mod tests {
             "did not stop at the timeout: {waited:?}"
         );
         assert_failed_with_manual_lines(&outcome, "did not finish within");
-        let pid: i32 = std::fs::read_to_string(&fake.pid)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // On a loaded machine the limit can pass before the shell runs its
+        // first line: then the kill hit the shell itself, and `wait` reaped it.
+        let pid: i32 = match std::fs::read_to_string(&fake.pid) {
+            Ok(s) => s.trim().parse().unwrap(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => panic!("{e}"),
+        };
         // SAFETY: signal 0 only probes for the pid's existence.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "child {pid} is still running after the timeout");

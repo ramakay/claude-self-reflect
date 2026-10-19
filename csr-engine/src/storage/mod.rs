@@ -1974,6 +1974,14 @@ impl Storage {
         queries::code_evolution_id_exists(&conn, id)
     }
 
+    /// `(session_id, file_path, tool_name)` of every row the live hook wrote.
+    pub fn code_evolution_live_triples(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::code_evolution_live_triples(&conn)
+    }
+
     pub fn get_recent_code_evolution(
         &self,
         file_path: &str,

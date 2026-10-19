@@ -84,7 +84,7 @@ fn generate_hook_config(binary_path: &str) -> serde_json::Value {
                 "hooks": [{"type": "command", "command": format!("{} hook stop", binary_path)}]
             }],
             "PostToolUse": [{
-                "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
                 "hooks": [{"type": "command", "command": format!("{} hook post-tool-use", binary_path)}]
             }],
             "UserPromptSubmit": [{
@@ -478,8 +478,58 @@ mod tests {
         assert!(cmd.contains("csr-engine hook post-tool-use"));
         assert_eq!(
             post_tool_use[0]["matcher"].as_str().unwrap(),
-            "Edit|Write|MultiEdit|NotebookEdit"
+            "Edit|Write|MultiEdit|NotebookEdit|Bash"
         );
+    }
+
+    /// A settings.json written by an earlier release carries the old PostToolUse
+    /// matcher. `hook install --apply` must replace that entry, not add a second
+    /// one next to it (which would fire the hook twice on an Edit) and not leave
+    /// the old matcher in place (which would never fire it for Bash). A user's
+    /// own PostToolUse hook stays.
+    #[test]
+    fn test_merge_upgrades_the_old_post_tool_use_matcher_in_place() {
+        let user = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/Users/me/bin/audit-bash.sh"}]
+        });
+        let old_csr = serde_json::json!({
+            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook post-tool-use"}]
+        });
+        let mut settings = serde_json::json!({
+            "hooks": {"PostToolUse": [old_csr, user.clone()]}
+        });
+
+        let new_config = generate_hook_config("/usr/local/bin/csr-engine");
+        merge_hook_config(&mut settings, &new_config).unwrap();
+
+        let entries = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        let csr: Vec<&serde_json::Value> = entries
+            .iter()
+            .filter(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("csr-engine")
+            })
+            .collect();
+        assert_eq!(
+            csr.len(),
+            1,
+            "exactly one CSR PostToolUse entry: {entries:?}"
+        );
+        assert_eq!(
+            csr[0]["matcher"].as_str().unwrap(),
+            "Edit|Write|MultiEdit|NotebookEdit|Bash"
+        );
+        assert!(entries.contains(&user), "the user's own hook survives");
+        assert_eq!(entries.len(), 2);
+
+        // A second apply changes nothing.
+        let once = settings.clone();
+        merge_hook_config(&mut settings, &new_config).unwrap();
+        assert_eq!(settings, once);
     }
 
     #[test]

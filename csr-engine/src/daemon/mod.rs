@@ -1084,6 +1084,57 @@ impl Daemon {
             })
         };
 
+        // One-time replay of every transcript for the files Bash calls wrote
+        // (`sed -i`, heredocs, short scripts): the live hook reads them from
+        // now on, this fills in the history before it. Meta-guarded
+        // (`coedit_bash_backfill_v1`), so a restart after it finished is one
+        // lookup; a run that failed an insert leaves the marker unset and is
+        // retried at the next start. Rows are keyed by a deterministic id, so
+        // a retry inserts only what is missing. It parses every transcript, so
+        // it waits a minute for startup to settle and holds the heavy-work
+        // permit.
+        let coedit_bash_backfill_handle = {
+            let storage = self.storage.clone();
+            let projects_dir = self.projects_dir.clone();
+            let shutdown = shutdown.clone();
+            let heavy_work = heavy_work.clone();
+            tokio::spawn(async move {
+                for _ in 0..6 {
+                    if shutdown.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                }
+                let Some(permit) =
+                    acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref()).await
+                else {
+                    return;
+                };
+                let result = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    crate::import::coedit_backfill::backfill_coedit_once(&storage, &projects_dir)
+                })
+                .await;
+                match result {
+                    Ok(Ok(None)) => {}
+                    Ok(Ok(Some(stats))) => {
+                        let (_, inserted, skipped) = stats.totals();
+                        tracing::info!(
+                            files_scanned = stats.files_scanned,
+                            events_found = stats.events_found,
+                            inserted,
+                            skipped,
+                            already_live = stats.already_live_total(),
+                            insert_errors = stats.insert_errors,
+                            "co-edit (Bash) history backfill completed"
+                        );
+                    }
+                    Ok(Err(error)) => tracing::warn!(%error, "co-edit (Bash) backfill failed"),
+                    Err(error) => tracing::warn!(%error, "co-edit (Bash) backfill panicked"),
+                }
+            })
+        };
+
         // Daemon-owned harness-strip job: reimports codex rollouts still
         // carrying pre-strip harness-marker content, in small (`HARNESS_
         // STRIP_V2_BATCH_SIZE`) idle-gated batches, one `heavy_work` permit
@@ -1553,6 +1604,10 @@ impl Daemon {
         // timestamp=...` inside one transaction per conversation — no HNSW
         // mutation — so a timeout here cannot corrupt the search index.
         let _ = tokio::time::timeout(timeout, codex_restamp_handle).await;
+        // The Bash co-edit replay inserts keyed rows into `code_evolution` only
+        // (no HNSW mutation); an abrupt stop leaves the marker unset and the
+        // next start finishes it.
+        let _ = tokio::time::timeout(timeout, coedit_bash_backfill_handle).await;
         // Memory registry only upserts its own SQLite table transactionally —
         // no HNSW mutation — so a timeout here cannot corrupt the search index.
         let _ = tokio::time::timeout(timeout, memory_registry_handle).await;
