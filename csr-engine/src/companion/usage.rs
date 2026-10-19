@@ -167,11 +167,12 @@ mod tests {
         use std::sync::Arc;
         let d = tempfile::tempdir().unwrap();
         let keep = d.path().join("csr-companion");
+        let clock = FakeClock::new(1_792_000_000_500.);
         let cx = Ctx {
             host: Arc::new(FakeHost::new(World::default())),
             session: Sessions::default().touch("sess-h", "/repo", 0.).0,
             store: Arc::new(crate::companion::store::Store::at(d.path().join("s.db"))),
-            clock: FakeClock::new(1_792_000_000_500.),
+            clock: clock.clone(),
             log: Arc::new(Log::default()),
             sid: "sess-h".into(),
             cwd: "/repo".into(),
@@ -180,6 +181,8 @@ mod tests {
             respawn: false,
             pid: 1,
             events: 1,
+            timers: crate::companion::relay::timers::fake::FakeTimers::new(clock),
+            module: Arc::default(),
         };
         let reply = measure_in(keep.clone())(cx, wp0_body()).await.unwrap();
         assert!(reply.answer.is_none() && reply.next.is_none() && reply.tree.is_none());

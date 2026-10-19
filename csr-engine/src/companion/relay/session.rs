@@ -6,6 +6,7 @@
 
 use serde_json::Value;
 use std::{
+    any::{Any, TypeId},
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
 };
@@ -25,9 +26,33 @@ pub struct Session {
     pub last_seen: f64,
     /// What a gate's `/event` left for its `/after`, by conversation id.
     left: VecDeque<(String, Value)>,
+    /// Each feature's own state for this session (`ext`).
+    ext: Ext,
+}
+
+/// State kept by its type: a feature keeps its own struct, and one that shares another's state
+/// names that feature's type.
+#[derive(Default)]
+pub struct Ext(HashMap<TypeId, Box<dyn Any + Send>>);
+
+impl Ext {
+    /// The state of type `T`, made with `Default` the first time it is asked for.
+    pub fn get<T: Default + Send + 'static>(&mut self) -> &mut T {
+        self.0
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()))
+            .downcast_mut()
+            .expect("keyed by its own TypeId")
+    }
 }
 
 impl Session {
+    /// A feature's state for this session only; what lives as long as the process is
+    /// `Ctx::kept`.
+    pub fn ext<T: Default + Send + 'static>(&mut self) -> &mut T {
+        self.ext.get()
+    }
+
     /// Keep `value` for the `/after` that names `id`.
     pub fn leave(&mut self, id: &str, value: Value) {
         if self.left.len() >= LEFT_KEPT {
@@ -66,6 +91,7 @@ impl Sessions {
                 first_seen: now,
                 last_seen: now,
                 left: VecDeque::new(),
+                ext: Ext::default(),
             }))
         });
         {
@@ -95,6 +121,25 @@ impl Sessions {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn each_feature_keeps_its_own_state_in_the_session_by_its_type() {
+        #[derive(Default)]
+        struct Band {
+            shown: u32,
+        }
+        #[derive(Default)]
+        struct Fleet {
+            names: Vec<String>,
+        }
+        let (session, _) = Sessions::default().touch("a", "/repo", 0.);
+        let mut s = session.lock().unwrap();
+        s.ext::<Band>().shown += 2;
+        s.ext::<Fleet>().names.push("x".into());
+        s.ext::<Band>().shown += 1;
+        assert_eq!(s.ext::<Band>().shown, 3);
+        assert_eq!(s.ext::<Fleet>().names, ["x"]);
+    }
 
     #[test]
     fn an_unknown_sid_opens_a_session_and_a_known_one_is_the_same_record() {

@@ -42,3 +42,6 @@ pub fn register(t: &mut Table) {
     t.on("start", "pane_cmd", on_start());
     t.on("csr", "pane_cmd", on_command());
 }
+
+/// The entries that run after every other feature's `start` (`app::table`).
+pub fn register_late(_t: &mut Table) {}

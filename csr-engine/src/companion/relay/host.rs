@@ -291,6 +291,9 @@ pub mod fake {
         pub fn advance(&self, ms: f64) {
             *self.0.lock().unwrap() += ms;
         }
+        pub fn set(&self, now: f64) {
+            *self.0.lock().unwrap() = now;
+        }
     }
 
     impl Clock for FakeClock {

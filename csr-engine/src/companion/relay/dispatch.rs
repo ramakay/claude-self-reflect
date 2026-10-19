@@ -17,7 +17,8 @@
 use super::{
     host::{parse_results, BoxFuture, Clock, Host, Hub},
     manifest::{self, Shape},
-    session::{SessionRef, Sessions},
+    session::{Ext, SessionRef, Sessions},
+    timers::{HubTimers, TimerWork, Timers},
 };
 use crate::companion::store::Store;
 use anyhow::Result;
@@ -76,6 +77,60 @@ pub struct Ctx {
     pub pid: u32,
     /// `/event` requests so far, this one included.
     pub events: u64,
+    /// The engine's timers; `after` and `every` below give their work a context.
+    pub timers: Arc<dyn Timers>,
+    /// What `kept` holds, one for the whole process.
+    pub module: Arc<Mutex<Ext>>,
+}
+
+impl Ctx {
+    /// The process-wide state of type `T`, made with `Default` the first time it is asked for: what
+    /// the TypeScript kept in module variables, which lived as long as the Claude Code process, as
+    /// this engine child does. A `/clear` keeps it; a respawn starts it again. `f` runs under a
+    /// lock, so it must not wait on anything: copy out what an `.await` needs.
+    pub fn kept<T: Default + Send + 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let mut module = self.module.lock().unwrap_or_else(|e| e.into_inner());
+        f(module.get::<T>())
+    }
+
+    /// The context a timer's run gets: this one on `host`, with no conversation of its own.
+    fn on_timer<F, Fut>(&self, work: F) -> TimerWork
+    where
+        F: Fn(Ctx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let base = Ctx {
+            id: String::new(),
+            left: None,
+            respawn: false,
+            ..self.clone()
+        };
+        Arc::new(move |host| {
+            let cx = Ctx {
+                host,
+                ..base.clone()
+            };
+            Box::pin(work(cx))
+        })
+    }
+
+    /// Run `work` once, `ms` from now (`$.clock.after`). The id cancels it.
+    pub fn after<F, Fut>(&self, ms: f64, work: F) -> u64
+    where
+        F: Fn(Ctx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.timers.after(ms, self.on_timer(work))
+    }
+
+    /// Run `work` every `ms` (`$.clock.every`). The id cancels it.
+    pub fn every<F, Fut>(&self, ms: f64, work: F) -> u64
+    where
+        F: Fn(Ctx) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.timers.every(ms, self.on_timer(work))
+    }
 }
 
 /// What a handler wants sent back. Which fields count depends on the hook's shape.
@@ -238,6 +293,11 @@ impl Table {
             .map(|entry| entry.feature)
             .collect()
     }
+
+    /// Every key with an entry, in no set order.
+    pub fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.rows.keys().copied()
+    }
 }
 
 /// The key a button press is routed by; it is not a hook, so the manifest does not list it.
@@ -366,6 +426,8 @@ pub struct App {
     table: Table,
     events: AtomicU64,
     warned: AtomicBool,
+    timers: Arc<dyn Timers>,
+    module: Arc<Mutex<Ext>>,
 }
 
 impl App {
@@ -380,6 +442,8 @@ impl App {
         Arc::new(Self {
             relay: relay.to_string(),
             pid: std::process::id(),
+            timers: HubTimers::new(hub.clone()),
+            module: Arc::default(),
             hub,
             sessions: Mutex::new(Sessions::default()),
             store,
@@ -480,6 +544,8 @@ impl App {
             respawn: at.respawn,
             pid: self.pid,
             events: at.events,
+            timers: self.timers.clone(),
+            module: self.module.clone(),
         }
     }
 
@@ -636,12 +702,15 @@ impl Host for NoHost {
 #[cfg(test)]
 pub mod testing {
     use super::super::host::fake::{FakeClock, FakeHost, World};
+    use super::super::timers::fake::FakeTimers;
     use super::*;
 
     pub struct Fixture {
         pub cx: Ctx,
         pub host: FakeHost,
         pub clock: Arc<FakeClock>,
+        /// The context's timers: `timers.advance(ms, host)` fires what falls due.
+        pub timers: Arc<FakeTimers>,
         pub dir: tempfile::TempDir,
     }
 
@@ -657,6 +726,7 @@ pub mod testing {
         let clock = host.clock.clone();
         let session = Sessions::default().touch(sid, "/repo", clock.now()).0;
         session.lock().unwrap().interactive = Some(true);
+        let timers = FakeTimers::new(clock.clone());
         let cx = Ctx {
             host: Arc::new(host.clone()),
             session,
@@ -670,11 +740,14 @@ pub mod testing {
             respawn: false,
             pid: 1,
             events: 1,
+            timers: timers.clone(),
+            module: Arc::default(),
         };
         Fixture {
             cx,
             host,
             clock,
+            timers,
             dir,
         }
     }
@@ -1109,6 +1182,32 @@ mod tests {
         rig.clock.advance(super::super::session::IDLE_MS + 1.);
         post(&rig.app, "/event", ev("after", "tool", json!({}))).await;
         assert_eq!(rig.app.session_count(), 1, "the idle one is gone");
+    }
+
+    #[tokio::test]
+    async fn kept_state_outlives_a_clear_and_a_sessions_own_state_does_not() {
+        #[derive(Default)]
+        struct Count(u32);
+        let rig = rig(table(vec![(
+            "tool",
+            event(handler(|cx, _| async move {
+                let process = cx.kept(|c: &mut Count| {
+                    c.0 += 1;
+                    c.0
+                });
+                let own = cx.session.lock().map_or(0, |mut s| {
+                    let c = s.ext::<Count>();
+                    c.0 += 1;
+                    c.0
+                });
+                Ok(Reply::answer(json!([process, own])))
+            })),
+        )]));
+        let mut said = Vec::new();
+        for sid in ["before", "before", "after"] {
+            said.push(post(&rig.app, "/event", ev(sid, "tool", json!({}))).await["answer"].clone());
+        }
+        assert_eq!(said, vec![json!([1, 1]), json!([2, 2]), json!([3, 1])]);
     }
 
     #[tokio::test]
