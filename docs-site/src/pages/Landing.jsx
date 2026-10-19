@@ -858,6 +858,9 @@ function WhatsNewCard() {
           <strong>More sources</strong>: subagent transcripts, <code>~/.claude/plans</code>, task state, Codex sessions, and memory-file metadata join the corpus; <code>csr_transcript</code> is the 16th MCP tool
         </li>
         <li>
+          <strong>Code map</strong>: a per-worktree map of every definition in the repos your sessions are in, so <code>csr_search_by_file</code> and <code>csr_code_graph</code> answer for code no conversation touched
+        </li>
+        <li>
           <strong>Companion plugin</strong>: a pane beside the session shows what memory handed Claude and which code changed since your past sessions
         </li>
       </ul>
