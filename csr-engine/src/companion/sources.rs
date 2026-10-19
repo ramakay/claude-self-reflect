@@ -217,3 +217,37 @@ pub fn threshold(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
         .max(1.)
 }
+
+pub fn picture_fonts() -> &'static super::render::raster::Fonts {
+    use super::render::raster::Fonts;
+    use ab_glyph::{FontArc, FontVec};
+    static FONTS: std::sync::LazyLock<Fonts> = std::sync::LazyLock::new(|| {
+        let load = |bold: bool| {
+            [
+                ("/System/Library/Fonts/Menlo.ttc", u32::from(bold)),
+                ("/System/Library/Fonts/SFNSMono.ttf", 0),
+                // Linux has no Menlo; pane.py falls back to Pillow's own font there.
+                if bold {
+                    (
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+                        0,
+                    )
+                } else {
+                    ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0)
+                },
+            ]
+            .into_iter()
+            .find_map(|(path, index)| {
+                let bytes = std::fs::read(path).ok()?;
+                FontVec::try_from_vec_and_index(bytes, index)
+                    .ok()
+                    .map(FontArc::new)
+            })
+        };
+        Fonts {
+            regular: load(false),
+            bold: load(true),
+        }
+    });
+    &FONTS
+}

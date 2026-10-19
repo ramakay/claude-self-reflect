@@ -126,6 +126,7 @@ pub fn legend(
 pub struct Pane {
     paths: Paths,
     persist: bool,
+    exporting: bool,
     db: Option<Db>,
     root: std::path::PathBuf,
     limit: usize,
@@ -146,6 +147,11 @@ pub struct Pane {
     shifts: Vec<Value>,
     total: usize,
     hold: Option<(Value, f64)>,
+    pub pixels: bool,
+    pub placed: Vec<super::render::kitty::Placement>,
+    picture_cache: super::render::pictures::Cache,
+    pub session_picture: Option<super::render::raster::SessionFacts>,
+    pub last_picture: Option<super::render::raster::LastFacts>,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -159,9 +165,16 @@ impl Pane {
             })
             .unwrap_or_else(|| args.repo.canonicalize().unwrap_or(args.repo.clone()));
         let feed = Feed::new(&paths, &sid);
+        let pixels = super::render::kitty::pixels_enabled();
+        let picture_cache = if pixels {
+            super::render::pictures::Cache::with_fonts(super::sources::picture_fonts())
+        } else {
+            super::render::pictures::Cache::default()
+        };
         Self {
             paths,
-            persist: !args.frame,
+            persist: !args.frame && args.png.is_none(),
+            exporting: args.png.is_some(),
             db,
             root,
             limit: args.limit,
@@ -182,9 +195,15 @@ impl Pane {
             shifts: vec![],
             total: 0,
             hold: None,
+            pixels,
+            placed: vec![],
+            picture_cache,
+            session_picture: None,
+            last_picture: None,
         }
     }
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
+        self.placed.clear();
         let cols = cols.max(1);
         let rows = rows.max(1);
         if self.db.is_none() {
@@ -276,17 +295,28 @@ impl Pane {
             s["todos"] = s["last_session"]["todos"].clone();
         }
 
+        self.session_picture = (!string(&s["id"]).is_empty())
+            .then(|| super::render::raster::SessionFacts::from_value(s, now));
+        self.last_picture = s["last_session"]
+            .is_object()
+            .then(|| super::render::raster::LastFacts::from_value(&s["last_session"]));
         let ui = json!({
+            "pixels": self.pixels,
+            "rows": rows,
+            "now": now,
             "open": self.open,
             "sent": self.sent,
             "folds": self.folds,
-            "likes": send::read_likes(&self.paths),
+            "likes": if self.exporting { Value::Null } else { send::read_likes(&self.paths) },
         });
         let page = if self.view == "log" {
             pages::page_log(&data)
         } else {
             let page = pages::page_main(&data, s, now, &ui, self.db.as_ref());
-            if s["busy"] == true && self.hold.as_ref().is_some_and(|(_, at)| now - at < 120.) {
+            if self.exporting {
+                page
+            } else if s["busy"] == true && self.hold.as_ref().is_some_and(|(_, at)| now - at < 120.)
+            {
                 let mut page = page;
                 page["sections"] = json!(super::feed::living(
                     array(&self.hold.as_ref().unwrap().0).to_vec(),
@@ -301,6 +331,9 @@ impl Pane {
         };
         self.tall = self.view == "main" && (self.tall || self.top > 0 || self.open.is_string());
         let mut lines = pages::draw_page(&page, cols, if self.tall { 10000 } else { rows }, &ui);
+        if self.exporting {
+            return lines.rows;
+        }
         if let Some((key, row)) = self.anchor.take() {
             if let Some(actual) = lines
                 .acts
@@ -338,6 +371,30 @@ impl Pane {
             .filter(|(r, _)| *r >= top && *r < top + rows.saturating_sub(1))
             .map(|(r, a)| (r - top, a))
             .collect();
+        if self.pixels {
+            let cell = super::render::kitty::cell_size();
+            self.placed = lines
+                .pictures
+                .iter()
+                .filter_map(|wanted| {
+                    if wanted.row < top || wanted.row + wanted.rows > top + rows.saturating_sub(1) {
+                        return None;
+                    }
+                    let mut wanted = wanted.clone();
+                    wanted.row -= top;
+                    wanted.place(&mut self.picture_cache, cell)
+                })
+                .collect();
+            let logo = lines
+                .pictures
+                .iter()
+                .any(|p| matches!(p.picture, super::render::pictures::Picture::Logo));
+            if top == 0 && logo && !self.placed.iter().any(|p| p.col == 1 && p.cols == 4) {
+                if let Some(row) = lines.rows.first_mut() {
+                    *row = row.replacen(&slot("    ", "normal"), &slot("CTX ", "normal"), 1);
+                }
+            }
+        }
         let body = lines
             .rows
             .drain(top..)

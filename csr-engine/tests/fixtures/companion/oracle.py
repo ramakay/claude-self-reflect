@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
+sys.dont_write_bytecode = True
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -91,19 +93,67 @@ def main():
         session = pane.Session(SID)
         session.carried, session.previous = [], {}
         s = session.load()
-        for cols, rows in [(46, 30), (100, 40)]:
-            with mock.patch.object(pane.shutil, 'get_terminal_size', return_value=os.terminal_size((cols, rows))):
-                for page in ['main', 'log']:
-                    ui = dict(likes={})
-                    feed = pane.Feed(None)
-                    if page == 'main':
-                        lines, _ = pane.draw_main(data, s, cols, rows, NOW, ui, feed=feed)
-                    else:
-                        lines, _ = pane.draw_log(data, cols, rows, ui)
-                    lines = [pane.safe_line(line) for line in lines[:rows-1]]
-                    lines += [''] * (rows-1-len(lines))
-                    lines.append(pane.legend(page, cols-1, reload=60 if page == 'main' else None))
-                    (HERE / f'{page}-{cols}x{rows}.txt').write_text('\n'.join(lines) + '\n')
+        for pixels in [False, True]:
+            pane.PIXELS = pixels
+            for cols, rows in [(46, 30), (100, 40)]:
+                with mock.patch.object(pane.shutil, 'get_terminal_size', return_value=os.terminal_size((cols, rows))):
+                    for page in ['main', 'log']:
+                        ui = dict(likes={})
+                        feed = pane.Feed(None)
+                        if page == 'main':
+                            lines, _ = pane.draw_main(data, s, cols, rows, NOW, ui, feed=feed)
+                        else:
+                            lines, _ = pane.draw_log(data, cols, rows, ui)
+                        lines = [pane.safe_line(line) for line in lines[:rows-1]]
+                        lines += [''] * (rows-1-len(lines))
+                        lines.append(pane.legend(page, cols-1, reload=60 if page == 'main' else None))
+                        prefix = 'pixels-' if pixels else ''
+                        (HERE / f'{prefix}{page}-{cols}x{rows}.txt').write_text('\n'.join(lines) + '\n')
+        if '--png' in sys.argv:
+            pictures(pane)
+
+
+def pictures(pane):
+    out = HERE / 'pictures'
+    out.mkdir(exist_ok=True)
+    pane.PIXELS = True
+    # Exercise the original CLI against the same fixture HOME.
+    with mock.patch.object(sys, 'argv', ['pane.py', '--repo', str(REPO), '--sid', SID, '--png', str(out)]):
+        pane.main()
+    # --png uses carry_into, whose caches are outputs rather than fixture inputs.
+    keep = HOME / '.claude-self-reflect' / 'csr-companion'
+    for name in ['carried', 'previous']:
+        shutil.rmtree(keep / name, ignore_errors=True)
+    (keep / '.private').unlink(missing_ok=True)
+    session = dict(prompts=[100, 180, 240, 2000],
+                   replies=[[110, 100000, 0, 0], [190, 190000, 0, 0],
+                            [250, 70000, 0, 0], [2010, 155000, 0, 0]],
+                   compacts=[220], learned=dict(chunks=[120, 121, 130, 2020],
+                   turns=[['1970-01-01T00:03:00Z', '', '']]),
+                   gave=dict(recalls=[140, 141], carried=[150], dreams=[180]), asked=[160, 200])
+    last = dict(series=[[100, 100000], [200, 190000], [300, 70000], [400, 120000]],
+                prompt_times=[90, 180, 290, 390], compactions=[[220, 190000, 70000]], floor=65000)
+    context = dict(series=last['series'], prompts=last['prompt_times'], compacts=[220],
+                   csr_at=[220], floor=65000, now=400, band=list(pane.BAND))
+    context['clock'] = pane.Clock([r[0] for r in context['series']] + context['prompts'], context['now'])
+    payback = dict(at=220, cost=120000, saving=10000, need=12, done=4, net=-80000, per=2.5)
+    paid = dict(payback, done=20, net=80000)
+    ground = pane.tint('last', pane.ROW)
+    backs = pane.dark_steps(3)
+    cell = (16, 34)
+    (out / 'session-rich.png').write_bytes(pane.session_png(session, 40, cell, 2030, backs))
+    (out / 'session-light.png').write_bytes(pane.session_png(session, 40, cell, 2030))
+    (out / 'last-rich.png').write_bytes(pane.last_png(last, 43, 3, cell, ground))
+    for name, facts in [('payback', payback), ('paid', paid)]:
+        (out / (name + '.png')).write_bytes(pane.payback_png(facts, 40, 5, cell, ground))
+    (out / 'context.png').write_bytes(pane.context_png(context, 40, 3, cell, backs))
+    for name in pane.SECTION:
+        (out / ('iso-' + name + '.png')).write_bytes(pane.iso_png(name, cell, (pane.tint(name, pane.HEAD), pane.tint(name, pane.ROW))))
+    (out / 'emblem.png').write_bytes(pane.emblem_png(cell, tuple(backs[:2])))
+    (out / 'logo.png').write_bytes(pane.logo_png(cell, backs[0]))
+    del context['clock']
+    (HERE / 'pictures.json').write_text(json.dumps(dict(session=session, last=last, context=context,
+         payback=payback, paid=paid, now=2030), indent=2) + '\n')
 
 
 if __name__ == '__main__':

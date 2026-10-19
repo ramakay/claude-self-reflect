@@ -215,7 +215,7 @@ pub fn tint(name: &str, strength: f64) -> Rgb {
         round([251., 251., 249.][i] + (color[i] as f64 - [251., 251., 249.][i]) * strength) as u8
     })
 }
-fn linear(c: f64) -> f64 {
+pub(super) fn linear(c: f64) -> f64 {
     let c = c / 255.;
     if c <= 0.04045 {
         c / 12.92
@@ -223,7 +223,7 @@ fn linear(c: f64) -> f64 {
         ((c + 0.055) / 1.055).powf(2.4)
     }
 }
-fn lab(rgb: Rgb) -> [f64; 3] {
+pub(super) fn lab(rgb: Rgb) -> [f64; 3] {
     let [r, g, b] = rgb.map(|n| linear(n as f64));
     let x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
     let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -241,7 +241,7 @@ fn lab(rgb: Rgb) -> [f64; 3] {
         200. * (f(y) - f(z)),
     ]
 }
-fn from_lab([l, a, b]: [f64; 3]) -> Rgb {
+pub(super) fn from_lab([l, a, b]: [f64; 3]) -> Rgb {
     let fy = (l + 16.) / 116.;
     let g = |t: f64| {
         if t.powi(3) > 216. / 24389. {

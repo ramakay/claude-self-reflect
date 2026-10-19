@@ -8,6 +8,7 @@ pub mod masthead;
 pub mod pages;
 pub mod pane;
 pub mod paths;
+pub mod png;
 pub mod private;
 pub mod pyfmt;
 pub mod recall;
