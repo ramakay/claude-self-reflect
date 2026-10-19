@@ -1008,6 +1008,98 @@ fn the_visit_budget_stops_a_walk_over_many_non_code_entries_and_marks_the_view_t
     assert_invariants(&conn);
 }
 
+// ---- a link inside the repo never carries a scan into a protected folder ----------------
+
+/// Move `<repo>/<dir>` into `<home>/Documents/<name>` and leave a symlink to it.
+fn swap_dir_for_link_into_documents(fx: &Fx, repo: &Path, dir: &str, name: &str) -> PathBuf {
+    let docs = fx.home.join("Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    let target = docs.join(name);
+    std::fs::rename(repo.join(dir), &target).unwrap();
+    std::os::unix::fs::symlink(&target, repo.join(dir)).unwrap();
+    target
+}
+
+#[test]
+fn a_tracked_file_under_a_directory_swapped_for_a_link_into_a_protected_folder_is_never_read() {
+    let fx = Fx::new();
+    let main = fx.init_repo("lnk");
+    write(&main, "top.py", &py(&["top_fn"]));
+    write(&main, "src/a.py", &py(&["protected_secret_fn"]));
+    write(&main, "src/deep/b.py", &py(&["protected_deep_fn"]));
+    write(&main, "keep/c.py", &py(&["kept_fn"]));
+    fx.commit_all(&main, "init");
+    swap_dir_for_link_into_documents(&fx, &main, "src", "source");
+
+    // Readable on purpose: the old scan stat'ed and read it, and parsed its defs.
+    let conn = db();
+    let report = scan(&conn, &fx, &main);
+    let paths: Vec<String> = rows(&conn, &main).into_iter().map(|r| r.0).collect();
+    assert_eq!(paths, vec!["keep/c.py", "top.py"], "{paths:?}");
+    assert_eq!(report.views[0].files, 2);
+    assert!(hit_paths(&conn, "protected_secret_fn").is_empty());
+    assert!(hit_paths(&conn, "protected_deep_fn").is_empty());
+    assert_eq!(hit_paths(&conn, "kept_fn"), vec!["keep/c.py"]);
+    assert_invariants(&conn);
+
+    // Locked: the scan still succeeds without that file and without an error.
+    let _lock = super::testutil::Locked::new(&fx.home.join("Documents"));
+    let conn = db();
+    let report = scan(&conn, &fx, &main);
+    assert_eq!(report.views[0].status, "ok");
+    assert_eq!(report.views[0].files, 2);
+}
+
+#[test]
+fn a_directory_that_is_a_link_to_an_ordinary_place_is_still_scanned() {
+    let fx = Fx::new();
+    let main = fx.init_repo("lnk-ok");
+    write(&main, "lib/b.py", &py(&["linked_fn"]));
+    fx.commit_all(&main, "init");
+    let outside = fx.root.join("outside");
+    std::fs::rename(main.join("lib"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, main.join("lib")).unwrap();
+    let conn = db();
+    scan(&conn, &fx, &main);
+    let paths: Vec<String> = rows(&conn, &main).into_iter().map(|r| r.0).collect();
+    assert_eq!(paths, vec!["lib/b.py"]);
+}
+
+#[test]
+fn a_directory_event_is_resolved_before_it_is_stat_ed() {
+    let fx = Fx::new();
+    let main = fx.init_repo("evt");
+    write(&main, "src/lib/x.py", &py(&["event_fn"]));
+    write(&main, "other/y.py", &py(&["other_fn"]));
+    fx.commit_all(&main, "init");
+    let conn = db();
+    scan(&conn, &fx, &main);
+
+    // Control: a real directory is stat'ed once.
+    let _ = super::scan::test_hooks::take_lstats();
+    let home = Some(fx.home.as_path());
+    let got = super::scan::expand_dir_events_with(&conn, &[main.join("other")], home).unwrap();
+    assert_eq!(got.dir_events, 1);
+    assert_eq!(
+        super::scan::test_hooks::take_lstats(),
+        vec![main.join("other")]
+    );
+
+    // `src` is swapped for a link into the fake Documents (locked, so a stat
+    // inside it would fail). The event for `src/lib` stats nothing.
+    swap_dir_for_link_into_documents(&fx, &main, "src", "source");
+    let _lock = super::testutil::Locked::new(&fx.home.join("Documents"));
+    let got = super::scan::expand_dir_events_with(&conn, &[main.join("src/lib")], home).unwrap();
+    assert_eq!(got.dir_events, 1);
+    assert_eq!(
+        super::scan::test_hooks::take_lstats(),
+        Vec::<PathBuf>::new(),
+        "no lstat of anything reachable through the protected link"
+    );
+    // The stored row below it is still handed on, so rescan_paths drops it.
+    assert_eq!(got.paths, vec![main.join("src/lib/x.py")]);
+}
+
 // ---- session signals --------------------------------------------------------------------
 
 #[test]

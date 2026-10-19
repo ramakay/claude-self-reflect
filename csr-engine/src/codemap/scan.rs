@@ -156,6 +156,16 @@ pub(super) mod test_hooks {
         // (files returned, entries visited, stopped) of the last full-scan
         // untracked walk on this thread.
         static LAST_WALK: Cell<Option<(usize, usize, bool)>> = const { Cell::new(None) };
+        // Paths `expand_dir_events` asked `lstat` about, in order.
+        static LSTATS: RefCell<Vec<std::path::PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_lstat(path: &std::path::Path) {
+        LSTATS.with(|l| l.borrow_mut().push(path.to_path_buf()));
+    }
+
+    pub(crate) fn take_lstats() -> Vec<std::path::PathBuf> {
+        LSTATS.with(|l| std::mem::take(&mut *l.borrow_mut()))
     }
 
     pub(super) fn record_walk(files: usize, visited: usize, stopped: bool) {
@@ -638,6 +648,42 @@ fn walk_untracked(
     )
 }
 
+/// Is every directory above the repo-relative file `rel` safe to stat through?
+/// `root` is a view root that `list_views_with` already resolved, so the first
+/// level is an `lstat` inside a safe directory. A real directory is safe. A
+/// symlink is resolved with `resolve_safe`: one that leads into a protected
+/// folder is unsafe, and so is everything below it. A missing directory or a
+/// plain file in its place is unsafe too (the file would not stat anyway).
+///
+/// `memo` maps a repo-relative directory to its answer, so a scan costs one
+/// `lstat` per unique tracked directory however many files it holds. A tracked
+/// `src/a.rs` whose `src` was swapped for a link into `~/Documents` is skipped
+/// before `stat_regular` (which follows intermediate links) or a read can reach
+/// the protected folder.
+fn parent_dirs_safe(
+    root: &Path,
+    rel: &str,
+    memo: &mut HashMap<String, bool>,
+    home: Option<&Path>,
+) -> bool {
+    let Some((dir, _)) = rel.rsplit_once('/') else {
+        return true; // directly in the view root
+    };
+    if let Some(&known) = memo.get(dir) {
+        return known;
+    }
+    let safe = parent_dirs_safe(root, dir, memo, home) && {
+        let abs = root.join(dir);
+        match std::fs::symlink_metadata(&abs) {
+            Ok(m) if m.file_type().is_symlink() => identity::resolve_safe(&abs, home).is_ok(),
+            Ok(m) => m.is_dir(),
+            Err(_) => false,
+        }
+    };
+    memo.insert(dir.to_string(), safe);
+    safe
+}
+
 fn collect_view(
     view: &ViewId,
     common_dir: &Path,
@@ -653,7 +699,14 @@ fn collect_view(
         truncated: false,
         skipped_large: 0,
     };
+    let home = opts.home();
+    // One answer per directory of the view, not per file: a tracked file is only
+    // stat'ed (and read) when every directory above it is safe.
+    let mut dir_memo: HashMap<String, bool> = HashMap::new();
     for e in &entries {
+        if !parent_dirs_safe(&view.worktree_path, &e.path, &mut dir_memo, home.as_deref()) {
+            continue; // a link into a protected folder: skipped as if deleted
+        }
         let abs = view.worktree_path.join(&e.path);
         let Some(st) = stat_regular(&abs) else {
             continue; // deleted, or not a regular file any more
@@ -682,6 +735,10 @@ fn collect_view(
         // Only as many untracked files as the cap still has room for, and a
         // bounded number of visited entries: a stopped walk is a truncated view.
         let room = opts.max_files_per_view.saturating_sub(scan.files.len());
+        // No `parent_dirs_safe` check on the files this walk returns: `WalkBuilder`
+        // is left at `follow_links(false)`, so a symlinked directory is yielded
+        // as a symlink entry and never entered, and every returned path runs
+        // through real directories only.
         let walk = walk_untracked(
             view,
             common_dir,
@@ -1001,10 +1058,26 @@ pub(crate) struct DirExpansion {
 /// remaining file allowance, never following a symlink and never entering a
 /// protected folder.
 pub(crate) fn expand_dir_events(conn: &Connection, abs_paths: &[PathBuf]) -> Result<DirExpansion> {
+    expand_dir_events_with(conn, abs_paths, identity::home_dir().as_deref())
+}
+
+/// `lstat` says this path is a directory (a symlink is not). The only `lstat` of
+/// a watcher event path; tests record the paths it is asked about.
+fn lstat_is_dir(abs: &Path) -> bool {
+    #[cfg(test)]
+    test_hooks::record_lstat(abs);
+    std::fs::symlink_metadata(abs).is_ok_and(|m| m.is_dir())
+}
+
+pub(crate) fn expand_dir_events_with(
+    conn: &Connection,
+    abs_paths: &[PathBuf],
+    home: Option<&Path>,
+) -> Result<DirExpansion> {
     let mut out: BTreeSet<PathBuf> = BTreeSet::new();
     let mut result = DirExpansion::default();
     let mut views: Option<Vec<StoredView>> = None;
-    let home = identity::home_dir();
+    let home = home.map(Path::to_path_buf);
     for p in abs_paths {
         if has_code_extension(p) {
             out.insert(p.clone());
@@ -1037,9 +1110,15 @@ pub(crate) fn expand_dir_events(conn: &Connection, abs_paths: &[PathBuf]) -> Res
         // drops those whose file no longer exists.
         let stored = store::stored_paths_under(conn, view.id, rel)?;
         out.extend(stored.iter().map(|s| root.join(s)));
+        // Resolve BEFORE the `lstat`: `/repo/src/lib` with `/repo/src` swapped for
+        // a link into ~/Documents would otherwise be stat'ed through the link.
+        // `resolve_safe` refuses at the first protected prefix without a stat
+        // inside it; any error (protected or missing) ends this event.
+        if identity::resolve_safe(&abs, home.as_deref()).is_err() {
+            continue;
+        }
         // `lstat`: a symlink is not a directory to the full scan either.
-        let is_dir = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_dir());
-        if !is_dir || identity::resolve_safe(&abs, home.as_deref()).is_err() {
+        if !lstat_is_dir(&abs) {
             continue;
         }
         let room = (MAX_FILES_PER_PROJECT as i64 - view.files).max(0) as usize + stored.len();
