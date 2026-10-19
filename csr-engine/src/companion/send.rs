@@ -21,7 +21,8 @@ pub fn closed_send(head: &str, body: &str, most: usize) -> String {
     format!("{head}“{}”", fit(&straight(body), room))
 }
 pub fn strip_forwards(text: &str) -> String {
-    crate::extraction::provenance::strip_companion_forwards(text).unwrap_or_else(|| text.to_owned())
+    let text = super::envelopes::strip(text);
+    crate::extraction::provenance::strip_companion_forwards(&text).unwrap_or(text)
 }
 pub fn own_words(text: &str) -> String {
     static OPEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {

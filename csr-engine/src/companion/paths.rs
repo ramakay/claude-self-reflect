@@ -28,10 +28,12 @@ impl Paths {
         if !valid_id(sid) {
             return None;
         }
-        folders(&self.projects)
+        let mut matches = folders(&self.projects)
             .into_iter()
             .map(|p| p.join(format!("{sid}.jsonl")))
-            .find(|p| p.is_file())
+            .filter(|p| p.is_file());
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
     }
     pub fn project_folder(&self, cwd: &str) -> PathBuf {
         self.projects.join(

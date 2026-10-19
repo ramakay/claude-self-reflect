@@ -7,6 +7,8 @@ use std::path::Path;
 
 pub struct Db {
     storage: Storage,
+    #[cfg(test)]
+    pub(super) queries: std::sync::atomic::AtomicUsize,
 }
 impl Db {
     pub fn open(paths: &Paths) -> anyhow::Result<Self> {
@@ -15,9 +17,16 @@ impl Db {
             let _: i64 = con.pragma_query_value(None, "schema_version", |row| row.get(0))?;
             Ok(())
         })?;
-        Ok(Self { storage })
+        Ok(Self {
+            storage,
+            #[cfg(test)]
+            queries: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
     pub fn query(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
+        #[cfg(test)]
+        self.queries
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.storage
             .with_connection(|con| {
                 let values: Vec<rusqlite::types::Value> = params
@@ -31,7 +40,7 @@ impl Db {
                         _ => rusqlite::types::Value::Null,
                     })
                     .collect();
-                let mut stmt = con.prepare(sql)?;
+                let mut stmt = con.prepare_cached(sql)?;
                 let n = stmt.column_count();
                 let rows = stmt
                     .query_map(params_from_iter(values), |row| {

@@ -2,7 +2,7 @@ use clap::{Args, Subcommand};
 use std::{io::Read, path::PathBuf};
 
 #[derive(Args, Debug)]
-#[command(version)]
+#[command(version, display_name = "csr-engine-companion")]
 pub struct CompanionArgs {
     #[command(subcommand)]
     pub command: CompanionCmd,

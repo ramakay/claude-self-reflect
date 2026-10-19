@@ -3,12 +3,7 @@ use super::{
     paths::{epoch, folders, read_json, valid_id, Paths},
 };
 use serde_json::{json, Value};
-use std::{
-    collections::BTreeMap,
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 pub fn session_record(paths: &Paths, sid: &str) -> Option<Value> {
     if !valid_id(sid) {
@@ -41,33 +36,51 @@ pub fn session_record(paths: &Paths, sid: &str) -> Option<Value> {
         })
 }
 
-pub fn lineage(paths: &Paths, sid: &str) -> Vec<String> {
+pub fn lineage_paths(paths: &Paths, sid: &str) -> Vec<PathBuf> {
+    let Some(mut path) = paths.transcript(sid) else {
+        return vec![];
+    };
+    let mut result = vec![path.clone()];
     let mut ids = vec![sid.to_owned()];
     if std::env::var("CSR_NO_CONTINUED")
         .is_ok_and(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true"))
     {
-        return ids;
+        return result;
     }
-    while ids.len() <= 5 {
-        let Some(path) = paths.transcript(ids.last().unwrap()) else {
-            break;
-        };
+    while result.len() <= 5 {
         let Some(old) = crate::hooks::resume_lineage::pane_predecessor(&path, ids.last().unwrap())
         else {
             break;
         };
-        if !valid_id(&old) || ids.contains(&old) {
+        if !valid_id(&old) || ids.contains(&old) || paths.transcript(&old).is_none() {
             break;
         }
+        let sibling = path.parent().unwrap().join(format!("{old}.jsonl"));
+        if !sibling.is_file() {
+            break;
+        }
+        path = sibling;
+        result.push(path.clone());
         ids.push(old);
     }
-    ids
+    result
+}
+pub fn lineage(paths: &Paths, sid: &str) -> Vec<String> {
+    let found = lineage_paths(paths, sid);
+    if found.is_empty() {
+        return vec![sid.to_owned()];
+    }
+    found
+        .iter()
+        .filter_map(|p| p.file_stem()?.to_str().map(str::to_owned))
+        .collect()
 }
 
 pub struct Session {
     pub id: String,
     pub path: Option<PathBuf>,
-    offset: u64,
+    tail: super::tail::Tail,
+    dirty: bool,
     looked: f64,
     main_id: Option<String>,
     measuring: Option<usize>,
@@ -79,7 +92,8 @@ impl Session {
         Self {
             id: sid.into(),
             path: None,
-            offset: 0,
+            tail: super::tail::Tail::default(),
+            dirty: true,
             looked: 0.,
             main_id: None,
             measuring: None,
@@ -140,250 +154,254 @@ impl Session {
         let Some(path) = self.path.as_ref() else {
             return;
         };
-        let Ok(mut file) = File::open(path) else {
-            return;
-        };
-        if file.metadata().is_ok_and(|m| m.len() < self.offset) {
-            let path = self.path.clone();
-            *self = Self::new(&self.id);
-            self.path = path;
-        }
-        if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
-        }
-        let mut bytes = Vec::new();
-        if file.read_to_end(&mut bytes).is_err() {
-            return;
-        }
-        let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else {
-            return;
-        };
-        self.offset += (end + 1) as u64;
-        for raw in bytes[..=end].split(|b| *b == b'\n') {
-            let Ok(e) = sonic_rs::from_slice::<Value>(raw) else {
-                continue;
-            };
-            let kind = e["type"].as_str().unwrap_or("");
-            let when = e["timestamp"].as_str().and_then(epoch);
-            if self.data["started"] == 0. {
-                if let Some(t) = when {
-                    self.data["started"] = json!(t);
-                }
-            }
-            if matches!(kind, "human" | "user" | "assistant") {
-                self.data["messages"] = json!(self.data["messages"].as_u64().unwrap_or(0) + 1);
-            }
-            let side = e["isSidechain"] == true;
-            if kind == "ai-title" && e["aiTitle"].is_string() {
-                self.data["title"] = e["aiTitle"].clone();
-            }
-            let Some(t) = when else {
-                if kind == "ai-title" && e["aiTitle"].is_string() {
-                    self.data["title"] = e["aiTitle"].clone();
-                }
-                continue;
-            };
-            let m = &e["message"];
-            if kind == "assistant" {
-                let context = [
-                    "input_tokens",
-                    "cache_read_input_tokens",
-                    "cache_creation_input_tokens",
-                ]
-                .iter()
-                .map(|k| m["usage"][k].as_u64().unwrap_or(0))
-                .sum::<u64>();
-                let id = m["id"].as_str();
-                if let Some(id) = id {
-                    self.replies.insert(
-                        id.to_owned(),
-                        json!([
-                            t,
-                            context,
-                            m["usage"]["output_tokens"].as_u64().unwrap_or(0),
-                            m["usage"]["cache_creation_input_tokens"]
-                                .as_u64()
-                                .unwrap_or(0),
-                        ]),
-                    );
-                }
-                if m["stop_reason"] == "end_turn" && !side {
-                    self.data["turn_end"] = json!(t);
-                }
-                if context > 0 && !side {
-                    if id.is_some() && id == self.main_id.as_deref() {
-                        *self.data["main"]
-                            .as_array_mut()
-                            .unwrap()
-                            .last_mut()
-                            .unwrap() = json!([t, context]);
-                    } else {
-                        self.push("main", json!([t, context]));
-                    }
-                    self.main_id = id.map(str::to_owned);
-                    if let Some(model) = m["model"]
-                        .as_str()
-                        .filter(|s| !s.is_empty() && !s.starts_with('<'))
-                    {
-                        self.data["model"] = json!(model);
-                    }
-                    if let Some(i) = self.measuring.take() {
-                        self.data["compact_sizes"][i][1] = json!(context);
-                    }
-                }
-                for part in m["content"].as_array().into_iter().flatten() {
-                    if part["type"] == "text" && !side {
-                        let text = part["text"].as_str().unwrap_or("");
-                        self.push("talk", json!([t, text]));
-                        self.data["said"] = json!([t, text]);
-                    }
-                    if part["type"] != "tool_use" {
-                        continue;
-                    }
-                    let name = part["name"].as_str().unwrap_or("");
-                    let count = self.data["tools"][name].as_u64().unwrap_or(0) + 1;
-                    self.data["tools"][name] = json!(count);
-                    if let Some(path) = part["input"]["file_path"]
-                        .as_str()
-                        .filter(|p| p.starts_with('/'))
-                    {
-                        let path =
-                            std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-                        let path = path.to_string_lossy();
-                        let count = self.data["files"][path.as_ref()].as_u64().unwrap_or(0) + 1;
-                        self.data["files"][path.as_ref()] = json!(count);
-                        self.data["last"][path.as_ref()] = json!(t);
-                        if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
-                            && !self.data["edited"]
-                                .as_array()
-                                .unwrap()
-                                .contains(&json!(path))
-                        {
-                            self.push("edited", json!(path));
-                        }
-                    }
-                    if name == "Bash" {
-                        static NAMED: std::sync::LazyLock<regex::Regex> =
-                            std::sync::LazyLock::new(|| {
-                                regex::Regex::new(r"(/(?:Users|home)/[\w./@+-]+)").unwrap()
-                            });
-                        let command = part["input"]["command"].as_str().unwrap_or("");
-                        let names: std::collections::BTreeSet<_> = NAMED
-                            .find_iter(command)
-                            .map(|m| m.as_str().trim_end_matches(['.', ',', ';', ':']))
-                            .collect();
-                        for named in names {
-                            let count = self.data["shell"][named].as_u64().unwrap_or(0) + 1;
-                            self.data["shell"][named] = json!(count);
-                            self.data["last"][named] = json!(t);
-                        }
-                    }
-                    if let Some(tool) = name.strip_prefix("mcp__claude-self-reflect__") {
-                        self.push("asked", json!(t));
-                        let args = &part["input"];
-                        let ask = [
-                            "query",
-                            "concept",
-                            "topic",
-                            "file_path",
-                            "symbol",
-                            "target",
-                            "pattern",
-                            "conversation_id",
-                        ]
-                        .iter()
-                        .find_map(|k| args[k].as_str().filter(|s| !s.trim().is_empty()))
-                        .unwrap_or("");
-                        self.push("questions", json!([t, tool, ask]));
-                    }
-                }
-            } else if kind == "user" && e["isCompactSummary"] == true {
-                let text = message_text(m);
-                if !text.trim().is_empty() {
-                    self.push("summaries", json!([t, text]));
-                }
-            } else if kind == "user" && e["isMeta"] != true {
-                let text = message_text(m);
-                let content = &m["content"];
-                let parts: Vec<_> = if let Some(text) = content.as_str() {
-                    vec![text]
-                } else {
-                    content
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter(|p| p["type"] == "text")
-                        .filter_map(|p| p["text"].as_str())
-                        .collect()
+        let path = path.clone();
+        let mut tail = std::mem::take(&mut self.tail);
+        let _ = tail.poll(
+            &path,
+            usize::MAX,
+            || false,
+            |raw| {
+                let Some(raw) = raw else {
+                    let path = self.path.clone();
+                    *self = Self::new(&self.id);
+                    self.path = path;
+                    return;
                 };
-                if parts.iter().any(|text| {
-                    !text.trim().is_empty() && !text.trim_start().starts_with(['<', '/'])
-                }) {
-                    self.push("prompts", json!(t));
-                    if !side
-                        && !text
-                            .trim_start()
-                            .starts_with("[Request interrupted by user")
-                    {
-                        let own = super::send::own_words(&text);
-                        self.push("talk", json!([t, own]));
-                        self.push("typed", json!([t, own]));
-                    }
-                }
-            } else if kind == "attachment" {
-                let a = &e["attachment"];
-                let text = a["prompt"].as_str().unwrap_or("").trim();
-                if a["type"] == "queued_command"
-                    && a["humanTurn"] == true
-                    && !text.is_empty()
-                    && !text.starts_with(['<', '/'])
-                {
-                    self.push("prompts", json!(t));
-                }
-                if a["type"] == "hook_success"
-                    && a["hookEvent"] == "SessionStart"
-                    && a["command"].as_str().is_some_and(|s| {
-                        s.contains("csr-engine") && s.ends_with("hook session-start")
-                    })
-                    && a["content"].is_string()
-                {
-                    let source = a["hookName"]
-                        .as_str()
-                        .and_then(|s| s.split_once(':'))
-                        .map(|(_, s)| s)
-                        .unwrap_or("startup");
-                    self.data["told"] = json!({
-                        "at": t,
-                        "source": source,
-                        "text": a["content"],
-                    });
-                }
-            } else if kind == "system" && e["subtype"] == "compact_boundary" {
-                self.push("compacts", json!(t));
-                let meta = &e["compactMetadata"];
-                self.push(
-                    "compact_sizes",
-                    json!([meta["preTokens"], null, meta["durationMs"]]),
-                );
-                self.push("summary_sizes", meta["postTokens"].clone());
-                self.measuring = Some(self.data["compact_sizes"].as_array().unwrap().len() - 1);
-            }
-        }
+                self.read_line(raw);
+            },
+        );
+        self.tail = tail;
         let talk = self.data["talk"].as_array_mut().unwrap();
         if talk.len() > 200 {
             talk.drain(..talk.len() - 200);
         }
     }
-    pub fn load(&mut self, paths: &Paths, db: Option<&Db>) -> Value {
+    fn read_line(&mut self, raw: &[u8]) {
+        self.dirty = true;
+        let Ok(e) = sonic_rs::from_slice::<Value>(raw) else {
+            return;
+        };
+        let kind = e["type"].as_str().unwrap_or("");
+        let when = e["timestamp"].as_str().and_then(epoch);
+        if self.data["started"] == 0. {
+            if let Some(t) = when {
+                self.data["started"] = json!(t);
+            }
+        }
+        if matches!(kind, "human" | "user" | "assistant") {
+            self.data["messages"] = json!(self.data["messages"].as_u64().unwrap_or(0) + 1);
+        }
+        let side = e["isSidechain"] == true;
+        if kind == "ai-title" && e["aiTitle"].is_string() {
+            self.data["title"] = e["aiTitle"].clone();
+        }
+        let Some(t) = when else {
+            if kind == "ai-title" && e["aiTitle"].is_string() {
+                self.data["title"] = e["aiTitle"].clone();
+            }
+            return;
+        };
+        let m = &e["message"];
+        if kind == "assistant" {
+            let context = [
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            ]
+            .iter()
+            .map(|k| m["usage"][k].as_u64().unwrap_or(0))
+            .sum::<u64>();
+            let id = m["id"].as_str();
+            if let Some(id) = id {
+                self.replies.insert(
+                    id.to_owned(),
+                    json!([
+                        t,
+                        context,
+                        m["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                        m["usage"]["cache_creation_input_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
+                    ]),
+                );
+            }
+            if m["stop_reason"] == "end_turn" && !side {
+                self.data["turn_end"] = json!(t);
+            }
+            if context > 0 && !side {
+                if id.is_some() && id == self.main_id.as_deref() {
+                    *self.data["main"]
+                        .as_array_mut()
+                        .unwrap()
+                        .last_mut()
+                        .unwrap() = json!([t, context]);
+                } else {
+                    self.push("main", json!([t, context]));
+                }
+                self.main_id = id.map(str::to_owned);
+                if let Some(model) = m["model"]
+                    .as_str()
+                    .filter(|s| !s.is_empty() && !s.starts_with('<'))
+                {
+                    self.data["model"] = json!(model);
+                }
+                if let Some(i) = self.measuring.take() {
+                    self.data["compact_sizes"][i][1] = json!(context);
+                }
+            }
+            for part in m["content"].as_array().into_iter().flatten() {
+                if part["type"] == "text" && !side {
+                    let text = part["text"].as_str().unwrap_or("");
+                    self.push("talk", json!([t, text]));
+                    self.data["said"] = json!([t, text]);
+                }
+                if part["type"] != "tool_use" {
+                    continue;
+                }
+                let name = part["name"].as_str().unwrap_or("");
+                let count = self.data["tools"][name].as_u64().unwrap_or(0) + 1;
+                self.data["tools"][name] = json!(count);
+                if let Some(path) = part["input"]["file_path"]
+                    .as_str()
+                    .filter(|p| p.starts_with('/'))
+                {
+                    let path = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+                    let path = path.to_string_lossy();
+                    let count = self.data["files"][path.as_ref()].as_u64().unwrap_or(0) + 1;
+                    self.data["files"][path.as_ref()] = json!(count);
+                    self.data["last"][path.as_ref()] = json!(t);
+                    if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
+                        && !self.data["edited"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!(path))
+                    {
+                        self.push("edited", json!(path));
+                    }
+                }
+                if name == "Bash" {
+                    static NAMED: std::sync::LazyLock<regex::Regex> =
+                        std::sync::LazyLock::new(|| {
+                            regex::Regex::new(r"(/(?:Users|home)/[\w./@+-]+)").unwrap()
+                        });
+                    let command = part["input"]["command"].as_str().unwrap_or("");
+                    let names: std::collections::BTreeSet<_> = NAMED
+                        .find_iter(command)
+                        .map(|m| m.as_str().trim_end_matches(['.', ',', ';', ':']))
+                        .collect();
+                    for named in names {
+                        let count = self.data["shell"][named].as_u64().unwrap_or(0) + 1;
+                        self.data["shell"][named] = json!(count);
+                        self.data["last"][named] = json!(t);
+                    }
+                }
+                if let Some(tool) = name.strip_prefix("mcp__claude-self-reflect__") {
+                    self.push("asked", json!(t));
+                    let args = &part["input"];
+                    let ask = [
+                        "query",
+                        "concept",
+                        "topic",
+                        "file_path",
+                        "symbol",
+                        "target",
+                        "pattern",
+                        "conversation_id",
+                    ]
+                    .iter()
+                    .find_map(|k| args[k].as_str().filter(|s| !s.trim().is_empty()))
+                    .unwrap_or("");
+                    self.push("questions", json!([t, tool, ask]));
+                }
+            }
+        } else if kind == "user" && e["isCompactSummary"] == true {
+            let text = message_text(m);
+            if !text.trim().is_empty() {
+                self.push("summaries", json!([t, text]));
+            }
+        } else if kind == "user" && e["isMeta"] != true {
+            let text = message_text(m);
+            let content = &m["content"];
+            let parts: Vec<_> = if let Some(text) = content.as_str() {
+                vec![text]
+            } else {
+                content
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["type"] == "text")
+                    .filter_map(|p| p["text"].as_str())
+                    .collect()
+            };
+            if parts
+                .iter()
+                .any(|text| !text.trim().is_empty() && !text.trim_start().starts_with(['<', '/']))
+            {
+                self.push("prompts", json!(t));
+                if !side
+                    && !text
+                        .trim_start()
+                        .starts_with("[Request interrupted by user")
+                {
+                    let own = super::send::own_words(&text);
+                    if !own.trim().is_empty() {
+                        self.push("talk", json!([t, own]));
+                        self.push("typed", json!([t, own]));
+                    }
+                }
+            }
+        } else if kind == "attachment" {
+            let a = &e["attachment"];
+            let text = a["prompt"].as_str().unwrap_or("").trim();
+            if a["type"] == "queued_command"
+                && a["humanTurn"] == true
+                && !text.is_empty()
+                && !text.starts_with(['<', '/'])
+            {
+                self.push("prompts", json!(t));
+            }
+            if a["type"] == "hook_success"
+                && a["hookEvent"] == "SessionStart"
+                && a["command"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("csr-engine") && s.ends_with("hook session-start"))
+                && a["content"].is_string()
+            {
+                let source = a["hookName"]
+                    .as_str()
+                    .and_then(|s| s.split_once(':'))
+                    .map(|(_, s)| s)
+                    .unwrap_or("startup");
+                self.data["told"] = json!({
+                    "at": t,
+                    "source": source,
+                    "text": a["content"],
+                });
+            }
+        } else if kind == "system" && e["subtype"] == "compact_boundary" {
+            self.push("compacts", json!(t));
+            let meta = &e["compactMetadata"];
+            self.push(
+                "compact_sizes",
+                json!([meta["preTokens"], null, meta["durationMs"]]),
+            );
+            self.push("summary_sizes", meta["postTokens"].clone());
+            self.measuring = Some(self.data["compact_sizes"].as_array().unwrap().len() - 1);
+        }
+    }
+    pub fn load(&mut self, paths: &Paths, db: Option<&Db>) -> &mut Value {
         self.read_transcript(paths);
-        let mut s = self.data.clone();
-        let mut replies: Vec<_> = self.replies.values().cloned().collect();
-        replies.sort_by(|a, b| {
-            a[0].as_f64()
-                .partial_cmp(&b[0].as_f64())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        s["replies"] = json!(replies);
+        let s = &mut self.data;
+        if self.dirty {
+            let mut replies: Vec<_> = self.replies.values().cloned().collect();
+            replies.sort_by(|a, b| {
+                a[0].as_f64()
+                    .partial_cmp(&b[0].as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            s["replies"] = json!(replies);
+            self.dirty = false;
+        }
         let record = session_record(paths, &self.id);
         if s["started"] == 0. {
             if let Some(record) = &record {
@@ -530,7 +548,7 @@ mod tests {
         std::fs::write(&f, line).unwrap();
         let mut s = Session::new("s");
         s.read_transcript(&p);
-        assert_eq!(s.offset, 0);
+        assert_eq!(s.tail.offset, line.len() as u64);
         use std::io::Write;
         writeln!(std::fs::OpenOptions::new().append(true).open(&f).unwrap()).unwrap();
         s.read_transcript(&p);
@@ -902,5 +920,99 @@ mod previous_tests {
         assert!(facts["handed"].is_null());
         assert_eq!(facts["typed"][1], "the last words I typed");
         assert_eq!(facts["said"][1], "words");
+    }
+}
+
+#[cfg(test)]
+mod reader_regressions {
+    use super::*;
+    fn row(text: &str) -> String {
+        json!({"type":"user","timestamp":"2026-10-18T10:00:00Z",
+            "message":{"content":text}})
+        .to_string()
+            + "\n"
+    }
+    #[test]
+    fn load_borrows_histories_and_partial_lines_cross_chunk_boundaries() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let path = paths.projects.join("p/s.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let long = row(&"x".repeat(super::super::tail::CHUNK + 17));
+        std::fs::write(&path, &long[..long.len() - 1]).unwrap();
+        let mut session = Session::new("s");
+        session.read_transcript(&paths);
+        assert_eq!(session.tail.offset, (long.len() - 1) as u64);
+        assert_eq!(session.data["messages"], 0);
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        session.load(&paths, None);
+        assert_eq!(session.data["messages"], 1);
+        let history = session.data["typed"].as_array().unwrap().as_ptr();
+        let loaded = session.load(&paths, None);
+        assert_eq!(loaded["typed"].as_array().unwrap().as_ptr(), history);
+    }
+    #[test]
+    fn replacement_and_truncation_reset_all_transcript_aggregates() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let path = paths.projects.join("p/s.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, row("old")).unwrap();
+        let mut session = Session::new("s");
+        session.read_transcript(&paths);
+        let other = path.with_extension("new");
+        std::fs::write(&other, row("new and longer")).unwrap();
+        std::fs::rename(other, &path).unwrap();
+        session.read_transcript(&paths);
+        assert_eq!(session.data["messages"], 1);
+        assert_eq!(session.data["typed"][0][1], "new and longer");
+        std::fs::write(&path, "").unwrap();
+        session.read_transcript(&paths);
+        assert_eq!(session.data["messages"], 0);
+        assert!(session.data["typed"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn duplicate_predecessor_ids_never_cross_project_boundaries() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        for name in ["a", "b"] {
+            let folder = paths.projects.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(
+                folder.join("old.jsonl"),
+                concat!(
+                    "{\"type\":\"continued-in\",\"sessionId\":\"old\",",
+                    "\"continuedInSessionId\":\"new\"}\n"
+                ),
+            )
+            .unwrap();
+        }
+        std::fs::write(paths.projects.join("b/new.jsonl"), "{}\n").unwrap();
+        assert_eq!(lineage(&paths, "new"), ["new"]);
+        assert!(paths.transcript("old").is_none());
+    }
+}
+
+#[cfg(test)]
+mod typed_regressions {
+    use super::*;
+    #[test]
+    fn agent_envelope_only_messages_never_enter_typed_history() {
+        let mut session = Session::new("s");
+        let envelope = concat!(
+            "[[CSR:AGENTS:v1]]\n",
+            "{\"kind\":\"context\",\"session\":\"s\",\"at\":1,\"agents\":[]}\n",
+            "[[/CSR:AGENTS:v1]]\n"
+        );
+        let row = json!({"type":"user","timestamp":"2026-10-18T00:00:00Z",
+            "message":{"content":envelope}});
+        session.read_line(row.to_string().as_bytes());
+        assert!(session.data["typed"].as_array().unwrap().is_empty());
     }
 }

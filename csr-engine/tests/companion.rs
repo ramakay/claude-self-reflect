@@ -216,6 +216,15 @@ fn keys_and_clicks_open_rows_and_keep_a_dream_answer() {
 #[cfg(unix)]
 #[test]
 fn sigterm_restores_the_terminal_and_removes_the_pid_file() {
+    terminal_session(false);
+}
+#[cfg(unix)]
+#[test]
+fn rejected_binary_reload_keeps_the_process_heartbeat_and_pid_cleanup() {
+    terminal_session(true);
+}
+#[cfg(unix)]
+fn terminal_session(reload: bool) {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::time::{Duration, Instant};
@@ -246,7 +255,14 @@ fn sigterm_restores_the_terminal_and_removes_the_pid_file() {
         0
     );
     let before = unsafe { before.assume_init() };
-    let child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+    let binary = paths.home.join("test-engine");
+    let executable = if reload {
+        fs::copy(env!("CARGO_BIN_EXE_csr-engine"), &binary).unwrap();
+        binary.as_path()
+    } else {
+        std::path::Path::new(env!("CARGO_BIN_EXE_csr-engine"))
+    };
+    let child = Command::new(executable)
         .env("HOME", &paths.home)
         .args([
             "companion",
@@ -282,6 +298,28 @@ fn sigterm_restores_the_terminal_and_removes_the_pid_file() {
     }
     assert!(pid.exists(), "watch created its pid file");
     std::thread::sleep(Duration::from_millis(100));
+    if reload {
+        let old = fs::metadata(&pid).unwrap().modified().unwrap();
+        let bad = paths.home.join("bad-engine");
+        fs::write(&bad, "broken binary").unwrap();
+        fs::rename(&bad, &binary).unwrap();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(7) {
+            let _ = master.read_to_end(&mut output);
+            assert!(
+                child_guard.0.try_wait().unwrap().is_none(),
+                "the old process must survive"
+            );
+            if fs::metadata(&pid).unwrap().modified().unwrap() > old
+                && String::from_utf8_lossy(&output).contains("engine reload:")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(String::from_utf8_lossy(&output).contains("engine reload:"));
+        assert!(fs::metadata(&pid).unwrap().modified().unwrap() > old);
+    }
     assert_eq!(
         unsafe { libc::kill(child_guard.0.id() as i32, libc::SIGTERM) },
         0
@@ -326,4 +364,19 @@ fn a_stray_click_on_close_never_closes_the_pane() {
     let col = span[0].as_u64().unwrap() as usize;
     assert!(pane.click(29, col, 1792320000.));
     assert!(!pane.key("q"));
+}
+
+#[test]
+fn engine_probe_identifies_the_companion_subcommand() {
+    let (_home, paths) = home();
+    let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+        .env("HOME", paths.home)
+        .args(["companion", "--version"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("csr-engine-companion {}\n", env!("CARGO_PKG_VERSION"))
+    );
 }

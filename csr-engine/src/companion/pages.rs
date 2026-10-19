@@ -1,11 +1,4 @@
-use super::{
-    array,
-    db::Db,
-    dreams, masthead, num,
-    paths::{epoch, Paths},
-    render::text::*,
-    send, string,
-};
+use super::{array, db::Db, dreams, masthead, num, render::text::*, send, string};
 use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -44,76 +37,7 @@ pub fn stamp(at: f64, now: f64) -> String {
     })
     .to_string()
 }
-pub fn where_it_stands(text: &str) -> String {
-    let mut sentences = vec![];
-    let mut at = 0;
-    for (i, c) in text.char_indices() {
-        if c.is_whitespace()
-            && i > 0
-            && text[..i].ends_with(['.', '!', '?'])
-            && text[i..]
-                .trim_start()
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase() || c == '`')
-        {
-            sentences.push(text[at..i].trim());
-            at = i;
-        }
-    }
-    sentences.push(text[at..].trim());
-    let re = regex::Regex::new(r"(?i)\b(?:stands?|stood|standing)\b").unwrap();
-    let first = sentences
-        .iter()
-        .rposition(|s| re.is_match(s))
-        .unwrap_or(sentences.len().saturating_sub(2));
-    sentences[first..].join(" ")
-}
-pub fn session_story(db: &Db, paths: &Paths, sid: &str) -> Value {
-    for id in super::session::lineage(paths, sid) {
-        let rows = db.query(
-            "select content,tags,timestamp from reflections where tags like \
-                ? and tags like '%session_story%' order by timestamp desc limit \
-                1",
-            &[json!(format!("%conv_{id}%"))],
-        );
-        let Some(r) = rows.first() else {
-            continue;
-        };
-        let text = one_line(string(&r[0]), usize::MAX);
-        if text.is_empty() {
-            continue;
-        }
-        let tags: Value = serde_json::from_str(string(&r[1])).unwrap_or(Value::Null);
-        let rev = array(&tags)
-            .iter()
-            .find_map(|t| {
-                string(t)
-                    .strip_prefix("story_rev_")
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(1);
-        let by = if array(&tags).contains(&json!("story_by_haiku")) {
-            "Haiku"
-        } else if array(&tags).contains(&json!("story_extracted")) {
-            "extract"
-        } else {
-            ""
-        };
-        let mut story = json!({
-            "text": text,
-            "now": where_it_stands(&text),
-            "rev": rev,
-            "by": by,
-            "at": epoch(string(&r[2])),
-        });
-        if id != sid {
-            story["from_sid"] = json!(id);
-        }
-        return story;
-    }
-    Value::Null
-}
+pub use super::recall::{session_story, where_it_stands};
 fn story_rights(story: &Value, now: f64) -> Vec<String> {
     if story.is_null() {
         return vec![String::new()];
@@ -171,61 +95,9 @@ fn section_value(
 }
 pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>) -> Value {
     let sid = string(&s["id"]);
-    let mut rules = vec![];
-    let mut rules_at = 0_f64;
-    if let Some(db) = db {
-        let project = string(&s["project"]);
-        let basename = std::path::Path::new(string(&data["repo"]))
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        for r in db.query(
-            "select ts,quote,session_id,transcript_path,byte_start from \
-                intent_events where project in (?,?) and kind='correction' \
-                order by ts desc limit 200",
-            &[json!(project), json!(basename)],
-        ) {
-            if rules.len() >= 3 {
-                break;
-            }
-            let quote = one_line(string(&r[1]), 700);
-            if !send::typed_by_you(
-                std::path::Path::new(string(&r[3])),
-                num(&r[4]) as u64,
-                Some(&quote),
-            ) {
-                continue;
-            }
-            let at = epoch(string(&r[0])).unwrap_or(0.);
-            rules_at = rules_at.max(at);
-            let day = Local
-                .timestamp_opt(at as i64, 0)
-                .single()
-                .map(|v| v.format("%m-%d").to_string())
-                .unwrap_or_default();
-            rules.push(json!({
-                "key": format!(
-                    "rule:{}:{}",
-                    string(&r[0]),
-                    quote.chars().take(30).collect::<String>()
-                ),
-                "title": quote,
-                "meta": format!(
-                    "you said · {day}{}",
-                    if r[2] == sid { " · this session" } else { "" }
-                ),
-                "detail": [format!(
-                    "Your words, session {}. CSR hands them to Claude when the work \
-                        comes near.",
-                    string(&r[2]).chars().take(8).collect::<String>()
-                )],
-                "send": one_line(
-                    &format!("A standing rule from {day}: “{quote}”"),
-                    700,
-                ),
-            }));
-        }
-    }
+    let (rules, rules_at) = db
+        .map(|db| super::recall::rules(db, s, string(&data["repo"])))
+        .unwrap_or_default();
     let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], sid);
     let star = &fed["star"];
     let starred = !star.is_null();
@@ -759,11 +631,11 @@ fn told_section(s: &Value) -> Option<Value> {
         .filter(|s| !s.is_empty())
         .unwrap_or("startup");
     let said = match source {
-        "startup" => "at start",
-        "resume" => "at resume",
-        "compact" => "after compact",
-        "clear" => "after clear",
-        _ => source,
+        "startup" => "at start".into(),
+        "resume" => "at resume".into(),
+        "compact" => "after compact".into(),
+        "clear" => "after clear".into(),
+        _ => one_line(source, 12),
     };
     let when = told["at"]
         .as_f64()
@@ -795,7 +667,7 @@ fn told_section(s: &Value) -> Option<Value> {
             ),
         })],
         told["at"].clone(),
-        said,
+        &said,
     ))
 }
 fn from_when(at: f64, now: f64) -> String {
@@ -815,144 +687,8 @@ fn from_when(at: f64, now: f64) -> String {
         format!("{} months ago", (days / 30.) as i64)
     }
 }
-fn gist(text: &str) -> String {
-    let text = one_line(&text.replace('`', ""), 700);
-    let text = text
-        .strip_prefix("The session ")
-        .or_else(|| text.strip_prefix("This session "))
-        .unwrap_or(&text);
-    let first = text
-        .split(". ")
-        .next()
-        .unwrap_or(text)
-        .trim_end_matches([' ', '.']);
-    let mut chars = first.chars();
-    let Some(c) = chars.next() else {
-        return String::new();
-    };
-    c.to_uppercase().collect::<String>() + chars.as_str()
-}
 fn remembered_section(db: &Db, s: &Value, now: f64) -> Option<Value> {
-    let sid = string(&s["id"]);
-    let rows = db.query(
-        "select r.retrieved_at,r.memory_type,r.memory_id,\
-            c.conversation_id,p.source_conv_id,c.timestamp from \
-            retrieval_events r left join chunks c on c.id=r.memory_id left \
-            join chunk_provenance p on p.chunk_id=r.memory_id where \
-            r.session_id=? order by r.retrieved_at",
-        &[json!(sid)],
-    );
-    let uuid = regex::Regex::new(r"^[0-9a-f-]{36}$").unwrap();
-    let mut groups: BTreeMap<String, Value> = BTreeMap::new();
-    for r in rows {
-        let mut conversation = if string(&r[3]).starts_with("agent-") {
-            string(&r[4]).to_owned()
-        } else {
-            string(&r[3]).to_owned()
-        };
-        let memory = string(&r[2]);
-        let reflection = r[1] == "reflection";
-        if reflection {
-            if let Some(id) = memory
-                .strip_prefix("extracted_v3_")
-                .or_else(|| memory.strip_prefix("story_"))
-                .filter(|id| uuid.is_match(id))
-            {
-                conversation = id.into();
-            } else {
-                conversation = format!("reflection:{memory}");
-            }
-        }
-        if conversation.is_empty() || conversation == sid {
-            continue;
-        }
-        let (title, when, project) = if conversation.starts_with("reflection:") {
-            let rows = db.query(
-                "select content,timestamp from reflections where id=?",
-                &[json!(memory)],
-            );
-            let Some(r) = rows.first() else {
-                continue;
-            };
-            (gist(string(&r[0])), epoch(string(&r[1])), String::new())
-        } else {
-            let rows = db.query(
-                "select first_prompt,first_ts,last_ts,project from \
-                    session_registry where session_id=?",
-                &[json!(conversation)],
-            );
-            let seen = rows.first();
-            let story = db.scalar(
-                "select content from reflections where tags like ? and tags like \
-                    '%session_story%' order by (id like 'story_%'), timestamp desc \
-                    limit 1",
-                &[json!(format!("%conv_{conversation}%"))],
-            );
-            let extracted = if story.is_null() {
-                db.scalar(
-                    "select content from reflections where id=?",
-                    &[json!(format!("extracted_v3_{conversation}"))],
-                )
-            } else {
-                Value::Null
-            };
-            let title = story
-                .as_str()
-                .or(extracted.as_str())
-                .or_else(|| {
-                    seen.and_then(|r| r[0].as_str())
-                        .filter(|s| !s.trim_start().starts_with(['[', '<', '/']))
-                })
-                .unwrap_or("");
-            (
-                gist(title),
-                seen.and_then(|r| {
-                    epoch(if string(&r[2]).is_empty() {
-                        string(&r[1])
-                    } else {
-                        string(&r[2])
-                    })
-                }),
-                seen.map(|r| string(&r[3]).to_owned()).unwrap_or_default(),
-            )
-        };
-        if title.is_empty() {
-            continue;
-        }
-        let moment = epoch(string(&r[0])).unwrap_or(0.);
-        let item = groups.entry(conversation.clone()).or_insert_with(|| {
-            json!({
-                "key": conversation,
-                "title": title,
-                "when": when,
-                "project": project,
-                "at": moment,
-                "first": moment,
-                "seconds": [],
-            })
-        });
-        if moment > num(&item["at"]) {
-            item["at"] = json!(moment);
-        }
-        if moment < num(&item["first"]) {
-            item["first"] = json!(moment);
-        }
-        let second = json!(moment as i64);
-        if moment != 0. && !array(&item["seconds"]).contains(&second) {
-            item["seconds"].as_array_mut().unwrap().push(second);
-        }
-    }
-    let mut recalled: Vec<_> = groups
-        .into_values()
-        .filter(|i| {
-            let id = string(&i["key"]);
-            uuid.is_match(id)
-                && array(&s["questions"])
-                    .iter()
-                    .any(|q| num(&q[0]) >= num(&i["first"]) && string(&q[2]).contains(&id[..8]))
-        })
-        .collect();
-    recalled.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+    let recalled = super::recall::remembered(db, s);
     let at = recalled.iter().map(|r| num(&r["at"])).fold(0., f64::max);
     let items: Vec<_> = recalled
         .iter()
@@ -1692,5 +1428,37 @@ mod default_tests {
         assert!(!text.contains("0 learned"));
         assert!(text.contains("First session here"));
         assert_eq!(lines.rows[0].matches("CTX").count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod source_regressions {
+    use super::*;
+    #[test]
+    fn unknown_hook_sources_are_bounded_and_cannot_inject_terminal_controls() {
+        let s = json!({"id":"s","told":{"at":1800000000.,
+            "source":"\u{1b}[2Jthis is a very long source\nnext", "text":"Useful recap"}});
+        let section = told_section(&s).unwrap();
+        let right = string(&section["right"]);
+        assert!(!right.contains('\u{1b}'));
+        assert!(!right.contains('\n'));
+        assert!(right.starts_with(&one_line(string(&s["told"]["source"]), 12)));
+    }
+    #[test]
+    fn drawing_and_gauge_modules_leave_queries_and_os_probes_in_sources() {
+        assert!(!include_str!("pages.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .contains("db.query("));
+        let math = include_str!("masthead.rs");
+        for name in [
+            "kept_status",
+            "account_limits",
+            "csr_status_at",
+            "compacting_info",
+        ] {
+            assert!(!math.contains(&format!("pub fn {name}(")));
+        }
     }
 }

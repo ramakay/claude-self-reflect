@@ -4,6 +4,7 @@ use super::{
     private, string,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 pub const SETTLED: &[&str] = &[
     "helpful",
     "not_relevant",
@@ -18,13 +19,6 @@ pub const SETTLED: &[&str] = &[
     "rejected",
 ];
 pub const ADOPTED: &[&str] = &["helpful", "ask_claude", "sent"];
-pub fn records(paths: &Paths) -> Vec<Value> {
-    std::fs::read_to_string(paths.keep.join("dreams.jsonl"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|s| serde_json::from_str(s).ok())
-        .collect()
-}
 pub fn keep(paths: &Paths, record: &Value) -> std::io::Result<()> {
     private::append(
         &paths.keep.join("dreams.jsonl"),
@@ -32,9 +26,13 @@ pub fn keep(paths: &Paths, record: &Value) -> std::io::Result<()> {
         &paths.keep,
     )
 }
-pub fn load_dream_log(records: &[Value], root: &str) -> Vec<Value> {
-    let mut dreams = Vec::<Value>::new();
-    for r in records {
+#[derive(Default)]
+struct DreamIndex {
+    positions: HashMap<String, usize>,
+    items: Vec<Value>,
+}
+impl DreamIndex {
+    fn apply(&mut self, r: &Value) {
         if r["kind"] == "dream"
             && r["id"].is_string()
             && r["line"].as_str().is_some_and(|s| !s.is_empty())
@@ -44,13 +42,19 @@ pub fn load_dream_log(records: &[Value], root: &str) -> Vec<Value> {
             if d["at"].is_null() {
                 d["at"] = json!(0.);
             }
-            if let Some(i) = dreams.iter().position(|d| d["id"] == r["id"]) {
-                dreams[i] = d;
+            if let Some(i) = self.positions.get(string(&r["id"])).copied() {
+                self.items[i] = d;
             } else {
-                dreams.push(d);
+                self.positions
+                    .insert(string(&r["id"]).to_owned(), self.items.len());
+                self.items.push(d);
             }
         } else if r["kind"] == "answer" && SETTLED.contains(&string(&r["answer"])) {
-            if let Some(d) = dreams.iter_mut().find(|d| d["id"] == r["id"]) {
+            if let Some(d) = self
+                .positions
+                .get(string(&r["id"]))
+                .map(|i| &mut self.items[*i])
+            {
                 let a = string(&d["answer"]);
                 let next = string(&r["answer"]);
                 if matches!(a, "" | "dismiss" | "got_it" | "ignored")
@@ -63,6 +67,56 @@ pub fn load_dream_log(records: &[Value], root: &str) -> Vec<Value> {
             }
         }
     }
+}
+#[derive(Default)]
+pub struct DreamLog {
+    tail: super::tail::Tail,
+    index: DreamIndex,
+    pub records: Vec<Value>,
+}
+impl DreamLog {
+    pub fn poll(&mut self, paths: &Paths) {
+        let mut tail = std::mem::take(&mut self.tail);
+        let _ = tail.poll(
+            &paths.keep.join("dreams.jsonl"),
+            usize::MAX,
+            || false,
+            |line| {
+                let Some(line) = line else {
+                    self.index = DreamIndex::default();
+                    self.records.clear();
+                    return;
+                };
+                if let Ok(row) = sonic_rs::from_slice::<Value>(line) {
+                    self.index.apply(&row);
+                    if matches!(string(&row["kind"]), "chapter" | "look" | "dream") {
+                        self.records.push(json!({"kind":row["kind"],"at":row["at"],
+                        "repo":row["repo"],"session":row["session"],"of":row["of"],
+                        "outcome":row["outcome"],"every":row["every"]}));
+                    }
+                }
+            },
+        );
+        self.tail = tail;
+    }
+    pub fn dreams(&self, root: &str) -> Vec<Value> {
+        let mut dreams: Vec<_> = self
+            .index
+            .items
+            .iter()
+            .filter(|d| root.is_empty() || d["repo"].is_null() || d["repo"] == root)
+            .cloned()
+            .collect();
+        dreams.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+        dreams
+    }
+}
+pub fn load_dream_log(records: &[Value], root: &str) -> Vec<Value> {
+    let mut index = DreamIndex::default();
+    for r in records {
+        index.apply(r);
+    }
+    let mut dreams = index.items;
     dreams.retain(|d| root.is_empty() || d["repo"].is_null() || d["repo"] == root);
     dreams.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
     dreams
@@ -236,5 +290,52 @@ mod tests {
         );
         assert_eq!(array(&f["passed"]).len(), 1);
         assert_eq!(array(&f["folded"]).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    #[test]
+    fn dream_log_reads_only_new_bytes_and_resets_after_rotation() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().into());
+        let file = paths.keep.join("dreams.jsonl");
+        std::fs::create_dir_all(&paths.keep).unwrap();
+        std::fs::write(
+            &file,
+            "{\"kind\":\"dream\",\"id\":\"a\",\"line\":\"one\"}\n",
+        )
+        .unwrap();
+        let mut log = DreamLog::default();
+        log.poll(&paths);
+        let offset = log.tail.offset;
+        log.poll(&paths);
+        assert_eq!(log.tail.offset, offset);
+        assert_eq!(log.dreams("").len(), 1);
+        assert_eq!(log.records.len(), 1);
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap(),
+            "{{\"kind\":\"answer\",\"id\":\"a\",\"answer\":\"helpful\"}}"
+        )
+        .unwrap();
+        log.poll(&paths);
+        assert_eq!(log.dreams("")[0]["answer"], "helpful");
+        assert_eq!(log.records.len(), 1);
+        std::fs::rename(&file, paths.keep.join("old")).unwrap();
+        std::fs::write(
+            &file,
+            "{\"kind\":\"dream\",\"id\":\"b\",\"line\":\"two\"}\n",
+        )
+        .unwrap();
+        log.poll(&paths);
+        assert_eq!(log.dreams("")[0]["id"], "b");
+        std::fs::write(&file, "").unwrap();
+        log.poll(&paths);
+        assert!(log.dreams("").is_empty());
     }
 }

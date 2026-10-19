@@ -137,6 +137,7 @@ pub struct Pane {
     sent: Value,
     folds: Vec<Value>,
     feed: Feed,
+    dreams: dreams::DreamLog,
     pub acts: BTreeMap<usize, Value>,
     pub top: usize,
     tall: bool,
@@ -172,6 +173,7 @@ impl Pane {
             sent: Value::Null,
             folds: vec![],
             feed,
+            dreams: dreams::DreamLog::default(),
             acts: BTreeMap::new(),
             top: 0,
             tall: false,
@@ -222,7 +224,8 @@ impl Pane {
             self.shifts.truncate(self.limit);
             self.loaded = now;
         }
-        let records = dreams::records(&self.paths);
+        self.dreams.poll(&self.paths);
+        let records = &self.dreams.records;
         let root = self.root.to_string_lossy();
         let kept = masthead::kept_status(&self.paths, &self.sid, now);
         let story = self
@@ -234,9 +237,9 @@ impl Pane {
             "repo": root,
             "shifts": self.shifts,
             "total": self.total,
-            "dreams": dreams::load_dream_log(&records, &root),
-            "chapter": dreams::last_chapter(&records, &root, &self.sid),
-            "look": dreams::last_look(&records, &root),
+            "dreams": self.dreams.dreams(&root),
+            "chapter": dreams::last_chapter(records, &root, &self.sid),
+            "look": dreams::last_look(records, &root),
             "dreams_on": dreams::dreams_on(&self.paths),
             "story": story,
             "claude_fields": kept["fields"],
@@ -250,16 +253,21 @@ impl Pane {
                 self.persist,
             ),
         });
-        let mut s = self
+        if let Some(session) = self.session.as_mut() {
+            session.read_transcript(&self.paths);
+        }
+        if let Some(session) = &self.session {
+            if session.data["last_session"].is_null() {
+                let previous = self.previous(&session.data);
+                self.session.as_mut().unwrap().data["last_session"] = previous;
+            }
+        }
+        let mut empty = json!({"id":null});
+        let s = self
             .session
             .as_mut()
             .map(|s| s.load(&self.paths, self.db.as_ref()))
-            .unwrap_or(json!({
-                "id": null,
-            }));
-        if s["last_session"].is_null() && !self.sid.is_empty() {
-            s["last_session"] = self.previous(&s);
-        }
+            .unwrap_or(&mut empty);
         if let Some(id) = s["last_session"]["id"].as_str().map(str::to_owned) {
             s["last_session"]["running"] =
                 json!(super::session::session_record(&self.paths, &id).is_some());
@@ -277,7 +285,7 @@ impl Pane {
         let page = if self.view == "log" {
             pages::page_log(&data)
         } else {
-            let page = pages::page_main(&data, &s, now, &ui, self.db.as_ref());
+            let page = pages::page_main(&data, s, now, &ui, self.db.as_ref());
             if s["busy"] == true && self.hold.as_ref().is_some_and(|(_, at)| now - at < 120.) {
                 let mut page = page;
                 page["sections"] = json!(super::feed::living(
@@ -379,15 +387,21 @@ impl Pane {
         let Some(mine) = mine else {
             return Value::Null;
         };
-        let mut previous = super::session::lineage(&self.paths, &self.sid)
+        let mut previous = super::session::lineage_paths(&self.paths, &self.sid)
             .get(1)
-            .and_then(|id| self.paths.transcript(id));
+            .cloned();
         if previous.is_none() {
             let started = num(&s["started"]);
             let mut candidates: Vec<_> = super::paths::folders(mine.parent().unwrap())
                 .into_iter()
                 .filter_map(|path| {
-                    if path == mine || path.extension().is_none_or(|s| s != "jsonl") {
+                    if path == mine
+                        || path.extension().is_none_or(|s| s != "jsonl")
+                        || path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_none_or(|id| self.paths.transcript(id).is_none())
+                    {
                         return None;
                     }
                     let t = std::fs::metadata(&path)

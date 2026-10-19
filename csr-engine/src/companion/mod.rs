@@ -1,6 +1,8 @@
 pub mod cli;
+mod compaction_scan;
 pub mod db;
 pub mod dreams;
+mod envelopes;
 pub mod feed;
 pub mod masthead;
 pub mod pages;
@@ -8,9 +10,12 @@ pub mod pane;
 pub mod paths;
 pub mod private;
 pub mod pyfmt;
+pub mod recall;
 pub mod render;
 pub mod send;
 pub mod session;
+pub mod sources;
+mod tail;
 pub mod watch;
 /// Borrow an array, treating missing or differently typed values as empty.
 fn array(v: &serde_json::Value) -> &[serde_json::Value] {

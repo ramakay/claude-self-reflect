@@ -156,11 +156,30 @@ pub fn write_atomic(path: &Path, text: &str, root: &Path) -> io::Result<()> {
     result
 }
 
+fn credential_key(key: &str) -> bool {
+    static KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r"(?i)^[A-Za-z0-9_.-]*?(?:password|passwd|secret|token|api[_-]?key|",
+            r"access[_-]?key|private[_-]?key|client[_-]?secret|auth|authorization)$"
+        ))
+        .unwrap()
+    });
+    KEY.is_match(key)
+}
+
 pub fn redact_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => *text = crate::redact::redact_private(text).into_owned(),
         serde_json::Value::Array(values) => values.iter_mut().for_each(redact_value),
-        serde_json::Value::Object(values) => values.values_mut().for_each(redact_value),
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if credential_key(key) && value.is_string() {
+                    *value = serde_json::Value::String("[redacted]".into());
+                } else {
+                    redact_value(value);
+                }
+            }
+        }
         _ => (),
     }
 }
@@ -366,5 +385,21 @@ mod normalized_paths {
             fs::read_to_string(d.path().join("elsewhere/x")).unwrap(),
             "x"
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    #[test]
+    fn json_credential_keys_redact_short_and_nested_secrets() {
+        let mut value = serde_json::json!({"token":"abc.def","password":"hunter2",
+            "nested":[{"API-KEY":"short","Authorization":"plain","label":"ordinary"}]});
+        super::redact_value(&mut value);
+        assert_eq!(value["token"], "[redacted]");
+        assert_eq!(value["password"], "[redacted]");
+        assert_eq!(value["nested"][0]["API-KEY"], "[redacted]");
+        assert_eq!(value["nested"][0]["Authorization"], "[redacted]");
+        assert_eq!(value["nested"][0]["label"], "ordinary");
+        assert_eq!(crate::redact::redact_private("hunter2"), "hunter2");
     }
 }
