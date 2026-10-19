@@ -102,6 +102,17 @@ const MAX_GRAPH_FILE_BYTES: u64 = 256 * 1024;
 /// Reads the on-disk file (post-edit), upserts nodes, replaces this file's edges,
 /// marks file state, then re-resolves + re-ranks the project.
 fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
+    update_code_graph_with(input, engine, resolve_project_for_hook)
+}
+
+/// Core of `update_code_graph` with the project resolver passed in, so tests
+/// drive it without mutating process-global env vars. `resolve` takes the edited
+/// file's parent and the hook input's session cwd.
+fn update_code_graph_with(
+    input: &HookInput,
+    engine: &Engine,
+    resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
+) -> Result<()> {
     let tool_input = input
         .tool_input
         .as_ref()
@@ -116,7 +127,16 @@ fn update_code_graph(input: &HookInput, engine: &Engine) -> Result<()> {
     // innovation, receipt R4) wants an honest file-level row even for
     // extensions the extractor doesn't parse, instead of the file vanishing
     // silently.
-    let project = resolve_project_for_hook(Path::new(file_path).parent());
+    let project = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
+    // No project, no graph write. `resolve_code_edges("")` and
+    // `compute_code_rank("")` read `''` as EVERY project (`?1 = '' OR project
+    // = ?1`), so a scratch file with no session project would bind a call in
+    // one project to a definition in another and re-rank the whole graph from
+    // inside the hook. A node filed under `''` is no better: no scoped query
+    // would ever find it.
+    if project.is_empty() {
+        return Ok(());
+    }
     let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
     let stored_path_str = stored_path.to_string_lossy();
 
@@ -261,6 +281,16 @@ const MAX_AST_DIFF_BYTES: usize = 50_000;
 
 /// Track structural code changes from Edit/Write operations.
 async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> {
+    track_code_evolution_with(input, engine, resolve_project_for_hook).await
+}
+
+/// Core of `track_code_evolution` with the project resolver passed in (see
+/// `update_code_graph_with`).
+async fn track_code_evolution_with(
+    input: &HookInput,
+    engine: &Engine,
+    resolve: impl Fn(Option<&Path>, Option<&str>) -> String,
+) -> Result<()> {
     let tool_input = input
         .tool_input
         .as_ref()
@@ -277,7 +307,11 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     // record an honest file-level presence row instead of silently dropping.
     if language.is_empty() {
         let conv_id = conv_id_for(input);
-        let project_name = resolve_project_for_hook(Path::new(file_path).parent());
+        let project_name = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
+        // A scratch file with no session project is not project history.
+        if project_name.is_empty() {
+            return Ok(());
+        }
         let stored_path = crate::extraction::repo_path::canonical_repo_path(Path::new(file_path));
         let stored_path_str = stored_path.to_string_lossy();
         let repo_root = crate::extraction::repo_root::repo_root_for_file(&stored_path_str);
@@ -368,7 +402,11 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
     let conv_id = conv_id_for(input);
 
     // Resolve project name for cross-project scoping
-    let project_name = resolve_project_for_hook(Path::new(file_path).parent());
+    let project_name = resolve(Path::new(file_path).parent(), input.cwd.as_deref());
+    // A scratch file with no session project is not project history.
+    if project_name.is_empty() {
+        return Ok(());
+    }
 
     // Read from the original path (worktree-local); store under the canonical
     // main-repo path so worktree edits do not create duplicate rows (D5 — mirrors
@@ -425,12 +463,15 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
 ///    skipped for a temp path: a scratch file's folder name ("scratchpad",
 ///    "bin") is not a project, so it takes the session's project instead
 /// 2. `CLAUDE_PROJECT_DIR` env var
-/// 3. `MCP_CLIENT_CWD` via `resolve_current_project` (MCP tool path)
-/// 4. empty string
-fn resolve_project_for_hook(file_path_parent: Option<&Path>) -> String {
+/// 3. the hook input's own session `cwd`, when non-blank
+/// 4. `MCP_CLIENT_CWD` via `resolve_current_project` (MCP tool path)
+/// 5. empty string, which callers treat as "no project" and write nothing for
+///    (`''` means every project in the resolver and ranker SQL)
+fn resolve_project_for_hook(file_path_parent: Option<&Path>, session_cwd: Option<&str>) -> String {
     resolve_project_for_hook_with(
         file_path_parent,
         std::env::var("CLAUDE_PROJECT_DIR").ok(),
+        session_cwd,
         crate::search::cross_project::resolve_current_project(),
     )
 }
@@ -441,6 +482,7 @@ fn resolve_project_for_hook(file_path_parent: Option<&Path>) -> String {
 fn resolve_project_for_hook_with(
     file_path_parent: Option<&Path>,
     claude_project_dir: Option<String>,
+    session_cwd: Option<&str>,
     current_project: Option<String>,
 ) -> String {
     if let Some(parent) = file_path_parent.filter(|p| !crate::codemap::identity::is_temp_path(p)) {
@@ -453,6 +495,13 @@ fn resolve_project_for_hook_with(
     }
     if let Some(dir) = claude_project_dir {
         if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&dir) {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    if let Some(cwd) = session_cwd.filter(|c| !c.trim().is_empty()) {
+        if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(cwd) {
             if !p.is_empty() {
                 return p;
             }
@@ -490,7 +539,7 @@ mod tests {
         // Env-free variant — passing None for both fallbacks isolates the
         // parent-directory chain without mutating process-global env vars.
         let parent = Path::new("/Users/x/projects/my-repo/src/main.rs").parent();
-        let project = resolve_project_for_hook_with(parent, None, None);
+        let project = resolve_project_for_hook_with(parent, None, None, None);
         assert_eq!(project, "my-repo");
         assert!(!project.is_empty());
     }
@@ -501,25 +550,223 @@ mod tests {
             Path::new("/private/tmp/claude-501/-Users-x-projects-my-repo/sid/scratchpad/fix.py");
         let session = Some("/Users/x/projects/my-repo".to_string());
         assert_eq!(
-            resolve_project_for_hook_with(scratchpad.parent(), session, None),
+            resolve_project_for_hook_with(scratchpad.parent(), session, None, None),
             "my-repo"
         );
         let patcher = Path::new("/tmp/patches/bin/apply.py");
         assert_eq!(
-            resolve_project_for_hook_with(patcher.parent(), None, Some("my-repo".into())),
+            resolve_project_for_hook_with(patcher.parent(), None, None, Some("my-repo".into())),
             "my-repo"
         );
         // No session context: an empty project, never the folder name.
         assert_eq!(
-            resolve_project_for_hook_with(patcher.parent(), None, None),
+            resolve_project_for_hook_with(patcher.parent(), None, None, None),
             ""
         );
         // A folder merely named tmp is not a temp root.
         let repo_file = Path::new("/Users/x/projects/my-repo/tmp/a.rs");
         assert_eq!(
-            resolve_project_for_hook_with(repo_file.parent(), None, None),
+            resolve_project_for_hook_with(repo_file.parent(), None, None, None),
             "my-repo"
         );
+    }
+
+    #[test]
+    fn resolve_project_for_hook_falls_back_to_the_hook_input_cwd() {
+        let patcher = Path::new("/tmp/patches/bin/apply.py");
+        // The hook's own session cwd names the project when the file and
+        // CLAUDE_PROJECT_DIR do not.
+        assert_eq!(
+            resolve_project_for_hook_with(
+                patcher.parent(),
+                None,
+                Some("/Users/x/projects/my-repo"),
+                None
+            ),
+            "my-repo"
+        );
+        // Order: CLAUDE_PROJECT_DIR beats the session cwd, the session cwd
+        // beats MCP_CLIENT_CWD.
+        assert_eq!(
+            resolve_project_for_hook_with(
+                patcher.parent(),
+                Some("/Users/x/projects/from-env".into()),
+                Some("/Users/x/projects/my-repo"),
+                None
+            ),
+            "from-env"
+        );
+        assert_eq!(
+            resolve_project_for_hook_with(
+                patcher.parent(),
+                None,
+                Some("/Users/x/projects/my-repo"),
+                Some("from-mcp".into())
+            ),
+            "my-repo"
+        );
+        // A blank cwd is no cwd: it falls through to the next step, then to "".
+        for blank in ["", "   "] {
+            assert_eq!(
+                resolve_project_for_hook_with(patcher.parent(), None, Some(blank), None),
+                ""
+            );
+            assert_eq!(
+                resolve_project_for_hook_with(
+                    patcher.parent(),
+                    None,
+                    Some(blank),
+                    Some("from-mcp".into())
+                ),
+                "from-mcp"
+            );
+        }
+        // A real repo file keeps its own project over the session cwd.
+        let repo_file = Path::new("/Users/x/projects/my-repo/src/a.rs");
+        assert_eq!(
+            resolve_project_for_hook_with(
+                repo_file.parent(),
+                None,
+                Some("/Users/x/projects/other"),
+                None
+            ),
+            "my-repo"
+        );
+    }
+
+    /// Row counts of every table a hook edit can write the code graph into.
+    fn graph_rows(storage: &crate::storage::Storage) -> Vec<(String, i64)> {
+        [
+            "code_nodes",
+            "code_edges",
+            "code_graph_file_state",
+            "code_evolution",
+        ]
+        .iter()
+        .map(|t| {
+            let n: i64 = storage
+                .with_connection(|c| {
+                    Ok(c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))?)
+                })
+                .unwrap();
+            (t.to_string(), n)
+        })
+        .collect()
+    }
+
+    /// Env-free resolver for the tests below: no CLAUDE_PROJECT_DIR, no
+    /// MCP_CLIENT_CWD, only the file and the hook input's own cwd.
+    fn resolve_without_env(parent: Option<&Path>, cwd: Option<&str>) -> String {
+        resolve_project_for_hook_with(parent, None, cwd, None)
+    }
+
+    fn write_input(file: &Path, cwd: Option<&str>) -> crate::hooks::HookInput {
+        crate::hooks::HookInput {
+            transcript_path: Some("/tmp/nonexistent-test-transcript.jsonl".to_string()),
+            session_id: Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into()),
+            cwd: cwd.map(str::to_string),
+            tool_name: Some("Write".into()),
+            tool_input: Some(serde_json::json!({
+                "file_path": file.to_string_lossy().to_string(),
+                "content": "fn scratch_fn() { helper(); }\nfn helper() {}\n",
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_scratch_file_with_no_project_leaves_the_code_graph_untouched() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A repository, so the only thing that can stop the write is the
+        // missing project.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let before = graph_rows(&storage);
+
+        for name in ["scratch.rs", "notes.yml"] {
+            let file = tmp.path().join(name);
+            std::fs::write(&file, "fn scratch_fn() { helper(); }\nfn helper() {}\n").unwrap();
+            assert!(
+                crate::codemap::identity::is_temp_path(file.parent().unwrap()),
+                "fixture must be a temp path"
+            );
+            update_code_graph_with(&write_input(&file, None), &engine, resolve_without_env)
+                .unwrap();
+            update_code_graph_with(
+                &write_input(&file, Some("  ")),
+                &engine,
+                resolve_without_env,
+            )
+            .unwrap();
+        }
+        assert_eq!(graph_rows(&storage), before, "nothing may be written");
+        assert!(before.iter().all(|(_, n)| *n == 0));
+    }
+
+    #[test]
+    fn a_scratch_file_with_a_session_cwd_is_filed_under_that_project() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("scratch.rs");
+        std::fs::write(&file, "fn scratch_fn() { helper(); }\nfn helper() {}\n").unwrap();
+        update_code_graph_with(
+            &write_input(&file, Some("/Users/x/projects/my-repo")),
+            &engine,
+            resolve_without_env,
+        )
+        .unwrap();
+        let projects: Vec<String> = storage
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT DISTINCT project FROM code_nodes")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(projects, vec!["my-repo".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn code_evolution_skips_a_scratch_file_with_no_project() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        // One supported-language file (structural diff branch) and one
+        // unsupported (touch-row branch); both would insert if a project existed.
+        for name in ["scratch.rs", "notes.yml"] {
+            let file = tmp.path().join(name);
+            std::fs::write(&file, "fn scratch_fn() {}\n").unwrap();
+            track_code_evolution_with(&write_input(&file, None), &engine, resolve_without_env)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            graph_rows(&storage)
+                .into_iter()
+                .find(|(t, _)| t == "code_evolution")
+                .unwrap()
+                .1,
+            0
+        );
+
+        // Control: the same two edits with a session cwd do land.
+        for name in ["scratch.rs", "notes.yml"] {
+            let file = tmp.path().join(name);
+            track_code_evolution_with(
+                &write_input(&file, Some("/Users/x/projects/my-repo")),
+                &engine,
+                resolve_without_env,
+            )
+            .await
+            .unwrap();
+        }
+        let projects: Vec<String> = storage
+            .with_connection(|c| {
+                let mut stmt = c.prepare("SELECT DISTINCT project_name FROM code_evolution")?;
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(projects, vec!["my-repo".to_string()]);
     }
 
     fn queue_rows(storage: &crate::storage::Storage) -> Vec<String> {
@@ -982,6 +1229,9 @@ mod tests {
         let input = crate::hooks::HookInput {
             transcript_path: Some(tmp.path().join("conv.jsonl").to_string_lossy().to_string()),
             session_id: Some("session".into()),
+            // The file is under a temp root, so its project comes from the
+            // session cwd; with none the graph write is skipped.
+            cwd: Some("/Users/x/projects/proj".into()),
             tool_name: Some("Edit".into()),
             tool_input: Some(serde_json::json!({
                 "file_path": canonical_file.to_string_lossy().to_string()
