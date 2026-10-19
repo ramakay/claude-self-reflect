@@ -67,6 +67,8 @@ Channels that disagree by more than 48h are shown labeled, never merged.
 Symbols with no evidence in either channel render `unattributed` — they do
 not inherit their file's first toucher.
 
+In v10.1 the tool also appends a `<code_map>` section from the live code map (no new tool; there are still 16). For each matching path (an absolute path by its worktree, else an exact repo-relative path, else a suffix on a `/` boundary, at most 10) it lists the worktrees holding the file, grouped by blob (`same blob in main, a; differs in b (dirty)`), plus the definitions in the blob most worktrees share. When no conversation touched the file, it says so and the map is the answer. The section is at most 1,500 bytes and read-only. `CSR_NO_CODEMAP=1` removes it.
+
 ### csr_search_by_concept
 Theme-based cross-project search. E.g., "security patterns", "error handling".
 
@@ -84,6 +86,8 @@ edges resolve only through recorded witnesses (or state why they cannot —
 `external`, `method-dispatched`, `stale`, `local`), symbol origins come from
 the two-channel attribution described under `csr_search_by_file`, and the
 system abstains visibly (`unattributed`, `unverified:`) instead of guessing.
+
+In v10.1 the tool also appends a `<code_map>` section with the map's definitions of the exact symbol name. When the conversation graph does not know the symbol, the answer comes from the map. The map holds definitions, not call edges, and the answer says so: callers and callees are not in it. The section is at most 1,500 bytes and read-only. `CSR_NO_CODEMAP=1` removes it.
 
 ## Activity Tools
 
