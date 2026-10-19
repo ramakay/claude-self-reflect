@@ -1102,6 +1102,116 @@ fn a_directory_event_is_resolved_before_it_is_stat_ed() {
     assert_eq!(got.paths, vec![main.join("src/lib/x.py")]);
 }
 
+// ---- the walk budget bounds enumeration, and the unsorted walk keeps path order ----------
+
+#[test]
+fn a_flat_directory_larger_than_the_budget_stops_the_walk_at_the_budget() {
+    let fx = Fx::new();
+    let main = fx.init_repo("flat");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    let budget = walk_visit_budget(5);
+    assert_eq!(budget, 100);
+    for i in 0..budget + 40 {
+        write(&main, &format!("flat/n{i:04}"), "");
+    }
+    write(&main, "zzz.py", &py(&["late"]));
+    let found = collect_walk(
+        &main,
+        &common_of(&main),
+        None,
+        Some(&fx.home),
+        |rel| rel != "a.py",
+        usize::MAX,
+        budget,
+    );
+    assert!(found.stopped);
+    assert!(found.visited <= budget, "visited {}", found.visited);
+    assert!(found.files.is_empty(), "{:?}", found.files);
+}
+
+#[test]
+fn entries_the_filter_rejects_count_toward_the_budget() {
+    let fx = Fx::new();
+    let main = fx.init_repo("rejects");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    let budget = walk_visit_budget(5);
+    // Many nested repos in one directory: each is rejected (somebody else's
+    // view), so none is ever yielded. The walk must still run out of budget.
+    for i in 0..budget + 30 {
+        write(&main, &format!("pkgs/r{i:04}/.git"), "gitdir: nowhere\n");
+    }
+    write(&main, "zzz.py", &py(&["late"]));
+    let found = collect_walk(
+        &main,
+        &common_of(&main),
+        None,
+        Some(&fx.home),
+        |rel| rel != "a.py",
+        usize::MAX,
+        budget,
+    );
+    assert!(found.stopped, "rejected entries were never counted");
+    assert!(found.visited <= budget, "visited {}", found.visited);
+    assert!(found.files.is_empty(), "{:?}", found.files);
+}
+
+#[test]
+fn names_the_ignore_rules_drop_never_reach_the_filter_so_they_are_not_counted() {
+    // The remaining unbounded cost, pinned: the ignore crate drops an ignored
+    // name before `filter_entry` runs, so a directory of ignored names costs
+    // readdir time (not memory) and spends none of the budget.
+    let fx = Fx::new();
+    let main = fx.init_repo("ignored");
+    write(&main, ".gitignore", "junk_*\n");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    let budget = walk_visit_budget(5);
+    for i in 0..budget + 40 {
+        write(&main, &format!("junk_{i:04}"), "");
+    }
+    write(&main, "b.py", &py(&["kept"]));
+    let found = collect_walk(
+        &main,
+        &common_of(&main),
+        None,
+        Some(&fx.home),
+        |rel| rel != "a.py",
+        usize::MAX,
+        budget,
+    );
+    assert!(!found.stopped);
+    assert_eq!(found.files, vec!["b.py"]);
+    assert!(found.visited < 10, "visited {}", found.visited);
+}
+
+#[test]
+fn the_unsorted_walk_still_returns_files_in_component_path_order() {
+    let fx = Fx::new();
+    let main = fx.init_repo("order");
+    write(&main, "a.py", &py(&["tracked"]));
+    fx.commit_all(&main, "init");
+    for rel in [
+        "a.rs", "a-x.py", "a/b.py", "a/a/c.py", "b/z.py", "b/y.py", "a0.py",
+    ] {
+        write(&main, rel, &py(&["f"]));
+    }
+    let found = collect_walk(
+        &main,
+        &common_of(&main),
+        None,
+        Some(&fx.home),
+        |rel| rel != "a.py",
+        usize::MAX,
+        10_000,
+    );
+    assert_eq!(
+        found.files,
+        vec!["a/a/c.py", "a/b.py", "a-x.py", "a.rs", "a0.py", "b/y.py", "b/z.py"]
+    );
+}
+
 // ---- ignore files that link into a protected folder are never opened --------------------
 
 fn walk_all(fx: &Fx, main: &Path) -> super::scan::WalkOutcome {

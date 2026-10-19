@@ -21,6 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -565,6 +567,8 @@ fn untracked_walk(
     common_dir: &Path,
     only_under: Option<&Path>,
     home: Option<&Path>,
+    counter: Arc<AtomicUsize>,
+    visit_budget: usize,
 ) -> Option<ignore::Walk> {
     if root
         .ancestors()
@@ -581,8 +585,10 @@ fn untracked_walk(
         .git_global(false)
         // Explicit ignore files are matched relative to this directory: the
         // repo root, as git does, not the daemon's working directory.
-        .current_dir(root)
-        .sort_by_file_path(|a, b| a.cmp(b));
+        .current_dir(root);
+    // No `sort_by_file_path`: walkdir would read and sort a whole directory
+    // before yielding any of it, an unbounded allocation for a directory with
+    // millions of entries. `collect_walk` sorts what it keeps instead.
     if let Some(global) = identity::global_excludes_file(home) {
         let _ = builder.add_ignore(global);
     }
@@ -596,13 +602,22 @@ fn untracked_walk(
         if entry.depth() == 0 {
             return true;
         }
+        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+        // Every entry the crate offers counts toward the visit budget, kept or
+        // rejected below. The first one past the budget is let through (unless
+        // it is a directory whose ignore file is unsafe) so that `collect_walk`
+        // receives it, sees the spent budget and stops: a rejected entry is
+        // never yielded, so rejecting everything would leave the crate looping
+        // over the rest of the directory.
+        if counter.fetch_add(1, Ordering::Relaxed) >= visit_budget {
+            return !(is_dir && ignore_dir_has_protected_link(entry.path(), home.as_deref()));
+        }
         if let Some(only) = &only {
             let p = entry.path();
             if !(only.starts_with(p) || p.starts_with(only)) {
                 return false;
             }
         }
-        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
         let name = entry.file_name().to_str();
         if name.is_some_and(|n| is_hard_skip_dir(n) || UNTRACKED_SKIP_DIRS.contains(&n)) {
             return false;
@@ -652,7 +667,21 @@ pub(super) fn collect_walk(
         stopped: false,
         visited: 0,
     };
-    let Some(walk) = untracked_walk(root, common_dir, only_under, home) else {
+    // Shared with the walker's `filter_entry`, which counts every entry the
+    // crate offers it (kept or rejected); the walk is over once it passes the
+    // budget. Entries the crate drops by ignore-pattern match before the filter
+    // runs (`skip_entry` calls `should_skip_entry` first, ignore 0.4.32
+    // walk.rs:1156) are never counted: reading a directory full of ignored names
+    // is still unbounded work (time, not memory: nothing is sorted or collected).
+    let counter = Arc::new(AtomicUsize::new(0));
+    let Some(walk) = untracked_walk(
+        root,
+        common_dir,
+        only_under,
+        home,
+        counter.clone(),
+        visit_budget,
+    ) else {
         // An ignore file of the root or an ancestor links into a protected
         // folder: no safe walk exists, so nothing is walked and the view is
         // marked truncated.
@@ -662,21 +691,17 @@ pub(super) fn collect_walk(
     for entry in walk {
         let Ok(entry) = entry else {
             // An unreadable entry is still a visit.
-            if out.visited >= visit_budget {
-                out.stopped = true;
+            if counter.fetch_add(1, Ordering::Relaxed) >= visit_budget {
                 break;
             }
-            out.visited += 1;
             continue;
         };
         if entry.depth() == 0 {
             continue;
         }
-        if out.visited >= visit_budget {
-            out.stopped = true;
-            break;
+        if counter.load(Ordering::Relaxed) > visit_budget {
+            break; // the entry past the budget: the walk is over
         }
-        out.visited += 1;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -696,6 +721,12 @@ pub(super) fn collect_walk(
         }
         out.files.push(rel.to_string());
     }
+    let seen = counter.load(Ordering::Relaxed);
+    out.stopped |= seen > visit_budget;
+    out.visited = seen.min(visit_budget);
+    // The walker is not sorted (see `untracked_walk`): put what was kept in path
+    // order, component by component, as the sorted walk yielded it.
+    out.files.sort_by(|a, b| Path::new(a).cmp(Path::new(b)));
     out
 }
 
