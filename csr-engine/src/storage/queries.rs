@@ -3458,6 +3458,17 @@ pub fn conversation_message_count(conn: &Connection, conversation_id: &str) -> R
     Ok(count as usize)
 }
 
+/// Does the database hold any chunk or any reflection? O(1): `EXISTS` stops at
+/// the first row. The truth about "no history yet", where the in-memory index
+/// can be empty on a full corpus (a daemon-proxied hook never loads it).
+pub fn has_any_history(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM chunks) OR EXISTS(SELECT 1 FROM reflections)",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn count_conversations(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT conversation_id) FROM chunks",

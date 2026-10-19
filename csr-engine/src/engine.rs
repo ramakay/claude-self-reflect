@@ -389,6 +389,14 @@ impl Engine {
         self.proxied
     }
 
+    /// Test seam: the same engine, marked as built by `new_proxied` (whose
+    /// in-memory index is empty by design).
+    #[cfg(test)]
+    pub(crate) fn proxied_for_test(mut self) -> Self {
+        self.proxied = true;
+        self
+    }
+
     /// Construct an engine for write-only hooks (precompact, session-end) that
     /// import a transcript but never search.
     ///

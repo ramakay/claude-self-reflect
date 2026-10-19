@@ -1028,6 +1028,12 @@ impl Storage {
 
     // ─── Status queries ───
 
+    /// Is there any chunk or reflection in the database at all?
+    pub fn has_any_history(&self) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::has_any_history(&conn)
+    }
+
     pub fn count_conversations(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::count_conversations(&conn)

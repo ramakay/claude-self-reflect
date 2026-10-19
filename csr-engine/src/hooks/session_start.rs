@@ -51,6 +51,10 @@ pub(crate) const DEGRADED_STATUS: &str = "CSR engine ready (degraded mode).";
 pub(crate) const NO_HISTORY_NOTE: &str =
     "No history yet. CSR captures this project's sessions as you work.";
 
+/// The same note without index counts, for a daemon-proxied hook: its in-memory
+/// index is empty by design, so "0 chunks, 0 reflections" would be false.
+pub(crate) const NO_RECENT_SESSIONS_NOTE: &str = "CSR: No recent sessions for this project.";
+
 /// The note a project with nothing to recall receives.
 pub(crate) fn format_empty_status(chunk_count: usize, reflection_count: usize) -> String {
     format!(
@@ -114,6 +118,28 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         println!("{DEGRADED_STATUS}");
     }
     Ok(()) // Always succeed
+}
+
+/// The line a project gets when nothing else rendered, and whether it is the
+/// "No history yet" note (which also drops the capability manifest).
+///
+/// "No history yet" is a fact about the database, so `has_any_history` decides
+/// it, never the in-memory index: that index is empty in a daemon-proxied hook
+/// (`Engine::new_proxied`) whatever the corpus holds. An unreadable database is
+/// treated as a non-empty corpus. A proxied engine prints no index counts either.
+async fn nothing_rendered_note(engine: &Engine, output_is_empty: bool) -> (String, bool) {
+    let empty_corpus = matches!(engine.storage().has_any_history(), Ok(false));
+    if empty_corpus && output_is_empty {
+        (NO_HISTORY_NOTE.to_string(), true)
+    } else if engine.is_proxied() {
+        (NO_RECENT_SESSIONS_NOTE.to_string(), false)
+    } else {
+        let (chunk_count, reflection_count) = {
+            let search = engine.search().read().await;
+            (search.chunk_count(), search.reflection_count())
+        };
+        (format_empty_status(chunk_count, reflection_count), false)
+    }
 }
 
 async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
@@ -389,16 +415,9 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     // Nothing rendered on any path — only now is "no recent sessions" true.
     let mut no_history = false;
     if defer_empty_note {
-        let (chunk_count, reflection_count) = {
-            let search = engine.search().read().await;
-            (search.chunk_count(), search.reflection_count())
-        };
-        if chunk_count == 0 && reflection_count == 0 && output.is_empty() {
-            output.push_str(NO_HISTORY_NOTE);
-            no_history = true;
-        } else {
-            output.push_str(&format_empty_status(chunk_count, reflection_count));
-        }
+        let (note, none_yet) = nothing_rendered_note(engine, output.is_empty()).await;
+        output.push_str(&note);
+        no_history = none_yet;
     }
     if !no_history {
         output.insert_str(0, MEMORY_MANIFEST);
@@ -2439,6 +2458,91 @@ mod tests {
         assert!(is_session_framing_line(NO_HISTORY_NOTE));
         assert!(!NO_HISTORY_NOTE.contains("indexed and searchable"));
         assert_eq!(NO_HISTORY_NOTE.lines().count(), 1);
+    }
+
+    /// An engine over `storage` whose in-memory index is empty, as a
+    /// daemon-proxied hook's is.
+    fn engine_with_empty_index(storage: crate::storage::Storage) -> Engine {
+        Engine::from_parts(
+            std::sync::Arc::new(storage),
+            std::sync::Arc::new(crate::embeddings::EmbeddingEngine::new().unwrap()),
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::search::SearchEngine::new(
+                100,
+            ))),
+            std::path::PathBuf::from("/tmp"),
+        )
+    }
+
+    fn add_chunk(storage: &crate::storage::Storage) {
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO chunks (id, conversation_id, project_name, timestamp, content, message_count)
+                     VALUES ('c1', 'conv1', 'p', '2026-10-01T00:00:00Z', 'some history', 2)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn add_reflection(storage: &crate::storage::Storage) {
+        storage
+            .with_connection(|c| {
+                c.execute(
+                    "INSERT INTO reflections (id, content, tags, timestamp)
+                     VALUES ('r1', 'a note', '[]', '2026-10-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn has_any_history_is_false_empty_and_true_for_a_chunk_or_a_reflection() {
+        let empty = crate::storage::Storage::open_memory().unwrap();
+        assert!(!empty.has_any_history().unwrap());
+        let chunk_only = crate::storage::Storage::open_memory().unwrap();
+        add_chunk(&chunk_only);
+        assert!(chunk_only.has_any_history().unwrap());
+        let reflection_only = crate::storage::Storage::open_memory().unwrap();
+        add_reflection(&reflection_only);
+        assert!(reflection_only.has_any_history().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_populated_database_with_an_empty_index_is_not_no_history() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        add_chunk(&storage);
+        let engine = engine_with_empty_index(storage);
+        let (note, none_yet) = nothing_rendered_note(&engine, true).await;
+        assert!(!none_yet, "the manifest stays");
+        assert_ne!(note, NO_HISTORY_NOTE);
+        assert!(note.contains("No recent sessions for this project."));
+    }
+
+    #[tokio::test]
+    async fn a_proxied_engine_prints_no_index_counts() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        add_reflection(&storage);
+        let engine = engine_with_empty_index(storage).proxied_for_test();
+        let (note, none_yet) = nothing_rendered_note(&engine, true).await;
+        assert!(!none_yet);
+        assert_eq!(note, NO_RECENT_SESSIONS_NOTE);
+        assert!(!note.contains("chunks"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_database_gets_the_no_history_note_and_no_manifest() {
+        let engine = engine_with_empty_index(crate::storage::Storage::open_memory().unwrap());
+        let (note, none_yet) = nothing_rendered_note(&engine, true).await;
+        assert_eq!(note, NO_HISTORY_NOTE);
+        assert!(none_yet, "the caller drops the manifest");
+        // Something else already rendered: the corpus is not what is missing.
+        let (note, none_yet) = nothing_rendered_note(&engine, false).await;
+        assert!(!none_yet);
+        assert_ne!(note, NO_HISTORY_NOTE);
     }
 
     #[test]
