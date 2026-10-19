@@ -1347,3 +1347,450 @@ fn test_old_failure_does_not_reopen_retry() {
     assert_eq!(found[2].outcome, "draft");
     assert!(agents::read_handoffs(&state, &drafts, "../x").is_empty());
 }
+
+/// `csr-engine companion statusline`, run for real under a throwaway HOME with a pane "open"
+/// (this process's pid), as the Node wrapper's pytest suites ran statusline.cjs.
+mod statusline_tests {
+    use serde_json::{json, Value};
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+    use std::time::{Duration, SystemTime};
+    use std::{fs, thread};
+
+    const SH: &str = "cat >/dev/null; echo drawn";
+
+    fn run(home: &Path, args: &[&str], input: &[u8], env: &[(&str, &str)]) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["companion", "statusline"])
+            .args(args)
+            .env("HOME", home)
+            .envs(env.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let input = input.to_vec();
+        let feeder = thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        let out = child.wait_with_output().unwrap();
+        feeder.join().unwrap();
+        out
+    }
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+    /// What a run printed and exited with: stdout, stderr, status code.
+    fn seen(out: &Output) -> (String, String, Option<i32>) {
+        (text(&out.stdout), text(&out.stderr), out.status.code())
+    }
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+    fn keep(home: &Path, name: &str) -> PathBuf {
+        home.join(".claude-self-reflect").join(name)
+    }
+    /// A pane "open" for `session`: its pid file names this test process.
+    fn open_pane(home: &Path, name: &str, session: &str) -> PathBuf {
+        let folder = keep(home, name);
+        fs::create_dir_all(folder.join("panes")).unwrap();
+        let body = json!({ "pid": std::process::id() }).to_string();
+        fs::write(folder.join("panes").join(format!("{session}.json")), body).unwrap();
+        folder
+    }
+    fn kept(folder: &Path, session: &str) -> Value {
+        let file = folder.join("statusline").join(format!("{session}.json"));
+        serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap()
+    }
+    fn status() -> Value {
+        json!({
+            "session_id": "sess-w", "model": {"display_name": "Opus"},
+            "prompt_cache": {"warm": true, "ttl": "1h", "expires_at": 1800003000,
+                "hit_ratio": 0.91, "misses": 0, "last_miss_cause": null,
+                "recache_tokens_if_cold": 152000},
+            "rate_limits": {"five_hour": {"used_percentage": 34, "resets_at": 1800003600},
+                "seven_day": {"used_percentage": 12, "resets_at": 1800400000}},
+            "context_window": {"total_input_tokens": 57000, "context_window_size": 1000000,
+                "remaining_percentage": 94},
+        })
+    }
+    fn input(value: &Value) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+    fn strings(a: &str, b: &str, code: i32) -> (String, String, Option<i32>) {
+        (a.into(), b.into(), Some(code))
+    }
+
+    #[test]
+    fn test_the_wrapped_commands_stderr_passes_through_and_a_line_exits_0() {
+        let home = tempfile::tempdir().unwrap();
+        let data = input(&json!({"session_id": "sess-1"}));
+        let out = run(
+            home.path(),
+            &["--sh", "echo line; echo oops >&2; exit 3"],
+            &data,
+            &[],
+        );
+        assert_eq!(seen(&out), strings("line\n", "oops\n", 0));
+        // Nothing to show: its own status says it failed.
+        let out = run(home.path(), &["--sh", "echo oops >&2; exit 3"], &data, &[]);
+        assert_eq!(seen(&out), strings("", "oops\n", 3));
+    }
+
+    #[test]
+    fn test_a_command_that_never_reads_stdin_adds_no_error() {
+        let home = tempfile::tempdir().unwrap();
+        let big = json!({"session_id": "sess-1", "pad": "x".repeat(4_000_000)});
+        let out = run(home.path(), &["--sh", "echo line"], &input(&big), &[]);
+        assert_eq!(seen(&out), strings("line\n", "", 0));
+    }
+
+    #[test]
+    fn test_the_argv_form_runs_no_shell_and_the_commands_own_flags_pass_through() {
+        let home = tempfile::tempdir().unwrap();
+        let data = input(&json!({"session_id": "sess-1"}));
+        let out = run(home.path(), &["sh", "-c", "echo fine"], &data, &[]);
+        assert_eq!(seen(&out), strings("fine\n", "", 0));
+        let out = run(
+            home.path(),
+            &["/bin/echo", "-n", "--help", "--version"],
+            &data,
+            &[],
+        );
+        assert_eq!(seen(&out), strings("--help --version", "", 0));
+        // No shell: a metacharacter is just text.
+        let out = run(home.path(), &["/bin/echo", "a;", "echo", "b"], &data, &[]);
+        assert_eq!(text(&out.stdout), "a; echo b\n");
+    }
+
+    #[test]
+    fn test_several_words_after_sh_are_joined_with_one_space() {
+        let home = tempfile::tempdir().unwrap();
+        let out = run(
+            home.path(),
+            &["--sh", "echo", "a", "&&", "echo", "b"],
+            b"{}",
+            &[],
+        );
+        assert_eq!(text(&out.stdout), "a\nb\n");
+        // A word that looks like a flag is still one of the shell string's words.
+        let out = run(
+            home.path(),
+            &["--sh", "printf", "%s.", "-n", "x"],
+            b"{}",
+            &[],
+        );
+        assert_eq!(text(&out.stdout), "-n.x.");
+    }
+
+    #[test]
+    fn test_a_command_that_cannot_start_says_why_on_stderr() {
+        let home = tempfile::tempdir().unwrap();
+        let out = run(
+            home.path(),
+            &["/nonexistent/csr-statusline-command"],
+            b"{}",
+            &[],
+        );
+        assert_eq!((text(&out.stdout), out.status.code()), ("".into(), Some(1)));
+        let want = "statusline: spawnSync /nonexistent/csr-statusline-command ENOENT";
+        assert!(text(&out.stderr).contains(want), "{}", text(&out.stderr));
+    }
+
+    #[test]
+    fn test_no_command_prints_nothing_and_exits_0() {
+        let home = tempfile::tempdir().unwrap();
+        for args in [vec![], vec!["--sh"], vec!["--sh", ""]] {
+            let out = run(home.path(), &args, &input(&status()), &[]);
+            assert_eq!(seen(&out), strings("", "", 0));
+        }
+    }
+
+    #[test]
+    fn test_no_command_with_a_pane_open_keeps_an_empty_line() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "sess-w");
+        let out = run(home.path(), &[], &input(&status()), &[]);
+        assert_eq!(seen(&out), strings("", "", 0));
+        assert_eq!(kept(&folder, "sess-w")["line"], "");
+    }
+
+    #[test]
+    fn test_a_command_that_runs_out_of_time_is_killed_after_5_seconds() {
+        let home = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let out = run(
+            home.path(),
+            &["--sh", "echo early; exec sleep 30"],
+            b"{}",
+            &[],
+        );
+        let took = start.elapsed();
+        assert!(
+            took > Duration::from_secs(4) && took < Duration::from_secs(20),
+            "{took:?}"
+        );
+        assert_eq!(
+            (text(&out.stdout), out.status.code()),
+            ("early\n".into(), Some(0))
+        );
+        assert!(text(&out.stderr).contains("statusline: spawnSync /bin/sh ETIMEDOUT"));
+        let out = run(home.path(), &["--sh", "exec sleep 30"], b"{}", &[]);
+        assert_eq!((text(&out.stdout), out.status.code()), ("".into(), Some(1)));
+    }
+
+    #[test]
+    fn test_a_pid_file_the_pane_stopped_touching_is_a_pane_that_is_gone() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "sess-w");
+        let file = fs::File::options()
+            .write(true)
+            .open(folder.join("panes/sess-w.json"))
+            .unwrap();
+        // A live pid, but no heartbeat for 2 min.
+        file.set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        let out = run(home.path(), &["--sh", SH], &input(&status()), &[]);
+        assert_eq!(text(&out.stdout).trim(), "drawn");
+        assert!(!folder.join("statusline").exists());
+    }
+
+    #[test]
+    fn test_a_dead_pid_is_a_pane_that_is_gone() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = keep(home.path(), "csr-companion");
+        fs::create_dir_all(folder.join("panes")).unwrap();
+        let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        fs::write(
+            folder.join("panes/sess-w.json"),
+            json!({ "pid": pid }).to_string(),
+        )
+        .unwrap();
+        let out = run(home.path(), &["--sh", SH], &input(&status()), &[]);
+        assert_eq!(text(&out.stdout).trim(), "drawn");
+        assert!(!folder.join("statusline").exists());
+    }
+
+    #[test]
+    fn test_a_character_split_across_input_chunks_reaches_the_command_whole() {
+        for pad in ["", "a"] {
+            let home = tempfile::tempdir().unwrap();
+            let place = format!("/repo/{pad}{}", "é".repeat(40000));
+            let data = json!({"session_id": "sess-nopane", "workspace": {"current_dir": place}});
+            let out = run(home.path(), &["--sh", "cat"], &input(&data), &[]);
+            assert!(!text(&out.stdout).contains('\u{fffd}'));
+            let back: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                back["workspace"]["current_dir"],
+                data["workspace"]["current_dir"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_raw_fields_are_kept_beside_the_line_atomically() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "sess-w");
+        let out = run(home.path(), &["--sh", SH], &input(&status()), &[]);
+        // Drawn in the pane, not under the prompt.
+        assert_eq!((text(&out.stdout), out.status.code()), ("".into(), Some(0)));
+        let names: Vec<_> = fs::read_dir(folder.join("statusline"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["sess-w.json"]); // no .tmp left behind
+        let record = kept(&folder, "sess-w");
+        assert_eq!(record["line"], "drawn\n");
+        let want: Value = ["prompt_cache", "rate_limits", "context_window"]
+            .iter()
+            .map(|k| (k.to_string(), status()[k].clone()))
+            .collect();
+        assert_eq!(record["fields"], want);
+        assert!(record["fields"].get("model").is_none());
+        let raw = fs::read_to_string(folder.join("statusline/sess-w.json")).unwrap();
+        assert!(raw.starts_with("{\"at\":") && raw.contains(",\"line\":\"drawn\\n\",\"fields\":{"));
+        assert!(record["at"].as_f64().unwrap() > 1.7e9);
+    }
+
+    #[test]
+    fn test_absent_fields_stay_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "sess-w");
+        let bare = json!({"session_id": "sess-w", "rate_limits": null, "prompt_cache": "odd"});
+        run(home.path(), &["--sh", SH], &input(&bare), &[]);
+        assert_eq!(kept(&folder, "sess-w")["fields"], json!({}));
+    }
+
+    #[test]
+    fn test_without_a_pane_the_line_passes_through_and_nothing_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let out = run(home.path(), &["--sh", SH], &input(&status()), &[]);
+        assert_eq!(
+            (text(&out.stdout), out.status.code()),
+            ("drawn\n".into(), Some(0))
+        );
+        assert!(!home.path().join(".claude-self-reflect").exists());
+        // The line is untouched: no redaction, no newline added or removed.
+        let out = run(
+            home.path(),
+            &["--sh", "printf 'token=abc123'"],
+            &input(&status()),
+            &[],
+        );
+        assert_eq!(text(&out.stdout), "token=abc123");
+    }
+
+    #[test]
+    fn test_the_command_is_asked_for_its_compact_line_only_while_a_pane_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let script = "cat >/dev/null; echo \"c=$STATUSLINE_COMPACT\"";
+        let out = run(home.path(), &["--sh", script], &input(&status()), &[]);
+        assert_eq!(text(&out.stdout), "c=\n");
+        let folder = open_pane(home.path(), "csr-companion", "sess-w");
+        run(home.path(), &["--sh", script], &input(&status()), &[]);
+        assert_eq!(kept(&folder, "sess-w")["line"], "c=1\n");
+    }
+
+    #[test]
+    fn test_the_status_line_it_keeps_has_no_credential_in_it() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "s2");
+        let line = "cat >/dev/null; echo \"ctx 40% token=abc123 Bearer abc123def456\"";
+        let out = run(
+            home.path(),
+            &["--sh", line],
+            &input(&json!({"session_id": "s2"})),
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(0));
+        let record = kept(&folder, "s2");
+        assert_eq!(
+            record["line"].as_str().unwrap().trim(),
+            "ctx 40% token=[redacted] Bearer [redacted]"
+        );
+    }
+
+    #[test]
+    fn test_a_secret_in_a_kept_field_goes_too() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "s2");
+        let data = json!({"session_id": "s2", "prompt_cache": {
+            "note": "key sk-0123456789abcdefghij", "password": "hunter2", "n": 5}});
+        run(home.path(), &["--sh", SH], &input(&data), &[]);
+        assert_eq!(
+            kept(&folder, "s2")["fields"],
+            json!({"prompt_cache": {"note": "key [redacted]", "password": "[redacted]", "n": 5}})
+        );
+    }
+
+    #[test]
+    fn test_the_shared_table_gives_the_same_answers_in_the_status_line_wrapper() {
+        let pairs: Vec<[String; 2]> =
+            serde_json::from_str(include_str!("fixtures/companion/redaction_table.json")).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "s2");
+        for [said, want] in pairs {
+            let out = run(
+                home.path(),
+                &["--sh", "cat >/dev/null; printf %s \"$SAID\""],
+                &input(&json!({"session_id": "s2"})),
+                &[("SAID", &said)],
+            );
+            let code = if said.is_empty() { 1 } else { 0 };
+            assert_eq!(out.status.code(), Some(code), "{said}");
+            assert_eq!(kept(&folder, "s2")["line"], want, "{said}");
+        }
+    }
+
+    #[test]
+    fn test_the_kept_file_is_0600_in_0700_folders_and_an_old_one_is_tightened() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "s1");
+        fs::create_dir_all(folder.join("statusline")).unwrap();
+        let old = folder.join("statusline/s1.json");
+        fs::write(&old, "{}").unwrap();
+        for dir in [&folder, &folder.join("statusline")] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+        let out = run(
+            home.path(),
+            &["--sh", SH],
+            &input(&json!({"session_id": "s1"})),
+            &[],
+        );
+        assert_eq!(out.status.code(), Some(0));
+        let modes = [mode(&folder), mode(&folder.join("statusline")), mode(&old)];
+        assert_eq!(modes, [0o700, 0o700, 0o600]);
+        assert_eq!(
+            kept(&folder, "s1")["line"].as_str().unwrap().trim(),
+            "drawn"
+        ); // rewritten
+    }
+
+    #[test]
+    fn test_the_wrapper_does_not_write_through_a_link_either() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "s3");
+        let elsewhere = home.path().join("outside/folder");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&elsewhere, folder.join("statusline")).unwrap();
+        let data = input(&json!({"session_id": "s3"}));
+        let out = run(home.path(), &["--sh", SH], &data, &[]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(
+            (fs::read_dir(&elsewhere).unwrap().count(), mode(&elsewhere)),
+            (0, 0o755)
+        );
+        // It fell back to the prompt line.
+        assert_eq!(text(&out.stdout).trim(), "drawn");
+        // A link in the file's own place is refused too, its target left alone.
+        fs::remove_file(folder.join("statusline")).unwrap();
+        fs::create_dir(folder.join("statusline")).unwrap();
+        let target = home.path().join("outside/target");
+        fs::write(&target, "keep").unwrap();
+        symlink(&target, folder.join("statusline/s3.json")).unwrap();
+        let out = run(home.path(), &["--sh", SH], &data, &[]);
+        assert_eq!(text(&out.stdout).trim(), "drawn");
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn test_a_session_id_that_is_not_a_word_never_finds_a_pane() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = open_pane(home.path(), "csr-companion", "a.b");
+        for id in [json!("a.b"), json!("../x"), json!(""), json!(null)] {
+            let out = run(
+                home.path(),
+                &["--sh", SH],
+                &input(&json!({"session_id": id})),
+                &[],
+            );
+            assert_eq!(text(&out.stdout).trim(), "drawn", "{id}");
+        }
+        assert!(!folder.join("statusline").exists());
+        let out = run(home.path(), &["--sh", SH], b"not json", &[]);
+        assert_eq!(text(&out.stdout).trim(), "drawn");
+    }
+
+    #[test]
+    fn test_the_dev_mods_keep_wins_and_a_pane_in_only_the_plugins_keep_still_counts() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = open_pane(home.path(), "csr-companion", "s1");
+        let data = input(&json!({"session_id": "s1"}));
+        run(home.path(), &["--sh", SH], &data, &[]);
+        assert!(plugin.join("statusline/s1.json").exists());
+        let shifts = open_pane(home.path(), "csr-shifts", "s1");
+        fs::remove_file(plugin.join("statusline/s1.json")).unwrap();
+        run(home.path(), &["--sh", SH], &data, &[]);
+        assert!(shifts.join("statusline/s1.json").exists());
+        assert!(!plugin.join("statusline/s1.json").exists());
+    }
+}

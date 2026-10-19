@@ -12,6 +12,8 @@ pub struct CompanionArgs {
 pub enum CompanionCmd {
     Pane(Box<PaneArgs>),
     Lease(super::lease::LeaseArgs),
+    /// Run Claude's status command, keeping its line for the pane while one is open
+    Statusline(super::statusline::StatuslineArgs),
     Private {
         #[command(subcommand)]
         command: PrivateCmd,
@@ -160,6 +162,7 @@ pub fn run(args: &CompanionArgs) -> i32 {
                 Ok(())
             }
         }
+        CompanionCmd::Statusline(args) => return super::statusline::run(args),
         CompanionCmd::Lease(args) => super::lease::step_under_lock(args).and_then(|out| {
             println!("{}", serde_json::to_string(&out)?);
             Ok(())
