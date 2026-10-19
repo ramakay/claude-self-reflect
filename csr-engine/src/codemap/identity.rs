@@ -275,6 +275,32 @@ pub fn is_temp_path(path: &Path) -> bool {
         .any(|root| norm == Path::new(root) || norm.starts_with(root))
 }
 
+/// `CSR_CODEMAP_ALLOW_TEMP` as a value: `1` or `true` (any case) maps repos under
+/// a temp root on purpose. Anything else, or unset, keeps them out.
+pub fn allow_temp_from(v: Option<&str>) -> bool {
+    v.is_some_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
+}
+
+fn allow_temp() -> bool {
+    allow_temp_from(std::env::var("CSR_CODEMAP_ALLOW_TEMP").ok().as_deref())
+}
+
+/// A temp-root path that the map must not register: `is_temp_path`, unless
+/// `CSR_CODEMAP_ALLOW_TEMP=1` opts temp repos in. Lexical.
+pub fn temp_excluded(path: &Path) -> bool {
+    is_temp_path(path) && !allow_temp()
+}
+
+/// Is the home folder `root` itself or inside it? True for a worktree root that is
+/// the home folder (a dotfiles repo, `git init ~`) or an ancestor of it: a scan
+/// of such a view walks all of `$HOME`. `None` home: false. Lexical only.
+pub fn contains_home(root: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|h| normalize_lexical(h).starts_with(normalize_lexical(root)))
+}
+
 /// The error `refuse_if_protected` and `resolve_safe` return for a protected
 /// folder. Callers tell "refused" from "missing" with `is_protected_error`.
 #[derive(Debug)]
@@ -1058,6 +1084,31 @@ mod tests {
         assert!(is_temp_path(Path::new("/private/var/folders/ab")));
         assert!(!is_temp_path(Path::new("/Users/z/tmp/x")));
         assert!(!is_temp_path(Path::new("/tmpfoo/x")));
+    }
+
+    #[test]
+    fn allow_temp_reads_one_or_true_in_any_case_only() {
+        for yes in ["1", "true", "TRUE", "True", " 1 "] {
+            assert!(allow_temp_from(Some(yes)), "{yes:?}");
+        }
+        for no in ["0", "", "yes", "false", "2"] {
+            assert!(!allow_temp_from(Some(no)), "{no:?}");
+        }
+        assert!(!allow_temp_from(None));
+    }
+
+    #[test]
+    fn contains_home_is_true_for_home_and_its_ancestors_only() {
+        let home = Path::new("/Users/z");
+        let h = Some(home);
+        assert!(contains_home(Path::new("/Users/z"), h), "home itself");
+        assert!(contains_home(Path::new("/Users/z/"), h), "trailing slash");
+        assert!(contains_home(Path::new("/Users"), h), "an ancestor");
+        assert!(contains_home(Path::new("/"), h), "the root");
+        assert!(!contains_home(Path::new("/Users/y"), h), "a sibling");
+        assert!(!contains_home(Path::new("/Users/z/proj"), h), "a child");
+        assert!(!contains_home(Path::new("/Users/zz"), h), "a name prefix");
+        assert!(!contains_home(Path::new("/Users/z"), None), "no home");
     }
 
     #[test]

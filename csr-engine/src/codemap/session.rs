@@ -477,11 +477,17 @@ pub fn on_post_tool_use(
 /// map on, and no live daemon (`daemon_live`) to do it. The repo check walks up
 /// from `cwd`, which is safe: `identify_with` refuses a protected path before any
 /// filesystem call.
+///
+/// The daemon's drops apply too (`discover::resolve_signal`): the home folder
+/// itself, a cwd or repo under a temp root (`is_temp`; `CSR_CODEMAP_ALLOW_TEMP=1`
+/// lifts it), and a repo whose worktree root is the home folder or above it, whose
+/// scan would walk all of `$HOME`.
 fn ordinary_repo_cwd(
     cwd: &Path,
     home: Option<&Path>,
     disabled: bool,
     daemon_live: bool,
+    is_temp: &dyn Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     if disabled || daemon_live || !cwd.is_absolute() {
         return None;
@@ -490,7 +496,16 @@ fn ordinary_repo_cwd(
     if identity::protected_class(&cwd, home).is_some() {
         return None;
     }
-    identity::identify_with(&cwd, home).ok()?;
+    if home.is_some_and(|h| cwd == normalize_lexical(h)) || is_temp(&cwd) {
+        return None;
+    }
+    let id = identity::identify_with(&cwd, home).ok()?;
+    if is_temp(&id.common_dir)
+        || is_temp(&id.worktree_root)
+        || identity::contains_home(&id.worktree_root, home)
+    {
+        return None;
+    }
     Some(cwd)
 }
 
@@ -504,9 +519,10 @@ pub fn on_session_start_ordinary(
     home: Option<&Path>,
     disabled: bool,
     daemon_live: bool,
+    is_temp: &dyn Fn(&Path) -> bool,
     spawner: &dyn Spawner,
 ) -> Option<u32> {
-    let cwd = ordinary_repo_cwd(cwd, home, disabled, daemon_live)?;
+    let cwd = ordinary_repo_cwd(cwd, home, disabled, daemon_live, is_temp)?;
     match spawner.spawn(&scan_argv(db_path, &cwd)) {
         Ok(pid) => Some(pid),
         Err(e) => {
@@ -533,6 +549,7 @@ pub fn on_post_tool_use_ordinary(
     home: Option<&Path>,
     disabled: bool,
     daemon_live: bool,
+    is_temp: &dyn Fn(&Path) -> bool,
     now: i64,
     alive: &dyn Fn(u32) -> bool,
     spawner: &dyn Spawner,
@@ -541,7 +558,7 @@ pub fn on_post_tool_use_ordinary(
     let Some(edited) = edited.filter(|p| p.is_absolute() && has_code_extension(p)) else {
         return Drained::NotQueued;
     };
-    let Some(cwd) = ordinary_repo_cwd(cwd, home, disabled, daemon_live) else {
+    let Some(cwd) = ordinary_repo_cwd(cwd, home, disabled, daemon_live, is_temp) else {
         return Drained::NotProtected;
     };
     let Ok(id) = identity::identify_with(&cwd, home) else {
@@ -1154,7 +1171,8 @@ mod tests {
         let repo = ordinary_repo(&f);
         let rec = Recorder::new();
         let cwd = repo.join("src");
-        let pid = on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &rec);
+        let pid =
+            on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &no_temp, &rec);
         assert_eq!(pid, Some(4242));
         let want = vec![
             "--db-path".to_string(),
@@ -1178,7 +1196,94 @@ mod tests {
         let repo = ordinary_repo(&f);
         let rec = Recorder::new();
         assert_eq!(
-            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, true, &rec),
+            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, true, &no_temp, &rec),
+            None
+        );
+        assert!(rec.args().is_empty());
+    }
+
+    fn no_temp(_: &Path) -> bool {
+        false
+    }
+
+    fn always_temp(_: &Path) -> bool {
+        true
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_a_temp_cwd_and_maps_it_when_temp_is_allowed() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let rec = Recorder::new();
+        assert_eq!(
+            on_session_start_ordinary(
+                &repo,
+                &f.db,
+                Some(&f.home),
+                false,
+                false,
+                &always_temp,
+                &rec
+            ),
+            None
+        );
+        assert!(rec.args().is_empty(), "a temp repo is not mapped");
+        assert_eq!(
+            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            Some(4242),
+            "with the temp rule off the same repo is mapped"
+        );
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_the_home_folder_and_a_repo_rooted_at_it() {
+        let f = fake();
+        let rec = Recorder::new();
+        // cwd is the home folder itself, git repo or not
+        std::fs::create_dir_all(f.home.join(".git")).unwrap();
+        assert_eq!(
+            on_session_start_ordinary(&f.home, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            None
+        );
+        // a dotfiles repo: `git init ~`, session in a subfolder of it
+        let sub = f.home.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            on_session_start_ordinary(&sub, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            None,
+            "the scan would walk all of $HOME"
+        );
+        assert!(rec.args().is_empty());
+        // the edit path obeys the same rule
+        let conn = db();
+        let out = on_post_tool_use_ordinary(
+            &conn,
+            &sub,
+            Some(&sub.join("a.rs")),
+            &f.db,
+            Some(&f.home),
+            false,
+            false,
+            &no_temp,
+            1,
+            &|_| true,
+            &rec,
+        );
+        assert_eq!(out, Drained::NotProtected);
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_a_repo_whose_root_holds_the_home_folder() {
+        let f = fake();
+        let rec = Recorder::new();
+        // A .git above $HOME (`/` or `/Users`), the session outside $HOME: the
+        // repo root contains the home folder, so its scan would walk all of it.
+        let top = f.home.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        let cwd = top.join("data");
+        assert_eq!(
+            on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &no_temp, &rec),
             None
         );
         assert!(rec.args().is_empty());
@@ -1201,7 +1306,15 @@ mod tests {
             (protected, false),
             (f.home.clone(), false),
         ] {
-            let out = on_session_start_ordinary(&cwd, &f.db, Some(&f.home), disabled, false, &rec);
+            let out = on_session_start_ordinary(
+                &cwd,
+                &f.db,
+                Some(&f.home),
+                disabled,
+                false,
+                &no_temp,
+                &rec,
+            );
             assert_eq!(out, None, "{}", cwd.display());
         }
         assert!(rec.args().is_empty());
@@ -1224,6 +1337,7 @@ mod tests {
             Some(&f.home),
             false,
             daemon_live,
+            &no_temp,
             now,
             &|_| true,
             rec,
@@ -1288,6 +1402,7 @@ mod tests {
             Some(&f.home),
             false,
             false,
+            &no_temp,
             1_000,
             &|_| true,
             &probe,

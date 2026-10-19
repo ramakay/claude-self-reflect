@@ -348,6 +348,7 @@ fn codemap_session_start_ordinary(input: &HookInput, engine: &Engine) {
         crate::codemap::identity::home_dir().as_deref(),
         crate::codemap::disabled(),
         crate::daemon::Daemon::daemon_lock_live(),
+        &crate::codemap::identity::temp_excluded,
         &crate::codemap::session::DetachedSpawner,
     );
 }
@@ -375,6 +376,7 @@ fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
             home.as_deref(),
             crate::codemap::disabled(),
             crate::daemon::Daemon::daemon_lock_live(),
+            &crate::codemap::identity::temp_excluded,
             crate::codemap::now_secs(),
             &crate::codemap::session::pid_alive,
             &crate::codemap::session::DetachedSpawner,

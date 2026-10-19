@@ -74,7 +74,10 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   signal). Before, it followed 30 days of Claude Code history and every `code_nodes` project, so it polled repos you
   had not touched in weeks. A repo that goes idle is no longer polled or watched but keeps its views, blobs and defs:
   the next signal rescans it warm (parses 0 blobs when nothing changed). Deleting idle repos is not done; garbage
-  collection is unchanged. A cwd that is your home, a temp folder or not a git repo maps nothing. The map only reads
+  collection is unchanged. A cwd that is your home, a temp folder or not a git repo maps nothing. With no daemon
+  running, the session maps an ordinary repo itself (one detached scan at SessionStart, a drain after edits); a live
+  daemon keeps ownership. Sessions and the daemon both skip temp folders, the home folder and a repo rooted at the
+  home folder; `CSR_CODEMAP_ALLOW_TEMP=1` maps temp-folder repos on purpose. The map only reads
   repos: no git command that writes, no index refresh. Caps: 5000 files per view, 512 KiB per file (5d718598,
   005bef70, 7d3a78b6).
 - **Repos in Desktop, Documents and Downloads are mapped by the session, never by the daemon.** The daemon still
