@@ -421,7 +421,9 @@ async fn track_code_evolution(input: &HookInput, engine: &Engine) -> Result<()> 
 /// Resolve project name for hook processes (no `MCP_CLIENT_CWD`).
 ///
 /// Fallback chain:
-/// 1. parent directory of the edited file (via `resolve_project_from_cwd`)
+/// 1. parent directory of the edited file (via `resolve_project_from_cwd`),
+///    skipped for a temp path: a scratch file's folder name ("scratchpad",
+///    "bin") is not a project, so it takes the session's project instead
 /// 2. `CLAUDE_PROJECT_DIR` env var
 /// 3. `MCP_CLIENT_CWD` via `resolve_current_project` (MCP tool path)
 /// 4. empty string
@@ -441,7 +443,7 @@ fn resolve_project_for_hook_with(
     claude_project_dir: Option<String>,
     current_project: Option<String>,
 ) -> String {
-    if let Some(parent) = file_path_parent {
+    if let Some(parent) = file_path_parent.filter(|p| !crate::codemap::identity::is_temp_path(p)) {
         let parent_str = parent.to_string_lossy();
         if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&parent_str) {
             if !p.is_empty() {
@@ -491,6 +493,33 @@ mod tests {
         let project = resolve_project_for_hook_with(parent, None, None);
         assert_eq!(project, "my-repo");
         assert!(!project.is_empty());
+    }
+
+    #[test]
+    fn resolve_project_for_hook_gives_a_temp_file_the_session_project() {
+        let scratchpad =
+            Path::new("/private/tmp/claude-501/-Users-x-projects-my-repo/sid/scratchpad/fix.py");
+        let session = Some("/Users/x/projects/my-repo".to_string());
+        assert_eq!(
+            resolve_project_for_hook_with(scratchpad.parent(), session, None),
+            "my-repo"
+        );
+        let patcher = Path::new("/tmp/patches/bin/apply.py");
+        assert_eq!(
+            resolve_project_for_hook_with(patcher.parent(), None, Some("my-repo".into())),
+            "my-repo"
+        );
+        // No session context: an empty project, never the folder name.
+        assert_eq!(
+            resolve_project_for_hook_with(patcher.parent(), None, None),
+            ""
+        );
+        // A folder merely named tmp is not a temp root.
+        let repo_file = Path::new("/Users/x/projects/my-repo/tmp/a.rs");
+        assert_eq!(
+            resolve_project_for_hook_with(repo_file.parent(), None, None),
+            "my-repo"
+        );
     }
 
     fn queue_rows(storage: &crate::storage::Storage) -> Vec<String> {
