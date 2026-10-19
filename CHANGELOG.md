@@ -398,8 +398,8 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 - **`plugins/csr-companion` ships in the repo** (marketplace `claude-self-reflect`, `.claude-plugin/marketplace.json`,
   relative source path). Install with `/plugin marketplace add ramakay/claude-self-reflect` then
-  `/plugin install csr-companion@claude-self-reflect`. `csr-engine setup` ends by printing those two lines and
-  installs nothing; the npm package does not install it either (7e697466).
+  `/plugin install csr-companion@claude-self-reflect`. The npm package does not install it by itself; `csr-engine
+  setup` does (next bullet, 4ecae9c5) and prints those two lines only when it skips or cannot install (7e697466).
 - **`csr-engine setup` now installs the companion** through Claude Code's plugin CLI
   (`claude plugin install csr-companion --marketplace ramakay/claude-self-reflect`), under the same single consent that
   runs setup. It skips a plugin that is already installed, `csr-engine setup --no-companion` skips it, and a missing
@@ -439,8 +439,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - `setup` scans the memory registry, restamps Codex timestamps, strips harness text (fd924ec4, 23dd336d,
   bf7ca8d9). `hook install` no longer registers SubagentStop and removes CSR's entry from an older
   `settings.json`; `csr-engine setup` runs that same install step, so re-running `csr-engine setup` or
-  `csr-engine hook install --apply` after upgrading clears it (4adf32ee, 06af27e2, 34f5648c). Setup ends with the
-  companion plugin's two install lines and installs nothing itself (7e697466).
+  `csr-engine hook install --apply` after upgrading clears it (4adf32ee, 06af27e2, 34f5648c). Setup ends by
+  installing the companion plugin through `claude plugin`, or with its two install lines when it cannot (7e697466,
+  4ecae9c5).
 - Windows (unpublished until now): hook commands use forward slashes (86afb4a3, #273); three Windows-only
   prompt-submit failures fixed, stdin reads bounded to 2 s (2c9bdb3b, #285).
 - Releases trigger on tags only, and publishing waits for a required reviewer (53afe9b2, 774d1b75).
