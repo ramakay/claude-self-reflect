@@ -60,11 +60,13 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
 - **A live map of every definition in your repos, per worktree.** The conversation code graph only knows symbols a
   session touched; the map reads the repos, so CSR answers for code no conversation mentioned and says which worktree
   holds which version of it. It is keyed by git blob oid: a worktree is a view of file paths and blob oids, and a blob
-  is parsed once per extractor version however many worktrees hold it. On the owner's machine (sandbox DB):
-  claude-self-reflect is 9 views, 2,495 view-file pairs, 449 unique blobs and 23,536 defs, mapped cold in 6.2 s at 81 MB
-  max RSS; a warm rescan takes 0.06 s and parses 0 blobs. anukriti is 2 views, 1,643 pairs, 835 blobs, cold in 3.2 s.
-  34.8% (claude-self-reflect) and 64.1% (anukriti) of the mapped files were never touched by a conversation
-  (b2f108e8).
+  is parsed once per extractor version however many worktrees hold it. On the owner's machine, with the installed
+  binary mapping into an empty database: claude-self-reflect is 9 views, 2,531 view-file pairs, 465 unique blobs (5.4
+  copies each) and 23,553 defs, mapped cold in 7.7 s at 87 MB max RSS; a warm rescan takes 0.13 s at 24 MB and parses
+  0 blobs. anukriti is 3 views, 2,470 pairs, 851 blobs and 7,439 defs, cold in 5.1 s at 75 MB. 61.0%
+  (claude-self-reflect) and 66.4% (anukriti) of the mapped paths were never touched by a conversation. Of the files the
+  conversation code graph knows that are still on disk, 625 of 947 are in the live map; the other 322 are `.mjs` (189,
+  not a mapped extension), git-ignored (119) or untracked under a dot directory (14) (b2f108e8).
 - **Which repos: the ones your sessions are in.** SessionStart and PostToolUse write one row per working directory
   to `codemap_signals` (one indexed upsert, 100 ms busy timeout, never a parse). The daemon polls and watches the
   repos with a signal in the last 24 hours (`CSR_CODEMAP_ACTIVE_HOURS`), plus repos you named with `csr-engine
@@ -98,17 +100,16 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   `scan --session` and `drain` are what the hooks start for protected folders; you rarely run them by hand.
 - **Three freshness signals** (1a175565): a 60 s poll of every active repo (`CSR_CODEMAP_POLL_SECS`), a file watcher
   with a 5 s debounce (`CSR_CODEMAP_NO_WATCH=1` turns it off), and a queue the PostToolUse hook fills with one insert
-  and no parse. A dirty edit shows in 5.1-5.4 s. A commit shows in 5.1 s with the watcher and in 36-54 s by the poll
-  alone. `git worktree add` takes 33-48 s to appear and `remove` 39-42 s. 2,000 files written under `target/` caused
-  0 rescans.
-- **Cost (sandbox, session scope), `codemap watch` on a clone of the owner's database with a SessionStart signal for
-  each repo worked in during the last 24 h:** 3 repos, 12 views, 4,351 view-file pairs, 1,493 unique blobs, 34,008
-  defs (the fourth cwd, `this-ai-life`, is not a git repo and maps nothing). Cold, 420 s: 96.6 MB max RSS and 15.8 s
-  CPU (14.23 s user + 1.53 s sys); the three repos mapped in 1.3 s, 5.6 s and 10.8 s. Warm, 130 s: 30.2 MB max RSS
-  and 0.77 s CPU (0.19 s user + 0.58 s sys), 0 blobs parsed. Not comparable one to one with the earlier run (7 repos, 41
-  views, live machine under load, 30-day repo set: 100 MB and 11.0 s CPU cold, 62.5 MB and 0.85 s CPU warm); the
-  repo set differs, and the cold CPU here is higher, not lower. Hook cost, 10 runs each,
-  codemap on against `CSR_NO_CODEMAP=1` on the same sandbox database: SessionStart median 304 ms against 303 ms
+  and no parse. Installed, on the owner's machine: a dirty edit in a worktree showed in 6 s and left the map 7 s after
+  it was undone; `git worktree add` showed in 59 s and `remove` in 62 s; a repo registered with `codemap add` was
+  mapped by the next poll in 49 s. In a sandbox, a commit showed in 5.1 s with the watcher and in 36-54 s by the poll
+  alone, and 2,000 files written under `target/` caused 0 rescans.
+- **Cost, installed, on the owner's machine under real load (load average 9-15 from other sessions' builds):** the
+  live daemon maps 4 repos, 20 views, 6,204 view-file pairs, 1,744 unique blobs and 34,125 defs. The map's own
+  freshness loop (`codemap watch` over the two repos above, 12 views, warm) used 0.43 s CPU (0.11 s user + 0.32 s sys)
+  in 131 s at 28.9 MB max RSS and parsed 0 blobs. The whole daemon's CPU is not a measure of the map: it used 62.9 s
+  in 120 s at 3.84 GB RSS ten minutes after a restart, while it reloaded its search index. Hook cost, 10 runs each,
+  codemap on against `CSR_NO_CODEMAP=1` on a sandbox database: SessionStart median 304 ms against 303 ms
   (second pass 428 against 392), PostToolUse median 4,820 ms against 4,529 ms (second pass 4,191 against 4,152);
   the 4 s is the existing hook, the codemap share is inside the run-to-run noise.
 - **Two tools and `status` use it, with no new MCP tool (still 16).** `csr_search_by_file` appends a `<code_map>`
