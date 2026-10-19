@@ -97,7 +97,7 @@ SessionStart and PostToolUse each write one row for the session's working direct
 Repos in `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive and `/Volumes` are different. The daemon never opens them, so the macOS privacy prompt never fires for it. A session working there has already opened the folder, so its own child process maps the repo:
 
 - SessionStart starts one detached `csr-engine codemap scan --repo <cwd> --session`.
-- PostToolUse queues the edited file and starts one detached `csr-engine codemap drain --repo <cwd>` unless one is running. The drain waits 5 seconds, rescans the queued files, repeats while new edits arrive and exits (after nine minutes at the latest).
+- PostToolUse queues the edited file and starts one detached `csr-engine codemap drain --repo <cwd>` unless one is running. The drain waits 5 seconds, rescans the queued files, repeats while new edits arrive and exits (after nine minutes it hands off like an idle drain: it releases its lock and looks at the queue once more, so a late edit is never dropped).
 
 Both children have no stdio and the hook never waits for them. Nothing watches a protected folder, so an edit made outside Claude Code is not seen until the next session event in that repo. `CSR_NO_CODEMAP=1` turns all of this off.
 

@@ -474,13 +474,24 @@ pub fn query(db_path: &Path, text: &str, json: bool, limit: usize) -> Result<()>
 /// Waits `debounce` so a burst of edits becomes one rescan, rescans the queued
 /// paths that lie in the repo's views, or the whole repo when HEAD or the index
 /// moved (or a worktree appeared or went), then repeats while new rows arrived, and
-/// exits. It ends after `session::DRAIN_MAX` whatever is queued: the next hook
-/// starts another.
+/// exits. After `session::DRAIN_MAX` on one lock stamp it hands off exactly as an
+/// idle drain does (`drain_with`), so no queued edit is stranded and the lock never
+/// ages past `LOCK_STALE_SECS` while held.
 ///
 /// On the way out it does not just remove its session lock file: it releases the
 /// lock and then looks at the queue again (`session::release_and_recheck`), so an
 /// edit queued while it was deciding to exit is never stranded.
 pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Result<()> {
+    drain_with(db_path, repo, debounce, super::session::DRAIN_MAX)
+}
+
+/// `drain` with the time limit as a parameter, so a test can reach it at once.
+fn drain_with(
+    db_path: &Path,
+    repo: &Path,
+    debounce: std::time::Duration,
+    max: std::time::Duration,
+) -> Result<()> {
     if super::disabled() {
         println!("{}", disabled_notice());
         return Ok(());
@@ -493,15 +504,23 @@ pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Resu
     let protected = scope.root.is_some();
     let id = identity::identify(repo)?;
     let storage = Storage::open(db_path)?;
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let mut passes = 0usize;
+    // The exit sequence, shared by an idle pass and a pass at the time limit.
+    let mut rows_left = || {
+        storage
+            .with_connection(|conn| {
+                let (_, live, stored) = view_roots(conn, &id.common_dir, home.as_deref())?;
+                let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+                let common = id.common_dir.to_string_lossy();
+                Ok(!super::session::rows_owned(conn, &common, &roots, home.as_deref())?.is_empty())
+            })
+            // Unknown counts as "rows left": better one more look.
+            .unwrap_or(true)
+    };
     loop {
         std::thread::sleep(debounce);
-        if started.elapsed() > super::session::DRAIN_MAX {
-            println!("drain: time limit after {passes} passes");
-            break;
-        }
-        match storage.with_connection(|conn| {
+        let handoff = match storage.with_connection(|conn| {
             drain_pass(
                 conn,
                 db_path,
@@ -511,40 +530,34 @@ pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Resu
                 home.as_deref(),
             )
         })? {
-            Pass::Worked => passes += 1,
             Pass::Removed => break,
             Pass::Idle => {
                 #[cfg(test)]
                 super::session::test_hooks::after_idle();
-                let mut rows_left =
-                    || {
-                        storage
-                            .with_connection(|conn| {
-                                let (_, live, stored) =
-                                    view_roots(conn, &id.common_dir, home.as_deref())?;
-                                let roots: Vec<std::path::PathBuf> =
-                                    live.union(&stored).map(Into::into).collect();
-                                let common = id.common_dir.to_string_lossy();
-                                Ok(!super::session::rows_owned(
-                                    conn,
-                                    &common,
-                                    &roots,
-                                    home.as_deref(),
-                                )?
-                                .is_empty())
-                            })
-                            // Unknown counts as "rows left": better one more look.
-                            .unwrap_or(true)
-                    };
-                match super::session::release_and_recheck(
-                    &mut hold,
-                    super::now_secs(),
-                    &super::session::pid_alive,
-                    &mut rows_left,
-                ) {
-                    super::session::Handoff::Continue => {}
-                    super::session::Handoff::Exit => break,
+                true
+            }
+            Pass::Worked => {
+                passes += 1;
+                let at_limit = started.elapsed() > max;
+                if at_limit {
+                    println!("drain: time limit after {passes} passes");
                 }
+                at_limit
+            }
+        };
+        if handoff {
+            // At the limit exactly as when idle: release the lock, then look at the
+            // queue again. An edit queued during the last debounce saw our live
+            // lock, so its hook spawned nothing; the recheck finds its row.
+            match super::session::release_and_recheck(
+                &mut hold,
+                super::now_secs(),
+                &super::session::pid_alive,
+                &mut rows_left,
+            ) {
+                // The retaken lock carries a fresh start stamp.
+                super::session::Handoff::Continue => started = std::time::Instant::now(),
+                super::session::Handoff::Exit => break,
             }
         }
     }
@@ -1066,6 +1079,53 @@ mod tests {
             [pb],
             "B's row stays for B's drain; A's own row is gone"
         );
+    }
+
+    #[test]
+    fn a_drain_at_its_time_limit_hands_off_its_queue_instead_of_dropping_it() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &repo);
+                Ok(())
+            })
+            .unwrap();
+        let lock = session::lock_path(&db_path, &repo);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let held = session::try_take(&lock, super::super::now_secs(), &session::pid_alive)
+            .unwrap()
+            .expect("lock is free");
+        held.set_pid(std::process::id(), super::super::now_secs());
+        // The edit a hook queued during the drain's last debounce: it saw the live
+        // lock above, so its child exited and nothing else will ever map it.
+        write(&repo, "a.py", &py(&["alpha", "delta_last"]));
+        storage
+            .with_connection(|conn| super::super::enqueue(conn, &repo.join("a.py")))
+            .unwrap();
+        drop(storage);
+
+        // A zero limit: the time check fires on the first pass.
+        drain_with(
+            &db_path,
+            &repo,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+
+        assert_eq!(
+            defs_named(&db_path, "delta_last"),
+            1,
+            "the last edit was mapped, not dropped"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(
+            store::queue_read(&conn).unwrap().is_empty(),
+            "the queue row is gone"
+        );
+        assert!(!lock.exists(), "the session lock file was released");
     }
 
     #[test]

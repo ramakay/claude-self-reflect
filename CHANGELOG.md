@@ -87,7 +87,7 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   opened it, so SessionStart there starts one detached `csr-engine codemap scan --repo <cwd> --session`, and
   PostToolUse queues the edited file and starts one detached `codemap drain --repo <cwd>` unless one is running.
   The drain waits out a 5 s debounce, rescans the queued files (the whole repo when HEAD or the index moved),
-  repeats while new edits arrive and exits (after nine minutes at the latest). Both children have no stdio and are never waited on, so the hook returns
+  repeats while new edits arrive and exits (after nine minutes it hands off like an idle drain: it releases its lock and looks at the queue once more, so a late edit is never dropped). Both children have no stdio and are never waited on, so the hook returns
   at once; one spawn per hook call, no retries, and the in-flight check is a lock file next to the database. `--session`
   opens only the one protected folder the cwd is in, only in those two processes. **Lag:** nothing watches a
   protected folder, so an edit made outside Claude in a protected repo is not seen until the next session event in

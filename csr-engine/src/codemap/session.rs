@@ -53,8 +53,11 @@ pub const LOCK_STALE_SECS: i64 = 600;
 /// How long a `drain` waits for further edits before it rescans (`--debounce`).
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// A `drain` ends after this long even if edits keep arriving: the next hook
-/// starts a new one, and the lock goes stale at ten minutes.
+/// How long a `drain` works on one lock stamp. It bounds the stamp, not the drain:
+/// past this a pass that did work goes through the same exit sequence as an idle one
+/// (`release_and_recheck`), so rows queued meanwhile are never stranded; a drain
+/// that retakes the lock starts a fresh stamp and carries on. The limit sits below
+/// `LOCK_STALE_SECS`, so a lock held by a live drain never goes stale.
 pub const DRAIN_MAX: Duration = Duration::from_secs(9 * 60);
 
 /// Starts the detached children. A trait so tests assert the argv instead of
