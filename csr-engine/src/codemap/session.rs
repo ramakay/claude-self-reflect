@@ -130,7 +130,7 @@ pub struct SessionLock {
 impl SessionLock {
     /// Record the child's pid (`pid=0` until it is known). Never recreates a file
     /// the child has already removed.
-    fn set_pid(&self, pid: u32, now: i64) {
+    pub(crate) fn set_pid(&self, pid: u32, now: i64) {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -228,21 +228,110 @@ pub fn try_take(
 /// file is still this process's (or not yet attributed).
 pub struct LockHold {
     path: PathBuf,
+    /// False once `release_and_recheck` has handed the lock over: the file is then
+    /// not this child's to touch (a hook may already have made a new one).
+    armed: bool,
 }
 
 impl LockHold {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, armed: true }
     }
-}
 
-impl Drop for LockHold {
-    fn drop(&mut self) {
+    /// Remove the lock file, only if it is still this process's or not yet
+    /// attributed to a child.
+    fn remove_if_own(&self) {
         match read_lock(&self.path) {
             Some((pid, _)) if pid != 0 && pid != std::process::id() => {}
             _ => {
                 let _ = std::fs::remove_file(&self.path);
             }
+        }
+    }
+}
+
+impl Drop for LockHold {
+    fn drop(&mut self) {
+        if self.armed {
+            self.remove_if_own();
+        }
+    }
+}
+
+/// What a drain does after a pass found nothing to do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// Rows arrived and this child holds the lock again: run another pass.
+    Continue,
+    /// Nothing is left, or another drain owns what is: exit.
+    Exit,
+}
+
+/// The exit sequence of a drain whose last pass found nothing: release the lock
+/// file, THEN read the queue again (`rows_left`). If rows are there, take the same
+/// lock (`try_take`), record this pid and carry on; if it is taken, another drain
+/// owns the rows and this one exits.
+///
+/// Why no edit is stranded. A hook does two things in this order: enqueue the
+/// row, then `try_take` the lock (live lock: `InFlight`, no spawn). Call our
+/// release R and our queue read Q, with R before Q.
+///
+/// - A hook whose `try_take` came before R found our lock and spawned nothing.
+///   Its enqueue came before its `try_take`, so before R, so before Q: Q sees
+///   the row.
+/// - A hook whose `try_take` came after R finds no live lock, takes it and
+///   spawns its own drain, whatever Q saw. If Q also saw its row, our `try_take`
+///   finds that lock and we exit; the row has an owner either way.
+///
+/// So every row is seen by Q or owned by a freshly spawned drain; the old exit
+/// (read empty, then remove the file) had a gap between the read and the
+/// removal in which a hook could enqueue, see the live lock, and leave.
+pub fn release_and_recheck(
+    hold: &mut LockHold,
+    now: i64,
+    alive: &dyn Fn(u32) -> bool,
+    rows_left: &mut dyn FnMut() -> bool,
+) -> Handoff {
+    hold.remove_if_own();
+    if !rows_left() {
+        hold.armed = false;
+        return Handoff::Exit;
+    }
+    match try_take(&hold.path, now, alive) {
+        Ok(Some(lock)) => {
+            lock.set_pid(std::process::id(), now);
+            Handoff::Continue
+        }
+        // Another drain took it (or the lock cannot be made): not ours any more.
+        _ => {
+            hold.armed = false;
+            Handoff::Exit
+        }
+    }
+}
+
+/// Test-only seam: a closure run by `cli::drain` right after a pass found
+/// nothing, before it releases its lock, so a test can queue an edit in the
+/// window the exit sequence has to cover. Thread-local.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static AFTER_IDLE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set_after_idle(hook: impl FnMut() + 'static) {
+        AFTER_IDLE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn after_idle() {
+        // Taken out first so the hook may itself call back into this module.
+        let hook = AFTER_IDLE.with(|h| h.borrow_mut().take());
+        if let Some(mut f) = hook {
+            f();
         }
     }
 }
@@ -288,6 +377,25 @@ pub enum Drained {
     Failed,
 }
 
+/// The real path of `edited` when it lies in the same protected folder as the
+/// session's `cwd`, else `None`. The hook runs under the session's own macOS
+/// grant, so a scope for `cwd` lets `resolve_safe` look inside that one folder
+/// (and no other; a chain through any other protected folder is still refused).
+/// The parent is resolved and the file name joined on, so a file that was just
+/// deleted still resolves. The scope is dropped before this returns.
+fn resolve_in_session_root(
+    cwd: &Path,
+    edited: &Path,
+    home: Option<&Path>,
+    class: &identity::TccRoot,
+) -> Option<PathBuf> {
+    let _scope = identity::session_scope(cwd, home);
+    let real = identity::resolve_safe(edited.parent()?, home)
+        .ok()?
+        .join(edited.file_name()?);
+    (identity::protected_class(&real, home)?.key == class.key).then_some(real)
+}
+
 /// PostToolUse in `cwd` after an edit of `edited`: enqueue the file, and spawn a
 /// detached `codemap drain` unless one is in flight. One spawn per call at most,
 /// no retries.
@@ -307,13 +415,27 @@ pub fn on_post_tool_use(
         return Drained::NotProtected;
     }
     let cwd = normalize_lexical(cwd);
-    if identity::protected_class(&cwd, home).is_none() {
+    let Some(class) = identity::protected_class(&cwd, home) else {
         return Drained::NotProtected;
-    }
-    let Some(edited) =
-        edited.filter(|p| p.is_absolute() && has_code_extension(p) && is_tcc_path(p, home))
-    else {
+    };
+    let Some(edited) = edited.filter(|p| p.is_absolute() && has_code_extension(p)) else {
         return Drained::NotQueued;
+    };
+    // A path that is lexically protected is queued as it is. One that is not may
+    // still be an alias of the session's folder (`/work/project` linked to
+    // `~/Documents/project`): the drain matches rows against RESOLVED view roots,
+    // so the alias is resolved here and the resolved path queued.
+    let resolved;
+    let edited = if is_tcc_path(edited, home) {
+        edited
+    } else {
+        match resolve_in_session_root(&cwd, edited, home, &class) {
+            Some(real) => {
+                resolved = real;
+                resolved.as_path()
+            }
+            None => return Drained::NotQueued,
+        }
     };
     if let Err(e) = super::with_hook_busy_timeout(conn, || super::enqueue(conn, edited)) {
         eprintln!("CSR: code map session enqueue skipped (non-fatal): {e}");
@@ -701,5 +823,125 @@ mod tests {
             name.starts_with("session-") && name.ends_with(".lock"),
             "{name}"
         );
+    }
+
+    // ---- exit handoff (finding 7) --------------------------------------------------
+
+    fn held_lock(f: &Fake) -> (PathBuf, LockHold) {
+        let path = lock_path(&f.db, &f.home.join("Documents/probe"));
+        let lock = try_take(&path, 100, &|_| false).unwrap().unwrap();
+        lock.set_pid(std::process::id(), 100);
+        (path.clone(), LockHold::new(path))
+    }
+
+    #[test]
+    fn handoff_with_nothing_queued_releases_the_lock_before_it_reads_the_queue() {
+        let f = fake();
+        let (path, mut hold) = held_lock(&f);
+        let mut seen_released = false;
+        let out = release_and_recheck(&mut hold, 200, &|_| true, &mut || {
+            seen_released = !path.exists();
+            false
+        });
+        assert_eq!(out, Handoff::Exit);
+        assert!(seen_released, "the lock was released before the queue read");
+        drop(hold);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn handoff_with_a_row_queued_in_the_window_takes_the_lock_again_and_continues() {
+        let f = fake();
+        let (path, mut hold) = held_lock(&f);
+        let out = release_and_recheck(&mut hold, 200, &|_| true, &mut || true);
+        assert_eq!(out, Handoff::Continue);
+        let (pid, _) = read_lock(&path).expect("the lock is held again");
+        assert_eq!(pid, std::process::id());
+        // Still this child's: dropping the hold removes it on the way out.
+        drop(hold);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn handoff_leaves_a_lock_a_new_hook_took_after_the_release() {
+        let f = fake();
+        let (path, mut hold) = held_lock(&f);
+        let p = path.clone();
+        let out = release_and_recheck(&mut hold, 200, &|_| true, &mut || {
+            // A hook arrives between our release and our queue read: it sees no
+            // lock, takes it, and has spawned its own drain (pid 999999).
+            std::fs::write(&p, "pid=999999 start=200\n").unwrap();
+            true
+        });
+        assert_eq!(out, Handoff::Exit, "that drain owns the rows");
+        drop(hold);
+        assert!(path.exists(), "the new drain's lock is not removed by us");
+        assert_eq!(read_lock(&path).unwrap().0, 999_999);
+    }
+
+    // ---- a symlinked protected cwd (finding 8) -------------------------------------
+
+    #[test]
+    fn an_edit_through_an_alias_of_the_session_folder_is_queued_by_its_real_path() {
+        let f = fake();
+        let conn = db();
+        let rec = Recorder::new();
+        let real = f.home.join("Documents/proj");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        let alias = f.home.join("work");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let out = on_post_tool_use(
+            &conn,
+            &alias,
+            Some(&alias.join("src/a.rs")),
+            &f.db,
+            Some(&f.home),
+            false,
+            10,
+            &|_| true,
+            &rec,
+        );
+        assert!(matches!(out, Drained::Spawned(_)), "{out:?}");
+        let queued = store::queue_read(&conn).unwrap();
+        let paths: Vec<&str> = queued.iter().map(|(p, _)| p.as_str()).collect();
+        let want = real.join("src/a.rs").to_string_lossy().to_string();
+        assert_eq!(
+            paths,
+            [want.as_str()],
+            "queued by the real path, which is what the drain's view roots match"
+        );
+        assert_eq!(rows_under(&conn, &[real]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_alias_edit_outside_the_session_folder_is_not_queued() {
+        let f = fake();
+        let conn = db();
+        let rec = Recorder::new();
+        let real = f.home.join("Documents/proj");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = f.home.join("work");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // An ordinary folder, and a link into ANOTHER protected folder.
+        let plain = f.home.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let other = f.home.join("desk");
+        std::os::unix::fs::symlink(f.home.join("Desktop"), &other).unwrap();
+        for edited in [plain.join("a.rs"), other.join("a.rs")] {
+            let out = on_post_tool_use(
+                &conn,
+                &alias,
+                Some(&edited),
+                &f.db,
+                Some(&f.home),
+                false,
+                10,
+                &|_| true,
+                &rec,
+            );
+            assert_eq!(out, Drained::NotQueued, "{}", edited.display());
+        }
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+        assert!(rec.args().is_empty());
     }
 }

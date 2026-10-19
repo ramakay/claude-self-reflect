@@ -332,3 +332,162 @@ fn a_session_in_an_ordinary_folder_spawns_nothing() {
     assert!(f.query("alpha_marker").is_empty());
     assert!(f.session_locks().is_empty());
 }
+
+// ---- a removal wins over a session scan or drain that was waiting for the lock ----
+
+fn defs_named(f: &Fake, name: &str) -> i64 {
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM codemap_defs WHERE name = ?1",
+        rusqlite::params![name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Start `csr-engine <args>` with a long lock wait and its stdout piped.
+fn spawn_waiting(f: &Fake, args: &[&str]) -> std::process::Child {
+    f.cmd()
+        .args(args)
+        .env("CSR_CODEMAP_LOCK_WAIT_SECS", "60")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// `codemap remove`, as its store calls do it: tombstone, then drop the views.
+fn tombstone(f: &Fake, common: &str) {
+    use csr_engine::codemap::store;
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    store::disable_repo(&conn, common, None).unwrap();
+    for v in store::stored_views(&conn, Some(common)).unwrap() {
+        store::delete_view(&conn, v.id).unwrap();
+    }
+    store::gc(&conn).unwrap();
+}
+
+fn dirty_edit(f: &Fake, def: &str) {
+    std::fs::write(
+        f.probe.join("app.py"),
+        format!("def alpha_marker():\n    return 1\n\ndef {def}():\n    return 2\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_session_scan_that_waited_for_the_lock_respects_a_removal_made_meanwhile() {
+    use csr_engine::codemap::lock;
+    let f = fake();
+    let probe = f.probe.to_str().unwrap();
+    assert!(f
+        .run(&["codemap", "scan", "--repo", probe, "--session"])
+        .status
+        .success());
+    dirty_edit(&f, "gamma_marker");
+    let common = f.probe.join(".git").to_string_lossy().to_string();
+
+    // Hold the repo lock the way a running scan (or `codemap remove`) does.
+    let lock::Acquired::Held(held) =
+        lock::acquire(&f.db, &common, Duration::from_secs(5), &|| false).unwrap()
+    else {
+        panic!("repo lock was free");
+    };
+    let child = spawn_waiting(&f, &["codemap", "scan", "--repo", probe, "--session"]);
+    std::thread::sleep(Duration::from_millis(2_000));
+    tombstone(&f, &common);
+    drop(held);
+
+    let out = child.wait_with_output().unwrap();
+    let log = text(&out);
+    assert!(out.status.success(), "{log}");
+    assert!(log.contains("codemap remove"), "skipped, said so: {log}");
+    assert_eq!(defs_named(&f, "gamma_marker"), 0, "nothing was scanned");
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let enabled: i64 = conn
+        .query_row("SELECT enabled FROM codemap_repos", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(enabled, 0, "the tombstone stands");
+}
+
+#[test]
+fn a_drain_that_waited_for_the_lock_respects_a_removal_made_meanwhile() {
+    use csr_engine::codemap::lock;
+    let f = fake();
+    let probe = f.probe.to_str().unwrap();
+    assert!(f
+        .run(&["codemap", "scan", "--repo", probe, "--session"])
+        .status
+        .success());
+    dirty_edit(&f, "gamma_marker");
+    let common = f.probe.join(".git").to_string_lossy().to_string();
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    csr_engine::codemap::enqueue(&conn, &f.probe.join("app.py")).unwrap();
+    drop(conn);
+
+    let lock::Acquired::Held(held) =
+        lock::acquire(&f.db, &common, Duration::from_secs(5), &|| false).unwrap()
+    else {
+        panic!("repo lock was free");
+    };
+    let child = spawn_waiting(
+        &f,
+        &["codemap", "drain", "--repo", probe, "--debounce", "0"],
+    );
+    std::thread::sleep(Duration::from_millis(2_000));
+    tombstone(&f, &common);
+    drop(held);
+
+    let out = child.wait_with_output().unwrap();
+    let log = text(&out);
+    assert!(out.status.success(), "{log}");
+    assert!(log.contains("drain skipped"), "{log}");
+    assert_eq!(
+        defs_named(&f, "gamma_marker"),
+        0,
+        "the edit was not rescanned"
+    );
+    assert_eq!(defs_named(&f, "alpha_marker"), 0, "no view was recreated");
+    let conn = rusqlite::Connection::open(&f.db).unwrap();
+    let views: i64 = conn
+        .query_row("SELECT COUNT(*) FROM codemap_views", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(views, 0);
+}
+
+// ---- a protected cwd reached through a symlink ----
+
+#[test]
+fn an_edit_made_through_a_symlink_to_a_protected_repo_is_queued_and_drained() {
+    let f = fake();
+    let probe = f.probe.to_str().unwrap();
+    assert!(f
+        .run(&["codemap", "scan", "--repo", probe, "--session"])
+        .status
+        .success());
+    assert!(f.query("beta_marker").is_empty());
+    let alias = f.home.join("work");
+    std::os::unix::fs::symlink(&f.probe, &alias).unwrap();
+
+    dirty_edit(&f, "beta_marker");
+    let out = f.hook(
+        "post-tool-use",
+        serde_json::json!({
+            "session_id": "sess-alias",
+            "cwd": alias,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": alias.join("app.py") },
+        }),
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        f.wait_for(40, |f| !f.query("beta_marker").is_empty()),
+        "the drain rescanned the file edited through the alias"
+    );
+    assert!(
+        f.wait_for(40, |f| f.session_locks().is_empty()),
+        "the child removed its lock: {:?}",
+        f.session_locks()
+    );
+}
