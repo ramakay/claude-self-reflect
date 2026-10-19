@@ -20,6 +20,7 @@ pub mod png;
 pub mod private;
 pub mod pyfmt;
 pub mod recall;
+pub mod relay;
 pub mod render;
 pub mod send;
 pub mod session;

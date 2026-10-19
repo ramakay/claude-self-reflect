@@ -1347,3 +1347,343 @@ fn test_old_failure_does_not_reopen_retry() {
     assert_eq!(found[2].outcome, "draft");
     assert!(agents::read_handoffs(&state, &drafts, "../x").is_empty());
 }
+
+mod relay {
+    use serde_json::{json, Value};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdout, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct Serve {
+        child: Child,
+        lines: Option<BufReader<ChildStdout>>,
+        sock: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Serve {
+        fn line(&mut self) -> Value {
+            let mut line = String::new();
+            self.lines.as_mut().unwrap().read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+    }
+
+    impl Drop for Serve {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn start(relay: &str, extra_env: &[(&str, &Path)]) -> Serve {
+        let dir = tempfile::Builder::new()
+            .prefix("csr-t")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let sock = dir.path().join("run/a.sock");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_csr-engine"));
+        command
+            .env("HOME", dir.path())
+            .args(["companion", "serve", "--sock"])
+            .arg(&sock)
+            .args(["--relay", relay])
+            .stdout(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap());
+        let mut first = String::new();
+        lines.read_line(&mut first).unwrap();
+        assert_eq!(first, "ready\n");
+        Serve {
+            child,
+            lines: Some(lines),
+            sock,
+            _dir: dir,
+        }
+    }
+
+    fn request(stream: &mut UnixStream, path: &str, body: &Value) -> Value {
+        let body = body.to_string();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: csr\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        let mut reply = vec![0u8; length];
+        stream.read_exact(&mut reply).unwrap();
+        serde_json::from_slice(&reply).unwrap()
+    }
+
+    fn post(sock: &Path, path: &str, body: &Value) -> Value {
+        request(&mut UnixStream::connect(sock).unwrap(), path, body)
+    }
+
+    fn exited(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
+        let until = Instant::now() + within;
+        while Instant::now() < until {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn serve_is_private_answers_csr_and_removes_its_socket_on_sigterm() {
+        let mut serve = start("1", &[]);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&serve.sock), 0o600);
+        assert_eq!(mode(serve.sock.parent().unwrap()), 0o700);
+        let reply = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "k": "tool", "e": {} }),
+        );
+        assert_eq!(reply, json!({}));
+        let reply = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "k": "csr", "e": {} }),
+        );
+        let pid = serve.child.id();
+        assert_eq!(
+            reply["answer"]["text"],
+            format!("csr relay ok pid={pid} events=2")
+        );
+        assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGTERM) }, 0);
+        let status = exited(&mut serve.child, Duration::from_secs(5)).expect("exits on SIGTERM");
+        assert!(status.success(), "{status:?}");
+        assert!(!serve.sock.exists());
+    }
+
+    #[test]
+    fn serve_exits_on_sigint_too() {
+        let mut serve = start("1", &[]);
+        assert_eq!(
+            unsafe { libc::kill(serve.child.id() as i32, libc::SIGINT) },
+            0
+        );
+        assert!(exited(&mut serve.child, Duration::from_secs(5))
+            .unwrap()
+            .success());
+        assert!(!serve.sock.exists());
+    }
+
+    #[test]
+    fn a_dead_socket_file_is_replaced_and_a_regular_file_is_refused() {
+        let dir = tempfile::Builder::new()
+            .prefix("csr-t")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let sock = run.join("a.sock");
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let serve = |sock: &Path| {
+            Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+                .env("HOME", dir.path())
+                .args(["companion", "serve", "--sock"])
+                .arg(sock)
+                .args(["--relay", "1"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let mut child = serve(&sock);
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+        post(&sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let file = run.join("b.sock");
+        std::fs::write(&file, "keep").unwrap();
+        let out = serve(&file).wait_with_output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not a socket"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
+    }
+
+    #[test]
+    fn a_different_relay_version_pushes_one_toast_on_stdout() {
+        let mut serve = start("2", &[]);
+        post(&serve.sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        let pushed = serve.line();
+        assert_eq!(pushed["calls"][0]["m"], "ui.toast");
+        assert_eq!(
+            pushed["calls"][0]["a"][0],
+            "CSR updated: run /reload-plugins"
+        );
+        // A second mismatch pushes nothing; the next line is the usage call that a start asks.
+        post(&serve.sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        let start = post(&serve.sock, "/event", &json!({ "v": "1", "k": "start" }));
+        post(
+            &serve.sock,
+            "/step",
+            &json!({ "v": "1", "id": start["id"], "results": [] }),
+        );
+        assert_eq!(serve.line()["calls"][0]["m"], "session.usage");
+    }
+
+    #[test]
+    fn start_then_step_pushes_a_usage_call_and_logs_what_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("relay.log");
+        let mut serve = start("1", &[("CSR_RELAY_LOG", &log)]);
+        let reply = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "sid": "s1", "k": "start", "e": { "cwd": "/r" } }),
+        );
+        assert_eq!(reply["calls"][0]["m"], "command.register");
+        let done = post(
+            &serve.sock,
+            "/step",
+            &json!({ "v": "1", "id": reply["id"], "results": [{ "id": "c1", "v": {} }] }),
+        );
+        assert_eq!(done, json!({}));
+        let pushed = serve.line();
+        assert_eq!(pushed["calls"][0]["m"], "session.usage");
+        post(
+            &serve.sock,
+            "/step",
+            &json!({ "v": "1", "id": pushed["id"], "results": [{ "id": "c1", "v": { "x": 1 } }] }),
+        );
+        let rows: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["k"], "boot");
+        assert_eq!(rows[0]["pid"], serve.child.id());
+        assert_eq!(rows[1]["k"], "start");
+        assert_eq!(rows[1]["sid"], "s1");
+        assert_eq!(rows[1]["pid"], serve.child.id());
+        assert!(rows[1]["bytes"].as_u64().unwrap() > 0);
+        assert!(rows[1]["handle_us"].is_u64());
+        assert_eq!(rows[3]["usage"][0]["v"], json!({ "x": 1 }));
+    }
+
+    #[test]
+    fn serve_exits_when_a_push_meets_a_closed_stdout() {
+        let mut serve = start("2", &[]);
+        drop(serve.lines.take());
+        let sock = serve.sock.clone();
+        post(&sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        let status = exited(&mut serve.child, Duration::from_secs(5)).expect("exits on EPIPE");
+        assert!(status.success(), "{status:?}");
+        assert!(!sock.exists());
+    }
+
+    #[test]
+    fn serve_exits_when_stdout_is_closed_and_nothing_is_pushed() {
+        let mut serve = start("1", &[]);
+        drop(serve.lines.take());
+        let status = exited(&mut serve.child, Duration::from_secs(5)).expect("exits when idle");
+        assert!(status.success(), "{status:?}");
+        assert!(!serve.sock.exists());
+    }
+
+    #[test]
+    fn the_relay_round_trip_stays_well_under_fifteen_ms() {
+        let serve = start("1", &[]);
+        let measure = |fresh: bool| {
+            let mut kept = UnixStream::connect(&serve.sock).unwrap();
+            let mut times = Vec::new();
+            for i in 0..1000 {
+                let body = json!({ "v": "1", "sid": "s", "cwd": "/r", "k": "tool",
+                    "e": { "tool": "Bash", "n": i, "input": { "command": "ls -la" } } });
+                let started = Instant::now();
+                if fresh {
+                    post(&serve.sock, "/event", &body);
+                } else {
+                    request(&mut kept, "/event", &body);
+                }
+                times.push(started.elapsed().as_secs_f64() * 1000.);
+            }
+            times.sort_by(f64::total_cmp);
+            (times[499], times[949], times[999])
+        };
+        for (name, fresh) in [("keep-alive", false), ("new connection", true)] {
+            let (p50, p95, max) = measure(fresh);
+            eprintln!(
+                "POST /event x1000 ({name}): p50 {p50:.3} ms, p95 {p95:.3} ms, max {max:.3} ms"
+            );
+            assert!(p95 < 15., "{name} p95 {p95} ms");
+        }
+    }
+
+    #[test]
+    fn plugin_emit_writes_a_plugin_that_claude_validates() {
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let emit = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", home.path())
+            .args(["companion", "plugin", "emit"])
+            .arg(out.path())
+            .output()
+            .unwrap();
+        assert!(
+            emit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&emit.stderr)
+        );
+        let relay = std::fs::read_to_string(out.path().join("hooks/register.js")).unwrap();
+        let engine = std::path::absolute(env!("CARGO_BIN_EXE_csr-engine")).unwrap();
+        assert!(
+            relay.contains(&format!("const ENGINE = '{}'", engine.display())),
+            "{relay}"
+        );
+        let sock_dir = home.path().join(".claude-self-reflect/csr-companion/run");
+        if sock_dir.as_os_str().len() + 14 <= 90 {
+            assert!(relay.contains(&format!("const SOCK_DIR = '{}'", sock_dir.display())));
+        } else {
+            assert!(relay.contains("const SOCK_DIR = '/tmp/csr-"));
+        }
+        let Ok(found) = Command::new("claude").arg("--version").output() else {
+            eprintln!("claude is not on PATH: validate skipped");
+            return;
+        };
+        if !found.status.success() {
+            return;
+        }
+        let validated = Command::new("claude")
+            .args(["plugin", "validate"])
+            .arg(out.path())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&validated.stdout);
+        assert!(
+            validated.status.success() && text.contains("Validation passed"),
+            "{text}"
+        );
+    }
+}

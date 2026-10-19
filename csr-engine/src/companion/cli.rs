@@ -16,6 +16,27 @@ pub enum CompanionCmd {
         #[command(subcommand)]
         command: PrivateCmd,
     },
+    /// The relay's engine: listens on a Unix socket for the hooks `register.js` forwards.
+    Serve(super::relay::ServeArgs),
+    /// The plugin the relay runs as.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginCmd {
+    /// Write `.claude-plugin/plugin.json`, `hooks/hooks.json` and `hooks/register.js`.
+    Emit {
+        dir: PathBuf,
+        /// The folder the relay's sockets go in.
+        #[arg(long)]
+        sock_dir: Option<PathBuf>,
+        /// The binary the relay starts; this one by default.
+        #[arg(long)]
+        engine: Option<PathBuf>,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -165,12 +186,32 @@ pub fn run(args: &CompanionArgs) -> i32 {
             Ok(())
         }),
         CompanionCmd::Private { command } => run_private(command),
+        CompanionCmd::Serve(args) => super::relay::serve(args),
+        CompanionCmd::Plugin { command } => run_plugin(command),
     };
     match result {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("companion: {error:#}");
             1
+        }
+    }
+}
+
+fn run_plugin(command: &PluginCmd) -> anyhow::Result<()> {
+    match command {
+        PluginCmd::Emit {
+            dir,
+            sock_dir,
+            engine,
+        } => {
+            let out = super::relay::emit::emit(dir, sock_dir.as_deref(), engine.as_deref())?;
+            for file in &out.files {
+                println!("{}", file.display());
+            }
+            println!("engine {}", out.engine.display());
+            println!("sockets {}", out.sock_dir.display());
+            Ok(())
         }
     }
 }
