@@ -480,8 +480,9 @@ pub fn on_post_tool_use(
 ///
 /// The daemon's drops apply too (`discover::resolve_signal`): the home folder
 /// itself, a cwd or repo under a temp root (`is_temp`; `CSR_CODEMAP_ALLOW_TEMP=1`
-/// lifts it), and a repo whose worktree root is the home folder or above it, whose
-/// scan would walk all of `$HOME`.
+/// lifts it), a repo whose worktree root is the home folder, a protected folder's
+/// ancestor (`identity::contains_tcc_root`), and a repo none of whose views survive
+/// that exclusion (`identity::only_excluded_views`): a scan would walk all of `$HOME`.
 fn ordinary_repo_cwd(
     cwd: &Path,
     home: Option<&Path>,
@@ -502,7 +503,8 @@ fn ordinary_repo_cwd(
     let id = identity::identify_with(&cwd, home).ok()?;
     if is_temp(&id.common_dir)
         || is_temp(&id.worktree_root)
-        || identity::contains_home(&id.worktree_root, home)
+        || identity::contains_tcc_root(&id.worktree_root, home)
+        || identity::only_excluded_views(&id.common_dir, home)
     {
         return None;
     }
@@ -1287,6 +1289,38 @@ mod tests {
             None
         );
         assert!(rec.args().is_empty());
+    }
+
+    #[test]
+    fn ordinary_session_start_in_a_linked_worktree_of_a_home_rooted_repo_maps_only_that_worktree() {
+        use crate::codemap::testutil::{py, write, Fx};
+        let fx = Fx::new();
+        let f = fake();
+        let rec = Recorder::new();
+        // `git init ~` with a linked worktree under it (a dotfiles repo): the
+        // session gate used to look only at the linked root and let it in, and the
+        // scan then walked the main worktree, all of $HOME.
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        write(&fx.home, "rc.py", &py(&["rc"]));
+        fx.commit_all(&fx.home, "init");
+        let wt = fx.add_worktree(&fx.home, &fx.home.join("projects/dotfiles"), "dots");
+        // The linked view survives; the home view is dropped by the listing.
+        assert_eq!(
+            on_session_start_ordinary(&wt, &f.db, Some(&fx.home), false, false, &no_temp, &rec),
+            Some(4242)
+        );
+        // A linked worktree rooted at the folder that holds Library/Mobile Documents
+        // and a main that is the home folder: no view is walkable.
+        let lib = fx.add_worktree(&fx.home, &fx.home.join("Library"), "lib");
+        assert_eq!(
+            on_session_start_ordinary(&lib, &f.db, Some(&fx.home), false, false, &no_temp, &rec),
+            None
+        );
+        assert_eq!(
+            rec.args().len(),
+            1,
+            "only the dotfiles worktree was spawned"
+        );
     }
 
     #[test]

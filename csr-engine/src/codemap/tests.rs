@@ -1492,9 +1492,11 @@ fn record_signal_normalizes_the_cwd_lexically_and_skips_relative_and_disabled() 
 // ---- a view rooted above a protected folder never stats inside it ------------------------
 
 #[test]
-fn a_view_rooted_at_home_maps_nothing_inside_the_protected_folders() {
+fn a_view_rooted_at_home_is_not_a_view_so_nothing_under_it_is_walked_or_mapped() {
     let fx = Fx::new();
-    // `codemap scan --repo ~` on a dotfiles-style repo: the view is rooted at home.
+    // `codemap scan --repo ~` on a dotfiles-style repo: the view would be rooted at
+    // home. The walk crate opens a directory before any filter sees it, so a walk
+    // rooted here would open `~/Documents`; the listing drops the view instead.
     fx.git(&fx.home, &["init", "-q", "-b", "main"]);
     write(&fx.home, "src/a.py", &py(&["home_ok_fn"]));
     write(&fx.home, "Documents/x.py", &py(&["docs_tracked_fn"]));
@@ -1504,13 +1506,27 @@ fn a_view_rooted_at_home_maps_nothing_inside_the_protected_folders() {
 
     let conn = db();
     let report = scan_repo(&conn, &common_of(&fx.home), &opts(&fx)).unwrap();
-    let paths: Vec<String> = rows(&conn, &fx.home).into_iter().map(|r| r.0).collect();
-    assert_eq!(paths, vec!["src/a.py"], "{paths:?}");
-    assert_eq!(report.views[0].files, 1);
-    assert_eq!(hit_paths(&conn, "home_ok_fn"), vec!["src/a.py"]);
-    for name in ["docs_tracked_fn", "docs_untracked_fn", "desk_untracked_fn"] {
+    assert!(report.views.is_empty(), "{:?}", report.views);
+    assert!(store::stored_views(&conn, None).unwrap().is_empty());
+    for name in [
+        "home_ok_fn",
+        "docs_tracked_fn",
+        "docs_untracked_fn",
+        "desk_untracked_fn",
+    ] {
         assert!(hit_paths(&conn, name).is_empty(), "{name} was mapped");
     }
+    // And the walk itself refuses such a root, whoever offers it.
+    let found = collect_walk(
+        &fx.home,
+        &common_of(&fx.home),
+        None,
+        Some(&fx.home),
+        |_| true,
+        100,
+        walk_visit_budget(100),
+    );
+    assert!(found.files.is_empty(), "{:?}", found.files);
     assert_invariants(&conn);
 }
 

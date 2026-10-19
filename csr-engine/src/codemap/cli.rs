@@ -19,6 +19,10 @@ use crate::storage::Storage;
 
 const NOT_INITIALISED: &str = "code map not initialised";
 
+/// Why a repo none of whose views survive the home/protected-folder exclusion is
+/// not registered.
+const EXCLUDED_REPO: &str = "not registered: every worktree of this repo contains the home folder or a macOS-protected folder, and a scan would walk it";
+
 fn disabled_notice() -> &'static str {
     "code map is disabled (CSR_NO_CODEMAP=1); nothing was done"
 }
@@ -35,6 +39,9 @@ fn age(secs: i64) -> String {
 /// `codemap add <path>`: register a repo and list its views.
 pub fn add(db_path: &Path, path: &Path) -> Result<()> {
     let id = identity::identify(path)?;
+    if identity::only_excluded_views(&id.common_dir, home_dir().as_deref()) {
+        bail!("{}", EXCLUDED_REPO);
+    }
     let main = main_path_of(&id.common_dir);
     let storage = Storage::open(db_path)?;
     storage.with_connection(|conn| {
@@ -147,6 +154,9 @@ fn scan_locked<T>(
 enum SessionScan {
     /// The repo carries a `codemap remove` tombstone: nothing was written.
     Removed,
+    /// Every view of the repo contains the home folder or a protected folder:
+    /// nothing was registered or scanned.
+    Excluded,
     Done(RepoScanReport),
 }
 
@@ -163,12 +173,19 @@ fn main_path_of(common_dir: &Path) -> Option<std::path::PathBuf> {
 /// signal row: that row keeps the repo active in `status` (and in a daemon that
 /// starts later), and only the daemon's poll would resolve it. Best effort.
 /// Call it under the repo lock, after the `repo_removed` check.
+///
+/// `Ok(false)` registers nothing: every view of the repo contains the home folder
+/// or a protected folder (`identity::only_excluded_views`), so no scan may walk it.
 fn register_session_repo(
     conn: &rusqlite::Connection,
     common_dir: &Path,
     cwd: &Path,
     protected: bool,
-) -> Result<()> {
+    home: Option<&Path>,
+) -> Result<bool> {
+    if identity::only_excluded_views(common_dir, home) {
+        return Ok(false);
+    }
     let common = common_dir.to_string_lossy().to_string();
     let main = main_path_of(common_dir);
     let source = if protected { "session" } else { "signal" };
@@ -183,7 +200,7 @@ fn register_session_repo(
         let cwd = identity::normalize_lexical(cwd);
         let _ = store::signal_resolve(conn, &cwd.to_string_lossy(), Some(&common), "repo");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Has `codemap remove` tombstoned this repo (a row with `enabled = 0`)?
@@ -236,8 +253,19 @@ pub fn scan(
                     return Ok(SessionScan::Removed);
                 }
                 if session {
-                    register_session_repo(conn, &id.common_dir, path, protected)?;
+                    if !register_session_repo(
+                        conn,
+                        &id.common_dir,
+                        path,
+                        protected,
+                        home.as_deref(),
+                    )? {
+                        return Ok(SessionScan::Excluded);
+                    }
                 } else {
+                    if identity::only_excluded_views(&id.common_dir, home.as_deref()) {
+                        return Ok(SessionScan::Excluded);
+                    }
                     let main = main_path_of(&id.common_dir);
                     store::upsert_repo(
                         conn,
@@ -254,6 +282,14 @@ pub fn scan(
         match report {
             Some(SessionScan::Removed) => {
                 let line = format!("scan skipped: {common} was removed with `codemap remove`");
+                if json {
+                    println!("{}", serde_json::json!({ "skipped": line }));
+                } else {
+                    println!("{line}");
+                }
+            }
+            Some(SessionScan::Excluded) => {
+                let line = format!("scan skipped: {common} {EXCLUDED_REPO}");
                 if json {
                     println!("{}", serde_json::json!({ "skipped": line }));
                 } else {
@@ -599,11 +635,12 @@ fn drain_pass(
     if changed {
         // A repo the map has no row for (the first edit of a session with no
         // daemon) is registered here, under the lock and after the tombstone check.
-        if !store::list_repos(conn)?
+        let known = store::list_repos(conn)?
             .iter()
-            .any(|r| r.common_dir == common_str)
-        {
-            register_session_repo(conn, common, cwd, protected)?;
+            .any(|r| r.common_dir == common_str);
+        if !known && !register_session_repo(conn, common, cwd, protected, home)? {
+            println!("drain skipped: {common_str} {EXCLUDED_REPO}");
+            return Ok(Pass::Removed);
         }
         let report = scan_repo(conn, common, &ScanOpts::default())?;
         println!(
@@ -735,6 +772,81 @@ mod tests {
             "no row is left stranded"
         );
         assert!(!lock.exists(), "the drain's lock goes on the way out");
+    }
+
+    /// A repo whose main worktree is the fake home (`git init ~`), with a linked
+    /// worktree under it. Returns (common dir, linked worktree path).
+    fn home_rooted_repo(fx: &Fx) -> (std::path::PathBuf, std::path::PathBuf) {
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        write(&fx.home, "rc.py", &py(&["rc"]));
+        fx.commit_all(&fx.home, "init");
+        let wt = fx.add_worktree(&fx.home, &fx.home.join("projects/dotfiles"), "dots");
+        (fx.home.join(".git"), wt)
+    }
+
+    #[test]
+    fn a_repo_none_of_whose_views_survive_the_home_exclusion_is_not_registered() {
+        let fx = Fx::new();
+        let (common, wt) = home_rooted_repo(&fx);
+        let conn = crate::codemap::testutil::db();
+        let home = Some(fx.home.as_path());
+
+        // The linked worktree is a view: registered, for that worktree alone.
+        assert!(register_session_repo(&conn, &common, &wt, false, home).unwrap());
+        assert_eq!(store::list_repos(&conn).unwrap().len(), 1);
+
+        // Its directory gone, only the home view is left, and it is excluded.
+        let conn = crate::codemap::testutil::db();
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!register_session_repo(&conn, &common, &fx.home, false, home).unwrap());
+        assert!(
+            store::list_repos(&conn).unwrap().is_empty(),
+            "no repo row for a repo with nothing to map"
+        );
+
+        // A control repo keeps registering.
+        let ctl = fx.init_repo("ctl");
+        write(&ctl, "a.py", &py(&["a"]));
+        fx.commit_all(&ctl, "init");
+        assert!(register_session_repo(&conn, &ctl.join(".git"), &ctl, false, home).unwrap());
+        assert_eq!(store::list_repos(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_full_scan_deletes_a_stored_view_that_contains_the_home_folder() {
+        let fx = Fx::new();
+        let (common, wt) = home_rooted_repo(&fx);
+        let conn = crate::codemap::testutil::db();
+        let common_str = common.to_string_lossy().to_string();
+        let home_str = fx.home.to_string_lossy().to_string();
+        // What a database written before the exclusion holds: a view for the home.
+        store::upsert_repo(&conn, &common_str, Some(&home_str), "signal", false).unwrap();
+        store::mark_view_error(
+            &conn,
+            &store::ViewWrite {
+                common_dir: &common_str,
+                worktree_path: &home_str,
+                branch: None,
+                head_oid: None,
+                index_mtime_ns: None,
+                index_size: None,
+                scanned_at: 1,
+                status: "ok",
+                truncated: false,
+                scan_ms: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(store::stored_views(&conn, None).unwrap().len(), 1);
+
+        scan_with_home(&conn, &fx, &fx.home);
+
+        let paths: Vec<String> = store::stored_views(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.worktree_path)
+            .collect();
+        assert_eq!(paths, [wt.to_string_lossy().to_string()], "{paths:?}");
     }
 
     #[test]

@@ -793,6 +793,10 @@ impl<'a> Pump<'a> {
             .unwrap_or_default()
             .into_iter()
             .filter(|p| !is_tcc_path(p, Some(home)))
+            // A stored view that contains the home folder or a protected folder
+            // (written before `list_views_with` dropped them) is not watched; the
+            // next full scan deletes it.
+            .filter(|p| !identity::contains_tcc_root(p, Some(home)))
             // Resolved without stat'ing a protected folder: a stored root that
             // is now a symlink into one is dropped, not followed.
             .filter_map(|p| {
