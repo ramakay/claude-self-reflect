@@ -11,7 +11,6 @@
 //! every prompt would pay one ONNX forward pass per exemplar.
 
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -143,15 +142,7 @@ struct ProbeCache {
     probes: Vec<(Intent, Vec<Vec<f32>>)>,
 }
 
-fn cache_path() -> Option<PathBuf> {
-    #[cfg(test)]
-    return Some(std::env::temp_dir().join(format!(
-        "csr-test-intent-probes-{}.json",
-        std::process::id()
-    )));
-    #[cfg(not(test))]
-    dirs::home_dir().map(|h| h.join(".claude-self-reflect").join("intent_probes.json"))
-}
+const CACHE_FILE: &str = "intent_probes.json";
 
 impl ProbeSet {
     /// Load exemplar vectors from the disk cache, or embed and cache them.
@@ -159,7 +150,7 @@ impl ProbeSet {
     /// rather than blocking — hooks never block the session).
     pub async fn load_or_build(embeddings: &Arc<EmbeddingEngine>) -> Option<Self> {
         let hash = exemplar_hash();
-        if let Some(path) = cache_path() {
+        if let Some(path) = embeddings.probe_cache_path(CACHE_FILE) {
             if let Ok(bytes) = std::fs::read(&path) {
                 if let Ok(cache) = serde_json::from_slice::<ProbeCache>(&bytes) {
                     if cache.hash == hash {
@@ -191,16 +182,11 @@ impl ProbeSet {
             return None;
         }
 
-        if let Some(path) = cache_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(bytes) = serde_json::to_vec(&ProbeCache {
-                hash,
-                probes: probes.clone(),
-            }) {
-                let _ = std::fs::write(&path, bytes);
-            }
+        if let Ok(bytes) = serde_json::to_vec(&ProbeCache {
+            hash,
+            probes: probes.clone(),
+        }) {
+            embeddings.write_probe_cache(CACHE_FILE, &bytes);
         }
 
         Some(Self { probes })

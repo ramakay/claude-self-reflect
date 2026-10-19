@@ -2767,6 +2767,7 @@ fn rebuild_index_command_fails_loudly_when_the_index_directory_cannot_be_created
         .arg("--projects-dir")
         .arg(&projects_dir)
         .arg("rebuild-index")
+        .env("HOME", tmp.path().join("home"))
         .output()
         .expect("failed to run the csr-engine binary");
 
@@ -3000,6 +3001,7 @@ mod proxied_server_stays_responsive {
             .arg(dir.path().join("csr-engine.db"))
             .arg("--projects-dir")
             .arg(dir.path().join("projects"))
+            .env("HOME", dir.path().join("home"))
             .env("CSR_TOKIO_WORKERS", "1")
             .env("CSR_ENRICH_INITIAL_DELAY_SECS", "3600")
             .env_remove("CSR_NO_DAEMON_PROXY")
@@ -3104,6 +3106,38 @@ mod index_compatibility_and_damage {
             .unwrap()
     }
 
+    /// A home folder for the server under test, holding a clone of the model
+    /// cache this test process resolves: the binary finds its model under its
+    /// own `$HOME`, and a search embeds the query.
+    fn server_home(dir: &Path) -> std::path::PathBuf {
+        let home = dir.join("home");
+        let real_home = dirs::home_dir().expect("a home dir");
+        let source = dirs::cache_dir()
+            .expect("a cache dir")
+            .join("csr-engine")
+            .join("fastembed");
+        let target = home.join(source.strip_prefix(&real_home).unwrap());
+        if source.exists() && !target.exists() {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let cloned = Command::new("cp")
+                .arg("-Rc")
+                .arg(&source)
+                .arg(&target)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !cloned {
+                let _ = std::fs::remove_dir_all(&target);
+                let copied = Command::new("cp")
+                    .arg("-R")
+                    .arg(&source)
+                    .arg(&target)
+                    .status();
+                assert!(copied.unwrap().success(), "could not copy the model cache");
+            }
+        }
+        home
+    }
+
     /// One in-process MCP session (no daemon): initialize, then a search.
     /// Returns (exit success, every stdout line, stderr).
     fn serve_once(dir: &Path) -> (bool, Vec<serde_json::Value>, String) {
@@ -3112,6 +3146,7 @@ mod index_compatibility_and_damage {
             .arg(dir.join("csr-engine.db"))
             .arg("--projects-dir")
             .arg(dir.join("projects"))
+            .env("HOME", server_home(dir))
             .env("CSR_NO_DAEMON_PROXY", "1")
             .env("CSR_ENRICH_INITIAL_DELAY_SECS", "3600")
             .stdin(Stdio::piped())

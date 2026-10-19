@@ -11,9 +11,10 @@ async fn searching_hook_startup_cannot_publish_a_rebuilt_index() {
     let index = dir.path().join("index-v3");
     std::fs::create_dir(&index).unwrap();
     std::fs::write(index.join("manifest.json"), "invalid cache sentinel").unwrap();
-    let engine = csr_engine::engine::Engine::new_for_hook(
+    let engine = csr_engine::engine::Engine::new_for_hook_with_home(
         &dir.path().join("test.db"),
         &dir.path().join("projects"),
+        None,
     )
     .unwrap();
     engine.flush_index().await;
@@ -288,6 +289,7 @@ mod prompt_process {
         WARM.call_once(|| {
             let status = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
                 .arg("--version")
+                .env("HOME", std::env::temp_dir().join("csr-warm-launch-home"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -305,6 +307,7 @@ mod prompt_process {
             .arg(dir.join("csr-engine.db"))
             .arg("--projects-dir")
             .arg(dir.join("projects"))
+            .env("HOME", dir.join("home"))
             .env("CSR_TIMING_LOG", dir.join("timing.log"))
             .env("CSR_HOOK_TIMING_PROBE", "1")
             .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
@@ -1352,6 +1355,7 @@ fn non_utf8_path_arguments_do_not_panic_startup() {
             command.env("CSR_HOOK_TIMING_PROBE", "1");
         }
         let output = command
+            .env("HOME", dir.path().join("home"))
             .args(["hook", hook, "--db-path"])
             .arg(dir.path().join("csr-engine.db"))
             .arg("--projects-dir")
@@ -1406,6 +1410,7 @@ fn retired_subagent_stop_hook_is_a_silent_noop() {
             command.env("CSR_HOOK_TIMING_PROBE", "1");
         }
         let mut child = command
+            .env("HOME", dir.path().join("home"))
             .args(["hook", "subagent-stop", "--db-path"])
             .arg(dir.path().join("csr-engine.db"))
             .arg("--projects-dir")

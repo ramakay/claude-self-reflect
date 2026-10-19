@@ -1677,7 +1677,10 @@ async fn run(
             return Ok(());
         }
         let stats = if *dry_run {
-            let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new()?);
+            let embeddings = std::sync::Arc::new(
+                csr_engine::embeddings::EmbeddingEngine::new()?
+                    .with_probe_dir(args.db_path.parent().unwrap_or(std::path::Path::new("."))),
+            );
             csr_engine::transcript::intent_events::backfill_intent_events(
                 None,
                 &embeddings,

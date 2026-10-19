@@ -1265,7 +1265,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (db, projects) = seed(tmp.path());
         crate::search::vector_ipc::write_heartbeat(tmp.path());
-        let engine = crate::engine::Engine::new_proxied(&db, &projects)
+        let engine = crate::engine::Engine::new_proxied_with_home(&db, &projects, None)
             .unwrap()
             .expect("configured");
         let proxy = engine.search().read().await.proxy().unwrap().clone();

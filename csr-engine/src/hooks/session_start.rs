@@ -401,7 +401,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
             } else {
                 // C-3 fix: try rolling summary file as last-resort fallback
                 // (written by stop hook, survives Ctrl+C when DB enrichment hasn't fired)
-                if let Some(rolling) = read_rolling_summary(project_name) {
+                if let Some(rolling) = read_rolling_summary(engine.data_dir(), project_name) {
                     output.push_str(RECENT_SESSIONS_HEADER);
                     output.push_str(&format!("- {}\n", rolling));
                     output.push_str(DEEPER_CONTEXT_FOOTER);
@@ -427,7 +427,7 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
     log_session_start_injection(project_name, &output, story_count, session_count);
 
     // Write focus file for SwiftBar status plugin
-    write_focus_file(project_name, &output);
+    write_focus_file(engine.data_dir(), project_name, &output);
 
     // Agent context (stdout → Claude sees as additionalContext)
     println!("{output}");
@@ -721,12 +721,9 @@ fn sanitize_filename(name: &str) -> String {
 
 /// Read the rolling summary file written by the stop hook (C-3 fix).
 /// Returns the first non-empty line as a fallback context string.
-fn read_rolling_summary(project: &str) -> Option<String> {
-    let home = dirs::home_dir()?;
+fn read_rolling_summary(data_dir: &Path, project: &str) -> Option<String> {
     let safe_name = sanitize_filename(project);
-    let path = home
-        .join(".claude-self-reflect")
-        .join(format!("rolling-summary-{}.txt", safe_name));
+    let path = data_dir.join(format!("rolling-summary-{}.txt", safe_name));
     let content = std::fs::read_to_string(&path).ok()?;
     let first_line = content.lines().find(|l| !l.trim().is_empty())?;
     // Skip command-only/probe rolling summaries ("memory-feedback") and bare
@@ -744,20 +741,18 @@ fn read_rolling_summary(project: &str) -> Option<String> {
 
 /// Write a one-line focus description for the SwiftBar status plugin.
 /// Extracts the first meaningful line from session-start output.
-fn write_focus_file(project: &str, output: &str) {
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".claude-self-reflect").join("current-focus.txt");
-        // Extract first meaningful content line, skipping framing added for hook safety.
-        let focus = output
-            .lines()
-            .find(|l| !is_session_framing_line(l))
-            .map(focus_text_from_output_line)
-            .unwrap_or("New session");
-        // Cap at 120 chars
-        let truncated: String = focus.chars().take(120).collect();
-        let content = format!("[{}] {}", project, truncated);
-        let _ = std::fs::write(&path, content);
-    }
+fn write_focus_file(data_dir: &Path, project: &str, output: &str) {
+    let path = data_dir.join("current-focus.txt");
+    // Extract first meaningful content line, skipping framing added for hook safety.
+    let focus = output
+        .lines()
+        .find(|l| !is_session_framing_line(l))
+        .map(focus_text_from_output_line)
+        .unwrap_or("New session");
+    // Cap at 120 chars
+    let truncated: String = focus.chars().take(120).collect();
+    let content = format!("[{}] {}", project, truncated);
+    let _ = std::fs::write(&path, content);
 }
 
 fn is_session_framing_line(line: &str) -> bool {

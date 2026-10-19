@@ -1,6 +1,5 @@
 //! High-precision, abstaining reaction classifier for retrospective labels.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -329,17 +328,12 @@ struct ProbeCache {
     probes: Vec<(Reaction, Vec<Vec<f32>>)>,
 }
 
-fn cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| {
-        home.join(".claude-self-reflect")
-            .join("reaction_probes.json")
-    })
-}
+const CACHE_FILE: &str = "reaction_probes.json";
 
 impl ProbeSet {
     pub async fn load_or_build(embeddings: &Arc<EmbeddingEngine>) -> Option<Self> {
         let hash = classifier_hash();
-        if let Some(path) = cache_path() {
+        if let Some(path) = embeddings.probe_cache_path(CACHE_FILE) {
             if let Ok(bytes) = std::fs::read(&path) {
                 if let Ok(cache) = serde_json::from_slice::<ProbeCache>(&bytes) {
                     if cache.classifier_hash == hash {
@@ -369,16 +363,11 @@ impl ProbeSet {
         if probes.iter().any(|(_, vectors)| vectors.is_empty()) {
             return None;
         }
-        if let Some(path) = cache_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(bytes) = serde_json::to_vec(&ProbeCache {
-                classifier_hash: hash,
-                probes: probes.clone(),
-            }) {
-                let _ = std::fs::write(path, bytes);
-            }
+        if let Ok(bytes) = serde_json::to_vec(&ProbeCache {
+            classifier_hash: hash,
+            probes: probes.clone(),
+        }) {
+            embeddings.write_probe_cache(CACHE_FILE, &bytes);
         }
         Some(Self { probes })
     }

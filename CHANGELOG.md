@@ -474,6 +474,12 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   file) pairs committed during a session and touched by no edit tool, CSR held 0 before and 131 after (83 at the
   worktree path, 48 under the main checkout path every worktree edit is stored at). The full-text fallback of
   `csr_search_by_file` matches a path as a phrase of its tokens; it had recovered 0 of 441.
+- **The engine's own files follow its database.** The classifier probe caches, the session summary files,
+  `current-focus.txt` and the Shift Map likes log resolve beside the database, not under `~/.claude-self-reflect`
+  whatever `--db-path` says; for the default database they are the same files. A probe cache is replaced in one
+  rename, so a hook reading it while another process writes it never sees half a file. The test suites no longer read
+  or write the home folder they run under: lib, hooks_integration, integration and five more suites pass with a decoy
+  home whose files were neither read nor written.
 
 ### Known limitations
 

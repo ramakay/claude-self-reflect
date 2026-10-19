@@ -418,12 +418,8 @@ fn write_session_summary(engine: &Engine, input: &HookInput, cwd: &Path) {
         summary = format!("[{}] Session completed", project);
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let path = home
-            .join(".claude-self-reflect")
-            .join("last-session-summary.txt");
-        let _ = std::fs::write(&path, &summary);
-    }
+    let path = engine.data_dir().join("last-session-summary.txt");
+    let _ = std::fs::write(&path, &summary);
 }
 
 #[cfg(test)]
