@@ -226,9 +226,14 @@ fn extract_target_path(tool_name: &str, input: &serde_json::Value) -> Option<Str
 /// the JSONL record's own `cwd` field when the file path itself doesn't
 /// contain a `projects` component (the closest historical substitute for the
 /// live hook's `CLAUDE_PROJECT_DIR` / `MCP_CLIENT_CWD` fallbacks, neither of
-/// which have a replay equivalent).
+/// which have a replay equivalent). A temp path skips the file step, as in
+/// the live hook: a scratch file takes its session's project, not its
+/// folder name.
 fn resolve_project_for_backfill(file_path: &str, record_cwd: Option<&str>) -> String {
-    if let Some(parent) = Path::new(file_path).parent() {
+    if let Some(parent) = Path::new(file_path)
+        .parent()
+        .filter(|p| !crate::codemap::identity::is_temp_path(p))
+    {
         let parent_str = parent.to_string_lossy();
         if let Some(p) = crate::search::cross_project::resolve_project_from_cwd(&parent_str) {
             if !p.is_empty() {
@@ -464,6 +469,24 @@ mod tests {
         // canonical_repo_path falls back to the input path when nothing on
         // disk exists to canonicalize against (no .git ancestor in tmpdir).
         assert!(ev.file_path.ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn extract_events_files_a_scratch_edit_under_its_session_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = edit_line(
+            "/private/tmp/claude-501/-Users-me-projects-demo/sess-1/scratchpad/fix.py",
+            "2026-01-01T00:00:00.000Z",
+        );
+        let proj = tmp.path().join("-Users-me-projects-demo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let jsonl = proj.join("conv-tmp.jsonl");
+        let mut f = std::fs::File::create(&jsonl).unwrap();
+        writeln!(f, "{line}").unwrap();
+
+        let events = extract_events(&jsonl, "conv-tmp").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].project_name, "demo");
     }
 
     #[test]
