@@ -12,7 +12,7 @@ title: Privacy & Security
 | Storage | No — SQLite |
 | MCP server | No — stdio |
 
-**Zero network connections** by default. No telemetry.
+The index, search and storage run on your machine, and CSR sends no telemetry. A few features do use the network or a model. The section Network and model use, below, lists each one with its off switch.
 
 ## Consent-Gated Activation
 
@@ -22,11 +22,15 @@ Installing CSR does not activate it. Nothing is written to `~/.claude/settings.j
 
 The code map only reads your repos: it runs no git command that writes and refreshes no index. It is stored in the local SQLite database. The daemon never opens `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or `/Volumes`, so the macOS privacy prompt never fires for it; a session working in one of those folders maps its own repo. `CSR_NO_CODEMAP=1` turns the code map off.
 
-## Optional Cloud: AI Narratives
+## Network and model use
 
-Only Layer 3 sends text to a cloud model. It runs through `claude -p`, so it uses your existing Claude Code login and no API key. Running `csr-engine daemon` starts it. Set `CSR_NO_AI_NARRATIVES=1` to turn it off.
+- **Embedding model download.** The first run downloads the embedding model (AllMiniLM-L6-v2, about 87 MB on disk) into your user cache folder, `csr-engine/fastembed`. After that, embeddings run locally.
+- **SessionStart briefing.** The hook that setup installs runs `claude -p` with your Claude Code login and no API key. It runs at most once per 30 minutes per project, and only when that project's episodes changed. `CSR_NO_AI_NARRATIVES=1` turns it off.
+- **Daemon narratives (Layer 3).** These run through `claude -p` too, and only while `csr-engine daemon` runs. `CSR_NO_AI_NARRATIVES=1` turns them off.
+- **Batch API narrator.** This runs only when `ANTHROPIC_API_KEY` is set in the environment of the daemon or of the MCP server. The MCP server runs these loops itself when no daemon is live. Cost: ~$0.012/conversation. Unset the key to stop it.
+- **Companion Dreams.** Dreams is on by default once the companion plugin is installed. It forks the session's model for one "what if...?" look, budgeted to about 1 token for every 10 Claude spends. Turn it off with Dreams in `/config`.
 
-The daemon's separate Batch API narrator runs only if `ANTHROPIC_API_KEY` is set. Cost: ~$0.012/conversation.
+`CSR_NO_AI_NARRATIVES=1` covers the briefing and the daemon narratives only. Dreams has its own switch, and the Batch API narrator stops when the key is unset. No single setting turns off all of these.
 
 ## Data
 
