@@ -609,7 +609,18 @@ fn untracked_walk(
         // receives it, sees the spent budget and stops: a rejected entry is
         // never yielded, so rejecting everything would leave the crate looping
         // over the rest of the directory.
-        if counter.fetch_add(1, Ordering::Relaxed) >= visit_budget {
+        let over = counter.fetch_add(1, Ordering::Relaxed) >= visit_budget;
+        // A protected folder (`~/Documents` under a view rooted at `$HOME`) is
+        // refused lexically BEFORE any filesystem call, the `lstat` of its
+        // `.gitignore` included: that stat is what macOS prompts for. The walk is
+        // the sequential `ignore::Walk` (`builder.build()`), which runs this
+        // closure on the caller's thread, so a session child's thread-local scope
+        // (`identity::session_scope`) is visible here and a view inside the
+        // session's own protected folder still walks its own tree.
+        if is_tcc_path(entry.path(), home.as_deref()) {
+            return false;
+        }
+        if over {
             return !(is_dir && ignore_dir_has_protected_link(entry.path(), home.as_deref()));
         }
         if let Some(only) = &only {
@@ -807,10 +818,16 @@ fn collect_view(
     // stat'ed (and read) when every directory above it is safe.
     let mut dir_memo: HashMap<String, bool> = HashMap::new();
     for e in &entries {
+        let abs = view.worktree_path.join(&e.path);
+        // A view rooted above a protected folder (an explicit `codemap scan
+        // --repo ~`) tracks files inside it: refuse them lexically, before the
+        // `lstat` of any parent, which would itself touch the folder.
+        if is_tcc_path(&abs, home.as_deref()) {
+            continue;
+        }
         if !parent_dirs_safe(&view.worktree_path, &e.path, &mut dir_memo, home.as_deref()) {
             continue; // a link into a protected folder: skipped as if deleted
         }
-        let abs = view.worktree_path.join(&e.path);
         let Some(st) = stat_regular(&abs) else {
             continue; // deleted, or not a regular file any more
         };
