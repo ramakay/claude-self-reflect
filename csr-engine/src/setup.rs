@@ -63,10 +63,9 @@ pub async fn handle(
 
     // Step 3: Install hooks
     eprintln!("[3/7] Installing hooks...");
-    if let Err(e) = hooks::install::handle(true) {
-        eprintln!("  Warning: hook installation failed: {e}");
-        eprintln!("  You can run `csr-engine hook install --apply` later.");
-    }
+    // Like the MCP step: a failure does not cost the user the import, but it
+    // is carried to the summary instead of being dropped after this warning.
+    let hook_error = hook_install_step(|| hooks::install::handle(true));
 
     // Step 4: Import conversations
     eprintln!("[4/7] Importing conversations...");
@@ -246,17 +245,22 @@ pub async fn handle(
     let reflections = eng.storage().count_reflection_embeddings().unwrap_or(0);
     let projects = eng.storage().count_projects().unwrap_or(0);
 
-    if let Some(failure) = mcp_error {
+    if mcp_error.is_some() || hook_error.is_some() {
         eprintln!("\n=== Setup Incomplete ===\n");
         eprintln!("  Conversations: {}", conversations);
         eprintln!("  Reflections:   {}", reflections);
         eprintln!("  Projects:      {}", projects);
         eprintln!();
-        eprintln!("  Hooks and import are done. {}", failure.summary);
-        eprintln!("  {}", failure.detail);
+        eprint!(
+            "{}",
+            incomplete_report(mcp_error.as_ref(), hook_error.as_deref())
+        );
         eprintln!();
         // Short on purpose: the detail above is the only copy the user reads.
-        return Err(anyhow::anyhow!("MCP server not registered"));
+        return Err(anyhow::anyhow!(incomplete_error(
+            mcp_error.is_some(),
+            hook_error.is_some()
+        )));
     }
 
     // The engine steps all succeeded: now the companion. Not part of the numbered
@@ -285,6 +289,52 @@ pub async fn handle(
     eprint!("{}", next_steps(companion_outcome.as_ref()));
 
     Ok(())
+}
+
+/// Run the hook install and keep its failure for the summary. The error is
+/// flattened to one line; the remedy is printed once, by `incomplete_report`.
+fn hook_install_step(install: impl FnOnce() -> Result<()>) -> Option<String> {
+    match install() {
+        Ok(()) => None,
+        Err(e) => {
+            eprintln!("  Warning: hook installation failed: {e}");
+            Some(e.to_string())
+        }
+    }
+}
+
+/// The body of the "Setup Incomplete" summary: what failed, what still works,
+/// and the commands that fix it. At least one of the two must have failed.
+fn incomplete_report(mcp: Option<&McpFailure>, hook_error: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(error) = hook_error {
+        out.push_str(&format!(
+            "  Hooks are NOT installed: {error}\n  Automatic recall is inactive until they are. Run: csr-engine hook install --apply\n"
+        ));
+    }
+    if let Some(failure) = mcp {
+        let done = if hook_error.is_some() {
+            "The import is done."
+        } else {
+            "Hooks and import are done."
+        };
+        out.push_str(&format!(
+            "  {done} {}\n  {}\n",
+            failure.summary, failure.detail
+        ));
+    } else {
+        out.push_str("  The import and the MCP registration are done.\n");
+    }
+    out
+}
+
+/// The short error `handle` returns for an incomplete setup (non-zero exit).
+fn incomplete_error(mcp_failed: bool, hooks_failed: bool) -> &'static str {
+    match (mcp_failed, hooks_failed) {
+        (true, true) => "MCP server not registered and hooks not installed",
+        (true, false) => "MCP server not registered",
+        _ => "hooks not installed",
+    }
 }
 
 /// The two commands that install the companion plugin (the pane, and the dreamer's
@@ -1382,6 +1432,41 @@ mod tests {
         assert!(
             matches!(ran, Some(CompanionOutcome::Installed(_))),
             "{ran:?}"
+        );
+    }
+
+    #[test]
+    fn hook_install_failure_is_carried_not_dropped() {
+        let carried = hook_install_step(|| Err(anyhow::anyhow!("settings.json is not valid JSON")));
+        assert_eq!(carried.as_deref(), Some("settings.json is not valid JSON"));
+        assert_eq!(hook_install_step(|| Ok(())), None);
+
+        let report = incomplete_report(None, carried.as_deref());
+        assert!(report.contains("Hooks are NOT installed: settings.json is not valid JSON"));
+        assert!(report.contains("Automatic recall is inactive"));
+        assert!(report.contains("csr-engine hook install --apply"));
+        assert!(report.contains("MCP registration are done"), "{report}");
+        // the same non-zero status the MCP failure path returns
+        assert_eq!(incomplete_error(false, true), "hooks not installed");
+        assert_eq!(incomplete_error(true, false), "MCP server not registered");
+    }
+
+    #[test]
+    fn incomplete_report_keeps_the_mcp_wording_and_adds_the_hooks() {
+        let mcp = mcp_registration_error("/bin/csr-engine", "boom", &PriorEntry::None);
+        let only_mcp = incomplete_report(Some(&mcp), None);
+        assert!(
+            only_mcp.starts_with("  Hooks and import are done. The MCP server is NOT registered:")
+        );
+        assert!(!only_mcp.contains("Hooks are NOT installed"));
+
+        let both = incomplete_report(Some(&mcp), Some("disk full"));
+        assert!(both.contains("Hooks are NOT installed: disk full"));
+        assert!(both.contains("  The import is done. The MCP server is NOT registered:"));
+        assert!(!both.contains("Hooks and import are done"));
+        assert_eq!(
+            incomplete_error(true, true),
+            "MCP server not registered and hooks not installed"
         );
     }
 
