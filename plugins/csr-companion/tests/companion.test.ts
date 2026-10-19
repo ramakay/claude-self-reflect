@@ -74,6 +74,10 @@ type World = {
   sources?: Partial<Record<SettingsSource, Record<string, unknown>>>
   configDir?: string
   noNode?: boolean
+  engineBin?: string
+  engineAccept?: string | false
+  engineReply?: string
+  privateFailure?: string
   forkGate?: Promise<void> // a fork that answers only once this settles
   git?: Record<string, string> // what `git -C dir <args>` prints, keyed by the args; missing ones fail
   gitIn?: Record<string, Record<string, string>> // the same, for each -C directory on its own
@@ -231,6 +235,7 @@ function host(on: On, world: World) {
     if (world.herdr && e.name === 'HERDR_PANE_ID') return { value: 'w2:p1' }
     if (world.herdr && e.name === 'HERDR_BIN_PATH') return { value: '/bin/herdr' }
     if (e.name === 'HOME') return { value: HOME }
+    if (e.name === 'CSR_ENGINE_BIN') return { value: world.engineBin }
     if (e.name === 'CLAUDE_CONFIG_DIR') return { value: world.configDir }
     return { value: undefined }
   })
@@ -265,7 +270,12 @@ function host(on: On, world: World) {
       return said === undefined ? { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } } : ok(said)
     }
     if (e.argv[0] === 'node' && world.noNode) return { value: { exitCode: 127, stdout: '', stderr: 'node: not found', isStdoutTruncated: false, isStderrTruncated: false } }
-    if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/private.py')) { // `private.py write PATH [--redact]`: text on stdin, kept 0600
+    if (e.argv[1] === 'companion' && e.argv[2] === '--version') {
+      if (world.engineAccept === false || (typeof world.engineAccept === 'string' && e.argv[0] !== world.engineAccept)) return { value: { exitCode: 127, stdout: '', stderr: 'missing', isStdoutTruncated: false, isStderrTruncated: false } }
+      return ok(world.engineReply ?? 'csr-engine-companion 10.1.0\n')
+    }
+    if (e.argv[1] === 'companion' && e.argv[2] === 'private') { // private write PATH: text on stdin, kept 0600
+      if (world.privateFailure === e.argv[4]) return { value: { exitCode: 1, stdout: '', stderr: 'write refused', isStdoutTruncated: false, isStderrTruncated: false } }
       files.set(e.argv[4] as string, e.init?.stdin ?? '')
       writes.push(e.argv[4] as string)
       return ok('')
@@ -381,10 +391,30 @@ test('session start in herdr: no status line, old pane closed, new split watches
   expect(seen.runs).toContainEqual(['/bin/herdr', 'pane', 'rename', 'w2:p9', 'CSR'])
   const watcher = seen.runs.find(argv => argv.includes('--watch'))
   expect(watcher?.slice(0, 4)).toEqual(['/bin/herdr', 'pane', 'run', 'w2:p9'])
-  expect(watcher?.some(arg => arg.endsWith('/bin/pane_guard.py'))).toBe(true) // the guard runs pane.py, and outlives a broken edit
+  expect(watcher?.slice(4, 7)).toEqual([`${HOME}/.local/bin/csr-engine`, 'companion', 'pane'])
   expect(watcher?.slice(-4)).toEqual(['--sid', 'sess-1', '--agent', 'w2:p1']) // a second click on a row types into Claude's pane
   expect(seen.runs.find(argv => argv[0] === 'python3')).toEqual(expect.arrayContaining(['--json', '--sid', 'sess-1']))
   expect(seen.opened).toEqual([])
+})
+
+test('a missing engine opens no herdr split and says so once per session', async ($, on) => {
+  const seen = host(on, { herdr: true, repo: true, engineAccept: false })
+  await $.session.start(START as never)
+  await settle(() => seen.toasts.some(text => text.includes('CSR engine missing')))
+  await $.session.start(START as never)
+  expect(seen.runs.some(argv => argv[2] === 'split')).toBe(false)
+  expect(seen.toasts.filter(text => text.includes('CSR engine missing'))).toHaveLength(1)
+  expect(seen.runs.filter(argv => argv[1] === 'companion' && argv[2] === '--version')).toHaveLength(2)
+})
+
+test('engine discovery tries the override then the manifest and caches the probe', async ($, on) => {
+  const seen = host(on, { herdr: true, repo: true, engineBin: '/custom/csr-engine', engineAccept: '/manifest/csr-engine', files: {
+    [`${HOME}/.claude-self-reflect/csr-companion/engine.json`]: JSON.stringify({ path: '/manifest/csr-engine' }),
+  } })
+  await $.session.start(START as never)
+  await settle(() => seen.runs.some(argv => argv.includes('--watch')))
+  expect(seen.runs.find(argv => argv.includes('--watch'))?.slice(4, 7)).toEqual(['/manifest/csr-engine', 'companion', 'pane'])
+  expect(seen.runs.filter(argv => argv[1] === 'companion' && argv[2] === '--version').map(argv => argv[0])).toEqual(['/custom/csr-engine', '/manifest/csr-engine'])
 })
 
 test('session start outside herdr opens the Claude Code pane instead', async ($, on) => {
@@ -1583,8 +1613,8 @@ test('/csr statusline on copies the wrapper out of the plugin, backs up the file
   expect(Object.keys(JSON.parse(seen.files.get(USER) ?? '{}'))).toEqual(['model', 'statusLine', 'hooks', 'theme'])
   expect(seen.writes).toEqual([STABLE, BACKUP, USER])
   expect(seen.writes.some(path => path.includes('/csr-companion/bin/'))).toBe(false) // never into the plugin's folder
-  // The companion's own files go through bin/private.py (0700 folders, 0600 files); the person's settings.json does not.
-  const private_ = seen.runs.filter(argv => (argv[2] ?? '').endsWith('/bin/private.py')).map(argv => argv[4])
+  // The companion's own files go through the private writer; the person's settings.json does not.
+  const private_ = seen.runs.filter(argv => argv[1] === 'companion' && argv[2] === 'private').map(argv => argv[4])
   expect(private_).toEqual([STABLE, BACKUP])
   expect(seen.store.get('statusline')).toEqual({ original: ORIGINAL, wrapped: WRAPPED })
 })
@@ -3057,4 +3087,47 @@ test('the dreamer reads the claimed reports in the agents\' words, and the runni
   expect(prompt).toContain('Still at work, for context only (nothing to ask about yet): Plan (running).')
   expect(prompt).not.toContain('[[CSR:AGENTS') // the machine envelope is not what the dreamer reads
   expect(prompt).toContain('Do not dream about an agent that is running, stalled, failed, killed or reported nothing.')
+})
+
+
+test('statusline never updates settings when the private writer is missing', async ($, on) => {
+  const raw = fileOf(lineOf(ORIGINAL))
+  const seen = host(on, { herdr: false, repo: true, engineAccept: false, files: { [USER]: raw } })
+  expect(await csr($, 'statusline on')).toContain('engine missing')
+  expect(seen.files.get(USER)).toBe(raw)
+  expect(seen.store.has('statusline')).toBe(false)
+})
+
+test('statusline stops before settings when either private write fails', async ($, on) => {
+  const seen = host(on, { herdr: false, repo: true, privateFailure: BACKUP,
+    files: { [USER]: fileOf(lineOf(ORIGINAL)) } })
+  expect(await csr($, 'statusline on')).toContain('private write failed')
+  expect(seen.files.get(USER)).toBe(fileOf(lineOf(ORIGINAL)))
+  expect(seen.store.has('statusline')).toBe(false)
+})
+
+test('engine discovery rejects an unrelated version response', async ($, on) => {
+  const seen = host(on, { herdr: true, repo: true, engineReply: 'another-engine 1.0' })
+  await $.session.start(START as never)
+  await settle(() => seen.toasts.some(text => text.includes('CSR engine missing')))
+  expect(seen.runs.some(argv => argv.includes('--watch'))).toBe(false)
+})
+
+test('engine discovery skips relative overrides and manifest paths', async ($, on) => {
+  const seen = host(on, { herdr: true, repo: true, engineBin: 'relative/engine', files: {
+    [`${HOME}/.claude-self-reflect/csr-companion/engine.json`]: JSON.stringify({ path: '../engine' }),
+  } })
+  await $.session.start(START as never)
+  await settle(() => seen.runs.some(argv => argv.includes('--watch')))
+  const probes = seen.runs.filter(argv => argv[1] === 'companion' && argv[2] === '--version')
+  expect(probes.some(argv => argv[0] === 'relative/engine' || argv[0] === '../engine')).toBe(false)
+})
+
+test('statusline never updates settings when the wrapper write fails', async ($, on) => {
+  const raw = fileOf(lineOf(ORIGINAL))
+  const seen = host(on, { herdr: false, repo: true, privateFailure: STABLE, files: { [USER]: raw } })
+  expect(await csr($, 'statusline on')).toContain('private write failed')
+  expect(seen.files.get(USER)).toBe(raw)
+  expect(seen.files.has(BACKUP)).toBe(false)
+  expect(seen.store.has('statusline')).toBe(false)
 })

@@ -36,6 +36,7 @@ type World = {
   hold?: (argv: readonly string[]) => Promise<void> | undefined // a process.run that answers only once this settles
   said?: (e: { tool: string; command?: string }) => string // what a tool call answers
   holdHome?: () => Promise<void> | undefined // a HOME lookup that answers only once this settles
+  privateFails?: (path: string, text: string) => boolean // the engine's private writer exits 1 for these
 }
 
 function world(on: On, w: World) {
@@ -68,7 +69,9 @@ function world(on: On, w: World) {
       const said = w.git?.[e.argv.slice(3).join(' ')]
       return said === undefined ? fail : ok(said)
     }
-    if ((e.argv[2] ?? '').endsWith('/bin/private.py')) { // `private.py write PATH [--redact]`: text on stdin, kept 0600
+    if (e.argv[1] === 'companion' && e.argv[2] === '--version') return ok('csr-engine-companion 10.1.0\n')
+    if (e.argv[1] === 'companion' && e.argv[2] === 'private') { // `engine private write PATH [--redact]`: text on stdin, kept 0600
+      if (w.privateFails?.(e.argv[4] as string, e.init?.stdin ?? '')) return fail
       files.set(e.argv[4] as string, e.init?.stdin ?? '')
       return ok('')
     }
@@ -702,6 +705,24 @@ test('a pane.py that does not answer never stops the high edge: past it, from th
   expect(seen.compacted.length).toBe(1)
   expect(seen.compactsLogged().at(-1)).toEqual(expect.objectContaining({ event: 'compact', forced: true, payback: null }))
   expect(seen.appended()[0]).toBe('CSR compacted at 300k → 21k · kept: 1 running agent')
+})
+
+test('a private writer that fails never stops a compaction: the plan and marker files only feed the pane', AUTO, async ($, on) => {
+  const seen = world(on, { ctx: 300_000, privateFails: () => true })
+  await fromPhone($)
+  await turn($, 'Still going.', [AGENT])
+  expect(seen.compacted.length).toBe(1)
+  expect(seen.compactsLogged().at(-1)).toEqual(expect.objectContaining({ event: 'compact' }))
+})
+
+// The marker is cleared in the compaction hook's finally. Here rm leaves the marker, so it is overwritten as ended,
+// and that write fails. The kit drops the messages on an AUTO compaction (see above), so the call is made here.
+test('a marker that cannot be cleared leaves exactly one compaction', AUTO, async ($, on) => {
+  const seen = world(on, { ctx: 300_000, privateFails: (path, text) => path.includes('/compacting/') && text.includes('ended') })
+  const messages = [{ role: 'user', text: 'one', toolUses: [] }, { role: 'assistant', text: 'done', toolUses: [] }]
+  await $.session.compact({ trigger: 'plugin', instructions: 'keep', messages } as never)
+  expect(seen.runs.filter(argv => argv[2] === 'private' && String(argv[4]).includes('/compacting/')).length).toBe(2)
+  expect(seen.compacted.length).toBe(1)
 })
 
 test('a compaction a hook vetoes is logged as a skip, and the plan says so', AUTO, async ($, on) => {

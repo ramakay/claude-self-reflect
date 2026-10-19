@@ -157,7 +157,8 @@ function world() {
     process: { run: async (argv, init) => {
       runs.push(argv)
       let stdout = '{}'
-      if (argv.some(arg => arg.endsWith('/private.py'))) await $.fs.write(argv[4], init.stdin) // bin/private.py write PATH, text on stdin
+      if (argv[1] === 'companion' && argv[2] === '--version') stdout = 'csr-engine-companion 10.1.0\n'
+      else if (argv[1] === 'companion' && argv[2] === 'private' && argv[3] === 'write') await $.fs.write(argv[4], init.stdin)
       else if (argv.some(arg => arg.endsWith('/lease.py'))) stdout = JSON.stringify({ held: leaseHeld })
       else if (argv.includes('--brief')) stdout = '* The current work has a side branch.'
       else if (argv.includes('--keep')) records.push(JSON.parse(argv[argv.indexOf('--keep') + 1]))

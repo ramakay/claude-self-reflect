@@ -93,7 +93,8 @@ function host(on: On, world: World = {}) {
   on('fs.read', async (_$, e) => (e.path.endsWith('.drafts.jsonl') && world.drafts !== undefined ? { value: world.drafts } : { deny: `ENOENT: ${e.path}` }) as never)
   on('prompt.submit', async (_$, e) => ({ text: e.text }))
   on('process.run', async (_$, e) => {
-    if (e.argv[0] === 'python3' && (e.argv[2] ?? '').endsWith('/bin/private.py')) { // private.py write PATH [--redact-json], text on stdin
+    if (e.argv[1] === 'companion' && e.argv[2] === '--version') return { value: { exitCode: 0, stdout: 'csr-engine-companion 10.1.0\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[1] === 'companion' && e.argv[2] === 'private') { // engine private write PATH [--redact-json], text on stdin
       world.writes?.push({ path: e.argv[4] as string, text: e.init?.stdin ?? '', flags: e.argv.slice(5) })
     }
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }

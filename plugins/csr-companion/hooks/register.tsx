@@ -39,19 +39,49 @@ import { CHOICES, dueSteps, heading, LINES, refusedText, STEPS } from './setup'
 // your past sessions, in a herdr split beside Claude.
 const script = ($: EngineInterface) => `${$.plugin.root}/bin/pane.py`
 
-// Everything written into the companion's folder (~/.claude-self-reflect/csr-companion) goes through bin/private.py:
-// $.fs.write has no mode to ask for, and a file it makes is 0644 in a 0755 folder, readable by every local user, where
-// the folder holds text from your transcripts. private.py makes the folders 0700 and the file 0600, and with `redact`
-// removes keys, bearer tokens, password=/token= values and PEM blocks from the text first. Rejects when it could not.
-// Files that are the person's own (settings.json, CLAUDE.md) are not the companion's and keep $.fs.write.
-// `redact`: 'text' removes credentials from plain text; 'json' parses the JSON, redacts the strings in it and
-// serializes it again (redacting the serialized form would break its escaping and could leave the secret in).
+const engines = new Map<string, Promise<string | null>>()
+async function engine($: EngineInterface): Promise<string | null> {
+  const session = await $.session.id()
+  let found = engines.get(session)
+  if (!found) {
+    found = (async () => {
+      const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+      const override = await $.env.get('CSR_ENGINE_BIN')
+      const candidates = override?.startsWith('/') ? [override] : []
+      if (home) {
+        try {
+          const kept = JSON.parse(await $.fs.read(`${home}/.claude-self-reflect/csr-companion/engine.json`))
+          if (typeof kept?.path === 'string' && kept.path.startsWith('/')) candidates.push(kept.path)
+        } catch {}
+        candidates.push(`${home}/.local/bin/csr-engine`)
+      }
+      candidates.push('csr-engine')
+      for (const binary of new Set(candidates.filter((p): p is string => !!p))) {
+        try {
+          const probe = await $.process.run([binary, 'companion', '--version'], { timeoutMs: 10_000 })
+          if (probe.exitCode === 0 && /^csr-engine-companion \S+$/.test(probe.stdout.trim())) return binary
+        } catch {}
+      }
+      $.ui.toast('CSR engine missing: npx claude-self-reflect setup')
+      return null
+    })()
+    engines.set(session, found)
+  }
+  return found
+}
+
+// Everything in the companion folder goes through the engine's private writer:
+// $.fs.write has no mode to ask for and makes files 0644 in a 0755 folder, readable
+// by every local user, where the folder holds text from your transcripts. The
+// writer keeps folders 0700 and files 0600. JSON is parsed before redaction so
+// credentials inside escaped strings cannot survive it.
 async function keepWrite($: EngineInterface, path: string, text: string, redact?: 'text' | 'json'): Promise<void> {
+  const binary = await engine($)
+  if (!binary) throw new Error('CSR engine missing: private write was not performed')
   const flag = redact === 'json' ? ['--redact-json'] : redact === 'text' ? ['--redact'] : []
-  const ran = await $.process.run(['python3', '-I', `${$.plugin.root}/bin/private.py`, 'write', path, ...flag], { stdin: text, timeoutMs: 10_000 })
+  const ran = await $.process.run([binary, 'companion', 'private', 'write', path, ...flag], { stdin: text, timeoutMs: 10_000 })
   if (ran.exitCode !== 0) throw new Error(`private write failed: ${ran.stderr.trim()}`)
 }
-const guard = ($: EngineInterface) => `${$.plugin.root}/bin/pane_guard.py` // runs pane.py, and outlives an edit that breaks it
 const PANE = 'csr'
 const LABEL = 'CSR'
 const STAR = '☾' // CSR's mark where You should know draws its ✦
@@ -1320,6 +1350,7 @@ async function showPlan($: EngineInterface, state: string, text: string | null, 
   const done = planQueue.then(async () => {
     if (!currentPlan(op)) return
     await update($, infinite, current => (currentPlan(op) ? { plan: text, story: current?.story ?? null } : current))
+    // The plan file only feeds the pane: a failed write never stops the plan or a compaction.
     if (path && currentPlan(op)) await keepWrite($, path, JSON.stringify({ at, state, text, ...extra }), 'json').catch(() => undefined)
   })
   planQueue = done.catch(() => undefined)
@@ -2644,6 +2675,8 @@ async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> 
   const self = await $.env.get('HERDR_PANE_ID')
   const herdr = (await $.env.get('HERDR_BIN_PATH')) ?? 'herdr'
   if (!self) return false
+  const binary = await engine($)
+  if (!binary) return false
   // Claude's own space and tab, asked of herdr by its pane id: the old CSR pane is looked for there,
   // whichever space you are looking at when the session starts.
   const got = await $.process.run([herdr, 'pane', 'get', self])
@@ -2678,7 +2711,9 @@ async function openHerdrPane($: EngineInterface, cwd: string): Promise<boolean> 
   if (!id) return false
   await $.process.run([herdr, 'pane', 'rename', id, LABEL])
   const session = await $.session.id()
-  await $.process.run([herdr, 'pane', 'run', id, 'python3', '-I', guard($), '--repo', cwd, '--watch', '--sid', session, '--agent', self])
+  // The engine's watch catches a failing frame and re-execs when its binary changes,
+  // so the split survives both a broken frame and an engine update.
+  await $.process.run([herdr, 'pane', 'run', id, binary, 'companion', 'pane', '--repo', cwd, '--watch', '--sid', session, '--agent', self])
   return true
 }
 
@@ -2873,6 +2908,7 @@ async function markCompacting($: EngineInterface, trigger: string): Promise<stri
 }
 
 // Removed with rm; where that cannot run, the marker is overwritten as ended, which the pane reads as none.
+// It runs in the compaction hook's finally, so nothing here throws.
 async function unmarkCompacting($: EngineInterface, path: string): Promise<void> {
   try {
     await $.process.run(['rm', '-f', path], { timeoutMs: 5_000 })
