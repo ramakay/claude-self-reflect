@@ -7,8 +7,9 @@ title: Installation
 - **macOS** (Apple Silicon) or **Linux** (x86_64 / ARM64)
 - **Claude Code** CLI installed
 - ~50MB disk for binary, ~100MB for database
+- For the optional companion pane: Claude Code 2.1.296 or later, and `python3` 3.9 or later on your PATH (the macOS system `python3` is 3.9)
 
-No Docker. No Python. No API keys.
+No Docker and no API keys. The engine needs no Python. Only the companion pane runs `python3`.
 
 ## Install
 
