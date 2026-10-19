@@ -661,11 +661,39 @@ fn drain_pass(
             report.paths, report.updated, report.removed, report.unchanged
         );
     }
-    // Only the rows this pass saw: one re-enqueued meanwhile keeps its newer stamp.
-    for (p, at, _) in &owned {
-        store::queue_delete_upto(conn, p, *at)?;
-    }
+    ack_owned_rows(conn, common, home, &owned)?;
     Ok(Pass::Worked)
+}
+
+/// Delete the queue rows a drain pass handled, but only those this repo still
+/// owns. `before` is the pass's snapshot (`session::owned_rows`), taken before the
+/// repo lock and the scan. A nested repo may have stored its first view since: its
+/// scan could have read the file before the edit, so the row now belongs to that
+/// repo's drain (or the daemon's pump) and stays queued. The view roots and the
+/// owned rows are read again here for that reason.
+///
+/// Each delete is `queue_delete_upto(path, stamp)` with the snapshot's stamp: a row
+/// re-enqueued meanwhile keeps its newer stamp. Returns the rows deleted.
+fn ack_owned_rows(
+    conn: &rusqlite::Connection,
+    common: &Path,
+    home: Option<&Path>,
+    before: &[(String, i64, std::path::PathBuf)],
+) -> Result<usize> {
+    let (_, live, stored) = view_roots(conn, common, home)?;
+    let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+    let still_ours: std::collections::HashSet<String> =
+        super::session::owned_rows(conn, &common.to_string_lossy(), &roots, home)?
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+    let mut deleted = 0usize;
+    for (p, at, _) in before {
+        if still_ours.contains(p) {
+            deleted += store::queue_delete_upto(conn, p, *at)?;
+        }
+    }
+    Ok(deleted)
 }
 
 fn stamp() -> String {
@@ -977,6 +1005,101 @@ mod tests {
             vec![b.join("src/lib.py").to_string_lossy().to_string()],
             "A's row is gone, B's stays for B's own drain"
         );
+    }
+
+    /// A's snapshot of the rows it owns, as `drain_pass` takes it.
+    fn snapshot(
+        conn: &rusqlite::Connection,
+        fx: &Fx,
+        a: &Path,
+    ) -> Vec<(String, i64, std::path::PathBuf)> {
+        let home = Some(fx.home.as_path());
+        let (_, live, stored) = view_roots(conn, &a.join(".git"), home).unwrap();
+        let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+        session::owned_rows(conn, &a.join(".git").to_string_lossy(), &roots, home).unwrap()
+    }
+
+    #[test]
+    fn a_drain_keeps_the_row_of_a_nested_repo_that_stored_its_first_view_during_the_pass() {
+        let fx = Fx::new();
+        let a = fx.init_repo("a");
+        write(&a, "src/a.py", &py(&["alpha"]));
+        fx.commit_all(&a, "init a");
+        let b = a.join("inner");
+        std::fs::create_dir_all(&b).unwrap();
+        fx.git(&b, &["init", "-q", "-b", "main"]);
+        write(&b, "src/lib.py", &py(&["beta"]));
+        fx.commit_all(&b, "init b");
+        let b = std::fs::canonicalize(&b).unwrap();
+        let conn = crate::codemap::testutil::db();
+        let home = Some(fx.home.as_path());
+        scan_with_home(&conn, &fx, &a);
+        let (pa, pb) = (a.join("src/a.py"), b.join("src/lib.py"));
+        let (pa, pb) = (
+            pa.to_string_lossy().to_string(),
+            pb.to_string_lossy().to_string(),
+        );
+        store::queue_push(&conn, &pa, 10).unwrap();
+        store::queue_push(&conn, &pb, 10).unwrap();
+
+        // A's snapshot: B has no stored view yet, so B's file lies in A's view.
+        let before = snapshot(&conn, &fx, &a);
+        let mut owned: Vec<&str> = before.iter().map(|(p, _, _)| p.as_str()).collect();
+        owned.sort();
+        let mut want = vec![pa.as_str(), pb.as_str()];
+        want.sort();
+        assert_eq!(owned, want, "both rows are A's at snapshot time");
+
+        // While A's pass runs, B stores its first view (its scan may have read the
+        // file before the edit).
+        scan_with_home(&conn, &fx, &b);
+
+        let deleted = ack_owned_rows(&conn, &a.join(".git"), home, &before).unwrap();
+        assert_eq!(deleted, 1);
+        let left: Vec<String> = store::queue_read(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            left,
+            [pb],
+            "B's row stays for B's drain; A's own row is gone"
+        );
+    }
+
+    #[test]
+    fn a_drain_keeps_a_row_enqueued_again_after_its_snapshot() {
+        let fx = Fx::new();
+        let a = fx.init_repo("a");
+        write(&a, "src/a.py", &py(&["alpha"]));
+        fx.commit_all(&a, "init a");
+        let conn = crate::codemap::testutil::db();
+        let home = Some(fx.home.as_path());
+        scan_with_home(&conn, &fx, &a);
+        let pa = a.join("src/a.py").to_string_lossy().to_string();
+        store::queue_push(&conn, &pa, 10).unwrap();
+        let before = snapshot(&conn, &fx, &a);
+        assert_eq!(before.len(), 1);
+
+        // The hook queued the same file again with a newer stamp.
+        store::queue_push(&conn, &pa, 20).unwrap();
+        assert_eq!(
+            ack_owned_rows(&conn, &a.join(".git"), home, &before).unwrap(),
+            0
+        );
+        assert_eq!(store::queue_read(&conn).unwrap(), [(pa.clone(), 20)]);
+
+        // A row at the snapshot's stamp is deleted.
+        let conn = crate::codemap::testutil::db();
+        scan_with_home(&conn, &fx, &a);
+        store::queue_push(&conn, &pa, 10).unwrap();
+        let before = snapshot(&conn, &fx, &a);
+        assert_eq!(
+            ack_owned_rows(&conn, &a.join(".git"), home, &before).unwrap(),
+            1
+        );
+        assert!(store::queue_read(&conn).unwrap().is_empty());
     }
 
     #[test]
