@@ -48,10 +48,12 @@ macOS's bundled `sqlite3` can't load the FTS5 module, so it silently skips the `
 ## AI Narratives
 
 ### Unexpected charges
+API charges come from the Batch API narrator, which runs only when `ANTHROPIC_API_KEY` is set in the environment of the daemon or of the MCP server. To stop it:
 ```bash
 pkill -f "csr-engine daemon"
 unset ANTHROPIC_API_KEY
 ```
+The other model calls go through `claude -p` and use your Claude Code login, not an API key. `CSR_NO_AI_NARRATIVES=1` stops the SessionStart briefing and the daemon narratives. Companion Dreams is a separate switch: turn off Dreams in `/config`. See [Privacy & Security](#/docs/privacy) for the full list.
 
 ## Help
 

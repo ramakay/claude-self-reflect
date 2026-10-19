@@ -47,7 +47,7 @@ Indexes ALL your Claude Code projects automatically. Solutions from one project 
 
 ### Privacy First
 
-Everything runs on your machine by default. No cloud APIs, no accounts, no telemetry. The only optional cloud feature is AI Narratives (Layer 3).
+Search, storage and embeddings run on your machine. There are no accounts and no telemetry. The first run downloads the embedding model. A few features call a model through your own Claude Code login, and each has an off switch. See [Privacy & Security](#/docs/privacy).
 
 ### Consent First
 
