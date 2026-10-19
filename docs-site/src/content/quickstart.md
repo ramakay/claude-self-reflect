@@ -2,7 +2,7 @@
 title: Quick Start
 ---
 
-> Everything below assumes CSR is activated — you've run `csr-engine setup` and restarted Claude Code. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
+> Everything below assumes CSR is activated — you've run `csr-engine setup` and restarted Claude Code. Setup also installed the csr-companion plugin unless you passed `--no-companion`; if so, run `/plugin marketplace add ramakay/claude-self-reflect` and `/plugin install csr-companion@claude-self-reflect` in Claude Code. Installing alone doesn't activate anything; see [Installation](#/docs/installation).
 
 ## Your First Search
 

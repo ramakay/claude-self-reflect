@@ -16,7 +16,7 @@ No Docker. No Python. No API keys.
 curl -fsSL https://raw.githubusercontent.com/ramakay/claude-self-reflect/main/scripts/install.sh | sh
 ```
 
-Downloads the binary (SHA256-verified) and then **asks before activating**. Setup — which imports conversations, registers the MCP server, and installs all 6 hooks — only runs after you confirm at the prompt.
+Downloads the binary (SHA256-verified) and then **asks before activating**. Setup, which imports conversations, registers the MCP server, installs all 6 hooks and installs the csr-companion plugin, only runs after you confirm at the prompt.
 
 Non-interactive installs (CI, scripts) never activate automatically. Control the behavior with:
 
@@ -33,6 +33,21 @@ csr-engine setup
 ```
 
 By default `npm install` only downloads the checksummed binary — it does not modify `~/.claude/settings.json`, register MCP servers, or index conversations. Activation is the separate, explicit `csr-engine setup` step, or set `CSR_AUTO_SETUP=1` during install to opt in.
+
+### The companion plugin
+
+After the other steps succeed, setup installs csr-companion (the pane beside the session) through Claude Code's own plugin CLI, under the same consent as the rest of setup. Then run `/reload-plugins` in Claude Code, or restart it.
+
+- `csr-engine setup --no-companion` skips the plugin.
+- If the install fails or is skipped, setup prints the reason and the two lines to run yourself in Claude Code:
+
+```
+/plugin marketplace add ramakay/claude-self-reflect
+/plugin install csr-companion@claude-self-reflect
+```
+
+- `CSR_COMPANION_MARKETPLACE` overrides the marketplace source setup passes to the plugin CLI (default `ramakay/claude-self-reflect`).
+- A failed plugin install never fails setup.
 
 ## Verify
 

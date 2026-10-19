@@ -8,9 +8,10 @@ title: CLI Reference
 Starts MCP server (stdio mode).
 
 ### setup
-One-shot: import + MCP registration + hook installation.
+One-shot: import + MCP registration + hook installation + the csr-companion plugin (installed through Claude Code's plugin CLI).
 ```bash
 csr-engine setup
+csr-engine setup --no-companion   # skip the plugin
 ```
 
 ### status
