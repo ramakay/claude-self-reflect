@@ -90,6 +90,17 @@ Fires before a compaction. Imports the transcript so it stays searchable after t
 
 Records files edited with deduplication. Enables `csr_search_by_file`.
 
+## Code Map: Which Directory a Session Works In
+
+SessionStart and PostToolUse each write one row for the session's working directory (one indexed upsert, 100 ms busy timeout, never a parse). The daemon maps the repos with a row from the last 24 hours (`CSR_CODEMAP_ACTIVE_HOURS`). PostToolUse also queues the edited code file with one insert, so the map picks it up without a parse in the hook.
+
+Repos in `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive and `/Volumes` are different. The daemon never opens them, so the macOS privacy prompt never fires for it. A session working there has already opened the folder, so its own child process maps the repo:
+
+- SessionStart starts one detached `csr-engine codemap scan --repo <cwd> --session`.
+- PostToolUse queues the edited file and starts one detached `csr-engine codemap drain --repo <cwd>` unless one is running. The drain waits 5 seconds, rescans the queued files, repeats while new edits arrive and exits (after nine minutes at the latest).
+
+Both children have no stdio and the hook never waits for them. Nothing watches a protected folder, so an edit made outside Claude Code is not seen until the next session event in that repo. `CSR_NO_CODEMAP=1` turns all of this off.
+
 ## Error Handling
 
 Every hook is wrapped in a catch-all. If anything fails, it logs and returns Ok — **never blocks Claude Code**.
