@@ -4,7 +4,7 @@ title: Architecture
 
 ## Overview
 
-CSR is a single 44MB Rust binary. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No daemons, no database servers, no containers, no network services.
+CSR is a single 44MB Rust binary. Everything — storage, search, embeddings, MCP server, hooks, and enrichment — runs in one process. No database servers, no containers, no network services. The one background process is optional: `csr-engine daemon` does enrichment and dreaming (a launchd plist is in `scripts/launchd/`), and hooks and the MCP server run without it.
 
 ![CSR Architecture Diagram](/claude-self-reflect/images/arch-diagram.png)
 
@@ -95,6 +95,9 @@ Verified live: `csr-engine eval --continuity-live` probes the real index (not fi
 
 ### Code Graph (`src/storage/codegraph.rs`)
 Conversation-provenance code graph. AST anchors (function-level, body-hashed) link code symbols to the sessions that created or modified them. Queried via the `csr_code_graph` MCP tool.
+
+### Code Map (`src/codemap/`)
+A live map of every definition in your repos, per worktree. It is keyed by git blob oid: a worktree is a view of file paths and blob oids, and a blob is parsed once per extractor version however many worktrees hold it. Three signals keep it fresh: a 60 s poll of each active repo, a file watcher with a 5 s debounce, and a queue the PostToolUse hook fills with one insert and no parse. It maps the repos your sessions are in (last 24 hours, at most 16). It only reads repos and stores the map in the same SQLite database. `csr_search_by_file` and `csr_code_graph` answer from it for code no conversation touched.
 
 ### Injection Engine (`src/injection/`)
 Token-budgeted context injection for hooks. Multi-signal scoring model:
