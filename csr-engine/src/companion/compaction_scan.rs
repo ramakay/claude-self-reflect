@@ -53,19 +53,24 @@ impl CompactionScan {
         }
         while self.directories.is_some() && Instant::now() < end && !stop() {
             if let Some(files) = &mut self.files {
-                if let Some(Ok(file)) = files.next() {
-                    let path = file.path();
-                    if path.extension().is_some_and(|s| s == "jsonl") {
-                        if let Some(time) = file.metadata().ok().and_then(|m| m.modified().ok()) {
-                            let time = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-                            self.found.push((time.as_nanos() as u64, path));
-                            self.found.sort_by(|a, b| b.cmp(a));
-                            self.found.truncate(60);
+                match files.next() {
+                    Some(Ok(file)) => {
+                        let path = file.path();
+                        if path.extension().is_some_and(|s| s == "jsonl") {
+                            // fs::metadata follows a symlinked transcript to the file it names.
+                            let time = fs::metadata(&path).and_then(|m| m.modified());
+                            if let Ok(time) = time {
+                                let time = time.duration_since(UNIX_EPOCH).unwrap_or_default();
+                                self.found.push((time.as_nanos() as u64, path));
+                                self.found.sort_by(|a, b| b.cmp(a));
+                                self.found.truncate(60);
+                            }
                         }
+                        continue;
                     }
-                    continue;
+                    Some(Err(_)) => continue, // one unreadable entry, not the whole folder
+                    None => self.files = None,
                 }
-                self.files = None;
             }
             match self.directories.as_mut().unwrap().next() {
                 Some(Ok(folder)) => self.files = fs::read_dir(folder.path()).ok(),
@@ -188,5 +193,26 @@ mod tests {
         assert!(scan.complete);
         assert_eq!(scan.usual()["n"], 10);
         assert_eq!(scan.usual()["median"], 2.);
+    }
+    #[test]
+    fn a_symlinked_transcript_is_dated_by_the_file_it_names() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::new(d.path().join("home"));
+        let real = d.path().join("elsewhere.jsonl");
+        fs::write(&real, "{}\n").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        fs::File::options()
+            .write(true)
+            .open(&real)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let link = paths.projects.join("p/s.jsonl");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut scan = CompactionScan::default();
+        scan.step(&paths, 1000., false, 64, Duration::from_secs(1), || false);
+        let seconds = Duration::from_nanos(scan.found[0].0).as_secs();
+        assert_eq!((seconds, &scan.found[0].1), (1_000, &link));
     }
 }

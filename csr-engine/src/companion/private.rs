@@ -173,7 +173,9 @@ pub fn redact_value(value: &mut serde_json::Value) {
         serde_json::Value::Array(values) => values.iter_mut().for_each(redact_value),
         serde_json::Value::Object(values) => {
             for (key, value) in values {
-                if credential_key(key) && value.is_string() {
+                // Any value under a credential name goes, not just a string: a token can sit
+                // in an object, a list or a number too.
+                if credential_key(key) && !value.is_null() {
                     *value = serde_json::Value::String("[redacted]".into());
                 } else {
                     redact_value(value);
@@ -401,5 +403,17 @@ mod credential_tests {
         assert_eq!(value["nested"][0]["Authorization"], "[redacted]");
         assert_eq!(value["nested"][0]["label"], "ordinary");
         assert_eq!(crate::redact::redact_private("hunter2"), "hunter2");
+    }
+    #[test]
+    fn json_credential_keys_redact_objects_lists_and_numbers_too() {
+        let mut value = serde_json::json!({"token":{"value":"abc.def"},"password":["hunter2"],
+            "api_key":123456,"secret":null,"author":"kept","tokens_used":5});
+        super::redact_value(&mut value);
+        assert_eq!(value["token"], "[redacted]");
+        assert_eq!(value["password"], "[redacted]");
+        assert_eq!(value["api_key"], "[redacted]");
+        assert!(value["secret"].is_null());
+        assert_eq!(value["author"], "kept");
+        assert_eq!(value["tokens_used"], 5);
     }
 }

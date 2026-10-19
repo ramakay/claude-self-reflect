@@ -15,6 +15,8 @@ impl Db {
         let storage = Storage::open_read_only(&paths.db)?;
         storage.with_connection(|con| {
             let _: i64 = con.pragma_query_value(None, "schema_version", |row| row.get(0))?;
+            // One frame runs about 21 distinct statements; rusqlite keeps 16 by default.
+            con.set_prepared_statement_cache_capacity(64);
             Ok(())
         })?;
         Ok(Self {

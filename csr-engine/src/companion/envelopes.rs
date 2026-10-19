@@ -99,7 +99,7 @@ pub fn strip(text: &str) -> String {
     let mut i = 0;
     while i < lines.len() {
         let head = if i == 0 {
-            line(i).trim_start_matches('\u{feff}')
+            line(i).strip_prefix('\u{feff}').unwrap_or(line(i)) // one BOM, as agents.py
         } else {
             line(i)
         };
@@ -139,5 +139,16 @@ mod tests {
         );
         let invalid = envelope.replace("\"session\":\"s\",", "");
         assert_eq!(strip(&invalid), invalid);
+    }
+    #[test]
+    fn one_leading_bom_is_allowed_before_an_envelope_and_two_are_not() {
+        let envelope = concat!(
+            "[[CSR:AGENTS:v1]]\n",
+            "{\"kind\":\"context\",\"session\":\"s\",\"at\":1,\"agents\":[]}\n",
+            "[[/CSR:AGENTS:v1]]\n"
+        );
+        assert_eq!(strip(&format!("\u{feff}{envelope}")), "");
+        let two = format!("\u{feff}\u{feff}{envelope}");
+        assert_eq!(strip(&two), two);
     }
 }
