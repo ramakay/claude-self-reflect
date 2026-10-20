@@ -561,9 +561,11 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 ### Known limitations
 
-- **Stop hook memory on very large transcripts.** Episode extraction reads the whole transcript and holds about 6x its
-  size: 1.42 GB max RSS on a 244 MB transcript, 486 MB on a 3.4 MB one (release build, 2026-10-20). Stop runs
-  detached, so the session does not wait; streaming extraction is planned.
+- **Stop hook memory on a catch-up import.** The Stop worker now streams the transcript and builds only the
+  provenance document it reads: 351 MB max RSS on a 244 MB transcript, was 1.28 GB, with byte-identical output
+  (2,599 of 2,599 derivations; release build, 2026-10-20, fe5e6928). A Stop that also has to import a long
+  unimported tail still peaks near 1.03 GB, because the import holds that tail's chunks. Stop runs detached, so the
+  session does not wait; a streaming import is planned.
 - **Headless settings.** `claude -p` children drop user settings unless those settings carry auth: `apiKeyHelper` or
   an `env` key such as `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `..._VERTEX` keeps
   them. `CSR_HEADLESS_USER_SETTINGS=1` always keeps, `=0` always drops (bcea4a8a, 64e24d1e). Only key names are
