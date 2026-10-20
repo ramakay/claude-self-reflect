@@ -1,4 +1,4 @@
-//! Package C's keys and clicks, through `Pane::click`: In flight (the agent rows, the Codex rows and
+//! The main page's keys and clicks, through `Pane::click`: In flight (the agent rows, the Codex rows and
 //! their folds), "How Claude read you", and the dream answer the pane keeps for six seconds. Each
 //! test builds the same rich HOME as tests/companion_frame.rs (base home, rich overlay, DB from
 //! home.sql then rich/home.sql) and drives a Pane at the pinned time.
@@ -148,6 +148,10 @@ fn plain(line: &str) -> String {
 /// A frame at `at`, as plain text.
 fn draw(pane: &mut Pane, at: f64) -> Vec<String> {
     pane.frame(100, 70, at).iter().map(|l| plain(l)).collect()
+}
+/// A 100x140 frame: room below Lost and found and the compaction card for the dreams that passed.
+fn tall(pane: &mut Pane, at: f64) -> Vec<String> {
+    pane.frame(100, 140, at).iter().map(|l| plain(l)).collect()
 }
 /// The first screen row whose act key starts with `key`.
 fn row_of(pane: &Pane, key: &str) -> usize {
@@ -339,13 +343,13 @@ fn the_answer_the_pane_kept_stands_in_place_of_the_answer_rows_until_it_is_six_s
 fn an_opened_earlier_dream_shows_its_title_and_the_first_two_reasons() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 140);
-    draw(&mut pane, NOW);
+    tall(&mut pane, NOW);
     let row = row_of(&pane, "fold:passed");
     pane.click(row, 8, NOW);
-    draw(&mut pane, NOW);
+    tall(&mut pane, NOW);
     let row = row_of(&pane, "dream:older");
     pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
+    let text = tall(&mut pane, NOW);
     assert!(has(&text, "A small reader"), "{text:#?}");
     assert!(has(&text, "Bound the tail before parsing."), "{text:#?}");
     assert!(!has(&text, "- Bound the tail"), "{text:#?}");

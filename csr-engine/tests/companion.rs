@@ -63,6 +63,15 @@ fn bare_home() -> (tempfile::TempDir, Paths) {
     let (d, paths) = home();
     let _ = fs::remove_dir_all(d.path().join(".codex"));
     let _ = fs::remove_dir_all(paths.keep.join("agents"));
+    // ... and no compaction of CSR's, so no "this session:" row under the masthead (the rich world checks it)
+    let dreams = paths.keep.join("dreams.jsonl");
+    let kept: String = fs::read_to_string(&dreams)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.contains("\"kind\": \"compact\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&dreams, kept).unwrap();
     (d, paths)
 }
 fn args(page: &str, cols: usize, rows: usize) -> PaneArgs {

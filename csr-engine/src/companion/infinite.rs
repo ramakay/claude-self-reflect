@@ -65,11 +65,12 @@ pub fn csr_boundaries(records: &[Value], compacts: &Value) -> Vec<f64> {
 }
 
 /// The infinite-session rows for the info page: `{plan, state, story, card, tally, csr_at}`, null
-/// when there is neither a plan nor a compaction of CSR's to tell. The compaction card belongs to
-/// the main page and is not drawn here, so it stays null.
+/// when there is neither a plan, a story nor a card of CSR's to tell. The card is the main page's
+/// compaction card (`card.rs`).
 pub fn infinite_info(paths: &Paths, sid: &str, now: f64, s: &Value) -> Value {
     let plan = compact_plan_of(paths, sid, now);
     let (mut story, mut tally, mut csr_at) = (Value::Null, Value::Null, vec![]);
+    let mut card = Value::Null;
     if s.as_object().is_some_and(|o| !o.is_empty()) {
         let main = &s["main"];
         let records = compact::compact_records(paths, sid);
@@ -89,16 +90,33 @@ pub fn infinite_info(paths: &Paths, sid: &str, now: f64, s: &Value) -> Value {
             story = json!(made.text);
             tally = json!({"by_csr": made.by_csr, "by_you": made.by_you, "payback": made.payback});
         }
+        // the card reads the two newest summaries, which hold what the window learnt
+        let summaries = array(&s["summaries"]);
+        let newest = json!(&summaries[summaries.len().saturating_sub(2)..]);
+        card = super::card::compaction_card(
+            &records,
+            &newest,
+            now,
+            main,
+            &s["compacts"],
+            &s["summary_sizes"],
+        );
+        if card["stage"] == "done" && card["took"].as_f64().is_some_and(|t| t != 0.) {
+            // how long your own /compact takes, as last kept (never scanned here)
+            card["usual"] = compact::compact_usual(paths, now, false)
+                .and_then(|u| serde_json::to_value(u).ok())
+                .unwrap_or(Value::Null);
+        }
         csr_at = csr_boundaries(&records, &s["compacts"]);
     }
-    if plan.is_null() && story.is_null() {
+    if plan.is_null() && story.is_null() && card.is_null() {
         return Value::Null;
     }
     json!({
         "plan": plan["text"],
         "state": plan["state"],
         "story": story,
-        "card": null,
+        "card": card,
         "tally": tally,
         "csr_at": csr_at,
     })

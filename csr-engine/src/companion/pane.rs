@@ -1,6 +1,6 @@
 use super::{
-    array, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, info, layout, masthead, num, pages,
-    paths::Paths, render::text::*, send, session::Session, string, threads, value,
+    array, carry, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, info, layout, masthead, num,
+    pages, paths::Paths, render::text::*, send, session::Session, string, threads, value,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -227,13 +227,18 @@ pub struct Pane {
     pub phone: super::phone::Phone,
     /// This pane in herdr; set by the watch loop, absent in frame and test runs.
     pub herdr: Option<super::phone::Herdr>,
-    // package C: the Codex rollouts, the readers behind "How Claude read you", and the dream
+    // the Codex rollouts, the readers behind "How Claude read you", and the dream
     // answer the pane keeps in place of the answer rows for six seconds (dream, answer, when)
     codex: super::codex_runs::CodexRolloutIndex,
     readers: super::readings::Readers,
     pub answered: Option<(String, String, f64)>,
     /// Column mode's gauge strip: (first column, first row past it); a click there is on no row.
     edge: Option<(usize, usize)>,
+    /// The session before this one, read once off the draw path (`carry.rs`).
+    carry: carry::Carry,
+    carry_gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// A compaction's marker was there at the last frame.
+    compacting: bool,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -295,6 +300,9 @@ impl Pane {
             readers: Default::default(),
             answered: None,
             edge: None,
+            carry: Default::default(),
+            carry_gate: None,
+            compacting: false,
         }
     }
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
@@ -398,27 +406,36 @@ impl Pane {
             (Some(session), "threads") => threads::lost_value(&self.paths, session),
             _ => vec![],
         };
-        if let Some(session) = &self.session {
-            if session.data["last_session"].is_null() {
-                let previous = self.previous(&session.data);
-                self.session.as_mut().unwrap().data["last_session"] = previous;
-            }
-        }
         let can_refresh = self
             .session
             .as_ref()
             .is_some_and(|session| session.path.is_some())
             && super::shiftmap::engine_binary().is_some();
         let mut empty = json!({"id":null});
+        if let Some(session) = self.session.as_mut() {
+            session.load(&self.paths, self.db.as_ref());
+        }
+        let project = self.carry_step();
         let s = self
             .session
             .as_mut()
-            .map(|s| s.load(&self.paths, self.db.as_ref()))
+            .map(|s| &mut s.data)
             .unwrap_or(&mut empty);
-        if let Some(id) = s["last_session"]["id"].as_str().map(str::to_owned) {
-            s["last_session"]["running"] =
-                json!(super::session::session_record(&self.paths, &id).is_some());
+        if s["last_session"].is_null() {
+            if let Some(done) = self.carry.done() {
+                s["last_session"] = done.facts.clone();
+            }
         }
+        s["lost"] = if string(&s["id"]).is_empty() {
+            json!([])
+        } else {
+            carry::lost_of(&self.paths, s, project.as_deref(), self.carry.threads())
+        };
+        // whether the session before this one still runs: kept apart from its facts, which the
+        // picture reads
+        s["last_running"] = json!(s["last_session"]["id"]
+            .as_str()
+            .is_some_and(|id| { super::session::session_record(&self.paths, id).is_some() }));
         if s["last_session"]["todos"].is_array() {
             s["todos"] = s["last_session"]["todos"].clone();
         }
@@ -428,6 +445,15 @@ impl Pane {
         self.last_picture = s["last_session"]
             .is_object()
             .then(|| super::render::raster::LastFacts::from_value(&s["last_session"]));
+        // the mod's plan and what CSR's compactions did: the main page's card and masthead rows,
+        // the info page's lines
+        data["infinite"] = infinite::infinite_info(&self.paths, &self.sid, now, s);
+        // the marker went: draw at once, not from what the page last held
+        let running = data["compacting"].is_object();
+        if self.compacting && !running {
+            self.hold = None;
+        }
+        self.compacting = running;
         data["map_view"] = match self.map.motion(
             now,
             super::shiftmap::map_open(&self.open),
@@ -438,7 +464,7 @@ impl Pane {
         };
         data["can_refresh"] = json!(can_refresh);
         if self.view == "main" {
-            // package C: In flight (agents, Codex runs) and How Claude read you
+            // In flight (agents, Codex runs) and How Claude read you
             data["agents"] = json!(super::agents::agents_of(&self.paths, &self.sid));
             data["codex"] = if self.codex.present() {
                 self.codex.refresh(now)
@@ -470,7 +496,6 @@ impl Pane {
                 },
                 (&mut self.narrative, &mut self.spend),
                 &mut data,
-                s,
                 now,
             );
         }
@@ -504,7 +529,7 @@ impl Pane {
             } else if s["busy"] == true && self.hold.as_ref().is_some_and(|(_, at)| now - at < 120.)
             {
                 let mut page = page;
-                // package C: In flight is never held; it is drawn fresh among the held ones
+                // In flight is never held; it is drawn fresh among the held ones
                 let fresh: Vec<Value> = array(&page["sections"])
                     .iter()
                     .filter(|s| s["name"] == "flight" && !array(&s["items"]).is_empty())
@@ -699,18 +724,16 @@ impl Pane {
         body.push(foot);
         body
     }
-    /// What only the info page reads: the plan's week, what CSR cost in it, the infinite-session
-    /// rows and the facts under a running compaction.
+    /// What only the info page reads: the plan's week, what CSR cost in it, and the facts under a
+    /// running compaction.
     fn info_data(
         env: Wide,
         (narrative_kept, spend_kept): (&mut Option<(Value, f64, Value)>, &mut Option<value::Spend>),
         data: &mut Value,
-        s: &Value,
         now: f64,
     ) {
         Self::week_data(&env, (&mut *narrative_kept, &mut *spend_kept), data, now);
-        let Wide { paths, db, sid, .. } = env;
-        data["infinite"] = infinite::infinite_info(paths, sid, now, s);
+        let Wide { db, sid, .. } = env;
         if data["compacting"].is_object() {
             let facts = db
                 .map(|db| {
@@ -762,46 +785,56 @@ impl Pane {
         data["narrative"] = narrative;
         data["spend"] = spent;
     }
-    fn previous(&self, s: &Value) -> Value {
-        if let Some(path) = self.paths.kept_file("previous", &self.sid) {
-            let cached = super::paths::read_json(&path);
-            if cached.is_object() {
-                return cached;
+    /// Once, when the session before this one can be found: start the carry (a thread off the draw
+    /// path in the watch loop; inline in a one-shot run), take its result when it lands. Returns the
+    /// session's project, for its threads.
+    fn carry_step(&mut self) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let mine = session.path.clone().or_else(|| {
+            session.data["cwd"].as_str().map(|cwd| {
+                self.paths
+                    .project_folder(cwd)
+                    .join(format!("{}.jsonl", self.sid))
+            })
+        })?;
+        if !self.carry.started() {
+            let job = carry::Job {
+                paths: self.paths.clone(),
+                sid: self.sid.clone(),
+                path: mine.clone(),
+                started: num(&session.data["started"]),
+                persist: self.persist,
+            };
+            match self.carry_gate.take() {
+                Some(gate) if self.persist => self.carry.spawn(move || {
+                    let _ = gate.recv();
+                    carry::work(&job)
+                }),
+                _ => self.carry.start(job, !self.persist),
             }
         }
-        let mine = self
-            .session
-            .as_ref()
-            .and_then(|s| s.path.clone())
-            .or_else(|| {
-                s["cwd"].as_str().map(|cwd| {
-                    self.paths
-                        .project_folder(cwd)
-                        .join(format!("{}.jsonl", self.sid))
-                })
-            });
-        let Some(mine) = mine else {
-            return Value::Null;
-        };
-        let Some(path) = super::sources::previous_session(&self.paths, &mine, num(&s["started"]))
-        else {
-            return json!({});
-        };
-        let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let mut prev = Session::new(id);
-        prev.path = Some(path.clone());
-        prev.read_transcript(&self.paths);
-        let facts = super::session::previous_facts(&self.paths, &prev, self.db.as_ref());
-        if self.persist {
-            if let Some(path) = self.paths.kept_file("previous", &self.sid) {
-                let _ = super::private::write_atomic(
-                    &path,
-                    &super::private::dumps(&facts),
-                    &self.paths.keep,
-                );
-            }
-        }
-        facts
+        self.carry.poll();
+        mine.parent()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    }
+    /// Hold the carry's thread until the returned sender fires or drops. A test seam: it shows
+    /// that a frame draws, and returns, while the carry is still working.
+    pub fn hold_carry(&mut self) -> std::sync::mpsc::Sender<()> {
+        let (send, receive) = std::sync::mpsc::channel();
+        self.carry_gate = Some(receive);
+        send
+    }
+    /// True between frames once the marker of the compaction the pane is showing is gone: the
+    /// watch loop then draws at once, not on its next tick.
+    pub fn compaction_gone(&self) -> bool {
+        self.compacting
+            && self.session.is_some()
+            && self
+                .paths
+                .kept_file("compacting", &self.sid)
+                .is_none_or(|marker| !marker.exists())
     }
     pub fn key(&mut self, key: &str) -> bool {
         match key {

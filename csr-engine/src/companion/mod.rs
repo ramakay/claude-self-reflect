@@ -1,6 +1,8 @@
 pub mod agents;
 pub mod app;
 pub mod brief;
+pub mod card;
+pub mod carry;
 pub mod cli;
 pub mod coach;
 pub mod codex_runs;
@@ -17,6 +19,7 @@ pub mod info;
 pub mod layout;
 pub mod lease;
 pub mod lost;
+pub mod lostmain;
 pub mod masthead;
 pub mod note;
 pub mod pages;

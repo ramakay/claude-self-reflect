@@ -507,8 +507,13 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   every 2 s, 8 days back), "How Claude read you", the six-second "kept: <answer>" echo on an answered dream, and an
   opened earlier dream's first two reasons are back too, as are the value row above the legend (a click opens the info
   page), the window a page taller than the pane scrolls in, the legend's read countdown, and column mode below 24
-  columns with the CTX, 7D, 5H and cache tapes down its edge. Still missing from the main page: Lost and found and
-  the compaction card.
+  columns with the CTX, 7D, 5H and cache tapes down its edge. After CSR compacts, the main page shows the compaction
+  card again (sizes before and after, its payback picture, what it kept and learnt), and the masthead says "this
+  session: N compactions by CSR". Lost and found is back on the main page ("Left over" on a fresh session), with its
+  side task, subagent, drop and later asks; the session before this one is read on a worker thread and kept under
+  `keep/carried/` and `keep/previous/`, so a frame never waits for it. On a phone, rules, Handed and Lost and found
+  show twice their items and the story twice its rows, as pane.py did. All 56 frame and section goldens drawn by
+  pane.py's whole frame over the rich fixture now match, text, clicks and picture placements.
 - **A file written through Bash now reaches file history** (`csr_search_by_file`, `csr_code_graph`, the `csr_why`
   file hop), as an Edit or Write does. The PostToolUse matcher named only the edit tools: over 14 days of the owner's
   corpus, `csr_search_by_file` found the editing session for 1 of 574 Bash-only (file, session) pairs, against 390 of

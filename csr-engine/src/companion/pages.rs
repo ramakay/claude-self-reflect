@@ -16,7 +16,8 @@ pub struct Lines {
 }
 impl Lines {
     fn put(&mut self, rows: Vec<String>, act: Option<&Value>) {
-        if let Some(act) = act {
+        // a row with no act of its own (a thread's "now in Claude's prompt" line) is a null one
+        if let Some(act) = act.filter(|act| !act.is_null()) {
             for i in 0..rows.len() {
                 self.acts.insert(self.rows.len() + i, act.clone());
             }
@@ -100,8 +101,14 @@ fn section_value(
 }
 pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>) -> Value {
     let sid = string(&s["id"]);
+    // on a phone the pane is the whole screen and tall: capped sections show more, and more of the story
+    let more = if ui["phone"] == true {
+        super::lostmain::PHONE_MORE
+    } else {
+        1
+    };
     let (rules, rules_at) = db
-        .map(|db| super::recall::rules(db, s, string(&data["repo"])))
+        .map(|db| super::recall::rules(db, s, string(&data["repo"]), 3 * more))
         .unwrap_or_default();
     let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], sid);
     let star = &fed["star"];
@@ -232,7 +239,7 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
             "like": format!("story:{sid}:{}", story["rev"]),
             "title": story["now"],
             "open_title": story["text"],
-            "lines": 6,
+            "lines": 6 * more,
             "open_lines": 30,
             "detail": [],
             "send": send::closed_send(
@@ -273,11 +280,17 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
         section_value("rules", "Your rules", "", rules, json!(rules_at), ""),
     ];
     if let Some(db) = db {
-        if let Some(handed) = remembered_section(db, s, now) {
+        if let Some(handed) = remembered_section(db, s, now, 2 * more) {
             sections.insert(2, handed);
         }
     }
-    // package C: How Claude read you (before Your rules), then In flight (right after the story)
+    for (k, lost) in super::lostmain::lost_sections(s, now, 3 * more)
+        .into_iter()
+        .enumerate()
+    {
+        sections.insert(2 + k, lost);
+    }
+    // How Claude read you (before Your rules), then In flight (right after the story)
     let readings: Vec<super::coach::Reading> =
         serde_json::from_value(data["readings"].clone()).unwrap_or_default();
     let coach_at = sections.iter().position(|s| s["name"] == "rules");
@@ -291,6 +304,13 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
         let story_at = sections.iter().position(|s| s["name"] == "story");
         sections.insert(story_at.map_or(0, |at| at + 1), flight);
     }
+    let waiting = super::card::lost_waiting(&s["lost"]);
+    if let Some(card) =
+        super::card::compact_section(&data["infinite"]["card"], &data["compacting"], waiting)
+    {
+        // CSR's own compaction: under the story, which is pinned on top (the feed keeps it there)
+        sections.insert(1, card);
+    }
     let g = masthead::gauges_compacting(
         &data["claude_fields"],
         data["claude_at"].as_f64(),
@@ -303,6 +323,8 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
     let mut page = json!({
         "head": {
             "gauges": g,
+            // the mod's plan and what CSR's compactions did
+            "infinite": data["infinite"],
         },
         "quiet": "Nothing to report yet. A section shows here once CSR has \
             something for it.",
@@ -352,6 +374,9 @@ fn page_default(mut page: Value, data: &Value, s: &Value, now: f64, rows: usize)
     }
     if let Some(last) = last_section(s, now, rows) {
         sections.push(last);
+    }
+    if let Some(left) = super::lostmain::left_over(s, now) {
+        sections.push(left);
     }
     let todos: Vec<_> = array(&s["todos"])
         .iter()
@@ -404,11 +429,16 @@ fn page_default(mut page: Value, data: &Value, s: &Value, now: f64, rows: usize)
     for s in &mut sections {
         s["born"] = begun.clone();
     }
+    let taken: Vec<String> = sections
+        .iter()
+        .map(|s| string(&s["name"]).to_owned())
+        .chain(["lost".to_owned(), "story".to_owned()])
+        .collect();
     sections.extend(
         array(&page["sections"])
             .iter()
             .filter(|s| {
-                !array(&s["items"]).is_empty() && s["name"] != "story" && s["name"] != "dreams"
+                !array(&s["items"]).is_empty() && !taken.iter().any(|t| t == string(&s["name"]))
             })
             .cloned(),
     );
@@ -506,14 +536,18 @@ fn last_section(s: &Value, now: f64, rows: usize) -> Option<Value> {
     .filter(|s| !s.is_empty())
     .collect::<Vec<_>>()
     .join(" · ");
-    let right = format!(
-        "{id8} · {}",
-        if f["running"] == true {
-            "still running".to_owned()
-        } else {
-            stamp(num(&f["last"]), now)
-        }
-    );
+    let right = if super::truthy(&f["last"]) {
+        format!(
+            "{id8} · {}",
+            if s["last_running"] == true {
+                "still running".to_owned()
+            } else {
+                stamp(num(&f["last"]), now)
+            }
+        )
+    } else {
+        id8.clone()
+    };
     let mut detail = vec![];
     if num(&f["floor"]) > 0. && compacts > 0 {
         detail.push(format!(
@@ -539,11 +573,7 @@ fn last_section(s: &Value, now: f64, rows: usize) -> Option<Value> {
     if let Some(text) = f["said"][1].as_str() {
         detail.push(format!("Claude last: {}", quoted(text)));
     }
-    let last_row = chrono::Local
-        .timestamp_opt(num(&f["last"]) as i64, 0)
-        .single()
-        .map(|t| t.format("%H:%M").to_string())
-        .unwrap_or_default();
+    let last_row = super::recall::date(num(&f["last"]), "%m-%d %H:%M");
     let item = json!({
         "key": format!("last:{id}"),
         "title": title,
@@ -717,12 +747,12 @@ fn from_when(at: f64, now: f64) -> String {
         format!("{} months ago", (days / 30.) as i64)
     }
 }
-fn remembered_section(db: &Db, s: &Value, now: f64) -> Option<Value> {
+fn remembered_section(db: &Db, s: &Value, now: f64, most: usize) -> Option<Value> {
     let recalled = super::recall::remembered(db, s);
     let at = recalled.iter().map(|r| num(&r["at"])).fold(0., f64::max);
     let items: Vec<_> = recalled
         .iter()
-        .take(2)
+        .take(most)
         .map(|r| {
             let id = string(&r["key"]);
             let times = array(&r["seconds"]).len().max(1);
@@ -1165,6 +1195,8 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     } else {
         None
     };
+    // the mod's plan for the next compaction, and the story
+    top.extend(super::card::infinite_rows(&head["infinite"], width));
     let grounds = dark_steps(top.len());
     let mut out = Lines::default();
     if let Some(row) = lanes {
@@ -1252,7 +1284,7 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                         }),
                     ));
                 }
-                // package C: the pane keeps an answer six seconds in place of the two rows
+                // The pane keeps an answer six seconds in place of the two rows
                 if ui["answered"][0].is_string() && ui["answered"][0] == item["dream"] {
                     let said = dreams::answer_word(string(&ui["answered"][1]));
                     blocks.truncate(blocks.len() - 2);
@@ -1267,6 +1299,13 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                     ));
                 }
             }
+            blocks.extend(super::lostmain::answer_blocks(
+                item,
+                width,
+                at,
+                &ui["sent"],
+                is_open,
+            ));
         }
         if !blocks.is_empty() {
             let base = 2 + blocks[0].0.len();
@@ -1299,6 +1338,8 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
         rooms.insert(i, *base + extra);
         left -= extra as isize;
     }
+    // the items' own pictures (a last session, a compaction's payback) go after every section icon
+    let mut wanted = vec![];
     for (k, (s, blocks, _, _)) in built.into_iter().enumerate() {
         let name = string(&s["name"]);
         let mut part = Lines::default();
@@ -1393,7 +1434,7 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                     &act["picture"]
                 };
                 if picture["rows"].as_u64() == Some((j - i + 1) as u64) {
-                    out.pictures.push(Wanted {
+                    wanted.push(Wanted {
                         row: start + i,
                         col: at,
                         cols: width - at,
@@ -1412,6 +1453,7 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
         out.acts
             .extend(part.acts.into_iter().map(|(r, a)| (r + start, a)));
     }
+    out.pictures.extend(wanted);
     out
 }
 #[cfg(test)]

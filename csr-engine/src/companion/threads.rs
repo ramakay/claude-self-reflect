@@ -224,7 +224,7 @@ type Block = (String, Option<Value>);
 
 /// A thread's answers under its row, two to a row; each row is its own block, so a click knows
 /// the thread and, by its column, the answer.
-fn lost_rows(item: &Value, width: usize, at: usize, sent: &Value) -> Vec<Block> {
+pub fn lost_rows(item: &Value, width: usize, at: usize, sent: &Value) -> Vec<Block> {
     let half = width.saturating_sub(at) / 2;
     let mut rows: Vec<Block> = vec![];
     let mut pairs: Vec<&[(&str, &str)]> = vec![&LOST_ASKS[..2], &LOST_ASKS[2..]];

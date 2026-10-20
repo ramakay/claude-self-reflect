@@ -530,6 +530,7 @@ impl Session {
                 &sid,
             );
             s["sessions"] = db.scalar("select count(*) from session_registry", &[]);
+            s["remembered"] = json!(super::recall::remembered_items(db, s));
         }
         s
     }

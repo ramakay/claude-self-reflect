@@ -97,7 +97,7 @@ fn gist(text: &str) -> String {
     };
     c.to_uppercase().collect::<String>() + chars.as_str()
 }
-pub fn rules(db: &Db, s: &Value, root: &str) -> (Vec<Value>, f64) {
+pub fn rules(db: &Db, s: &Value, root: &str, most: usize) -> (Vec<Value>, f64) {
     let sid = string(&s["id"]);
     let mut rules = vec![];
     let mut rules_at = 0_f64;
@@ -113,7 +113,7 @@ pub fn rules(db: &Db, s: &Value, root: &str) -> (Vec<Value>, f64) {
                 order by ts desc limit 200",
             &[json!(project), json!(basename)],
         ) {
-            if rules.len() >= 3 {
+            if rules.len() >= most {
                 break;
             }
             let quote = one_line(string(&r[1]), 700);
@@ -157,7 +157,61 @@ pub fn rules(db: &Db, s: &Value, root: &str) -> (Vec<Value>, f64) {
     (rules, rules_at)
 }
 
+/// Everything CSR handed Claude this session, as `s["remembered"]` holds it (pane.py's
+/// `remembered_items`): one row per past session or reflection with how many hand-offs carried it
+/// and whether Claude then opened it, and each time Claude asked CSR itself; newest first.
+pub fn remembered_items(db: &Db, s: &Value) -> Vec<Value> {
+    let uuid = regex::Regex::new(r"^[0-9a-f-]{36}$").unwrap();
+    let mut items: Vec<Value> = recalled_groups(db, s)
+        .into_values()
+        .filter(|i| !string(&i["title"]).is_empty())
+        .map(|i| {
+            let key = string(&i["key"]);
+            let opened = uuid.is_match(key)
+                && array(&s["questions"])
+                    .iter()
+                    .any(|q| num(&q[0]) >= num(&i["first"]) && string(&q[2]).contains(&key[..8]));
+            json!({
+                "kind": "recall",
+                "key": key,
+                "at": i["at"],
+                "first": i["first"],
+                "text": i["title"],
+                "when": i["when"],
+                "project": i["project"],
+                "times": array(&i["seconds"]).len().max(1),
+                "opened": opened,
+            })
+        })
+        .collect();
+    items.extend(
+        array(&s["questions"])
+            .iter()
+            .map(|q| json!({"kind": "asked", "at": q[0], "text": q[2], "tool": q[1], "times": 1})),
+    );
+    items.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+    items
+}
+
 pub fn remembered(db: &Db, s: &Value) -> Vec<Value> {
+    let uuid = regex::Regex::new(r"^[0-9a-f-]{36}$").unwrap();
+    let mut recalled: Vec<_> = recalled_groups(db, s)
+        .into_values()
+        .filter(|i| {
+            let id = string(&i["key"]);
+            !string(&i["title"]).is_empty()
+                && uuid.is_match(id)
+                && array(&s["questions"])
+                    .iter()
+                    .any(|q| num(&q[0]) >= num(&i["first"]) && string(&q[2]).contains(&id[..8]))
+        })
+        .collect();
+    recalled.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+    recalled
+}
+
+/// The past sessions and reflections CSR handed Claude this session, by key, with their titles.
+fn recalled_groups(db: &Db, s: &Value) -> BTreeMap<String, Value> {
     let sid = string(&s["id"]);
     let rows = db.query(
         "select r.retrieved_at,r.memory_type,r.memory_id,\
@@ -271,19 +325,7 @@ pub fn remembered(db: &Db, s: &Value) -> Vec<Value> {
         item["when"] = json!(when);
         item["project"] = json!(project);
     }
-    let mut recalled: Vec<_> = groups
-        .into_values()
-        .filter(|i| {
-            let id = string(&i["key"]);
-            !string(&i["title"]).is_empty()
-                && uuid.is_match(id)
-                && array(&s["questions"])
-                    .iter()
-                    .any(|q| num(&q[0]) >= num(&i["first"]) && string(&q[2]).contains(&id[..8]))
-        })
-        .collect();
-    recalled.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
-    recalled
+    groups
 }
 
 #[derive(Debug)]

@@ -248,7 +248,7 @@ pub fn summary_items(text: &str) -> Vec<(String, Vec<String>)> {
     }
     out
 }
-fn pairs(value: &Value) -> Vec<(f64, String)> {
+pub fn pairs(value: &Value) -> Vec<(f64, String)> {
     array(value)
         .iter()
         .map(|r| (num(&r[0]), string(&r[1]).into()))

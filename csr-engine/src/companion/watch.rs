@@ -466,6 +466,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
             }
             // The Shift Map's hold is up and it folds: draw it now.
             pressed |= pane.map_wait(now).1;
+            // A compaction ended: draw it now.
+            pressed |= pane.compaction_gone();
             if (boundary.failures > 0 && (boundary.ready(now) || pressed))
                 || (boundary.failures == 0 && (pressed || last.elapsed() >= Duration::from_secs(1)))
             {

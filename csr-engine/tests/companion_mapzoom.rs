@@ -53,6 +53,15 @@ fn home() -> (tempfile::TempDir, Paths) {
     let _ = fs::remove_dir_all(d.path().join(".codex"));
     let _ = fs::remove_dir_all(d.path().join(".claude-self-reflect/csr-companion/agents"));
     let paths = Paths::new(d.path().into());
+    // The goldens were drawn with no compaction of CSR's, so no "this session:" row under the masthead.
+    let dreams = paths.keep.join("dreams.jsonl");
+    let kept: String = fs::read_to_string(&dreams)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.contains("\"kind\": \"compact\""))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&dreams, kept).unwrap();
     let _ = fs::remove_file(&paths.db);
     let con = rusqlite::Connection::open(&paths.db).unwrap();
     con.execute_batch(include_str!("fixtures/companion/home.sql"))
