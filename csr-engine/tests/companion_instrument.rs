@@ -350,23 +350,25 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     }
     (home, paths)
 }
-fn snapshot(state: &str, theme: Theme) -> (Value, Vec<u8>) {
+fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<u8>) {
     let (_home, paths) = state_home(state);
-    let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", 76, 67));
+    let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, rows));
     pane.theme = theme;
     pane.pixels = false;
     if state == "03-agents" {
         pane.key("i");
     }
     let text = pane
-        .frame(76, 67, NOW)
+        .frame(cols, rows, NOW)
         .iter()
         .map(|s| text::plain(s))
         .collect::<Vec<_>>();
     assert!(!text.join("\n").contains("Before:"));
-    let path = fixture()
-        .join("instrument/text")
-        .join(format!("{state}.txt"));
+    let mut dir = fixture().join("instrument/text");
+    if (cols, rows) != (76, 67) {
+        dir = dir.join(format!("{cols}x{rows}"));
+    }
+    let path = dir.join(format!("{state}.txt"));
     let plain = text
         .iter()
         .map(|line| line.trim_end())
@@ -383,7 +385,7 @@ fn snapshot(state: &str, theme: Theme) -> (Value, Vec<u8>) {
     assert!(!plain.contains("d dream"));
     pane.pixels = true;
     pane.enable_cards();
-    pane.frame(76, 67, NOW);
+    pane.frame(cols, rows, NOW);
     assert_eq!(
         pane.placed.len(),
         1,
@@ -419,27 +421,30 @@ fn snapshot(state: &str, theme: Theme) -> (Value, Vec<u8>) {
 }
 #[test]
 fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
-    for theme in [Theme::Dark, Theme::Light] {
-        for state in STATES {
-            let (value, png) = snapshot(state, theme);
-            let name = if theme == Theme::Dark {
-                "dark"
-            } else {
-                "light"
-            };
-            let golden = fixture()
-                .join("instrument")
-                .join(name)
-                .join(format!("{state}.json"));
-            if std::env::var_os("CSR_INSTRUMENT_UPDATE").is_some() {
-                write_json(&golden, &value);
-            }
-            let expected: Value = serde_json::from_slice(&fs::read(&golden).unwrap()).unwrap();
-            assert_eq!(value, expected, "{name}/{state}");
-            if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
-                let dir = PathBuf::from(dir).join(name);
-                fs::create_dir_all(&dir).unwrap();
-                fs::write(dir.join(format!("{state}.png")), png).unwrap();
+    for (cols, rows) in [(76, 67), (44, 30)] {
+        for theme in [Theme::Dark, Theme::Light] {
+            for state in STATES {
+                let (value, png) = snapshot(state, theme, cols, rows);
+                let name = if theme == Theme::Dark {
+                    "dark"
+                } else {
+                    "light"
+                };
+                let mut dir = fixture().join("instrument");
+                if (cols, rows) != (76, 67) {
+                    dir = dir.join(format!("{cols}x{rows}"));
+                }
+                let golden = dir.join(name).join(format!("{state}.json"));
+                if std::env::var_os("CSR_INSTRUMENT_UPDATE").is_some() {
+                    write_json(&golden, &value);
+                }
+                let expected: Value = serde_json::from_slice(&fs::read(&golden).unwrap()).unwrap();
+                assert_eq!(value, expected, "{name}/{state}");
+                if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
+                    let dir = PathBuf::from(dir).join(format!("{cols}x{rows}")).join(name);
+                    fs::create_dir_all(&dir).unwrap();
+                    fs::write(dir.join(format!("{state}.png")), png).unwrap();
+                }
             }
         }
     }
@@ -505,7 +510,7 @@ fn real_pixel_answer_promotes_the_next_dream_and_live_theme_repaints() {
 }
 #[test]
 fn text_fallback_rows_fit_narrow_terminals() {
-    for cols in [10, 23, 30, 46, 76] {
+    for cols in [10, 23, 30, 40, 44, 45, 46, 76] {
         let (_home, paths) = state_home("02-running");
         let mut pane = Pane::new(paths, &args("main", "sess-now", cols, 30));
         pane.pixels = false;
@@ -513,6 +518,182 @@ fn text_fallback_rows_fit_narrow_terminals() {
             assert!(text::len(&text::plain(&row)) <= cols, "{cols}: {row:?}");
         }
     }
+}
+
+#[test]
+fn theme_key_keeps_a_visible_click_target_even_when_it_is_the_only_key() {
+    let (_home, paths) = state_home("02-running");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+    pane.pixels = false;
+    for cols in [1, 2, 4, 5, 7, 10, 23, 39, 40, 44, 45] {
+        let lines = pane.frame(cols, 30, NOW);
+        let footer = text::plain(&lines[29]);
+        assert!(
+            footer.contains('b') && text::len(&footer) <= cols,
+            "{cols}: {footer}"
+        );
+        let keys = pane.acts[&29]["keys"].as_array().unwrap();
+        assert!(keys.iter().any(|span| span[2] == "b"), "{cols}: {keys:?}");
+    }
+}
+
+#[test]
+fn live_context_without_transcript_or_open_dream_is_not_an_empty_session() {
+    let shape: Value = serde_json::from_str(include_str!(
+        "fixtures/companion/instrument/live-passed.json"
+    ))
+    .unwrap();
+    let (_home, paths) = state_home("02-running");
+    write_json(&paths.keep.join("usage/sess-now.json"), &shape["usage"]);
+    fs::write(paths.projects.join("fixture/sess-now.jsonl"), "").unwrap();
+    fs::write(
+        paths.keep.join("dreams.jsonl"),
+        shape["dream_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    for theme in [Theme::Dark, Theme::Light] {
+        for cols in [30, 39, 40, 41, 42, 43, 44, 45, 60] {
+            let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, 30));
+            pane.theme = theme;
+            pane.pixels = false;
+            let lines: Vec<_> = pane
+                .frame(cols, 30, NOW)
+                .iter()
+                .map(|r| text::plain(r))
+                .collect();
+            let shown = lines.join("\n");
+            assert!(shown.contains("CTX 140k/1M"), "{shown}");
+            assert!(shown.contains("The last look found nothing."), "{shown}");
+            assert!(shown.contains("Story ·"), "{shown}");
+            assert!(!shown.contains("Ask about past work.") && !shown.contains("Code changed?"));
+            assert!(!shown.contains("→ passed") && !shown.contains("Launch images"));
+            assert!(lines.iter().all(|line| text::len(line) <= cols));
+            let last_content = lines[..29]
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+                .unwrap();
+            assert!(28 - last_content <= 3, "{cols}: {shown}");
+            let footer = &lines[29];
+            assert!(
+                footer.contains("b thm") || footer.contains("b theme"),
+                "{footer}"
+            );
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.frame(cols, 30, NOW);
+            assert_eq!(pane.placed.len(), 1, "{cols}");
+            if cols >= 40 {
+                let metrics = pane.instrument_metrics.as_ref().expect("whole Instrument");
+                assert!(metrics.dream / metrics.height <= 0.3);
+                assert!(metrics.story_region.is_some());
+                assert_eq!(pane.placed[0].row, 0);
+                assert!(pane.placed[0].rows <= 29);
+            } else {
+                assert!(pane.instrument_metrics.is_none());
+                assert_eq!(pane.placed[0].row + pane.placed[0].rows, 29);
+            }
+        }
+    }
+}
+
+#[test]
+fn turns_alone_are_active_and_the_newest_open_what_if_wins() {
+    use csr_engine::companion::render::instrument::{Batch, Composition};
+    let session = json!({"id":"sess-now","prompts":[NOW-10.]});
+    let mut data = json!({"look":{"session":"sess-now","outcome":"quiet"}});
+    let composition = Composition::build(&data, &session, NOW);
+    assert!(!composition.empty_session);
+    assert_eq!(composition.dream.state, Batch::Nothing);
+    data["dreams"] = json!([
+        {"id":"older","session":"sess-now","at":NOW-100.,"line":"Older high confidence?","confidence":0.99,"answer":null},
+        {"id":"newest","session":"sess-now","at":NOW-5.,"line":"Newest open question?","confidence":0.5,"answer":null},
+        {"id":"settled","session":"sess-now","at":NOW-1.,"line":"Settled question?","answer":"ignored"}
+    ]);
+    let composition = Composition::build(&data, &session, NOW);
+    assert_eq!(composition.dream.state, Batch::Ready);
+    assert_eq!(composition.question(), "Newest open question?");
+    assert_eq!(composition.dream.queue.len(), 1);
+    let untouched = Composition::build(&json!({}), &session, NOW);
+    let lines = csr_engine::companion::render::instrument::text_rows(
+        &untouched,
+        44,
+        30,
+        Default::default(),
+    )
+    .join("\n");
+    assert!(lines.contains("No open what-if yet."));
+    assert!(!lines.contains("looked"));
+}
+
+#[test]
+fn all_states_draw_the_whole_instrument_from_40_columns_in_short_panes() {
+    for state in STATES {
+        let (_home, paths) = state_home(state);
+        for cols in [40, 41, 42, 43, 44, 45, 60, 76, 100] {
+            let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", cols, 30));
+            pane.pixels = true;
+            pane.enable_cards();
+            let lines = pane.frame(cols, 30, NOW);
+            let metrics = pane
+                .instrument_metrics
+                .as_ref()
+                .unwrap_or_else(|| panic!("{state} at {cols}"));
+            assert!(metrics.dream / metrics.height <= 0.3, "{state} at {cols}");
+            assert_eq!(pane.placed.len(), 1);
+            assert_eq!(pane.placed[0].row, 0);
+            assert!(pane.placed[0].rows <= 29);
+            assert!(lines.iter().all(|r| text::len(&text::plain(r)) <= cols));
+        }
+    }
+}
+
+#[test]
+fn learnt_facts_without_a_story_still_have_a_pixel_panel() {
+    use csr_engine::companion::render::instrument::{self, Composition};
+    let data = json!({"learnt":[[3,"notes kept"]],"claude_fields":{"context_window":{"total_input_tokens":140000,"context_window_size":1000000}}});
+    let c = Composition::build(&data, &json!({"id":"usage-only"}), NOW);
+    assert!(c.story.is_empty() && c.shifts.is_empty());
+    let (_, metrics) =
+        instrument::draw(&c, 44 * 16, 29 * 34, Theme::Dark, Default::default(), false).unwrap();
+    assert!(metrics.story_region.is_some());
+}
+
+#[test]
+fn scaled_instrument_answer_click_uses_the_centered_pixel_coordinates() {
+    let (_home, paths) = state_home("02-running");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 100, 30));
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.frame(100, 30, NOW);
+    assert!(pane.instrument_metrics.as_ref().unwrap().content_left > 0.);
+    let (row, act) = pane
+        .acts
+        .iter()
+        .find(|(_, a)| a["dream"].is_string())
+        .unwrap();
+    let span = act["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s[2] == "helpful")
+        .unwrap();
+    let col = (span[0].as_u64().unwrap() + span[1].as_u64().unwrap()) as usize / 2;
+    assert!(pane.click(*row, col, NOW));
+    pane.frame(100, 30, NOW + 1.);
+    assert!(pane
+        .instrument_metrics
+        .as_ref()
+        .unwrap()
+        .question_lines
+        .join(" ")
+        .contains("launch gallery"));
 }
 
 #[test]
@@ -572,7 +753,7 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
             let shorter = pane.frame(cols, 45, NOW);
             assert_eq!(shorter.len(), 45);
             assert!(text::plain(&shorter[44]).contains("q close"));
-            // Resizing only changes the empty terminal area below the content.
+            // Text content is pinned above the keys at either height.
             let content = |rows: Vec<String>| {
                 rows.into_iter()
                     .take(44)
@@ -582,7 +763,7 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
             };
             assert_eq!(
                 content(shorter),
-                lines[..44]
+                lines[..66]
                     .iter()
                     .filter(|line| !line.is_empty())
                     .cloned()
@@ -691,14 +872,7 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             "07-away",
             vec!["asked while you were away", "looked 4×. 3 new what-ifs"],
         ),
-        (
-            "08-offer",
-            vec![
-                "dreamer 9k of 40k",
-                "Label the dream budget → helpful",
-                "Keep the figure in place",
-            ],
-        ),
+        ("08-offer", vec!["dreamer 9k of 40k", "Dreaming."]),
         (
             "08b-nothing",
             vec![
@@ -728,7 +902,13 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             assert!(!shown.contains("d queue"));
         }
         if state == "02-running" {
-            assert!(pane.click(0, 0, NOW));
+            let row = *pane
+                .acts
+                .iter()
+                .find(|(_, a)| a["key"] == "instrument:dreams")
+                .unwrap()
+                .0;
+            assert!(pane.click(row, 0, NOW));
             let detail = pane.frame(76, 67, NOW).join("\n");
             assert!(detail.contains("at most 30%"));
         }

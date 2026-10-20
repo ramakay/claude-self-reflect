@@ -67,7 +67,7 @@ pub struct PaneArgs {
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub repeat: u32,
-    #[arg(long, hide = true, default_value_t = 60)]
+    #[arg(long, hide = true, default_value_t = 44)]
     pub cols: usize,
     #[arg(long, hide = true, default_value_t = 30)]
     pub rows: usize,

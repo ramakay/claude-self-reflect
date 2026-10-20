@@ -1,8 +1,8 @@
 {
-  "0": {
+  "60": {
     "key": "instrument:dreams"
   },
-  "2": {
+  "62": {
     "dream": "arrived",
     "key": "dream:arrived",
     "send": "CSR's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. - Page the output. - Keep each page small.”",
@@ -29,14 +29,17 @@
       ]
     ]
   },
-  "3": {
+  "63": {
     "key": "instrument:threads"
   },
-  "4": {
+  "65": {
     "key": "instrument:changes"
   },
-  "5": {
+  "66": {
     "key": "instrument:figure"
+  },
+  "68": {
+    "key": "instrument:agents"
   },
   "69": {
     "key": "legend",
@@ -72,8 +75,5 @@
         "q"
       ]
     ]
-  },
-  "7": {
-    "key": "instrument:agents"
   }
 }

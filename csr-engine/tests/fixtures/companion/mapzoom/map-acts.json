@@ -1,83 +1,83 @@
 {
   "entry-100x40": {
-    "0": "instrument:dreams",
-    "1": "dream:newest",
-    "10": "instrument:changes",
-    "12": "instrument:figure",
-    "2": "instrument:threads",
-    "3": "instrument:changes",
-    "6": "instrument:changes",
-    "9": "instrument:changes"
+    "24": "instrument:dreams",
+    "25": "dream:newest",
+    "26": "instrument:threads",
+    "28": "instrument:changes",
+    "31": "instrument:changes",
+    "34": "instrument:changes",
+    "35": "instrument:changes",
+    "37": "instrument:figure"
   },
   "entry-46x30": {
-    "0": "instrument:dreams",
-    "1": "instrument:dreams",
-    "10": "instrument:changes",
-    "15": "instrument:changes",
-    "16": "instrument:changes",
-    "18": "instrument:figure",
-    "2": "dream:newest",
-    "4": "instrument:threads",
-    "6": "instrument:changes"
+    "10": "dream:newest",
+    "12": "instrument:threads",
+    "14": "instrument:changes",
+    "18": "instrument:changes",
+    "23": "instrument:changes",
+    "24": "instrument:changes",
+    "26": "instrument:figure",
+    "8": "instrument:dreams",
+    "9": "instrument:dreams"
   },
   "folded-100x40": {
-    "0": "instrument:dreams",
-    "1": "dream:newest",
-    "2": "instrument:threads",
-    "3": "instrument:changes",
-    "4": "instrument:changes",
-    "5": "instrument:changes",
-    "6": "instrument:figure"
+    "30": "instrument:dreams",
+    "31": "dream:newest",
+    "32": "instrument:threads",
+    "34": "instrument:changes",
+    "35": "instrument:changes",
+    "36": "instrument:changes",
+    "37": "instrument:figure"
   },
   "folded-46x30": {
-    "0": "instrument:dreams",
-    "1": "instrument:dreams",
-    "10": "instrument:changes",
-    "11": "instrument:figure",
-    "2": "dream:newest",
-    "4": "instrument:threads",
-    "6": "instrument:changes",
-    "8": "instrument:changes"
+    "15": "instrument:dreams",
+    "16": "instrument:dreams",
+    "17": "dream:newest",
+    "19": "instrument:threads",
+    "21": "instrument:changes",
+    "23": "instrument:changes",
+    "25": "instrument:changes",
+    "26": "instrument:figure"
   },
   "inherited-100x40": {
-    "0": "instrument:dreams",
-    "1": "dream:newest",
-    "10": "instrument:changes",
-    "12": "instrument:figure",
-    "2": "instrument:threads",
-    "3": "instrument:changes",
-    "6": "instrument:changes",
-    "9": "instrument:changes"
+    "24": "instrument:dreams",
+    "25": "dream:newest",
+    "26": "instrument:threads",
+    "28": "instrument:changes",
+    "31": "instrument:changes",
+    "34": "instrument:changes",
+    "35": "instrument:changes",
+    "37": "instrument:figure"
   },
   "inherited-46x30": {
-    "0": "instrument:dreams",
-    "1": "instrument:dreams",
-    "10": "instrument:changes",
-    "15": "instrument:changes",
-    "16": "instrument:changes",
-    "18": "instrument:figure",
-    "2": "dream:newest",
-    "4": "instrument:threads",
-    "6": "instrument:changes"
+    "10": "dream:newest",
+    "12": "instrument:threads",
+    "14": "instrument:changes",
+    "18": "instrument:changes",
+    "23": "instrument:changes",
+    "24": "instrument:changes",
+    "26": "instrument:figure",
+    "8": "instrument:dreams",
+    "9": "instrument:dreams"
   },
   "landed-100x40": {
-    "0": "instrument:dreams",
-    "1": "dream:newest",
-    "2": "instrument:threads",
-    "3": "instrument:changes",
-    "4": "instrument:changes",
-    "5": "instrument:changes",
-    "6": "instrument:figure"
+    "30": "instrument:dreams",
+    "31": "dream:newest",
+    "32": "instrument:threads",
+    "34": "instrument:changes",
+    "35": "instrument:changes",
+    "36": "instrument:changes",
+    "37": "instrument:figure"
   },
   "landed-46x30": {
-    "0": "instrument:dreams",
-    "1": "instrument:dreams",
-    "10": "instrument:changes",
-    "11": "instrument:figure",
-    "2": "dream:newest",
-    "4": "instrument:threads",
-    "6": "instrument:changes",
-    "8": "instrument:changes"
+    "15": "instrument:dreams",
+    "16": "instrument:dreams",
+    "17": "dream:newest",
+    "19": "instrument:threads",
+    "21": "instrument:changes",
+    "23": "instrument:changes",
+    "25": "instrument:changes",
+    "26": "instrument:figure"
   },
   "note-100x40": {
     "0": "view:info",
@@ -143,25 +143,25 @@
     "9": "shifts"
   },
   "open-100x40": {
-    "0": "instrument:dreams",
-    "1": "dream:newest",
-    "10": "instrument:changes",
-    "12": "instrument:figure",
-    "2": "instrument:threads",
-    "3": "instrument:changes",
-    "6": "instrument:changes",
-    "9": "instrument:changes"
+    "24": "instrument:dreams",
+    "25": "dream:newest",
+    "26": "instrument:threads",
+    "28": "instrument:changes",
+    "31": "instrument:changes",
+    "34": "instrument:changes",
+    "35": "instrument:changes",
+    "37": "instrument:figure"
   },
   "open-46x30": {
-    "0": "instrument:dreams",
-    "1": "instrument:dreams",
-    "10": "instrument:changes",
-    "15": "instrument:changes",
-    "16": "instrument:changes",
-    "18": "instrument:figure",
-    "2": "dream:newest",
-    "4": "instrument:threads",
-    "6": "instrument:changes"
+    "10": "dream:newest",
+    "12": "instrument:threads",
+    "14": "instrument:changes",
+    "18": "instrument:changes",
+    "23": "instrument:changes",
+    "24": "instrument:changes",
+    "26": "instrument:figure",
+    "8": "instrument:dreams",
+    "9": "instrument:dreams"
   },
   "refreshing-100x40": {
     "0": "view:info",
@@ -211,22 +211,22 @@
     "9": "shifts"
   },
   "shut-100x40": {
-    "0": "instrument:dreams",
-    "1": "dream:newest",
-    "2": "instrument:threads",
-    "3": "instrument:changes",
-    "4": "instrument:changes",
-    "5": "instrument:changes",
-    "6": "instrument:figure"
+    "30": "instrument:dreams",
+    "31": "dream:newest",
+    "32": "instrument:threads",
+    "34": "instrument:changes",
+    "35": "instrument:changes",
+    "36": "instrument:changes",
+    "37": "instrument:figure"
   },
   "shut-46x30": {
-    "0": "instrument:dreams",
-    "1": "instrument:dreams",
-    "10": "instrument:changes",
-    "11": "instrument:figure",
-    "2": "dream:newest",
-    "4": "instrument:threads",
-    "6": "instrument:changes",
-    "8": "instrument:changes"
+    "15": "instrument:dreams",
+    "16": "instrument:dreams",
+    "17": "dream:newest",
+    "19": "instrument:threads",
+    "21": "instrument:changes",
+    "23": "instrument:changes",
+    "25": "instrument:changes",
+    "26": "instrument:figure"
   }
 }

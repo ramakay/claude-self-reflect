@@ -1,7 +1,7 @@
-0	{"key":"instrument:dreams"}
-1	{"key":"instrument:dreams"}
-2	{"dream":"newest","key":"dream:newest","send":"CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,11,"helpful"],[11,23,"thought_of_it"],[23,34,"not_relevant"],[34,46,"ask_claude"]]}
-4	{"key":"instrument:threads"}
-6	{"key":"instrument:changes"}
-7	{"key":"instrument:figure"}
-29	{"key":"legend","keys":[[0,9,"l"],[11,20,"t"],[22,30,"i"],[32,39,"q"]]}
+19	{"key":"instrument:dreams"}
+20	{"key":"instrument:dreams"}
+21	{"dream":"newest","key":"dream:newest","send":"CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,11,"helpful"],[11,23,"thought_of_it"],[23,34,"not_relevant"],[34,46,"ask_claude"]]}
+23	{"key":"instrument:threads"}
+25	{"key":"instrument:changes"}
+26	{"key":"instrument:figure"}
+29	{"key":"legend","keys":[[0,5,"l"],[7,12,"t"],[14,19,"i"],[21,26,"b"],[28,34,"q"]]}

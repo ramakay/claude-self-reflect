@@ -23,7 +23,6 @@ pub struct DreamCard {
     pub handed: usize,
     pub top: Value,
     pub queue: Vec<Value>,
-    pub answered: Vec<Value>,
     pub budget: Value,
     pub look: Value,
     pub looks: usize,
@@ -34,6 +33,7 @@ pub struct DreamCard {
 }
 #[derive(Clone, Debug)]
 pub struct Composition {
+    pub empty_session: bool,
     pub learnt: Vec<String>,
     pub requests: Vec<(f64, f64)>,
     pub codex_week: Value,
@@ -69,18 +69,30 @@ fn observation(v: &Value) -> Vec<Value> {
 impl Composition {
     pub fn build(data: &Value, s: &Value, now: f64) -> Self {
         let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], string(&s["id"]));
-        let top = fed["star"].clone();
+        let mut pending = array(&fed["queue"]).to_vec();
+        if !fed["star"].is_null() {
+            pending.insert(0, fed["star"].clone());
+        }
+        pending.sort_by(|a, b| num(&b["at"]).total_cmp(&num(&a["at"])));
+        let top = pending.first().cloned().unwrap_or(Value::Null);
         let missing = Value::Null;
         let look = if data["look"]["session"] == s["id"] {
             &data["look"]
         } else {
             &missing
         };
+        // A dream queue can be empty in a busy session. Usage can arrive before its transcript.
+        let empty_session =
+            masthead::ctx_now(&data["claude_fields"], data["claude_at"].as_f64(), s)
+                .0
+                .is_none_or(|n| n <= 0.)
+                && array(&s["main"]).is_empty()
+                && array(&s["prompts"]).is_empty();
         let state = if !top.is_null() {
             Batch::Ready
         } else if matches!(string(&look["outcome"]), "dreaming" | "started") {
             Batch::Dreaming
-        } else if look["outcome"] == "none" {
+        } else if look["outcome"] == "none" || !empty_session {
             Batch::Nothing
         } else {
             Batch::Empty
@@ -89,12 +101,14 @@ impl Composition {
         let looks = records
             .iter()
             .filter(|r| {
-                r["kind"] == "look" && !matches!(string(&r["outcome"]), "dreaming" | "started")
+                r["session"] == s["id"]
+                    && r["kind"] == "look"
+                    && !matches!(string(&r["outcome"]), "dreaming" | "started")
             })
             .count();
         let none = records
             .iter()
-            .filter(|r| r["kind"] == "look" && r["outcome"] == "none")
+            .filter(|r| r["session"] == s["id"] && r["kind"] == "look" && r["outcome"] == "none")
             .count();
         let source = if top.is_null() { look } else { &top };
         let mut river: Vec<_> = array(&data["dreams"])
@@ -228,6 +242,7 @@ impl Composition {
                     })
             });
         Self {
+            empty_session,
             learnt: array(&data["learnt"])
                 .iter()
                 .filter_map(|v| {
@@ -267,17 +282,9 @@ impl Composition {
                 ),
                 carried: top["carried"] == true,
                 top: top.clone(),
-                queue: array(&fed["queue"]).to_vec(),
-                answered: array(&data["dreams"])
-                    .iter()
-                    .filter(|d| {
-                        d["session"] == s["id"] && dreams::SETTLED.contains(&string(&d["answer"]))
-                    })
-                    .take(2)
-                    .cloned()
-                    .collect(),
-                budget: if fed["budget"].is_object() {
-                    fed["budget"].clone()
+                queue: pending.into_iter().skip(1).collect(),
+                budget: if top["budget"].is_object() {
+                    top["budget"].clone()
                 } else {
                     look["budget"].clone()
                 },
@@ -388,6 +395,10 @@ fn status_line(c: &Composition) -> String {
             "The last look found nothing. {} of {} looks end this way.",
             c.dream.none, c.dream.looks
         ),
+        Batch::Nothing if c.dream.look.is_object() => {
+            "The dreamer looked; no open what-if remains.".into()
+        }
+        Batch::Nothing => "No open what-if yet.".into(),
         Batch::Dreaming => {
             let names = array(&c.dream.look["threads"])
                 .iter()
@@ -622,13 +633,6 @@ pub fn rows_with_figure(
     out.extend(hero);
     if c.dream.state != Batch::Ready {
         out.extend(wrap(&status_line(c)));
-        for d in &c.dream.answered {
-            out.extend(wrap(&format!(
-                "{} → {}",
-                string(&d["title"]),
-                dreams::answer_word(string(&d["answer"]))
-            )));
-        }
     }
     if c.asked_away {
         out.extend(wrap("asked while you were away"));
@@ -639,7 +643,7 @@ pub fn rows_with_figure(
     if let Some(n) = &c.notice {
         out.extend(wrap(n));
     }
-    if c.dream.state == Batch::Empty {
+    if c.empty_session {
         for line in [
             "Ask about past work. CSR finds it.",
             "Code changed? CSR warns Claude.",
@@ -649,10 +653,8 @@ pub fn rows_with_figure(
         }
     }
     if !c.story.is_empty() {
-        out.extend(fact_rows(
-            &format!("Story · {} · {}", c.story_age, first_sentence(&c.story)),
-            cols,
-        ));
+        out.extend(fact_rows(&format!("Story · {}", c.story_age), cols));
+        out.extend(wrap(first_sentence(&c.story)));
     }
     let mut details_start = out.len();
     for v in c
@@ -871,6 +873,8 @@ fn single(
 }
 #[derive(Clone, Debug)]
 pub struct Metrics {
+    pub content_left: f32,
+    pub content_width: f32,
     pub dream: f32,
     pub answer_y: Option<f32>,
     pub answer_spans: Vec<(f32, f32, String)>,
@@ -917,10 +921,16 @@ pub fn draw(
     let f = &*fonts;
     let t = theme.tokens();
     let ratio = width as f32 / (W * S);
-    let maxh = available_height as f32 / (S * ratio);
+    // Lay out the complete instrument before fitting both dimensions. Wide, short panes get
+    // centered side margins rather than an undersized hero budget and a text-only fallback.
+    let maxh = (available_height as f32 / (S * ratio)).max(800.);
     let learn_h = if c.learnt.is_empty() { 0. } else { 20. };
     let story_support = if c.story.is_empty() && c.shifts.is_empty() {
-        0.
+        if c.learnt.is_empty() {
+            0.
+        } else {
+            P * 2. + learn_h + 12.
+        }
     } else if c.shifts.is_empty() {
         P + 38. + P + 12.
     } else {
@@ -931,23 +941,12 @@ pub fn draw(
     } else {
         360.
     };
-    let support = M
-        + 12.
-        + story_support
-        + 42.
-        + figure_support
-        + if c.dream.state == Batch::Empty {
-            94.
-        } else {
-            0.
-        };
-    let hero_limit = (maxh * 0.30).min((support * 3. / 7.).floor()).floor().min(
-        if c.dream.state == Batch::Empty {
-            136.
-        } else {
-            240.
-        },
-    );
+    let support =
+        M + 12. + story_support + 42. + figure_support + if c.empty_session { 94. } else { 0. };
+    let hero_limit = (maxh * 0.30)
+        .min((support * 3. / 7.).floor())
+        .floor()
+        .min(if c.empty_session { 136. } else { 240. });
     let has_extra = !c.dream.confusing.is_empty() || !c.dream.should_be.is_empty();
     let full_extras = extras(c, false);
     let collapsed = has_extra
@@ -960,11 +959,6 @@ pub fn draw(
         .map(|s| f.wrap(s, sans(11.5, t.regular), IW).len() as f32 * 16.)
         .sum::<f32>();
     let status = status_line(c);
-    let answered_h = if c.dream.state != Batch::Ready {
-        c.dream.answered.len() as f32 * 17.
-    } else {
-        0.
-    };
     let status_lines = f.wrap(&status, sans(11.5, t.regular), IW);
     let status_h = if status.is_empty() {
         0.
@@ -979,8 +973,7 @@ pub fn draw(
             12.
         }
         + extras_h
-        + status_h
-        + answered_h;
+        + status_h;
     let (qs, question) = question_layout(f, &c.question(), (hero_limit - overhead).max(25.), t);
     let qh = question.len() as f32 * qs.size * 1.28;
     let hero_h = overhead + qh;
@@ -988,7 +981,11 @@ pub fn draw(
         return None;
     }
     let story_h = if c.story.is_empty() && c.shifts.is_empty() {
-        0.
+        if c.learnt.is_empty() {
+            0.
+        } else {
+            P * 2.
+        }
     } else {
         if c.shifts.is_empty() {
             P + 38. + P
@@ -1012,11 +1009,7 @@ pub fn draw(
     } else {
         0.
     };
-    let empty_help = if c.dream.state == Batch::Empty {
-        94.
-    } else {
-        0.
-    };
+    let empty_help = if c.empty_session { 94. } else { 0. };
     let mut drill_lines = vec![];
     if open.changes {
         for v in &c.shifts {
@@ -1339,26 +1332,6 @@ pub fn draw(
             b += 16.;
         }
     }
-    if c.dream.state != Batch::Ready {
-        for d in &c.dream.answered {
-            single(
-                &mut canvas,
-                f,
-                &format!(
-                    "{} → {}",
-                    string(&d["title"]),
-                    dreams::answer_word(string(&d["answer"]))
-                ),
-                IX,
-                b,
-                IW,
-                10.5,
-                t.quiet,
-                t,
-            );
-            b += 17.;
-        }
-    }
     y += hero_h + 12.;
     if let Some(notice) = &c.notice {
         panel(&mut canvas, y, notice_h, t);
@@ -1372,7 +1345,11 @@ pub fn draw(
         label(
             &mut canvas,
             f,
-            "Where the work stands",
+            if c.story.is_empty() && c.shifts.is_empty() {
+                "This session"
+            } else {
+                "Where the work stands"
+            },
             IX,
             y + P,
             13.,
@@ -1407,7 +1384,12 @@ pub fn draw(
                 f,
                 &c.learnt.join(" · "),
                 IX,
-                y + P + 58.,
+                y + P
+                    + if c.story.is_empty() && c.shifts.is_empty() {
+                        20.
+                    } else {
+                        58.
+                    },
                 IW,
                 12.,
                 t.mint,
@@ -1567,37 +1549,33 @@ pub fn draw(
                 t.regular,
             );
         }
-        y += empty_help;
     }
-    single(
-        &mut canvas,
-        f,
-        &footer(c),
-        IX,
-        (y + 23.).min(height - 10.),
-        IW,
-        10.5,
-        t.quiet,
-        t,
-    );
     let raw = image::RgbaImage::from_raw(
         canvas.pm.width(),
         canvas.pm.height(),
         canvas.pm.data().to_vec(),
     )?;
-    let output = image::imageops::resize(
+    let scale = (width as f32 / W).min(available_height as f32 / height);
+    let fitted_width = (W * scale).round().min(width as f32) as u32;
+    let fitted_height = (height * scale).round().min(available_height as f32) as u32;
+    let fitted = image::imageops::resize(
         &raw,
-        width,
-        (height * S * ratio).round() as u32,
+        fitted_width,
+        fitted_height,
         image::imageops::FilterType::Lanczos3,
     );
+    let left = (width - fitted_width) / 2;
+    let mut output = image::RgbaImage::from_pixel(width, fitted_height, image::Rgba(t.ground));
+    image::imageops::overlay(&mut output, &fitted, i64::from(left), 0);
     let pm = tiny_skia::Pixmap::from_vec(
         output.into_raw(),
-        tiny_skia::IntSize::from_wh(width, (height * S * ratio).round() as u32)?,
+        tiny_skia::IntSize::from_wh(width, fitted_height)?,
     )?;
     Some((
         pm,
         Metrics {
+            content_left: left as f32 / width as f32,
+            content_width: fitted_width as f32 / width as f32,
             dream: hero_h,
             answer_y,
             answer_spans,

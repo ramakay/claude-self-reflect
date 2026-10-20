@@ -750,7 +750,7 @@ impl Pane {
         use super::render::{instrument, raster, text};
         self.instrument_metrics = None;
         let cell = super::render::kitty::cell_size();
-        let strip = if self.pixels && self.cards && cols < 46 {
+        let strip = if self.pixels && self.cards && cols < 40 {
             instrument::strip(
                 composition,
                 cols as u32 * cell.0,
@@ -816,7 +816,7 @@ impl Pane {
                     self.acts.insert(r, json!({"key":"instrument:figure"}));
                 }
             }
-        } else if self.pixels && self.cards && cols >= 46 {
+        } else if self.pixels && self.cards && cols >= 40 {
             let cell = super::render::kitty::cell_size();
             if let Some((pm, metrics)) = instrument::draw(
                 composition,
@@ -824,7 +824,7 @@ impl Pane {
                 rows.saturating_sub(1) as u32 * cell.1,
                 self.theme,
                 self.instrument_open,
-                cols < 46,
+                cols < 40,
             ) {
                 if let Ok(png) = raster::png(&pm) {
                     self.instrument_metrics = Some(metrics.clone());
@@ -871,8 +871,12 @@ impl Pane {
                             .answer_spans
                             .iter()
                             .map(|(a, b, word)| json!([
-                                (a / 605. * cols as f32).floor() as usize,
-                                (b / 605. * cols as f32).ceil() as usize,
+                                ((metrics.content_left + a / 605. * metrics.content_width)
+                                    * cols as f32)
+                                    .floor() as usize,
+                                ((metrics.content_left + b / 605. * metrics.content_width)
+                                    * cols as f32)
+                                    .ceil() as usize,
                                 word
                             ]))
                             .collect::<Vec<_>>());
@@ -883,6 +887,17 @@ impl Pane {
         }
         out.truncate(rows.saturating_sub(1));
         out = out.into_iter().map(|line| text::safe_line(&line)).collect();
+        // Text content sits immediately above the keys; placements already own their rows.
+        if self.placed.is_empty() && !out.is_empty() {
+            let gap = rows.saturating_sub(1 + out.len());
+            if gap > 0 {
+                self.acts = std::mem::take(&mut self.acts)
+                    .into_iter()
+                    .map(|(row, act)| (row + gap, act))
+                    .collect();
+                out.splice(0..0, std::iter::repeat_n(String::new(), gap));
+            }
+        }
         out.resize(rows.saturating_sub(1), String::new());
         let token = self.theme.tokens();
         let rgb = [token.quiet[0], token.quiet[1], token.quiet[2]];
@@ -912,20 +927,47 @@ impl Pane {
             ("b", "theme"),
             ("q", "close"),
         ]);
-        // Keep close visible; omit whole lower-priority key labels when space is tight.
+        // Theme is essential at every width. Abbreviate, then omit secondary keys first.
         let width = |keys: &[(&str, &str)]| {
             keys.iter()
-                .map(|(key, label)| key.len() + 1 + label.len())
+                .map(|(key, label)| key.len() + usize::from(!label.is_empty()) + label.len())
                 .sum::<usize>()
                 + keys.len().saturating_sub(1) * 2
         };
-        while keys.len() > 1 && width(&keys) > cols {
-            keys.remove(keys.len() - 2);
+        if width(&keys) > cols {
+            for (_, label) in &mut keys {
+                *label = match *label {
+                    "changes" => "chg",
+                    "threads" => "thr",
+                    "figure" => "fig",
+                    "theme" => "thm",
+                    "close" => "quit",
+                    other => other,
+                };
+            }
+        }
+        for key in ["l", "t", "i", "d", "z"] {
+            if width(&keys) <= cols {
+                break;
+            }
+            keys.retain(|(k, _)| *k != key);
+        }
+        if width(&keys) > cols {
+            keys = vec![("b", "thm")];
+            if width(&keys) > cols {
+                keys = vec![("b", "")];
+            }
         }
         let footer = text::fit(
             &keys
                 .iter()
-                .map(|(key, label)| format!("{key} {label}"))
+                .map(|(key, label)| {
+                    if label.is_empty() {
+                        (*key).to_owned()
+                    } else {
+                        format!("{key} {label}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("  "),
             cols,
@@ -933,7 +975,7 @@ impl Pane {
         let mut start = 0;
         let mut spans = vec![];
         for (key, label) in keys {
-            let end = start + key.len() + 1 + label.len();
+            let end = start + key.len() + usize::from(!label.is_empty()) + label.len();
             if end <= cols {
                 spans.push(json!([start, end, key]));
             }

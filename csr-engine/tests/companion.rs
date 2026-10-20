@@ -589,6 +589,29 @@ fn pictures_match_pillow_dimensions_and_pixels() {
 fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
     let (_home, paths) = bare_home();
     let output = tempfile::tempdir().unwrap();
+    fn snapshot(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &std::path::Path,
+            at: &std::path::Path,
+            found: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(at).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    visit(root, &entry.path(), found);
+                } else {
+                    found.insert(
+                        entry.path().strip_prefix(root).unwrap().into(),
+                        fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut found = std::collections::BTreeMap::new();
+        visit(root, root, &mut found);
+        found
+    }
+    let before = snapshot(&paths.home);
     let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
         .env("HOME", &paths.home)
         .env("TERM_PROGRAM", "kitty")
@@ -616,7 +639,11 @@ fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
         format!("{}\n", output.path().display())
     );
     let actual = fs::read_to_string(output.path().join("screen.txt")).unwrap();
-    let expected = golden(fixture().join("pictures/screen.txt"), &actual);
+    let mut screen_args = args("main", 46, 30);
+    screen_args.png = Some(output.path().into());
+    let mut screen_pane = Pane::new(paths.clone(), &screen_args);
+    screen_pane.pixels = true;
+    let expected = screen_pane.frame(46, 30, 1792320000.).join("\n") + "\n";
     assert_eq!(actual, expected);
     let actual = image::open(output.path().join("session.png"))
         .unwrap()
@@ -638,6 +665,104 @@ fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
     assert!(!paths.keep.join("previous").exists());
     assert!(!paths.keep.join("panes").exists());
     assert!(!output.path().join("last.png").exists());
+    use csr_engine::companion::render::{kitty, theme::Theme};
+    let cell = kitty::cell_size();
+    let check = |cols: usize, rows: usize| {
+        for (name, theme) in [("dark", Theme::Dark), ("light", Theme::Light)] {
+            let image = image::open(output.path().join(format!("instrument-{name}.png")))
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(
+                image.dimensions(),
+                (cols as u32 * cell.0, rows as u32 * cell.1)
+            );
+            let mut shot = args("main", cols, rows);
+            shot.png = Some(output.path().into());
+            let mut pane = Pane::new(paths.clone(), &shot);
+            pane.theme = theme;
+            pane.pixels = true;
+            pane.enable_cards();
+            let lines = pane.frame(cols, rows, 1792320000.);
+            assert!(
+                !pane.placed.is_empty(),
+                "instrument must export actual pane pixels"
+            );
+            for placement in &pane.placed {
+                assert!(placement.col + placement.cols <= cols);
+                assert!(placement.row + placement.rows < rows);
+                let source = image::load_from_memory(&placement.png).unwrap().to_rgba8();
+                let source = image::imageops::resize(
+                    &source,
+                    placement.cols as u32 * cell.0,
+                    placement.rows as u32 * cell.1,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                let mut expected = image::RgbaImage::from_pixel(
+                    source.width(),
+                    source.height(),
+                    image::Rgba(theme.tokens().ground),
+                );
+                image::imageops::overlay(&mut expected, &source, 0, 0);
+                let region = image::imageops::crop_imm(
+                    &image,
+                    placement.col as u32 * cell.0,
+                    placement.row as u32 * cell.1,
+                    source.width(),
+                    source.height(),
+                )
+                .to_image();
+                assert_eq!(region, expected, "placement pixels at {cols}x{rows} {name}");
+            }
+            assert!(lines.last().unwrap().contains("q "));
+            let footer = image::imageops::crop_imm(
+                &image,
+                0,
+                (rows as u32 - 1) * cell.1,
+                image.width(),
+                cell.1,
+            )
+            .to_image();
+            assert!(
+                footer.pixels().any(|p| p.0 != theme.tokens().ground),
+                "footer text must be drawn"
+            );
+        }
+    };
+    check(44, 30);
+    for (cols, rows) in [(44, 30), (60, 40)] {
+        let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .env("HOME", &paths.home)
+            .env("TERM_PROGRAM", "kitty")
+            .env("CSR_COMPANION_NOW", "1792320000")
+            .env_remove("CSR_COMPANION_PIXELS")
+            .args([
+                "companion",
+                "pane",
+                "--repo",
+                args("main", cols, rows).repo.to_str().unwrap(),
+                "--sid",
+                "sess-now",
+                "--png",
+                output.path().to_str().unwrap(),
+                "--cols",
+                &cols.to_string(),
+                "--rows",
+                &rows.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        check(cols, rows);
+    }
+    assert_eq!(
+        snapshot(&paths.home),
+        before,
+        "PNG export must leave HOME untouched"
+    );
 }
 
 #[test]

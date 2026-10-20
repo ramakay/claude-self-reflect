@@ -578,7 +578,7 @@ fn the_cli_draws_the_three_pages() {
         let text = plain_rows(&[String::from_utf8(out.stdout).unwrap()]).concat();
         assert!(
             if page == "figure" {
-                text.contains("i figure")
+                text.contains("i fig") && text.contains("b th")
             } else {
                 text.contains("d back   j/k scroll   q close")
             },
