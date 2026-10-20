@@ -27,7 +27,7 @@ Single 78MB binary. Embedded SQLite, no database server. No containers. No API k
 ## Table of Contents
 
 - [The Problem](#the-forgetting-problem) — Why Claude needs memory
-- [The Architecture](#one-binary-44mb) — How CSR solves it
+- [The Architecture](#one-binary-78mb) — How CSR solves it
 - [The Pipeline](#the-pipeline) — Progressive enrichment (9.3x improvement)
 - [The Paper](#the-paper) — The research behind the retrieval design (preprint)
 - [btw, these too](#btw-these-too): Smaller features that ship with it
