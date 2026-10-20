@@ -38,7 +38,42 @@ impl MessageIndex {
         parent: Option<&super::ParentContext>,
         needles: &[&str],
     ) -> Result<Self> {
-        Self::read_lines(path, conversation_id, codex, plan, parent, needles, false)
+        Self::read_lines(
+            path,
+            conversation_id,
+            codex,
+            plan,
+            parent,
+            needles,
+            false,
+            None,
+        )
+    }
+
+    /// [`Self::read`] for a caller that only wants [`Self::inputs`] (or
+    /// [`Self::raw_inputs`] when `raw`): the other three documents are never
+    /// built, which on a large transcript is most of the memory. The inputs
+    /// are byte-identical to the full index's.
+    pub(super) fn read_inputs_only(
+        path: &Path,
+        conversation_id: &str,
+        codex: bool,
+        plan: bool,
+        parent: Option<&super::ParentContext>,
+        raw: bool,
+    ) -> Result<Self> {
+        // A plan reads document 0 whichever form is asked for.
+        let only = if plan || raw { 0 } else { 2 };
+        Self::read_lines(
+            path,
+            conversation_id,
+            codex,
+            plan,
+            parent,
+            &[],
+            false,
+            Some(only),
+        )
     }
 
     /// [`Self::read`] for a transcript the importer has already read: a line it
@@ -50,7 +85,16 @@ impl MessageIndex {
         conversation_id: &str,
         needles: &[&str],
     ) -> Result<Self> {
-        Self::read_lines(path, conversation_id, false, false, None, needles, true)
+        Self::read_lines(
+            path,
+            conversation_id,
+            false,
+            false,
+            None,
+            needles,
+            true,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -62,7 +106,9 @@ impl MessageIndex {
         parent: Option<&super::ParentContext>,
         needles: &[&str],
         skip_malformed: bool,
+        only: Option<usize>,
     ) -> Result<Self> {
+        let wanted = |document: usize| only.is_none_or(|only| only == document);
         let mut documents = vec![
             Document::default(),
             Document::default(),
@@ -111,16 +157,18 @@ impl MessageIndex {
                 let clean_components = components(&clean, &names, codex, true);
                 // Payload sanitization and marker suppression landed separately.
                 // Keep both deterministic representations for older stored chunks.
-                documents[3].push(
-                    &clean,
-                    clean_components.clone(),
-                    conversation_id,
-                    seq,
-                    path,
-                    offset,
-                    floor,
-                    parent,
-                );
+                if wanted(3) {
+                    documents[3].push(
+                        &clean,
+                        clean_components.clone(),
+                        conversation_id,
+                        seq,
+                        path,
+                        offset,
+                        floor,
+                        parent,
+                    );
+                }
                 let marker = |parts: &[(String, String)]| {
                     super::drops_as_marker_only(
                         &raw,
@@ -131,7 +179,7 @@ impl MessageIndex {
                             .join("\n"),
                     )
                 };
-                if !marker(&raw_components) {
+                if wanted(1) && !marker(&raw_components) {
                     documents[1].push(
                         &raw,
                         raw_components.clone(),
@@ -143,7 +191,7 @@ impl MessageIndex {
                         parent,
                     );
                 }
-                if !marker(&clean_components) {
+                if wanted(2) && !marker(&clean_components) {
                     documents[2].push(
                         &clean,
                         clean_components,
@@ -155,16 +203,18 @@ impl MessageIndex {
                         parent,
                     );
                 }
-                documents[0].push(
-                    &raw,
-                    raw_components.clone(),
-                    conversation_id,
-                    seq,
-                    path,
-                    offset,
-                    floor,
-                    parent,
-                );
+                if wanted(0) {
+                    documents[0].push(
+                        &raw,
+                        raw_components.clone(),
+                        conversation_id,
+                        seq,
+                        path,
+                        offset,
+                        floor,
+                        parent,
+                    );
+                }
                 // Context is observed before search sanitization: removing a stored
                 // wrapper or tool body cannot make later assistant text more trusted.
                 for (channel, _) in raw_components {

@@ -692,12 +692,80 @@ fn is_task_prompt(prose: &str) -> bool {
 /// Pure function — no I/O, no engine access. Parses each line as JSON and
 /// extracts fields from the Claude Code transcript format.
 pub fn extract_episode(lines: &[&str], session_id: &str, project: &str) -> Episode {
-    let messages: Vec<serde_json::Value> = lines
-        .iter()
-        .filter_map(|line| serde_json::from_str(line.trim()).ok())
-        .collect();
-    let (sanitized, _) = crate::import::sanitize_messages_for_search(&messages);
-    extract_episode_from_messages(&sanitized, &messages, session_id, project)
+    let mut sanitizer = crate::import::RowSanitizer::for_derived();
+    extract_episode_from_rows(
+        lines
+            .iter()
+            .filter_map(|line| episode_row(line, &mut sanitizer)),
+        session_id,
+        project,
+    )
+}
+
+/// One transcript line as the episode extraction reads it: the row sanitized
+/// for search, and the untouched row, which only user rows need (forwarded
+/// notes and dreamer what-ifs, which the sanitizer blanks as CSR's own
+/// words). Other rows carry `Null` as their raw twin: the extraction never
+/// reads it for them, so they are not cloned.
+fn episode_row(
+    line: &str,
+    sanitizer: &mut crate::import::RowSanitizer,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let mut row: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let user_row = matches!(
+        row.get("type").and_then(|v| v.as_str()),
+        Some("user" | "human")
+    );
+    let raw = if user_row {
+        row.clone()
+    } else {
+        serde_json::Value::Null
+    };
+    sanitizer.sanitize(&mut row);
+    Some((row, raw))
+}
+
+/// [`extract_episode`] over a transcript file, one line in memory at a time.
+/// Same episode as reading the file whole, without holding the file or its
+/// parsed rows. Errors on an unreadable file or invalid UTF-8, as
+/// `read_to_string` did.
+pub(crate) fn extract_episode_from_file(
+    path: &Path,
+    session_id: &str,
+    project: &str,
+) -> Result<Episode> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut sanitizer = crate::import::RowSanitizer::for_derived();
+    let mut failure: Option<std::io::Error> = None;
+    let mut buf = Vec::new();
+    let rows = std::iter::from_fn(|| loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(error) => {
+                failure = Some(error);
+                return None;
+            }
+        }
+        match std::str::from_utf8(&buf) {
+            Ok(line) => {
+                if let Some(row) = episode_row(line, &mut sanitizer) {
+                    return Some(row);
+                }
+            }
+            Err(error) => {
+                failure = Some(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+                return None;
+            }
+        }
+    });
+    let episode = extract_episode_from_rows(rows, session_id, project);
+    match failure {
+        Some(error) => Err(error.into()),
+        None => Ok(episode),
+    }
 }
 
 /// `messages` are sanitized for search; `raw` are the same rows untouched
@@ -709,6 +777,26 @@ pub(crate) fn extract_episode_from_messages(
     session_id: &str,
     project: &str,
 ) -> Episode {
+    extract_episode_from_rows(
+        messages
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row, raw.get(index).unwrap_or(row))),
+        session_id,
+        project,
+    )
+}
+
+/// The extraction proper: `(sanitized, raw)` row pairs in transcript order.
+fn extract_episode_from_rows<S, R>(
+    rows: impl IntoIterator<Item = (S, R)>,
+    session_id: &str,
+    project: &str,
+) -> Episode
+where
+    S: std::borrow::Borrow<serde_json::Value>,
+    R: std::borrow::Borrow<serde_json::Value>,
+{
     let mut request = String::new();
     let mut investigated = HashSet::new();
     let mut files_modified = HashSet::new();
@@ -744,7 +832,9 @@ pub(crate) fn extract_episode_from_messages(
     // Error signature patterns
     let error_patterns: &[&str] = &["error[", "Error:", "panic", "FAIL", "FAILED", "Exception"];
 
-    for (index, val) in messages.iter().enumerate() {
+    for (row, raw_row) in rows {
+        let val: &serde_json::Value = row.borrow();
+        let raw_row: &serde_json::Value = raw_row.borrow();
         let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
         message_count += 1;
         // A legacy in-file subagent row. It still counts toward tools/files,
@@ -768,7 +858,6 @@ pub(crate) fn extract_episode_from_messages(
         // mid-turn (no finished turn since the last task) is the same task
         // continued, so it joins the current segment's text instead.
         if msg_type == "user" || msg_type == "human" {
-            let raw_row = raw.get(index).unwrap_or(val);
             // A transcript that opens with a CSR agent prompt (narrator,
             // analyst, labeler child) is CSR talking to itself: none of its
             // rows is the person's task. The importer skips it whole too.
@@ -1338,23 +1427,24 @@ pub async fn extract_and_store_episode(
     let project = resolve_project_from_cwd(&cwd.to_string_lossy());
     let project_name = project.as_deref().unwrap_or("unknown");
 
-    // Read transcript lines
-    let raw = std::fs::read_to_string(&tp)?;
-    let lines: Vec<&str> = raw.lines().collect();
-
+    // The transcript can be hundreds of MB: it is streamed a line at a time
+    // here, never held whole (see `extract_episode_from_file`).
     let mut provenance_inputs = crate::import::transcript_inputs(engine.storage(), &tp, session_id)
-        .unwrap_or_else(|_| {
-            crate::storage::artifact_provenance::InputEnvelope::new(vec![
-                crate::storage::artifact_provenance::ArtifactInput::unknown(&raw),
-            ])
-        });
+        .or_else(|_| {
+            let raw = std::fs::read_to_string(&tp)?;
+            Ok::<_, anyhow::Error>(crate::storage::artifact_provenance::InputEnvelope::new(
+                vec![crate::storage::artifact_provenance::ArtifactInput::unknown(
+                    &raw,
+                )],
+            ))
+        })?;
     let mut task_inputs = None;
 
-    let mut episode = extract_episode(&lines, session_id, project_name);
+    let mut episode = extract_episode_from_file(&tp, session_id, project_name)?;
 
     // Journal v2 instrumentation feeds (plan `.plans/journal-v2-mailbox-plan.md`
     // §3.3/§4.1): one extra streaming pass over the same transcript file
-    // (already in page cache from the `read_to_string` above for anything
+    // (already in page cache from the streaming read above for anything
     // under the size cap). Wrapped so ANY failure — oversized file,
     // transcript deleted between the existence check above and this scan,
     // malformed content — leaves the fields `None` ("never measured")
@@ -4281,5 +4371,98 @@ mod tests {
                 "{leaked} reached the episode: {derived}"
             );
         }
+    }
+    // ---- streaming equivalence (Stop memory) ----
+
+    /// The extraction as it ran before the Stop hook streamed: every line
+    /// parsed into one Vec, a full sanitized copy beside it.
+    fn episode_whole_file(raw: &str) -> String {
+        let messages: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str(line.trim()).ok())
+            .collect();
+        let (sanitized, _) = crate::import::sanitize_messages_for_search(&messages);
+        let mut episode = extract_episode_from_messages(&sanitized, &messages, "sid", "proj");
+        episode.timestamp.clear();
+        serde_json::to_string(&episode).unwrap()
+    }
+
+    fn episode_streamed(path: &Path) -> String {
+        let mut episode = extract_episode_from_file(path, "sid", "proj").unwrap();
+        episode.timestamp.clear();
+        serde_json::to_string(&episode).unwrap()
+    }
+
+    #[test]
+    fn streamed_episode_equals_whole_file_episode() {
+        let dreamer = "What if memory notes included their originating session?\n\n\
+                       CSR's dreamer asked this while you worked. It is a question, not a task.\n\n\
+                       > Notes should show their origin.";
+        let mut lines = multi_topic_session();
+        lines.extend([
+            typed_line(dreamer, "typed"),
+            "this line is not json".to_string(),
+            String::new(),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "csr-1", "name": "csr_reflect_on_past", "input": {"query": "history"}},
+                    {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "/src/lib.rs"}}
+                ]}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [
+                    {"type": "text", "text": "Error: genuine compiler failure"},
+                    {"type": "tool_result", "tool_use_id": "csr-1", "content": "Error: not found in CSR memory"},
+                    {"type": "tool_result", "tool_use_id": "read-1", "content": "ordinary sibling result"}
+                ]}
+            })
+            .to_string(),
+            assistant_text_line("Investigation complete."),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        for (name, joiner) in [("lf.jsonl", "\n"), ("crlf.jsonl", "\r\n")] {
+            let raw = lines.join(joiner);
+            for tail in ["", joiner] {
+                let path = dir.path().join(name);
+                std::fs::write(&path, format!("{raw}{tail}")).unwrap();
+                let whole = episode_whole_file(&std::fs::read_to_string(&path).unwrap());
+                assert_eq!(episode_streamed(&path), whole, "{name} tail={tail:?}");
+                let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+                let mut by_lines = extract_episode(&refs, "sid", "proj");
+                by_lines.timestamp.clear();
+                assert_eq!(serde_json::to_string(&by_lines).unwrap(), whole);
+            }
+        }
+        // The fixture actually exercised the paths: notes, tasks, receipts.
+        let whole: serde_json::Value =
+            serde_json::from_str(&episode_whole_file(&lines.join("\n"))).unwrap();
+        assert!(whole["message_count"].as_u64().unwrap() > 10);
+        assert!(!whole["tools_used"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn streamed_episode_rejects_invalid_utf8_like_read_to_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.jsonl");
+        let mut bytes = user_line("hello").into_bytes();
+        bytes.extend_from_slice(b"\n\xff\xfe\n");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(std::fs::read_to_string(&path).is_err());
+        assert!(extract_episode_from_file(&path, "sid", "proj").is_err());
+    }
+
+    /// Manual check on a real transcript:
+    /// `CSR_EQUIV_TRANSCRIPT=/path/x.jsonl cargo test --release --lib -- --ignored streamed_episode_real`
+    #[test]
+    #[ignore]
+    fn streamed_episode_real_transcript_equals_whole_file_episode() {
+        let path = std::path::PathBuf::from(std::env::var("CSR_EQUIV_TRANSCRIPT").unwrap());
+        let whole = episode_whole_file(&std::fs::read_to_string(&path).unwrap());
+        let streamed = episode_streamed(&path);
+        assert_eq!(streamed, whole);
+        println!("equivalent: {} bytes of episode JSON", streamed.len());
     }
 }

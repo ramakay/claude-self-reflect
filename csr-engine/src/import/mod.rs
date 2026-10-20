@@ -533,13 +533,14 @@ pub(crate) fn transcript_inputs_variant(
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with("rollout-"));
-    let index = provenance_matcher::MessageIndex::read(
+    // Only one of the index's four documents is read back: build just that one.
+    let index = provenance_matcher::MessageIndex::read_inputs_only(
         path,
         conversation_id,
         codex,
         path.extension().is_some_and(|e| e == "md"),
         parent.as_ref(),
-        &[],
+        raw,
     )?;
     Ok(if raw {
         index.raw_inputs()
@@ -1518,6 +1519,21 @@ pub(crate) fn sanitize_messages_for_search(
         sanitize_message_for_search(message, &mut sanitizer);
     }
     (sanitized, sanitizer.stats)
+}
+
+/// Row-at-a-time form of [`sanitize_messages_for_search`]: feeding it the
+/// rows in order gives each row the same result as the slice form, without
+/// holding a second copy of the whole transcript.
+pub(crate) struct RowSanitizer(CsrMessageSanitizer);
+
+impl RowSanitizer {
+    pub(crate) fn for_derived() -> Self {
+        Self(CsrMessageSanitizer::for_derived())
+    }
+
+    pub(crate) fn sanitize(&mut self, message: &mut serde_json::Value) {
+        sanitize_message_for_search(message, &mut self.0);
+    }
 }
 
 fn sanitize_message_for_search(
