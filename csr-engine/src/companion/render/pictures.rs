@@ -1,4 +1,5 @@
 use super::{
+    cards,
     raster::{self, Cell, ContextFacts, LastFacts, PaybackFacts, SessionFacts},
     text::Rgb,
 };
@@ -18,6 +19,8 @@ pub enum Picture {
     Payback(PaybackFacts),
     Context(ContextFacts),
     Iso(String),
+    Card(cards::Card),
+    Pill(cards::Pill),
     Emblem,
     Logo,
 }
@@ -113,6 +116,8 @@ impl Picture {
             Self::Payback(f) => raster::payback(f, cols, rows, cell, ground, fonts),
             Self::Context(f) => raster::context(f, cols, rows, cell, backs, fonts),
             Self::Iso(name) => raster::iso(name, cell, two),
+            Self::Card(card) => cards::draw_card(card, cols, rows, cell, backs, cards::fonts()?),
+            Self::Pill(pill) => cards::draw_pill(pill, cols, rows, cell, backs, cards::fonts()?),
             Self::Emblem => raster::emblem(cell, two),
             Self::Logo => raster::logo(cell, ground),
         }
@@ -166,6 +171,8 @@ impl Hash for Picture {
                 hash_numbers(h, &[f.floor, f.now, f.band.0, f.band.1]);
             }
             Self::Iso(name) => name.hash(h),
+            Self::Card(card) => format!("{card:?}").hash(h),
+            Self::Pill(pill) => format!("{pill:?}").hash(h),
             _ => (),
         }
     }

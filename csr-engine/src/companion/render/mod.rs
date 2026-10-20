@@ -1,3 +1,4 @@
+pub mod cards;
 pub mod kitty;
 pub mod pictures;
 pub mod raster;
