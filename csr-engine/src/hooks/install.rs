@@ -349,9 +349,11 @@ pub fn post_tool_use_records_bash(settings_path: &std::path::Path) -> bool {
 /// Does a hook `matcher` select `tool`? Claude Code's rules: `*`, empty or missing match
 /// every tool. A matcher of only letters, digits, `_`, `-`, spaces, `,` and `|` is an
 /// exact name, or a list of exact names split on `|` or `,` (spaces around a name are
-/// ignored). Anything else is a JavaScript regex tested unanchored. A pattern the `regex`
-/// crate cannot compile (JavaScript lookaround, say) counts as not selecting the tool: the
-/// caller then waits, which is the safe side.
+/// ignored). Anything else is a JavaScript regex tested unanchored. Claude Code runs the
+/// pattern as JavaScript, but this reads it with Rust's `regex`, which has no lookaround or
+/// backreferences: such a pattern does not compile here and counts as not selecting the
+/// tool, so the caller waits (the replay stays `pending`). That safe side is deliberate; no
+/// second regex engine is added for it.
 fn matcher_covers(matcher: &str, tool: &str) -> bool {
     if matcher.is_empty() || matcher == "*" {
         return true;
@@ -362,6 +364,7 @@ fn matcher_covers(matcher: &str, tool: &str) -> bool {
     if plain {
         return matcher.split(['|', ',']).any(|name| name.trim() == tool);
     }
+    // JavaScript-only syntax fails to compile here and reads as "does not select the tool".
     regex::Regex::new(matcher).is_ok_and(|re| re.is_match(tool))
 }
 

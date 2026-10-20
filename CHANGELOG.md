@@ -417,7 +417,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   version or relay text changed; a plugin the user switched off stays off and its options are kept: they are read
   before any step that deletes the plugin, an option read that fails stops that step with nothing removed, and a
   migration that fails half-way saves the options and the enabled state in
-  `~/.claude-self-reflect/csr-companion/plugin-migration.json` for the rerun). `--no-companion`
+  `~/.claude-self-reflect/csr-companion/plugin-migration.json` for the rerun; the rerun switches the plugin off again
+  when only the disable had failed, keeps the file when that fails too, and stops before installing when the file
+  cannot be read). `--no-companion`
   skips it, and a missing `claude`, a failed step or a 120 s timeout prints the reason plus
   `csr-engine companion plugin install` and still exits 0. The GitHub marketplace source,
   `CSR_COMPANION_MARKETPLACE`, the `/plugin marketplace add` lines and the `setup --relay` flag are gone; a machine
@@ -484,7 +486,8 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   existing transcripts, subagent ones under their parent session, skips what the live hook already recorded and keeps
   only what the hook would keep, and it is marked done only when every project folder was listed and every transcript
   read. It waits until `~/.claude/settings.json` has the PostToolUse hook recording Bash (Claude Code's matcher
-  rules: `*`, empty or missing; an exact name in a `|` or `,` list; otherwise a regex tested unanchored), so
+  rules: `*`, empty or missing; an exact name in a `|` or `,` list; otherwise a regex tested unanchored; a pattern
+  that only JavaScript can read, such as lookaround, which Rust's `regex` cannot, counts as not recording Bash), so
   a daemon restarted on the new binary before `hook install --apply` cannot mark the replay done while the live hook
   still skips Bash (`csr-engine status` shows `aux.bash_file_history: waiting_on_hook` until then; the daemon looks
   again every 10 minutes). Checked against git, not command text, on a copy of the owner's DB: of 189 (session,

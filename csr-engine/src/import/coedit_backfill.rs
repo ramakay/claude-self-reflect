@@ -406,17 +406,26 @@ fn bash_events(
 /// Edit/Write/MultiEdit/NotebookEdit tool_use call, and every file a Bash
 /// tool_use wrote, as a `CoeditEvent`. A Bash call whose `tool_result` is an
 /// error wrote nothing the user kept and is dropped. Malformed / oversized
-/// lines are skipped silently — never fatal.
+/// lines (and lines that are not UTF-8) are skipped silently; a read that fails
+/// part-way is an error, so the caller does not mark the file done.
 fn extract_events(path: &Path, conv_id: &str) -> Result<Vec<CoeditEvent>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    extract_events_from(BufReader::new(file), conv_id)
+}
+
+/// `extract_events` over any reader, so a read that fails part-way can be tested.
+fn extract_events_from(reader: impl BufRead, conv_id: &str) -> Result<Vec<CoeditEvent>> {
     let mut events = Vec::new();
     let mut failed_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
             Ok(l) => l,
-            Err(_) => continue, // malformed encoding etc — tolerate silently
+            // A line that is not UTF-8 is a malformed line: its bytes are consumed and the
+            // next read goes on. Any other error is a failed read, and the same call
+            // returns it again: stop, so the caller counts it and writes no done marker.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(e) => return Err(e.into()),
         };
         if line.trim().is_empty() {
             continue;
@@ -864,6 +873,66 @@ mod tests {
         let events = extract_events(&jsonl, "conv-mixed").unwrap();
         assert_eq!(events.len(), 1, "only the valid line yields an event");
         assert!(events[0].file_path.ends_with("ok.rs"));
+    }
+
+    /// Yields `data`, then fails with `kind` on every further read.
+    struct FailsAfter {
+        data: std::io::Cursor<Vec<u8>>,
+        kind: std::io::ErrorKind,
+    }
+
+    impl std::io::Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.data.read(buf)? {
+                0 => Err(std::io::Error::new(self.kind, "disk went away")),
+                n => Ok(n),
+            }
+        }
+    }
+
+    #[test]
+    fn extract_events_from_returns_a_read_error_after_good_lines() {
+        let good = edit_line(
+            "/Users/me/projects/demo/src/ok.rs",
+            "2026-01-01T00:00:00.000Z",
+        );
+        let reader = BufReader::new(FailsAfter {
+            data: std::io::Cursor::new(format!("{good}\n").into_bytes()),
+            kind: std::io::ErrorKind::Other,
+        });
+        let err =
+            extract_events_from(reader, "conv-io").expect_err("a failed read is not a clean read");
+        assert!(is_read_failure(&err), "{err:#}");
+        assert!(format!("{err:#}").contains("disk went away"), "{err:#}");
+    }
+
+    #[test]
+    fn extract_events_from_skips_a_line_that_is_not_utf8() {
+        let first = edit_line(
+            "/Users/me/projects/demo/src/a.rs",
+            "2026-01-01T00:00:00.000Z",
+        );
+        let last = edit_line(
+            "/Users/me/projects/demo/src/b.rs",
+            "2026-01-01T00:00:01.000Z",
+        );
+        let mut bytes = format!("{first}\n").into_bytes();
+        bytes.extend_from_slice(b"{\"broken\": \"\xff\xfe\"}\n");
+        bytes.extend_from_slice(format!("{last}\n").as_bytes());
+        let events = extract_events_from(std::io::Cursor::new(bytes), "conv-utf8").unwrap();
+        let files: Vec<&str> = events.iter().map(|e| e.file_path.as_str()).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(
+            files[0].ends_with("a.rs") && files[1].ends_with("b.rs"),
+            "{files:?}"
+        );
+    }
+
+    #[test]
+    fn extract_events_returns_the_error_for_a_file_it_cannot_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_events(&tmp.path().join("gone.jsonl"), "c").unwrap_err();
+        assert!(!is_read_failure(&err), "{err:#}");
     }
 
     #[test]

@@ -711,19 +711,40 @@ fn save_snapshot(home: &Path, snapshot: &Snapshot) -> Result<(), String> {
     })
 }
 
-/// The snapshot a failed migration left, if one is there and readable.
-fn load_snapshot(home: &Path) -> Option<Snapshot> {
-    let text = std::fs::read_to_string(pending_snapshot_path(home)).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+/// The snapshot a failed migration left. No file is `Ok(None)`. A file that cannot be read,
+/// is not JSON or has a malformed `options` list is an error naming it: reading it as "no
+/// snapshot" would install with the defaults and then delete the user's saved choices.
+fn load_snapshot(home: &Path) -> Result<Option<Snapshot>, String> {
+    let path = pending_snapshot_path(home);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable_snapshot(&path, &e.to_string())),
+    };
+    let bad = |why: &str| unreadable_snapshot(&path, why);
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| bad(&e.to_string()))?;
     let options = value["options"]
-        .as_array()?
+        .as_array()
+        .ok_or_else(|| bad("`options` is not a list"))?
         .iter()
         .map(|pair| Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string())))
-        .collect::<Option<Vec<_>>>()?;
-    Some(Snapshot {
-        options,
-        enabled: value["enabled"].as_bool().unwrap_or(true),
-    })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| bad("`options` holds an entry that is not a [key, value] pair"))?;
+    let enabled = match &value["enabled"] {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => *b,
+        _ => return Err(bad("`enabled` is not true or false")),
+    };
+    Ok(Some(Snapshot { options, enabled }))
+}
+
+fn unreadable_snapshot(path: &Path, why: &str) -> String {
+    format!(
+        "the saved plugin options in {} cannot be read ({}); fix the file or delete it, then \
+         run `csr-engine companion plugin install` again",
+        path.display(),
+        one_line(why)
+    )
 }
 
 fn clear_snapshot(home: &Path) {
@@ -766,11 +787,18 @@ fn install_relay_plugin(
     }
     run_outcome_ok(claude, &args, timeout, "install")?;
     if !enabled {
-        let disable = ["plugin", "disable", id.as_str(), "--json"];
-        run_outcome_ok(claude, &disable, timeout, "disable").map_err(|e| {
-            format!("{e}; the plugin is installed and enabled, run `claude plugin disable {id}`")
-        })?;
+        disable_relay_plugin(claude, timeout)?;
     }
+    Ok(())
+}
+
+/// `claude plugin disable`; a failure says how to finish by hand.
+fn disable_relay_plugin(claude: &Path, timeout: Duration) -> Result<(), String> {
+    let id = relay_plugin_id();
+    let disable = ["plugin", "disable", id.as_str(), "--json"];
+    run_outcome_ok(claude, &disable, timeout, "disable").map_err(|e| {
+        format!("{e}; the plugin is installed and enabled, run `claude plugin disable {id}`")
+    })?;
     Ok(())
 }
 
@@ -846,11 +874,13 @@ fn relay_steps(
     // c. the plugin
     let id = relay_plugin_id();
     let version = env!("CARGO_PKG_VERSION");
+    // A migration that failed half-way left the user's options here. A file that cannot be
+    // read stops the step before anything is installed or deleted.
+    let pending = load_snapshot(home)?;
     let listed = list_plugins(claude, timeout)?;
     match relay_entry(&listed) {
         None => {
-            // A migration that failed half-way left the user's options here.
-            let Snapshot { options, enabled } = load_snapshot(home).unwrap_or_default();
+            let Snapshot { options, enabled } = pending.clone().unwrap_or_default();
             install_relay_plugin(claude, &options, enabled, timeout)?;
             st.changed = true;
             st.plugin_changed = true;
@@ -880,16 +910,34 @@ fn relay_steps(
         }
     }
 
-    let listed = list_plugins(claude, timeout)?;
-    let entry = relay_entry(&listed)
-        .ok_or_else(|| format!("`claude plugin list` does not show {id} after the install"))?;
+    let mut listed = list_plugins(claude, timeout)?;
+    let after = || format!("`claude plugin list` does not show {id} after the install");
+    let entry = relay_entry(&listed).ok_or_else(after)?;
     if !relay_is_current(entry, &market.relay) {
         return Err(format!(
             "{id} is installed but its cache is not this engine's plugin; \
              run `claude plugin uninstall {id}` and then this again"
         ));
     }
-    // The install is confirmed: the saved options have done their job.
+    // A migration that failed after its install but before the disable left the plugin
+    // current and enabled, with the user's "off" still in the file. The saved options need
+    // no such step: the install that ran with `--config` applied them.
+    if pending.is_some_and(|s| !s.enabled) && relay_enabled(Some(entry)) {
+        disable_relay_plugin(claude, timeout)?;
+        st.changed = true;
+        st.plugin_changed = true;
+        st.steps
+            .push("plugin disabled again (as it was before)".into());
+        listed = list_plugins(claude, timeout)?;
+        if relay_entry(&listed).is_none_or(|e| relay_enabled(Some(e))) {
+            return Err(format!(
+                "`claude plugin disable` ran but {id} is still listed as enabled; \
+                 run `claude plugin disable {id}`"
+            ));
+        }
+    }
+    let entry = relay_entry(&listed).ok_or_else(after)?;
+    // The install is confirmed: the saved state has done its job.
     clear_snapshot(home);
     info_from(entry).ok_or_else(|| "`claude plugin list` named no plugin".to_string())
 }
@@ -2137,8 +2185,10 @@ case "$2" in
       stale) echo '[{{"id":"{id}","version":"0.5.0","scope":"user","enabled":'$E',"installPath":"{d}/cache-stale"}}]' ;;
       current) echo '[{{"id":"{id}","version":"{version}","scope":"user","enabled":'$E',"installPath":"{d}/cache-current"}}]' ;;
     esac ;;
-  disable) echo false > "$D/enabled"
+  disable)
     if [ -f "$D/disable_fails" ]; then echo "settings are read-only" >&2; exit 1; fi
+    if [ -f "$D/disable_fails_once" ]; then rm "$D/disable_fails_once"; echo "settings are read-only" >&2; exit 1; fi
+    echo false > "$D/enabled"
     echo '{{"command":"disable","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
   install)
     if [ -f "$D/install_fails_once" ]; then rm "$D/install_fails_once"; echo "disk full" >&2; exit 1; fi
@@ -2555,6 +2605,141 @@ esac
             .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
         assert_eq!(fake.enabled().trim(), "false");
         assert!(!fake.pending().exists());
+    }
+
+    /// A migration of a switched-off plugin whose install worked but whose disable failed:
+    /// the rerun finds the plugin current and enabled, and the saved "off" still holds.
+    fn failed_disable_after_a_migration() -> RelayFake {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true)
+            .disabled()
+            .with("disable_fails_once");
+        let first = fake.run();
+        let CompanionOutcome::Failed { reason } = &first.outcome else {
+            panic!("{first:?}");
+        };
+        assert!(reason.contains("settings are read-only"), "{reason}");
+        assert!(fake.pending().is_file(), "the saved state was dropped");
+        assert_eq!(
+            fake.enabled().trim(),
+            "true",
+            "the failed disable changed it"
+        );
+        fake
+    }
+
+    #[test]
+    fn a_rerun_disables_a_current_plugin_the_user_had_switched_off() {
+        let fake = failed_disable_after_a_migration();
+        let before = fake.calls().len();
+        let second = fake.run();
+        assert!(
+            matches!(second.outcome, CompanionOutcome::Installed(_)),
+            "{second:?}"
+        );
+        assert!(second.changed);
+        let calls = fake.calls()[before..].to_vec();
+        assert!(
+            calls.contains(&"plugin disable csr-companion@claude-self-reflect --json".into()),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("plugin install ")));
+        assert_eq!(fake.enabled().trim(), "false");
+        assert!(!fake.pending().exists(), "the file outlived the disable");
+        // a third run has nothing left to do
+        let before = fake.calls().len();
+        let third = fake.run();
+        assert!(
+            matches!(third.outcome, CompanionOutcome::AlreadyInstalled(_)),
+            "{third:?}"
+        );
+        assert!(!fake.calls()[before..].iter().any(|c| c.contains("disable")));
+    }
+
+    #[test]
+    fn a_rerun_whose_disable_fails_again_keeps_the_file() {
+        let fake = failed_disable_after_a_migration();
+        std::fs::write(fake.dir.path().join("disable_fails"), "").unwrap();
+        let second = fake.run();
+        let CompanionOutcome::Failed { reason } = &second.outcome else {
+            panic!("{second:?}");
+        };
+        assert!(reason.contains("settings are read-only"), "{reason}");
+        assert!(fake.pending().is_file(), "the saved state was dropped");
+        assert_eq!(fake.enabled().trim(), "true");
+    }
+
+    #[test]
+    fn a_plugin_that_was_on_is_not_disabled_by_a_stale_file() {
+        let fake = RelayFake::new(HERE, "current", true, false);
+        let path = fake.pending();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"options":[],"enabled":true}"#).unwrap();
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::AlreadyInstalled(_)),
+            "{report:?}"
+        );
+        assert!(!fake.calls().iter().any(|c| c.contains("disable")));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unreadable_snapshot_stops_setup_before_it_installs() {
+        for (text, why) in [
+            ("{ not json", "not JSON"),
+            (
+                r#"{"options":"dreams=false","enabled":false}"#,
+                "options not a list",
+            ),
+            (
+                r#"{"options":[["dreams"]],"enabled":false}"#,
+                "pair without a value",
+            ),
+            (r#"{"options":[],"enabled":"no"}"#, "enabled not a bool"),
+        ] {
+            let fake = RelayFake::new(NONE_REGISTERED, "absent", true, false);
+            let path = fake.pending();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            let report = fake.run();
+            let CompanionOutcome::Failed { reason } = &report.outcome else {
+                panic!("{why}: {report:?}");
+            };
+            assert!(
+                reason.contains(&path.display().to_string()),
+                "{why}: {reason}"
+            );
+            assert!(
+                reason.contains("fix the file or delete it"),
+                "{why}: {reason}"
+            );
+            let calls = fake.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("plugin install ")),
+                "{why}: installed over an unreadable snapshot: {calls:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_be_opened_is_an_error_not_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(load_snapshot(home.path()), Ok(None));
+        let path = pending_snapshot_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"options":[["a","b"]],"enabled":false}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root reads anything; then there is nothing to show
+        if std::fs::read_to_string(&path).is_err() {
+            let err = load_snapshot(home.path()).unwrap_err();
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let snap = load_snapshot(home.path()).unwrap().unwrap();
+        assert_eq!(snap.options, vec![("a".to_string(), "b".to_string())]);
+        assert!(!snap.enabled);
     }
 
     #[test]
