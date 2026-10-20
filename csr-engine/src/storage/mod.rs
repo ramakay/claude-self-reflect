@@ -1383,6 +1383,15 @@ impl Storage {
         Ok(())
     }
 
+    /// Chunk ids with a resolution proposal, oldest first (tests).
+    #[cfg(test)]
+    pub(crate) fn resolution_proposal_chunk_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let mut stmt = conn.prepare("SELECT chunk_id FROM resolution_proposals ORDER BY id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn count_resolution_proposals(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         Ok(
@@ -2428,6 +2437,17 @@ impl Storage {
     ) -> Result<std::collections::HashMap<String, queries::ResolutionEntry>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::get_resolutions_batch(&conn, chunk_ids)
+    }
+
+    /// Chunks of `project` whose latest user-confirmed verdict is `still_open`
+    /// (newest verdict first, at most `limit`).
+    pub fn get_still_open_chunks(
+        &self,
+        project: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationChunk>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::get_still_open_chunks(&conn, project, limit)
     }
 
     // ─── Dream verdicts (v10) ───
@@ -3800,6 +3820,30 @@ mod tests {
         assert_eq!(map.get("c1").unwrap().status, "resolved");
         assert_eq!(map.get("c2").unwrap().status, "resolved");
         assert_eq!(map.get("c1").unwrap().evidence, "test evidence");
+    }
+
+    #[test]
+    fn still_open_chunks_read_walks_the_ledger_index_and_joins_chunks_by_primary_key() {
+        let storage = Storage::open_memory().unwrap();
+        let plan = storage
+            .with_connection(|conn| {
+                Ok(conn
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN {}",
+                        queries::STILL_OPEN_CHUNKS_SQL
+                    ))?
+                    .query_map(rusqlite::params!["alpha", 500], |row| {
+                        row.get::<_, String>(3)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                    .join("\n"))
+            })
+            .unwrap();
+        eprintln!("STILL_OPEN PLAN:\n{plan}");
+        assert!(plan.contains("idx_resolution_open_recent"), "{plan}");
+        assert!(plan.contains("idx_resolution_chunk"), "{plan}");
+        assert!(!plan.contains("SCAN c"), "{plan}");
+        assert!(!plan.contains("USE TEMP B-TREE"), "{plan}");
     }
 
     #[test]

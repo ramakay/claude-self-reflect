@@ -5235,6 +5235,44 @@ pub fn get_resolutions_batch(
     Ok(map)
 }
 
+/// [`get_still_open_chunks`]'s statement; a test reads its plan.
+pub(crate) const STILL_OPEN_CHUNKS_SQL: &str =
+    "SELECT c.id, c.conversation_id, c.project_name, c.timestamp, c.content,
+            c.message_count, c.summary, c.is_sidechain
+     FROM resolution_ledger r INDEXED BY idx_resolution_open_recent
+     JOIN chunks c ON c.id = r.chunk_id
+     WHERE r.status IN ('still_open', 'regressed')
+       AND r.status = 'still_open'
+       AND r.source = 'user_confirmed'
+       AND c.project_name = ?1
+       AND NOT EXISTS (
+           SELECT 1
+           FROM resolution_ledger latest
+           WHERE latest.chunk_id = r.chunk_id
+             AND latest.source = 'user_confirmed'
+             AND latest.id > r.id
+       )
+     ORDER BY r.id DESC
+     LIMIT ?2";
+
+/// Chunks of `project` whose latest user-confirmed verdict is `still_open`,
+/// newest verdict first, at most `limit`. Same "latest user_confirmed row per
+/// chunk" rule as [`get_resolutions_batch`]: a later `resolved`/`regressed`
+/// user-confirmed row retires the chunk, and agent-sourced rows never count.
+///
+/// Reads the compact partial index `idx_resolution_open_recent` (newest ledger
+/// ids first), joins `chunks` by primary key, and probes `idx_resolution_chunk`
+/// for the "no later user-confirmed row" check. It never scans `chunks`.
+pub fn get_still_open_chunks(
+    conn: &Connection,
+    project: &str,
+    limit: usize,
+) -> Result<Vec<ConversationChunk>> {
+    let mut stmt = conn.prepare(STILL_OPEN_CHUNKS_SQL)?;
+    let rows = stmt.query_map(params![project, limit as i64], row_to_chunk)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 // ─── Session registry (history.jsonl spine — never embedded / never injected) ───
 
 /// One row per session to upsert: (session_id, project, first_prompt,

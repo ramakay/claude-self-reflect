@@ -306,6 +306,12 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   socket. An import now asks once per file, a busy answer pauses chunk asks for 15 s, and the episode and heuristic
   summary stores no longer wait for an answer they ignore. In a test with the daemon's index held, a 22-chunk import
   went from 69.3 s to 3.3 s and the next import made no ask. Stored reflections still wait for their ack.
+- After that fix a live Stop hook still took 10.9 s: 2,112 of 2,580 samples were the task-resolution probe, an FTS5
+  search over all 101,418 project chunks for each completed task on every Stop, while the ledger held 0 confirmed
+  still-open verdicts, so none of those searches could produce a proposal. The probe now reads the project's confirmed
+  still-open chunks first (one indexed query, at most 500) and returns when there are none. In a test with 100,000
+  chunks and 10 completed tasks it went from 443 ms to 0.09 ms (20,000 chunks: 81 ms to 0.11 ms). A still-open chunk
+  that bm25 ranked below the top 3 is now proposed.
 - prompt-submit asks the daemon over a private socket within a deadline and fails open (3651e549, 8e473f5e)
   [untraced: empty bodies; from the `src/hooks/prompt_transport.rs` doc]. The daemon index takes rows other
   processes write (a9f252f5, 1414dc1b) [untraced: subject only].

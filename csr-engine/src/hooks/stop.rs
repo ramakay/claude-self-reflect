@@ -1548,11 +1548,38 @@ pub async fn extract_and_store_episode(
     Ok(())
 }
 
-/// For each completed task, look for a chunk in this project carrying a
-/// still-open resolution verdict whose content matches the task subject; write
-/// a proposal row for the top match. Bounded here to 10 completed tasks — the
-/// transcript path caps todos at 10, but dir-loaded task state is uncapped
-/// (CodeRabbit), and this fn must not fan out FTS probes with it.
+/// Upper bound on the still-open candidate set read per Stop hook.
+const STILL_OPEN_CANDIDATE_LIMIT: usize = 500;
+
+/// Significant tokens of a task subject: lowercase alphanumeric words longer
+/// than three characters.
+fn subject_tokens(subject: &str) -> Vec<String> {
+    subject
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() > 3)
+        .collect()
+}
+
+/// For each completed task, look for a chunk in this project whose latest
+/// user-confirmed verdict is `still_open` and whose content carries the task
+/// subject; write a proposal row for the best match (most subject tokens, ties
+/// to the newest chunk). A human promotes a proposal with `csr_resolve`.
+///
+/// The probe starts from the verdicts, not the tasks: one indexed read of the
+/// project's still-open chunks (at most [`STILL_OPEN_CANDIDATE_LIMIT`], newest
+/// verdict first), and the function returns at once when there are none. A
+/// project with no confirmed still-open verdict, the usual case, therefore does
+/// no per-task work. This replaced an FTS5 search per task over the whole
+/// project on every Stop (10.9 s in one live hook, 2,112 of 2,580 samples).
+/// Each task is matched in memory against the candidates with the same rule
+/// as before: at least 60% of the subject's significant tokens must appear
+/// verbatim, identity rather than similarity.
+///
+/// The candidate set is a superset of what the FTS top-3 reached: a still-open
+/// chunk ranked fourth by bm25 is now found and proposed. Bounded to 10
+/// completed tasks — the transcript path caps todos at 10, but dir-loaded task
+/// state is uncapped (CodeRabbit).
 fn propose_task_resolutions(
     storage: &crate::storage::Storage,
     todos: &[TodoItem],
@@ -1567,48 +1594,46 @@ fn propose_task_resolutions(
     if completed.is_empty() {
         return;
     }
+    let Ok(candidates) = storage.get_still_open_chunks(project_name, STILL_OPEN_CANDIDATE_LIMIT)
+    else {
+        return;
+    };
+    if candidates.is_empty() {
+        return; // no confirmed still-open verdict — nothing can be proposed
+    }
+    let candidate_tokens: Vec<std::collections::HashSet<String>> = candidates
+        .iter()
+        .map(|c| {
+            c.content
+                .split(|ch: char| !ch.is_alphanumeric())
+                .map(|w| w.to_lowercase())
+                .collect()
+        })
+        .collect();
     for todo in completed {
-        let Ok(hits) = storage.fts5_search(&todo.content, 3, Some(project_name)) else {
-            continue;
-        };
-        let hits: Vec<_> = hits.into_iter().map(|(chunk, _, _)| chunk).collect();
-        // fts5_search OR-joins terms, so a hit can rank on one shared word.
-        // Require most of the subject's significant tokens verbatim in the hit
-        // before proposing — identity, not similarity (Codex: single-word
-        // matches attached completed tasks to unrelated still-open chunks).
-        let subject_tokens: Vec<String> = todo
-            .content
-            .split(|c: char| !c.is_alphanumeric())
-            .map(|w| w.to_lowercase())
-            .filter(|w| w.len() > 3)
-            .collect();
+        let subject_tokens = subject_tokens(&todo.content);
         if subject_tokens.is_empty() {
             continue;
         }
-        let Some(hit) = hits.iter().find(|h| {
-            let content_tokens: std::collections::HashSet<String> = h
-                .content
-                .split(|c: char| !c.is_alphanumeric())
-                .map(|w| w.to_lowercase())
-                .collect();
-            let matched = subject_tokens
-                .iter()
-                .filter(|t| content_tokens.contains(*t))
-                .count();
-            matched * 10 >= subject_tokens.len() * 6 // >= 60% overlap
-        }) else {
+        // Require most of the subject's significant tokens verbatim in the
+        // chunk before proposing — identity, not similarity (Codex:
+        // single-word matches attached completed tasks to unrelated
+        // still-open chunks).
+        let best = candidates
+            .iter()
+            .zip(&candidate_tokens)
+            .filter_map(|(chunk, tokens)| {
+                let matched = subject_tokens
+                    .iter()
+                    .filter(|t| tokens.contains(*t))
+                    .count();
+                (matched * 10 >= subject_tokens.len() * 6) // >= 60% overlap
+                    .then_some((matched, &chunk.timestamp, chunk))
+            })
+            .max_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        let Some((_, _, hit)) = best else {
             continue;
         };
-        let ids = vec![hit.id.clone()];
-        let Ok(resolutions) = storage.get_resolutions_batch(&ids) else {
-            continue;
-        };
-        let Some(entry) = resolutions.get(&hit.id) else {
-            continue; // no verdict recorded — nothing to propose against
-        };
-        if entry.status != "still_open" {
-            continue;
-        }
         let evidence = format!("task completed in session {session_id}: {}", todo.content);
         let _ =
             storage.insert_resolution_proposal(&hit.id, Some(&todo.content), &evidence, session_id);
@@ -1891,6 +1916,273 @@ mod tests {
         // Idempotent per (chunk, session).
         propose_task_resolutions(&storage, &todos, "proj", "sess-1");
         assert_eq!(storage.count_resolution_proposals().unwrap(), 1);
+    }
+
+    /// Seed one chunk in `project`; `verdict` is `(status, source)` for the ledger.
+    fn seed_chunk(
+        storage: &crate::storage::Storage,
+        id: &str,
+        project: &str,
+        timestamp: &str,
+        content: &str,
+        verdict: Option<(&str, &str)>,
+    ) {
+        use crate::import::ConversationChunk;
+        use crate::provenance::Speaker;
+        let chunk = ConversationChunk {
+            id: id.into(),
+            conversation_id: format!("conv-{id}"),
+            project_name: project.into(),
+            timestamp: timestamp.into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        };
+        storage.insert_chunk(&chunk, &[0.0; 4]).unwrap();
+        if let Some((status, source)) = verdict {
+            storage
+                .insert_resolutions(&[id.to_string()], status, "seed", None, source)
+                .unwrap();
+        }
+    }
+
+    fn completed(subject: &str) -> TodoItem {
+        TodoItem {
+            content: subject.into(),
+            status: "completed".into(),
+        }
+    }
+
+    #[test]
+    fn propose_task_resolutions_finds_still_open_chunk_ranked_below_the_top_three() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let subject = "fix registry offset checkpoint races";
+        // Four verdict-free chunks that out-rank the open one on bm25: short and
+        // exact. FTS top-3 saw only these.
+        for i in 0..4 {
+            seed_chunk(
+                &storage,
+                &format!("decoy-{i}"),
+                "proj",
+                "2026-07-27T12:00:00Z",
+                subject,
+                None,
+            );
+        }
+        seed_chunk(
+            &storage,
+            "open",
+            "proj",
+            "2026-07-27T12:00:00Z",
+            "fix registry offset checkpoint races after the watcher restarts, with a long \
+             tail of unrelated words about narrative caches, hooks, daemons and sockets",
+            Some(("still_open", "user_confirmed")),
+        );
+        propose_task_resolutions(&storage, &[completed(subject)], "proj", "sess-1");
+        assert_eq!(
+            storage.resolution_proposal_chunk_ids().unwrap(),
+            vec!["open".to_string()]
+        );
+    }
+
+    #[test]
+    fn propose_task_resolutions_ignores_resolved_agent_and_retired_verdicts() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let ts = "2026-07-27T12:00:00Z";
+        let subject = "fix registry offset checkpoint races";
+        let confirmed_open = Some(("still_open", "user_confirmed"));
+        seed_chunk(
+            &storage,
+            "resolved",
+            "proj",
+            ts,
+            subject,
+            Some(("resolved", "user_confirmed")),
+        );
+        seed_chunk(
+            &storage,
+            "agent-open",
+            "proj",
+            ts,
+            subject,
+            Some(("still_open", "agent")),
+        );
+        // Confirmed still_open, then confirmed resolved: the latest row wins.
+        seed_chunk(&storage, "retired", "proj", ts, subject, confirmed_open);
+        storage
+            .insert_resolutions(
+                &["retired".to_string()],
+                "resolved",
+                "seed",
+                None,
+                "user_confirmed",
+            )
+            .unwrap();
+        // An agent row after a confirmed still_open does not retire it.
+        seed_chunk(&storage, "kept", "proj", ts, subject, confirmed_open);
+        storage
+            .insert_resolutions(&["kept".to_string()], "resolved", "seed", None, "agent")
+            .unwrap();
+        // Another project's confirmed still_open is out of scope.
+        seed_chunk(&storage, "elsewhere", "other", ts, subject, confirmed_open);
+        propose_task_resolutions(&storage, &[completed(subject)], "proj", "sess-1");
+        assert_eq!(
+            storage.resolution_proposal_chunk_ids().unwrap(),
+            vec!["kept".to_string()]
+        );
+    }
+
+    #[test]
+    fn propose_task_resolutions_picks_best_overlap_then_newest() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let open = Some(("still_open", "user_confirmed"));
+        let subject = "fix registry offset checkpoint races";
+        // 3 of 4 significant tokens: passes 60% but loses to the full match.
+        seed_chunk(
+            &storage,
+            "partial",
+            "proj",
+            "2026-07-30T00:00:00Z",
+            "registry offset checkpoint",
+            open,
+        );
+        seed_chunk(
+            &storage,
+            "full-old",
+            "proj",
+            "2026-07-01T00:00:00Z",
+            subject,
+            open,
+        );
+        seed_chunk(
+            &storage,
+            "full-new",
+            "proj",
+            "2026-07-20T00:00:00Z",
+            subject,
+            open,
+        );
+        propose_task_resolutions(&storage, &[completed(subject)], "proj", "sess-1");
+        assert_eq!(
+            storage.resolution_proposal_chunk_ids().unwrap(),
+            vec!["full-new".to_string()]
+        );
+    }
+
+    #[test]
+    fn propose_task_resolutions_has_no_candidates_without_confirmed_still_open() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let subject = "fix registry offset checkpoint races";
+        for i in 0..50 {
+            // Agent rows and resolved verdicts only: nothing is a candidate.
+            let verdict = if i % 2 == 0 {
+                ("still_open", "agent")
+            } else {
+                ("resolved", "user_confirmed")
+            };
+            seed_chunk(
+                &storage,
+                &format!("c{i}"),
+                "proj",
+                "2026-07-27T12:00:00Z",
+                subject,
+                Some(verdict),
+            );
+        }
+        // The candidate read is empty, so the function returns before any
+        // per-task work.
+        assert!(storage
+            .get_still_open_chunks("proj", 500)
+            .unwrap()
+            .is_empty());
+        propose_task_resolutions(&storage, &[completed(subject)], "proj", "sess-1");
+        assert_eq!(storage.count_resolution_proposals().unwrap(), 0);
+    }
+
+    /// Timing evidence for the Stop hook: `STOPFTS_CHUNKS` chunks (default
+    /// 20,000) of shared vocabulary and ten completed tasks.
+    /// `cargo test --release --lib stop_probe_timing -- --nocapture`.
+    #[test]
+    fn stop_probe_timing_on_a_large_project() {
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let n: usize = std::env::var("STOPFTS_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let vocab = [
+            "registry",
+            "offset",
+            "checkpoint",
+            "races",
+            "narrative",
+            "cache",
+            "invalidation",
+            "stale",
+            "daemon",
+            "socket",
+            "watcher",
+            "restart",
+            "hook",
+            "index",
+            "vector",
+            "sync",
+        ];
+        for i in 0..n {
+            let content = format!(
+                "{} {} {} {} {} {} chunk {i}",
+                vocab[i % 16],
+                vocab[(i / 3) % 16],
+                vocab[(i / 7) % 16],
+                vocab[(i / 11) % 16],
+                vocab[(i / 13) % 16],
+                vocab[(i / 17) % 16],
+            );
+            let id = format!("c{i}");
+            seed_chunk(
+                &storage,
+                &id,
+                "proj",
+                "2026-07-27T12:00:00Z",
+                &content,
+                None,
+            );
+        }
+        let todos: Vec<TodoItem> = (0..10)
+            .map(|i| {
+                completed(&format!(
+                    "fix {} {} {} {} for session {i}",
+                    vocab[i % 16],
+                    vocab[(i + 3) % 16],
+                    vocab[(i + 5) % 16],
+                    vocab[(i + 9) % 16],
+                ))
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        propose_task_resolutions(&storage, &todos, "proj", "sess-1");
+        eprintln!(
+            "STOPFTS timing: {n} chunks, 10 tasks, no verdicts: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(storage.count_resolution_proposals().unwrap(), 0);
+        // One confirmed still-open chunk that matches the first task.
+        seed_chunk(
+            &storage,
+            "open",
+            "proj",
+            "2026-07-27T12:00:00Z",
+            "fix registry races cache socket for session 0 noted",
+            Some(("still_open", "user_confirmed")),
+        );
+        let started = std::time::Instant::now();
+        propose_task_resolutions(&storage, &todos, "proj", "sess-1");
+        eprintln!(
+            "STOPFTS timing: {n} chunks, 10 tasks, 1 still-open verdict: {:?}",
+            started.elapsed()
+        );
     }
 
     /// Build a JSONL line for a user message.
