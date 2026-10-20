@@ -152,7 +152,7 @@ fn the_value_row_sits_above_the_legend_and_a_click_on_it_opens_the_info_page() {
     assert_eq!(lines.len(), 40);
     assert_eq!(
         plain(&lines[38]),
-        " Fuel ≈3.2% · Haiku 4 · Dreams 2 · Took 2 · ♥ 2"
+        " Fuel ≈4.7% · Haiku 4 · Dreams 2 · Took 2 · ♥ 2"
     );
     assert!(plain(&lines[39]).contains("q close"));
     assert_eq!(act_key(&pane, 38), "view:info");
@@ -171,11 +171,11 @@ fn the_value_row_gives_way_by_width_and_takes_a_row_from_the_page() {
     let lines = pane.frame(46, 30, NOW);
     assert_eq!(
         plain(&lines[28]),
-        " Fuel ≈3.2% · Haiku 4 · Dreams 2 · Took 2"
+        " Fuel ≈4.7% · Haiku 4 · Dreams 2 · Took 2"
     );
     let (_home, mut narrow) = self::pane(30, 30);
     let lines = narrow.frame(30, 30, NOW);
-    assert_eq!(plain(&lines[28]), " Fuel ≈3.2% · Haiku 4");
+    assert_eq!(plain(&lines[28]), " Fuel ≈4.7% · Haiku 4");
     assert_eq!(act_key(&narrow, 28), "view:info");
 }
 
