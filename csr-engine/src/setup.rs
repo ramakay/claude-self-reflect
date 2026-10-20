@@ -2262,7 +2262,7 @@ esac
 
     #[test]
     fn market_state_reads_the_listing() {
-        let dir = Path::new("/private/tmp/csr-sbx/nowhere");
+        let dir = Path::new("/private/tmp/csr-checkout");
         let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
         assert_eq!(market_state(&json("[]"), dir), MarketState::Absent);
         assert_eq!(
@@ -2272,7 +2272,7 @@ esac
         assert_eq!(
             market_state(
                 &json(
-                    r#"[{"name":"claude-self-reflect","source":"directory","path":"/private/tmp/csr-sbx/nowhere"}]"#
+                    r#"[{"name":"claude-self-reflect","source":"directory","path":"/private/tmp/csr-checkout"}]"#
                 ),
                 dir
             ),

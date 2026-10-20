@@ -409,8 +409,8 @@ mod tests {
             PathBuf::from("/Users/a/.claude-self-reflect/csr-companion/run")
         );
         assert_eq!(
-            socket_dir(Some(Path::new("/private/tmp/csr-sbx/wp0/run")), &long),
-            PathBuf::from("/private/tmp/csr-sbx/wp0/run")
+            socket_dir(Some(Path::new("/private/tmp/csr/run")), &long),
+            PathBuf::from("/private/tmp/csr/run")
         );
     }
 
