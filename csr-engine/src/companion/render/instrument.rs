@@ -209,9 +209,10 @@ impl Composition {
             .chain(array(&s["prompts"]).iter().map(num))
             .collect();
         stamps.sort_by(f64::total_cmp);
-        let gap = stamps.windows(2).rev().find(|w| w[1] - w[0] > 3600.);
+        // Only the latest return counts: an hour-long gap earlier in the session is old news.
+        let gap = stamps.windows(2).last().filter(|w| w[1] - w[0] > 3600.);
         let notice = gap
-            .map(|w| {
+            .and_then(|w| {
                 let since = w[0];
                 let looks = records
                     .iter()
@@ -225,11 +226,14 @@ impl Composition {
                     .iter()
                     .filter(|d| d["session"] == s["id"] && num(&d["at"]) > since)
                     .count();
-                format!(
-                    "Away {}. The dreamer looked {looks}×. {fresh} new what-if{}.",
-                    masthead::span(w[1] - since),
-                    if fresh == 1 { "" } else { "s" }
-                )
+                // Nothing happened while away: say nothing rather than "looked 0×".
+                (looks > 0 || fresh > 0).then(|| {
+                    format!(
+                        "Away {}. The dreamer looked {looks}×. {fresh} new what-if{}.",
+                        masthead::span(w[1] - since),
+                        if fresh == 1 { "" } else { "s" }
+                    )
+                })
             })
             .or_else(|| {
                 let card = &data["infinite"]["card"];
