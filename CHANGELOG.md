@@ -449,6 +449,13 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   last told it. It reads the csr-engine database read-only
   and makes no model call. When the main page has room left, it closes with what CSR can do there, leaving out what the page
   already shows (acba87b9).
+- **Cards in pixel terminals** (herdr, kitty, Ghostty, WezTerm). The info view (`i`, or a click on the masthead) is a
+  stack of cards in the pane's own colours, each with its section's icon: context as a moon with 5H and 7D bars and
+  the `»` pace mark, tokens per request (cached, fresh, growth per turn), agents, cache time left, the Story with its
+  commit receipt, the open "what if" and recall in / notes out. The masthead becomes a two-row pill that keeps every
+  fact the text masthead shows. A card with no data is not drawn; nothing is sampled or made up. Fonts are read from
+  the system at run time (macOS system font, then Inter, Noto Sans, DejaVu Sans or Liberation Sans), none are
+  bundled, and without one the pane stays in text. Text mode is unchanged. Each card draws in 1.0-1.6 ms (fff25dfd).
 - **Dreamer** (on by default; turn it off in `/config`): asks one "what if...?" when your past sessions give it a
   reason and slows down when it finds nothing. Before each look it checks that its spend, plus the last look's cost,
   stays within 1 token for every 10 Claude spends. That is a check, not a cap: a fork takes no token ceiling, so one
