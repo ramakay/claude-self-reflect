@@ -3248,3 +3248,63 @@ mod statusline_unwrap {
             .exists());
     }
 }
+
+/// C3: SessionEnd re-spawns itself detached; the child's stderr used to go to
+/// /dev/null, so its failures were invisible. It now goes to a bounded log
+/// under the CSR data dir. Runs the real binary against a temp db/HOME.
+#[cfg(unix)]
+mod session_end_detached_log {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_detached_child_stderr_lands_in_a_log_under_the_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let timing = dir.path().join("timing.log");
+        let log = dir.path().join("logs/session-end-detached.log");
+        let payload = serde_json::json!({
+            "session_id": "detached-log-session",
+            "transcript_path": dir.path().join("projects/proj/detached-log-session.jsonl"),
+            "cwd": dir.path(),
+            "reason": "other",
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
+            .args(["hook", "session-end", "--db-path"])
+            .arg(dir.path().join("csr-engine.db"))
+            .arg("--projects-dir")
+            .arg(dir.path().join("projects"))
+            .env("HOME", &home)
+            .env("CSR_TIMING_LOG", &timing)
+            .env_remove("CSR_DISABLE_RECURSIVE_HOOKS")
+            .env_remove("CSR_HOOK_DETACHED")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "the hook must stay non-blocking and succeed"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            text.contains("session-end detached child spawned by hook pid"),
+            "the detached child's log must exist under the data dir: {text:?}"
+        );
+    }
+}
