@@ -1,0 +1,672 @@
+{
+ "0": {
+  "dream": "newest",
+  "key": "dream:newest:answers",
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "spans": [
+   [
+    6,
+    52,
+    "helpful"
+   ],
+   [
+    52,
+    98,
+    "thought_of_it"
+   ]
+  ]
+ },
+ "1": {
+  "dream": "newest",
+  "key": "dream:newest:answers",
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "spans": [
+   [
+    6,
+    52,
+    "not_relevant"
+   ],
+   [
+    52,
+    98,
+    "ask_claude"
+   ]
+  ]
+ },
+ "11": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "source": "compacted",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "12": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "13": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "14": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "15": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "16": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "17": {
+  "body": [
+   "Paid back: 3 of 22 calls. 19 calls to go.",
+   "Earned back: 37k of 267k (full input price).",
+   "Took 1:19. Your /compact: 1:27 (median of 12).",
+   "Kept 4 items, 3 lessons. Click to read.",
+   "3 waiting in Lost and found."
+  ],
+  "detail": [
+   "Kept: Export job wired to the nightly queue",
+   "Kept: Retries use jittered backoff",
+   "Kept: Edited the export job in lib.rs",
+   "Kept: Keep the read-only database boundary",
+   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
+   "Learnt: Your word “dknr” — interpreted as: done.",
+   "Learnt: You said to keep batch sizes small.",
+   "Cost: cache 140k + summary 108k + read 19k."
+  ],
+  "key": "compacted:1792319870.0",
+  "lede": [
+   "Each API call now sends 122k fewer tokens."
+  ],
+  "lines": 2,
+  "loud": 2,
+  "picture": {
+   "facts": {
+    "at": 1792319870.0,
+    "cost": 266700.0,
+    "done": 3,
+    "need": 22,
+    "net": -230100.0,
+    "per": null,
+    "saving": 12200.0
+   },
+   "kind": "payback",
+   "rows": 5
+  },
+  "plain_body": true,
+  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
+  "title": "Context: 192k → 70k tokens.",
+  "unrated": false,
+  "whole_detail": true
+ },
+ "2": {
+  "detail": [],
+  "key": "fold:passed",
+  "lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "› 1 adopted · 2 passed"
+ },
+ "20": {
+  "detail": [
+   "Your word “dknr” — interpreted as: done."
+  ],
+  "key": "read:1792319865.0:dknr",
+  "lines": 2,
+  "meta": "10-18 · in a compaction summary",
+  "send": "Earlier you read my “dknr” as “done”. Check that reading before relying on it.",
+  "title": "“dknr” → read as “done”"
+ },
+ "21": {
+  "detail": [
+   "Your word “dknr” — interpreted as: done."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "read:1792319865.0:dknr",
+  "lines": 2,
+  "meta": "10-18 · in a compaction summary",
+  "send": "Earlier you read my “dknr” as “done”. Check that reading before relying on it.",
+  "source": "coach",
+  "title": "“dknr” → read as “done”"
+ },
+ "22": {
+  "detail": [
+   "I'll interpret “dknr” as done and carry on."
+  ],
+  "key": "read:1792319790.0:dknr",
+  "lines": 2,
+  "meta": "10-18 · in a reply",
+  "send": "Earlier you read my “dknr” as “done and carry on”. Check that reading before relying on it.",
+  "title": "“dknr” → read as “done and carry on”"
+ },
+ "23": {
+  "detail": [
+   "I'll interpret “dknr” as done and carry on."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "read:1792319790.0:dknr",
+  "lines": 2,
+  "meta": "10-18 · in a reply",
+  "send": "Earlier you read my “dknr” as “done and carry on”. Check that reading before relying on it.",
+  "source": "coach",
+  "title": "“dknr” → read as “done and carry on”"
+ },
+ "26": {
+  "detail": [
+   "Session 3f6a2b1c · 6 days ago · pane-wp2 · handed to Claude 1× this session."
+  ],
+  "key": "recall:3f6a2b1c-8d4e-4f10-9a57-0c1d2e3f4a5b",
+  "meta": "opened · 6 days ago · pane-wp2",
+  "send": "CSR remembered a past session: “Add retry backoff to the export queue” (6 days ago · pane-wp2). The rest of it: csr_reflect_on_past(\"conv_3f6a2b1c-8d4e-4f10-9a57-0c1d2e3f4a5b\")",
+  "title": "Add retry backoff to the export queue"
+ },
+ "27": {
+  "detail": [
+   "Session 3f6a2b1c · 6 days ago · pane-wp2 · handed to Claude 1× this session."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "recall:3f6a2b1c-8d4e-4f10-9a57-0c1d2e3f4a5b",
+  "meta": "opened · 6 days ago · pane-wp2",
+  "send": "CSR remembered a past session: “Add retry backoff to the export queue” (6 days ago · pane-wp2). The rest of it: csr_reflect_on_past(\"conv_3f6a2b1c-8d4e-4f10-9a57-0c1d2e3f4a5b\")",
+  "source": "remembered",
+  "title": "Add retry backoff to the export queue"
+ },
+ "30": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "handed to a subagent 10:26, which failed 10-18 10:30: the test runner exited"
+  ],
+  "flag": "its subagent failed",
+  "key": "lost:e46850903e9f",
+  "lines": 2,
+  "lost": "e46850903e9f",
+  "meta": "quiet 10:25 · 2×",
+  "send": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "title": "Rebase the importer branch, awaiting your go.",
+  "top": true
+ },
+ "31": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "handed to a subagent 10:26, which failed 10-18 10:30: the test runner exited"
+  ],
+  "flag": "its subagent failed",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "lost:e46850903e9f",
+  "lines": 2,
+  "lost": "e46850903e9f",
+  "meta": "quiet 10:25 · 2×",
+  "send": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "source": "lost",
+  "title": "Rebase the importer branch, awaiting your go.",
+  "top": true
+ },
+ "32": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "item": "lost:e46850903e9f",
+  "key": "lost:e46850903e9f:side",
+  "lost": "e46850903e9f",
+  "spans": [
+   [
+    6,
+    52,
+    "side"
+   ],
+   [
+    52,
+    98,
+    "sub"
+   ]
+  ]
+ },
+ "33": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "item": "lost:e46850903e9f",
+  "key": "lost:e46850903e9f:drop",
+  "lost": "e46850903e9f",
+  "spans": [
+   [
+    6,
+    52,
+    "drop"
+   ],
+   [
+    52,
+    98,
+    "later"
+   ]
+  ]
+ },
+ "34": {
+  "asks": {
+   "side": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, after its last summary; ended 10-18 09:30",
+   "10-18 09:00 you: Check the worker restart",
+   "10-18 09:20 you: Also install the metrics exporter",
+   "10-18 09:30 you: wait, hold that"
+  ],
+  "flag": "waiting on you",
+  "key": "lost:f5616ba8b35d",
+  "lines": 2,
+  "lost": "f5616ba8b35d",
+  "meta": "from sess-bef",
+  "send": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "title": "Cut off before Claude finished answering: “wait, hold that”",
+  "top": false
+ },
+ "35": {
+  "asks": {
+   "side": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, after its last summary; ended 10-18 09:30",
+   "10-18 09:00 you: Check the worker restart",
+   "10-18 09:20 you: Also install the metrics exporter",
+   "10-18 09:30 you: wait, hold that"
+  ],
+  "flag": "waiting on you",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "lost:f5616ba8b35d",
+  "lines": 2,
+  "lost": "f5616ba8b35d",
+  "meta": "from sess-bef",
+  "send": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "source": "lost",
+  "title": "Cut off before Claude finished answering: “wait, hold that”",
+  "top": false
+ },
+ "36": {
+  "asks": {
+   "side": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, open when it ended"
+  ],
+  "flag": "waiting on you",
+  "key": "lost:206ae6dba6c5",
+  "lines": 2,
+  "lost": "206ae6dba6c5",
+  "meta": "from sess-bef · 1×",
+  "send": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "title": "Verify the worker restarts after a crash, awaiting your approval.",
+  "top": false
+ },
+ "37": {
+  "asks": {
+   "side": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, open when it ended"
+  ],
+  "flag": "waiting on you",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "lost:206ae6dba6c5",
+  "lines": 2,
+  "lost": "206ae6dba6c5",
+  "meta": "from sess-bef · 1×",
+  "send": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "source": "lost",
+  "title": "Verify the worker restarts after a crash, awaiting your approval.",
+  "top": false
+ },
+ "38": {
+  "key": "view:info"
+ },
+ "39": {
+  "key": "legend",
+  "keys": [
+   [
+    1,
+    21,
+    "l"
+   ],
+   [
+    23,
+    43,
+    "s"
+   ],
+   [
+    45,
+    64,
+    "f"
+   ],
+   [
+    66,
+    80,
+    "i"
+   ],
+   [
+    82,
+    89,
+    "r"
+   ],
+   [
+    91,
+    98,
+    "q"
+   ]
+  ]
+ },
+ "5": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "title": "Keep the read-only database boundary."
+ },
+ "6": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "source": "rules",
+  "title": "Keep the read-only database boundary."
+ },
+ "7": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:20:00Z:Never retry in a tight loop.",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Never retry in a tight loop.”",
+  "title": "Never retry in a tight loop."
+ },
+ "8": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "rule:2026-10-18T10:20:00Z:Never retry in a tight loop.",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Never retry in a tight loop.”",
+  "source": "rules",
+  "title": "Never retry in a tight loop."
+ }
+}

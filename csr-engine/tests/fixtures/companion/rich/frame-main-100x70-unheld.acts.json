@@ -1,0 +1,692 @@
+{
+ "0": {
+  "key": "view:info"
+ },
+ "1": {
+  "key": "view:info"
+ },
+ "10": {
+  "detail": [],
+  "key": "shiftrefresh",
+  "lines": 1,
+  "nosend": true,
+  "quiet": true,
+  "refresh": true,
+  "send": "",
+  "title": "↻ refresh the shift map · about 1.3¢ (avg of your 4 story calls)",
+  "unrated": true
+ },
+ "13": {
+  "answers": true,
+  "body": [
+   "Page the export",
+   "Page the output."
+  ],
+  "detail": [
+   "Keep each page small."
+  ],
+  "dream": "arrived",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "dream:arrived",
+  "lines": 3,
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. Page the output. Keep each page small.”",
+  "source": "dreams",
+  "title": "What if the export queue paged its output?"
+ },
+ "14": {
+  "answers": true,
+  "body": [
+   "Page the export",
+   "Page the output."
+  ],
+  "detail": [
+   "Keep each page small."
+  ],
+  "dream": "arrived",
+  "key": "dream:arrived",
+  "lines": 3,
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. Page the output. Keep each page small.”",
+  "title": "What if the export queue paged its output?"
+ },
+ "15": {
+  "answers": true,
+  "body": [
+   "Page the export",
+   "Page the output."
+  ],
+  "detail": [
+   "Keep each page small."
+  ],
+  "dream": "arrived",
+  "key": "dream:arrived",
+  "lines": 3,
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. Page the output. Keep each page small.”",
+  "title": "What if the export queue paged its output?"
+ },
+ "16": {
+  "dream": "arrived",
+  "key": "dream:arrived:answers",
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. Page the output. Keep each page small.”",
+  "spans": [
+   [
+    6,
+    52,
+    "helpful"
+   ],
+   [
+    52,
+    98,
+    "thought_of_it"
+   ]
+  ]
+ },
+ "17": {
+  "dream": "arrived",
+  "key": "dream:arrived:answers",
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if the export queue paged its output?” Its reasoning: “Page the export. Page the output. Keep each page small.”",
+  "spans": [
+   [
+    6,
+    52,
+    "not_relevant"
+   ],
+   [
+    52,
+    98,
+    "ask_claude"
+   ]
+  ]
+ },
+ "18": {
+  "detail": [],
+  "key": "fold:passed",
+  "lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "› 1 adopted · 3 passed"
+ },
+ "21": {
+  "body": [
+   "17m · 11 tools · Reading the queue schema"
+  ],
+  "detail": [
+   "Wrote: src/lib.rs"
+  ],
+  "fit_body": true,
+  "flag": "also edited by Claude this session: src/lib.rs",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-lead",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "general-purpose · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "22": {
+  "body": [
+   "17m · 11 tools · Reading the queue schema"
+  ],
+  "detail": [
+   "Wrote: src/lib.rs"
+  ],
+  "fit_body": true,
+  "flag": "also edited by Claude this session: src/lib.rs",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-lead",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "general-purpose · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "23": {
+  "body": [
+   "17m · 11 tools · Reading the queue schema"
+  ],
+  "detail": [
+   "Wrote: src/lib.rs"
+  ],
+  "fit_body": true,
+  "flag": "also edited by Claude this session: src/lib.rs",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-lead",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "general-purpose · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "24": {
+  "body": [
+   "  23m · 4 tools · Listing the retry settings"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "stalled 18m",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-child",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "└ Explore · claude-haiku-4-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "25": {
+  "body": [
+   "  23m · 4 tools · Listing the retry settings"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "stalled 18m",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-child",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "└ Explore · claude-haiku-4-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "26": {
+  "body": [
+   "  23m · 4 tools · Listing the retry settings"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "stalled 18m",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-child",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "└ Explore · claude-haiku-4-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "27": {
+  "body": [
+   "11m · 2 tools · Asked for the schema"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-wait",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Plan · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "28": {
+  "body": [
+   "11m · 2 tools · Asked for the schema"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-wait",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Plan · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "29": {
+  "body": [
+   "25m · 3 tools · Reviewed the reader"
+  ],
+  "detail": [
+   "What it found — the agent’s words",
+   "Bounded [reader] Ready."
+  ],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-done",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Explore · claude-sonnet-4-5 · done",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "30": {
+  "body": [
+   "25m · 3 tools · Reviewed the reader"
+  ],
+  "detail": [
+   "What it found — the agent’s words",
+   "Bounded [reader] Ready."
+  ],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-done",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Explore · claude-sonnet-4-5 · done",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "31": {
+  "detail": [],
+  "key": "fold:flight-more",
+  "lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "› and 3 more",
+  "unsigned": true
+ },
+ "32": {
+  "detail": [],
+  "key": "codex:week",
+  "lines": 1,
+  "nosend": true,
+  "quiet": true,
+  "send": "",
+  "title": "Codex week 41% · resets Thu 09:00 · 0 live",
+  "tone": null,
+  "unrated": true
+ },
+ "35": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "title": "Keep the read-only database boundary."
+ },
+ "36": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "source": "rules",
+  "title": "Keep the read-only database boundary."
+ },
+ "37": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:20:00Z:Never retry in a tight loop.",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Never retry in a tight loop.”",
+  "title": "Never retry in a tight loop."
+ },
+ "38": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "rule:2026-10-18T10:20:00Z:Never retry in a tight loop.",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Never retry in a tight loop.”",
+  "source": "rules",
+  "title": "Never retry in a tight loop."
+ },
+ "4": {
+  "detail": [],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "story",
+  "like": "story:sess-now:3",
+  "lines": 6,
+  "open_lines": 30,
+  "open_title": "The pane reads the session. Work stands at: text parity is ready for review. No model call is needed.",
+  "send": "CSR's story of this session, rev 3, quoted: “The pane reads the session. Work stands at: text parity is ready for review. No model call is needed.”",
+  "source": "story",
+  "title": "Work stands at: text parity is ready for review. No model call is needed."
+ },
+ "41": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "handed to a subagent 10:26, which failed 10-18 10:30: the test runner exited"
+  ],
+  "flag": "its subagent failed",
+  "key": "lost:e46850903e9f",
+  "lines": 2,
+  "lost": "e46850903e9f",
+  "meta": "quiet 10:25 · 2×",
+  "send": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "title": "Rebase the importer branch, awaiting your go.",
+  "top": true
+ },
+ "42": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "handed to a subagent 10:26, which failed 10-18 10:30: the test runner exited"
+  ],
+  "flag": "its subagent failed",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "lost:e46850903e9f",
+  "lines": 2,
+  "lost": "e46850903e9f",
+  "meta": "quiet 10:25 · 2×",
+  "send": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "source": "lost",
+  "title": "Rebase the importer branch, awaiting your go.",
+  "top": true
+ },
+ "43": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "item": "lost:e46850903e9f",
+  "key": "lost:e46850903e9f:side",
+  "lost": "e46850903e9f",
+  "spans": [
+   [
+    6,
+    52,
+    "side"
+   ],
+   [
+    52,
+    98,
+    "sub"
+   ]
+  ]
+ },
+ "44": {
+  "asks": {
+   "side": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Rebase the importer branch, awaiting your go.” went quiet after 10:25. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "item": "lost:e46850903e9f",
+  "key": "lost:e46850903e9f:drop",
+  "lost": "e46850903e9f",
+  "spans": [
+   [
+    6,
+    52,
+    "drop"
+   ],
+   [
+    52,
+    98,
+    "later"
+   ]
+  ]
+ },
+ "45": {
+  "asks": {
+   "side": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, after its last summary; ended 10-18 09:30",
+   "10-18 09:00 you: Check the worker restart",
+   "10-18 09:20 you: Also install the metrics exporter",
+   "10-18 09:30 you: wait, hold that"
+  ],
+  "flag": "waiting on you",
+  "key": "lost:f5616ba8b35d",
+  "lines": 2,
+  "lost": "f5616ba8b35d",
+  "meta": "from sess-bef",
+  "send": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "title": "Cut off before Claude finished answering: “wait, hold that”",
+  "top": false
+ },
+ "46": {
+  "asks": {
+   "side": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, after its last summary; ended 10-18 09:30",
+   "10-18 09:00 you: Check the worker restart",
+   "10-18 09:20 you: Also install the metrics exporter",
+   "10-18 09:30 you: wait, hold that"
+  ],
+  "flag": "waiting on you",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "lost:f5616ba8b35d",
+  "lines": 2,
+  "lost": "f5616ba8b35d",
+  "meta": "from sess-bef",
+  "send": "Lost and found: “Cut off before Claude finished answering: “wait, hold that”” went quiet after 09:30. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "source": "lost",
+  "title": "Cut off before Claude finished answering: “wait, hold that”",
+  "top": false
+ },
+ "47": {
+  "asks": {
+   "side": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, open when it ended"
+  ],
+  "flag": "waiting on you",
+  "key": "lost:206ae6dba6c5",
+  "lines": 2,
+  "lost": "206ae6dba6c5",
+  "meta": "from sess-bef · 1×",
+  "send": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "title": "Verify the worker restarts after a crash, awaiting your approval.",
+  "top": false
+ },
+ "48": {
+  "asks": {
+   "side": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+   "sub": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Hand it to a background subagent with a five-part spec (objective, files, interfaces, constraints, verification), keep working on the current task, and report its result when it lands."
+  },
+  "detail": [
+   "session sess-bef, open when it ended"
+  ],
+  "flag": "waiting on you",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "lost:206ae6dba6c5",
+  "lines": 2,
+  "lost": "206ae6dba6c5",
+  "meta": "from sess-bef · 1×",
+  "send": "Lost and found: “Verify the worker restarts after a crash, awaiting your approval.” went quiet after 08:50. Revisit it as a side task: finish or close it in a few steps without derailing the current work, then tell me in one line.",
+  "source": "lost",
+  "title": "Verify the worker restarts after a crash, awaiting your approval.",
+  "top": false
+ },
+ "5": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "6": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "68": {
+  "key": "view:info"
+ },
+ "69": {
+  "key": "legend",
+  "keys": [
+   [
+    1,
+    21,
+    "l"
+   ],
+   [
+    23,
+    43,
+    "s"
+   ],
+   [
+    45,
+    64,
+    "f"
+   ],
+   [
+    66,
+    80,
+    "i"
+   ],
+   [
+    82,
+    89,
+    "r"
+   ],
+   [
+    91,
+    98,
+    "q"
+   ]
+  ]
+ },
+ "7": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "8": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "9": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ }
+}

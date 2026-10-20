@@ -1,0 +1,12 @@
+{"type":"continued-in","sessionId":"sess-prev","continuedInSessionId":"sess-fresh"}
+{"type":"ai-title","aiTitle":"Tidy the importer tests"}
+{"type":"user","timestamp":"2026-10-18T06:30:00Z","message":{"role":"user","content":"Tidy the importer tests"}}
+{"type":"assistant","timestamp":"2026-10-18T06:31:00Z","message":{"id":"p1","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":30000,"output_tokens":400},"content":[{"type":"text","text":"Moved the fixtures."}]}}
+{"type":"user","timestamp":"2026-10-18T06:50:00Z","message":{"role":"user","content":"Run them offline"}}
+{"type":"assistant","timestamp":"2026-10-18T06:51:00Z","message":{"id":"p2","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":80000,"output_tokens":400},"content":[{"type":"text","text":"They run offline."}]}}
+{"type":"assistant","timestamp":"2026-10-18T07:10:00Z","message":{"id":"p3","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":120000,"output_tokens":400},"content":[{"type":"text","text":"Added a fixture loader."}]}}
+{"type":"system","subtype":"compact_boundary","timestamp":"2026-10-18T07:20:00Z","compactMetadata":{"trigger":"manual","preTokens":175000,"postTokens":18500,"durationMs":58000}}
+{"type":"user","timestamp":"2026-10-18T07:20:20Z","isCompactSummary":true,"message":{"role":"user","content":"1. Primary Request and Intent:\n   Wire the export job to the nightly queue.\n4. Errors and fixes:\n   - None this window.\n6. All user messages:\n   - Keep the read-only database boundary.\n7. Pending Tasks:\n   - Run the importer tests once the fixtures land.\n   - Update the changelog entry.\n8. Current Work:\n   Wiring the export job.\n9. Optional Next Step:\n   - None."}}
+{"type":"assistant","timestamp":"2026-10-18T07:30:00Z","message":{"id":"p4","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":55000,"output_tokens":400},"content":[{"type":"text","text":"Fixtures landed."}]}}
+{"type":"user","timestamp":"2026-10-18T07:40:00Z","message":{"role":"user","content":"Run the importer tests"}}
+{"type":"assistant","timestamp":"2026-10-18T07:41:00Z","message":{"id":"p5","model":"claude-sonnet-5","role":"assistant","stop_reason":"end_turn","usage":{"input_tokens":70000,"output_tokens":400},"content":[{"type":"text","text":"All importer tests pass."}]}}

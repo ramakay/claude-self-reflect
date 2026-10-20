@@ -1,0 +1,538 @@
+{
+ "0": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "1": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "10": {
+  "body": [
+   "  20m · 4 tools · Listing the retry settings"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "stalled 15m",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-child",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "└ Explore · claude-haiku-4-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "11": {
+  "body": [
+   "  20m · 4 tools · Listing the retry settings"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "stalled 15m",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-child",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "└ Explore · claude-haiku-4-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "12": {
+  "body": [
+   "  20m · 4 tools · Listing the retry settings"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "stalled 15m",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-child",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "└ Explore · claude-haiku-4-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "13": {
+  "body": [
+   "8m · 2 tools · Asked for the schema"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-wait",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Plan · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "14": {
+  "body": [
+   "8m · 2 tools · Asked for the schema"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-wait",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Plan · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "15": {
+  "body": [
+   "25m · 3 tools · Reviewed the reader"
+  ],
+  "detail": [
+   "What it found — the agent’s words",
+   "Bounded [reader] Ready."
+  ],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-done",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Explore · claude-sonnet-4-5 · done",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "16": {
+  "body": [
+   "25m · 3 tools · Reviewed the reader"
+  ],
+  "detail": [
+   "What it found — the agent’s words",
+   "Bounded [reader] Ready."
+  ],
+  "fit_body": true,
+  "flag": "",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-done",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "Explore · claude-sonnet-4-5 · done",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "17": {
+  "detail": [],
+  "key": "fold:flight-more",
+  "lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "› and 3 more",
+  "unsigned": true
+ },
+ "18": {
+  "detail": [],
+  "key": "codex:week",
+  "lines": 1,
+  "nosend": true,
+  "quiet": true,
+  "send": "",
+  "title": "Codex week 41% · resets Thu 09:00 · 2 live",
+  "tone": null,
+  "unrated": true
+ },
+ "19": {
+  "body": [
+   "10m · csr-engine/tests · 51k tokens"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "key": "codex:codex-live-2",
+  "lines": 1,
+  "nosend": true,
+  "send": "",
+  "title": "Codex · gpt-6-luna · medium",
+  "unrated": true
+ },
+ "2": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "20": {
+  "body": [
+   "10m · csr-engine/tests · 51k tokens"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "key": "codex:codex-live-2",
+  "lines": 1,
+  "nosend": true,
+  "send": "",
+  "title": "Codex · gpt-6-luna · medium",
+  "unrated": true
+ },
+ "21": {
+  "body": [
+   "20m · csr-engine/src · 184k tokens"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "key": "codex:codex-live-1",
+  "lines": 1,
+  "nosend": true,
+  "send": "",
+  "title": "Codex · gpt-6-astra · high",
+  "unrated": true
+ },
+ "22": {
+  "body": [
+   "20m · csr-engine/src · 184k tokens"
+  ],
+  "detail": [],
+  "fit_body": true,
+  "key": "codex:codex-live-1",
+  "lines": 1,
+  "nosend": true,
+  "send": "",
+  "title": "Codex · gpt-6-astra · high",
+  "unrated": true
+ },
+ "25": {
+  "answers": true,
+  "body": [
+   "Keep the pane alive",
+   "Catch a failing frame without losing the terminal."
+  ],
+  "detail": [
+   "Keep the heartbeat independent of the renderer.",
+   "Retry after a short backoff."
+  ],
+  "dream": "newest",
+  "heart": [
+   96,
+   100
+  ],
+  "key": "dream:newest",
+  "lines": 3,
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "source": "dreams",
+  "title": "What if a frame failed while the agent was busy?"
+ },
+ "26": {
+  "answers": true,
+  "body": [
+   "Keep the pane alive",
+   "Catch a failing frame without losing the terminal."
+  ],
+  "detail": [
+   "Keep the heartbeat independent of the renderer.",
+   "Retry after a short backoff."
+  ],
+  "dream": "newest",
+  "key": "dream:newest",
+  "lines": 3,
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "title": "What if a frame failed while the agent was busy?"
+ },
+ "27": {
+  "answers": true,
+  "body": [
+   "Keep the pane alive",
+   "Catch a failing frame without losing the terminal."
+  ],
+  "detail": [
+   "Keep the heartbeat independent of the renderer.",
+   "Retry after a short backoff."
+  ],
+  "dream": "newest",
+  "key": "dream:newest",
+  "lines": 3,
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "title": "What if a frame failed while the agent was busy?"
+ },
+ "28": {
+  "dream": "newest",
+  "key": "dream:newest:answers",
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "spans": [
+   [
+    6,
+    52,
+    "helpful"
+   ],
+   [
+    52,
+    98,
+    "thought_of_it"
+   ]
+  ]
+ },
+ "29": {
+  "dream": "newest",
+  "key": "dream:newest:answers",
+  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
+  "spans": [
+   [
+    6,
+    52,
+    "not_relevant"
+   ],
+   [
+    52,
+    98,
+    "ask_claude"
+   ]
+  ]
+ },
+ "3": {
+  "body": [
+   "shift · reader.rs:read",
+   "Before: The reader loaded a whole transcript.",
+   "After:  The reader streams chunks.",
+   "Haiku's words · names match commit 8e4e3f2"
+  ],
+  "body_loud": [
+   1,
+   2
+  ],
+  "detail": [],
+  "fit_body": true,
+  "hint": "click again to fold",
+  "key": "shifts",
+  "lines": 1,
+  "nosend": true,
+  "open_lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "Shift Map · as of 21 messages ago",
+  "unrated": true
+ },
+ "30": {
+  "detail": [],
+  "key": "fold:passed",
+  "lines": 1,
+  "quiet": true,
+  "send": "",
+  "title": "› 1 adopted · 2 passed"
+ },
+ "33": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "title": "Keep the read-only database boundary."
+ },
+ "34": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "source": "rules",
+  "title": "Keep the read-only database boundary."
+ },
+ "35": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:20:00Z:Never retry in a tight loop.",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Never retry in a tight loop.”",
+  "title": "Never retry in a tight loop."
+ },
+ "36": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   96,
+   100
+  ],
+  "key": "rule:2026-10-18T10:20:00Z:Never retry in a tight loop.",
+  "meta": "you said · 10-18 · this session",
+  "send": "A standing rule from 10-18: “Never retry in a tight loop.”",
+  "source": "rules",
+  "title": "Never retry in a tight loop."
+ },
+ "38": {
+  "key": "view:info"
+ },
+ "39": {
+  "key": "legend",
+  "keys": [
+   [
+    1,
+    21,
+    "l"
+   ],
+   [
+    23,
+    43,
+    "s"
+   ],
+   [
+    45,
+    64,
+    "f"
+   ],
+   [
+    66,
+    80,
+    "i"
+   ],
+   [
+    82,
+    89,
+    "r"
+   ],
+   [
+    91,
+    98,
+    "q"
+   ]
+  ]
+ },
+ "4": {
+  "detail": [],
+  "key": "shiftrefresh",
+  "lines": 1,
+  "nosend": true,
+  "quiet": true,
+  "refresh": true,
+  "send": "",
+  "title": "↻ refresh the shift map · about 1.3¢ (avg of your 4 story calls)",
+  "unrated": true
+ },
+ "7": {
+  "body": [
+   "14m · 11 tools · Reading the queue schema"
+  ],
+  "detail": [
+   "Wrote: src/lib.rs"
+  ],
+  "fit_body": true,
+  "flag": "also edited by Claude this session: src/lib.rs",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-lead",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "general-purpose · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "8": {
+  "body": [
+   "14m · 11 tools · Reading the queue schema"
+  ],
+  "detail": [
+   "Wrote: src/lib.rs"
+  ],
+  "fit_body": true,
+  "flag": "also edited by Claude this session: src/lib.rs",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-lead",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "general-purpose · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ },
+ "9": {
+  "body": [
+   "14m · 11 tools · Reading the queue schema"
+  ],
+  "detail": [
+   "Wrote: src/lib.rs"
+  ],
+  "fit_body": true,
+  "flag": "also edited by Claude this session: src/lib.rs",
+  "hint": "the agent's words, not yours: click again to fold",
+  "key": "flight:a-lead",
+  "lines": 1,
+  "meta": "",
+  "nosend": true,
+  "send": "",
+  "title": "general-purpose · claude-sonnet-5",
+  "unrated": true,
+  "whole_detail": true
+ }
+}

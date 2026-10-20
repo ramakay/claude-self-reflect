@@ -1,0 +1,543 @@
+{
+ "0": {
+  "key": "view:info"
+ },
+ "1": {
+  "key": "view:info"
+ },
+ "10": {
+  "body": [
+   "Dreamt: What if the importer kept every fixture bounded?",
+   "ANCHORS: 3 anchors retired by a1b2c3d · 2 earlier threads"
+  ],
+  "detail": [
+   "Dreamt: What if a failed run left its fixtures for inspection?",
+   "csr_reflect_on_past(\"importer fixtures\")"
+  ],
+  "key": "told:recap",
+  "like": "told:sess-fresh:1792319950.0",
+  "lines": 3,
+  "plain_body": true,
+  "send": "CSR's recap at the start of this session: recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests. The rest: csr_reflect_on_past(\"importer fixtures\")",
+  "title": "recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests."
+ },
+ "11": {
+  "body": [
+   "Dreamt: What if the importer kept every fixture bounded?",
+   "ANCHORS: 3 anchors retired by a1b2c3d · 2 earlier threads"
+  ],
+  "detail": [
+   "Dreamt: What if a failed run left its fixtures for inspection?",
+   "csr_reflect_on_past(\"importer fixtures\")"
+  ],
+  "key": "told:recap",
+  "like": "told:sess-fresh:1792319950.0",
+  "lines": 3,
+  "plain_body": true,
+  "send": "CSR's recap at the start of this session: recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests. The rest: csr_reflect_on_past(\"importer fixtures\")",
+  "title": "recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests."
+ },
+ "14": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "title": "Keep the read-only database boundary."
+ },
+ "15": {
+  "detail": [
+   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
+  ],
+  "heart": [
+   42,
+   46
+  ],
+  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
+  "meta": "you said · 10-18",
+  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
+  "source": "rules",
+  "title": "Keep the read-only database boundary."
+ },
+ "18": {
+  "body": [
+   "16m active · 3 prompts · 1 compacts",
+   "CSR learned 4 · handed 2× · peak 120k"
+  ],
+  "detail": [
+   "After a compaction the context settled near 55k, the median of the last 1.",
+   "You last: “Run the importer tests”",
+   "Claude last: “All importer tests pass.”"
+  ],
+  "fit_body": true,
+  "heart": [
+   42,
+   46
+  ],
+  "key": "last:sess-prev",
+  "lines": 1,
+  "picture": {
+   "facts": {
+    "active": 960.0,
+    "asked": 0,
+    "compactions": [
+     [
+      1792308000.0,
+      175000,
+      55000
+     ]
+    ],
+    "compacts": 1,
+    "first": 1792305000.0,
+    "floor": 55000,
+    "handed": 2,
+    "id": "sess-prev",
+    "last": 1792309260.0,
+    "learned": 4,
+    "mtime": 0,
+    "path": "<HOME>/.claude/projects/fixture/sess-prev.jsonl",
+    "peak": 120000,
+    "prompt_times": [
+     1792305000.0,
+     1792306200.0,
+     1792309200.0
+    ],
+    "prompts": 3,
+    "said": [
+     1792309260.0,
+     "All importer tests pass."
+    ],
+    "series": [
+     [
+      1792305060.0,
+      30000
+     ],
+     [
+      1792306260.0,
+      80000
+     ],
+     [
+      1792307400.0,
+      120000
+     ],
+     [
+      1792308600.0,
+      55000
+     ],
+     [
+      1792309260.0,
+      70000
+     ]
+    ],
+    "title": "Tidy the importer tests",
+    "todos": [
+     {
+      "status": "in_progress",
+      "subject": "Run the importer tests"
+     },
+     {
+      "status": "pending",
+      "subject": "Update the changelog entry"
+     }
+    ],
+    "typed": [
+     1792309200.0,
+     "Run the importer tests"
+    ]
+   },
+   "rows": 4
+  },
+  "send": "Last session sess-pre (“Tidy the importer tests”): 16m active, 3 prompts, 1 compactions, last row 10-18 07:41. The rest of it: csr_reflect_on_past(\"conv_sess-prev\")",
+  "source": "last",
+  "title": "Tidy the importer tests"
+ },
+ "19": {
+  "body": [
+   "16m active · 3 prompts · 1 compacts",
+   "CSR learned 4 · handed 2× · peak 120k"
+  ],
+  "detail": [
+   "After a compaction the context settled near 55k, the median of the last 1.",
+   "You last: “Run the importer tests”",
+   "Claude last: “All importer tests pass.”"
+  ],
+  "fit_body": true,
+  "key": "last:sess-prev",
+  "lines": 1,
+  "picture": {
+   "facts": {
+    "active": 960.0,
+    "asked": 0,
+    "compactions": [
+     [
+      1792308000.0,
+      175000,
+      55000
+     ]
+    ],
+    "compacts": 1,
+    "first": 1792305000.0,
+    "floor": 55000,
+    "handed": 2,
+    "id": "sess-prev",
+    "last": 1792309260.0,
+    "learned": 4,
+    "mtime": 0,
+    "path": "<HOME>/.claude/projects/fixture/sess-prev.jsonl",
+    "peak": 120000,
+    "prompt_times": [
+     1792305000.0,
+     1792306200.0,
+     1792309200.0
+    ],
+    "prompts": 3,
+    "said": [
+     1792309260.0,
+     "All importer tests pass."
+    ],
+    "series": [
+     [
+      1792305060.0,
+      30000
+     ],
+     [
+      1792306260.0,
+      80000
+     ],
+     [
+      1792307400.0,
+      120000
+     ],
+     [
+      1792308600.0,
+      55000
+     ],
+     [
+      1792309260.0,
+      70000
+     ]
+    ],
+    "title": "Tidy the importer tests",
+    "todos": [
+     {
+      "status": "in_progress",
+      "subject": "Run the importer tests"
+     },
+     {
+      "status": "pending",
+      "subject": "Update the changelog entry"
+     }
+    ],
+    "typed": [
+     1792309200.0,
+     "Run the importer tests"
+    ]
+   },
+   "rows": 4
+  },
+  "send": "Last session sess-pre (“Tidy the importer tests”): 16m active, 3 prompts, 1 compactions, last row 10-18 07:41. The rest of it: csr_reflect_on_past(\"conv_sess-prev\")",
+  "title": "Tidy the importer tests"
+ },
+ "20": {
+  "body": [
+   "16m active · 3 prompts · 1 compacts",
+   "CSR learned 4 · handed 2× · peak 120k"
+  ],
+  "detail": [
+   "After a compaction the context settled near 55k, the median of the last 1.",
+   "You last: “Run the importer tests”",
+   "Claude last: “All importer tests pass.”"
+  ],
+  "fit_body": true,
+  "key": "last:sess-prev",
+  "lines": 1,
+  "picture": {
+   "facts": {
+    "active": 960.0,
+    "asked": 0,
+    "compactions": [
+     [
+      1792308000.0,
+      175000,
+      55000
+     ]
+    ],
+    "compacts": 1,
+    "first": 1792305000.0,
+    "floor": 55000,
+    "handed": 2,
+    "id": "sess-prev",
+    "last": 1792309260.0,
+    "learned": 4,
+    "mtime": 0,
+    "path": "<HOME>/.claude/projects/fixture/sess-prev.jsonl",
+    "peak": 120000,
+    "prompt_times": [
+     1792305000.0,
+     1792306200.0,
+     1792309200.0
+    ],
+    "prompts": 3,
+    "said": [
+     1792309260.0,
+     "All importer tests pass."
+    ],
+    "series": [
+     [
+      1792305060.0,
+      30000
+     ],
+     [
+      1792306260.0,
+      80000
+     ],
+     [
+      1792307400.0,
+      120000
+     ],
+     [
+      1792308600.0,
+      55000
+     ],
+     [
+      1792309260.0,
+      70000
+     ]
+    ],
+    "title": "Tidy the importer tests",
+    "todos": [
+     {
+      "status": "in_progress",
+      "subject": "Run the importer tests"
+     },
+     {
+      "status": "pending",
+      "subject": "Update the changelog entry"
+     }
+    ],
+    "typed": [
+     1792309200.0,
+     "Run the importer tests"
+    ]
+   },
+   "rows": 4
+  },
+  "send": "Last session sess-pre (“Tidy the importer tests”): 16m active, 3 prompts, 1 compactions, last row 10-18 07:41. The rest of it: csr_reflect_on_past(\"conv_sess-prev\")",
+  "title": "Tidy the importer tests"
+ },
+ "21": {
+  "body": [
+   "16m active · 3 prompts · 1 compacts",
+   "CSR learned 4 · handed 2× · peak 120k"
+  ],
+  "detail": [
+   "After a compaction the context settled near 55k, the median of the last 1.",
+   "You last: “Run the importer tests”",
+   "Claude last: “All importer tests pass.”"
+  ],
+  "fit_body": true,
+  "key": "last:sess-prev",
+  "lines": 1,
+  "picture": {
+   "facts": {
+    "active": 960.0,
+    "asked": 0,
+    "compactions": [
+     [
+      1792308000.0,
+      175000,
+      55000
+     ]
+    ],
+    "compacts": 1,
+    "first": 1792305000.0,
+    "floor": 55000,
+    "handed": 2,
+    "id": "sess-prev",
+    "last": 1792309260.0,
+    "learned": 4,
+    "mtime": 0,
+    "path": "<HOME>/.claude/projects/fixture/sess-prev.jsonl",
+    "peak": 120000,
+    "prompt_times": [
+     1792305000.0,
+     1792306200.0,
+     1792309200.0
+    ],
+    "prompts": 3,
+    "said": [
+     1792309260.0,
+     "All importer tests pass."
+    ],
+    "series": [
+     [
+      1792305060.0,
+      30000
+     ],
+     [
+      1792306260.0,
+      80000
+     ],
+     [
+      1792307400.0,
+      120000
+     ],
+     [
+      1792308600.0,
+      55000
+     ],
+     [
+      1792309260.0,
+      70000
+     ]
+    ],
+    "title": "Tidy the importer tests",
+    "todos": [
+     {
+      "status": "in_progress",
+      "subject": "Run the importer tests"
+     },
+     {
+      "status": "pending",
+      "subject": "Update the changelog entry"
+     }
+    ],
+    "typed": [
+     1792309200.0,
+     "Run the importer tests"
+    ]
+   },
+   "rows": 4
+  },
+  "send": "Last session sess-pre (“Tidy the importer tests”): 16m active, 3 prompts, 1 compactions, last row 10-18 07:41. The rest of it: csr_reflect_on_past(\"conv_sess-prev\")",
+  "title": "Tidy the importer tests"
+ },
+ "24": {
+  "key": "todo:sess-pre:0",
+  "lines": 2,
+  "meta": "in progress · from sess-pre",
+  "send": "Left over from session sess-pre: “Run the importer tests” (in_progress).",
+  "title": "Run the importer tests"
+ },
+ "25": {
+  "heart": [
+   42,
+   46
+  ],
+  "key": "todo:sess-pre:0",
+  "lines": 2,
+  "meta": "in progress · from sess-pre",
+  "send": "Left over from session sess-pre: “Run the importer tests” (in_progress).",
+  "source": "todos",
+  "title": "Run the importer tests"
+ },
+ "28": {
+  "key": "view:info"
+ },
+ "29": {
+  "key": "legend",
+  "keys": [
+   [
+    1,
+    10,
+    "l"
+   ],
+   [
+    12,
+    18,
+    "i"
+   ],
+   [
+    20,
+    27,
+    "r"
+   ],
+   [
+    29,
+    36,
+    "q"
+   ]
+  ]
+ },
+ "3": {
+  "detail": [],
+  "key": "codex:week",
+  "lines": 1,
+  "nosend": true,
+  "quiet": true,
+  "send": "",
+  "title": "Codex week 41% · resets Thu 09:00 · 2 live",
+  "tone": null,
+  "unrated": true
+ },
+ "6": {
+  "body": [
+   "Dreamt: What if the importer kept every fixture bounded?",
+   "ANCHORS: 3 anchors retired by a1b2c3d · 2 earlier threads"
+  ],
+  "detail": [
+   "Dreamt: What if a failed run left its fixtures for inspection?",
+   "csr_reflect_on_past(\"importer fixtures\")"
+  ],
+  "heart": [
+   42,
+   46
+  ],
+  "key": "told:recap",
+  "like": "told:sess-fresh:1792319950.0",
+  "lines": 3,
+  "plain_body": true,
+  "send": "CSR's recap at the start of this session: recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests. The rest: csr_reflect_on_past(\"importer fixtures\")",
+  "source": "told",
+  "title": "recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests."
+ },
+ "7": {
+  "body": [
+   "Dreamt: What if the importer kept every fixture bounded?",
+   "ANCHORS: 3 anchors retired by a1b2c3d · 2 earlier threads"
+  ],
+  "detail": [
+   "Dreamt: What if a failed run left its fixtures for inspection?",
+   "csr_reflect_on_past(\"importer fixtures\")"
+  ],
+  "key": "told:recap",
+  "like": "told:sess-fresh:1792319950.0",
+  "lines": 3,
+  "plain_body": true,
+  "send": "CSR's recap at the start of this session: recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests. The rest: csr_reflect_on_past(\"importer fixtures\")",
+  "title": "recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests."
+ },
+ "8": {
+  "body": [
+   "Dreamt: What if the importer kept every fixture bounded?",
+   "ANCHORS: 3 anchors retired by a1b2c3d · 2 earlier threads"
+  ],
+  "detail": [
+   "Dreamt: What if a failed run left its fixtures for inspection?",
+   "csr_reflect_on_past(\"importer fixtures\")"
+  ],
+  "key": "told:recap",
+  "like": "told:sess-fresh:1792319950.0",
+  "lines": 3,
+  "plain_body": true,
+  "send": "CSR's recap at the start of this session: recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests. The rest: csr_reflect_on_past(\"importer fixtures\")",
+  "title": "recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests."
+ },
+ "9": {
+  "body": [
+   "Dreamt: What if the importer kept every fixture bounded?",
+   "ANCHORS: 3 anchors retired by a1b2c3d · 2 earlier threads"
+  ],
+  "detail": [
+   "Dreamt: What if a failed run left its fixtures for inspection?",
+   "csr_reflect_on_past(\"importer fixtures\")"
+  ],
+  "key": "told:recap",
+  "like": "told:sess-fresh:1792319950.0",
+  "lines": 3,
+  "plain_body": true,
+  "send": "CSR's recap at the start of this session: recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests. The rest: csr_reflect_on_past(\"importer fixtures\")",
+  "title": "recap [1h]: Tidy the importer tests: moved the fixtures. Settled: tests run offline (a1b2c3d). Now: 2 todos still open. Next: run the importer tests."
+ }
+}
