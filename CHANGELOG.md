@@ -447,7 +447,8 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - **Pane** beside the session: what the memory handed Claude, code that changed since your past sessions,
   "Lost and found" (threads a compaction summary carried once and then dropped), and the session story as csr-engine
   last told it. It reads the csr-engine database read-only
-  and makes no model call.
+  and makes no model call. When the main page has room left, it closes with what CSR can do there, leaving out what the page
+  already shows (acba87b9).
 - **Dreamer** (on by default; turn it off in `/config`): asks one "what if...?" when your past sessions give it a
   reason and slows down when it finds nothing. Before each look it checks that its spend, plus the last look's cost,
   stays within 1 token for every 10 Claude spends. That is a check, not a cap: a fork takes no token ceiling, so one
@@ -487,6 +488,17 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 ### Fixed
 
+- **Daemon dreams stalled for two days on a busy machine.** The nightly floor pass waited for 30 quiet minutes, and
+  parallel agents kept the machine busy, so the pass owed since 2026-10-19 03:00 never ran (last run 2026-10-18
+  13:05Z). An owed floor pass now runs after a grace (default 6 h past the 03:00 boundary,
+  `CSR_DREAM_FLOOR_GRACE_HOURS`, 1-168) even without a quiet window, and status no longer reports a deferral that will
+  not happen (80b661fd).
+- `history.jsonl` rows from the old Claude Code format (no `sessionId`, 575 rows from 2025-09/10) are skipped, not
+  counted as schema misses; a one-shot reconcile resets a counter that only legacy rows had raised (763374fe).
+- The detached SessionEnd child wrote its errors to `/dev/null`. It now appends them to
+  `~/.claude-self-reflect/logs/session-end-detached.log` (`0600`, rotated once at 1 MiB) and stays non-blocking
+  (093d1417). In-process hook tests no longer spawn the test binary as a detached engine child (a85afa8b).
+- `companion pane --json` printed `"dream_tokens_7d": -0.0` on an empty week; whole values print as integers (0a815888).
 - Code-graph worktree paths are canonical; 132 code_evolution and 384 code_nodes rows had throwaway keys
   (e0fe86f5). Re-extraction retires dropped symbols, never on an empty or partial parse (b939bac0, e64775ee,
   51ed42cb). csr_why's episode hop had resolved 0 of 665 links (43a635ab). `reflect_on_past` sinks resolved
@@ -542,6 +554,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 ### Known limitations
 
+- **Stop hook memory on very large transcripts.** Episode extraction reads the whole transcript and holds about 6x its
+  size: 1.42 GB max RSS on a 244 MB transcript, 486 MB on a 3.4 MB one (release build, 2026-10-20). Stop runs
+  detached, so the session does not wait; streaming extraction is planned.
 - **Headless settings.** `claude -p` children drop user settings unless those settings carry auth: `apiKeyHelper` or
   an `env` key such as `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK` or `..._VERTEX` keeps
   them. `CSR_HEADLESS_USER_SETTINGS=1` always keeps, `=0` always drops (bcea4a8a, 64e24d1e). Only key names are
