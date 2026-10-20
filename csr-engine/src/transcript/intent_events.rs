@@ -1619,22 +1619,26 @@ pub async fn extract_intent_events_after(
 /// Stop-hook extractor: read only bytes appended after the durable high-water
 /// mark. The carried user/assistant context is the minimum state needed to
 /// classify the first new user entry without reopening the old prefix.
+/// Reads at most `limit` bytes of the file, so a caller that took the
+/// transcript's length earlier sees no rows appended since.
 pub async fn extract_intent_events_incremental(
     transcript_path: &Path,
     session_id: &str,
     project: &str,
     embeddings: &Arc<EmbeddingEngine>,
     high_water: &IntentHighWater,
+    limit: u64,
 ) -> Result<IntentExtraction> {
     let mut state = high_water.clone();
-    let metadata = std::fs::metadata(transcript_path)?;
-    if state.byte_offset as u64 > metadata.len() {
+    let len = std::fs::metadata(transcript_path)?.len().min(limit);
+    if state.byte_offset as u64 > len {
         state = IntentHighWater::default();
     }
     let mut file = std::fs::File::open(transcript_path)?;
     file.seek(SeekFrom::Start(state.byte_offset as u64))?;
     let mut raw = String::new();
-    file.read_to_string(&mut raw)?;
+    file.take(len - state.byte_offset as u64)
+        .read_to_string(&mut raw)?;
     let sources = source_texts_tail(&raw, state.last_turn);
 
     let (classifiable, classifiable_turns) =

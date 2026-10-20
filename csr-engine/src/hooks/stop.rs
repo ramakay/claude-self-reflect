@@ -1491,6 +1491,7 @@ pub async fn extract_and_store_episode(
             project_name,
             engine.embeddings(),
             &high_water,
+            snapshot_len,
         )
         .await
         {
