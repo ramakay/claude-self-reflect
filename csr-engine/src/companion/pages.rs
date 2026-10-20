@@ -1158,7 +1158,49 @@ fn item_rows_mode(
     }
     rows
 }
+/// The lines that close a sparse main page: what CSR can do here, leaving out what the page
+/// already shows (a "told" card says what CSR handed Claude; a "changed" card lists the
+/// changes; a "lost" card lists the threads). None of them draws unless it fits in `room`.
+fn closer(page: &Value, width: usize, at: usize, room: usize) -> Vec<String> {
+    let shown = |name: &str| {
+        array(&page["sections"])
+            .iter()
+            .any(|s| s["name"] == name && !array(&s["items"]).is_empty())
+    };
+    let mut lines = vec![];
+    if !shown("told") {
+        lines.push("Ask about past work. CSR finds it.");
+    }
+    if !shown("changed") {
+        lines.push("Code changed? CSR warns Claude.");
+    }
+    if !shown("lost") {
+        lines.push("CSR keeps quiet threads. Press f.");
+    }
+    lines.push("Press l for changes. Press i for info.");
+    let lines: Vec<String> = lines
+        .into_iter()
+        .flat_map(|l| wrap(l, width.saturating_sub(at), 2))
+        .map(|l| format!("{}{}{l}{OFF}", " ".repeat(at), ink("faint")))
+        .collect();
+    // one blank row, then the lines: all of them or none, with a row to spare
+    if lines.len() + 2 <= room {
+        std::iter::once(String::new()).chain(lines).collect()
+    } else {
+        vec![]
+    }
+}
 pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
+    let mut out = draw_sections(page, cols, rows, ui);
+    if page["head"]["gauges"].is_object() {
+        let width = cols.saturating_sub(1).max(24);
+        let at = if ui["phone"] == true { 2 } else { 6 };
+        let room = rows.saturating_sub(out.rows.len());
+        out.put(closer(page, width, at, room), None);
+    }
+    out
+}
+fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     let width = cols.saturating_sub(1).max(24);
     let at = if ui["phone"] == true { 2 } else { 6 };
     let head = &page["head"];
@@ -1755,6 +1797,53 @@ pub fn lanes_legend(s: &Value, width: usize, dark: bool) -> String {
 #[cfg(test)]
 mod picture_tests {
     use super::*;
+    fn fresh() -> (Value, Value) {
+        let data = json!({"repo":"/fixture","dreams":[],"dreams_on":true});
+        let s = json!({"id":"fresh","turn_end":0,"last_session":null});
+        (data, s)
+    }
+    #[test]
+    fn a_sparse_main_page_closes_with_what_csr_can_do_when_there_is_room() {
+        let (data, s) = fresh();
+        let ui = json!({"rows":60});
+        let page = page_main(&data, &s, 1800000060., &ui, None);
+        let text = draw_page(&page, 60, 60, &ui)
+            .rows
+            .iter()
+            .map(|r| plain(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Ask about past work."), "{text}");
+        assert!(
+            text.contains("Press l for changes. Press i for info."),
+            "{text}"
+        );
+    }
+    #[test]
+    fn the_closer_does_not_draw_when_the_page_has_no_room_left() {
+        let (data, s) = fresh();
+        let ui = json!({"rows":8});
+        let page = page_main(&data, &s, 1800000060., &ui, None);
+        let text = draw_page(&page, 60, 8, &ui)
+            .rows
+            .iter()
+            .map(|r| plain(r))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("Ask about past work."), "{text}");
+    }
+    #[test]
+    fn the_closer_leaves_out_what_the_page_shows() {
+        let page = json!({"sections":[{"name":"told","items":[{"key":"k"}]}]});
+        let lines = closer(&page, 60, 6, 20)
+            .iter()
+            .map(|l| plain(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!lines.contains("Ask about past work."));
+        assert!(lines.contains("Press l for changes."));
+        assert!(closer(&page, 60, 6, 3).is_empty());
+    }
     #[test]
     fn last_session_picture_height_tracks_screen_rows() {
         let data = json!({"repo":"/fixture","dreams":[],"dreams_on":true});
