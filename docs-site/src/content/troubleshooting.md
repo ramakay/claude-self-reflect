@@ -48,12 +48,19 @@ macOS's bundled `sqlite3` can't load the FTS5 module, so it silently skips the `
 ## AI Narratives
 
 ### Unexpected charges
-API charges come from the Batch API narrator, which runs only when `ANTHROPIC_API_KEY` is set in the environment of the daemon or of the MCP server. To stop it:
+A charge can come from two places: the Batch API narrator, which calls the Anthropic API directly when `ANTHROPIC_API_KEY` is set in the environment of the daemon or of the MCP server, and any `claude -p` call, which is billed the way Claude Code is billed on your machine. A `claude -p` call bills an API key when one is in its environment or in a settings file that carries credentials. See [Privacy & Security](#/docs/privacy) for every caller and its switch.
+
+Unsetting a variable in one shell does not reach a process that is already running. A running MCP server and a running daemon keep the key they started with, and a launchd daemon takes its environment from its plist, not from your shell. To stop the charges:
+
+1. Remove `ANTHROPIC_API_KEY` from every place that supplies it: your shell profile, the `EnvironmentVariables` block of the daemon's plist if you run `scripts/launchd/com.ramakay.csr-engine.daemon.plist`, an `env` block for the MCP server in Claude Code's config, and an `env` block or `apiKeyHelper` in your Claude Code `settings.json`. If you passed `--anthropic-key` to `csr-engine setup`, also delete the line from `~/.claude-self-reflect/.env`.
+2. Restart the daemon. For the launchd daemon:
 ```bash
-pkill -f "csr-engine daemon"
-unset ANTHROPIC_API_KEY
+launchctl kickstart -k gui/$(id -u)/com.ramakay.csr-engine.daemon
 ```
-The other model calls go through `claude -p` and use your Claude Code login, not an API key. `CSR_NO_AI_NARRATIVES=1` stops the SessionStart briefing and the daemon narratives. Companion Dreams is a separate switch: turn off Dreams in `/config`. See [Privacy & Security](#/docs/privacy) for the full list.
+For a daemon you started by hand, stop it and start `csr-engine daemon` again from a shell that no longer has the key. To run a daemon with the Batch API narrator off whatever the environment holds, start it with `csr-engine daemon --no-ai`.
+3. Restart Claude Code, so it starts its MCP servers again without the key.
+
+`CSR_NO_AI_NARRATIVES=1` stops the briefing, the story calls, ratification and the dream commands. It does not stop the Batch API narrator. Companion Dreams is a separate switch: turn off Dreams in `/config`.
 
 ## Help
 

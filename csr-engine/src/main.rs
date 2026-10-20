@@ -1688,7 +1688,10 @@ async fn run(
             return Ok(());
         }
         let stats = if *dry_run {
-            let embeddings = std::sync::Arc::new(csr_engine::embeddings::EmbeddingEngine::new()?);
+            let embeddings = std::sync::Arc::new(
+                csr_engine::embeddings::EmbeddingEngine::new()?
+                    .with_probe_dir(args.db_path.parent().unwrap_or(std::path::Path::new("."))),
+            );
             csr_engine::transcript::intent_events::backfill_intent_events(
                 None,
                 &embeddings,
@@ -2030,6 +2033,12 @@ async fn run(
         let stdin_started = std::time::Instant::now();
         let input = csr_engine::hooks::read_stdin_json();
         let stdin_elapsed = stdin_started.elapsed();
+        // PostToolUse now fires for every Bash call. One that wrote no file has
+        // nothing to record: leave before the engine, the database and the
+        // transcript import are touched.
+        if csr_engine::hooks::post_tool_use::exits_before_engine(name, &input) {
+            return Ok(());
+        }
         let eng = {
             // Hook stdout is the injection channel. A stale or missing cache
             // makes `Engine::new` rebuild through hnsw_rs, which prints to

@@ -135,7 +135,7 @@ async fn the_section_follows_the_ledger_and_the_chunk_results() {
         conversation_id: "conv-1".into(),
         project_name: "p".into(),
         timestamp: "2026-10-01T00:00:00Z".into(),
-        content: "we looked at helperspy today".into(),
+        content: "we looked at helpers.py today".into(),
         message_count: 1,
         summary: None,
         author: crate::provenance::Speaker::User,
@@ -143,9 +143,9 @@ async fn the_section_follows_the_ledger_and_the_chunk_results() {
         is_sidechain: false,
     };
     storage.insert_chunk(&chunk, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-    // The chunk fallback is a keyword search that strips punctuation from the
-    // argument ("helpers.py" -> the word "helperspy"), so the chunk carries
-    // that word; the map resolves the same argument as a path suffix.
+    // The chunk fallback matches the path as a phrase of its tokens
+    // ("helpers py"), so a chunk that names the file is found; the map
+    // resolves the same argument as a path suffix.
     let out = by_file(&storage, "helpers.py", false).await;
     assert!(out.contains("conv-1"), "{out}");
     assert!(

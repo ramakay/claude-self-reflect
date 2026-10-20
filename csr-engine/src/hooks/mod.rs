@@ -6,6 +6,7 @@
 //! 3. Writes text to stdout (injected into Claude's context)
 //! 4. Exits with code 0 (never blocks the session)
 
+pub mod bash_writes;
 pub mod dream_match;
 pub mod exposure;
 pub mod install;
@@ -307,7 +308,9 @@ pub(crate) fn codemap_session_post_tool_use(input: &HookInput, engine: &Engine) 
     });
 }
 
-/// The file an Edit/Write/MultiEdit hook touched, as sent.
+/// The file an Edit/Write/MultiEdit hook touched, as sent; for a Bash call, the
+/// first file its command wrote (the rest are queued by the generic enqueue, and
+/// one queued file is enough to start the drain).
 fn edited_file(input: &HookInput) -> Option<std::path::PathBuf> {
     if post_tool_use::is_acted_on_tool(input.tool_name.as_deref()) {
         input
@@ -317,7 +320,7 @@ fn edited_file(input: &HookInput) -> Option<std::path::PathBuf> {
             .and_then(|v| v.as_str())
             .map(std::path::PathBuf::from)
     } else {
-        None
+        post_tool_use::bash_written_files(input).into_iter().next()
     }
 }
 
@@ -349,13 +352,16 @@ fn codemap_session_start_ordinary(input: &HookInput, engine: &Engine) {
         crate::codemap::identity::home_dir().as_deref(),
         crate::codemap::disabled(),
         crate::daemon::Daemon::daemon_lock_live(),
+        &crate::codemap::identity::temp_excluded,
         &crate::codemap::session::DetachedSpawner,
     );
 }
 
-/// PostToolUse after an edit in an ordinary git repo with no live daemon: start
-/// the detached drain (or the first scan). The edit itself is queued by the
-/// generic PostToolUse enqueue.
+/// PostToolUse after an edit in an ordinary git repo with no live daemon: queue
+/// the edit, then start the detached drain (its first full pass registers a repo
+/// the map does not know yet). The queue write comes first and before the slow
+/// transcript import, so the drain never starts on an empty queue. The generic
+/// PostToolUse enqueue later pushes the same path again; that is harmless.
 fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
     let Some(cwd) = ordinary_hook_cwd(input) else {
         return;
@@ -374,6 +380,7 @@ fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
             home.as_deref(),
             crate::codemap::disabled(),
             crate::daemon::Daemon::daemon_lock_live(),
+            &crate::codemap::identity::temp_excluded,
             crate::codemap::now_secs(),
             &crate::codemap::session::pid_alive,
             &crate::codemap::session::DetachedSpawner,

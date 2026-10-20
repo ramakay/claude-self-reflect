@@ -41,6 +41,10 @@ pub struct ViewListing {
     /// `<common>/worktrees/*` entries whose directory is gone (prunable), whose
     /// pointer is unreadable, or that sit in a protected folder.
     pub stale: usize,
+    /// Views dropped because their worktree root contains the home folder or a
+    /// protected folder (`contains_tcc_root`): a walk of such a root would be
+    /// offered `~/Documents` and the like. Not in `views`, never walked or watched.
+    pub excluded: usize,
 }
 
 /// HEAD and index-file facts for a view.
@@ -273,6 +277,75 @@ pub fn is_temp_path(path: &Path) -> bool {
     TEMP_ROOTS
         .iter()
         .any(|root| norm == Path::new(root) || norm.starts_with(root))
+}
+
+/// `CSR_CODEMAP_ALLOW_TEMP` as a value: `1` or `true` (any case) maps repos under
+/// a temp root on purpose. Anything else, or unset, keeps them out.
+pub fn allow_temp_from(v: Option<&str>) -> bool {
+    v.is_some_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true")
+    })
+}
+
+fn allow_temp() -> bool {
+    allow_temp_from(std::env::var("CSR_CODEMAP_ALLOW_TEMP").ok().as_deref())
+}
+
+/// A temp-root path that the map must not register: `is_temp_path`, unless
+/// `CSR_CODEMAP_ALLOW_TEMP=1` opts temp repos in. Lexical.
+pub fn temp_excluded(path: &Path) -> bool {
+    is_temp_path(path) && !allow_temp()
+}
+
+/// Is the home folder `root` itself or inside it? True for a worktree root that is
+/// the home folder (a dotfiles repo, `git init ~`) or an ancestor of it: a scan
+/// of such a view walks all of `$HOME`. `None` home: false. Lexical only.
+pub fn contains_home(root: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|h| normalize_lexical(h).starts_with(normalize_lexical(root)))
+}
+
+/// Is `root` a STRICT ancestor of a path `tcc_root_raw` would classify as protected?
+/// A walk that never follows symlinks can reach a protected folder only from such a
+/// root, and the walk crate opens a directory before any filter sees it, so a view
+/// rooted here must never be walked: `/`, `/Volumes`, `/Users`, `/Users/<x>`,
+/// `/Users/<x>/Library`, the home folder, `<home>/Library` and the ancestors of
+/// `home`, and the bare `/System`, `/System/Volumes`, `/System/Volumes/Data`
+/// firmlink prefixes. False for a protected folder itself and for anything inside
+/// one (`is_tcc_path`'s job), and for ordinary paths. Lexical, case-folded,
+/// firmlink-aware, and it ignores the session scope: a session child must not walk
+/// such a root either.
+pub fn contains_tcc_root(root: &Path, home: Option<&Path>) -> bool {
+    let norm = normalize_lexical(root);
+    let comps = lower_components(&norm);
+    // `/System`, `/System/Volumes`: the firmlink prefix on its way to `Data`.
+    const FIRMLINK: [&str; 4] = ["/", "system", "volumes", "data"];
+    if comps.len() >= 2 && comps.len() < 4 && comps.iter().zip(FIRMLINK).all(|(c, f)| c == f) {
+        return true;
+    }
+    let skip = firmlink_len(&comps);
+    let eff: Vec<&str> = std::iter::once("/")
+        .chain(comps.iter().skip(1 + skip).map(String::as_str))
+        .collect();
+    let n = eff.len();
+    if n == 1
+        || (n == 2 && (eff[1] == "volumes" || eff[1] == "users"))
+        || (n == 3 && eff[1] == "users")
+        || (n == 4 && eff[1] == "users" && eff[3] == "library")
+    {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    let h = lower_components(&normalize_lexical(home));
+    let hs = firmlink_len(&h);
+    let h: Vec<&str> = std::iter::once("/")
+        .chain(h.iter().skip(1 + hs).map(String::as_str))
+        .collect();
+    let hl = h.len();
+    // The home folder or one of its ancestors, or `<home>/Library`.
+    (n <= hl && eff[..] == h[..n]) || (n == hl + 1 && eff[..hl] == h[..] && eff[hl] == "library")
 }
 
 /// The error `refuse_if_protected` and `resolve_safe` return for a protected
@@ -729,6 +802,9 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
 
     match main_worktree_path(common_dir, home) {
         MainWorktree::Protected => listing.stale += 1,
+        // Checked before the first stat of the root: a main worktree that is the
+        // home folder is dropped, though a linked worktree below it may stay.
+        MainWorktree::Path(main) if contains_tcc_root(&main, home) => listing.excluded += 1,
         MainWorktree::Path(main) if main.is_dir() => {
             seen.insert(main.clone());
             listing.views.push(ViewId {
@@ -781,6 +857,10 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
             listing.stale += 1;
             continue;
         };
+        if contains_tcc_root(&wt, home) {
+            listing.excluded += 1;
+            continue;
+        }
         if !wt.is_dir() || resolve_safe(&pointer, home).is_err() || !seen.insert(wt.clone()) {
             listing.stale += 1;
             continue;
@@ -798,6 +878,14 @@ pub fn list_views_with(common_dir: &Path, home: Option<&Path>) -> Result<ViewLis
         });
     }
     Ok(listing)
+}
+
+/// A repo whose every view was dropped for containing the home folder or a
+/// protected folder (`ViewListing::excluded`): nothing of it may be registered,
+/// scanned or watched. False when it has any view left, or when it cannot be
+/// listed (the callers' other checks refuse a protected common dir).
+pub fn only_excluded_views(common_dir: &Path, home: Option<&Path>) -> bool {
+    list_views_with(common_dir, home).is_ok_and(|l| l.views.is_empty() && l.excluded > 0)
 }
 
 /// The one place a repository is opened with `gix` (`head_of` and
@@ -1058,6 +1146,157 @@ mod tests {
         assert!(is_temp_path(Path::new("/private/var/folders/ab")));
         assert!(!is_temp_path(Path::new("/Users/z/tmp/x")));
         assert!(!is_temp_path(Path::new("/tmpfoo/x")));
+    }
+
+    #[test]
+    fn allow_temp_reads_one_or_true_in_any_case_only() {
+        for yes in ["1", "true", "TRUE", "True", " 1 "] {
+            assert!(allow_temp_from(Some(yes)), "{yes:?}");
+        }
+        for no in ["0", "", "yes", "false", "2"] {
+            assert!(!allow_temp_from(Some(no)), "{no:?}");
+        }
+        assert!(!allow_temp_from(None));
+    }
+
+    #[test]
+    fn contains_home_is_true_for_home_and_its_ancestors_only() {
+        let home = Path::new("/Users/z");
+        let h = Some(home);
+        assert!(contains_home(Path::new("/Users/z"), h), "home itself");
+        assert!(contains_home(Path::new("/Users/z/"), h), "trailing slash");
+        assert!(contains_home(Path::new("/Users"), h), "an ancestor");
+        assert!(contains_home(Path::new("/"), h), "the root");
+        assert!(!contains_home(Path::new("/Users/y"), h), "a sibling");
+        assert!(!contains_home(Path::new("/Users/z/proj"), h), "a child");
+        assert!(!contains_home(Path::new("/Users/zz"), h), "a name prefix");
+        assert!(!contains_home(Path::new("/Users/z"), None), "no home");
+    }
+
+    #[test]
+    fn contains_tcc_root_is_true_for_strict_ancestors_of_protected_folders_only() {
+        let u = Some(Path::new("/Users/u"));
+        for yes in [
+            "/",
+            "/Users",
+            "/Users/u",
+            "/Users/u/",
+            "/Users/u/Library",
+            "/Users/other",
+            "/Volumes",
+            "/System",
+            "/System/Volumes",
+            "/System/Volumes/Data",
+            "/System/Volumes/Data/Users",
+            "/System/Volumes/Data/Users/u",
+            "/USERS/U",
+            "/users/u/LIBRARY",
+        ] {
+            assert!(contains_tcc_root(Path::new(yes), u), "{yes}");
+        }
+        for no in [
+            "/Users/u/projects/x",
+            "/Users/u/Documents",
+            "/Users/u/Documents/x",
+            "/Users/u/Library/Mobile Documents",
+            "/Users/u/Library/Caches",
+            "/Volumes/ext",
+            "/Volumes/ext/x",
+            "/private/tmp/x",
+            "/System/Library",
+            "/System/Volumes/Data/Users/u/Desktop",
+            "/Users/u/projects",
+        ] {
+            assert!(!contains_tcc_root(Path::new(no), u), "{no}");
+        }
+        // A home outside /Users: the folder, its Library and its ancestors.
+        let h = Some(Path::new("/private/tmp/h"));
+        for yes in ["/private/tmp/h", "/private/tmp/h/Library", "/private/tmp"] {
+            assert!(contains_tcc_root(Path::new(yes), h), "{yes}");
+        }
+        for no in [
+            "/private/tmp/x",
+            "/private/tmp/h/Documents",
+            "/private/tmp/h/proj",
+            "/private/tmp/h/Library/Caches",
+        ] {
+            assert!(!contains_tcc_root(Path::new(no), h), "{no}");
+        }
+        assert!(!contains_tcc_root(Path::new("/private/tmp/h"), None));
+    }
+
+    #[test]
+    fn contains_tcc_root_ignores_the_session_scope() {
+        let _scope = session_scope(
+            Path::new("/Users/u/Documents/p"),
+            Some(Path::new("/Users/u")),
+        );
+        assert!(contains_tcc_root(
+            Path::new("/Users/u"),
+            Some(Path::new("/Users/u"))
+        ));
+    }
+
+    #[test]
+    fn a_main_worktree_that_is_the_home_folder_is_excluded_but_its_linked_view_stays() {
+        let fx = Fx::new();
+        let home = Some(fx.home.as_path());
+        // `git init ~` with a linked worktree under it: the dotfiles door.
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        write(&fx.home, "rc.py", &py(&["rc"]));
+        fx.commit_all(&fx.home, "init");
+        let wt = fx.add_worktree(&fx.home, &fx.home.join("projects/dotfiles"), "dots");
+        let listing = list_views_with(&fx.home.join(".git"), home).unwrap();
+        assert_eq!(listing.excluded, 1, "the home view");
+        assert_eq!(listing.stale, 0);
+        assert_eq!(listing.views.len(), 1, "{:?}", listing.views);
+        assert_eq!(listing.views[0].worktree_path, wt);
+        assert!(!listing.views[0].is_main);
+        assert!(
+            !only_excluded_views(&fx.home.join(".git"), home),
+            "a view is left"
+        );
+
+        // The linked worktree gone: nothing of the repo may be mapped.
+        std::fs::remove_dir_all(&wt).unwrap();
+        let listing = list_views_with(&fx.home.join(".git"), home).unwrap();
+        assert!(listing.views.is_empty(), "{:?}", listing.views);
+        assert_eq!(listing.excluded, 1);
+        assert!(only_excluded_views(&fx.home.join(".git"), home));
+
+        // A control repo elsewhere keeps its main view.
+        let ctl = fx.init_repo("ctl");
+        write(&ctl, "a.py", &py(&["a"]));
+        fx.commit_all(&ctl, "init");
+        let listing = list_views_with(&ctl.join(".git"), home).unwrap();
+        assert_eq!((listing.views.len(), listing.excluded), (1, 0));
+        assert!(!only_excluded_views(&ctl.join(".git"), home));
+    }
+
+    #[test]
+    fn a_linked_worktree_that_contains_the_home_folder_is_excluded_too() {
+        let fx = Fx::new();
+        let home = Some(fx.home.as_path());
+        let main = fx.init_repo("a");
+        write(&main, "a.py", &py(&["alpha"]));
+        fx.commit_all(&main, "init");
+        fx.add_worktree(&main, &fx.root.join("a-wt"), "top");
+        // The linked worktree's pointer names the folder that holds the home folder.
+        let admin = std::fs::read_dir(main.join(".git/worktrees"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}/.git\n", fx.home.parent().unwrap().display()),
+        )
+        .unwrap();
+        let listing = list_views_with(&main.join(".git"), home).unwrap();
+        assert_eq!(listing.excluded, 1, "{listing:?}");
+        assert_eq!(listing.views.len(), 1, "only the main view");
+        assert_eq!(listing.views[0].worktree_path, main);
     }
 
     #[test]

@@ -1488,3 +1488,67 @@ fn record_signal_normalizes_the_cwd_lexically_and_skips_relative_and_disabled() 
     rec("/Users/nobody/Documents/proj", "post_tool_use", 200, false);
     assert_eq!(store::list_signals(&conn, 0).unwrap().len(), 2);
 }
+
+// ---- a view rooted above a protected folder never stats inside it ------------------------
+
+#[test]
+fn a_view_rooted_at_home_is_not_a_view_so_nothing_under_it_is_walked_or_mapped() {
+    let fx = Fx::new();
+    // `codemap scan --repo ~` on a dotfiles-style repo: the view would be rooted at
+    // home. The walk crate opens a directory before any filter sees it, so a walk
+    // rooted here would open `~/Documents`; the listing drops the view instead.
+    fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+    write(&fx.home, "src/a.py", &py(&["home_ok_fn"]));
+    write(&fx.home, "Documents/x.py", &py(&["docs_tracked_fn"]));
+    fx.commit_all(&fx.home, "init");
+    write(&fx.home, "Documents/y.py", &py(&["docs_untracked_fn"]));
+    write(&fx.home, "Desktop/z.py", &py(&["desk_untracked_fn"]));
+
+    let conn = db();
+    let report = scan_repo(&conn, &common_of(&fx.home), &opts(&fx)).unwrap();
+    assert!(report.views.is_empty(), "{:?}", report.views);
+    assert!(store::stored_views(&conn, None).unwrap().is_empty());
+    for name in [
+        "home_ok_fn",
+        "docs_tracked_fn",
+        "docs_untracked_fn",
+        "desk_untracked_fn",
+    ] {
+        assert!(hit_paths(&conn, name).is_empty(), "{name} was mapped");
+    }
+    // And the walk itself refuses such a root, whoever offers it.
+    let found = collect_walk(
+        &fx.home,
+        &common_of(&fx.home),
+        None,
+        Some(&fx.home),
+        |_| true,
+        100,
+        walk_visit_budget(100),
+    );
+    assert!(found.files.is_empty(), "{:?}", found.files);
+    assert_invariants(&conn);
+}
+
+#[test]
+fn a_session_scope_for_the_protected_folder_still_maps_the_repo_inside_it() {
+    let fx = Fx::new();
+    let repo = fx.home.join("Documents").join("proj");
+    std::fs::create_dir_all(&repo).unwrap();
+    fx.git(&repo, &["init", "-q", "-b", "main"]);
+    write(&repo, "src/a.py", &py(&["session_tracked_fn"]));
+    fx.commit_all(&repo, "init");
+    write(&repo, "src/new.py", &py(&["session_untracked_fn"]));
+
+    // What `scan --session` and `drain` hold on their one thread.
+    let _scope = identity::session_scope(&repo, Some(&fx.home));
+    let conn = db();
+    scan_repo(&conn, &common_of(&repo), &opts(&fx)).unwrap();
+    let paths: Vec<String> = rows(&conn, &repo).into_iter().map(|r| r.0).collect();
+    assert_eq!(paths, vec!["src/a.py", "src/new.py"], "{paths:?}");
+    assert_eq!(
+        hit_paths(&conn, "session_untracked_fn"),
+        vec!["src/new.py"],
+        "the sequential walk saw the session's scope"
+    );
+}

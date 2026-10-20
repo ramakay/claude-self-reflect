@@ -1030,6 +1030,10 @@ pub struct SourceCounts {
 pub struct AuxStatus {
     pub coverage: CoverageStats,
     pub file_history_sessions: usize,
+    /// The one-time replay of Bash-written files into file history: `done`,
+    /// `pending`, or `waiting_on_hook` (the installed PostToolUse hook does not
+    /// record Bash, so file history lacks Bash edits; run `hook install --apply`).
+    pub bash_file_history: &'static str,
     pub transcripts_unindexed: usize,
     pub schema_misses: SchemaMissCounts,
     pub sources: SourceCounts,
@@ -1152,7 +1156,14 @@ pub fn handle(
     deep: bool,
 ) -> Result<()> {
     // The statusline refresh is a hot path and prints none of the code map.
-    let report = gather_status_with(db_path, projects_dir, deep, !compact)?;
+    let report = gather_status_with(
+        db_path,
+        projects_dir,
+        deep,
+        !compact,
+        crate::binary_identity::default_run_dir().as_deref(),
+        crate::hooks::install::default_settings_path().as_deref(),
+    )?;
 
     if swiftbar {
         print_swiftbar(&report);
@@ -1182,7 +1193,8 @@ pub fn handle(
 /// and so it can never be truncated the way `grep -A3` on pretty JSON was
 /// (gap-G2 review finding 3).
 pub fn handle_stale() -> Result<()> {
-    for line in format_stale_processes(&gather_stale_processes()) {
+    let run_dir = crate::binary_identity::default_run_dir();
+    for line in format_stale_processes(&gather_stale_processes(run_dir.as_deref())) {
         println!("{line}");
     }
     Ok(())
@@ -1223,14 +1235,12 @@ pub fn gather_status_public(db_path: &Path, projects_dir: &Path) -> Result<Statu
 /// unreadable current identity (can't resolve `current_exe`) or a missing
 /// run dir (nothing has ever registered) both report no stale processes
 /// rather than erroring the whole status gather.
-fn gather_stale_processes() -> Vec<crate::binary_identity::StaleProcess> {
-    let (Some(current), Some(run_dir)) = (
-        crate::binary_identity::current_exe_identity(),
-        crate::binary_identity::default_run_dir(),
-    ) else {
+fn gather_stale_processes(run_dir: Option<&Path>) -> Vec<crate::binary_identity::StaleProcess> {
+    let (Some(current), Some(run_dir)) = (crate::binary_identity::current_exe_identity(), run_dir)
+    else {
         return Vec::new();
     };
-    crate::binary_identity::stale_processes(&run_dir, &current)
+    crate::binary_identity::stale_processes(run_dir, &current)
 }
 
 /// True when any live MCP stdio server is running a superseded binary (gap-G2
@@ -1240,18 +1250,30 @@ fn mcp_binary_stale_from(stale: &[crate::binary_identity::StaleProcess]) -> bool
     stale.iter().any(|p| p.role == "mcp_stdio")
 }
 
-/// Gather status data from SQLite and disk.
+/// Gather status data from SQLite and disk. The process registry is the
+/// installation's own run directory.
 fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
-    gather_status_with(db_path, projects_dir, deep, true)
+    gather_status_with(
+        db_path,
+        projects_dir,
+        deep,
+        true,
+        crate::binary_identity::default_run_dir().as_deref(),
+        crate::hooks::install::default_settings_path().as_deref(),
+    )
 }
 
-/// [`gather_status`] with the code map block switchable: `--compact` passes
-/// `false` and gets the default block without touching the code map tables.
+/// [`gather_status`] with the code map block switchable (`--compact` passes
+/// `false` and gets the default block without touching the code map tables)
+/// and the process registry's run directory and Claude Code settings file
+/// passed in, so a test reads its own and never the installation's.
 fn gather_status_with(
     db_path: &Path,
     projects_dir: &Path,
     deep: bool,
     with_codemap: bool,
+    run_dir: Option<&Path>,
+    settings: Option<&Path>,
 ) -> Result<StatusReport> {
     let now = chrono::Utc::now();
     let dreaming = dream_state::read_active_marker(now).map(|marker| DreamingView {
@@ -1259,10 +1281,10 @@ fn gather_status_with(
     });
     // Count total JSONL files on disk
     let total_jsonl = count_jsonl_files(projects_dir);
-    let stale_processes = gather_stale_processes();
+    let stale_processes = gather_stale_processes(run_dir);
     let mcp_binary_stale = mcp_binary_stale_from(&stale_processes);
-    let mcp_servers = crate::binary_identity::default_run_dir()
-        .map(|run_dir| crate::binary_identity::live_mcp_servers(&run_dir))
+    let mcp_servers = run_dir
+        .map(crate::binary_identity::live_mcp_servers)
         .unwrap_or_default();
     let maintenance = db_path.parent().and_then(crate::maintenance::active);
 
@@ -1419,7 +1441,7 @@ fn gather_status_with(
         }
     }
 
-    let aux = gather_aux(&storage, projects_dir);
+    let aux = gather_aux(&storage, projects_dir, settings);
     let dream = gather_dream(&storage);
     let dream_threads = gather_dream_threads(&storage);
     let memory_registry = gather_memory_registry(&storage);
@@ -2031,7 +2053,7 @@ fn gather_journal_server() -> DreamServerStatus {
 }
 
 /// Assemble aux coverage / file-history / transcript gap stats. Fail-soft to zeros.
-fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
+fn gather_aux(storage: &Storage, projects_dir: &Path, settings: Option<&Path>) -> AuxStatus {
     let (seen, imported, gap) = storage.coverage_stats().unwrap_or((0, 0, 0));
     let claude_dir = projects_dir.parent();
 
@@ -2082,6 +2104,9 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
             gap,
         },
         file_history_sessions,
+        bash_file_history: settings.map_or("waiting_on_hook", |settings| {
+            import::coedit_backfill::bash_replay_state(storage, settings)
+        }),
         transcripts_unindexed,
         schema_misses,
         sources: SourceCounts {
@@ -2208,7 +2233,10 @@ fn print_swiftbar(report: &StatusReport) {
     } else {
         "⚠️"
     };
-    let focus = read_current_focus().unwrap_or_default();
+    let focus = Path::new(&report.db_path)
+        .parent()
+        .and_then(read_current_focus)
+        .unwrap_or_default();
     if focus.is_empty() {
         println!("{} {}c {}r", icon, report.chunks, report.reflections);
     } else {
@@ -2315,11 +2343,10 @@ fn print_swiftbar(report: &StatusReport) {
     );
 }
 
-/// Read the current focus file written by session_start hook.
+/// Read the current focus file the session_start hook writes beside the database.
 /// Strips framing prefixes like "[project] SESSION CONTINUITY..." to extract clean focus.
-fn read_current_focus() -> Option<String> {
-    let home = dirs::home_dir()?;
-    let path = home.join(".claude-self-reflect").join("current-focus.txt");
+fn read_current_focus(data_dir: &Path) -> Option<String> {
+    let path = data_dir.join("current-focus.txt");
     let content = std::fs::read_to_string(&path).ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -2491,9 +2518,37 @@ fn format_dreaming_elapsed(elapsed_secs: u64) -> String {
 #[cfg(test)]
 mod codemap_tests;
 
+/// The run directory a status test reads: beside its database, never the
+/// installation's `~/.claude-self-reflect/run` (whose dead-pid records
+/// `stale_processes` deletes).
+#[cfg(test)]
+fn test_run_dir(db_path: &Path) -> std::path::PathBuf {
+    db_path.with_file_name("status-test-run")
+}
+
+/// The Claude Code settings file a status test reads: beside its database,
+/// never the installation's `~/.claude/settings.json`.
+#[cfg(test)]
+fn test_settings(db_path: &Path) -> std::path::PathBuf {
+    db_path.with_file_name("status-test-settings.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shadows the production `gather_status` for every test in this module:
+    /// the same gather over the test's own run directory.
+    fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
+        gather_status_with(
+            db_path,
+            projects_dir,
+            deep,
+            true,
+            Some(&test_run_dir(db_path)),
+            Some(&test_settings(db_path)),
+        )
+    }
 
     // --- gap-G2 review findings 2/3: `status --stale`'s output format is
     // the contract both installers depend on (`pid <n> (<role>, started
@@ -3474,6 +3529,8 @@ mod tests {
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
         assert_eq!(report.aux.coverage, CoverageStats::default());
         assert_eq!(report.aux.file_history_sessions, 0);
+        // No settings file beside the test database: the hook does not record Bash yet.
+        assert_eq!(report.aux.bash_file_history, "waiting_on_hook");
         assert_eq!(report.aux.transcripts_unindexed, 0);
     }
 

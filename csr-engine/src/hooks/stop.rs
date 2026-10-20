@@ -1778,17 +1778,16 @@ fn write_rolling_summary(input: &HookInput, engine: &Engine, cwd: &Path) -> Resu
 
     // Write rolling summary to a well-known file that SessionStart can read.
     // Simpler than the reflection system — no embeddings needed, just text.
-    if let Some(home) = dirs::home_dir() {
-        let dir = home.join(".claude-self-reflect");
-        // S-1 fix: sanitize project_name to prevent directory traversal
-        let safe_name: String = project_name
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-            .take(255)
-            .collect();
-        let path = dir.join(format!("rolling-summary-{}.txt", safe_name));
-        let _ = std::fs::write(&path, &summary);
-    }
+    // S-1 fix: sanitize project_name to prevent directory traversal
+    let safe_name: String = project_name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .take(255)
+        .collect();
+    let path = engine
+        .data_dir()
+        .join(format!("rolling-summary-{}.txt", safe_name));
+    let _ = std::fs::write(&path, &summary);
 
     Ok(())
 }

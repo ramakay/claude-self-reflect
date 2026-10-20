@@ -144,9 +144,23 @@ impl Engine {
 
     /// Hooks proxy to a configured daemon and never rebuild a missing cache.
     pub fn new_for_hook(db_path: &Path, projects_dir: &Path) -> Result<Self> {
+        Self::new_for_hook_with_home(
+            db_path,
+            projects_dir,
+            crate::search::vector_ipc::launchd_home().as_deref(),
+        )
+    }
+
+    /// [`Self::new_for_hook`] looking for the daemon's launchd job under
+    /// `home` (None: nowhere).
+    pub fn new_for_hook_with_home(
+        db_path: &Path,
+        projects_dir: &Path,
+        home: Option<&Path>,
+    ) -> Result<Self> {
         // Acquire before even probing the daemon: hooks do nothing during maintenance.
         let _operation = crate::maintenance::shared(db_path.parent().unwrap_or(Path::new(".")))?;
-        if let Some(engine) = Self::new_proxied(db_path, projects_dir)? {
+        if let Some(engine) = Self::new_proxied_with_home(db_path, projects_dir, home)? {
             return Ok(engine);
         }
         Self::new_with_persistence(db_path, projects_dir, false, None)
@@ -175,7 +189,8 @@ impl Engine {
         let t_storage = t0.elapsed();
 
         tracing::info!("initializing embedding engine");
-        let mut embeddings = Arc::new(EmbeddingEngine::new()?);
+        let data_dir = db_path.parent().unwrap_or(Path::new("."));
+        let mut embeddings = Arc::new(EmbeddingEngine::new()?.with_probe_dir(data_dir));
         let t_embed = t0.elapsed();
 
         // Compute index cache directory alongside the database
@@ -237,7 +252,7 @@ impl Engine {
             startup_backfill = (loaded.chunks_added, loaded.reflections_added);
             loaded.search
         } else if !persist {
-            embeddings = Arc::new(EmbeddingEngine::disabled());
+            embeddings = Arc::new(EmbeddingEngine::disabled().with_probe_dir(data_dir));
             SearchEngine::new(16)
         } else {
             // Cache miss — rebuild from SQLite vectors, streaming in bounded
@@ -356,13 +371,27 @@ impl Engine {
     /// daemon; while it does not answer, they answer keyword-only (see
     /// `mcp::CsrServer`) and try the daemon again on every call.
     pub fn new_proxied(db_path: &Path, projects_dir: &Path) -> Result<Option<Self>> {
+        Self::new_proxied_with_home(
+            db_path,
+            projects_dir,
+            crate::search::vector_ipc::launchd_home().as_deref(),
+        )
+    }
+
+    /// [`Self::new_proxied`] looking for the daemon's launchd job under
+    /// `home` (None: nowhere).
+    pub fn new_proxied_with_home(
+        db_path: &Path,
+        projects_dir: &Path,
+        home: Option<&Path>,
+    ) -> Result<Option<Self>> {
         use crate::search::vector_ipc::{
             daemon_configured_for_database, VectorClient, VectorProxy,
         };
         let Some(data_dir) = db_path.parent() else {
             return Ok(None);
         };
-        if !daemon_configured_for_database(db_path) {
+        if !daemon_configured_for_database(db_path, home) {
             return Ok(None);
         }
         let Some(client) = VectorClient::for_database(db_path) else {
@@ -373,7 +402,9 @@ impl Engine {
         tracing::info!("daemon configured: MCP vector search and embedding go to the daemon");
         Ok(Some(Self {
             storage,
-            embeddings: Arc::new(EmbeddingEngine::with_remote(proxy.clone())),
+            embeddings: Arc::new(
+                EmbeddingEngine::with_remote(proxy.clone()).with_probe_dir(data_dir),
+            ),
             search: Arc::new(RwLock::new(SearchEngine::proxied(proxy))),
             projects_dir: projects_dir.to_path_buf(),
             index_dir: data_dir.join("index-v3"),
@@ -389,6 +420,14 @@ impl Engine {
         self.proxied
     }
 
+    /// Test seam: the same engine, marked as built by `new_proxied` (whose
+    /// in-memory index is empty by design).
+    #[cfg(test)]
+    pub(crate) fn proxied_for_test(mut self) -> Self {
+        self.proxied = true;
+        self
+    }
+
     /// Construct an engine for write-only hooks (precompact, session-end) that
     /// import a transcript but never search.
     ///
@@ -401,8 +440,9 @@ impl Engine {
     /// additive-backfill path in [`Engine::new`].
     pub fn new_import_only(db_path: &Path, projects_dir: &Path) -> Result<Self> {
         let storage = Arc::new(Storage::open(db_path)?);
-        let embeddings = Arc::new(EmbeddingEngine::new()?);
-        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index-v3");
+        let data_dir = db_path.parent().unwrap_or(Path::new("."));
+        let embeddings = Arc::new(EmbeddingEngine::new()?.with_probe_dir(data_dir));
+        let index_dir = data_dir.join("index-v3");
         // Imports persist vectors to SQLite without constructing a local graph.
         let search = SearchEngine::new(IMPORT_ONLY_INDEX_CAPACITY).for_hook();
         Ok(Self {

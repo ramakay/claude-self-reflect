@@ -1028,6 +1028,12 @@ impl Storage {
 
     // ─── Status queries ───
 
+    /// Is there any chunk or reflection in the database at all?
+    pub fn has_any_history(&self) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::has_any_history(&conn)
+    }
+
     pub fn count_conversations(&self) -> Result<usize> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::count_conversations(&conn)
@@ -1966,6 +1972,14 @@ impl Storage {
     pub fn code_evolution_id_exists(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::code_evolution_id_exists(&conn, id)
+    }
+
+    /// `(session_id, file_path, tool_name)` of every row the live hook wrote.
+    pub fn code_evolution_live_triples(
+        &self,
+    ) -> Result<std::collections::HashSet<(String, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::code_evolution_live_triples(&conn)
     }
 
     pub fn get_recent_code_evolution(

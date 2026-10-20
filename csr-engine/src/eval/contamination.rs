@@ -610,6 +610,12 @@ pub fn engine_outputs() -> Vec<Output> {
         session_start::format_empty_status(100, 7),
     ));
     out.push(output(
+        "empty-status-proxied",
+        "empty_status",
+        R::EmptyStatus,
+        session_start::NO_RECENT_SESSIONS_NOTE.to_string(),
+    ));
+    out.push(output(
         "no-history",
         "empty_status",
         R::EmptyStatus,

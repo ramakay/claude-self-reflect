@@ -4,6 +4,19 @@ use super::*;
 use crate::codemap::status::{CodemapStatus, RepoStatus, SkippedRepo, StatusTotals, ViewStatus};
 use crate::codemap::testutil::{map_fixture, scan_repo_into};
 
+/// Shadows the production `gather_status`: the same gather over the test's own
+/// run directory, never the installation's.
+fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<StatusReport> {
+    gather_status_with(
+        db_path,
+        projects_dir,
+        deep,
+        true,
+        Some(&test_run_dir(db_path)),
+        Some(&test_settings(db_path)),
+    )
+}
+
 fn view(scanned_at: Option<i64>, status: &str, truncated: bool) -> ViewStatus {
     ViewStatus {
         path: "/w/v".into(),
@@ -239,7 +252,15 @@ fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
     );
 
     // The statusline path never reads the map.
-    let compact = gather_status_with(&db_path, &projects_dir, false, false).unwrap();
+    let compact = gather_status_with(
+        &db_path,
+        &projects_dir,
+        false,
+        false,
+        Some(&test_run_dir(&db_path)),
+        Some(&test_settings(&db_path)),
+    )
+    .unwrap();
     assert_eq!(compact.codemap, CodemapStatusBlock::default());
 }
 

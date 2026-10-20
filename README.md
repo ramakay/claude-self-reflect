@@ -363,7 +363,7 @@ settled in 997 ms. The six shell hooks keep running underneath. Receipts and cav
 <details>
 <summary><strong>AI Narratives</strong> — optional 9.3x quality boost</summary>
 
-Transform raw conversations into rich, searchable narratives. Runs through `claude -p` with your Claude Code login, so no API key is needed. An `ANTHROPIC_API_KEY` is read only by the optional Batch API path.
+Transform raw conversations into rich, searchable narratives. The briefing and story calls run through `claude -p`, which signs in the way Claude Code does on your machine, so CSR needs no API key of its own. An `ANTHROPIC_API_KEY` is read directly only by the optional Batch API path (the daemon or the MCP server), and a `claude -p` call inherits a key that is in its environment.
 
 ```bash
 csr-engine daemon
@@ -381,7 +381,7 @@ csr-engine daemon
 > `csr-engine status` shows calls and tokens spent today; cache read/creation tokens (often
 > the majority of real usage) are tracked separately in the status JSON (`cache_tokens_today` /
 > `cache_tokens_total`). Disable anytime with
-> `CSR_NO_AI_NARRATIVES=1`; pin a model with `CSR_NARRATIVE_MODEL=<model>`.
+> `CSR_NO_AI_NARRATIVES=1` (this does not stop the Batch API path); pin a model with `CSR_NARRATIVE_MODEL=<model>`.
 
 </details>
 

@@ -32,8 +32,9 @@
 //! daemon (setup never starts one), so with NO live daemon the session maps an
 //! ordinary repo the same way, through the same two children
 //! (`on_session_start_ordinary`, `on_post_tool_use_ordinary`). A live daemon
-//! keeps ownership: the hooks do nothing there. The scan child registers such a
-//! repo with source `signal`, as the daemon would.
+//! keeps ownership: the hooks do nothing there. The scan child (and a drain's first
+//! full pass, for a repo the first edit meets before any SessionStart scan)
+//! registers such a repo with source `signal`, as the daemon would.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -52,8 +53,11 @@ pub const LOCK_STALE_SECS: i64 = 600;
 /// How long a `drain` waits for further edits before it rescans (`--debounce`).
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(5);
 
-/// A `drain` ends after this long even if edits keep arriving: the next hook
-/// starts a new one, and the lock goes stale at ten minutes.
+/// How long a `drain` works on one lock stamp. It bounds the stamp, not the drain:
+/// past this a pass that did work goes through the same exit sequence as an idle one
+/// (`release_and_recheck`), so rows queued meanwhile are never stranded; a drain
+/// that retakes the lock starts a fresh stamp and carries on. The limit sits below
+/// `LOCK_STALE_SECS`, so a lock held by a live drain never goes stale.
 pub const DRAIN_MAX: Duration = Duration::from_secs(9 * 60);
 
 /// Starts the detached children. A trait so tests assert the argv instead of
@@ -317,9 +321,11 @@ pub fn release_and_recheck(
     }
 }
 
-/// Test-only seam: a closure run by `cli::drain` right after a pass found
-/// nothing, before it releases its lock, so a test can queue an edit in the
-/// window the exit sequence has to cover. Thread-local.
+/// Test-only seams, run by `cli::drain` while it still holds its lock, so a test
+/// can queue an edit in the window the exit sequence has to cover. Thread-local.
+/// `after_idle` runs right after a pass found nothing; `before_handoff` runs just
+/// before the shared `release_and_recheck`, whether the pass was idle or at the
+/// time limit.
 #[cfg(test)]
 pub(crate) mod test_hooks {
     use std::cell::RefCell;
@@ -328,6 +334,7 @@ pub(crate) mod test_hooks {
 
     thread_local! {
         static AFTER_IDLE: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        static BEFORE_HANDOFF: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn set_after_idle(hook: impl FnMut() + 'static) {
@@ -337,6 +344,17 @@ pub(crate) mod test_hooks {
     pub(crate) fn after_idle() {
         // Taken out first so the hook may itself call back into this module.
         let hook = AFTER_IDLE.with(|h| h.borrow_mut().take());
+        if let Some(mut f) = hook {
+            f();
+        }
+    }
+
+    pub(crate) fn set_before_handoff(hook: impl FnMut() + 'static) {
+        BEFORE_HANDOFF.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn before_handoff() {
+        let hook = BEFORE_HANDOFF.with(|h| h.borrow_mut().take());
         if let Some(mut f) = hook {
             f();
         }
@@ -476,11 +494,25 @@ pub fn on_post_tool_use(
 /// map on, and no live daemon (`daemon_live`) to do it. The repo check walks up
 /// from `cwd`, which is safe: `identify_with` refuses a protected path before any
 /// filesystem call.
+///
+/// The daemon's drops apply too (`discover::resolve_signal`): the home folder
+/// itself, a cwd or repo under a temp root (`is_temp`; `CSR_CODEMAP_ALLOW_TEMP=1`
+/// lifts it), a repo whose worktree root is the home folder, a protected folder's
+/// ancestor (`identity::contains_tcc_root`), and a repo none of whose views survive
+/// that exclusion: a scan would walk all of `$HOME`. The last of these is NOT
+/// checked here (`identity::only_excluded_views` lists every worktree: a `read_dir`
+/// and a `read_to_string` per `.git/worktrees/*/gitdir`, which can block on a FIFO
+/// and grows with the worktree count, inside a synchronous hook). It is redundant:
+/// the cwd's own worktree is one of the views, and once `contains_tcc_root` passes
+/// for its root that view survives the exclusion, so the listing cannot come up
+/// empty for that reason alone. The detached child (`register_session_repo`) keeps
+/// the check.
 fn ordinary_repo_cwd(
     cwd: &Path,
     home: Option<&Path>,
     disabled: bool,
     daemon_live: bool,
+    is_temp: &dyn Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
     if disabled || daemon_live || !cwd.is_absolute() {
         return None;
@@ -489,7 +521,16 @@ fn ordinary_repo_cwd(
     if identity::protected_class(&cwd, home).is_some() {
         return None;
     }
-    identity::identify_with(&cwd, home).ok()?;
+    if home.is_some_and(|h| cwd == normalize_lexical(h)) || is_temp(&cwd) {
+        return None;
+    }
+    let id = identity::identify_with(&cwd, home).ok()?;
+    if is_temp(&id.common_dir)
+        || is_temp(&id.worktree_root)
+        || identity::contains_tcc_root(&id.worktree_root, home)
+    {
+        return None;
+    }
     Some(cwd)
 }
 
@@ -503,9 +544,10 @@ pub fn on_session_start_ordinary(
     home: Option<&Path>,
     disabled: bool,
     daemon_live: bool,
+    is_temp: &dyn Fn(&Path) -> bool,
     spawner: &dyn Spawner,
 ) -> Option<u32> {
-    let cwd = ordinary_repo_cwd(cwd, home, disabled, daemon_live)?;
+    let cwd = ordinary_repo_cwd(cwd, home, disabled, daemon_live, is_temp)?;
     match spawner.spawn(&scan_argv(db_path, &cwd)) {
         Ok(pid) => Some(pid),
         Err(e) => {
@@ -515,12 +557,14 @@ pub fn on_session_start_ordinary(
     }
 }
 
-/// PostToolUse after an edit in an ordinary git repo while no daemon runs. The
-/// generic hook has already queued the edited file (the daemon would have drained
-/// it), so this only starts the child: a detached `codemap drain` unless one is
-/// in flight, or, for a repo the map does not know yet (the SessionStart scan
-/// never ran), a detached `codemap scan --session` that registers it. One spawn
-/// per call at most, no retries.
+/// PostToolUse after an edit in an ordinary git repo while no daemon runs. Does
+/// the two things of the lock protocol in order (`release_and_recheck`): it
+/// ENQUEUES the edited file itself, then tries the session lock and spawns a
+/// detached `codemap drain` unless one is in flight. The drain, not a scan,
+/// serves a repo the map does not know yet too: its first full pass registers the
+/// repo. A repo that `codemap remove` tombstoned is left alone. One spawn per call
+/// at most, no retries. (The generic PostToolUse enqueue runs later and pushes the
+/// same path again; that is harmless, the newer stamp just earns one more pass.)
 #[allow(clippy::too_many_arguments)]
 pub fn on_post_tool_use_ordinary(
     conn: &Connection,
@@ -530,32 +574,37 @@ pub fn on_post_tool_use_ordinary(
     home: Option<&Path>,
     disabled: bool,
     daemon_live: bool,
+    is_temp: &dyn Fn(&Path) -> bool,
     now: i64,
     alive: &dyn Fn(u32) -> bool,
     spawner: &dyn Spawner,
 ) -> Drained {
     // The cheap gate first: most PostToolUse calls are not code edits.
-    if !edited.is_some_and(|p| p.is_absolute() && has_code_extension(p)) {
+    let Some(edited) = edited.filter(|p| p.is_absolute() && has_code_extension(p)) else {
         return Drained::NotQueued;
-    }
-    let Some(cwd) = ordinary_repo_cwd(cwd, home, disabled, daemon_live) else {
+    };
+    let Some(cwd) = ordinary_repo_cwd(cwd, home, disabled, daemon_live, is_temp) else {
         return Drained::NotProtected;
     };
     let Ok(id) = identity::identify_with(&cwd, home) else {
         return Drained::NotQueued;
     };
     let common = id.common_dir.to_string_lossy().to_string();
-    let known = super::store::list_repos(conn)
-        .map(|repos| repos.iter().any(|r| r.common_dir == common))
-        .unwrap_or(false);
-    if !known {
-        return match spawner.spawn(&scan_argv(db_path, &cwd)) {
-            Ok(pid) => Drained::Spawned(pid),
-            Err(e) => {
-                eprintln!("CSR: code map session scan not started (non-fatal): {e}");
-                Drained::Failed
-            }
-        };
+    // A `codemap remove` tombstone: no row, no child.
+    if super::store::list_repos(conn)
+        .map(|repos| repos.iter().any(|r| r.common_dir == common && !r.enabled))
+        .unwrap_or(false)
+    {
+        return Drained::NotQueued;
+    }
+    if !super::should_enqueue(edited, home) {
+        return Drained::NotQueued;
+    }
+    // Enqueue first, lock second: a drain that is about to exit rechecks the
+    // queue after releasing the lock and so sees this row.
+    if let Err(e) = super::with_hook_busy_timeout(conn, || super::enqueue(conn, edited)) {
+        eprintln!("CSR: code map session enqueue skipped (non-fatal): {e}");
+        return Drained::Failed;
     }
     let lock = match try_take(&lock_path(db_path, &cwd), now, alive) {
         Ok(Some(lock)) => lock,
@@ -586,6 +635,76 @@ pub fn rows_under(conn: &Connection, roots: &[PathBuf]) -> anyhow::Result<Vec<(S
     Ok(super::store::queue_read(conn)?
         .into_iter()
         .filter(|(p, _)| roots.iter().any(|r| Path::new(p).starts_with(r)))
+        .collect())
+}
+
+/// The queued rows THIS repo's drain owns, each with the path to rescan it by.
+///
+/// A row `(path, stamp)` is owned when
+///
+/// 1. `path` lies under one of `roots` (the repo's view roots), or else its parent
+///    resolves (`identity::resolve_safe`, never a stat inside a protected folder;
+///    a protected or failing resolve means "not owned") to a directory that does
+///    and the file name joined on lies under one: an edit made through a symlinked
+///    spelling (`/work/current -> /work/project`) still belongs to the repo; AND
+/// 2. the longest stored view of ANY repo that contains that path belongs to
+///    `common_dir`, or no stored view contains it. A repo nested inside this one
+///    keeps its rows: they are not this drain's to rescan, and this drain holds no
+///    lock on that repo.
+///
+/// The parent resolve is memoised per directory for the call. The third element
+/// is the path that matched (the resolved spelling when the raw one did not lie
+/// under a root): hand it, not the queued string, to the rescan.
+pub(super) fn owned_rows(
+    conn: &Connection,
+    common_dir: &str,
+    roots: &[PathBuf],
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<(String, i64, PathBuf)>> {
+    let views = super::store::stored_views(conn, None)?;
+    let mut resolved: std::collections::HashMap<PathBuf, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let under_roots = |p: &Path| roots.iter().any(|r| p.starts_with(r));
+    let mut out = Vec::new();
+    for (queued, stamp) in super::store::queue_read(conn)? {
+        let raw = PathBuf::from(&queued);
+        let matched = if under_roots(&raw) {
+            Some(raw)
+        } else {
+            let real = raw
+                .parent()
+                .zip(raw.file_name())
+                .and_then(|(parent, name)| {
+                    resolved
+                        .entry(parent.to_path_buf())
+                        .or_insert_with(|| identity::resolve_safe(parent, home).ok())
+                        .as_ref()
+                        .map(|p| p.join(name))
+                });
+            real.filter(|p| under_roots(p))
+        };
+        let Some(matched) = matched else {
+            continue;
+        };
+        let foreign = super::scan::longest_view_for(&views, &matched)
+            .is_some_and(|v| v.common_dir != common_dir);
+        if !foreign {
+            out.push((queued, stamp, matched));
+        }
+    }
+    Ok(out)
+}
+
+/// The queued `(path, stamp)` rows this repo's drain owns (see `owned_rows`).
+pub fn rows_owned(
+    conn: &Connection,
+    common_dir: &str,
+    roots: &[PathBuf],
+    home: Option<&Path>,
+) -> anyhow::Result<Vec<(String, i64)>> {
+    Ok(owned_rows(conn, common_dir, roots, home)?
+        .into_iter()
+        .map(|(p, s, _)| (p, s))
         .collect())
 }
 
@@ -1077,7 +1196,8 @@ mod tests {
         let repo = ordinary_repo(&f);
         let rec = Recorder::new();
         let cwd = repo.join("src");
-        let pid = on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &rec);
+        let pid =
+            on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &no_temp, &rec);
         assert_eq!(pid, Some(4242));
         let want = vec![
             "--db-path".to_string(),
@@ -1101,10 +1221,129 @@ mod tests {
         let repo = ordinary_repo(&f);
         let rec = Recorder::new();
         assert_eq!(
-            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, true, &rec),
+            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, true, &no_temp, &rec),
             None
         );
         assert!(rec.args().is_empty());
+    }
+
+    fn no_temp(_: &Path) -> bool {
+        false
+    }
+
+    fn always_temp(_: &Path) -> bool {
+        true
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_a_temp_cwd_and_maps_it_when_temp_is_allowed() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let rec = Recorder::new();
+        assert_eq!(
+            on_session_start_ordinary(
+                &repo,
+                &f.db,
+                Some(&f.home),
+                false,
+                false,
+                &always_temp,
+                &rec
+            ),
+            None
+        );
+        assert!(rec.args().is_empty(), "a temp repo is not mapped");
+        assert_eq!(
+            on_session_start_ordinary(&repo, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            Some(4242),
+            "with the temp rule off the same repo is mapped"
+        );
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_the_home_folder_and_a_repo_rooted_at_it() {
+        let f = fake();
+        let rec = Recorder::new();
+        // cwd is the home folder itself, git repo or not
+        std::fs::create_dir_all(f.home.join(".git")).unwrap();
+        assert_eq!(
+            on_session_start_ordinary(&f.home, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            None
+        );
+        // a dotfiles repo: `git init ~`, session in a subfolder of it
+        let sub = f.home.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            on_session_start_ordinary(&sub, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            None,
+            "the scan would walk all of $HOME"
+        );
+        assert!(rec.args().is_empty());
+        // the edit path obeys the same rule
+        let conn = db();
+        let out = on_post_tool_use_ordinary(
+            &conn,
+            &sub,
+            Some(&sub.join("a.rs")),
+            &f.db,
+            Some(&f.home),
+            false,
+            false,
+            &no_temp,
+            1,
+            &|_| true,
+            &rec,
+        );
+        assert_eq!(out, Drained::NotProtected);
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_session_start_skips_a_repo_whose_root_holds_the_home_folder() {
+        let f = fake();
+        let rec = Recorder::new();
+        // A .git above $HOME (`/` or `/Users`), the session outside $HOME: the
+        // repo root contains the home folder, so its scan would walk all of it.
+        let top = f.home.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        let cwd = top.join("data");
+        assert_eq!(
+            on_session_start_ordinary(&cwd, &f.db, Some(&f.home), false, false, &no_temp, &rec),
+            None
+        );
+        assert!(rec.args().is_empty());
+    }
+
+    #[test]
+    fn ordinary_session_start_in_a_linked_worktree_of_a_home_rooted_repo_maps_only_that_worktree() {
+        use crate::codemap::testutil::{py, write, Fx};
+        let fx = Fx::new();
+        let f = fake();
+        let rec = Recorder::new();
+        // `git init ~` with a linked worktree under it (a dotfiles repo): the
+        // session gate used to look only at the linked root and let it in, and the
+        // scan then walked the main worktree, all of $HOME.
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        write(&fx.home, "rc.py", &py(&["rc"]));
+        fx.commit_all(&fx.home, "init");
+        let wt = fx.add_worktree(&fx.home, &fx.home.join("projects/dotfiles"), "dots");
+        // The linked view survives; the home view is dropped by the listing.
+        assert_eq!(
+            on_session_start_ordinary(&wt, &f.db, Some(&fx.home), false, false, &no_temp, &rec),
+            Some(4242)
+        );
+        // A linked worktree rooted at the folder that holds Library/Mobile Documents
+        // and a main that is the home folder: no view is walkable.
+        let lib = fx.add_worktree(&fx.home, &fx.home.join("Library"), "lib");
+        assert_eq!(
+            on_session_start_ordinary(&lib, &f.db, Some(&fx.home), false, false, &no_temp, &rec),
+            None
+        );
+        assert_eq!(
+            rec.args().len(),
+            1,
+            "only the dotfiles worktree was spawned"
+        );
     }
 
     #[test]
@@ -1124,7 +1363,15 @@ mod tests {
             (protected, false),
             (f.home.clone(), false),
         ] {
-            let out = on_session_start_ordinary(&cwd, &f.db, Some(&f.home), disabled, false, &rec);
+            let out = on_session_start_ordinary(
+                &cwd,
+                &f.db,
+                Some(&f.home),
+                disabled,
+                false,
+                &no_temp,
+                &rec,
+            );
             assert_eq!(out, None, "{}", cwd.display());
         }
         assert!(rec.args().is_empty());
@@ -1147,6 +1394,7 @@ mod tests {
             Some(&f.home),
             false,
             daemon_live,
+            &no_temp,
             now,
             &|_| true,
             rec,
@@ -1154,28 +1402,119 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_post_tool_use_scans_an_unknown_repo_then_drains_a_known_one_once() {
+    fn ordinary_post_tool_use_drains_a_known_repo_once() {
         let f = fake();
         let repo = ordinary_repo(&f);
         let conn = db();
         let rec = Recorder::new();
-
-        // not registered yet: the first edit starts the session scan
-        let out = ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000);
-        assert_eq!(out, Drained::Spawned(4242));
-        assert_eq!(rec.args()[0][3], "scan");
-
-        // registered: the edit starts one drain, a second finds it in flight
         let common = repo.join(".git");
         store::upsert_repo(&conn, &common.to_string_lossy(), None, "signal", false).unwrap();
         let out = ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_001);
-        assert_eq!(out, Drained::Spawned(4243));
-        assert_eq!(rec.args()[1][3], "drain");
+        assert_eq!(out, Drained::Spawned(4242));
+        assert_eq!(rec.args()[0][3], "drain");
         assert_eq!(
             ordinary_edit(&f, &conn, &rec, "src/b.rs", false, 1_002),
             Drained::InFlight
         );
-        assert_eq!(rec.args().len(), 2, "no third spawn");
+        assert_eq!(rec.args().len(), 1, "no second spawn");
+    }
+
+    /// A spawner that looks at the queue at the moment the child would start.
+    struct QueueProbe<'a> {
+        conn: &'a Connection,
+        queued_at_spawn: RefCell<Vec<Vec<String>>>,
+        argv: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl Spawner for QueueProbe<'_> {
+        fn spawn(&self, argv: &[OsString]) -> std::io::Result<u32> {
+            let rows = store::queue_read(self.conn).unwrap();
+            self.queued_at_spawn
+                .borrow_mut()
+                .push(rows.into_iter().map(|(p, _)| p).collect());
+            self.argv.borrow_mut().push(
+                argv.iter()
+                    .map(|a| a.to_string_lossy().to_string())
+                    .collect(),
+            );
+            Ok(5000)
+        }
+    }
+
+    #[test]
+    fn the_edit_is_queued_before_the_drain_is_spawned() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let conn = db();
+        let probe = QueueProbe {
+            conn: &conn,
+            queued_at_spawn: RefCell::new(Vec::new()),
+            argv: RefCell::new(Vec::new()),
+        };
+        let out = on_post_tool_use_ordinary(
+            &conn,
+            &repo,
+            Some(&repo.join("src/a.rs")),
+            &f.db,
+            Some(&f.home),
+            false,
+            false,
+            &no_temp,
+            1_000,
+            &|_| true,
+            &probe,
+        );
+        assert_eq!(out, Drained::Spawned(5000));
+        let want = repo.join("src/a.rs").to_string_lossy().to_string();
+        assert_eq!(
+            *probe.queued_at_spawn.borrow(),
+            vec![vec![want]],
+            "the row was there when the child started"
+        );
+        assert_eq!(probe.argv.borrow()[0][3], "drain");
+        assert_eq!(
+            probe.argv.borrow()[0][5],
+            repo.to_string_lossy().to_string()
+        );
+    }
+
+    #[test]
+    fn a_burst_of_edits_in_an_unknown_repo_starts_one_drain_and_queues_every_row() {
+        let f = fake();
+        ordinary_repo(&f);
+        let conn = db();
+        let rec = Recorder::new();
+        // The repo is not registered: the drain argv, never the scan argv.
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000),
+            Drained::Spawned(4242)
+        );
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/b.rs", false, 1_001),
+            Drained::InFlight
+        );
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/c.rs", false, 1_002),
+            Drained::InFlight
+        );
+        assert_eq!(rec.args().len(), 1, "one child for the burst");
+        assert_eq!(rec.args()[0][3], "drain");
+        assert_eq!(store::queue_read(&conn).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_removed_repo_gets_no_row_and_no_child() {
+        let f = fake();
+        let repo = ordinary_repo(&f);
+        let conn = db();
+        let rec = Recorder::new();
+        store::disable_repo(&conn, &repo.join(".git").to_string_lossy(), None).unwrap();
+        assert_eq!(
+            ordinary_edit(&f, &conn, &rec, "src/a.rs", false, 1_000),
+            Drained::NotQueued
+        );
+        assert!(rec.args().is_empty());
+        assert!(store::queue_read(&conn).unwrap().is_empty());
     }
 
     #[test]

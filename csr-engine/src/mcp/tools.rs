@@ -2631,11 +2631,14 @@ pub(super) async fn search_by_file_with_map(
     // supported-language file with no definitions and no recorded edits is
     // indexed and legitimately empty. Report the real state so the caller can
     // tell a coverage gap from an honest absence.
-    let chunks: Vec<_> = storage
-        .fts5_search(file_path, limit, project)?
-        .into_iter()
-        .map(|(chunk, _, _)| chunk)
-        .collect();
+    // The path is matched as one phrase of its tokens (`csr engine src storage
+    // mod rs`), not as free-text words: those fold a path into a single token
+    // no chunk holds.
+    let hits = match crate::storage::queries::fts5_path_expr(file_path) {
+        Some(expr) => storage.fts5_search_expr(&expr, limit, project)?,
+        None => Vec::new(),
+    };
+    let chunks: Vec<_> = hits.into_iter().map(|(chunk, _, _)| chunk).collect();
     let notes = csr_text_notes(storage, &chunks);
     // CSR-text rows after the clean ones, order kept inside each group
     let (clean, csr): (Vec<_>, Vec<_>) = chunks
@@ -7342,6 +7345,35 @@ mod tests {
         let by_file = search_by_file(&storage, "libfile", 5, None).await.unwrap();
         assert!(by_file.contains("conv-csr"), "the row is kept: {by_file}");
         assert!(by_file.contains("[CSR text]"), "file search: {by_file}");
+    }
+
+    /// With no ledger for the file, the fallback finds a chunk that names the
+    /// path, and not one that only holds the path's words apart.
+    #[tokio::test]
+    async fn file_search_fallback_finds_a_chunk_that_names_a_slash_path() {
+        let storage = Arc::new(Storage::open_memory().unwrap());
+        let mut index = SearchEngine::new(8);
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "names-it",
+            "conv-names",
+            "changed csr-engine/src/storage/mod.rs to add a column",
+            [1.0, 0.0, 0.0, 0.0],
+        );
+        store_csr_text_chunk(
+            &storage,
+            &mut index,
+            "scattered",
+            "conv-scattered",
+            "the storage engine in src of csr, a mod for rs files",
+            [0.0, 1.0, 0.0, 0.0],
+        );
+        let out = search_by_file(&storage, "csr-engine/src/storage/mod.rs", 5, None)
+            .await
+            .unwrap();
+        assert!(out.contains("conv-names"), "{out}");
+        assert!(!out.contains("conv-scattered"), "{out}");
     }
 
     /// The file search fallback sinks a CSR-text row below the clean rows, order

@@ -224,6 +224,44 @@ pub async fn handle(
         }
     }
 
+    // File history for the files Bash calls wrote (`sed -i`, heredocs, short
+    // scripts), replayed once from the transcripts just imported; the daemon
+    // does the same for an install that never reruns setup. Meta-guarded, and
+    // gated on the same hook check as the daemon: step 3 just installed the
+    // hooks, but if that failed the replay waits rather than mark itself done
+    // while the live hook still skips Bash.
+    {
+        use crate::import::coedit_backfill::BashReplay;
+        let storage = eng.storage().clone();
+        let projects_root = projects_dir.to_path_buf();
+        let settings = crate::hooks::install::default_settings_path().unwrap_or_default();
+        match tokio::task::spawn_blocking(move || {
+            crate::import::coedit_backfill::backfill_coedit_once(
+                &storage,
+                &projects_root,
+                &settings,
+            )
+        })
+        .await
+        {
+            Ok(Ok(BashReplay::Ran(stats))) => {
+                let (_, inserted, _) = stats.totals();
+                eprintln!(
+                    "  File history: {} edits recorded from {} transcripts ({} already live)",
+                    inserted,
+                    stats.files_scanned,
+                    stats.already_live_total()
+                );
+            }
+            Ok(Ok(BashReplay::WaitingOnHook)) => eprintln!(
+                "  File history: waiting for the Bash hook (run: csr-engine hook install --apply)"
+            ),
+            Ok(Ok(BashReplay::Done)) => {}
+            Ok(Err(e)) => eprintln!("  Warning: file-history backfill failed: {e}"),
+            Err(e) => eprintln!("  Warning: file-history backfill failed: {e}"),
+        }
+    }
+
     // Step 5: Run enrichment
     eprintln!("[5/7] Running heuristic enrichment...");
     let (backfilled, enriched) = eng.backfill_and_enrich().await?;
@@ -346,7 +384,7 @@ fn incomplete_report(mcp: Option<&McpFailure>, hook_error: Option<&str>) -> Stri
     let mut out = String::new();
     if let Some(error) = hook_error {
         out.push_str(&format!(
-            "  Hooks are NOT installed: {error}\n  Automatic recall is inactive until they are. Run: csr-engine hook install --apply\n"
+            "  Hook install failed: {error}\n  Hooks from an earlier install, if any, are unchanged. Run: csr-engine hook install --apply\n"
         ));
     }
     if let Some(failure) = mcp {
@@ -368,9 +406,9 @@ fn incomplete_report(mcp: Option<&McpFailure>, hook_error: Option<&str>) -> Stri
 /// The short error `handle` returns for an incomplete setup (non-zero exit).
 fn incomplete_error(mcp_failed: bool, hooks_failed: bool) -> &'static str {
     match (mcp_failed, hooks_failed) {
-        (true, true) => "MCP server not registered and hooks not installed",
+        (true, true) => "MCP server not registered and hook install failed",
         (true, false) => "MCP server not registered",
-        _ => "hooks not installed",
+        _ => "hook install failed",
     }
 }
 
@@ -1826,11 +1864,13 @@ mod tests {
             "did not stop at the timeout: {waited:?}"
         );
         assert_failed_with_manual_lines(&outcome, "did not finish within");
-        let pid: i32 = std::fs::read_to_string(&fake.pid)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        // On a loaded machine the limit can pass before the shell runs its
+        // first line: then the kill hit the shell itself, and `wait` reaped it.
+        let pid: i32 = match std::fs::read_to_string(&fake.pid) {
+            Ok(s) => s.trim().parse().unwrap(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => panic!("{e}"),
+        };
         // SAFETY: signal 0 only probes for the pid's existence.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "child {pid} is still running after the timeout");
@@ -1867,12 +1907,14 @@ mod tests {
         assert_eq!(hook_install_step(|| Ok(())), None);
 
         let report = incomplete_report(None, carried.as_deref());
-        assert!(report.contains("Hooks are NOT installed: settings.json is not valid JSON"));
-        assert!(report.contains("Automatic recall is inactive"));
+        assert!(report.contains("Hook install failed: settings.json is not valid JSON"));
+        assert!(report.contains("Hooks from an earlier install, if any, are unchanged."));
+        assert!(!report.contains("NOT installed"), "{report}");
+        assert!(!report.contains("inactive"), "{report}");
         assert!(report.contains("csr-engine hook install --apply"));
         assert!(report.contains("MCP registration are done"), "{report}");
         // the same non-zero status the MCP failure path returns
-        assert_eq!(incomplete_error(false, true), "hooks not installed");
+        assert_eq!(incomplete_error(false, true), "hook install failed");
         assert_eq!(incomplete_error(true, false), "MCP server not registered");
     }
 
@@ -1883,15 +1925,15 @@ mod tests {
         assert!(
             only_mcp.starts_with("  Hooks and import are done. The MCP server is NOT registered:")
         );
-        assert!(!only_mcp.contains("Hooks are NOT installed"));
+        assert!(!only_mcp.contains("Hook install failed"));
 
         let both = incomplete_report(Some(&mcp), Some("disk full"));
-        assert!(both.contains("Hooks are NOT installed: disk full"));
+        assert!(both.contains("Hook install failed: disk full"));
         assert!(both.contains("  The import is done. The MCP server is NOT registered:"));
         assert!(!both.contains("Hooks and import are done"));
         assert_eq!(
             incomplete_error(true, true),
-            "MCP server not registered and hooks not installed"
+            "MCP server not registered and hook install failed"
         );
     }
 

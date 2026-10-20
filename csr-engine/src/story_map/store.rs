@@ -622,9 +622,11 @@ pub async fn record_story_map(
     if story_map_disabled() {
         return;
     }
-    if let Some(path) = super::likes::likes_path() {
-        super::likes::sync_likes(engine.storage(), project, &path);
-    }
+    super::likes::sync_likes(
+        engine.storage(),
+        project,
+        &super::likes::likes_path(engine.data_dir()),
+    );
     if shifts.is_empty() {
         return;
     }

@@ -123,16 +123,23 @@ pub(crate) fn write_heartbeat_for_database(db_path: &Path) {
 /// Whether a daemon is configured for `data_dir`: `CSR_NO_DAEMON_PROXY=1`
 /// says no; an explicit opt-in, matching launchd job, database heartbeat or
 /// verified ping/Busy reply says yes. Configuration survives outages and saturation.
-pub fn daemon_configured(data_dir: &Path) -> bool {
-    daemon_configured_for_database(&data_dir.join("csr-engine.db"))
+pub fn daemon_configured(data_dir: &Path, home: Option<&Path>) -> bool {
+    daemon_configured_for_database(&data_dir.join("csr-engine.db"), home)
 }
 
-pub(crate) fn daemon_configured_for_database(db_path: &Path) -> bool {
+/// The home folder whose `Library/LaunchAgents` names the daemon's database.
+pub(crate) fn launchd_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// [`daemon_configured`] for one database file. `home` is where the launchd
+/// job is looked up; production passes [`launchd_home`], a test passes its own
+/// folder or None.
+pub(crate) fn daemon_configured_for_database(db_path: &Path, home: Option<&Path>) -> bool {
     let set = |name: &str| std::env::var(name).is_ok_and(|v| v == "1" || v == "true");
-    let home = std::env::var_os("HOME").map(PathBuf::from);
     daemon_configured_with(
         db_path,
-        home.as_deref(),
+        home,
         set("CSR_NO_DAEMON_PROXY"),
         set("CSR_DAEMON_PROXY"),
         |db| {
@@ -1439,7 +1446,7 @@ mod tests {
         .unwrap();
 
         let daemon = TestDaemon::start(&db).await;
-        let proxied = Engine::new_proxied(&db, &projects)
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
             .unwrap()
             .expect("the daemon answers");
         assert!(proxied.is_proxied());
@@ -1498,7 +1505,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (db, projects) = seed(tmp.path());
         let daemon = TestDaemon::start(&db).await;
-        let proxied = Engine::new_proxied(&db, &projects).unwrap().unwrap();
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
+            .unwrap()
+            .unwrap();
         for round in 0..5 {
             let content = format!("stored then searched, round {round}");
             crate::mcp::tools::store_reflection_internal(
@@ -1554,7 +1563,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (db, projects) = seed(tmp.path());
         let daemon = TestDaemon::start(&db).await;
-        let proxied = Engine::new_proxied(&db, &projects).unwrap().unwrap();
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
+            .unwrap()
+            .unwrap();
         let proxy = proxied.search().read().await.proxy().unwrap().clone();
         proxy.set_timings(ProxyTimings {
             backoff_first: Duration::from_millis(50),
@@ -1605,7 +1616,7 @@ mod tests {
         // Started while the daemon is down (heartbeat fresh, no socket):
         // proxied all the same (finding #4).
         write_heartbeat(tmp.path());
-        let proxied = Engine::new_proxied(&db, &projects)
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
             .unwrap()
             .expect("configured");
         let proxy = proxied.search().read().await.proxy().unwrap().clone();
@@ -1848,7 +1859,9 @@ mod tests {
             "a fresh heartbeat does not require a ping"
         )));
         assert!(
-            Engine::new_proxied(&db, &projects).unwrap().is_some(),
+            Engine::new_proxied_with_home(&db, &projects, None)
+                .unwrap()
+                .is_some(),
             "socket absent is fine"
         );
         // Without durable configuration or a typed reply, an old heartbeat expires.
@@ -1941,10 +1954,11 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() + Duration::from_secs(3600))
             .unwrap();
-        assert!(daemon_configured(dir.path()));
-        let hook = Engine::new_for_hook(
+        assert!(daemon_configured(dir.path(), None));
+        let hook = Engine::new_for_hook_with_home(
             &dir.path().join("csr-engine.db"),
             &dir.path().join("projects"),
+            None,
         )
         .unwrap();
         assert!(hook.is_proxied());

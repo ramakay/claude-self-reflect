@@ -36,7 +36,7 @@ The code map reads your repos and stores the map in the local database. `CSR_NO_
 | CSR_CODEMAP_NO_WATCH | — | Set to `1` (or `true`) to turn off the file watcher and keep the poll and the hook queue |
 | CSR_CODEMAP_LOCK_WAIT_SECS | 30 | Seconds a scan waits for another scan of the same repo before it gives up |
 
-AI narratives run through the Claude Code CLI (`claude -p`) and your Claude Code login, so no API key is required. `ANTHROPIC_API_KEY` is read only by the optional Batch API narrator in the daemon.
+The briefing, story, ratification and dream calls run through the Claude Code CLI (`claude -p`), which signs in the way Claude Code does on your machine. `ANTHROPIC_API_KEY` is read directly only by the optional Batch API narrator, in the daemon or in the MCP server. A `claude -p` call also inherits a key that is in its environment.
 
 ## Database
 

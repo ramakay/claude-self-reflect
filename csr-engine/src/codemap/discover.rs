@@ -31,7 +31,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::identity::normalize_lexical;
-use super::identity::{identify_with, is_dir_safe, is_protected_error, is_tcc_path, is_temp_path};
+use super::identity::{
+    contains_tcc_root, identify_with, is_dir_safe, is_protected_error, is_tcc_path,
+    only_excluded_views, temp_excluded,
+};
 use super::store::{self, StoredRepo};
 
 pub const DEFAULT_MAX_REPOS: usize = 16;
@@ -126,7 +129,7 @@ pub fn discover_with(
         max_repos,
         active_hours,
         now_secs,
-        &is_temp_path,
+        &temp_excluded,
     )
 }
 
@@ -351,6 +354,7 @@ pub fn select_repos(
 }
 
 /// What a signal's cwd came to.
+#[derive(Debug)]
 enum Resolved {
     Repo(PathBuf),
     /// Why it maps nothing: `protected`, `home`, `temp`, `disabled`, `not-a-repo`
@@ -383,6 +387,14 @@ fn resolve_signal(
         Ok(id) => {
             if is_tcc_path(&id.common_dir, home_opt) || is_tcc_path(&id.worktree_root, home_opt) {
                 Resolved::Dropped("protected")
+            } else if contains_tcc_root(&id.worktree_root, home_opt)
+                || only_excluded_views(&id.common_dir, home_opt)
+            {
+                // A repo rooted at the home folder (or above, or at a folder that
+                // holds a protected one), or one whose every view is: a scan would
+                // walk all of $HOME. A repo with a linked worktree elsewhere keeps
+                // that view; `list_views_with` drops the others.
+                Resolved::Dropped("home")
             } else if is_temp(&id.common_dir) || is_temp(&id.worktree_root) {
                 Resolved::Dropped("temp")
             } else if tombstones.contains(&id.common_dir) {
@@ -632,6 +644,71 @@ mod tests {
         store::disable_repo(&conn, &repo.join(".git").to_string_lossy(), None).unwrap();
         assert!(discover_impl(&conn, &fx.home, Some(&env), 16, 24, NOW, &no_temp).is_empty());
         assert_eq!(status_of(&conn, &repo).0.as_deref(), Some("disabled"));
+    }
+
+    #[test]
+    fn a_repo_whose_root_holds_the_home_folder_is_dropped_as_home() {
+        let fx = Fx::new();
+        let conn = db();
+        // A repo whose worktree root is an ANCESTOR of the home folder (`/` or
+        // `/Users` with a .git): a session started outside $HOME but inside that
+        // repo would have the scan walk all of $HOME.
+        let top = fx.home.parent().unwrap().to_path_buf();
+        fx.git(&top, &["init", "-q", "-b", "main"]);
+        signal(&conn, &fx.root, "session_start", NOW - H);
+        assert!(run(&conn, &fx, None, 16, 24, NOW).is_empty());
+        assert_eq!(status_of(&conn, &fx.root).0.as_deref(), Some("home"));
+        let resolved = resolve_signal(&fx.root, &fx.home, &no_temp, &[]);
+        assert!(
+            matches!(resolved, Resolved::Dropped("home")),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_repo_rooted_at_the_home_folder_is_never_registered() {
+        let fx = Fx::new();
+        // `git init ~`: `identify_with` stops at $HOME, so the walk up from a
+        // subfolder never returns it ("not inside a git repository below $HOME").
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        let sub = fx.home.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let resolved = resolve_signal(&sub, &fx.home, &no_temp, &[]);
+        assert!(
+            matches!(resolved, Resolved::Dropped("not-a-repo")),
+            "{resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_home_rooted_repo_is_reached_through_its_linked_worktree_only_for_that_worktree() {
+        use crate::codemap::testutil::{py, write};
+        let fx = Fx::new();
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        write(&fx.home, "rc.py", &py(&["rc"]));
+        fx.commit_all(&fx.home, "init");
+        let wt = fx.add_worktree(&fx.home, &fx.home.join("projects/dotfiles"), "dots");
+        // The linked worktree is a view; the repo is registered for it alone
+        // (`list_views_with` drops the home view, so the scan never walks `$HOME`).
+        let resolved = resolve_signal(&wt, &fx.home, &no_temp, &[]);
+        assert!(matches!(resolved, Resolved::Repo(_)), "{resolved:?}");
+        let listing = crate::codemap::identity::list_views_with(
+            &fx.home.join(".git"),
+            Some(fx.home.as_path()),
+        )
+        .unwrap();
+        assert_eq!(
+            (listing.views.len(), listing.excluded),
+            (1, 1),
+            "{listing:?}"
+        );
+        // A linked worktree that is itself `<home>/Library`: nothing to walk.
+        let lib = fx.add_worktree(&fx.home, &fx.home.join("Library"), "lib");
+        let resolved = resolve_signal(&lib, &fx.home, &no_temp, &[]);
+        assert!(
+            matches!(resolved, Resolved::Dropped("home")),
+            "{resolved:?}"
+        );
     }
 
     #[test]

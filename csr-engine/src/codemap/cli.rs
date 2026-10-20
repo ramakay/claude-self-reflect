@@ -12,12 +12,16 @@ use anyhow::{bail, Context, Result};
 use super::discover::discover;
 use super::identity::{self, home_dir};
 use super::lock;
-use super::scan::{rescan_paths, scan_repo, view_changed, RepoScanReport, ScanOpts};
+use super::scan::{rescan_paths_with, scan_repo, view_changed, RepoScanReport, ScanOpts};
 use super::status::{repo_path, status_report, CodemapStatus};
 use super::store;
 use crate::storage::Storage;
 
 const NOT_INITIALISED: &str = "code map not initialised";
+
+/// Why a repo none of whose views survive the home/protected-folder exclusion is
+/// not registered.
+const EXCLUDED_REPO: &str = "not registered: every worktree of this repo contains the home folder or a macOS-protected folder, and a scan would walk it";
 
 fn disabled_notice() -> &'static str {
     "code map is disabled (CSR_NO_CODEMAP=1); nothing was done"
@@ -35,9 +39,10 @@ fn age(secs: i64) -> String {
 /// `codemap add <path>`: register a repo and list its views.
 pub fn add(db_path: &Path, path: &Path) -> Result<()> {
     let id = identity::identify(path)?;
-    let main = (id.common_dir.file_name().is_some_and(|n| n == ".git"))
-        .then(|| id.common_dir.parent().map(Path::to_path_buf))
-        .flatten();
+    if identity::only_excluded_views(&id.common_dir, home_dir().as_deref()) {
+        bail!("{}", EXCLUDED_REPO);
+    }
+    let main = main_path_of(&id.common_dir);
     let storage = Storage::open(db_path)?;
     storage.with_connection(|conn| {
         store::upsert_repo(
@@ -149,7 +154,53 @@ fn scan_locked<T>(
 enum SessionScan {
     /// The repo carries a `codemap remove` tombstone: nothing was written.
     Removed,
+    /// Every view of the repo contains the home folder or a protected folder:
+    /// nothing was registered or scanned.
+    Excluded,
     Done(RepoScanReport),
+}
+
+/// The main checkout of a repo whose common dir is `<main>/.git`.
+fn main_path_of(common_dir: &Path) -> Option<std::path::PathBuf> {
+    (common_dir.file_name().is_some_and(|n| n == ".git"))
+        .then(|| common_dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+/// Register a repo for a SESSION (`scan --session`, and a drain's first full pass):
+/// source `session` for a protected folder, `signal` otherwise, never forcing a
+/// tombstoned repo back on. For an ordinary repo it also resolves the session's
+/// signal row: that row keeps the repo active in `status` (and in a daemon that
+/// starts later), and only the daemon's poll would resolve it. Best effort.
+/// Call it under the repo lock, after the `repo_removed` check.
+///
+/// `Ok(false)` registers nothing: every view of the repo contains the home folder
+/// or a protected folder (`identity::only_excluded_views`), so no scan may walk it.
+fn register_session_repo(
+    conn: &rusqlite::Connection,
+    common_dir: &Path,
+    cwd: &Path,
+    protected: bool,
+    home: Option<&Path>,
+) -> Result<bool> {
+    if identity::only_excluded_views(common_dir, home) {
+        return Ok(false);
+    }
+    let common = common_dir.to_string_lossy().to_string();
+    let main = main_path_of(common_dir);
+    let source = if protected { "session" } else { "signal" };
+    store::upsert_repo(
+        conn,
+        &common,
+        main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
+        source,
+        false,
+    )?;
+    if !protected {
+        let cwd = identity::normalize_lexical(cwd);
+        let _ = store::signal_resolve(conn, &cwd.to_string_lossy(), Some(&common), "repo");
+    }
+    Ok(true)
 }
 
 /// Has `codemap remove` tombstoned this repo (a row with `enabled = 0`)?
@@ -193,15 +244,7 @@ pub fn scan(
         let protected = scope.as_ref().is_some_and(|s| s.root.is_some());
         let id = identity::identify(path)?;
         let common = id.common_dir.to_string_lossy().to_string();
-        let (source, force) = match (session, protected) {
-            (false, _) => ("cli", true),
-            (true, true) => ("session", false),
-            (true, false) => ("signal", false),
-        };
         let report = storage.with_connection(|conn| {
-            let main = (id.common_dir.file_name().is_some_and(|n| n == ".git"))
-                .then(|| id.common_dir.parent().map(Path::to_path_buf))
-                .flatten();
             scan_locked(db_path, &common, || {
                 // Under the repo lock, which `codemap remove` holds while it
                 // writes the tombstone: a check made before the lock could
@@ -209,29 +252,44 @@ pub fn scan(
                 if session && repo_removed(conn, &common)? {
                     return Ok(SessionScan::Removed);
                 }
-                store::upsert_repo(
-                    conn,
-                    &common,
-                    main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
-                    source,
-                    force,
-                )?;
-                let report = scan_repo(conn, &id.common_dir, &opts)?;
-                if session && !protected {
-                    // An ordinary repo mapped by a session, not by the daemon: the
-                    // session's signal row is what keeps the repo active in
-                    // `status` (and in a daemon that starts later), and only the
-                    // daemon's poll resolves it. Best effort.
-                    let cwd = identity::normalize_lexical(path);
-                    let _ =
-                        store::signal_resolve(conn, &cwd.to_string_lossy(), Some(&common), "repo");
+                if session {
+                    if !register_session_repo(
+                        conn,
+                        &id.common_dir,
+                        path,
+                        protected,
+                        home.as_deref(),
+                    )? {
+                        return Ok(SessionScan::Excluded);
+                    }
+                } else {
+                    if identity::only_excluded_views(&id.common_dir, home.as_deref()) {
+                        return Ok(SessionScan::Excluded);
+                    }
+                    let main = main_path_of(&id.common_dir);
+                    store::upsert_repo(
+                        conn,
+                        &common,
+                        main.as_deref().map(|m| m.to_string_lossy()).as_deref(),
+                        "cli",
+                        true,
+                    )?;
                 }
+                let report = scan_repo(conn, &id.common_dir, &opts)?;
                 Ok(SessionScan::Done(report))
             })
         })?;
         match report {
             Some(SessionScan::Removed) => {
                 let line = format!("scan skipped: {common} was removed with `codemap remove`");
+                if json {
+                    println!("{}", serde_json::json!({ "skipped": line }));
+                } else {
+                    println!("{line}");
+                }
+            }
+            Some(SessionScan::Excluded) => {
+                let line = format!("scan skipped: {common} {EXCLUDED_REPO}");
                 if json {
                     println!("{}", serde_json::json!({ "skipped": line }));
                 } else {
@@ -416,13 +474,24 @@ pub fn query(db_path: &Path, text: &str, json: bool, limit: usize) -> Result<()>
 /// Waits `debounce` so a burst of edits becomes one rescan, rescans the queued
 /// paths that lie in the repo's views, or the whole repo when HEAD or the index
 /// moved (or a worktree appeared or went), then repeats while new rows arrived, and
-/// exits. It ends after `session::DRAIN_MAX` whatever is queued: the next hook
-/// starts another.
+/// exits. After `session::DRAIN_MAX` on one lock stamp it hands off exactly as an
+/// idle drain does (`drain_with`), so no queued edit is stranded and the lock never
+/// ages past `LOCK_STALE_SECS` while held.
 ///
 /// On the way out it does not just remove its session lock file: it releases the
 /// lock and then looks at the queue again (`session::release_and_recheck`), so an
 /// edit queued while it was deciding to exit is never stranded.
 pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Result<()> {
+    drain_with(db_path, repo, debounce, super::session::DRAIN_MAX)
+}
+
+/// `drain` with the time limit as a parameter, so a test can reach it at once.
+fn drain_with(
+    db_path: &Path,
+    repo: &Path,
+    debounce: std::time::Duration,
+    max: std::time::Duration,
+) -> Result<()> {
     if super::disabled() {
         println!("{}", disabled_notice());
         return Ok(());
@@ -431,46 +500,66 @@ pub fn drain(db_path: &Path, repo: &Path, debounce: std::time::Duration) -> Resu
     // hand it over (see `release_and_recheck`).
     let mut hold = super::session::LockHold::new(super::session::lock_path(db_path, repo));
     let home = home_dir();
-    let _scope = identity::session_scope(repo, home.as_deref());
+    let scope = identity::session_scope(repo, home.as_deref());
+    let protected = scope.root.is_some();
     let id = identity::identify(repo)?;
     let storage = Storage::open(db_path)?;
-    let started = std::time::Instant::now();
+    let mut started = std::time::Instant::now();
     let mut passes = 0usize;
+    // The exit sequence, shared by an idle pass and a pass at the time limit.
+    let mut rows_left = || {
+        storage
+            .with_connection(|conn| {
+                let (_, live, stored) = view_roots(conn, &id.common_dir, home.as_deref())?;
+                let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+                let common = id.common_dir.to_string_lossy();
+                Ok(!super::session::rows_owned(conn, &common, &roots, home.as_deref())?.is_empty())
+            })
+            // Unknown counts as "rows left": better one more look.
+            .unwrap_or(true)
+    };
     loop {
         std::thread::sleep(debounce);
-        if started.elapsed() > super::session::DRAIN_MAX {
-            println!("drain: time limit after {passes} passes");
-            break;
-        }
-        match storage
-            .with_connection(|conn| drain_pass(conn, db_path, &id.common_dir, home.as_deref()))?
-        {
-            Pass::Worked => passes += 1,
+        let handoff = match storage.with_connection(|conn| {
+            drain_pass(
+                conn,
+                db_path,
+                &id.common_dir,
+                repo,
+                protected,
+                home.as_deref(),
+            )
+        })? {
             Pass::Removed => break,
             Pass::Idle => {
                 #[cfg(test)]
                 super::session::test_hooks::after_idle();
-                let mut rows_left = || {
-                    storage
-                        .with_connection(|conn| {
-                            let (_, live, stored) =
-                                view_roots(conn, &id.common_dir, home.as_deref())?;
-                            let roots: Vec<std::path::PathBuf> =
-                                live.union(&stored).map(Into::into).collect();
-                            Ok(!super::session::rows_under(conn, &roots)?.is_empty())
-                        })
-                        // Unknown counts as "rows left": better one more look.
-                        .unwrap_or(true)
-                };
-                match super::session::release_and_recheck(
-                    &mut hold,
-                    super::now_secs(),
-                    &super::session::pid_alive,
-                    &mut rows_left,
-                ) {
-                    super::session::Handoff::Continue => {}
-                    super::session::Handoff::Exit => break,
+                true
+            }
+            Pass::Worked => {
+                passes += 1;
+                let at_limit = started.elapsed() > max;
+                if at_limit {
+                    println!("drain: time limit after {passes} passes");
                 }
+                at_limit
+            }
+        };
+        if handoff {
+            #[cfg(test)]
+            super::session::test_hooks::before_handoff();
+            // At the limit exactly as when idle: release the lock, then look at the
+            // queue again. An edit queued during the last debounce saw our live
+            // lock, so its hook spawned nothing; the recheck finds its row.
+            match super::session::release_and_recheck(
+                &mut hold,
+                super::now_secs(),
+                &super::session::pid_alive,
+                &mut rows_left,
+            ) {
+                // The retaken lock carries a fresh start stamp.
+                super::session::Handoff::Continue => started = std::time::Instant::now(),
+                super::session::Handoff::Exit => break,
             }
         }
     }
@@ -516,11 +605,15 @@ fn view_roots(
     Ok((listing, live, stored))
 }
 
-/// One drain pass.
+/// One drain pass. `cwd` is the path the drain was started for and `protected`
+/// says whether it lies in a macOS-protected folder: a repo the map does not
+/// know yet is registered by the first full pass, as `scan --session` would.
 fn drain_pass(
     conn: &rusqlite::Connection,
     db_path: &Path,
     common: &Path,
+    cwd: &Path,
+    protected: bool,
     home: Option<&Path>,
 ) -> Result<Pass> {
     let common_str = common.to_string_lossy().to_string();
@@ -535,8 +628,10 @@ fn drain_pass(
         }
     }
     let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
-    let rows = super::session::rows_under(conn, &roots)?;
-    if rows.is_empty() && !changed {
+    // Only the rows this repo owns: not a nested repo's, and an edit made through
+    // a symlinked spelling of a root counts (see `session::owned_rows`).
+    let owned = super::session::owned_rows(conn, &common_str, &roots, home)?;
+    if owned.is_empty() && !changed {
         return Ok(Pass::Idle);
     }
     let held = lock::acquire(db_path, &common_str, lock::wait_from_env(), &|| false)?;
@@ -553,6 +648,15 @@ fn drain_pass(
         return Ok(Pass::Removed);
     }
     if changed {
+        // A repo the map has no row for (the first edit of a session with no
+        // daemon) is registered here, under the lock and after the tombstone check.
+        let known = store::list_repos(conn)?
+            .iter()
+            .any(|r| r.common_dir == common_str);
+        if !known && !register_session_repo(conn, common, cwd, protected, home)? {
+            println!("drain skipped: {common_str} {EXCLUDED_REPO}");
+            return Ok(Pass::Removed);
+        }
         let report = scan_repo(conn, common, &ScanOpts::default())?;
         println!(
             "drain: full scan {} views, {} defs written",
@@ -560,21 +664,51 @@ fn drain_pass(
             report.totals.defs_written
         );
     } else {
-        let paths: Vec<std::path::PathBuf> = rows
-            .iter()
-            .map(|(p, _)| std::path::PathBuf::from(p))
-            .collect();
-        let report = rescan_paths(conn, &paths)?;
+        let paths: Vec<std::path::PathBuf> = owned.iter().map(|(_, _, m)| m.clone()).collect();
+        // This repo's flock is already held: its paths may be rescanned. Any other
+        // repo's views are left alone (no lock on them).
+        let own = |c: &str| -> Option<Box<dyn std::any::Any>> {
+            (c == common_str).then(|| Box::new(()) as Box<dyn std::any::Any>)
+        };
+        let report = rescan_paths_with(conn, &paths, &own)?;
         println!(
             "drain: {} paths, {} updated, {} removed, {} unchanged",
             report.paths, report.updated, report.removed, report.unchanged
         );
     }
-    // Only the rows this pass saw: one re-enqueued meanwhile keeps its newer stamp.
-    for (p, at) in &rows {
-        store::queue_delete_upto(conn, p, *at)?;
-    }
+    ack_owned_rows(conn, common, home, &owned)?;
     Ok(Pass::Worked)
+}
+
+/// Delete the queue rows a drain pass handled, but only those this repo still
+/// owns. `before` is the pass's snapshot (`session::owned_rows`), taken before the
+/// repo lock and the scan. A nested repo may have stored its first view since: its
+/// scan could have read the file before the edit, so the row now belongs to that
+/// repo's drain (or the daemon's pump) and stays queued. The view roots and the
+/// owned rows are read again here for that reason.
+///
+/// Each delete is `queue_delete_upto(path, stamp)` with the snapshot's stamp: a row
+/// re-enqueued meanwhile keeps its newer stamp. Returns the rows deleted.
+fn ack_owned_rows(
+    conn: &rusqlite::Connection,
+    common: &Path,
+    home: Option<&Path>,
+    before: &[(String, i64, std::path::PathBuf)],
+) -> Result<usize> {
+    let (_, live, stored) = view_roots(conn, common, home)?;
+    let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+    let still_ours: std::collections::HashSet<String> =
+        super::session::owned_rows(conn, &common.to_string_lossy(), &roots, home)?
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+    let mut deleted = 0usize;
+    for (p, at, _) in before {
+        if still_ours.contains(p) {
+            deleted += store::queue_delete_upto(conn, p, *at)?;
+        }
+    }
+    Ok(deleted)
 }
 
 fn stamp() -> String {
@@ -683,6 +817,81 @@ mod tests {
         assert!(!lock.exists(), "the drain's lock goes on the way out");
     }
 
+    /// A repo whose main worktree is the fake home (`git init ~`), with a linked
+    /// worktree under it. Returns (common dir, linked worktree path).
+    fn home_rooted_repo(fx: &Fx) -> (std::path::PathBuf, std::path::PathBuf) {
+        fx.git(&fx.home, &["init", "-q", "-b", "main"]);
+        write(&fx.home, "rc.py", &py(&["rc"]));
+        fx.commit_all(&fx.home, "init");
+        let wt = fx.add_worktree(&fx.home, &fx.home.join("projects/dotfiles"), "dots");
+        (fx.home.join(".git"), wt)
+    }
+
+    #[test]
+    fn a_repo_none_of_whose_views_survive_the_home_exclusion_is_not_registered() {
+        let fx = Fx::new();
+        let (common, wt) = home_rooted_repo(&fx);
+        let conn = crate::codemap::testutil::db();
+        let home = Some(fx.home.as_path());
+
+        // The linked worktree is a view: registered, for that worktree alone.
+        assert!(register_session_repo(&conn, &common, &wt, false, home).unwrap());
+        assert_eq!(store::list_repos(&conn).unwrap().len(), 1);
+
+        // Its directory gone, only the home view is left, and it is excluded.
+        let conn = crate::codemap::testutil::db();
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!register_session_repo(&conn, &common, &fx.home, false, home).unwrap());
+        assert!(
+            store::list_repos(&conn).unwrap().is_empty(),
+            "no repo row for a repo with nothing to map"
+        );
+
+        // A control repo keeps registering.
+        let ctl = fx.init_repo("ctl");
+        write(&ctl, "a.py", &py(&["a"]));
+        fx.commit_all(&ctl, "init");
+        assert!(register_session_repo(&conn, &ctl.join(".git"), &ctl, false, home).unwrap());
+        assert_eq!(store::list_repos(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_full_scan_deletes_a_stored_view_that_contains_the_home_folder() {
+        let fx = Fx::new();
+        let (common, wt) = home_rooted_repo(&fx);
+        let conn = crate::codemap::testutil::db();
+        let common_str = common.to_string_lossy().to_string();
+        let home_str = fx.home.to_string_lossy().to_string();
+        // What a database written before the exclusion holds: a view for the home.
+        store::upsert_repo(&conn, &common_str, Some(&home_str), "signal", false).unwrap();
+        store::mark_view_error(
+            &conn,
+            &store::ViewWrite {
+                common_dir: &common_str,
+                worktree_path: &home_str,
+                branch: None,
+                head_oid: None,
+                index_mtime_ns: None,
+                index_size: None,
+                scanned_at: 1,
+                status: "ok",
+                truncated: false,
+                scan_ms: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(store::stored_views(&conn, None).unwrap().len(), 1);
+
+        scan_with_home(&conn, &fx, &fx.home);
+
+        let paths: Vec<String> = store::stored_views(&conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.worktree_path)
+            .collect();
+        assert_eq!(paths, [wt.to_string_lossy().to_string()], "{paths:?}");
+    }
+
     #[test]
     fn a_session_scan_of_an_ordinary_repo_registers_it_and_resolves_its_signal() {
         let fx = Fx::new();
@@ -706,6 +915,340 @@ mod tests {
         );
         assert_eq!(signals[0].status.as_deref(), Some("repo"));
         assert_eq!(defs_named(&db_path, "alpha"), 1);
+    }
+
+    #[test]
+    fn a_drain_of_an_unregistered_ordinary_repo_registers_maps_and_resolves_it() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                super::super::record_signal(conn, &repo, "post_tool_use")?;
+                // the edit the hook queued
+                super::super::enqueue(conn, &repo.join("a.py"))
+            })
+            .unwrap();
+        drop(storage);
+
+        drain(&db_path, &repo, std::time::Duration::ZERO).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let repos = store::list_repos(&conn).unwrap();
+        assert_eq!(repos.len(), 1, "the drain registered the repo");
+        assert_eq!(repos[0].source, "signal");
+        assert!(repos[0].enabled);
+        assert_eq!(defs_named(&db_path, "alpha"), 1, "and mapped its defs");
+        let signals = store::list_signals(&conn, 0).unwrap();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].status.as_deref(), Some("repo"));
+        assert_eq!(
+            signals[0].common_dir.as_deref(),
+            Some(repos[0].common_dir.as_str())
+        );
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    /// Scan a repo with the fixture's home, as the drain's repo already is.
+    fn scan_with_home(conn: &rusqlite::Connection, fx: &Fx, repo: &Path) {
+        scan_repo(
+            conn,
+            &repo.join(".git"),
+            &ScanOpts {
+                home: Some(fx.home.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn queued_paths(db_path: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        store::queue_read(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    #[test]
+    fn a_drain_pass_rescans_only_its_own_repo_and_leaves_a_nested_repos_row() {
+        let fx = Fx::new();
+        let a = fx.init_repo("a");
+        write(&a, "src/a.py", &py(&["alpha"]));
+        fx.commit_all(&a, "init a");
+        // B is a repo of its own, nested inside A's tree.
+        let b = a.join("inner");
+        std::fs::create_dir_all(&b).unwrap();
+        fx.git(&b, &["init", "-q", "-b", "main"]);
+        write(&b, "src/lib.py", &py(&["beta"]));
+        fx.commit_all(&b, "init b");
+        let b = std::fs::canonicalize(&b).unwrap();
+        let data = fx.home.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let db_path = data.join("csr-engine.db");
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &a);
+                scan_with_home(conn, &fx, &b);
+                // both files change, both edits are queued
+                write(&a, "src/a.py", &py(&["alpha", "alpha_new"]));
+                write(&b, "src/lib.py", &py(&["beta", "beta_new"]));
+                super::super::enqueue(conn, &b.join("src/lib.py"))?;
+                super::super::enqueue(conn, &a.join("src/a.py"))?;
+                Ok(())
+            })
+            .unwrap();
+
+        let pass = storage
+            .with_connection(|conn| {
+                drain_pass(conn, &db_path, &a.join(".git"), &a, false, Some(&fx.home))
+            })
+            .unwrap();
+
+        assert_eq!(pass, Pass::Worked);
+        assert_eq!(
+            defs_named(&db_path, "alpha_new"),
+            1,
+            "A's file was rescanned"
+        );
+        assert_eq!(defs_named(&db_path, "beta_new"), 0, "B's view is untouched");
+        assert_eq!(defs_named(&db_path, "beta"), 1);
+        assert_eq!(
+            queued_paths(&db_path),
+            vec![b.join("src/lib.py").to_string_lossy().to_string()],
+            "A's row is gone, B's stays for B's own drain"
+        );
+    }
+
+    /// A's snapshot of the rows it owns, as `drain_pass` takes it.
+    fn snapshot(
+        conn: &rusqlite::Connection,
+        fx: &Fx,
+        a: &Path,
+    ) -> Vec<(String, i64, std::path::PathBuf)> {
+        let home = Some(fx.home.as_path());
+        let (_, live, stored) = view_roots(conn, &a.join(".git"), home).unwrap();
+        let roots: Vec<std::path::PathBuf> = live.union(&stored).map(Into::into).collect();
+        session::owned_rows(conn, &a.join(".git").to_string_lossy(), &roots, home).unwrap()
+    }
+
+    #[test]
+    fn a_drain_keeps_the_row_of_a_nested_repo_that_stored_its_first_view_during_the_pass() {
+        let fx = Fx::new();
+        let a = fx.init_repo("a");
+        write(&a, "src/a.py", &py(&["alpha"]));
+        fx.commit_all(&a, "init a");
+        let b = a.join("inner");
+        std::fs::create_dir_all(&b).unwrap();
+        fx.git(&b, &["init", "-q", "-b", "main"]);
+        write(&b, "src/lib.py", &py(&["beta"]));
+        fx.commit_all(&b, "init b");
+        let b = std::fs::canonicalize(&b).unwrap();
+        let conn = crate::codemap::testutil::db();
+        let home = Some(fx.home.as_path());
+        scan_with_home(&conn, &fx, &a);
+        let (pa, pb) = (a.join("src/a.py"), b.join("src/lib.py"));
+        let (pa, pb) = (
+            pa.to_string_lossy().to_string(),
+            pb.to_string_lossy().to_string(),
+        );
+        store::queue_push(&conn, &pa, 10).unwrap();
+        store::queue_push(&conn, &pb, 10).unwrap();
+
+        // A's snapshot: B has no stored view yet, so B's file lies in A's view.
+        let before = snapshot(&conn, &fx, &a);
+        let mut owned: Vec<&str> = before.iter().map(|(p, _, _)| p.as_str()).collect();
+        owned.sort();
+        let mut want = vec![pa.as_str(), pb.as_str()];
+        want.sort();
+        assert_eq!(owned, want, "both rows are A's at snapshot time");
+
+        // While A's pass runs, B stores its first view (its scan may have read the
+        // file before the edit).
+        scan_with_home(&conn, &fx, &b);
+
+        let deleted = ack_owned_rows(&conn, &a.join(".git"), home, &before).unwrap();
+        assert_eq!(deleted, 1);
+        let left: Vec<String> = store::queue_read(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            left,
+            [pb],
+            "B's row stays for B's drain; A's own row is gone"
+        );
+    }
+
+    #[test]
+    fn a_drain_at_its_time_limit_hands_off_its_queue_instead_of_dropping_it() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &repo);
+                Ok(())
+            })
+            .unwrap();
+        let lock = session::lock_path(&db_path, &repo);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let held = session::try_take(&lock, super::super::now_secs(), &session::pid_alive)
+            .unwrap()
+            .expect("lock is free");
+        held.set_pid(std::process::id(), super::super::now_secs());
+        // The edit a hook queued during the drain's last debounce: it saw the live
+        // lock above, so its child exited and nothing else will ever map it.
+        write(&repo, "a.py", &py(&["alpha", "delta_last"]));
+        storage
+            .with_connection(|conn| super::super::enqueue(conn, &repo.join("a.py")))
+            .unwrap();
+        drop(storage);
+
+        // What a hook does during the first pass's handoff: the file changes, the
+        // row is queued, and the lock is still ours, so the hook spawns nothing.
+        let (r, d) = (repo.clone(), db_path.clone());
+        test_hooks::set_before_handoff(move || {
+            write(&r, "a.py", &py(&["alpha", "delta_last", "epsilon_late"]));
+            let conn = rusqlite::Connection::open(&d).unwrap();
+            super::super::enqueue(&conn, &r.join("a.py")).unwrap();
+        });
+
+        // A zero limit: the time check fires on the first pass.
+        drain_with(
+            &db_path,
+            &repo,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+
+        assert_eq!(
+            defs_named(&db_path, "delta_last"),
+            1,
+            "the last edit was mapped, not dropped"
+        );
+        assert_eq!(
+            defs_named(&db_path, "epsilon_late"),
+            1,
+            "the edit queued during the at-limit handoff was mapped by the same drain"
+        );
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert!(
+            store::queue_read(&conn).unwrap().is_empty(),
+            "the queue row is gone"
+        );
+        assert!(!lock.exists(), "the session lock file was released");
+    }
+
+    #[test]
+    fn a_drain_keeps_a_row_enqueued_again_after_its_snapshot() {
+        let fx = Fx::new();
+        let a = fx.init_repo("a");
+        write(&a, "src/a.py", &py(&["alpha"]));
+        fx.commit_all(&a, "init a");
+        let conn = crate::codemap::testutil::db();
+        let home = Some(fx.home.as_path());
+        scan_with_home(&conn, &fx, &a);
+        let pa = a.join("src/a.py").to_string_lossy().to_string();
+        store::queue_push(&conn, &pa, 10).unwrap();
+        let before = snapshot(&conn, &fx, &a);
+        assert_eq!(before.len(), 1);
+
+        // The hook queued the same file again with a newer stamp.
+        store::queue_push(&conn, &pa, 20).unwrap();
+        assert_eq!(
+            ack_owned_rows(&conn, &a.join(".git"), home, &before).unwrap(),
+            0
+        );
+        assert_eq!(store::queue_read(&conn).unwrap(), [(pa.clone(), 20)]);
+
+        // A row at the snapshot's stamp is deleted.
+        let conn = crate::codemap::testutil::db();
+        scan_with_home(&conn, &fx, &a);
+        store::queue_push(&conn, &pa, 10).unwrap();
+        let before = snapshot(&conn, &fx, &a);
+        assert_eq!(
+            ack_owned_rows(&conn, &a.join(".git"), home, &before).unwrap(),
+            1
+        );
+        assert!(store::queue_read(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_drain_pass_applies_an_edit_queued_through_a_symlinked_spelling_of_the_repo() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let alias = fx.root.join("alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &repo);
+                write(&repo, "a.py", &py(&["alpha", "via_alias"]));
+                super::super::enqueue(conn, &alias.join("a.py"))
+            })
+            .unwrap();
+
+        let pass = storage
+            .with_connection(|conn| {
+                drain_pass(
+                    conn,
+                    &db_path,
+                    &repo.join(".git"),
+                    &repo,
+                    false,
+                    Some(&fx.home),
+                )
+            })
+            .unwrap();
+
+        assert_eq!(pass, Pass::Worked);
+        assert_eq!(defs_named(&db_path, "via_alias"), 1);
+        assert!(queued_paths(&db_path).is_empty(), "the row is deleted");
+    }
+
+    #[test]
+    fn a_row_whose_parent_is_a_link_into_a_protected_folder_is_not_owned() {
+        let fx = Fx::new();
+        let (repo, db_path) = repo_with_db(&fx);
+        let desktop = fx.home.join("Desktop");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let link = fx.root.join("deskalias");
+        std::os::unix::fs::symlink(&desktop, &link).unwrap();
+        let storage = Storage::open(&db_path).unwrap();
+        storage
+            .with_connection(|conn| {
+                scan_with_home(conn, &fx, &repo);
+                super::super::enqueue(conn, &link.join("x.py"))
+            })
+            .unwrap();
+        let (pass, owned) = storage
+            .with_connection(|conn| {
+                let roots = vec![repo.clone()];
+                let owned = session::rows_owned(
+                    conn,
+                    &repo.join(".git").to_string_lossy(),
+                    &roots,
+                    Some(&fx.home),
+                )?;
+                let pass = drain_pass(
+                    conn,
+                    &db_path,
+                    &repo.join(".git"),
+                    &repo,
+                    false,
+                    Some(&fx.home),
+                )?;
+                Ok((pass, owned))
+            })
+            .unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(pass, Pass::Idle, "nothing to do, and no failure");
+        assert_eq!(queued_paths(&db_path).len(), 1, "the row is left alone");
     }
 
     #[test]
@@ -745,7 +1288,9 @@ mod tests {
             .unwrap();
 
         let pass = storage
-            .with_connection(|conn| drain_pass(conn, &db_path, &common, Some(&fx.home)))
+            .with_connection(|conn| {
+                drain_pass(conn, &db_path, &common, &repo, false, Some(&fx.home))
+            })
             .unwrap();
 
         assert_eq!(pass, Pass::Removed);

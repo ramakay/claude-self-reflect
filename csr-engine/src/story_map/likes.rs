@@ -92,13 +92,10 @@ struct RawLikeLine {
     liked: Option<bool>,
 }
 
-/// Path to the companion pane's likes log: `$HOME/.claude-self-reflect/csr-companion/likes.jsonl`.
-pub fn likes_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".claude-self-reflect")
-            .join("csr-companion")
-            .join("likes.jsonl")
-    })
+/// Path to the companion pane's likes log: `csr-companion/likes.jsonl` in the
+/// engine's data directory (`~/.claude-self-reflect` for the installed database).
+pub fn likes_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("csr-companion").join("likes.jsonl")
 }
 
 fn prefs_meta_key(project: &str) -> String {

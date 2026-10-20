@@ -22,6 +22,10 @@ pub struct EmbeddingEngine {
     /// An MCP server of a configured daemon embeds there and never loads the
     /// model itself (see `search::vector_ipc`).
     remote: Option<std::sync::Arc<crate::search::vector_ipc::VectorProxy>>,
+    /// The data directory the classifier probe caches live in. Unset for an
+    /// engine built without a database (tests), which then builds its probes
+    /// in memory and never touches the disk.
+    probe_dir: Option<std::path::PathBuf>,
 }
 
 /// Serializes first-run model downloads within this process. Concurrent
@@ -88,6 +92,7 @@ impl EmbeddingEngine {
             disabled: false,
             model: Mutex::new(None),
             remote: None,
+            probe_dir: None,
         })
     }
 
@@ -97,6 +102,7 @@ impl EmbeddingEngine {
             disabled: true,
             model: Mutex::new(None),
             remote: None,
+            probe_dir: None,
         }
     }
 
@@ -106,6 +112,37 @@ impl EmbeddingEngine {
             disabled: false,
             model: Mutex::new(None),
             remote: Some(proxy),
+            probe_dir: None,
+        }
+    }
+
+    /// The same engine, with its classifier probe caches kept in `dir`: the
+    /// data directory of the database the engine was opened for.
+    pub fn with_probe_dir(mut self, dir: &std::path::Path) -> Self {
+        self.probe_dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// Where the probe cache named `file` lives, or None when this engine has
+    /// no data directory.
+    pub fn probe_cache_path(&self, file: &str) -> Option<std::path::PathBuf> {
+        self.probe_dir.as_ref().map(|dir| dir.join(file))
+    }
+
+    /// Replace the probe cache `file` in one rename, so a hook reading it
+    /// while another process writes sees the old or the new bytes, never a
+    /// half-written file. Best effort: a failed write leaves the cache absent
+    /// and the next call rebuilds it.
+    pub fn write_probe_cache(&self, file: &str, bytes: &[u8]) {
+        let Some(path) = self.probe_cache_path(file) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
