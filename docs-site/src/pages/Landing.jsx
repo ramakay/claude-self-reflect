@@ -209,7 +209,7 @@ function ImportBatchChart() {
 
 function BinaryDiagram() {
   return (
-    <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is forty four megabytes">
+    <svg className="binary-diagram" viewBox="0 0 150 150" role="img" aria-label="Single binary size is seventy eight megabytes">
       <circle cx="75" cy="75" r="58" fill="rgba(246,230,169,0.20)" stroke="rgba(26,26,46,0.62)" strokeWidth="2.4" />
       <circle cx="75" cy="75" r="45" fill="none" stroke="rgba(26,26,46,0.13)" strokeDasharray="4 6" />
       <text x="75" y="72" textAnchor="middle" className="binary-diagram__metric">78MB</text>
