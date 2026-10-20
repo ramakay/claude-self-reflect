@@ -1,6 +1,5 @@
-//! The frame around the main page: the value row, the gauge strip, column mode, the window on a tall page and
-//! the reload countdown, drawn and clicked through `Pane::frame`, `Pane::key` and `Pane::click` over the rich
-//! HOME of tests/companion_frame.rs (its goldens come from pane.py's own `Pane.frame`).
+//! Layout, reflow, legend actions and in-place navigation through the real Instrument frame.
+//! Narrow goldens share the complete Pane::frame scenarios in companion_frame.rs.
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
 use serde_json::Value;
 use std::{
@@ -146,181 +145,149 @@ fn act_key(pane: &Pane, row: usize) -> String {
 }
 
 #[test]
-fn the_value_row_sits_above_the_legend_and_a_click_on_it_opens_the_info_page() {
+fn the_context_click_toggles_the_figure_on_the_single_surface() {
     let (_home, mut pane) = pane(100, 40);
     let lines = pane.frame(100, 40, NOW);
     assert_eq!(lines.len(), 40);
-    assert_eq!(
-        plain(&lines[38]),
-        " Fuel ≈4.7% · Haiku 4 · Dreams 2 · Took 2 · ♥ 2"
-    );
+    assert!(!lines.iter().any(|l| plain(l).contains("Fuel")));
     assert!(plain(&lines[39]).contains("q close"));
-    assert_eq!(act_key(&pane, 38), "view:info");
-    assert_eq!(act_key(&pane, 39), "legend");
-    assert!(pane.click(38, 5, NOW));
-    assert_eq!(pane.view, "info");
-    // the i page has no value row: its cost section says the same in words
-    let info = pane.frame(100, 40, NOW);
-    assert!(!plain(&info[38]).starts_with(" Fuel"));
-    assert!(info.iter().any(|l| plain(l).contains("WHAT CSR COST YOU")));
+    let row = *pane
+        .acts
+        .iter()
+        .find(|(_, a)| a["key"] == "instrument:figure")
+        .unwrap()
+        .0;
+    assert!(pane.click(row, 0, NOW));
+    assert!(pane.instrument_open.figure);
+    assert_eq!(pane.view, "main");
+    pane.key("i");
+    assert!(!pane.instrument_open.figure);
 }
 
 #[test]
-fn the_value_row_gives_way_by_width_and_takes_a_row_from_the_page() {
-    let (_home, mut pane) = pane(46, 30);
-    let lines = pane.frame(46, 30, NOW);
-    assert_eq!(
-        plain(&lines[28]),
-        " Fuel ≈4.7% · Haiku 4 · Dreams 2 · Took 2"
-    );
-    let (_home, mut narrow) = self::pane(30, 30);
-    let lines = narrow.frame(30, 30, NOW);
-    assert_eq!(plain(&lines[28]), " Fuel ≈4.7% · Haiku 4");
-    assert_eq!(act_key(&narrow, 28), "view:info");
+fn the_instrument_reflows_without_the_retired_value_row() {
+    for cols in [7, 10, 23, 30, 46, 100] {
+        let (_home, mut pane) = pane(cols, 30);
+        pane.pixels = false;
+        let lines = pane.frame(cols, 30, NOW);
+        assert_eq!(lines.len(), 30);
+        assert!(!lines
+            .iter()
+            .any(|l| plain(l).contains("Fuel") || plain(l).contains("STS")));
+        assert!(lines
+            .iter()
+            .all(|l| csr_engine::companion::render::text::len(&plain(l)) <= cols));
+    }
 }
 
 #[test]
-fn the_log_page_and_the_summary_page_have_no_value_row() {
+fn changes_and_summary_have_no_retired_value_row() {
     let (_home, mut pane) = pane(100, 40);
     pane.frame(100, 40, NOW);
-    assert!(pane.key("l"));
-    let lines = pane.frame(100, 40, NOW);
-    assert!(!plain(&lines[38]).starts_with(" Fuel"));
-    assert_eq!(act_key(&pane, 39), "legend");
+    pane.key("l");
+    assert_eq!(pane.view, "main");
+    assert!(pane.instrument_open.changes);
+    for key in ["l", "s"] {
+        pane.key(key);
+        let rows = pane.frame(100, 40, NOW);
+        assert!(!rows.iter().any(|l| plain(l).contains("Fuel")));
+    }
+    assert_eq!(pane.view, "summary");
 }
 
 #[test]
-fn a_scrolled_page_is_a_window_that_keeps_the_value_row_and_the_legend_at_the_bottom() {
+fn a_scrolled_drilldown_keeps_the_instrument_and_legend() {
     let (_home, mut pane) = pane(100, 40);
-    pane.frame(100, 40, NOW);
+    pane.key("t");
+    let before = pane.frame(100, 40, NOW);
     pane.scroll(6);
-    let lines = pane.frame(100, 40, NOW);
-    assert_eq!(lines.len(), 40);
-    assert!(plain(&lines[38]).starts_with(" Fuel"));
-    assert!(plain(&lines[39]).contains("q close"));
-    assert_eq!(act_key(&pane, 38), "view:info");
-    // the page never scrolls past its own end: the window's bottom row is its last
-    pane.scroll(1000);
-    let far = pane.frame(100, 40, NOW);
-    assert_eq!(far.len(), 40);
-    assert!(plain(&far[38]).starts_with(" Fuel"));
-    // escape puts the page back at its top
-    assert!(pane.key("escape"));
-    assert_eq!(pane.top, 0);
+    assert_eq!(pane.instrument_open.scroll, 6);
+    let after = pane.frame(100, 40, NOW);
+    assert_eq!(before.len(), after.len());
+    assert!(after.iter().any(|l| plain(l).contains("CTX")));
+    assert_eq!(act_key(&pane, 39), "legend");
+    pane.key("escape");
+    assert_eq!(pane.instrument_open.scroll, 0);
+    assert!(!pane.instrument_open.threads);
 }
 
 #[test]
-fn the_legend_counts_down_to_the_next_read_and_pads_its_label() {
+fn the_legend_names_live_actions_and_hides_an_empty_queue() {
     let (_home, mut pane) = pane(100, 40);
-    let first = pane.frame(100, 40, NOW);
-    assert!(plain(&first[39]).contains("r ↻ 60s  q close"));
-    let later = pane.frame(100, 40, NOW + 10.2);
-    assert!(plain(&later[39]).contains("r ↻ 50s  q close"));
-    let last = pane.frame(100, 40, NOW + 55.);
-    assert!(plain(&last[39]).contains("r ↻ 5s   q close"));
-    // column mode has no room for it
-    let (_home, mut column) = self::pane(23, 30);
-    let lines = column.frame(23, 30, NOW);
-    assert!(!plain(&lines[29]).contains('↻'));
+    let rows = pane.frame(100, 40, NOW);
+    assert!(plain(&rows[39]).contains("i figure"));
+    assert!(plain(&rows[39]).contains("b theme"));
+    assert!(!plain(&rows[39]).contains("dream now"));
+    let act = &pane.acts[&39];
+    for span in act["keys"].as_array().unwrap() {
+        let key = span[2].as_str().unwrap();
+        assert!(plain(&rows[39]).contains(key));
+    }
+    let before = pane.theme;
+    let span = act["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s[2] == "b")
+        .unwrap();
+    let col = span[0].as_u64().unwrap() as usize;
+    pane.click(39, col, NOW);
+    assert_ne!(before, pane.theme);
 }
 
 #[test]
-fn column_mode_draws_the_strip_at_the_last_columns_and_stacks_the_values() {
+fn narrow_text_stacks_the_same_live_instrument_facts() {
+    let (_home, mut pane) = pane(23, 40);
+    pane.pixels = false;
+    let rows = pane.frame(23, 40, NOW);
+    let text = rows.iter().map(|l| plain(l)).collect::<Vec<_>>().join("\n");
+    for fact in ["CTX 78k/1M", "7D 62%", "5H 41%"] {
+        assert!(text.contains(fact), "missing {fact}: {text}");
+    }
+    assert!(!text.contains("STS"));
+    assert!(!rows.iter().any(|l| l.contains(";19H")));
+}
+
+#[test]
+fn narrow_context_click_opens_the_figure_in_place() {
+    let (_home, mut pane) = pane(23, 40);
+    pane.pixels = false;
+    pane.frame(23, 40, NOW);
+    let row = *pane
+        .acts
+        .iter()
+        .find(|(_, a)| a["key"] == "instrument:figure")
+        .unwrap()
+        .0;
+    assert!(pane.click(row, 0, NOW));
+    assert!(pane.instrument_open.figure);
+    assert_eq!(pane.view, "main");
+    pane.frame(23, 40, NOW);
+    pane.click(row, 0, NOW);
+    assert!(!pane.instrument_open.figure);
+}
+
+#[test]
+fn column_drilldowns_reflow_and_escape_returns_to_the_surface() {
     let (_home, mut pane) = pane(23, 30);
-    let lines = pane.frame(23, 30, NOW);
-    assert_eq!(lines.len(), 30);
-    let text: Vec<String> = lines.iter().map(|l| plain(l)).collect();
-    assert!(text[0].starts_with("CTX 78k"));
-    assert!(text[1].starts_with("7D 62%"));
-    assert!(text[2].starts_with("5H 41%"));
-    assert!(text[3].starts_with("◷4m"));
-    assert!(text[4].starts_with("STS"));
-    // every row but the legend's carries the strip, written by absolute position
-    for (row, line) in lines.iter().enumerate().take(29) {
+    for key in ["l", "t", "d"] {
+        pane.key(key);
+        assert_eq!(pane.view, "main");
+        let rows = pane.frame(23, 30, NOW);
+        assert_eq!(rows.len(), 30);
+        assert!(rows
+            .iter()
+            .all(|r| csr_engine::companion::render::text::len(&plain(r)) <= 23));
+        pane.key("escape");
         assert!(
-            line.contains(&format!("\x1b[{};19H", row + 1)),
-            "row {row} has no strip"
+            !pane.instrument_open.changes
+                && !pane.instrument_open.threads
+                && !pane.instrument_open.dreams
         );
     }
-    assert!(!lines[29].contains("\x1b[30;19H"));
-    assert_eq!(text[29].trim(), "l s i q");
-    // 7 columns keep one tape, at the last column but one
-    let (_home, mut thin) = self::pane(7, 30);
-    let lines = thin.frame(7, 30, NOW);
-    assert!(lines[0].contains("\x1b[1;6H"));
 }
 
-#[test]
-fn the_strip_is_on_no_row_and_the_masthead_in_column_mode_opens_the_info_page() {
-    let (_home, mut pane) = pane(23, 30);
-    pane.frame(23, 30, NOW);
-    assert_eq!(act_key(&pane, 0), "view:info");
-    assert_eq!(act_key(&pane, 1), "view:info");
-    assert_eq!(act_key(&pane, 2), "");
-    // a click on the strip beside the masthead is on no row
-    assert!(pane.click(0, 19, NOW));
-    assert_eq!(pane.view, "main");
-    assert!(pane.click(1, 22, NOW));
-    assert_eq!(pane.view, "main");
-    // a click on the value text opens the info page, drawn in column mode
-    assert!(pane.click(0, 3, NOW));
-    assert_eq!(pane.view, "info");
-    let info = pane.frame(23, 30, NOW);
-    assert_eq!(info.len(), 30);
-    assert!(
-        info[0].contains("\x1b[1;19H"),
-        "the strip stays on the info page"
-    );
-    assert_eq!(act_key(&pane, 0), "view:main");
-    let text: Vec<String> = info.iter().map(|l| plain(l)).collect();
-    assert!(text.iter().any(|l| l.contains("THIS SESSION")));
-    assert!(text.iter().any(|l| l.contains("WHAT CSR COST")));
-    // the title, clicked, goes back
-    assert!(pane.click(0, 2, NOW));
-    assert_eq!(pane.view, "main");
-}
-
-#[test]
-fn column_mode_legend_keys_and_pages_reflow() {
-    let (_home, mut pane) = pane(23, 30);
-    pane.frame(23, 30, NOW);
-    // "l" is the first label of the column legend
-    assert!(pane.click(29, 1, NOW));
-    assert_eq!(pane.view, "log");
-    let log = pane.frame(23, 30, NOW);
-    assert_eq!(log.len(), 30);
-    let text: Vec<String> = log.iter().map(|l| plain(l)).collect();
-    // the page's words, rewrapped to the 18 columns left of the strip
-    for line in text.iter().take(29) {
-        let body: String = line.chars().take(18).collect();
-        assert!(!body.is_empty() || line.is_empty() || line.chars().count() > 0);
-    }
-    assert_eq!(text[29].trim(), "d q");
-    assert!(pane.key("d"));
-    assert_eq!(pane.view, "main");
-}
-
-/// A row of a golden split where the strip's cursor-position escape starts: (text part, strip part).
-fn split_strip(row: &str) -> (String, String) {
-    let at = (0..row.len())
-        .filter(|i| row.is_char_boundary(*i))
-        .find(|i| {
-            let rest = &row[*i..];
-            rest.starts_with("\x1b[")
-                && rest[2..].split_once('H').is_some_and(|(pos, _)| {
-                    pos.contains(';') && pos.chars().all(|c| c.is_ascii_digit() || c == ';')
-                })
-        });
-    match at {
-        Some(i) => (row[..i].to_owned(), row[i..].to_owned()),
-        None => (row.to_owned(), String::new()),
-    }
-}
-
-/// Column mode against pane.py's own frames: the gauge strip of every row is byte for byte the golden's, the
-/// masthead's values and the legend are too, and the section counts the Rust page draws are the golden's counts in
-/// the golden's order. (Flight, the compaction card, Lost and found and the coach draw no count until packages C and
-/// D land; then every row is the golden's and `frame_main_*x30` in companion_frame.rs takes over.)
+/// Complete narrow frames, regenerated through Pane::frame.
 fn column_matches_the_golden(name: &str, pixels: bool) {
     let sc = {
         let text = fs::read_to_string(rich().join("frames.json")).unwrap();
@@ -343,45 +310,22 @@ fn column_matches_the_golden(name: &str, pixels: bool) {
     let want = fs::read_to_string(rich().join(format!("{name}.txt"))).unwrap();
     let want: Vec<&str> = want.strip_suffix('\n').unwrap().split('\n').collect();
     assert_eq!(drawn.len(), want.len(), "{name}: row count");
-    let (got, golden): (Vec<_>, Vec<_>) = (
-        drawn.iter().map(|r| split_strip(r)).collect::<Vec<_>>(),
-        want.iter().map(|r| split_strip(r)).collect::<Vec<_>>(),
-    );
-    for (i, ((_, g), (_, w))) in got.iter().zip(&golden).enumerate() {
-        assert_eq!(g, w, "{name}: row {i} (the strip)");
-    }
-    let masthead = 5; // CTX, 7D, 5H, cache, STS
-    for i in (0..masthead).chain([rows - 1]) {
-        assert_eq!(got[i].0, golden[i].0, "{name}: row {i} (text)");
-    }
-    let mut next = masthead;
-    for (i, (text, _)) in got.iter().enumerate().take(rows - 1).skip(masthead) {
-        if plain(text).trim().is_empty() {
-            continue;
-        }
-        let at = (next..golden.len() - 1)
-            .find(|j| golden[*j].0 == *text)
-            .unwrap_or_else(|| {
-                panic!(
-                    "{name}: row {i} ({:?}) is no count of the golden's",
-                    plain(text)
-                )
-            });
-        next = at + 1;
+    for (i, (got, want)) in drawn.iter().zip(want).enumerate() {
+        assert_eq!(got, want, "{name}: row {i}");
     }
 }
 #[test]
-fn column_mode_23x30_is_pane_pys_but_for_the_counts_of_packages_c_and_d() {
+fn column_mode_23x30_matches_the_instrument_top_frame() {
     column_matches_the_golden("frame-main-23x30", false);
     column_matches_the_golden("pixels-frame-main-23x30", true);
 }
 #[test]
-fn column_mode_10x30_is_pane_pys_but_for_the_counts_of_packages_c_and_d() {
+fn column_mode_10x30_matches_the_instrument_top_frame() {
     column_matches_the_golden("frame-main-10x30", false);
     column_matches_the_golden("pixels-frame-main-10x30", true);
 }
 #[test]
-fn column_mode_7x30_is_pane_pys_but_for_the_counts_of_packages_c_and_d() {
+fn column_mode_7x30_matches_the_instrument_top_frame() {
     column_matches_the_golden("frame-main-7x30", false);
     column_matches_the_golden("pixels-frame-main-7x30", true);
 }

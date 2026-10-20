@@ -1,7 +1,5 @@
-//! The main page's keys and clicks, through `Pane::click`: In flight (the agent rows, the Codex rows and
-//! their folds), "How Claude read you", and the dream answer the pane keeps for six seconds. Each
-//! test builds the same rich HOME as tests/companion_frame.rs (base home, rich overlay, DB from
-//! home.sql then rich/home.sql) and drives a Pane at the pinned time.
+//! Agent details, dream reasons, queue answers and the Codex figure through the real single surface.
+//! Each test drives Pane::frame, Pane::key or Pane::click over the rich private HOME.
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
 use serde_json::Value;
 use std::{
@@ -177,120 +175,85 @@ fn finished_agents(paths: &Paths) {
 }
 
 #[test]
-fn a_click_on_the_more_row_shows_the_rest_and_a_click_on_fewer_folds_it_again() {
+fn a_click_on_the_agent_summary_opens_real_details_and_folds_them() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 70);
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "› and 3 more"), "{text:#?}");
-    assert!(!has(&text, "a-orphan"));
-    let row = row_of(&pane, "fold:flight-more");
-    assert!(pane.click(row, 8, NOW));
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "⌄ fewer"), "{text:#?}");
-    assert!(!has(&text, "and 3 more"));
-    let row = row_of(&pane, "fold:flight-more");
-    pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "› and 3 more"), "{text:#?}");
+    let first = draw(&mut pane, NOW);
+    assert!(has(&first, "in flight"));
+    assert!(!has(&first, " tools"));
+    let row = row_of(&pane, "instrument:agents");
+    pane.click(row, 0, NOW);
+    assert!(pane.instrument_open.agents);
+    let open = draw(&mut pane, NOW);
+    assert!(has(&open, " tools"));
+    let row = row_of(&pane, "instrument:agents");
+    pane.click(row, 0, NOW);
+    assert!(!pane.instrument_open.agents);
 }
 
 #[test]
-fn a_click_on_the_finished_row_unfolds_the_agents_and_a_second_folds_them() {
+fn finished_agents_stay_folded_until_the_agent_details_open() {
     let (_home, paths) = rich_home();
     finished_agents(&paths);
     let mut pane = pane(&paths, 100, 70);
-    let text = draw(&mut pane, NOW);
-    let folded = text
-        .iter()
-        .find(|l| l.contains("3 agents finished"))
-        .unwrap();
-    assert!(folded.contains("›") && folded.contains("ago"), "{folded}");
-    assert!(!has(&text, "Explore · claude-sonnet-4-5 · done"));
-    let row = row_of(&pane, "fold:flight");
-    pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "⌄ 3 agents finished"), "{text:#?}");
-    assert!(
-        has(&text, "Explore · claude-sonnet-4-5 · done"),
-        "{text:#?}"
-    );
-    let row = row_of(&pane, "fold:flight");
-    pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "› 3 agents finished"), "{text:#?}");
+    let first = draw(&mut pane, NOW);
+    assert!(!has(&first, "in flight"));
+    assert!(!has(&first, " tools"));
+    pane.key("a");
+    let open = draw(&mut pane, NOW);
+    assert!(has(&open, " tools"));
+    pane.key("a");
+    let shut = draw(&mut pane, NOW);
+    assert!(!has(&shut, " tools"));
 }
 
 #[test]
-fn a_click_on_an_agent_opens_its_report_and_a_second_click_folds_it_and_sends_nothing() {
+fn opening_and_closing_agent_details_never_sends_a_prompt() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 70);
     draw(&mut pane, NOW);
-    let row = row_of(&pane, "flight:a-done");
-    pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
-    assert_eq!(pane.open, "flight:a-done");
-    assert!(has(&text, "What it found — the agent’s words"), "{text:#?}");
-    assert!(has(
-        &text,
-        "the agent's words, not yours: click again to fold"
-    ));
-    let row = row_of(&pane, "flight:a-done");
-    pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
-    assert!(pane.open.is_null(), "open is {}", pane.open);
-    assert!(
-        pane.sent.is_null(),
-        "an agent's report is never sent: {}",
-        pane.sent
-    );
-    assert!(!has(&text, "What it found"));
+    let row = row_of(&pane, "instrument:agents");
+    pane.click(row, 0, NOW);
+    draw(&mut pane, NOW);
+    assert!(pane.instrument_open.agents);
+    assert!(pane.sent.is_null());
+    pane.key("escape");
+    draw(&mut pane, NOW);
+    assert!(!pane.instrument_open.agents);
+    assert!(pane.sent.is_null());
 }
 
 #[test]
-fn a_click_on_the_codex_rows_opens_them_and_a_second_click_closes_without_sending() {
+fn codex_week_is_part_of_the_figure_and_never_sends_a_prompt() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 70);
+    let text = draw(&mut pane, NOW);
+    assert!(has(&text, "Codex 7D 41%"));
+    assert!(!pane.acts.values().any(|a| a["key"] == "codex:week"));
+    let row = row_of(&pane, "instrument:figure");
+    pane.click(row, 0, NOW);
+    assert!(pane.instrument_open.figure);
     draw(&mut pane, NOW);
-    for key in ["codex:week", "codex:codex-live-2"] {
-        let row = row_of(&pane, key);
-        pane.click(row, 8, NOW);
-        draw(&mut pane, NOW);
-        assert_eq!(pane.open, key);
-        let row = row_of(&pane, key);
-        pane.click(row, 8, NOW);
-        draw(&mut pane, NOW);
-        assert!(pane.open.is_null(), "{key}: open is {}", pane.open);
-        assert!(pane.sent.is_null(), "{key}: sent {}", pane.sent);
-    }
+    pane.click(row, 0, NOW);
+    assert!(!pane.instrument_open.figure);
+    assert!(pane.sent.is_null());
 }
 
 #[test]
-fn a_click_on_a_reading_opens_it_and_a_second_click_asks_to_put_it_in_the_prompt() {
+fn the_hero_opens_its_reasons_without_sending_or_answering() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 70);
     draw(&mut pane, NOW);
-    let row = row_of(&pane, "read:");
-    let key = pane.acts[&row]["key"].as_str().unwrap().to_owned();
-    assert_eq!(key, "read:1792319865.0:dknr");
-    pane.click(row, 8, NOW);
-    let text = draw(&mut pane, NOW);
-    assert_eq!(pane.open, key.as_str());
-    assert!(
-        has(&text, "Your word “dknr” — interpreted as: done."),
-        "{text:#?}"
-    );
-    assert!(has(&text, "↳ click again → Claude's prompt"));
-    let row = row_of(&pane, "read:");
-    pane.click(row, 8, NOW);
-    // no Claude pane to type into here, so the reading says it could not reach it
-    assert_eq!(pane.sent[0], key.as_str());
-    assert_eq!(pane.sent[1], false);
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "✗ couldn't reach Claude's pane"), "{text:#?}");
-    assert_eq!(
-        pane.acts[&row_of(&pane, "read:")]["send"],
-        "Earlier you read my “dknr” as “done”. Check that reading before relying on it."
-    );
+    let before = fs::read(paths.keep.join("dreams.jsonl")).unwrap();
+    let row = row_of(&pane, "instrument:dreams");
+    pane.click(row, 0, NOW);
+    let shown = draw(&mut pane, NOW);
+    assert!(pane.instrument_open.dreams);
+    assert!(has(&shown, "Catch a failing frame"));
+    assert!(pane.sent.is_null());
+    assert_eq!(fs::read(paths.keep.join("dreams.jsonl")).unwrap(), before);
+    pane.click(row, 0, NOW);
+    assert!(!pane.instrument_open.dreams);
 }
 
 #[test]
@@ -298,8 +261,8 @@ fn a_click_on_an_answer_keeps_it_in_the_log_and_remembers_it_for_six_seconds() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 70);
     let text = draw(&mut pane, NOW);
-    assert!(has(&text, "✓ helpful"), "{text:#?}");
-    let row = row_of(&pane, "dream:newest:answers");
+    assert!(has(&text, "1 helpful"), "{text:#?}");
+    let row = row_of(&pane, "dream:newest");
     // the left half of the row is "helpful"
     pane.click(row, 10, NOW);
     assert_eq!(
@@ -319,41 +282,32 @@ fn a_click_on_an_answer_keeps_it_in_the_log_and_remembers_it_for_six_seconds() {
 }
 
 #[test]
-fn the_answer_the_pane_kept_stands_in_place_of_the_answer_rows_until_it_is_six_seconds_old() {
+fn answering_promotes_the_next_pending_dream_immediately() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 70);
-    pane.answered = Some(("newest".into(), "helpful".into(), NOW - 2.));
-    let text = draw(&mut pane, NOW);
-    assert!(has(&text, "✓ kept: helpful"), "{text:#?}");
-    assert!(!has(&text, "= thought of it") && !has(&text, "→ ask Claude"));
-    // a click on the echo is on no row's answers: it opens nothing and answers nothing
-    let row = text
-        .iter()
-        .position(|l| l.contains("✓ kept: helpful"))
-        .unwrap();
-    assert!(!pane.acts.contains_key(&row));
-    let text = draw(&mut pane, NOW + 3.9);
-    assert!(has(&text, "✓ kept: helpful"));
-    let text = draw(&mut pane, NOW + 4.1);
-    assert!(pane.answered.is_none());
-    assert!(
-        !has(&text, "✓ kept: helpful") && has(&text, "= thought of it"),
-        "{text:#?}"
-    );
+    draw(&mut pane, NOW);
+    let row = row_of(&pane, "dream:newest");
+    pane.click(row, 1, NOW);
+    draw(&mut pane, NOW + 1.);
+    assert!(!pane.acts.values().any(|a| a["dream"] == "newest"));
+    assert_eq!(pane.view, "main");
+    assert!(pane.sent.is_null());
 }
 
 #[test]
-fn an_opened_earlier_dream_shows_its_title_and_the_first_two_reasons() {
+fn the_queue_opens_in_place_and_keeps_answered_dreams_folded() {
     let (_home, paths) = rich_home();
     let mut pane = pane(&paths, 100, 140);
-    tall(&mut pane, NOW);
-    let row = row_of(&pane, "fold:passed");
-    pane.click(row, 8, NOW);
-    tall(&mut pane, NOW);
-    let row = row_of(&pane, "dream:older");
-    pane.click(row, 8, NOW);
-    let text = tall(&mut pane, NOW);
-    assert!(has(&text, "A small reader"), "{text:#?}");
-    assert!(has(&text, "Bound the tail before parsing."), "{text:#?}");
-    assert!(!has(&text, "- Bound the tail"), "{text:#?}");
+    let before = tall(&mut pane, NOW);
+    pane.key("d");
+    let open = tall(&mut pane, NOW);
+    assert!(pane.instrument_open.dreams);
+    assert_eq!(pane.view, "main");
+    assert!(
+        open.iter().filter(|l| !l.is_empty()).count()
+            >= before.iter().filter(|l| !l.is_empty()).count()
+    );
+    assert!(pane.sent.is_null());
+    pane.key("d");
+    assert!(!pane.instrument_open.dreams);
 }

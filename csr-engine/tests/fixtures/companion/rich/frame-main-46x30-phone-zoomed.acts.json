@@ -1,408 +1,72 @@
 {
- "0": {
-  "key": "view:info"
- },
- "1": {
-  "key": "view:info"
- },
- "10": {
-  "body": [
-   "14m · 11 tools · Reading the queue schema"
-  ],
-  "detail": [
-   "Wrote: src/lib.rs"
-  ],
-  "fit_body": true,
-  "flag": "also edited by Claude this session: src/lib.rs",
-  "hint": "the agent's words, not yours: click again to fold",
-  "key": "flight:a-lead",
-  "lines": 1,
-  "meta": "",
-  "nosend": true,
-  "send": "",
-  "title": "general-purpose · claude-sonnet-5",
-  "unrated": true,
-  "whole_detail": true
- },
- "13": {
-  "answers": true,
-  "body": [
-   "Keep the pane alive",
-   "Catch a failing frame without losing the terminal."
-  ],
-  "detail": [
-   "Keep the heartbeat independent of the renderer.",
-   "Retry after a short backoff."
-  ],
-  "dream": "newest",
-  "heart": [
-   42,
-   46
-  ],
-  "key": "dream:newest",
-  "lines": 3,
-  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
-  "source": "dreams",
-  "title": "What if a frame failed while the agent was busy?"
- },
- "14": {
-  "answers": true,
-  "body": [
-   "Keep the pane alive",
-   "Catch a failing frame without losing the terminal."
-  ],
-  "detail": [
-   "Keep the heartbeat independent of the renderer.",
-   "Retry after a short backoff."
-  ],
-  "dream": "newest",
-  "key": "dream:newest",
-  "lines": 3,
-  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
-  "title": "What if a frame failed while the agent was busy?"
- },
- "15": {
-  "answers": true,
-  "body": [
-   "Keep the pane alive",
-   "Catch a failing frame without losing the terminal."
-  ],
-  "detail": [
-   "Keep the heartbeat independent of the renderer.",
-   "Retry after a short backoff."
-  ],
-  "dream": "newest",
-  "key": "dream:newest",
-  "lines": 3,
-  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
-  "title": "What if a frame failed while the agent was busy?"
- },
- "16": {
-  "answers": true,
-  "body": [
-   "Keep the pane alive",
-   "Catch a failing frame without losing the terminal."
-  ],
-  "detail": [
-   "Keep the heartbeat independent of the renderer.",
-   "Retry after a short backoff."
-  ],
-  "dream": "newest",
-  "key": "dream:newest",
-  "lines": 3,
-  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
-  "title": "What if a frame failed while the agent was busy?"
- },
- "17": {
-  "answers": true,
-  "body": [
-   "Keep the pane alive",
-   "Catch a failing frame without losing the terminal."
-  ],
-  "detail": [
-   "Keep the heartbeat independent of the renderer.",
-   "Retry after a short backoff."
-  ],
-  "dream": "newest",
-  "key": "dream:newest",
-  "lines": 3,
-  "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. Catch a failing frame without losing the terminal. Keep the heartbeat independent of the renderer. Retry after a short backoff.”",
-  "title": "What if a frame failed while the agent was busy?"
- },
- "20": {
-  "detail": [
-   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
-  ],
-  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
-  "meta": "you said · 10-18 · this session",
-  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
-  "title": "Keep the read-only database boundary."
- },
- "21": {
-  "detail": [
-   "Your words, session sess-now. CSR hands them to Claude when the work comes near."
-  ],
-  "heart": [
-   42,
-   46
-  ],
-  "key": "rule:2026-10-18T10:39:00Z:Keep the read-only database bo",
-  "meta": "you said · 10-18 · this session",
-  "send": "A standing rule from 10-18: “Keep the read-only database boundary.”",
-  "source": "rules",
-  "title": "Keep the read-only database boundary."
- },
- "24": {
-  "body": [
-   "Paid back: 3 of 22 calls. 19 calls to go.",
-   "Earned back: 37k of 267k (full input price).",
-   "Took 1:19. Your /compact: 1:27 (median of 12).",
-   "Kept 4 items, 3 lessons. Click to read.",
-   "3 waiting in Lost and found."
-  ],
-  "detail": [
-   "Kept: Export job wired to the nightly queue",
-   "Kept: Retries use jittered backoff",
-   "Kept: Edited the export job in lib.rs",
-   "Kept: Keep the read-only database boundary",
-   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
-   "Learnt: Your word “dknr” — interpreted as: done.",
-   "Learnt: You said to keep batch sizes small.",
-   "Cost: cache 140k + summary 108k + read 19k."
-  ],
-  "heart": [
-   42,
-   46
-  ],
-  "key": "compacted:1792319870.0",
-  "lede": [
-   "Each API call now sends 122k fewer tokens."
-  ],
-  "lines": 2,
-  "loud": 2,
-  "picture": {
-   "facts": {
-    "at": 1792319870.0,
-    "cost": 266700.0,
-    "done": 3,
-    "need": 22,
-    "net": -230100.0,
-    "per": null,
-    "saving": 12200.0
-   },
-   "kind": "payback",
-   "rows": 5
+  "0": {
+    "key": "instrument:dreams"
   },
-  "plain_body": true,
-  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
-  "source": "compacted",
-  "title": "Context: 192k → 70k tokens.",
-  "unrated": false,
-  "whole_detail": true
- },
- "25": {
-  "body": [
-   "Paid back: 3 of 22 calls. 19 calls to go.",
-   "Earned back: 37k of 267k (full input price).",
-   "Took 1:19. Your /compact: 1:27 (median of 12).",
-   "Kept 4 items, 3 lessons. Click to read.",
-   "3 waiting in Lost and found."
-  ],
-  "detail": [
-   "Kept: Export job wired to the nightly queue",
-   "Kept: Retries use jittered backoff",
-   "Kept: Edited the export job in lib.rs",
-   "Kept: Keep the read-only database boundary",
-   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
-   "Learnt: Your word “dknr” — interpreted as: done.",
-   "Learnt: You said to keep batch sizes small.",
-   "Cost: cache 140k + summary 108k + read 19k."
-  ],
-  "key": "compacted:1792319870.0",
-  "lede": [
-   "Each API call now sends 122k fewer tokens."
-  ],
-  "lines": 2,
-  "loud": 2,
-  "picture": {
-   "facts": {
-    "at": 1792319870.0,
-    "cost": 266700.0,
-    "done": 3,
-    "need": 22,
-    "net": -230100.0,
-    "per": null,
-    "saving": 12200.0
-   },
-   "kind": "payback",
-   "rows": 5
+  "1": {
+    "key": "instrument:dreams"
   },
-  "plain_body": true,
-  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
-  "title": "Context: 192k → 70k tokens.",
-  "unrated": false,
-  "whole_detail": true
- },
- "26": {
-  "body": [
-   "Paid back: 3 of 22 calls. 19 calls to go.",
-   "Earned back: 37k of 267k (full input price).",
-   "Took 1:19. Your /compact: 1:27 (median of 12).",
-   "Kept 4 items, 3 lessons. Click to read.",
-   "3 waiting in Lost and found."
-  ],
-  "detail": [
-   "Kept: Export job wired to the nightly queue",
-   "Kept: Retries use jittered backoff",
-   "Kept: Edited the export job in lib.rs",
-   "Kept: Keep the read-only database boundary",
-   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
-   "Learnt: Your word “dknr” — interpreted as: done.",
-   "Learnt: You said to keep batch sizes small.",
-   "Cost: cache 140k + summary 108k + read 19k."
-  ],
-  "key": "compacted:1792319870.0",
-  "lede": [
-   "Each API call now sends 122k fewer tokens."
-  ],
-  "lines": 2,
-  "loud": 2,
-  "picture": {
-   "facts": {
-    "at": 1792319870.0,
-    "cost": 266700.0,
-    "done": 3,
-    "need": 22,
-    "net": -230100.0,
-    "per": null,
-    "saving": 12200.0
-   },
-   "kind": "payback",
-   "rows": 5
+  "2": {
+    "dream": "newest",
+    "key": "dream:newest",
+    "send": "CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”",
+    "spans": [
+      [
+        0,
+        11,
+        "helpful"
+      ],
+      [
+        11,
+        23,
+        "thought_of_it"
+      ],
+      [
+        23,
+        34,
+        "not_relevant"
+      ],
+      [
+        34,
+        46,
+        "ask_claude"
+      ]
+    ]
   },
-  "plain_body": true,
-  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
-  "title": "Context: 192k → 70k tokens.",
-  "unrated": false,
-  "whole_detail": true
- },
- "27": {
-  "body": [
-   "Paid back: 3 of 22 calls. 19 calls to go.",
-   "Earned back: 37k of 267k (full input price).",
-   "Took 1:19. Your /compact: 1:27 (median of 12).",
-   "Kept 4 items, 3 lessons. Click to read.",
-   "3 waiting in Lost and found."
-  ],
-  "detail": [
-   "Kept: Export job wired to the nightly queue",
-   "Kept: Retries use jittered backoff",
-   "Kept: Edited the export job in lib.rs",
-   "Kept: Keep the read-only database boundary",
-   "Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.",
-   "Learnt: Your word “dknr” — interpreted as: done.",
-   "Learnt: You said to keep batch sizes small.",
-   "Cost: cache 140k + summary 108k + read 19k."
-  ],
-  "key": "compacted:1792319870.0",
-  "lede": [
-   "Each API call now sends 122k fewer tokens."
-  ],
-  "lines": 2,
-  "loud": 2,
-  "picture": {
-   "facts": {
-    "at": 1792319870.0,
-    "cost": 266700.0,
-    "done": 3,
-    "need": 22,
-    "net": -230100.0,
-    "per": null,
-    "saving": 12200.0
-   },
-   "kind": "payback",
-   "rows": 5
+  "29": {
+    "key": "legend",
+    "keys": [
+      [
+        0,
+        7,
+        "z"
+      ],
+      [
+        9,
+        18,
+        "l"
+      ],
+      [
+        20,
+        29,
+        "t"
+      ],
+      [
+        31,
+        39,
+        "i"
+      ]
+    ]
   },
-  "plain_body": true,
-  "send": "CSR's compaction card (compacted by csr), quoted: “Context: 192k → 70k tokens. Each API call now sends 122k fewer tokens.; Paid back: 3 of 22 calls. 19 calls to go.; Earned back: 37k of 267k (full input price).; Took 1:19. Your /compact: 1:27 (median of 12).; Kept 4 items, 3 lessons. Click to read.; 3 waiting in Lost and found.; Kept: Export job wired to the nightly queue; Kept: Retries use jittered backoff; Kept: Edited the export job in lib.rs; Kept: Keep the read-only database boundary; Learnt: The staging queue rejected oversized batches: fixed the batch size at 50.; Learnt: Your word \"dknr\" — interpreted as: done.; Learnt: You said to keep batch sizes small.; Cost: cache 140k + summary 108k + read 19k..”",
-  "title": "Context: 192k → 70k tokens.",
-  "unrated": false,
-  "whole_detail": true
- },
- "28": {
-  "key": "view:info"
- },
- "29": {
-  "key": "legend",
-  "keys": [
-   [
-    1,
-    10,
-    "l"
-   ],
-   [
-    12,
-    18,
-    "i"
-   ],
-   [
-    20,
-    27,
-    "z"
-   ],
-   [
-    29,
-    36,
-    "r"
-   ],
-   [
-    38,
-    45,
-    "q"
-   ]
-  ]
- },
- "4": {
-  "detail": [],
-  "heart": [
-   42,
-   46
-  ],
-  "key": "story",
-  "like": "story:sess-now:3",
-  "lines": 12,
-  "open_lines": 30,
-  "open_title": "The pane reads the session. Work stands at: text parity is ready for review. No model call is needed.",
-  "send": "CSR's story of this session, rev 3, quoted: “The pane reads the session. Work stands at: text parity is ready for review. No model call is needed.”",
-  "source": "story",
-  "title": "Work stands at: text parity is ready for review. No model call is needed."
- },
- "5": {
-  "detail": [],
-  "key": "story",
-  "like": "story:sess-now:3",
-  "lines": 12,
-  "open_lines": 30,
-  "open_title": "The pane reads the session. Work stands at: text parity is ready for review. No model call is needed.",
-  "send": "CSR's story of this session, rev 3, quoted: “The pane reads the session. Work stands at: text parity is ready for review. No model call is needed.”",
-  "title": "Work stands at: text parity is ready for review. No model call is needed."
- },
- "8": {
-  "body": [
-   "14m · 11 tools · Reading the queue schema"
-  ],
-  "detail": [
-   "Wrote: src/lib.rs"
-  ],
-  "fit_body": true,
-  "flag": "also edited by Claude this session: src/lib.rs",
-  "hint": "the agent's words, not yours: click again to fold",
-  "key": "flight:a-lead",
-  "lines": 1,
-  "meta": "",
-  "nosend": true,
-  "send": "",
-  "title": "general-purpose · claude-sonnet-5",
-  "unrated": true,
-  "whole_detail": true
- },
- "9": {
-  "body": [
-   "14m · 11 tools · Reading the queue schema"
-  ],
-  "detail": [
-   "Wrote: src/lib.rs"
-  ],
-  "fit_body": true,
-  "flag": "also edited by Claude this session: src/lib.rs",
-  "hint": "the agent's words, not yours: click again to fold",
-  "key": "flight:a-lead",
-  "lines": 1,
-  "meta": "",
-  "nosend": true,
-  "send": "",
-  "title": "general-purpose · claude-sonnet-5",
-  "unrated": true,
-  "whole_detail": true
- }
+  "4": {
+    "key": "instrument:threads"
+  },
+  "6": {
+    "key": "instrument:changes"
+  },
+  "7": {
+    "key": "instrument:figure"
+  },
+  "9": {
+    "key": "instrument:agents"
+  }
 }

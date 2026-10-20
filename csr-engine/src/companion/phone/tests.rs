@@ -72,10 +72,10 @@ fn test_the_threshold_reads_herdr_config_and_falls_back_on_any_doubt() {
     }
 }
 #[test]
-fn test_the_legend_matches_pane_py_for_every_phone_column_and_zoom_state() {
-    let cases: Vec<Value> = serde_json::from_str(LEGENDS).unwrap();
+fn test_the_legend_matches_live_labels_for_every_phone_column_and_zoom_state() {
+    let mut cases: Vec<Value> = serde_json::from_str(LEGENDS).unwrap();
     assert_eq!(cases.len(), 256);
-    for case in &cases {
+    for case in &mut cases {
         let (text, spans) = legend_parts(
             case["view"].as_str().unwrap(),
             case["width"].as_u64().unwrap() as usize,
@@ -87,12 +87,25 @@ fn test_the_legend_matches_pane_py_for_every_phone_column_and_zoom_state() {
             },
         );
         let spans: Vec<Value> = spans.iter().map(|(a, b, k)| json!([a, b, k])).collect();
+        assert!(!crate::companion::render::text::plain(&text).contains("info"));
+        if std::env::var_os("CSR_LEGEND_UPDATE").is_some() {
+            case["text"] = json!(text);
+            case["spans"] = json!(spans);
+        }
         assert_eq!(
             (json!(text), json!(spans)),
             (case["text"].clone(), case["spans"].clone()),
             "{}",
             case.to_string().chars().take(160).collect::<String>()
         );
+    }
+    if std::env::var_os("CSR_LEGEND_UPDATE").is_some() {
+        std::fs::write(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/companion/mapzoom/legend-phone.json"),
+            serde_json::to_string_pretty(&cases).unwrap() + "\n",
+        )
+        .unwrap();
     }
 }
 #[test]

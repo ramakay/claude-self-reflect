@@ -139,7 +139,50 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     let (home, paths) = rich_home();
     let empty = state == "01-empty";
     let con = rusqlite::Connection::open(&paths.db).unwrap();
+    // These are the existing learnt feed schemas, absent from the old minimal oracle DB.
+    con.execute_batch("ALTER TABLE memory_registry ADD COLUMN file_path TEXT;
+        ALTER TABLE memory_registry ADD COLUMN modified_ts TEXT;
+        ALTER TABLE witness_ledger ADD COLUMN project TEXT;
+        UPDATE witness_ledger SET project='pane-wp2';
+        DELETE FROM witness_verdicts WHERE id=2;
+        CREATE INDEX idx_witness_verdicts_recap_created ON witness_verdicts(julianday(created_at),id);
+        CREATE TABLE provenance_events(event_id TEXT PRIMARY KEY,conversation_id TEXT);
+        CREATE TABLE resolution_ledger(id INTEGER PRIMARY KEY,chunk_id TEXT,claim TEXT,evidence TEXT,status TEXT,source TEXT,event_id TEXT);").unwrap();
+    if !empty {
+        con.execute_batch("DELETE FROM memory_registry;
+            INSERT INTO memory_registry VALUES('sess-now','pane-layout','/notes/layout','2026-10-18T10:35:00Z');
+            INSERT INTO memory_registry VALUES('sess-now','batch-gate','/notes/batch','2026-10-18T10:36:00Z');
+            INSERT INTO memory_registry VALUES('sess-now','figure-spacing','/notes/figure','2026-10-18T10:37:00Z');
+            INSERT INTO provenance_events VALUES('confirmed-1','sess-now'),('confirmed-2','sess-now');
+            INSERT INTO resolution_ledger VALUES(1,'finding-1','Budget is labelled','oid:8e4e3f27','resolved','user_confirmed','confirmed-1');
+            INSERT INTO resolution_ledger VALUES(2,'finding-2','Question fits','oid:8e4e3f27','resolved','user_confirmed','confirmed-2');").unwrap();
+        let raw: String = con
+            .query_row(
+                "SELECT value FROM meta WHERE key='story_map:sess-now'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut map: Value = serde_json::from_str(&raw).unwrap();
+        map["current"]["entries"].as_array_mut().unwrap().extend([
+            json!({"kind":"added","claim":"Label the budget","before":[],"now":"The dream budget has a label.","was":"The budget had no label.","after":[{"scope":"render/instrument.rs","sym":"meta","mark":"+"}],"receipts":["oid:7625eed7"]}),
+            json!({"kind":"risk","claim":"Check section readability","before":[],"now":"Check readable section text at every height.","was":"Sections used tiny amber body text.","after":[{"scope":"render/instrument.rs","sym":"draw","mark":"!"}],"receipts":[],"grounded":false})
+        ]);
+        con.execute(
+            "UPDATE meta SET value=? WHERE key='story_map:sess-now'",
+            [map.to_string()],
+        )
+        .unwrap();
+    }
+    if state == "06-after" {
+        con.execute(
+            "UPDATE reflections SET timestamp='2026-10-18T10:39:00Z' WHERE id='story'",
+            [],
+        )
+        .unwrap();
+    }
     if empty {
+        con.execute("delete from witness_verdicts", []).unwrap();
         con.execute("delete from reflections where id='story'", [])
             .unwrap();
         con.execute("delete from meta where key like 'story_map:%'", [])
@@ -165,19 +208,41 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     let mut lines = vec![];
     if !empty {
         for (i, value) in values.iter().enumerate() {
+            let value = if state == "04-band" && i == 12 {
+                &84
+            } else {
+                value
+            };
             let at =
                 NOW - (values.len() - i) as f64 * 30. - if state == "07-away" { 8040. } else { 0. };
             let stamp = chrono::DateTime::from_timestamp(at as i64, 0)
                 .unwrap()
                 .to_rfc3339();
             if i == 12 {
-                lines.push(json!({"type":"system","subtype":"compact_boundary","timestamp":stamp,"compactMetadata":{"preTokens":266000,"postTokens":21700,"durationMs":45000,"trigger":"manual"}}));
+                lines.push(json!({"type":"system","subtype":"compact_boundary","timestamp":stamp,"compactMetadata":{"preTokens":if state=="06-after"{265400}else{266000},"postTokens":21700,"durationMs":45000,"trigger":"manual"}}));
             }
-            lines.push(json!({"type":"user","timestamp":stamp,"message":{"role":"user","content":"Keep the question first."}}));
+            if state != "04-band" || i % 2 == 0 {
+                lines.push(json!({"type":"user","timestamp":stamp,"message":{"role":"user","content":"Keep the question first."}}));
+            }
             lines.push(json!({"type":"assistant","timestamp":stamp,"message":{"id":format!("b-{i}"),"role":"assistant","model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":value*if i==12{550}else{10},"cache_read_input_tokens":value*if i==12{450}else{990},"cache_creation":{"ephemeral_1h_input_tokens":value*990},"output_tokens":400},"content":[{"type":"text","text":"Working on the pane."}]}}));
+            if state == "04-band" {
+                let last = lines.last().unwrap().clone();
+                for call in 1..15 {
+                    let mut request = last.clone();
+                    request["message"]["id"] = json!(format!("band-{i}-{call}"));
+                    lines.push(request);
+                }
+            }
         }
     }
     if state == "06-after" {
+        // 38 post-compact requests repay the first compact; the second has only one so far.
+        let last = lines.last().unwrap().clone();
+        for call in 0..27 {
+            let mut request = last.clone();
+            request["message"]["id"] = json!(format!("paid-{call}"));
+            lines.push(request);
+        }
         let stamp = chrono::DateTime::from_timestamp((NOW - 6.) as i64, 0)
             .unwrap()
             .to_rfc3339();
@@ -201,8 +266,11 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
     )
     .unwrap();
     let mut log = vec![];
+    if empty {
+        log.push(json!({"kind":"look","session":"sess-now","at":NOW,"outcome":"idle","budget":{"spent":0,"cap":40000}}));
+    }
     if !empty {
-        log.push(json!({"kind":"compact","event":"compact","outcome":"compacted","session":"sess-now","at":NOW-359.,"ctx_before":266000,"ctx_after":21700,"took_ms":45000}));
+        log.push(json!({"kind":"compact","event":"compact","outcome":"compacted","session":"sess-now","at":NOW-359.,"ctx_before":if state=="06-after"{265400}else{266000},"ctx_after":21700,"took_ms":45000}));
         if state == "06-after" {
             log.push(json!({"kind":"compact","event":"compact","outcome":"compacted","session":"sess-now","at":NOW-5.,"ctx_before":192000,"ctx_after":21700,"took_ms":45000}));
         }
@@ -212,6 +280,13 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
             );
         }
         if state == "08-offer" {
+            log.push(json!({"kind":"batch","session":"sess-now","at":NOW-700.,"dreams":[
+                {"id":"prev-one","line":"What if the budget had a label?","title":"Label the dream budget","confidence":0.8},
+                {"id":"prev-two","line":"What if the figure opened in place?","title":"Keep the figure in place","confidence":0.7}]}));
+            log.push(json!({"kind":"answer","id":"prev-one","answer":"helpful","at":NOW-650.}));
+            log.push(
+                json!({"kind":"answer","id":"prev-two","answer":"thought_of_it","at":NOW-640.}),
+            );
             log.push(json!({"kind":"looking","session":"sess-now","at":NOW-38.,"outcome":"dreaming","budget":{"spent":9000,"cap":40000},"threads":["pane redesign","launch images","release landing"]}));
         } else if state == "08b-nothing" {
             log.push(json!({"kind":"look","session":"sess-now","at":NOW-30.,"outcome":"none","budget":{"spent":14000,"cap":40000}}));
@@ -256,6 +331,18 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
         let _ = fs::remove_file(paths.keep.join("agents/sess-now.json"));
     }
     if state == "05-compacting" {
+        for entry in fs::read_dir(paths.projects.join("fixture")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap() != "sess-now.jsonl" {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let own = (0..3).map(|i| json!({"type":"system","subtype":"compact_boundary","timestamp":chrono::DateTime::from_timestamp((NOW-5000.-i as f64*100.) as i64,0).unwrap().to_rfc3339(),"compactMetadata":{"preTokens":190000,"postTokens":21700,"durationMs":45000,"trigger":"manual"}}).to_string()).collect::<Vec<_>>().join("\n");
+        fs::write(
+            paths.projects.join("fixture/own-compacts.jsonl"),
+            own + "\n",
+        )
+        .unwrap();
         write_json(
             &paths.keep.join("compacting/sess-now.json"),
             &json!({"at":(NOW-12.)*1000.,"trigger":"auto"}),
@@ -277,6 +364,23 @@ fn snapshot(state: &str, theme: Theme) -> (Value, Vec<u8>) {
         .map(|s| text::plain(s))
         .collect::<Vec<_>>();
     assert!(!text.join("\n").contains("Before:"));
+    let path = fixture()
+        .join("instrument/text")
+        .join(format!("{state}.txt"));
+    let plain = text
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if std::env::var_os("CSR_INSTRUMENT_UPDATE").is_some() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &plain).unwrap();
+    }
+    assert_eq!(fs::read_to_string(path).unwrap(), plain);
+    assert!(!plain.contains("STS"));
+    assert!(!plain.contains("Should be a …"));
+    assert!(!plain.contains("d dream"));
     pane.pixels = true;
     pane.enable_cards();
     pane.frame(76, 67, NOW);
@@ -469,6 +573,82 @@ fn fresh_session_does_not_inherit_another_sessions_empty_look() {
     let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
     pane.pixels = false;
     let text = pane.frame(76, 67, NOW).join("\n");
-    assert!(text.contains("Press d."));
+    assert!(text.contains("The dreamer looks as you work."));
+    assert!(!text.contains("d dream"));
     assert!(!text.contains("last look found nothing"));
+}
+
+#[test]
+fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
+    for (state, expected) in [
+        (
+            "01-empty",
+            vec!["The dreamer looks as you work.", "dreamer 0 of 40k"],
+        ),
+        (
+            "02-running",
+            vec![
+                "3 notes kept",
+                "2 findings confirmed",
+                "1 fact retired",
+                "unverified",
+                "Should be a hook:",
+                "turns 4, 8",
+            ],
+        ),
+        ("04-band", vec!["♻ ~1 prompt · 28 calls"]),
+        ("05-compacting", vec!["Compacting · 12s of ~45s"]),
+        (
+            "06-after",
+            vec![
+                "Compacted. 2 by CSR. Saved ~118k so far.",
+                "refreshed 1m ago",
+            ],
+        ),
+        (
+            "07-away",
+            vec!["asked while you were away", "looked 4×. 3 new what-ifs"],
+        ),
+        (
+            "08-offer",
+            vec![
+                "dreamer 9k of 40k",
+                "Label the dream budget → helpful",
+                "Keep the figure in place",
+            ],
+        ),
+        (
+            "08b-nothing",
+            vec![
+                "The dreamer looks as you work.",
+                "The last look found nothing.",
+            ],
+        ),
+    ] {
+        let (_home, paths) = state_home(state);
+        let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", 76, 67));
+        pane.pixels = false;
+        let shown = pane
+            .frame(76, 67, NOW)
+            .iter()
+            .map(|l| text::plain(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for phrase in expected {
+            assert!(shown.contains(phrase), "{state}: missing {phrase}: {shown}");
+        }
+        assert!(!shown.contains("STS") && !shown.contains("♻A") && !shown.contains("d dream"));
+        if matches!(state, "01-empty" | "08b-nothing") {
+            let before = fs::read(paths.keep.join("dreams.jsonl")).unwrap();
+            pane.key("d");
+            pane.frame(76, 67, NOW);
+            assert_eq!(fs::read(paths.keep.join("dreams.jsonl")).unwrap(), before);
+            assert!(!shown.contains("d queue"));
+        }
+        if state == "02-running" {
+            assert!(pane.click(0, 0, NOW));
+            let detail = pane.frame(76, 67, NOW).join("\n");
+            assert!(detail.contains("at most 30%"));
+        }
+    }
 }

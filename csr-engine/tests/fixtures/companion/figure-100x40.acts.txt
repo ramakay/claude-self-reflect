@@ -1,0 +1,6 @@
+0	{"key":"instrument:dreams"}
+1	{"dream":"newest","key":"dream:newest","send":"CSR's dreamer asked this while you worked, quoted: “What if a frame failed while the agent was busy?” Its reasoning: “Keep the pane alive. - Catch a failing frame without losing the terminal. - Keep the heartbeat independent of the renderer. - Retry after a short backoff.”","spans":[[0,25,"helpful"],[25,50,"thought_of_it"],[50,75,"not_relevant"],[75,100,"ask_claude"]]}
+2	{"key":"instrument:threads"}
+3	{"key":"instrument:changes"}
+4	{"key":"instrument:figure"}
+39	{"key":"legend","keys":[[0,9,"l"],[11,20,"t"],[22,30,"i"],[32,39,"b"],[41,48,"q"]]}
