@@ -155,6 +155,10 @@ pub struct SearchEngine {
     /// this engine's own indexes stay empty and never dirty — see
     /// [`vector_ipc`].
     proxy: Option<std::sync::Arc<vector_ipc::VectorProxy>>,
+    /// A proxied engine was handed chunks since its last
+    /// [`Self::sync_pending_chunks`]: SQLite holds them, the daemon may not
+    /// have applied them yet.
+    chunks_unsynced: bool,
     /// The `HnswIo`s a loaded engine's indexes borrow from (their memory
     /// maps, when mapped). Declared after the indexes, so those drop first
     /// and the maps are released with the engine. They used to be leaked
@@ -493,6 +497,7 @@ impl SearchEngine {
             published_basenames: None,
             vectors_mapped: false,
             proxy: None,
+            chunks_unsynced: false,
             _mapped: Vec::new(),
             rebuilt_at_generation: None,
         }
@@ -628,9 +633,10 @@ impl SearchEngine {
     }
 
     pub fn insert_chunk(&mut self, id: String, embedding: Vec<f32>) {
-        if let Some(proxy) = &self.proxy {
-            // SQLite holds the change; the daemon applies it before answering.
-            proxy.sync_committed();
+        if self.proxy.is_some() {
+            // SQLite holds the change. No round trip per chunk: the importer
+            // calls `sync_pending_chunks` once, after the file's last chunk.
+            self.chunks_unsynced = true;
             return;
         }
         if !self.allow_local_mutations {
@@ -645,6 +651,30 @@ impl SearchEngine {
         self.chunk_hashes.push(vector_hash(&embedding));
         self.chunk_index.insert((&embedding, idx));
         self.mark_chunk_dirty();
+    }
+
+    /// Ask the daemon, once, to apply every chunk handed to
+    /// [`Self::insert_chunk`] since the last call, so a search right after an
+    /// import finds them. Does nothing, and costs nothing, without a proxy or
+    /// when no chunk was written. `true` when the daemon confirmed it applied
+    /// them; a busy daemon answers `false` and is left alone for a while (see
+    /// `VectorProxy::sync_chunks`), and its own poll applies the chunks.
+    pub fn sync_pending_chunks(&mut self) -> bool {
+        if !std::mem::take(&mut self.chunks_unsynced) {
+            return false;
+        }
+        self.proxy.as_ref().is_some_and(|proxy| proxy.sync_chunks())
+    }
+
+    /// [`Self::insert_reflection`] for a caller that ignores the answer (the
+    /// Stop hook's episode, the heuristic summary): through a proxy it makes
+    /// no round trip and the daemon applies the row at its next poll, instead
+    /// of the caller waiting for an acknowledgement it throws away.
+    pub fn insert_reflection_unacked(&mut self, id: String, embedding: Vec<f32>) {
+        if self.proxy.is_some() {
+            return;
+        }
+        self.insert_reflection(id, embedding);
     }
 
     pub fn insert_reflection(&mut self, id: String, embedding: Vec<f32>) -> bool {
@@ -1844,6 +1874,7 @@ impl SearchEngine {
             published_basenames: Some((manifest.chunk_basename, manifest.reflection_basename)),
             vectors_mapped,
             proxy: None,
+            chunks_unsynced: false,
             _mapped: mapped,
             rebuilt_at_generation: None,
         })

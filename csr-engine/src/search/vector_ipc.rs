@@ -759,6 +759,9 @@ pub struct VectorProxy {
     answered: AtomicBool,
     failures: AtomicU64,
     down_since: std::sync::Mutex<Option<Instant>>,
+    /// When a Sync last came back unapplied or failed. Chunk-import syncs
+    /// are skipped for the down window after it (see [`Self::sync_chunks`]).
+    sync_busy_since: std::sync::Mutex<Option<Instant>>,
     timings: std::sync::Mutex<ProxyTimings>,
     /// The server's run record, rewritten with its current path.
     run_record: std::sync::Mutex<Option<PathBuf>>,
@@ -773,6 +776,7 @@ impl VectorProxy {
             answered: AtomicBool::new(false),
             failures: AtomicU64::new(0),
             down_since: std::sync::Mutex::new(None),
+            sync_busy_since: std::sync::Mutex::new(None),
             timings: std::sync::Mutex::new(ProxyTimings::default()),
             run_record: std::sync::Mutex::new(None),
         }
@@ -1013,14 +1017,44 @@ impl VectorProxy {
     /// every change up to the latest one before answering, so a search right
     /// after a store finds it (bounded by [`SYNC_WAIT`]; the keyword index
     /// has it regardless). `true` when the daemon confirmed it applied them.
+    ///
+    /// Always asks: reflections keep their acknowledgement.
     pub(crate) fn sync_committed(&self) -> bool {
+        self.sync(false)
+    }
+
+    /// [`Self::sync_committed`] for the chunks of an import. The daemon
+    /// applies changes through one storage connection that its watcher, codemap
+    /// and dream cycle share, so under load a Sync runs to its full wait and
+    /// comes back unapplied. After one did (or the call failed), further chunk
+    /// syncs return `false` at once for the down window: the chunks are in
+    /// SQLite and the daemon's own poll applies them.
+    pub(crate) fn sync_chunks(&self) -> bool {
+        self.sync(true)
+    }
+
+    fn sync(&self, skip_while_busy: bool) -> bool {
+        if skip_while_busy && self.recently_busy() {
+            return false;
+        }
         let Ok(seq) = self.storage.latest_embedding_change_seq() else {
             return false;
         };
-        matches!(
+        let applied = matches!(
             self.remote(Op::Sync { seq }, SYNC_TIMEOUT),
             Some(Reply::Synced { applied: true })
-        )
+        );
+        if let Ok(mut busy) = self.sync_busy_since.lock() {
+            *busy = (!applied).then(Instant::now);
+        }
+        applied
+    }
+
+    fn recently_busy(&self) -> bool {
+        let window = self.timings().down_window;
+        self.sync_busy_since
+            .lock()
+            .is_ok_and(|busy| busy.is_some_and(|since| since.elapsed() < window))
     }
 }
 
@@ -1198,15 +1232,19 @@ async fn serve_one(
                         .map(|hit| (hit.id, hit.score))
                         .collect(),
                 },
-                Op::Sync { seq } => Reply::Synced {
-                    applied: wait_for_sync(
-                        &data_dir,
-                        &search,
-                        seq,
-                        &nudge,
-                        Instant::now() + SYNC_WAIT,
-                    ),
-                },
+                Op::Sync { seq } => {
+                    #[cfg(test)]
+                    test_support::count_sync(&data_dir);
+                    Reply::Synced {
+                        applied: wait_for_sync(
+                            &data_dir,
+                            &search,
+                            seq,
+                            &nudge,
+                            Instant::now() + SYNC_WAIT,
+                        ),
+                    }
+                }
             })
         })
         .await
@@ -1296,6 +1334,27 @@ pub(crate) mod test_support {
         // Cache miss: rebuilds from SQLite and publishes the generation.
         drop(Engine::new(&db, &projects).unwrap());
         (db, projects)
+    }
+
+    /// Sync requests each test daemon has served, by data dir (tests share a
+    /// process, so one global counter would mix them up).
+    static SYNCS_SERVED: std::sync::Mutex<Vec<(PathBuf, u64)>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn count_sync(data_dir: &Path) {
+        let mut served = SYNCS_SERVED.lock().unwrap();
+        match served.iter_mut().find(|(dir, _)| dir == data_dir) {
+            Some((_, count)) => *count += 1,
+            None => served.push((data_dir.to_path_buf(), 1)),
+        }
+    }
+
+    /// How many Sync requests the daemon for `data_dir` has served so far.
+    pub(crate) fn syncs_served(data_dir: &Path) -> u64 {
+        let served = SYNCS_SERVED.lock().unwrap();
+        served
+            .iter()
+            .find(|(dir, _)| dir == data_dir)
+            .map_or(0, |(_, count)| *count)
     }
 
     pub(crate) struct TestDaemon {
@@ -1539,6 +1598,178 @@ mod tests {
             .unwrap();
         assert!(synced, "the daemon confirms it applied the change");
         assert!(daemon.search.read().await.has_reflection("acked"));
+        daemon.stop().await;
+    }
+
+    /// A transcript whose messages are each longer than half a chunk, so every
+    /// message is a chunk of its own: `messages` chunks.
+    fn long_transcript(projects: &Path, name: &str, messages: usize) -> PathBuf {
+        let dir = projects.join("-tmp-stopsync");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lines: Vec<String> = (0..messages)
+            .map(|i| {
+                let mut text = format!("{name} note {i}: ");
+                while text.len() < 600 {
+                    text.push_str(TOPICS[(i + text.len()) % TOPICS.len()]);
+                    text.push_str(&format!(" #{} ", i * 31 + text.len()));
+                }
+                let stamp = format!("2026-10-19T00:{:02}:{:02}Z", i / 60, i % 60);
+                if i % 2 == 0 {
+                    serde_json::json!({"type": "user", "timestamp": stamp,
+                        "message": {"content": text}})
+                } else {
+                    serde_json::json!({"type": "assistant", "timestamp": stamp,
+                        "message": {"content": [{"type": "text", "text": text}]}})
+                }
+                .to_string()
+            })
+            .collect();
+        let path = dir.join(format!("{name}.jsonl"));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    /// An import writes N chunks; the daemon is asked to apply them once, not
+    /// once per chunk. The Stop hook sat 25.8 s on a live machine making one
+    /// Sync round trip per chunk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_import_asks_the_daemon_to_sync_once_per_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
+            .unwrap()
+            .unwrap();
+        let transcript = long_transcript(&projects, "once", 24);
+        let before = syncs_served(tmp.path());
+        let imported = proxied.import_file(&transcript, "stopsync").await.unwrap();
+        assert!(imported >= 20, "a transcript of many chunks: {imported}");
+        assert_eq!(
+            syncs_served(tmp.path()) - before,
+            1,
+            "{imported} chunks, one Sync"
+        );
+
+        // The one Sync at the end of the file still gives read-after-import.
+        let ids = proxied
+            .storage()
+            .get_chunk_ids_for_project("stopsync")
+            .unwrap();
+        assert_eq!(ids.len(), imported);
+        let chunks = proxied.storage().get_chunks_by_ids(&ids).unwrap();
+        for chunk in chunks.iter().take(3) {
+            let vector = daemon_embedding(&daemon, &chunk.content).await;
+            let hits = proxied
+                .search()
+                .read()
+                .await
+                .search_chunks(&vector, 1, 0.99);
+            assert_eq!(hits.len(), 1, "found {} right after the import", chunk.id);
+            assert_eq!(hits[0].id, chunk.id);
+        }
+        assert!(daemon.search.read().await.has_chunk(&ids[0]));
+        daemon.stop().await;
+    }
+
+    /// A whole Stop hook on a proxied engine (import, heuristic summary,
+    /// episode store) makes one Sync in total: the import's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stop_hook_makes_one_sync_in_total() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
+            .unwrap()
+            .unwrap();
+        let transcript = long_transcript(&projects, "stop-hook", 24);
+        let session = "5d0c0000-1111-2222-3333-444444444444";
+        let input = crate::hooks::HookInput {
+            session_id: Some(session.into()),
+            transcript_path: Some(transcript.to_string_lossy().into_owned()),
+            cwd: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let before = syncs_served(tmp.path());
+        crate::hooks::stop::handle(&input, &proxied, tmp.path())
+            .await
+            .unwrap();
+        let stored = proxied
+            .storage()
+            .get_reflections_by_tag(&format!("conv_{session}"), 10)
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|(_, _, tags, _)| tags.iter().any(|t| t == "session_episode")),
+            "the episode was stored"
+        );
+        assert_eq!(
+            syncs_served(tmp.path()) - before,
+            1,
+            "import, summary and episode: one Sync"
+        );
+        daemon.stop().await;
+    }
+
+    /// While the daemon cannot apply changes (its index is held), an import
+    /// must not wait out one Sync per chunk, and the next import in the same
+    /// window must not ask again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_busy_daemon_is_asked_once_and_then_left_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (db, projects) = seed(tmp.path());
+        let daemon = TestDaemon::start(&db).await;
+        let proxied = Engine::new_proxied_with_home(&db, &projects, None)
+            .unwrap()
+            .unwrap();
+        let first = long_transcript(&projects, "busy-one", 22);
+        let second = long_transcript(&projects, "busy-two", 22);
+        // Warm the model so the timing below measures syncs, not a cold load.
+        daemon_embedding(&daemon, "warm").await;
+
+        let held = daemon.search.write().await;
+        let before = syncs_served(tmp.path());
+        let started = Instant::now();
+        let imported = proxied.import_file(&first, "stopsync").await.unwrap();
+        let took = started.elapsed();
+        eprintln!("busy import: {imported} chunks in {took:?}");
+        assert!(imported >= 20, "{imported}");
+        assert!(took < Duration::from_secs(5), "the import took {took:?}");
+        assert_eq!(
+            syncs_served(tmp.path()) - before,
+            1,
+            "one Sync, not {imported}"
+        );
+
+        let again = syncs_served(tmp.path());
+        let started = Instant::now();
+        let imported = proxied.import_file(&second, "stopsync").await.unwrap();
+        assert!(imported >= 20, "{imported}");
+        assert_eq!(
+            syncs_served(tmp.path()),
+            again,
+            "no Sync round trip while the daemon is known busy"
+        );
+        eprintln!(
+            "second busy import: {imported} chunks in {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the second import took {:?}",
+            started.elapsed()
+        );
+        drop(held);
+        // A reflection store keeps asking, latch or not, and the answer clears it.
+        let proxy = proxied.search().read().await.proxy().unwrap().clone();
+        let acked = tokio::task::spawn_blocking(move || {
+            let acked = proxy.sync_committed();
+            (acked, proxy.sync_chunks())
+        })
+        .await
+        .unwrap();
+        assert!(acked.0, "the reflection ack ignores the busy latch");
+        assert!(acked.1, "an applied Sync clears the latch");
         daemon.stop().await;
     }
 

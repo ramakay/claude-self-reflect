@@ -769,6 +769,9 @@ impl Engine {
         {
             tracing::warn!(conv = %conversation_id, %error, "queued-prompt indexing failed (non-fatal)");
         }
+        // Last step of a file's chunk writes on every path of `import_file_with_observer`:
+        // a proxied engine asks the daemon once for the file, not once per chunk.
+        self.search.write().await.sync_pending_chunks();
     }
 
     /// Backfill missing import_state rows and run heuristic enrichment for all unenriched conversations.

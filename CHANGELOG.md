@@ -301,6 +301,11 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
 - **Hooks that never search skip the index** (259k chunks): notification 879 -> 10 ms, `continue` 860 -> 13 ms,
   subagent-stop 869 -> 19 ms (a60ef867; that hook is gone, see Dreaming / witness). Precompact, session-end, stop,
   post-tool-use only import; precompact 21 ms vs a 346,570 ms rebuild (a4453aa1, 58953b81, bcad285b). Hooks never dump the index (~1 GB/prompt before; a7dfb889).
+- A Stop hook asked the daemon to apply the index once per imported chunk, and under load each ask ran to its
+  3 s wait: one live Stop hook took 25.8 s (earlier ones 10 s to 253 s), 6,382 of 6,398 samples waiting on the
+  socket. An import now asks once per file, a busy answer pauses chunk asks for 15 s, and the episode and heuristic
+  summary stores no longer wait for an answer they ignore. In a test with the daemon's index held, a 22-chunk import
+  went from 69.3 s to 3.3 s and the next import made no ask. Stored reflections still wait for their ack.
 - prompt-submit asks the daemon over a private socket within a deadline and fails open (3651e549, 8e473f5e)
   [untraced: empty bodies; from the `src/hooks/prompt_transport.rs` doc]. The daemon index takes rows other
   processes write (a9f252f5, 1414dc1b) [untraced: subject only].

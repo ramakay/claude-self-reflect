@@ -1223,10 +1223,13 @@ async fn store_episode_supported(
         &ranges.unwrap_or_else(|| vec![(0, content.chars().count()); inputs.inputs().len()]),
     )?;
 
-    // Also insert into the in-memory search index
+    // Also insert into the in-memory search index. Nothing here reads the
+    // acknowledgement, so a proxied hook does not wait for one: the daemon
+    // applies the episode at its next poll, and the hook's one Sync is the
+    // import's.
     {
         let mut idx = engine.search().write().await;
-        idx.insert_reflection(id, embedding);
+        idx.insert_reflection_unacked(id, embedding);
     }
 
     Ok(())

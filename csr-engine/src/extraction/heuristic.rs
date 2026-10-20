@@ -145,7 +145,8 @@ pub async fn enrich_conversation(
 
         storage.insert_reflection(&reflection_id, &content, &tags, &embedding)?;
         let mut idx = search.write().await;
-        idx.insert_reflection(reflection_id.clone(), embedding);
+        // The answer is not used, so a proxied engine does not wait for it.
+        idx.insert_reflection_unacked(reflection_id.clone(), embedding);
 
         storage.mark_enrichment_completed(conv_id, "heuristic", &reflection_id)?;
 
