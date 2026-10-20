@@ -373,11 +373,10 @@ pub fn story_cost(db: &Db) -> Option<Value> {
         calls += row[1].as_i64().unwrap_or(0);
         tokens += counts.iter().sum::<i64>();
         let cost = if counts.iter().any(|n| *n != 0) {
-            crate::journal::composer::model_price(string(&row[0])).map(|(input, output)| {
-                (input * (counts[0] as f64 + 0.1 * counts[2] as f64 + 1.25 * counts[3] as f64)
-                    + output * counts[1] as f64)
-                    / 1e6
-            })
+            crate::journal::composer::list_cost_summed(
+                string(&row[0]),
+                [counts[0], counts[1], counts[2], counts[3], 0],
+            )
         } else {
             Some(0.)
         };

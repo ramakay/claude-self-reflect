@@ -3742,6 +3742,17 @@ mod tests {
         std::fs::create_dir_all(&projects_dir).unwrap();
 
         let _storage = Storage::open(&db_path).unwrap();
+        // The owed floor pass yields to activity only inside its grace window
+        // after the floor hour; past it the pass no longer defers. Read the
+        // clock the way gather_status does so the test holds at any hour.
+        let grace_open = {
+            use crate::daemon::dream_cadence as cadence;
+            !cadence::floor_grace_expired(
+                chrono::Local::now().naive_local(),
+                cadence::floor_hour(),
+                cadence::floor_grace_secs(),
+            )
+        };
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
         // The journal-server block is the one environment-dependent field:
         // whether a listener answers on the loopback port depends on whether
@@ -3762,15 +3773,18 @@ mod tests {
             },
             ..DreamStatus::default()
         };
+        let mut expected = expected;
+        expected.cadence.floor_deferred_awaiting_idle = grace_open;
         assert_eq!(report.dream, expected);
         assert_eq!(
             report.dream.effort.unaccounted_invocations,
             Some(0),
             "a fresh database has no invocation in flight"
         );
-        assert!(
-            report.dream.cadence.floor_deferred_awaiting_idle,
-            "a never-dreamed machine with no observed activity owes the floor pass and defers it"
+        assert_eq!(
+            report.dream.cadence.floor_deferred_awaiting_idle, grace_open,
+            "a never-dreamed machine with no observed activity owes the floor pass and defers it \
+             until the grace window closes"
         );
         assert_eq!(
             report.dream.server.url.is_some(),

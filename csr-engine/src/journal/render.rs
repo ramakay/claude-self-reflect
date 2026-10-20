@@ -704,7 +704,7 @@ mod tests {
         assert!(html.contains(r#"<details class="fold">"#));
         assert!(html.contains(r#"Spend<span class="fold-note">"#));
         assert!(html.contains("1,000,000 in · 1,000,000 out"));
-        assert!(html.contains("≈$18.0000 at list price"));
+        assert!(html.contains("≈$12.0000 at list price"));
         assert!(html.contains("2 calls · claude-sonnet-5"));
     }
 

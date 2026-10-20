@@ -11,10 +11,7 @@ use std::{
 };
 
 pub const WEEK: f64 = 604800.;
-const CACHE_READ: f64 = 0.1;
-const CACHE_WRITE: f64 = 1.25;
-const CACHE_WRITE_1H: f64 = 2.0;
-const BOUND_MODEL: &str = "opus-5";
+const BOUND_MODEL: &str = "opus-5-5";
 const SCAN_LIST_EVERY: f64 = 60.;
 const SPEND_EVERY: f64 = 30.;
 const SCAN_LINES: usize = 256;
@@ -43,20 +40,9 @@ pub fn plan_of(fields: &Value, limits: &Value, now: f64) -> Value {
     json!({"mode": "api", "start": now - WEEK, "used": null})
 }
 
-/// US$ at list price for those counts; None when the model has no price.
+/// US$ at list price for one request's counts; None when the model has no price.
 pub fn cost_of(model: &str, counts: [i64; 5]) -> Option<f64> {
-    let (price_in, price_out) = crate::journal::composer::model_price(model)?;
-    let [tokens_in, tokens_out, read, write, write_1h] = counts.map(|n| n as f64);
-    let hour = write_1h.min(write);
-    Some(
-        (price_in
-            * (tokens_in
-                + CACHE_READ * read
-                + CACHE_WRITE * (write - hour)
-                + CACHE_WRITE_1H * hour)
-            + price_out * tokens_out)
-            / 1e6,
-    )
+    crate::journal::composer::list_cost(model, counts)
 }
 
 /// (input, output, cache read, cache write, of it kept an hour) from a usage in the API's spelling.
@@ -100,7 +86,10 @@ pub fn narrative_week(db: &Db, start: f64) -> Value {
             tokens += counts.iter().sum::<i64>();
         }
         let cost = if counts.iter().any(|n| *n != 0) {
-            cost_of(model, [counts[0], counts[1], counts[2], counts[3], 0])
+            crate::journal::composer::list_cost_summed(
+                model,
+                [counts[0], counts[1], counts[2], counts[3], 0],
+            )
         } else {
             Some(0.)
         };

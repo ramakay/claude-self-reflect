@@ -81,39 +81,98 @@ const PLAN_PROMPT_CAP_BYTES: usize = 8 * 1024;
 // ─── spend ────────────────────────────────────────────────────────────────
 
 /// Published list prices, US$ per million tokens, keyed by the longest
-/// distinguishing fragment of a model id. Ordered **longest key first**: the
-/// match is a substring test, so `"haiku-4"` must be tried before `"haiku"`.
+/// distinguishing fragment of a model id: `(key, input, output, cache-read
+/// multiplier)`. Ordered **most specific key first**: the match is a substring
+/// test, so `"opus-5-5"` must be tried before `"opus-5"` and `"haiku-4"`
+/// before `"haiku"`. A bare alias (`"haiku"`) resolves to the current model of
+/// that line, as `claude --model haiku` does. Rates as of 2026-10.
+///
+/// Cache reads are 0.1× input except Opus 5.5 (0.05×) and Fable/Mythos 5.1
+/// (0.025×). Haiku 5.5 has a second card for prompts over 100K tokens, which
+/// only [`list_cost`] can apply; see [`HAIKU_5_5_LONG`].
 ///
 /// This is a *list price* table, not a bill. `claude -p` may be served under
 /// a subscription, in which case no per-call charge exists at all — which is
 /// exactly why [`DreamSpend::cost_usd`] is presented as an at-list-price
 /// figure and never as "you were charged this".
-const MODEL_PRICES: &[(&str, f64, f64)] = &[
-    ("mythos-5", 10.0, 50.0),
-    ("sonnet-5", 3.0, 15.0),
-    ("sonnet-4", 3.0, 15.0),
-    ("fable-5", 10.0, 50.0),
-    ("haiku-4", 1.0, 5.0),
-    ("opus-5", 5.0, 25.0),
-    ("opus-4", 5.0, 25.0),
-    ("sonnet", 3.0, 15.0),
-    ("haiku", 1.0, 5.0),
-    ("opus", 5.0, 25.0),
+const MODEL_PRICES: &[(&str, f64, f64, f64)] = &[
+    ("mythos-5-1", 10.0, 50.0, 0.025),
+    ("fable-5-1", 10.0, 50.0, 0.025),
+    ("mythos-5", 10.0, 50.0, 0.1),
+    ("fable-5", 10.0, 50.0, 0.1),
+    ("opus-5-5", 4.0, 20.0, 0.05),
+    ("sonnet-5-5", 2.0, 10.0, 0.1),
+    ("haiku-5-5", 0.10, 0.50, 0.1),
+    ("sonnet-5", 2.0, 10.0, 0.1),
+    ("sonnet-4", 3.0, 15.0, 0.1),
+    ("haiku-4", 1.0, 5.0, 0.1),
+    ("opus-5", 5.0, 25.0, 0.1),
+    ("opus-4", 5.0, 25.0, 0.1),
+    ("sonnet", 2.0, 10.0, 0.1),
+    ("haiku", 0.10, 0.50, 0.1),
+    ("opus", 4.0, 20.0, 0.05),
 ];
 
-/// Cache-read tokens bill at ~0.1× the input rate.
-const CACHE_READ_MULTIPLIER: f64 = 0.1;
-/// Cache-write tokens bill at ~1.25× the input rate (5-minute TTL).
+/// Haiku 5.5's card for a prompt over [`HAIKU_5_5_LONG_PROMPT`] tokens:
+/// `(input, output)` US$ per million.
+const HAIKU_5_5_LONG: (f64, f64) = (0.50, 2.50);
+/// Prompt size (input + cache read + cache write) above which Haiku 5.5
+/// bills at [`HAIKU_5_5_LONG`].
+const HAIKU_5_5_LONG_PROMPT: i64 = 100_000;
+/// Cache-write tokens bill at 1.25× the input rate (5-minute TTL).
 const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
+/// Cache-write tokens kept an hour bill at 2× the input rate.
+const CACHE_WRITE_1H_MULTIPLIER: f64 = 2.0;
+
+fn price_row(model: &str) -> Option<(f64, f64, f64)> {
+    let lower = model.to_ascii_lowercase();
+    MODEL_PRICES
+        .iter()
+        .find(|(key, ..)| lower.contains(key))
+        .map(|(_, input, output, read)| (*input, *output, *read))
+}
 
 /// `(input, output)` US$ per million tokens, or `None` when the model is not
 /// in the table. An unknown model yields no cost — never a zero.
 pub fn model_price(model: &str) -> Option<(f64, f64)> {
-    let lower = model.to_ascii_lowercase();
-    MODEL_PRICES
-        .iter()
-        .find(|(key, _, _)| lower.contains(key))
-        .map(|(_, input, output)| (*input, *output))
+    price_row(model).map(|(input, output, _)| (input, output))
+}
+
+/// List-price US$ for **one request's** usage: `[input, output, cache read,
+/// cache write, of that write kept an hour]`. Picks Haiku 5.5's long-prompt
+/// card when that request's prompt is over 100K tokens. `None` for an
+/// unpriced model.
+pub fn list_cost(model: &str, counts: [i64; 5]) -> Option<f64> {
+    let long = model.to_ascii_lowercase().contains("haiku-5-5")
+        && counts[0] + counts[2] + counts[3] > HAIKU_5_5_LONG_PROMPT;
+    cost_at(model, counts, long)
+}
+
+/// List-price US$ for usage **summed over many requests**. A sum cannot say
+/// which request crossed Haiku 5.5's 100K line, so this uses the base card;
+/// it understates only Haiku 5.5 calls whose own prompt was over 100K.
+pub fn list_cost_summed(model: &str, counts: [i64; 5]) -> Option<f64> {
+    cost_at(model, counts, false)
+}
+
+fn cost_at(model: &str, counts: [i64; 5], long: bool) -> Option<f64> {
+    let (base_in, base_out, read_multiplier) = price_row(model)?;
+    let (price_in, price_out) = if long {
+        HAIKU_5_5_LONG
+    } else {
+        (base_in, base_out)
+    };
+    let [tokens_in, tokens_out, read, write, write_1h] = counts.map(|n| n as f64);
+    let hour = write_1h.min(write);
+    Some(
+        (price_in
+            * (tokens_in
+                + read_multiplier * read
+                + CACHE_WRITE_MULTIPLIER * (write - hour)
+                + CACHE_WRITE_1H_MULTIPLIER * hour)
+            + price_out * tokens_out)
+            / 1e6,
+    )
 }
 
 /// Measured spend for one dream. Every field is a sum over rows that
@@ -161,15 +220,15 @@ impl DreamSpend {
             spend.cache_read_tokens += row.cache_read_tokens;
             spend.cache_creation_tokens += row.cache_creation_tokens;
             spend.models.push(row.model.clone());
-            match model_price(&row.model) {
-                Some((input_rate, output_rate)) => {
-                    let per_million = |tokens: i64, rate: f64| (tokens as f64) * rate / 1_000_000.0;
-                    cost += per_million(row.input_tokens, input_rate);
-                    cost += per_million(row.output_tokens, output_rate);
-                    cost += per_million(row.cache_read_tokens, input_rate) * CACHE_READ_MULTIPLIER;
-                    cost +=
-                        per_million(row.cache_creation_tokens, input_rate) * CACHE_WRITE_MULTIPLIER;
-                }
+            let counts = [
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_tokens,
+                0,
+            ];
+            match list_cost_summed(&row.model, counts) {
+                Some(row_cost) => cost += row_cost,
                 None => spend.unpriced_models.push(row.model.clone()),
             }
         }
@@ -2514,10 +2573,10 @@ mod tests {
         assert_eq!(spend.calls, 1);
         assert_eq!(spend.input_tokens, 1_000_000);
         assert_eq!(spend.output_tokens, 1_000_000);
-        // 1 MTok in at $3 + 1 MTok out at $15.
-        assert_eq!(spend.cost_usd, Some(18.0));
+        // 1 MTok in at $2 + 1 MTok out at $10.
+        assert_eq!(spend.cost_usd, Some(12.0));
         assert_eq!(spend.tokens_label(), "1,000,000 in · 1,000,000 out");
-        assert!(spend.cost_label().starts_with("≈$18.0000 at list price"));
+        assert!(spend.cost_label().starts_with("≈$12.0000 at list price"));
     }
 
     #[test]
@@ -2597,17 +2656,65 @@ mod tests {
 
     #[test]
     fn model_price_matches_bare_aliases_and_full_ids_alike() {
-        assert_eq!(model_price("sonnet-5"), Some((3.0, 15.0)));
-        assert_eq!(model_price("claude-sonnet-5"), Some((3.0, 15.0)));
+        assert_eq!(model_price("sonnet-5"), Some((2.0, 10.0)));
+        assert_eq!(model_price("claude-sonnet-5"), Some((2.0, 10.0)));
         assert_eq!(model_price("claude-opus-4-8"), Some((5.0, 25.0)));
         assert_eq!(model_price("claude-haiku-4-5"), Some((1.0, 5.0)));
         assert_eq!(model_price("claude-fable-5"), Some((10.0, 50.0)));
+        assert_eq!(model_price("claude-opus-5"), Some((5.0, 25.0)));
+        assert_eq!(model_price("claude-opus-5-5"), Some((4.0, 20.0)));
+        assert_eq!(model_price("claude-sonnet-5-5"), Some((2.0, 10.0)));
+        assert_eq!(model_price("claude-haiku-5-5"), Some((0.10, 0.50)));
+        assert_eq!(model_price("claude-fable-5-1"), Some((10.0, 50.0)));
+        assert_eq!(model_price("haiku"), Some((0.10, 0.50)));
+        assert_eq!(model_price("opus"), Some((4.0, 20.0)));
         assert_eq!(model_price("unknown"), None);
         assert_eq!(
             model_price("default"),
             None,
             "the chain's placeholder label must not be priced as a model"
         );
+    }
+
+    #[test]
+    fn list_cost_uses_each_models_cache_read_rate() {
+        let million = 1_000_000;
+        let read_only = [0, 0, million, 0, 0];
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        assert!(close(list_cost_summed("claude-haiku-5-5", read_only), 0.01));
+        assert!(close(
+            list_cost_summed("claude-sonnet-5-5", read_only),
+            0.20
+        ));
+        assert!(close(list_cost_summed("claude-opus-5-5", read_only), 0.20));
+        assert!(close(list_cost_summed("claude-fable-5-1", read_only), 0.25));
+        assert!(close(list_cost_summed("claude-opus-5", read_only), 0.50));
+        // 1M written: 400k for 5 minutes at 1.25x, 600k for an hour at 2x.
+        let writes = [0, 0, 0, million, 600_000];
+        assert!(close(
+            list_cost("claude-opus-5-5", writes),
+            4.0 * (0.4 * 1.25 + 0.6 * 2.0)
+        ));
+        assert_eq!(list_cost("unknown", read_only), None);
+    }
+
+    #[test]
+    fn haiku_5_5_long_prompt_card_applies_per_request_only() {
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        let short = [80_000, 10_000, 20_000, 0, 0];
+        assert!(close(
+            list_cost("claude-haiku-5-5", short),
+            (80_000.0 * 0.10 + 20_000.0 * 0.01 + 10_000.0 * 0.50) / 1e6
+        ));
+        let long = [80_000, 10_000, 30_000, 0, 0];
+        assert!(close(
+            list_cost("claude-haiku-5-5", long),
+            (80_000.0 * 0.50 + 30_000.0 * 0.05 + 10_000.0 * 2.50) / 1e6
+        ));
+        assert!(close(
+            list_cost_summed("claude-haiku-5-5", long),
+            (80_000.0 * 0.10 + 30_000.0 * 0.01 + 10_000.0 * 0.50) / 1e6
+        ));
     }
 
     #[test]
