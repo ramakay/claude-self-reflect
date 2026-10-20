@@ -502,9 +502,11 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   the main page. `m` opens the Shift Map at full size or folds it, with its refresh and cost. `z`, or a tap on a phone's
   narrow split, fills the screen. `csr-engine companion pane --page info|summary|threads` draws one page. Frames
   are byte-equal to pane.py at a93a568d^ at 46x30 and 100x40, text and pixels. Five main-page goldens gained the
-  Shift Map block the fixture database already carried, which the earlier oracle never drew. Still missing from the
-  main page: In flight, Lost and found, "How Claude read you", the compaction card, the value row, the strip and
-  column mode.
+  Shift Map block the fixture database already carried, which the earlier oracle never drew. In flight (the
+  session's agents, the Codex week and live Codex runs, read by a Rust port of `codex_runs.py`: incremental, at most
+  every 2 s, 8 days back), "How Claude read you", the six-second "kept: <answer>" echo on an answered dream, and an
+  opened earlier dream's first two reasons are back too. Still missing from the main page: Lost and found, the
+  compaction card, the value row, the strip and column mode.
 - **A file written through Bash now reaches file history** (`csr_search_by_file`, `csr_code_graph`, the `csr_why`
   file hop), as an Edit or Write does. The PostToolUse matcher named only the edit tools: over 14 days of the owner's
   corpus, `csr_search_by_file` found the editing session for 1 of 574 Bash-only (file, session) pairs, against 390 of

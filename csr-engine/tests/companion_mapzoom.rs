@@ -49,6 +49,9 @@ fn home() -> (tempfile::TempDir, Paths) {
         }
     }
     copy(&fixture().join("home"), d.path());
+    // The mapzoom goldens were drawn with no agents and no Codex runs; In flight is checked in the rich world.
+    let _ = fs::remove_dir_all(d.path().join(".codex"));
+    let _ = fs::remove_dir_all(d.path().join(".claude-self-reflect/csr-companion/agents"));
     let paths = Paths::new(d.path().into());
     let _ = fs::remove_file(&paths.db);
     let con = rusqlite::Connection::open(&paths.db).unwrap();

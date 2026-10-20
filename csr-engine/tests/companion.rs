@@ -57,6 +57,14 @@ fn home() -> (tempfile::TempDir, Paths) {
     }
     (d, paths)
 }
+/// The home the main-*.txt goldens were drawn from: pane.py's draw_main over a hand-built data dict with no
+/// agents and no Codex runs (oracle.py). In flight is checked in companion_frame.rs, in the rich world.
+fn bare_home() -> (tempfile::TempDir, Paths) {
+    let (d, paths) = home();
+    let _ = fs::remove_dir_all(d.path().join(".codex"));
+    let _ = fs::remove_dir_all(paths.keep.join("agents"));
+    (d, paths)
+}
 fn args(page: &str, cols: usize, rows: usize) -> PaneArgs {
     use clap::Parser;
     #[derive(Parser)]
@@ -88,7 +96,7 @@ fn args(page: &str, cols: usize, rows: usize) -> PaneArgs {
 fn frame_goldens_are_byte_equal() {
     for (cols, rows) in [(46, 30), (100, 40)] {
         for page in ["main", "log"] {
-            let (_home, paths) = home();
+            let (_home, paths) = bare_home();
             let mut pane = Pane::new(paths, &args(page, cols, rows));
             pane.pixels = false;
             let actual = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
@@ -411,7 +419,7 @@ fn engine_probe_identifies_the_companion_subcommand() {
 fn pixel_frames_are_byte_equal_to_pillow_layouts() {
     for (cols, rows) in [(46, 30), (100, 40)] {
         for page in ["main", "log"] {
-            let (_home, paths) = home();
+            let (_home, paths) = bare_home();
             let mut pane = Pane::new(paths, &args(page, cols, rows));
             pane.pixels = true;
             let actual = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
@@ -542,7 +550,7 @@ fn pictures_match_pillow_dimensions_and_pixels() {
 
 #[test]
 fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
-    let (_home, paths) = home();
+    let (_home, paths) = bare_home();
     let output = tempfile::tempdir().unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
         .env("HOME", &paths.home)
@@ -597,7 +605,7 @@ fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
 
 #[test]
 fn disabling_pixels_keeps_text_strips_even_in_kitty() {
-    let (_home, paths) = home();
+    let (_home, paths) = bare_home();
     let out = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
         .env("HOME", paths.home)
         .env("TERM_PROGRAM", "kitty")

@@ -227,6 +227,11 @@ pub struct Pane {
     pub phone: super::phone::Phone,
     /// This pane in herdr; set by the watch loop, absent in frame and test runs.
     pub herdr: Option<super::phone::Herdr>,
+    // package C: the Codex rollouts, the readers behind "How Claude read you", and the dream
+    // answer the pane keeps in place of the answer rows for six seconds (dream, answer, when)
+    codex: super::codex_runs::CodexRolloutIndex,
+    readers: super::readings::Readers,
+    pub answered: Option<(String, String, f64)>,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -246,6 +251,7 @@ impl Pane {
         } else {
             super::render::pictures::Cache::default()
         };
+        let codex = super::codex_runs::CodexRolloutIndex::new(&paths.home);
         Self {
             paths,
             persist: !args.frame && args.png.is_none(),
@@ -283,6 +289,9 @@ impl Pane {
             map: Default::default(),
             phone: Default::default(),
             herdr: None,
+            codex,
+            readers: Default::default(),
+            answered: None,
         }
     }
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
@@ -317,6 +326,9 @@ impl Pane {
                 self.open = Value::Null;
             }
             self.sent = Value::Null;
+        }
+        if self.answered.as_ref().is_some_and(|a| now - a.2 > 6.) {
+            self.answered = None;
         }
 
         if self.loaded == 0. || now - self.loaded >= 60. {
@@ -419,7 +431,18 @@ impl Pane {
             None => Value::Null,
         };
         data["can_refresh"] = json!(can_refresh);
+        if self.view == "main" {
+            // package C: In flight (agents, Codex runs) and How Claude read you
+            data["agents"] = json!(super::agents::agents_of(&self.paths, &self.sid));
+            data["codex"] = if self.codex.present() {
+                self.codex.refresh(now)
+            } else {
+                Value::Null
+            };
+            data["readings"] = json!(self.readers.how_claude_read(&self.paths, &self.sid, 2, now));
+        }
         let ui = json!({
+            "answered": self.answered,
             "pixels": self.pixels,
             "rows": rows,
             "cols": cols,
@@ -457,10 +480,20 @@ impl Pane {
             } else if s["busy"] == true && self.hold.as_ref().is_some_and(|(_, at)| now - at < 120.)
             {
                 let mut page = page;
-                page["sections"] = json!(super::feed::living(
-                    array(&self.hold.as_ref().unwrap().0).to_vec(),
-                    now,
-                ));
+                // package C: In flight is never held; it is drawn fresh among the held ones
+                let fresh: Vec<Value> = array(&page["sections"])
+                    .iter()
+                    .filter(|s| s["name"] == "flight" && !array(&s["items"]).is_empty())
+                    .cloned()
+                    .collect();
+                let mut sections: Vec<Value> =
+                    super::feed::living(array(&self.hold.as_ref().unwrap().0).to_vec(), now)
+                        .into_iter()
+                        .filter(|s| s["name"] != "flight")
+                        .collect();
+                let at = usize::from(sections.first().is_some_and(|s| s["name"] == "story"));
+                sections.splice(at..at, fresh);
+                page["sections"] = json!(sections);
                 page
             } else {
                 let page = self.feed.page(page, now);
@@ -879,6 +912,7 @@ impl Pane {
                 self.sent = json!([act["key"], went, now]);
                 send::focus_back();
             }
+            self.answered = Some((string(&act["dream"]).into(), string(&span[2]).into(), now));
             self.hold = None;
             return true;
         }
@@ -981,6 +1015,7 @@ impl Pane {
                         "by": "pane",
                     }),
                 );
+                self.answered = Some((string(&act["dream"]).into(), "ask_claude".into(), now));
                 self.hold = None;
             }
             send::focus_back();

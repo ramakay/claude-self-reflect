@@ -183,6 +183,15 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
         }));
         if open {
             for d in &earlier {
+                // pane.py reasons_of: one leading * or - and the spaces after it come off
+                let mut detail = vec![json!(string(&d["title"]))];
+                detail.extend(
+                    string(&d["text"])
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .take(2)
+                        .map(|l| json!(l.strip_prefix(['*', '-']).map_or(l, str::trim_start))),
+                );
                 items.push(json!({
                     "key": format!("dream:{}", string(&d["id"])),
                     "title": d["line"],
@@ -193,7 +202,7 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
                         stamp(num(&d["at"]), now),
                         dreams::answer_word(string(&d["answer"]))
                     ),
-                    "detail": [d["title"], d["text"]],
+                    "detail": detail,
                     "send": dream_send(d),
                 }));
             }
@@ -267,6 +276,20 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
         if let Some(handed) = remembered_section(db, s, now) {
             sections.insert(2, handed);
         }
+    }
+    // package C: How Claude read you (before Your rules), then In flight (right after the story)
+    let readings: Vec<super::coach::Reading> =
+        serde_json::from_value(data["readings"].clone()).unwrap_or_default();
+    let coach_at = sections.iter().position(|s| s["name"] == "rules");
+    sections.insert(
+        coach_at.unwrap_or(sections.len()),
+        super::readings::coach_section(&readings),
+    );
+    if let Some(flight) =
+        super::flight::flight_section(&data["agents"], &data["codex"], now, array(&ui["folds"]))
+    {
+        let story_at = sections.iter().position(|s| s["name"] == "story");
+        sections.insert(story_at.map_or(0, |at| at + 1), flight);
     }
     let g = masthead::gauges_compacting(
         &data["claude_fields"],
@@ -943,11 +966,21 @@ fn item_rows_mode(
         string(&item["title"])
     }
     .replace('`', "");
-    let voice = ink(if item["quiet"] == true {
+    let mut voice = ink(if item["quiet"] == true {
         "quiet"
     } else {
         "you"
     });
+    // a figure that nears its limit: ochre, then vermilion
+    if let Some(tone) = item["tone"]
+        .as_str()
+        .filter(|t| matches!(*t, "amber" | "red"))
+    {
+        voice = format!(
+            "{}{BOLD}",
+            ink(if tone == "amber" { "dream" } else { "turn" })
+        );
+    }
     let pad = " ".repeat(at);
     let mut rows: Vec<_> = wrap(
         &title,
@@ -1219,6 +1252,20 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                         }),
                     ));
                 }
+                // package C: the pane keeps an answer six seconds in place of the two rows
+                if ui["answered"][0].is_string() && ui["answered"][0] == item["dream"] {
+                    let said = dreams::answer_word(string(&ui["answered"][1]));
+                    blocks.truncate(blocks.len() - 2);
+                    blocks.push((
+                        vec![format!(
+                            "{}{}{}{OFF}",
+                            " ".repeat(at),
+                            ink("faint"),
+                            fit(&format!("✓ kept: {said}"), width.saturating_sub(at))
+                        )],
+                        Value::Null,
+                    ));
+                }
             }
         }
         if !blocks.is_empty() {
@@ -1257,7 +1304,9 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
         let mut part = Lines::default();
         part.rows.push(heading_mode(s, width, at, pixels));
         let room = rooms[&k] - 1;
-        let opened_at = blocks.iter().position(|(_, a)| a["key"] == ui["open"]);
+        let opened_at = blocks
+            .iter()
+            .position(|(_, a)| !a.is_null() && a["key"] == ui["open"]);
         let mut first = 0;
         while let Some(open) = opened_at {
             if first >= open
@@ -1285,7 +1334,7 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
             } else if part.rows.len() + r.len() > room {
                 break;
             }
-            part.put(r, Some(&a));
+            part.put(r, (!a.is_null()).then_some(&a));
         }
         for (i, line) in part.rows.iter_mut().enumerate() {
             if line.contains("\x1b[24m") {

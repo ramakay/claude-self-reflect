@@ -157,6 +157,14 @@ fn show(name: &str) -> (tempfile::TempDir, Shown) {
         &args(sc["sid"].as_str().unwrap(), cols, rows),
     );
     pane.pixels = sc["pixels"] == true;
+    if let [dream, answer, at] = sc["answered"].as_array().map_or(&[][..], Vec::as_slice) {
+        // the dream answer the pane kept: (dream id, answer, when)
+        pane.answered = Some((
+            dream.as_str().unwrap().into(),
+            answer.as_str().unwrap().into(),
+            at.as_f64().unwrap(),
+        ));
+    }
     let mut text = vec![];
     for step in sc["steps"].as_array().unwrap() {
         let at = step["at"].as_f64().unwrap();
@@ -446,17 +454,17 @@ fn goldens_are_complete_and_free_of_machine_paths() {
 }
 
 #[test]
-#[ignore = "packages C+D+E: Flight, compaction card, value row"]
+#[ignore = "packages D+E: compaction card, value row"]
 fn frame_main_46x30() {
     check_frame("frame-main-46x30");
 }
 #[test]
-#[ignore = "packages C+D+E: Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages D+E: compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x40() {
     check_frame("frame-main-100x40");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70() {
     check_frame("frame-main-100x70");
 }
@@ -476,17 +484,17 @@ fn frame_main_7x30() {
     check_frame("frame-main-7x30");
 }
 #[test]
-#[ignore = "packages C+D+E: Flight, compaction card, value row"]
+#[ignore = "packages D+E: compaction card, value row"]
 fn pixels_frame_main_46x30() {
     check_frame("pixels-frame-main-46x30");
 }
 #[test]
-#[ignore = "packages C+D+E: Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages D+E: compaction card, Lost and found / told / last / todos, value row"]
 fn pixels_frame_main_100x40() {
     check_frame("pixels-frame-main-100x40");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn pixels_frame_main_100x70() {
     check_frame("pixels-frame-main-100x70");
 }
@@ -506,117 +514,117 @@ fn pixels_frame_main_7x30() {
     check_frame("pixels-frame-main-7x30");
 }
 #[test]
-#[ignore = "packages C+D+E: Flight, compaction card, value row, held/tall main"]
+#[ignore = "packages D+E: compaction card, value row, held/tall main"]
 fn frame_main_100x40_tall() {
     check_frame("frame-main-100x40-tall");
 }
 #[test]
-#[ignore = "packages C+D+E: coach, compaction card, Lost and found / told / last / todos, value row, held/tall main"]
+#[ignore = "packages D+E: compaction card, Lost and found / told / last / todos, value row, held/tall main"]
 fn frame_main_100x40_tall_bottom() {
     check_frame("frame-main-100x40-tall-bottom");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, compaction card, value row, held/tall main"]
+#[ignore = "packages B+D+E: shift map, compaction card, value row, held/tall main"]
 fn frame_main_46x30_tall() {
     check_frame("frame-main-46x30-tall");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_held() {
     check_frame("frame-main-100x70-held");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_unheld() {
     check_frame("frame-main-100x70-unheld");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_fold_passed() {
     check_frame("frame-main-100x70-fold-passed");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_fold_flight_more() {
     check_frame("frame-main-100x70-fold-flight-more");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_flight_folded() {
     check_frame("frame-main-100x70-flight-folded");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_flight_unfolded() {
     check_frame("frame-main-100x70-flight-unfolded");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_open_compacted() {
     check_frame("frame-main-100x70-open-compacted");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_open_agent() {
     check_frame("frame-main-100x70-open-agent");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_open_reading() {
     check_frame("frame-main-100x70-open-reading");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_open_rule() {
     check_frame("frame-main-100x70-open-rule");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_open_story() {
     check_frame("frame-main-100x70-open-story");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_open_recall() {
     check_frame("frame-main-100x70-open-recall");
 }
 #[test]
-#[ignore = "packages C+D+E: coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages D+E: compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x40_open_lost() {
     check_frame("frame-main-100x40-open-lost");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, compaction card, Lost and found / told / last / todos, Earlier, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, Earlier, value row"]
 fn frame_main_100x70_earlier() {
     check_frame("frame-main-100x70-earlier");
 }
 #[test]
-#[ignore = "packages B+C+D+E: shift map, Flight, coach, answered, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: shift map, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_answered() {
     check_frame("frame-main-100x70-answered");
 }
 #[test]
-#[ignore = "packages C+D+E: Flight, Lost and found / told / last / todos, value row"]
+#[ignore = "packages D+E: Lost and found / told / last / todos, value row"]
 fn frame_main_100x70_fresh() {
     check_frame("frame-main-100x70-fresh");
 }
 #[test]
-#[ignore = "packages C+D+E: Flight, Lost and found / told / last / todos, value row"]
+#[ignore = "packages D+E: Lost and found / told / last / todos, value row"]
 fn frame_main_46x30_fresh() {
     check_frame("frame-main-46x30-fresh");
 }
 #[test]
-#[ignore = "packages B+C+D+E: phone, Flight, compaction card, value row"]
+#[ignore = "packages B+D+E: phone, compaction card, value row"]
 fn frame_main_46x30_phone() {
     check_frame("frame-main-46x30-phone");
 }
 #[test]
-#[ignore = "packages B+C+D+E: phone, Flight, coach, compaction card, Lost and found / told / last / todos, value row"]
+#[ignore = "packages B+D+E: phone, compaction card, Lost and found / told / last / todos, value row"]
 fn frame_main_38x40_phone() {
     check_frame("frame-main-38x40-phone");
 }
 #[test]
-#[ignore = "packages B+C+D+E: phone zoom, Flight, compaction card, value row"]
+#[ignore = "packages B+D+E: phone zoom, compaction card, value row"]
 fn frame_main_46x30_phone_zoomed() {
     check_frame("frame-main-46x30-phone-zoomed");
 }
@@ -625,7 +633,6 @@ fn section_frame_main_100x70_story() {
     check_section("frame-main-100x70", "story");
 }
 #[test]
-#[ignore = "package C: Flight"]
 fn section_frame_main_100x70_flight() {
     check_section("frame-main-100x70", "flight");
 }
@@ -643,7 +650,6 @@ fn section_frame_main_100x70_compacted() {
     check_section("frame-main-100x70", "compacted");
 }
 #[test]
-#[ignore = "package C: coach"]
 fn section_frame_main_100x70_coach() {
     check_section("frame-main-100x70", "coach");
 }
@@ -657,7 +663,6 @@ fn section_frame_main_100x70_lost() {
     check_section("frame-main-100x70", "lost");
 }
 #[test]
-#[ignore = "package C: Flight"]
 fn section_frame_main_100x70_fresh_flight() {
     check_section("frame-main-100x70-fresh", "flight");
 }
@@ -693,7 +698,6 @@ fn section_frame_main_46x30_story() {
     check_section("frame-main-46x30", "story");
 }
 #[test]
-#[ignore = "package C: Flight"]
 fn section_frame_main_46x30_flight() {
     check_section("frame-main-46x30", "flight");
 }
