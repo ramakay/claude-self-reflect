@@ -325,7 +325,7 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl FakeOutside {
-    fn new(setup: Setup) -> Self {
+    pub fn new(setup: Setup) -> Self {
         Self {
             setup,
             kept: Mutex::default(),

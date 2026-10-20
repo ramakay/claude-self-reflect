@@ -2,9 +2,12 @@
 
 use super::*;
 use crate::companion::{
-    app::dreamer::{
-        self, answered,
-        outside::fake::{Fake, Gated},
+    app::{
+        band::{self, tests::kit as bandkit},
+        dreamer::{
+            self,
+            outside::fake::{Fake, Gated},
+        },
     },
     relay::{
         dispatch::testing::{fixture_in, run, until, Fixture},
@@ -108,8 +111,10 @@ fn dream_rig_in(world: World, sid: &str) -> Rig {
     });
     let out = Arc::new(Fake::new(keep.clone(), BRIEF));
     let mut table = Table::new();
+    band::register_with(&mut table, bandkit::gear().seams);
     register_with(&mut table, keep.clone());
     dreamer::register_with(&mut table, out.clone());
+    band::register_late(&mut table);
     let fx = fixture_in(world, sid);
     install_keep(&fx.cx, &keep);
     Rig {
@@ -171,10 +176,26 @@ impl Rig {
         self.out.as_ref().expect("a dream rig")
     }
 
-    /// The line of the dream the band draws, if one is up.
-    fn up(&self) -> Option<String> {
-        let view = self.row(SID, "view");
-        view["note"]["line"].as_str().map(str::to_string)
+    /// What the band draws now.
+    async fn band(&self) -> bandkit::Drawn {
+        bandkit::band(&self.table, &self.fx.cx).await
+    }
+
+    /// Wait until the band shows text that matches `pattern`.
+    async fn band_has(&self, pattern: &str) -> bool {
+        for _ in 0..1000 {
+            if self.band().await.has(pattern) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    /// Press the band's button labelled `label`.
+    async fn press_label(&self, label: &str) {
+        let pressed = bandkit::press(&self.table, &self.fx.cx, label).await;
+        assert!(pressed, "the band draws a button {label}");
     }
 
     /// A context whose forks wait until the gate is opened.
@@ -293,11 +314,11 @@ fn at(claude: f64, dreamer: f64, last_look: f64) -> PaceRow {
     }
 }
 
-// ---- the TypeScript's tests, one for one (companion.test.ts), by name.
+// ---- the removed TypeScript companion's tests, one for one, by name.
 //
 // Where a test also asserts what the dreamer does (its forks, `look` records, the band), it
-// runs on a dream rig: the pace and the dreamer together. The band is another package, so the
-// dream it would draw is read from the session's `view` row, and a button is `answered`.
+// runs on a dream rig: the pace and the dreamer together, under the real band, which a test
+// draws and whose buttons it presses.
 
 #[tokio::test]
 async fn on_the_first_look_waits_until_claude_has_spent_10_tokens_for_each_one_it_costs() {
@@ -335,7 +356,7 @@ async fn on_the_first_look_waits_until_claude_has_spent_10_tokens_for_each_one_i
     assert_eq!(r.row(SID, "chapter")["steps"], json!(6));
     assert_eq!(r.row(SID, "pace")["claude"], num(6. * LOOK));
     r.steps(cx, 6, None, None).await; // 12 steps: 1 in 12, within it
-    assert!(until(|| r.up().is_some()).await);
+    assert!(r.band_has("What if the notes also read").await);
     assert_eq!(r.row(SID, "pace")["claude"], num(12. * LOOK));
     assert_eq!(r.row(SID, "chapter")["steps"], json!(12));
     let chapters = r.of_kind("chapter");
@@ -377,10 +398,18 @@ async fn on_the_first_look_waits_until_claude_has_spent_10_tokens_for_each_one_i
     }
     let view = r.row(SID, "view");
     assert_eq!(view["note"]["kind"], "dream");
+    let drawn = r.band().await;
+    assert!(drawn.has("Dream · "));
+    assert!(drawn.has_button("Already thought of it"));
+    r.press_label("Learn more").await;
+    let explained = r.band().await;
+    assert!(explained.has("Notes could follow side branches"));
+    assert!(explained.has("this look 41,000 tokens"));
     // Ask Claude: the box is filled, and the dream is adopted, which gives its place back.
-    answered(cx, &view["note"], "ask_claude", false, None)
-        .await
-        .unwrap();
+    r.press_label("Ask Claude").await;
+    let filled = r.fx.host.seen.lock().unwrap().filled.clone();
+    assert_eq!(filled.len(), 1);
+    assert!(filled[0].starts_with(&format!("“{DREAM_LINE}”")));
     let last = r.records().pop().unwrap();
     assert_eq!(
         (last["kind"].clone(), last["answer"].clone()),

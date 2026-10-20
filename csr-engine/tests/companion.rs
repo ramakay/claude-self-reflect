@@ -477,7 +477,7 @@ fn pictures_match_pillow_dimensions_and_pixels() {
         "last-rich",
         last(&LastFacts::from_value(&facts["last"]), 43, 3, cell, ground).unwrap(),
     );
-    // These three draw text. Their goldens are in the Mac's Menlo, as pane.py draws
+    // These three draw text. Their goldens are in the Mac's Menlo, as the pane draws
     // them; where Menlo is missing (Linux CI) the text comes from another font.
     let menlo = std::path::Path::new("/System/Library/Fonts/Menlo.ttc").exists();
     if !menlo {
@@ -1598,6 +1598,210 @@ mod relay {
         assert!(rows[1]["handle_us"].is_u64());
         assert_eq!(rows[3]["k"], "usage");
         assert_eq!(rows[3]["usage"], json!({ "x": 1 }));
+    }
+
+    /// What the engine pushes on stdout, read apart so a test can wait for it with a time limit.
+    fn listen(serve: &mut Serve) -> std::sync::mpsc::Receiver<Value> {
+        let mut lines = serve.lines.take().unwrap();
+        let (send, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if lines.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let Ok(pushed) = serde_json::from_str(&line) else {
+                    continue;
+                };
+                if send.send(pushed).is_err() {
+                    break;
+                }
+            }
+        });
+        got
+    }
+
+    /// What Claude Code says to a call of the engine's: a long conversation, where an empty
+    /// history pays a compaction back in 14 calls, the compactor on auto, a terminal to draw on;
+    /// anything else nothing.
+    fn said(call: &Value) -> Value {
+        match call["m"].as_str().unwrap_or("") {
+            "session.usage" => json!({ "startedAt": 0, "rateLimits": [],
+                "context": { "tokens": 260_000, "window": 1_000_000, "percent": 26 } }),
+            "config.list" => json!([{ "key": "csr-companion.autoCompact", "kind": "enum",
+                "value": "auto" }]),
+            "session.surfaces" => json!(["terminal"]),
+            _ => Value::Null,
+        }
+    }
+
+    /// A reply that holds calls is answered, and its answer too, until one holds none.
+    fn settle(sock: &Path, mut reply: Value) -> Value {
+        while let Some(calls) = reply["calls"].as_array() {
+            let results: Vec<Value> = (calls.iter())
+                .map(|call| json!({ "id": call["id"], "v": said(call) }))
+                .collect();
+            let body = json!({ "v": "1", "id": reply["id"], "results": results });
+            reply = post(sock, "/step", &body);
+        }
+        reply
+    }
+
+    /// Answer what the engine pushes until `done` holds, for at most ten seconds.
+    fn pump(sock: &Path, pushed: &std::sync::mpsc::Receiver<Value>, done: impl Fn() -> bool) {
+        let limit = Instant::now() + Duration::from_secs(10);
+        while !done() && Instant::now() < limit {
+            if let Ok(conversation) = pushed.recv_timeout(Duration::from_millis(20)) {
+                settle(sock, conversation);
+            }
+        }
+        assert!(done(), "the engine did not get there");
+    }
+
+    /// The text and the buttons (label, key) of a tree.
+    fn drawn(tree: &Value, texts: &mut Vec<String>, buttons: &mut Vec<(String, String)>) {
+        if tree["type"] == "Button" {
+            let (label, key) = (&tree["props"]["label"], &tree["props"]["key"]);
+            buttons.push((label.as_str().unwrap().into(), key.as_str().unwrap().into()));
+        }
+        for child in tree["children"].as_array().into_iter().flatten() {
+            match child.as_str() {
+                Some(text) => texts.push(text.to_string()),
+                None => drawn(child, texts, buttons),
+            }
+        }
+    }
+
+    fn band(sock: &Path, sid: &str) -> Value {
+        let e = json!({ "component": "AbovePrompt", "props": {}, "beneath": null });
+        let reply = post(
+            sock,
+            "/event",
+            &json!({ "v": "1", "sid": sid, "cwd": "/repo", "k": "band", "e": e }),
+        );
+        settle(sock, reply)
+    }
+
+    fn press(sock: &Path, sid: &str, key: &str) -> Value {
+        let body = json!({ "v": "1", "sid": sid, "cwd": "/repo", "key": key, "requestId": "r1" });
+        settle(sock, post(sock, "/press", &body))
+    }
+
+    fn button_of(tree: &Value, label: &str) -> String {
+        let (mut texts, mut buttons) = (Vec::new(), Vec::new());
+        drawn(tree, &mut texts, &mut buttons);
+        let found = buttons.iter().find(|(shown, _)| shown == label);
+        found
+            .unwrap_or_else(|| panic!("no button {label} in {buttons:?}"))
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn the_band_draws_a_remembered_note_and_a_countdown_s_cancel_reaches_the_compactor() {
+        use csr_engine::companion::store::{Store, MACHINE};
+        let mut serve = start("1", &[]);
+        let pushed = listen(&mut serve);
+        let root = serve._dir.path().join(".claude-self-reflect/csr-companion");
+        let store = Store::at(root.join("companion.db"));
+        let note = json!({
+            "id": "shift:src/hooks/mod.rs:ca5655a841fb:d8fe3a96", "kind": "shift",
+            "file": "src/hooks/mod.rs",
+            "line": "`dispatch_hook` in mod.rs changed in ca5655a on 09-17.",
+            "title": "Your 09-14 work on dispatch_hook has changed since",
+            "text": "On 09-14 you asked “switch to main”.", "sketch": [],
+            "oid": "ca5655a841fb", "conversation": "d8fe3a96-e6f8", "at": 1,
+        });
+        let up = json!({ "kind": "offer", "note": note, "tag": "Heads up", "shownAt": 1,
+            "promptsSurvived": 0 });
+        store.set("s1", "view", &up).unwrap();
+
+        // A session with a remembered note: the band draws the note and its buttons.
+        let tree = band(&serve.sock, "s1");
+        let (mut texts, mut buttons) = (Vec::new(), Vec::new());
+        drawn(&tree["tree"], &mut texts, &mut buttons);
+        assert!(texts.iter().any(|t| t == "Heads up · "), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("changed in ca5655a")),
+            "{texts:?}"
+        );
+        let labels: Vec<&str> = buttons.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["Learn more", "Knew this already", "Dismiss"]);
+
+        // Knew this already: the press is answered, and the note never shows again.
+        let key = button_of(&tree["tree"], "Knew this already");
+        assert_eq!(press(&serve.sock, "s1", &key), json!({}));
+        assert_eq!(
+            store.get(MACHINE, "known").unwrap().unwrap(),
+            json!([note["id"]])
+        );
+        assert_eq!(store.get("s1", "view").unwrap(), None);
+        assert_eq!(band(&serve.sock, "s1"), json!({}));
+        assert_eq!(
+            press(&serve.sock, "s1", &key),
+            json!({}),
+            "a late press is nothing"
+        );
+
+        // A turn that ends high on context, on auto: a countdown, with its Cancel on the band.
+        let start = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "sid": "s2", "cwd": "/repo", "k": "start",
+                "e": { "cwd": "/repo", "isInteractive": true } }),
+        );
+        settle(&serve.sock, start);
+        let notify = |k: &str, e: Value| {
+            let body = json!({ "v": "1", "sid": "s2", "cwd": "/repo", "k": k, "e": e });
+            post(&serve.sock, "/event", &body)
+        };
+        notify("turn_start", json!({ "text": "", "turnId": "t" }));
+        notify(
+            "stop",
+            json!({ "stop_hook_active": false, "background_tasks": [] }),
+        );
+        let landed = "Done. Codex committed 6369e6b on the study branch; the gates are green.";
+        notify(
+            "turn_complete",
+            json!({ "answer": landed, "durationMs": 1000, "isAborted": false, "turnId": "t",
+                "reason": "answer" }),
+        );
+        let counting = || {
+            store
+                .get("s2", "compact")
+                .ok()
+                .flatten()
+                .is_some_and(|v| v["kind"] == "countdown")
+        };
+        pump(&serve.sock, &pushed, counting);
+        let tree = band(&serve.sock, "s2");
+        let (mut texts, mut buttons) = (Vec::new(), Vec::new());
+        drawn(&tree["tree"], &mut texts, &mut buttons);
+        assert!(
+            texts.iter().any(|t| t.starts_with("Compacting in")),
+            "{texts:?}"
+        );
+        let key = button_of(&tree["tree"], "Cancel");
+        assert_eq!(key, "compact-cancel");
+
+        // The band's press goes to the compactor: the countdown is over, and the log says who.
+        assert_eq!(press(&serve.sock, "s2", &key), json!({}));
+        pump(&serve.sock, &pushed, || !counting());
+        let log = root.join("dreams.jsonl");
+        let cancelled = || {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            text.lines()
+                .any(|l| l.contains("\"event\":\"cancel\"") && l.contains("\"by\":\"press\""))
+        };
+        pump(&serve.sock, &pushed, cancelled);
+        let after = band(&serve.sock, "s2");
+        let (mut texts, mut buttons) = (Vec::new(), Vec::new());
+        drawn(&after["tree"], &mut texts, &mut buttons);
+        assert!(
+            !texts.iter().any(|t| t.starts_with("Compacting")),
+            "{texts:?}"
+        );
     }
 
     #[test]

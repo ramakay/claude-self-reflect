@@ -238,7 +238,7 @@ async fn open_herdr_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> bool {
 }
 
 /// Open the pane: a herdr split when there is one, else Claude Code's own pane. Says which.
-async fn open_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> &'static str {
+pub(crate) async fn open_pane(cx: &Ctx, outside: &dyn Outside, cwd: &str) -> &'static str {
     if open_herdr_pane(cx, outside, cwd).await {
         return "herdr";
     }

@@ -7,7 +7,7 @@
 //! and `engine` the tests that drive the hooks with it. Nothing reads or writes the real HOME.
 
 mod engine;
-mod kit;
+pub(crate) mod kit;
 
 use super::rules::{
     act_why, decide, ends_on_question, keep_list, last_question, mode_of, notice_line,

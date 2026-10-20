@@ -1,10 +1,12 @@
-//! The dreamer's tests: the TypeScript's (companion.test.ts), one for one by name, and the rest
+//! The dreamer's tests: the removed TypeScript companion's, one for one by name, and the rest
 //! of what the module does.
 //!
-//! The band is another package. Where a TypeScript test looked for a note in the band, these look
-//! at the session's `view` row, which is what the band draws; where one pressed a band button
-//! or let two prompts pass, `band_prompt` stands in for the band's note lifecycle (it counts the
-//! prompt and, at the second, calls `typed_past`, as the band's entry does).
+//! The rig carries the real band (`band::register_with` and `register_late`, on a pretend
+//! machine and pane). Where a TypeScript test looked for a note in the band, pressed one of its
+//! buttons or let two prompts pass, the test here draws the band, presses the button by its
+//! label and sends the prompt through the `digit` entries, the band's lifecycle among them. A
+//! few tests still read the `view` row (`up`), where the TypeScript asked only whether a dream
+//! was kept; they do not claim the band drew it.
 
 use super::{
     answers::LoggedDream,
@@ -13,7 +15,15 @@ use super::{
     *,
 };
 use crate::companion::{
-    app::{pace, pace::facts, state, state::strings},
+    app::{
+        band::{
+            self,
+            tests::kit::{self as bandkit, Drawn},
+        },
+        pace,
+        pace::facts,
+        state::strings,
+    },
     relay::{
         dispatch::testing::{fixture_in, run, until, Fixture},
         host::fake::World,
@@ -22,6 +32,8 @@ use crate::companion::{
 use std::{collections::HashSet, sync::Mutex, time::Duration};
 
 const SID: &str = "sess-1";
+/// What the dream of `dream_reply` says first, as the TypeScript's band tests find it.
+const NOTES_READ: &str = "What if the notes also read";
 /// Where the fake clock starts (the TypeScript's `NOW`).
 const NOW: f64 = 1_791_547_200_000.;
 /// What one step of Claude's costs: the four counts of `usage()`.
@@ -112,8 +124,10 @@ fn rig_in(world: World, sid: &str) -> Rig {
     });
     let out = Arc::new(Fake::new(keep.clone(), BRIEF));
     let mut table = Table::new();
+    band::register_with(&mut table, bandkit::gear().seams);
     pace::register_with(&mut table, keep.clone());
     register_with(&mut table, out.clone());
+    band::register_late(&mut table);
     let fx = fixture_in(world, sid);
     pace::install_keep(&fx.cx, &keep);
     Rig {
@@ -201,7 +215,32 @@ impl Rig {
         self.fx.host.seen.lock().unwrap().forks.clone()
     }
 
-    /// The line of the dream the band draws, if one is up.
+    /// What the band draws now (`band` of the TypeScript's `mount`).
+    async fn band(&self) -> Drawn {
+        bandkit::band(&self.table, &self.fx.cx).await
+    }
+
+    /// Wait until the band shows text that matches `pattern`.
+    async fn band_has(&self, pattern: &str) -> bool {
+        for _ in 0..1000 {
+            if self.band().await.has(pattern) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    /// Press the band's button labelled `label`; false when it draws none.
+    async fn press(&self, label: &str) -> bool {
+        bandkit::press(&self.table, &self.fx.cx, label).await
+    }
+
+    fn filled(&self) -> Vec<String> {
+        self.fx.host.seen.lock().unwrap().filled.clone()
+    }
+
+    /// The line of the dream in the session's `view` row, if one is up.
     fn up(&self) -> Option<String> {
         let view = self.row(SID, "view");
         view["note"]["line"].as_str().map(str::to_string)
@@ -280,29 +319,6 @@ impl Rig {
         run(&self.table, "digit", cx, e).await;
     }
 
-    /// A prompt, and the band's note lifecycle after it: two prompts past a note clear it, and
-    /// a dream cleared that way was typed past.
-    async fn band_prompt(&self, cx: &Ctx, text: &str) {
-        self.prompt(cx, text, "human").await;
-        let mut ignored = None;
-        state::update(cx, "view", |current| {
-            let mut view = current?;
-            let survived = view["promptsSurvived"].as_u64().unwrap_or(0) + 1;
-            if survived < 2 {
-                view["promptsSurvived"] = json!(survived);
-                return Some(view);
-            }
-            if view["kind"] == "offer" {
-                ignored = Some(view["note"].clone());
-            }
-            None
-        })
-        .unwrap();
-        if let Some(note) = ignored {
-            typed_past(cx, &note).await.unwrap();
-        }
-    }
-
     /// A chapter that started an hour ago, ten steps in, with one dream shown.
     fn hour_old_chapter(&self) {
         let chapter = json!({ "session": SID, "started": NOW - 3_600_000., "steps": 10,
@@ -373,7 +389,10 @@ async fn a_look_that_finds_nothing_does_not_slow_the_next_and_with_nothing_new_a
         (pace["looks"].clone(), pace["dreams"].clone()),
         (json!(1), json!(0))
     );
-    assert_eq!(r.up(), None);
+    assert!(
+        !r.band().await.drew,
+        "a look that found nothing leaves the band bare"
+    );
     // Step 6 waits for its share; step 12 finds nothing.
     let looks = r.looks();
     assert_eq!(looks.len(), 2, "{looks:?}");
@@ -1292,7 +1311,7 @@ async fn a_look_still_running_when_a_compaction_starts_the_next_chapter_leaves_t
         fresh,
         "due, looks and shown as the compaction set them"
     );
-    assert_eq!(r.up(), None);
+    assert!(!r.band().await.drew, "the stale look shows nothing");
     let stale = r.find(|record| record["outcome"] == "stale").unwrap();
     assert!(stale["tokens"].is_number());
 }
@@ -1302,15 +1321,12 @@ async fn a_compaction_carries_the_dream_that_is_up_once_marked_still_open_the_ne
     let r = rig(replies(&[dream_reply()]));
     let cx = r.cx();
     r.go(12).await;
-    assert!(until(|| r.up().is_some()).await);
+    assert!(r.band_has(NOTES_READ).await);
     r.compact(&cx, "manual").await;
     let view = r.row(SID, "view");
-    assert_eq!(
-        view["carried"],
-        json!(true),
-        "still open from before the compaction"
-    );
-    assert_eq!(r.up().as_deref(), Some(DREAM_LINE));
+    assert_eq!(view["carried"], json!(true));
+    assert!(r.band_has("still open from before the compaction").await);
+    assert!(r.band().await.has(NOTES_READ));
     let carried = r.with("answer", "answer", "carried");
     assert_eq!(carried.len(), 1, "{:?}", r.records());
     let chapter = r.row(SID, "chapter");
@@ -1321,9 +1337,9 @@ async fn a_compaction_carries_the_dream_that_is_up_once_marked_still_open_the_ne
     // Two prompts again to answer it.
     assert_eq!(view["promptsSurvived"], json!(0));
     r.prompt(&cx, "one", "human").await;
-    assert_eq!(r.up().as_deref(), Some(DREAM_LINE));
+    assert!(r.band().await.has(NOTES_READ));
     r.compact(&cx, "manual").await;
-    assert_eq!(r.up(), None);
+    assert!(!r.band().await.has(NOTES_READ));
     let answers: Vec<Value> = r
         .of_kind("answer")
         .into_iter()
@@ -1337,10 +1353,14 @@ async fn a_dream_typed_past_is_never_asked_again_and_the_dreamer_backs_off() {
     let r = rig(replies(&[dream_reply(), dream_reply(), dream_reply()]));
     let cx = r.cx();
     r.go(12).await;
-    assert!(until(|| r.up().is_some()).await);
-    r.band_prompt(&cx, "one").await;
-    r.band_prompt(&cx, "two").await;
-    assert_eq!(r.up(), None);
+    assert!(r.band_has(NOTES_READ).await);
+    r.prompt(&cx, "one", "human").await;
+    assert!(
+        r.band().await.has(NOTES_READ),
+        "two prompts again to answer it"
+    );
+    r.prompt(&cx, "two", "human").await;
+    assert!(!r.band().await.has(NOTES_READ));
     assert_eq!(r.row(SID, "looksToSkip"), json!(1));
     let answers = r.row(MACHINE, "answers");
     assert_eq!(
@@ -1363,7 +1383,7 @@ async fn a_dream_typed_past_is_never_asked_again_and_the_dreamer_backs_off() {
         r.forks()[1].contains(DREAM_LINE),
         "the seen list rides in the prompt"
     );
-    assert_eq!(r.up(), None);
+    assert!(!r.band().await.has(NOTES_READ));
 }
 
 #[tokio::test]
@@ -1379,12 +1399,7 @@ async fn a_dream_about_the_pane_that_cites_no_other_session_still_reaches_you_yo
     .join("\n");
     let r = rig(replies(&[pigment]));
     r.go(12).await;
-    assert!(
-        until(|| r
-            .up()
-            .is_some_and(|line| line.contains("pigment's nyt inks")))
-        .await
-    );
+    assert!(r.band_has("pigment's nyt inks").await);
     assert_eq!(r.dreams().len(), 1);
     assert!(r.find(|record| record["outcome"] == "ungrounded").is_none());
 }
@@ -1394,13 +1409,13 @@ async fn a_dream_answered_in_the_pane_leaves_the_band_and_is_never_counted_as_ty
     let r = rig(replies(&[dream_reply()]));
     let cx = r.cx();
     r.go(12).await;
-    assert!(until(|| r.up().is_some()).await);
+    assert!(r.band_has(NOTES_READ).await);
     let id = r.dreams()[0]["id"].as_str().unwrap().to_string();
     let said = json!({ "kind": "dream", "id": id, "line": DREAM_LINE });
     let answer = json!({ "kind": "answer", "id": id, "answer": "helpful", "at": 1, "by": "pane" });
     r.out.set_log(&format!("{said}\n{answer}\n"));
     r.prompt(&cx, "one", "human").await;
-    assert_eq!(r.up(), None);
+    assert!(!r.band().await.has(NOTES_READ));
     assert_eq!(r.of_kind("answer").len(), 0, "the pane logged it, once");
     assert_eq!(r.row(SID, "looksToSkip").as_i64().unwrap_or(0), 0);
     let answers = r.row(MACHINE, "answers");
@@ -1419,13 +1434,116 @@ async fn a_dream_about_csr_s_own_dream_cycle_still_reaches_you_only_the_pane_and
     );
     let r = rig(replies(&[work]));
     r.go(12).await;
-    assert!(
-        until(|| r
-            .up()
-            .is_some_and(|line| line.contains("What if the dream cycle also read")))
-        .await
-    );
+    assert!(r.band_has("What if the dream cycle also read").await);
     assert_eq!(r.dreams().len(), 1);
+}
+
+#[tokio::test]
+async fn the_dim_4_on_a_dream_turns_dreams_off_after_a_second_press() {
+    let r = rig(replies(&[dream_reply()]));
+    r.go(12).await;
+    assert!(r.band_has(NOTES_READ).await);
+
+    assert!(r.press("Disable").await);
+    assert!(r.fx.host.seen.lock().unwrap().configured.is_empty());
+    assert!(r.band().await.has_button("Press again to turn dreams off"));
+
+    assert!(r.press("Press again to turn dreams off").await);
+    let configured = r.fx.host.seen.lock().unwrap().configured.clone();
+    assert_eq!(
+        configured,
+        [json!({ "key": "csr-companion.dreams", "value": false })]
+    );
+    let last = r.records().pop().unwrap();
+    assert_eq!(
+        (last["kind"].clone(), last["answer"].clone()),
+        (json!("answer"), json!("turn_off"))
+    );
+    assert!(!r.band().await.has(NOTES_READ));
+}
+
+#[tokio::test]
+async fn a_dream_waits_while_you_should_know_asks_so_its_4_can_never_turn_the_other_band() {
+    let r = rig(replies(&[dream_reply()]));
+    let cx = r.cx();
+    r.go(12).await;
+    assert!(until(|| !r.forks().is_empty()).await);
+    assert!(
+        r.band_has(NOTES_READ).await,
+        "the dream is up when nothing asks"
+    );
+    // You should know's band, below this one, asks with its own 4.
+    let asking = json!({ "type": "Box", "props": {}, "children": [
+        { "type": "Button", "props": { "key": "ysk-disable", "hotkey": "4", "plain": true,
+            "label": "Disable" }, "children": [] }] });
+    let under = bandkit::draw(&r.table, &cx, asking).await;
+    assert!(under.is_none(), "the band leaves the one below as it is");
+
+    // Prompts typed while the dream was hidden are not "typed past".
+    r.prompt(&cx, "one", "human").await;
+    r.prompt(&cx, "two", "human").await;
+    assert!(r
+        .records()
+        .iter()
+        .all(|record| record["answer"] != "ignored"));
+    assert_eq!(r.row(SID, "looksToSkip"), Value::Null);
+
+    // As You should know's band redraws when its note clears: the dream, with its own 4.
+    let shown = r.band().await;
+    assert!(shown.has(NOTES_READ));
+    assert_eq!(shown.key_of("Disable").as_deref(), Some("band-disable"));
+    assert!(shown.key_of("ysk-disable").is_none());
+}
+
+#[tokio::test]
+async fn a_dream_that_cannot_be_turned_off_says_so_and_stays_up() {
+    let world = World {
+        config_refused: true,
+        ..replies(&[dream_reply()])
+    };
+    let r = rig(world);
+    r.go(12).await;
+    assert!(r.band_has(NOTES_READ).await);
+    assert!(r.press("Disable").await);
+    assert!(r.press("Press again to turn dreams off").await);
+    let shown = r.band().await;
+    assert!(shown.has("Couldn't turn dreams off here. Use /config."));
+    assert!(shown.has(NOTES_READ));
+    assert!(
+        shown.has_button("Disable"),
+        "the confirm is asked for again"
+    );
+}
+
+#[tokio::test]
+async fn already_thought_of_it_keeps_the_dream_from_being_asked_again() {
+    let r = rig(replies(&[dream_reply()]));
+    r.go(12).await;
+    assert!(r.band_has(NOTES_READ).await);
+    assert!(r.press("Already thought of it").await);
+    assert!(!r.band().await.has(NOTES_READ));
+    let seen = strings(&r.cx(), MACHINE, "knownDreams");
+    assert_eq!(seen, [seen_entry(DREAM_LINE, Some(TITLE))]);
+    let last = r.records().pop().unwrap();
+    assert_eq!(last["answer"], "thought_of_it");
+}
+
+#[tokio::test]
+async fn learn_more_explains_the_dream_and_ask_claude_hands_it_over() {
+    let r = rig(replies(&[dream_reply()]));
+    r.go(12).await;
+    assert!(r.band_has(NOTES_READ).await);
+    assert!(r.press("Learn more").await);
+    let explained = r.band().await;
+    assert!(explained.has(TITLE));
+    assert!(explained.has("this look 41,000 tokens"));
+    assert!(r.press("Ask Claude").await);
+    let filled = r.filled();
+    assert_eq!(filled.len(), 1);
+    assert!(filled[0].starts_with(&format!("“{DREAM_LINE}”")));
+    assert!(!r.band().await.has(NOTES_READ));
+    let last = r.records().pop().unwrap();
+    assert_eq!(last["answer"], "ask_claude");
 }
 
 // ---------------------------------------------------------------- You should know's fork

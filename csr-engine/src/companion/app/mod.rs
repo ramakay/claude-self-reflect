@@ -10,7 +10,7 @@
 //!
 //! The order of the calls in `table()`:
 //!
-//! 1. `band`: the held digit on `digit`, the `band` render.
+//! 1. `band`: the held digit on `digit`, the `band` render, its buttons on `press`.
 //! 2. `pane_cmd`: the WP0 `start` (registers `/csr`), the `csr` answer, the `pane` render.
 //! 3. `usage`: the log row of the session's usage, after `pane_cmd`'s start; `measure`.
 //! 4. `touch`, `fleet`, `compactor`, `setup_walk`, `pace`, `story`, `dreamer`, `guard`, `carry`,
@@ -56,7 +56,7 @@ pub fn table() -> Table {
     t
 }
 
-/// The finished table: each key's features in the order they run (46 entries).
+/// The finished table: each key's features in the order they run (47 entries).
 #[cfg(test)]
 const TARGET: &[(&str, &[&str])] = &[
     ("stop", &["compactor"]),
@@ -93,7 +93,7 @@ const TARGET: &[(&str, &[&str])] = &[
     ("carry", &["carry"]),
     ("keep", &["subagent"]),
     ("pane", &["pane_cmd"]),
-    ("press", &["pane_cmd", "setup_walk"]),
+    ("press", &["band", "pane_cmd", "setup_walk"]),
     ("measure", &["usage"]),
 ];
 
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn the_table_registers_each_feature_where_the_map_puts_it() {
         let t = table();
-        assert_eq!(TARGET.iter().map(|(_, f)| f.len()).sum::<usize>(), 46);
+        assert_eq!(TARGET.iter().map(|(_, f)| f.len()).sum::<usize>(), 47);
         for key in t.keys() {
             let want = TARGET.iter().find(|(k, _)| *k == key);
             assert!(want.is_some(), "{key} is not a key the map names");
@@ -137,6 +137,7 @@ mod tests {
             "guard",
             "pane_cmd",
             "dreamer",
+            "band",
         ];
         for (key, want) in TARGET {
             let only = |list: &[&str]| -> Vec<String> {

@@ -1,15 +1,22 @@
-//! The guard's tests: the 23 of the removed `companion.test.ts`, on a pretend machine. The three
-//! that press a band button (1772, 1794, 2235) are ported at the function the press calls
-//! (`coach_note`, `add_to_claude_md`); the button itself is the band's.
+//! The guard's tests: the 23 of the removed TypeScript `companion.test.ts`, on a pretend machine.
+//! The two coaching tests that press a band button draw the real band and press it by label; the
+//! third drives `add_to_claude_md`, the function its button calls.
 
 use super::{
     shell::commands,
     verdict::{protected_text, GitVerdict},
     *,
 };
-use crate::companion::relay::{
-    dispatch::testing::{fixture, run, until, Fixture},
-    host::fake::World,
+use crate::companion::{
+    app::band::{
+        self,
+        tests::kit::{self as bandkit, Drawn},
+        Seams,
+    },
+    relay::{
+        dispatch::testing::{fixture, run, until, Fixture},
+        host::fake::World,
+    },
 };
 use std::{collections::HashMap, sync::Mutex};
 
@@ -209,6 +216,12 @@ struct Rig {
 fn rig(disk: Arc<Pretend>) -> Rig {
     let mut table = Table::new();
     register_with(&mut table, disk.clone());
+    // The band draws the coaching note, and its 1 writes through the same pretend machine.
+    let seams = Seams {
+        machine: disk.clone(),
+        ..bandkit::gear().seams
+    };
+    band::register_with(&mut table, seams);
     Rig {
         fx: fixture(World::default()),
         table,
@@ -216,6 +229,10 @@ fn rig(disk: Arc<Pretend>) -> Rig {
 }
 
 impl Rig {
+    async fn band(&self) -> Drawn {
+        bandkit::band(&self.table, &self.fx.cx).await
+    }
+
     /// What the guard answers a Bash call: the reason it denies with, or none.
     async fn bash(&self, command: &str) -> Option<String> {
         let e = json!({ "tool": "Bash", "command": command });
@@ -276,18 +293,21 @@ async fn a_coaching_note_names_a_word_you_said_in_2_sessions_writes_nothing_and_
     );
     assert!(r.fx.host.calls().iter().any(|(m, _)| m == "ui.invalidate"));
 
+    let shown = r.band().await;
+    assert!(shown.has("You said “quokka”"));
+    assert_eq!(shown.labels(), ["Add to CLAUDE.md", "Dismiss"]);
+
     // the key 1: the band hands the note's text to add_to_claude_md
-    let line = view["note"]["text"].as_str().unwrap();
-    assert!(add_to_claude_md(&machine(&disk), line).await);
+    assert!(bandkit::press(&r.table, &r.fx.cx, "Add to CLAUDE.md").await);
     let want = format!(
         "# Prefs\n\n## Core\n- be brief\n\n## Terms\n{}\n",
         term_note()["text"].as_str().unwrap()
     );
     assert_eq!(disk.read(CLAUDE_MD), Some(want));
     assert_eq!(strings(&r.fx.cx, MACHINE, "coached"), ["term:quokka"]);
+    assert_eq!(r.view(), None, "the band closed it");
 
     // once: the same word is not offered again
-    r.fx.cx.store.delete("s", "view").unwrap(); // the band closed it
     run(&r.table, "start", &r.fx.cx, json!({ "cwd": "/repo" })).await;
     assert!(until(|| disk.with(|d| d.coach_calls) == 2).await);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -302,8 +322,8 @@ async fn dismissing_a_coaching_note_leaves_claude_md_alone() {
     let r = rig(disk.clone());
     run(&r.table, "start", &r.fx.cx, json!({ "cwd": "/repo" })).await;
     assert!(until(|| r.view().is_some()).await);
-    // Dismiss is the band's close of the view: nothing in the guard writes
-    r.fx.cx.store.delete("s", "view").unwrap();
+    assert!(bandkit::press(&r.table, &r.fx.cx, "Dismiss").await);
+    assert_eq!(r.view(), None);
     assert_eq!(disk.read(CLAUDE_MD).as_deref(), Some("# Prefs\n"));
     assert!(disk.with(|d| d.writes.is_empty()));
 }

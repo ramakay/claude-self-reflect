@@ -400,16 +400,16 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 
 ### Companion plugin
 
-- **The companion runs inside the engine, and the TypeScript plugin is gone.** The pane, the dreamer, the
-  compaction coach, the git guard, the agents and Codex runs, the Shift Map refresh and the first-run walkthrough are
-  Rust in `csr-engine` (`csr-engine companion serve`). What Claude Code loads is one generated relay,
+- **The companion runs inside the engine, and the TypeScript plugin is gone.** The pane, the band above the
+  prompt, the dreamer, the compaction coach, the git guard, the agents and Codex runs, the Shift Map refresh and the
+  first-run walkthrough are Rust in `csr-engine` (`csr-engine companion serve`). What Claude Code loads is one generated relay,
   `hooks/register.js`, with its `plugin.json` and `hooks.json`, written by the binary at the engine's own version
   (`csr-engine companion plugin emit`); the relay holds no logic and starts only `csr-engine companion serve`. No
   Node, TypeScript or Python runs at run time. `plugins/csr-companion/`, the repo's `.claude-plugin/` marketplace
   and the pre-commit pytest branch are removed; the CI plugin job now runs `claude plugin test` on the relay
   fixture and `claude plugin validate` on what the binary installs. The status line wrapper (`/csr statusline on`)
   is retired: `csr-engine hook install --apply` puts the original `statusLine.command` back and deletes the
-  wrapper files. At this change (private HOME): lib 4379, `companion` 95, `companion_plugin` 5,
+  wrapper files. At this change (private HOME): lib 4406, `companion` 96, `companion_plugin` 5,
   `hooks_integration` 75, `integration` 75, and the relay's 20 `claude plugin test` cases, all passing.
 - **`csr-engine setup` installs the generated relay.** It writes a local marketplace under
   `~/.claude-self-reflect/csr-companion/marketplace` and installs the plugin from it through `claude plugin` (the same

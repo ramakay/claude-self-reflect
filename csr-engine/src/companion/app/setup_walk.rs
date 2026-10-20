@@ -2,7 +2,7 @@
 //! prompt. Port of the removed `setup.ts` and of the TypeScript companion's
 //! `STEPS`/`startSetup`/`setAside`/`answerStep` with the press and command wiring they have there.
 //!
-//! The band draws the walkthrough (a later package's); `walk` hands it what to draw as data. The
+//! The band draws the walkthrough (`band.rs`); `walk` hands it what to draw as data. The
 //! view is the session's `setup` row, `{ steps, done, aside, message? }`; each answer is the
 //! machine's `setup:answer:<step>` row and each start that showed a step the machine's
 //! `setup:seen:<step>` list. Every change asks Claude Code to draw the band again.

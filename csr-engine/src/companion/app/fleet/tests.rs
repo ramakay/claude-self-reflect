@@ -1,5 +1,5 @@
-//! The 43 fleet tests: `tests/agents.test.ts` (26) and `tests/companion.test.ts` 2825-3080 (17),
-//! by their snake-case names.
+//! The 43 fleet tests of the removed TypeScript companion: its agents tests (26) and its fleet
+//! group (17), by their snake-case names.
 //!
 //! The pace and the dreamer are other packages, and here they are the real ones: the table holds
 //! the fleet's entries, the pace's and the dreamer's, in the manifest's order, and the dreamer
@@ -402,8 +402,8 @@ fn spawn_call(id: &str, extra: Value) -> Value {
     )
 }
 
-/// The brief `pane.py` would print once these agents had reported: CSR's lines, then the agents
-/// as the machine envelope.
+/// The brief the removed `pane.py` would print once these agents had reported: CSR's lines, then
+/// the agents as the machine envelope.
 struct Said {
     id: &'static str,
     turn: &'static str,
@@ -494,7 +494,7 @@ fn running_in_file(state: &AgentState, now: i64) -> usize {
         .count()
 }
 
-// ---------------------------------------------------------------- agents.test.ts
+// ---------------------------------------------------------------- the agents tests
 
 #[tokio::test]
 async fn spawn_result_supplies_id_and_model() {
@@ -1583,7 +1583,7 @@ fn the_list_saying_a_bound_agent_failed_or_was_killed_settles_its_handoff_its() 
     assert_eq!(killed.handoffs[0].ended_at, Some(10));
 }
 
-// ---------------------------------------------------------------- companion.test.ts
+// ---------------------------------------------------------------- the fleet group
 
 /// A dreaming session whose brief is `brief`.
 fn dreaming_rig(brief: String) -> Rig {

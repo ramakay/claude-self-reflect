@@ -19,7 +19,7 @@ mod flow;
 pub mod outside;
 pub mod rules;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod watch;
 
 use crate::companion::{
