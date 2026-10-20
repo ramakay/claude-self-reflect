@@ -486,6 +486,18 @@ pub fn transcript_inputs(
     transcript_inputs_variant(storage, path, conversation_id, false)
 }
 
+/// [`transcript_inputs`] over the first `limit` bytes of the file only, so a
+/// reader that took the file's length earlier sees the same rows as this one
+/// even if the transcript has been appended to since.
+pub fn transcript_inputs_limited(
+    storage: &crate::storage::Storage,
+    path: &Path,
+    conversation_id: &str,
+    limit: u64,
+) -> Result<crate::storage::artifact_provenance::InputEnvelope> {
+    transcript_inputs_at(storage, path, conversation_id, false, Some(limit))
+}
+
 /// Producer-side convenience: the transcript's input envelope, or a single
 /// Unknown input naming the path when the file cannot be read or parsed.
 /// Never an empty envelope, so a producer's floor can never be an empty-set
@@ -507,6 +519,16 @@ pub(crate) fn transcript_inputs_variant(
     path: &Path,
     conversation_id: &str,
     raw: bool,
+) -> Result<crate::storage::artifact_provenance::InputEnvelope> {
+    transcript_inputs_at(storage, path, conversation_id, raw, None)
+}
+
+fn transcript_inputs_at(
+    storage: &crate::storage::Storage,
+    path: &Path,
+    conversation_id: &str,
+    raw: bool,
+    limit: Option<u64>,
 ) -> Result<crate::storage::artifact_provenance::InputEnvelope> {
     let sidechain = path
         .parent()
@@ -541,6 +563,7 @@ pub(crate) fn transcript_inputs_variant(
         path.extension().is_some_and(|e| e == "md"),
         parent.as_ref(),
         raw,
+        limit,
     )?;
     Ok(if raw {
         index.raw_inputs()

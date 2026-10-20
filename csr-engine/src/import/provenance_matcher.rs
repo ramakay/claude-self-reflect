@@ -47,13 +47,16 @@ impl MessageIndex {
             needles,
             false,
             None,
+            None,
         )
     }
 
     /// [`Self::read`] for a caller that only wants [`Self::inputs`] (or
     /// [`Self::raw_inputs`] when `raw`): the other three documents are never
     /// built, which on a large transcript is most of the memory. The inputs
-    /// are byte-identical to the full index's.
+    /// are byte-identical to the full index's. `limit` reads only the first
+    /// that many bytes of a Claude Code transcript (a snapshot of a file that
+    /// is still being appended to); it does not apply to plan or Codex files.
     pub(super) fn read_inputs_only(
         path: &Path,
         conversation_id: &str,
@@ -61,6 +64,7 @@ impl MessageIndex {
         plan: bool,
         parent: Option<&super::ParentContext>,
         raw: bool,
+        limit: Option<u64>,
     ) -> Result<Self> {
         // A plan reads document 0 whichever form is asked for.
         let only = if plan || raw { 0 } else { 2 };
@@ -73,6 +77,7 @@ impl MessageIndex {
             &[],
             false,
             Some(only),
+            limit,
         )
     }
 
@@ -94,6 +99,7 @@ impl MessageIndex {
             needles,
             true,
             None,
+            None,
         )
     }
 
@@ -107,6 +113,7 @@ impl MessageIndex {
         needles: &[&str],
         skip_malformed: bool,
         only: Option<usize>,
+        limit: Option<u64>,
     ) -> Result<Self> {
         let wanted = |document: usize| only.is_none_or(|only| only == document);
         let mut documents = vec![
@@ -239,7 +246,12 @@ impl MessageIndex {
                 })?;
             } else {
                 let mut offset = 0;
-                for line in BufReader::new(std::fs::File::open(path)?).split(b'\n') {
+                let file = std::fs::File::open(path)?;
+                let reader: Box<dyn std::io::Read> = match limit {
+                    Some(limit) => Box::new(std::io::Read::take(file, limit)),
+                    None => Box::new(file),
+                };
+                for line in BufReader::new(reader).split(b'\n') {
                     let line = line?;
                     let start = offset;
                     offset += line.len() as u64 + 1;

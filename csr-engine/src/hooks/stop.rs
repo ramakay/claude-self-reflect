@@ -725,17 +725,21 @@ fn episode_row(
     Some((row, raw))
 }
 
-/// [`extract_episode`] over a transcript file, one line in memory at a time.
+/// [`extract_episode`] over the first `limit` bytes of a transcript file, one
+/// line in memory at a time. The caller takes `limit` from the file's length
+/// once, so a transcript Claude Code is still appending to cannot show this
+/// reader rows the provenance reader never saw.
 /// Same episode as reading the file whole, without holding the file or its
 /// parsed rows. Errors on an unreadable file or invalid UTF-8, as
 /// `read_to_string` did.
 pub(crate) fn extract_episode_from_file(
     path: &Path,
+    limit: u64,
     session_id: &str,
     project: &str,
 ) -> Result<Episode> {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    use std::io::{BufRead, Read};
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?.take(limit));
     let mut sanitizer = crate::import::RowSanitizer::for_derived();
     let mut failure: Option<std::io::Error> = None;
     let mut buf = Vec::new();
@@ -1429,9 +1433,18 @@ pub async fn extract_and_store_episode(
 
     // The transcript can be hundreds of MB: it is streamed a line at a time
     // here, never held whole (see `extract_episode_from_file`).
-    let mut provenance_inputs = crate::import::transcript_inputs(engine.storage(), &tp, session_id)
-        .or_else(|_| {
-            let raw = std::fs::read_to_string(&tp)?;
+    // One snapshot length for both reads: Claude Code appends to the live
+    // transcript, and a row seen by only one of them would break the match
+    // between the episode and its provenance.
+    let snapshot_len = std::fs::metadata(&tp)?.len();
+    let mut provenance_inputs =
+        crate::import::transcript_inputs_limited(engine.storage(), &tp, session_id, snapshot_len)
+            .or_else(|_| {
+            use std::io::Read;
+            let mut raw = String::new();
+            std::fs::File::open(&tp)?
+                .take(snapshot_len)
+                .read_to_string(&mut raw)?;
             Ok::<_, anyhow::Error>(crate::storage::artifact_provenance::InputEnvelope::new(
                 vec![crate::storage::artifact_provenance::ArtifactInput::unknown(
                     &raw,
@@ -1440,7 +1453,7 @@ pub async fn extract_and_store_episode(
         })?;
     let mut task_inputs = None;
 
-    let mut episode = extract_episode_from_file(&tp, session_id, project_name)?;
+    let mut episode = extract_episode_from_file(&tp, snapshot_len, session_id, project_name)?;
 
     // Journal v2 instrumentation feeds (plan `.plans/journal-v2-mailbox-plan.md`
     // §3.3/§4.1): one extra streaming pass over the same transcript file
@@ -4388,7 +4401,9 @@ mod tests {
     }
 
     fn episode_streamed(path: &Path) -> String {
-        let mut episode = extract_episode_from_file(path, "sid", "proj").unwrap();
+        let mut episode =
+            extract_episode_from_file(path, std::fs::metadata(path).unwrap().len(), "sid", "proj")
+                .unwrap();
         episode.timestamp.clear();
         serde_json::to_string(&episode).unwrap()
     }
@@ -4451,7 +4466,13 @@ mod tests {
         bytes.extend_from_slice(b"\n\xff\xfe\n");
         std::fs::write(&path, bytes).unwrap();
         assert!(std::fs::read_to_string(&path).is_err());
-        assert!(extract_episode_from_file(&path, "sid", "proj").is_err());
+        assert!(extract_episode_from_file(
+            &path,
+            std::fs::metadata(&path).unwrap().len(),
+            "sid",
+            "proj"
+        )
+        .is_err());
     }
 
     /// Manual check on a real transcript:
@@ -4464,5 +4485,64 @@ mod tests {
         let streamed = episode_streamed(&path);
         assert_eq!(streamed, whole);
         println!("equivalent: {} bytes of episode JSON", streamed.len());
+    }
+
+    /// Claude Code appends to the live transcript. Both reads of the Stop hook
+    /// stop at one snapshot length, so a row (or garbage) appended between
+    /// them shows up in neither the episode nor the provenance inputs.
+    #[test]
+    fn rows_appended_between_the_two_reads_reach_neither() {
+        use std::io::Write;
+        let base = [
+            user_line("fix the importer"),
+            assistant_tool_line(&[("Edit", "/src/a.rs")]),
+            assistant_text_line("Fixed and complete."),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let pristine = dir.path().join("pristine.jsonl");
+        std::fs::write(&pristine, format!("{}\n", base.join("\n"))).unwrap();
+        let mut expected_episode =
+            extract_episode_from_file(&pristine, u64::MAX, "s", "p").unwrap();
+        expected_episode.timestamp.clear();
+        let expected_episode = serde_json::to_string(&expected_episode).unwrap();
+
+        let appended: [&[u8]; 3] = [
+            // a whole new row that would add a tool, a file and a message
+            br#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Write","input":{"file_path":"/src/late.rs"}}]}}
+"#,
+            b"\xff\xfe\n",
+            // the start of a row still being written
+            br#"{"type":"user","message":{"content":"half"#,
+        ];
+        for tail in appended {
+            let live = dir.path().join("live.jsonl");
+            std::fs::write(&live, format!("{}\n", base.join("\n"))).unwrap();
+            let snapshot_len = std::fs::metadata(&live).unwrap().len();
+            // Receipts name the file, so the expected inputs are read from the
+            // same path, before anything is appended.
+            let expected_inputs = format!(
+                "{:?}",
+                crate::import::transcript_inputs(&storage, &live, "s").unwrap()
+            );
+            let inputs =
+                crate::import::transcript_inputs_limited(&storage, &live, "s", snapshot_len)
+                    .unwrap();
+            // Claude Code appends between the hook's two reads.
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&live)
+                .unwrap()
+                .write_all(tail)
+                .unwrap();
+            let mut episode = extract_episode_from_file(&live, snapshot_len, "s", "p").unwrap();
+            episode.timestamp.clear();
+            assert_eq!(serde_json::to_string(&episode).unwrap(), expected_episode);
+            assert_eq!(format!("{inputs:?}"), expected_inputs);
+            // and a provenance read taken after the append is also capped
+            let late = crate::import::transcript_inputs_limited(&storage, &live, "s", snapshot_len)
+                .unwrap();
+            assert_eq!(format!("{late:?}"), expected_inputs);
+        }
     }
 }
