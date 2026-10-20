@@ -402,6 +402,23 @@ fn parse_lsof(output: &std::process::Output) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
 
+    /// A child another test is spawning (fork+exec when it sets PATH) can hold
+    /// an inherited copy of a lock descriptor until its exec, longer under
+    /// load; wait that window out before asserting the lock is free.
+    /// Probes exclusively: a leaked shared copy does not block `active`'s
+    /// shared probe, but it does block the exclusive lock asserted next.
+    fn wait_released(dir: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(file) = File::open(dir.join(LOCK_FILE)) {
+                if FileExt::try_lock_exclusive(&file).is_ok() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn round4_nested_shared_reuses_operation_handle() {
         let dir = tempfile::tempdir().unwrap();
@@ -428,6 +445,7 @@ mod tests {
         drop(lock);
         // Ownership goes away; the persistent inode must never be removed.
         assert!(dir.path().join(LOCK_FILE).exists());
+        wait_released(dir.path());
         assert!(active(dir.path()).is_none());
         assert!(try_shared(dir.path()).unwrap().is_some());
     }
@@ -466,7 +484,8 @@ mod tests {
         releaser.await.unwrap();
         assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
         drop(writer);
-        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+        wait_released(dir.path());
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::from_secs(5)).is_ok());
     }
 
     #[test]
@@ -544,11 +563,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let owner = MaintenanceLock::acquire_for(&dir, Duration::ZERO).ok();
-        std::fs::write(
-            dir.join(format!("result-{id}")),
-            if owner.is_some() { "owner" } else { "refused" },
-        )
-        .unwrap();
+        // Write then rename: the parent polls for the name, and a plain write
+        // lets it read the file between create and write.
+        let partial = dir.join(format!("partial-{id}"));
+        std::fs::write(&partial, if owner.is_some() { "owner" } else { "refused" }).unwrap();
+        std::fs::rename(&partial, dir.join(format!("result-{id}"))).unwrap();
         while !dir.join("release").exists() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(1));
@@ -572,7 +591,7 @@ mod tests {
         .unwrap();
         let inactive = active(dir.path()).is_none();
         assert!(unrelated.try_wait().unwrap().is_none());
-        let lock = MaintenanceLock::acquire_for(dir.path(), Duration::ZERO);
+        let lock = MaintenanceLock::acquire_for(dir.path(), Duration::from_secs(5));
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
         assert!(inactive, "live unrelated pid must not own maintenance");
@@ -581,12 +600,7 @@ mod tests {
         assert!(try_shared(dir.path()).unwrap().is_none());
         drop(lock);
         assert!(path.exists());
-        // A child another test is spawning can hold an inherited copy of the
-        // lock descriptor until its exec; wait that window out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while active(dir.path()).is_some() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_released(dir.path());
         assert!(active(dir.path()).is_none());
         assert!(try_shared(dir.path()).unwrap().is_some());
     }
@@ -617,7 +631,8 @@ mod tests {
             .unwrap();
         assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_err());
         drop(writer);
-        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+        wait_released(dir.path());
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::from_secs(5)).is_ok());
     }
 
     #[cfg(unix)]
@@ -759,8 +774,9 @@ mod tests {
         child.wait().unwrap();
         assert!(held);
         assert!(dir.path().join(LOCK_FILE).exists());
+        wait_released(dir.path());
         assert!(active(dir.path()).is_none());
-        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::ZERO).is_ok());
+        assert!(MaintenanceLock::acquire_for(dir.path(), Duration::from_secs(5)).is_ok());
     }
     #[test]
     fn the_preflight_lists_another_process_holding_the_database() {
