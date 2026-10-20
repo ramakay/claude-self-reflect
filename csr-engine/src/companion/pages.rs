@@ -44,7 +44,7 @@ pub fn stamp(at: f64, now: f64) -> String {
     .to_string()
 }
 pub use super::recall::{session_story, where_it_stands};
-fn story_rights(story: &Value, now: f64) -> Vec<String> {
+pub(super) fn story_rights(story: &Value, now: f64) -> Vec<String> {
     if story.is_null() {
         return vec![String::new()];
     }

@@ -162,10 +162,11 @@ fn card_pictures(pane: &Pane) -> Vec<(usize, usize, image::RgbaImage)> {
         })
         .collect()
 }
-const CARD_FACE: [u8; 4] = [0x27, 0x32, 0x46, 255];
-/// A picture is a card when its rounded face is painted inside the margin.
+const PAPER: [u8; 4] = [251, 251, 249, 255];
+/// A picture is a card when its washed face (not the paper ground) is painted left of the icon.
 fn painted(img: &image::RgbaImage) -> bool {
-    img.get_pixel(20, 20).0 == CARD_FACE
+    let p = img.get_pixel(14, 14).0;
+    p[3] == 255 && p != PAPER && p[0] > 200
 }
 
 #[test]
@@ -179,8 +180,8 @@ fn the_info_frame_draws_every_card_that_has_data_one_picture_each_and_scrolls_by
     let text = full.frame(46, 120, NOW);
     let cards = card_pictures(&full);
     assert!(
-        cards.len() == 6,
-        "rings, history, agents, cache, dreams and the mirror draw: got {}",
+        cards.len() == 7,
+        "story, moon, history, agents, cache, what-if and the mirror draw: got {}",
         cards.len()
     );
     for (row, rows, img) in &cards {
@@ -199,7 +200,7 @@ fn the_info_frame_draws_every_card_that_has_data_one_picture_each_and_scrolls_by
     assert!(shown.len() < cards.len());
     assert!(shown.iter().all(|(row, rows, _)| row + rows < 22));
     // scrolled down, a later card comes into view
-    short.scroll(12);
+    short.scroll(40);
     short.frame(46, 22, NOW);
     assert_ne!(
         card_pictures(&short)

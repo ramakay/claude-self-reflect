@@ -2,12 +2,13 @@
 //!
 //! Every figure a card draws is measured: the builders at the bottom read the same gauges, session and
 //! dream data the text rows read, and a card with nothing real to say is not built at all.
-use super::text::Rgb;
+#![allow(clippy::too_many_arguments)]
+use super::{text::Rgb, theme};
 use crate::companion::{agents, array, dreams, masthead, num, pyfmt::short, string};
 use ab_glyph::{point, Font, FontVec, GlyphId, ScaleFont, VariableFont};
 use serde_json::Value;
 use std::sync::LazyLock;
-use tiny_skia::{FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Transform};
 
 /// One point is two device pixels: the pane's cell size is already measured at twice the screen's.
 const S: f32 = 2.0;
@@ -18,24 +19,25 @@ const GAP: f32 = 8.;
 const MARGIN: f32 = 4.;
 
 type Rgba = [u8; 4];
-const fn hex(v: u32) -> Rgba {
-    [(v >> 16) as u8, (v >> 8) as u8, v as u8, 255]
+fn px(c: Rgb) -> Rgba {
+    [c[0], c[1], c[2], 255]
 }
-const CARD: Rgba = hex(0x273246);
-const TRACK: Rgba = hex(0x4a5263);
-const BLUE: Rgba = hex(0x4f7dff);
-const PINK: Rgba = hex(0xe0559a);
-const AMBER: Rgba = hex(0xe8c547);
-const RED: Rgba = hex(0xe8582c);
-const LABEL: Rgba = hex(0xc9d1de);
-const HEAD: Rgba = hex(0x5f8cff);
-const INK: Rgba = hex(0xe6ebf2);
-const GREEN: Rgba = hex(0x5fd38d);
-const LAV: Rgba = hex(0xa99bff);
-const PILL: Rgba = hex(0x2a3447);
-const WHITE: Rgba = hex(0xffffff);
-const DIM: Rgba = hex(0x9aa6b8);
-const RULE: Rgba = hex(0x3a4558);
+const MONO: f32 = 0.;
+/// A card's section: the pane icon at its left, the section's ink and the wash it is faced with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Look {
+    icon: &'static str,
+    section: &'static str,
+    title: &'static str,
+}
+impl Look {
+    fn ink(self) -> Rgb {
+        super::text::ink_rgb(super::text::section(self.section))
+    }
+    fn face(self) -> Rgb {
+        super::text::tint(self.section, 0.07)
+    }
+}
 
 // ---------------------------------------------------------------- fonts
 
@@ -46,6 +48,7 @@ struct Face {
 }
 /// The system's UI font at the weights the cards use, and the symbol fonts behind it.
 pub struct CardFonts {
+    mono: Option<FontVec>,
     primary: Vec<Face>,
     fallback: Vec<FontVec>,
 }
@@ -98,9 +101,30 @@ impl CardFonts {
         .into_iter()
         .filter_map(|p| FontVec::try_from_vec(read_font(p)?).ok())
         .collect();
-        (!primary.is_empty()).then_some(Self { primary, fallback })
+        let mono = [
+            ("/System/Library/Fonts/Menlo.ttc", 0),
+            ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
+            ("/usr/share/fonts/dejavu/DejaVuSansMono.ttf", 0),
+            (
+                "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+                0,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(p, i)| FontVec::try_from_vec_and_index(read_font(p)?, i).ok());
+        (!primary.is_empty()).then_some(Self {
+            mono,
+            primary,
+            fallback,
+        })
     }
     fn face(&self, size: f32, wght: f32) -> &FontVec {
+        if wght == MONO {
+            if let Some(m) = &self.mono {
+                return m;
+            }
+        }
+        let wght = if wght == MONO { 400. } else { wght };
         let want_o = if size >= 20. { 28. } else { 17. };
         self.primary
             .iter()
@@ -321,33 +345,6 @@ fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     p.close();
     p.finish()
 }
-/// An arc clockwise from 12 o'clock; angles in degrees clockwise from the top.
-fn arc_path(cx: f32, cy: f32, r: f32, a0: f32, a1: f32) -> Option<Path> {
-    let (t0, t1) = ((a0 as f64).to_radians(), (a1 as f64).to_radians());
-    let n = (((t1 - t0).abs() / std::f64::consts::FRAC_PI_2).ceil() as usize).max(1);
-    let d = (t1 - t0) / n as f64;
-    let k = 4. / 3. * (d / 4.).tan();
-    let (cx, cy, r) = (cx as f64, cy as f64, r as f64);
-    let pt = |t: f64| (cx + r * t.sin(), cy - r * t.cos());
-    let mut pb = PathBuilder::new();
-    let (x0, y0) = pt(t0);
-    pb.move_to(x0 as f32, y0 as f32);
-    for i in 0..n {
-        let (ta, tb) = (t0 + d * i as f64, t0 + d * (i + 1) as f64);
-        let (pa, pbp) = (pt(ta), pt(tb));
-        let c1 = (pa.0 + k * r * ta.cos(), pa.1 + k * r * ta.sin());
-        let c2 = (pbp.0 - k * r * tb.cos(), pbp.1 - k * r * tb.sin());
-        pb.cubic_to(
-            c1.0 as f32,
-            c1.1 as f32,
-            c2.0 as f32,
-            c2.1 as f32,
-            pbp.0 as f32,
-            pbp.1 as f32,
-        );
-    }
-    pb.finish()
-}
 impl Canvas {
     fn new(w_px: u32, h_px: u32) -> Option<Self> {
         // A corrupt terminal report must not allocate an unbounded image.
@@ -391,54 +388,6 @@ impl Canvas {
             self.pm
                 .fill_path(&p, &paint(col), FillRule::Winding, sc(), None);
         }
-    }
-    fn stroke(&mut self, p: &Path, w: f32, col: Rgba) {
-        let st = Stroke {
-            width: w,
-            line_cap: LineCap::Butt,
-            ..Stroke::default()
-        };
-        self.pm.stroke_path(p, &paint(col), &st, sc(), None);
-    }
-    /// A ring gauge. `segs` are consecutive (fraction, colour) arcs from 12 o'clock, clockwise.
-    fn ring(&mut self, cx: f32, cy: f32, d: f32, stroke: f32, segs: &[(f32, Rgba)]) {
-        if self.dry {
-            return;
-        }
-        let r = d / 2. - stroke / 2.;
-        if let Some(p) = PathBuilder::from_circle(cx, cy, r) {
-            self.stroke(&p, stroke, TRACK);
-        }
-        let total: f32 = segs.iter().map(|s| s.0).sum();
-        if total <= 0.0005 {
-            return;
-        }
-        if total >= 0.9995 && segs.len() == 1 {
-            if let Some(p) = PathBuilder::from_circle(cx, cy, r) {
-                self.stroke(&p, stroke, segs[0].1);
-            }
-            return;
-        }
-        let mut acc = 0.;
-        for (i, (f, col)) in segs.iter().enumerate() {
-            let a0 = acc * 360.;
-            let mut a1 = (acc + f) * 360.;
-            if i + 1 < segs.len() {
-                a1 += 0.5;
-            }
-            if let Some(p) = arc_path(cx, cy, r, a0, a1) {
-                self.stroke(&p, stroke, *col);
-            }
-            acc += f;
-        }
-        self.circle(cx, cy - r, stroke / 2., segs[0].1);
-        let t = (acc * 360.0_f32).to_radians();
-        self.circle(
-            cx + r * t.sin(),
-            cy - r * t.cos(),
-            stroke / 2.,
-            segs[segs.len() - 1].1,
-        );
     }
     /// Draw text with its baseline at `base`; returns the advance in points.
     #[allow(clippy::too_many_arguments)]
@@ -510,28 +459,35 @@ pub enum Dot {
     Red,
 }
 impl Dot {
-    fn rgba(self) -> Rgba {
+    fn rgb(self) -> Rgb {
         match self {
-            Dot::Blue => BLUE,
-            Dot::Pink => PINK,
-            Dot::Amber => AMBER,
-            Dot::Green => GREEN,
-            Dot::Track => TRACK,
-            Dot::Red => RED,
+            Dot::Blue => theme::CTX,
+            Dot::Pink | Dot::Red => theme::TURN,
+            Dot::Amber => theme::DREAM,
+            Dot::Green => theme::RECALL,
+            Dot::Track => theme::FAINT,
         }
     }
 }
 /// One legend row: a dot, its label, its value.
 pub type Legend = (Dot, String, String);
-/// One ring of the top card: its share, the name in it, the line under it.
+/// The moon: how much of the window the context fills, and what it says under it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RingFact {
+pub struct MoonFact {
     pub share: f64,
-    pub name: String,
+    pub tokens: f64,
     pub caption: String,
-    pub dot: Dot,
 }
-/// How an agent's slot is drawn.
+/// A thin bar for a quota window: its share, its words, and where the pace stands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BarFact {
+    pub name: String,
+    pub share: f64,
+    pub caption: String,
+    pub pace: Option<f64>,
+    pub tone: Dot,
+}
+/// How an agent's pip is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Slot {
     Running,
@@ -540,8 +496,11 @@ pub enum Slot {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Card {
-    /// CTX, 5H and 7D rings, each with the line that says it in words.
-    Rings(Vec<RingFact>),
+    /// The context as a moon, and the 5H and 7D windows as bars beside it.
+    Moon {
+        moon: Option<MoonFact>,
+        bars: Vec<BarFact>,
+    },
     /// Context per request as bars, cached under fresh when the transcript splits them.
     History {
         bars: Vec<(f64, f64)>,
@@ -557,10 +516,19 @@ pub enum Card {
         cold: bool,
         legend: Vec<Legend>,
     },
-    Dreams {
-        count: usize,
-        share: f64,
+    /// The open dream, how many asks are left, and what this session has.
+    WhatIf {
         line: String,
+        tally: String,
+        count: usize,
+        unread: usize,
+    },
+    /// The session's story as a note: its rights, the sentence where work stands, and the Shift
+    /// Map's first shift with its receipt (text, loud).
+    Story {
+        rights: String,
+        now: String,
+        shifts: Vec<(String, bool)>,
     },
     /// What CSR handed Claude, up, and what it wrote down, down, over the session.
     Mirror {
@@ -569,6 +537,24 @@ pub enum Card {
         up: Vec<f64>,
         down: Vec<f64>,
     },
+}
+impl Card {
+    fn look(&self) -> Look {
+        let (icon, section, title) = match self {
+            Card::Moon { .. } => ("last", "last", "CONTEXT"),
+            Card::History { .. } => ("touching", "touching", "TOKENS PER REQUEST"),
+            Card::Agents { .. } => ("flight", "flight", "AGENTS"),
+            Card::Cache { .. } => ("told", "told", "CACHE"),
+            Card::WhatIf { .. } => ("dreams", "dreams", "WHAT IF\u{2026}"),
+            Card::Story { .. } => ("rules", "rules", "STORY"),
+            Card::Mirror { .. } => ("memory", "memory", "RECALL IN \u{b7} NOTES OUT"),
+        };
+        Look {
+            icon,
+            section,
+            title,
+        }
+    }
 }
 /// A run of the pill's text: the words, their ink, whether they are bold.
 pub type Run = (String, Ink, bool);
@@ -582,18 +568,18 @@ pub enum Ink {
     Red,
 }
 impl Ink {
-    fn rgba(self) -> Rgba {
+    fn rgb(self) -> Rgb {
         match self {
-            Ink::Dim => DIM,
-            Ink::White => WHITE,
-            Ink::Green => GREEN,
-            Ink::Lavender => LAV,
-            Ink::Amber => AMBER,
-            Ink::Red => RED,
+            Ink::Dim => theme::DATA_QUIET,
+            Ink::White => theme::DATA,
+            Ink::Green => theme::STRIP_GREEN,
+            Ink::Lavender => theme::STRIP_PURPLE,
+            Ink::Amber => theme::RAMP_AMBER,
+            Ink::Red => theme::RAMP_RED,
         }
     }
 }
-/// The collapsed masthead: two lines of groups of runs in one rounded pill, at one text size.
+/// The collapsed masthead: two lines of groups of runs on the masthead's slate, at one text size.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pill {
     pub size: f32,
@@ -602,94 +588,190 @@ pub struct Pill {
 
 // ---------------------------------------------------------------- widgets
 
-#[allow(clippy::too_many_arguments)]
+struct Env<'a> {
+    f: &'a CardFonts,
+    cell: (u32, u32),
+}
+impl Canvas {
+    /// A face with a hairline border, corners `r` points.
+    fn panel(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, face: Rgb) {
+        self.rrect(x, y, w, h, r, px(theme::HAIRLINE));
+        self.rrect(
+            x + 0.5,
+            y + 0.5,
+            w - 1.,
+            h - 1.,
+            (r - 0.5).max(0.),
+            px(face),
+        );
+    }
+    fn lit(&mut self, points: &[(f32, f32)], col: Rgba) {
+        if self.dry || points.len() < 3 {
+            return;
+        }
+        let mut pb = PathBuilder::new();
+        pb.move_to(points[0].0, points[0].1);
+        for p in &points[1..] {
+            pb.line_to(p.0, p.1);
+        }
+        pb.close();
+        if let Some(path) = pb.finish() {
+            self.pm
+                .fill_path(&path, &paint(col), FillRule::Winding, sc(), None);
+        }
+    }
+}
+/// The pane's own icon for a section, drawn at the left of a heading on the card's face.
+fn icon(c: &mut Canvas, e: &Env, look: Look, x: f32, y: f32) {
+    if c.dry {
+        return;
+    }
+    type Key = (&'static str, (u32, u32), Rgb);
+    static ICONS: LazyLock<std::sync::Mutex<std::collections::HashMap<Key, Option<Pixmap>>>> =
+        LazyLock::new(Default::default);
+    let key = (look.icon, e.cell, look.face());
+    let Ok(mut cache) = ICONS.lock() else {
+        return;
+    };
+    let made = cache
+        .entry(key)
+        .or_insert_with(|| super::raster::iso(look.icon, e.cell, [look.face(), look.face()]));
+    if let Some(pm) = made {
+        let scale = 0.62;
+        c.pm.draw_pixmap(
+            0,
+            0,
+            pm.as_ref(),
+            &tiny_skia::PixmapPaint {
+                quality: tiny_skia::FilterQuality::Bilinear,
+                ..Default::default()
+            },
+            Transform::from_row(scale, 0., 0., scale, x * S, y * S),
+            None,
+        );
+    }
+}
+const HEAD_H: f32 = 26.;
+/// The card's heading: its icon, its title in the section's ink, a word at the right.
+fn heading(c: &mut Canvas, e: &Env, look: Look, x: f32, y: f32, w: f32, right: &str) {
+    icon(c, e, look, x + PAD - 4., y + PAD - 6.);
+    let tx = x + PAD + 30.;
+    let base = y + PAD + 7. + e.f.cap(10.5, 600.) / 2.;
+    c.text(
+        e.f,
+        look.title,
+        tx,
+        base,
+        10.5,
+        600.,
+        px(look.ink()),
+        0.8,
+        Anchor::L,
+    );
+    if !right.is_empty() {
+        let room = w - 2. * PAD - 30. - e.f.width(look.title, 10.5, 600., 0.8) - 8.;
+        let right = fit_width(e.f, right, 11., MONO, room);
+        c.text(
+            e.f,
+            &right,
+            x + w - PAD,
+            base,
+            11.,
+            MONO,
+            px(theme::QUIET),
+            0.,
+            Anchor::R,
+        );
+    }
+}
+/// `text` cut with an ellipsis to fit `room` points.
+fn fit_width(f: &CardFonts, text: &str, size: f32, wght: f32, room: f32) -> String {
+    if f.width(text, size, wght, 0.) <= room {
+        return text.to_owned();
+    }
+    let mut out: String = text.to_owned();
+    while !out.is_empty() && f.width(&format!("{out}\u{2026}"), size, wght, 0.) > room {
+        out.pop();
+    }
+    format!("{}\u{2026}", out.trim_end())
+}
+/// `text` broken into lines of at most `room` points, the last cut with an ellipsis.
+fn wrap(f: &CardFonts, text: &str, size: f32, wght: f32, room: f32, most: usize) -> Vec<String> {
+    let mut lines: Vec<String> = vec![];
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let tried = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if f.width(&tried, size, wght, 0.) > room && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            line = word.to_owned();
+        } else {
+            line = tried;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.len() > most {
+        lines.truncate(most);
+        let last = lines[most - 1].clone();
+        lines[most - 1] = fit_width(f, &format!("{last} \u{2026}"), size, wght, room - 1.);
+    }
+    lines
+}
 fn legend_row(
     c: &mut Canvas,
     f: &CardFonts,
     x: f32,
     y: f32,
     w: f32,
-    dot: Rgba,
+    dot: Rgb,
     label: &str,
     value: &str,
 ) {
     let mid = y + 9.;
     let base = mid + f.cap(12., 400.) / 2.;
-    c.circle(x + 4., mid, 4., dot);
-    c.text(f, label, x + 16., base, 12., 400., INK, 0., Anchor::L);
+    c.circle(x + 4., mid, 3.5, px(dot));
+    c.text(
+        f,
+        label,
+        x + 15.,
+        base,
+        12.,
+        400.,
+        px(theme::QUIET),
+        0.,
+        Anchor::L,
+    );
     if !value.is_empty() {
-        c.text(f, value, x + w, base, 12., 400., INK, 0., Anchor::R);
+        c.text(
+            f,
+            value,
+            x + w,
+            base,
+            12.,
+            MONO,
+            px(theme::INK),
+            0.,
+            Anchor::R,
+        );
     }
 }
 fn legend(c: &mut Canvas, f: &CardFonts, x: f32, y: f32, w: f32, rows: &[Legend]) -> f32 {
     for (i, (dot, label, value)) in rows.iter().enumerate() {
-        legend_row(c, f, x, y + 18. * i as f32, w, dot.rgba(), label, value);
+        legend_row(c, f, x, y + 18. * i as f32, w, dot.rgb(), label, value);
     }
     18. * rows.len() as f32
-}
-fn header(c: &mut Canvas, f: &CardFonts, x: f32, y: f32, w: f32, name: &str, value: &str) {
-    let base = y + 11.;
-    c.text(f, name, x, base, 11., 600., HEAD, 0.6, Anchor::L);
-    if !value.is_empty() {
-        let room = w - f.width(name, 11., 600., 0.6) - 12.;
-        let value = if f.width(value, 12., 400., 0.) > room {
-            value.split(' ').next().unwrap_or(value)
-        } else {
-            value
-        };
-        c.text(f, value, x + w, base, 12., 400., INK, 0., Anchor::R);
-    }
-}
-/// A number, its smaller `%` and an all-caps name, centred in a ring.
-#[allow(clippy::too_many_arguments)]
-fn ring_text(
-    c: &mut Canvas,
-    f: &CardFonts,
-    cx: f32,
-    cy: f32,
-    num: &str,
-    pct: bool,
-    nsize: f32,
-    label: &str,
-) {
-    let psize = nsize * 0.6;
-    let cap_n = f.cap(nsize, 600.);
-    let cap_l = f.cap(10., 500.);
-    let gap = if nsize > 20. { 8. } else { 6. };
-    let top = cy - (cap_n + gap + cap_l) / 2.;
-    let base_n = top + cap_n;
-    let base_l = base_n + gap + cap_l;
-    let (l, nr, _, _) = f.ink(num, nsize, 600., 0.);
-    let adv = f.width(num, nsize, 600., 0.);
-    let ink_right = if pct {
-        adv + 0.5 + f.ink("%", psize, 600., 0.).1
-    } else {
-        nr
-    };
-    let x0 = cx - (l + ink_right) / 2.;
-    c.text(f, num, x0, base_n, nsize, 600., WHITE, 0., Anchor::L);
-    if pct {
-        c.text(
-            f,
-            "%",
-            x0 + adv + 0.5,
-            base_n,
-            psize,
-            600.,
-            WHITE,
-            0.,
-            Anchor::L,
-        );
-    }
-    c.text(f, label, cx, base_l, 10., 500., LABEL, 0.9, Anchor::M);
 }
 fn bars(c: &mut Canvas, x: f32, bottom: f32, w: f32, h: f32, data: &[(f64, f64)]) {
     if data.is_empty() {
         return;
     }
     let n = (((w + 1.) / 3.).floor() as usize).min(data.len()).max(1);
-    let total_w = 3. * n as f32 - 1.;
-    let x0 = x + (w - total_w);
+    let x0 = x + (w - (3. * n as f32 - 1.));
     let peak = data.iter().map(|(a, b)| a + b).fold(0., f64::max).max(1.);
     for i in 0..n {
         // the newest bar sits on the right edge
@@ -697,37 +779,141 @@ fn bars(c: &mut Canvas, x: f32, bottom: f32, w: f32, h: f32, data: &[(f64, f64)]
         let ha = (((a / peak) as f32 * h * 2.).round() / 2.).max(if a > 0. { 0.5 } else { 0. });
         let hb = (((b / peak) as f32 * h * 2.).round() / 2.).max(if b > 0. { 0.5 } else { 0. });
         let bx = x0 + 3. * i as f32;
-        c.rect(bx, bottom - ha, 2., ha, BLUE);
-        c.rect(bx, bottom - ha - hb, 2., hb, PINK);
+        c.rect(bx, bottom - ha, 2., ha, px(theme::CTX));
+        c.rect(bx, bottom - ha - hb, 2., hb, px(theme::TURN));
     }
 }
-
-fn rings(c: &mut Canvas, f: &CardFonts, x: f32, y: f32, w: f32, items: &[RingFact]) -> f32 {
-    let col = (w - 2. * PAD) / items.len().max(1) as f32;
-    let d = 80.;
-    for (i, r) in items.iter().enumerate() {
-        let cx = x + PAD + col * (i as f32 + 0.5);
-        let cy = y + PAD + d / 2.;
-        c.ring(cx, cy, d, 5., &[(r.share as f32, r.dot.rgba())]);
-        ring_text(
-            c,
+/// The context moon: a night disc, lit from the right by the share of the window in use.
+fn moon(c: &mut Canvas, f: &CardFonts, cx: f32, cy: f32, r: f32, m: &MoonFact) {
+    if !c.dry {
+        c.circle(cx, cy, r + 0.75, px(theme::HAIRLINE));
+        c.circle(cx, cy, r, px(theme::SLATE_TOP));
+        let share = m.share.clamp(0., 1.) as f32;
+        if share >= 0.995 {
+            c.circle(cx, cy, r, px(super::text::heat(m.tokens)));
+        } else if share > 0.004 {
+            let k = 1. - 2. * share;
+            let steps = 48;
+            let mut pts = vec![];
+            for i in 0..=steps {
+                let t =
+                    -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / steps as f32;
+                pts.push((cx + r * t.cos(), cy + r * t.sin()));
+            }
+            for i in 0..=steps {
+                let t =
+                    std::f32::consts::FRAC_PI_2 - std::f32::consts::PI * i as f32 / steps as f32;
+                pts.push((cx + k * r * t.cos(), cy + r * t.sin()));
+            }
+            c.lit(&pts, px(super::text::heat(m.tokens)));
+        }
+    }
+    let n = ((m.share * 100.).round() as i64).to_string();
+    let (l, nr, _, _) = f.ink(&n, 20., 600., 0.);
+    let adv = f.width(&n, 20., 600., 0.);
+    let pr = f.ink("%", 12., 600., 0.).1;
+    let x0 = cx - (l + adv + 0.5 + pr) / 2.;
+    let base = cy + f.cap(20., 600.) / 2.;
+    let _ = nr;
+    c.text(f, &n, x0, base, 20., 600., px(theme::DATA), 0., Anchor::L);
+    c.text(
+        f,
+        "%",
+        x0 + adv + 0.5,
+        base,
+        12.,
+        600.,
+        px(theme::DATA),
+        0.,
+        Anchor::L,
+    );
+}
+fn moon_card(
+    c: &mut Canvas,
+    e: &Env,
+    look: Look,
+    x: f32,
+    y: f32,
+    w: f32,
+    moon_fact: &Option<MoonFact>,
+    bars: &[BarFact],
+) -> f32 {
+    heading(c, e, look, x, y, w, "");
+    let f = e.f;
+    let top = y + PAD + HEAD_H + 6.;
+    let r = 36.;
+    let mut left = x + PAD;
+    let mut height = 0.;
+    if let Some(m) = moon_fact {
+        let cx = x + PAD + r;
+        moon(c, f, cx, top + r, r, m);
+        c.text(
             f,
+            &m.caption,
             cx,
-            cy,
-            &format!("{}", (r.share * 100.).round() as i64),
-            true,
-            18.,
-            &r.name,
+            top + 2. * r + 6. + f.cap(11., MONO),
+            11.,
+            MONO,
+            px(theme::QUIET),
+            0.,
+            Anchor::M,
         );
-        let base = y + PAD + d + 6. + f.cap(11., 400.) + 3.;
-        c.text(f, &r.caption, cx, base, 11., 400., LABEL, 0., Anchor::M);
+        left = x + PAD + 2. * r + 22.;
+        height = 2. * r + 6. + f.cap(11., MONO) + 4.;
     }
-    PAD + d + 6. + 14. + PAD
+    let bw = x + w - PAD - left;
+    let row = 40.;
+    let used = row * bars.len() as f32;
+    let mut by = top + ((height - used) / 2.).max(0.);
+    for b in bars {
+        let ink = match b.tone {
+            Dot::Amber => theme::DREAM,
+            Dot::Red => theme::TURN,
+            _ => theme::CTX,
+        };
+        let base = by + 9. + f.cap(11., 600.) / 2.;
+        c.text(f, &b.name, left, base, 11., 600., px(ink), 0.6, Anchor::L);
+        c.text(
+            f,
+            &format!("{}%", (b.share * 100.).round() as i64),
+            left + bw,
+            base,
+            13.,
+            MONO,
+            px(theme::INK),
+            0.,
+            Anchor::R,
+        );
+        let ty = by + 17.;
+        c.rrect(left, ty, bw, 5., 2.5, px(theme::TRACK));
+        let fw = (bw * b.share.clamp(0., 1.) as f32).max(if b.share > 0. { 3. } else { 0. });
+        if fw > 0. {
+            c.rrect(left, ty, fw, 5., 2.5, px(ink));
+        }
+        if let Some(p) = b.pace {
+            // where an even burn would stand now
+            c.rect(left + bw * p as f32 - 0.5, ty - 2., 1., 9., px(theme::INK));
+        }
+        c.text(
+            f,
+            &b.caption,
+            left,
+            by + 33. + f.cap(10., 400.) / 2.,
+            10.,
+            400.,
+            px(theme::FAINT),
+            0.,
+            Anchor::L,
+        );
+        by += row;
+    }
+    let body = height.max(used);
+    top + body + PAD - y
 }
-#[allow(clippy::too_many_arguments)]
 fn history(
     c: &mut Canvas,
-    f: &CardFonts,
+    e: &Env,
+    look: Look,
     x: f32,
     y: f32,
     w: f32,
@@ -735,59 +921,51 @@ fn history(
     head: &str,
     rows: &[Legend],
 ) -> f32 {
+    heading(c, e, look, x, y, w, head);
     let (ix, iw) = (x + PAD, w - 2. * PAD);
-    let mut cy = y + PAD;
-    header(c, f, ix, cy, iw, "TOKENS PER REQUEST", head);
-    cy += 24.;
-    let bh = 48.;
+    let mut cy = y + PAD + HEAD_H + 6.;
+    let bh = 44.;
     bars(c, ix, cy + bh, iw, bh, data);
     cy += bh + 8.;
-    cy += legend(c, f, ix, cy, iw, rows);
+    cy += legend(c, e.f, ix, cy, iw, rows);
     cy + PAD - y
 }
-#[allow(clippy::too_many_arguments)]
 fn agents_card(
     c: &mut Canvas,
-    f: &CardFonts,
+    e: &Env,
+    look: Look,
     x: f32,
     y: f32,
     w: f32,
     slots: &[Slot],
     rows: &[Legend],
 ) -> f32 {
+    heading(c, e, look, x, y, w, "");
     let (ix, iw) = (x + PAD, w - 2. * PAD);
-    let mut cy = y + PAD;
-    header(c, f, ix, cy, iw, "AGENTS", "");
-    cy += 24.;
-    let per = if iw < 10. * 22. + 9. * 3. { 5 } else { 10 };
-    let d = ((iw - (per as f32 - 1.) * 4.) / per as f32).clamp(22., 30.);
-    let pitch = if per > 1 {
-        (iw - d) / (per as f32 - 1.)
-    } else {
-        0.
-    };
-    let lines = slots.len().div_ceil(per).max(1);
+    let mut cy = y + PAD + HEAD_H + 6.;
+    let d = 12.;
     for (i, slot) in slots.iter().enumerate() {
-        let (r, col) = (i / per, i % per);
-        let cx = ix + d / 2. + pitch * col as f32;
-        let cy2 = cy + r as f32 * (d + 6.) + d / 2.;
+        let px0 = ix + i as f32 * (d + 6.);
+        if px0 + d > ix + iw {
+            break;
+        }
         match slot {
-            Slot::Running => c.ring(cx, cy2, d, 2.5, &[(1., BLUE)]),
-            Slot::Stalled => c.ring(cx, cy2, d, 2.5, &[(1., AMBER)]),
+            Slot::Running => c.rrect(px0, cy, d, d, 3., px(theme::CTX)),
+            Slot::Stalled => c.rrect(px0, cy, d, d, 3., px(theme::DREAM)),
             Slot::Done => {
-                c.ring(cx, cy2, d, 2.5, &[]);
-                c.circle(cx, cy2, 3., GREEN);
+                c.rrect(px0, cy, d, d, 3., px(theme::RECALL));
+                c.rrect(px0 + 2., cy + 2., d - 4., d - 4., 1.5, px(look.face()));
             }
         }
     }
-    cy += d * lines as f32 + 6. * (lines as f32 - 1.) + 8.;
-    cy += legend(c, f, ix, cy, iw, rows);
+    cy += d + 10.;
+    cy += legend(c, e.f, ix, cy, iw, rows);
     cy + PAD - y
 }
-#[allow(clippy::too_many_arguments)]
 fn cache_card(
     c: &mut Canvas,
-    f: &CardFonts,
+    e: &Env,
+    look: Look,
     x: f32,
     y: f32,
     w: f32,
@@ -795,87 +973,155 @@ fn cache_card(
     cold: bool,
     rows: &[Legend],
 ) -> f32 {
-    let d: f32 = 72.;
+    heading(c, e, look, x, y, w, "");
     let (ix, iw) = (x + PAD, w - 2. * PAD);
-    let h = PAD + d.max(18. * rows.len() as f32) + PAD;
-    let (cx, cy) = (ix + d / 2., y + h / 2.);
-    c.ring(
-        cx,
-        cy,
-        d,
-        5.,
-        &[(share as f32, if cold { AMBER } else { BLUE })],
-    );
-    ring_text(
-        c,
-        f,
-        cx,
-        cy,
-        &format!("{}", (share * 100.).round() as i64),
-        true,
-        18.,
-        "CACHE",
-    );
-    let lx = ix + d + 16.;
-    let top = cy - 9. * rows.len() as f32;
-    legend(c, f, lx, top, iw - d - 16., rows);
-    h
+    let mut cy = y + PAD + HEAD_H + 6.;
+    let ink = if cold { theme::DREAM } else { theme::RECALL };
+    c.rrect(ix, cy, iw, 6., 3., px(theme::TRACK));
+    let fw = (iw * share.clamp(0., 1.) as f32).max(if share > 0. { 3. } else { 0. });
+    if fw > 0. {
+        c.rrect(ix, cy, fw, 6., 3., px(ink));
+    }
+    cy += 6. + 10.;
+    cy += legend(c, e.f, ix, cy, iw, rows);
+    cy + PAD - y
 }
-#[allow(clippy::too_many_arguments)]
-fn dreams_card(
+fn what_if_card(
     c: &mut Canvas,
-    f: &CardFonts,
+    e: &Env,
+    look: Look,
     x: f32,
     y: f32,
-    _w: f32,
-    count: usize,
-    share: f64,
+    w: f32,
     line: &str,
+    tally: &str,
+    count: usize,
+    unread: usize,
 ) -> f32 {
-    let d = 30.;
-    let h = PAD + d + PAD;
-    let (cx, cy) = (x + PAD + d / 2., y + h / 2.);
-    c.ring(cx, cy, d, 3., &[(share as f32, BLUE)]);
-    c.text(
-        f,
-        &count.to_string(),
-        cx,
-        cy + f.cap(13., 600.) / 2.,
-        13.,
-        600.,
-        WHITE,
-        0.,
-        Anchor::M,
-    );
-    let tx = x + PAD + d + 10.;
-    c.text(
-        f,
-        "Dreams",
-        tx,
-        cy - 8. + f.cap(13., 500.) / 2.,
-        13.,
-        500.,
-        INK,
-        0.,
-        Anchor::L,
+    heading(c, e, look, x, y, w, tally);
+    let (ix, iw) = (x + PAD, w - 2. * PAD);
+    let mut cy = y + PAD + HEAD_H + 4.;
+    let f = e.f;
+    if !line.is_empty() {
+        for l in wrap(f, line, 12., 400., iw, 3) {
+            c.text(
+                f,
+                &l,
+                ix,
+                cy + 8. + f.cap(12., 400.) / 2.,
+                12.,
+                400.,
+                px(theme::INK),
+                0.,
+                Anchor::L,
+            );
+            cy += 17.;
+        }
+        cy += 3.;
+    }
+    let said = format!(
+        "{count} {} this session \u{b7} {unread} unread",
+        if count == 1 { "dream" } else { "dreams" }
     );
     c.text(
         f,
-        line,
-        tx,
-        cy + 8. + f.cap(12., 400.) / 2.,
-        12.,
+        &said,
+        ix,
+        cy + 6. + f.cap(10., 400.) / 2.,
+        10.,
         400.,
-        LABEL,
+        px(theme::FAINT),
         0.,
         Anchor::L,
     );
-    h
+    cy + 14. + PAD - y
 }
-#[allow(clippy::too_many_arguments)]
+fn story_card(
+    c: &mut Canvas,
+    e: &Env,
+    look: Look,
+    x: f32,
+    y: f32,
+    w: f32,
+    rights: &str,
+    now: &str,
+    shifts: &[(String, bool)],
+) -> f32 {
+    heading(c, e, look, x, y, w, "");
+    let (ix, iw) = (x + PAD, w - 2. * PAD);
+    let f = e.f;
+    let mut cy = y + PAD + HEAD_H + 2.;
+    if !rights.is_empty() {
+        let said = fit_width(f, rights, 10., MONO, iw);
+        c.text(
+            f,
+            &said,
+            ix,
+            cy + 6. + f.cap(10., MONO) / 2.,
+            10.,
+            MONO,
+            px(theme::FAINT),
+            0.,
+            Anchor::L,
+        );
+        cy += 16.;
+    }
+    for l in wrap(f, now, 12.5, 400., iw, 4) {
+        c.text(
+            f,
+            &l,
+            ix,
+            cy + 8. + f.cap(12.5, 400.) / 2.,
+            12.5,
+            400.,
+            px(theme::INK),
+            0.,
+            Anchor::L,
+        );
+        cy += 17.;
+    }
+    if !shifts.is_empty() {
+        cy += 4.;
+        c.rect(ix, cy, iw, 0.5, px(theme::HAIRLINE));
+        cy += 6.;
+        for (text, loud) in shifts.iter().take(9) {
+            if *loud {
+                let l = fit_width(f, text, 11.5, 400., iw);
+                c.text(
+                    f,
+                    &l,
+                    ix,
+                    cy + 7. + f.cap(11.5, 400.) / 2.,
+                    11.5,
+                    400.,
+                    px(theme::INK),
+                    0.,
+                    Anchor::L,
+                );
+                cy += 15.;
+            } else {
+                let l = fit_width(f, text.trim(), 10., MONO, iw);
+                c.text(
+                    f,
+                    &l,
+                    ix,
+                    cy + 6. + f.cap(10., MONO) / 2.,
+                    10.,
+                    MONO,
+                    px(theme::QUIET),
+                    0.,
+                    Anchor::L,
+                );
+                cy += 13.;
+            }
+        }
+    }
+    cy + PAD - y
+}
 fn mirror_card(
     c: &mut Canvas,
-    f: &CardFonts,
+    e: &Env,
+    look: Look,
     x: f32,
     y: f32,
     w: f32,
@@ -884,35 +1130,37 @@ fn mirror_card(
     up: &[f64],
     down: &[f64],
 ) -> f32 {
+    heading(c, e, look, x, y, w, "");
+    let f = e.f;
     let (ix, iw) = (x + PAD, w - 2. * PAD);
-    let mut cy = y + PAD;
-    let cap = f.cap(22., 600.);
+    let mut cy = y + PAD + HEAD_H + 4.;
+    let cap = f.cap(20., MONO);
     let half = iw / 2.;
     let figs = [
-        (count_text(recalled), "RECALL IN", PINK),
-        (count_text(noted), "NOTES OUT", BLUE),
+        (count_text(recalled), "RECALL IN", theme::RECALL),
+        (count_text(noted), "NOTES OUT", theme::CTX),
     ];
     for (i, (v, label, col)) in figs.iter().enumerate() {
         let fx = ix + half * i as f32;
-        c.text(f, v, fx, cy + cap, 22., 600., WHITE, 0., Anchor::L);
-        let ly = cy + cap + 6. + 7.;
-        c.circle(fx + 3.5, ly, 3.5, *col);
+        c.text(f, v, fx, cy + cap, 20., MONO, px(theme::INK), 0., Anchor::L);
+        let ly = cy + cap + 6. + 6.;
+        c.circle(fx + 3.5, ly, 3.5, px(*col));
         c.text(
             f,
             label,
             fx + 12.,
-            ly + f.cap(10., 500.) / 2.,
+            ly + f.cap(10., 600.) / 2.,
             10.,
-            500.,
-            LABEL,
+            600.,
+            px(*col),
             0.8,
             Anchor::L,
         );
     }
-    cy += cap + 6. + 14. + 10.;
+    cy += cap + 6. + 12. + 10.;
     let n = (((iw + 1.) / 3.).floor() as usize).max(1);
     let x0 = ix + (iw - (3. * n as f32 - 1.));
-    let arm = 26.;
+    let arm = 24.;
     let mid = cy + arm;
     let (top, bottom) = (
         up.iter().copied().fold(0., f64::max).max(1.),
@@ -924,14 +1172,14 @@ fn mirror_card(
         let (u, d) = (at(up), at(down));
         if u > 0. {
             let hu = (((u / top) as f32 * arm * 2.).round() / 2.).max(0.5);
-            c.rect(bx, mid - hu, 2., hu, PINK);
+            c.rect(bx, mid - hu, 2., hu, px(theme::RECALL));
         }
         if d > 0. {
             let hd = (((d / bottom) as f32 * arm * 2.).round() / 2.).max(0.5);
-            c.rect(bx, mid + 1., 2., hd, BLUE);
+            c.rect(bx, mid + 1., 2., hd, px(theme::CTX));
         }
     }
-    c.rect(ix, mid, iw, 1., RULE);
+    c.rect(ix, mid, iw, 1., px(theme::HAIRLINE));
     cy += 2. * arm + 1.;
     cy + PAD - y
 }
@@ -945,23 +1193,34 @@ fn count_text(n: usize) -> String {
 
 // ---------------------------------------------------------------- drawing
 
-fn draw_body(c: &mut Canvas, f: &CardFonts, card: &Card, x: f32, y: f32, w: f32) -> f32 {
+fn draw_body(c: &mut Canvas, e: &Env, card: &Card, x: f32, y: f32, w: f32) -> f32 {
+    let look = card.look();
     match card {
-        Card::Rings(items) => rings(c, f, x, y, w, items),
-        Card::History { bars, head, legend } => history(c, f, x, y, w, bars, head, legend),
-        Card::Agents { slots, legend } => agents_card(c, f, x, y, w, slots, legend),
+        Card::Moon { moon, bars } => moon_card(c, e, look, x, y, w, moon, bars),
+        Card::History { bars, head, legend } => history(c, e, look, x, y, w, bars, head, legend),
+        Card::Agents { slots, legend } => agents_card(c, e, look, x, y, w, slots, legend),
         Card::Cache {
             share,
             cold,
             legend,
-        } => cache_card(c, f, x, y, w, *share, *cold, legend),
-        Card::Dreams { count, share, line } => dreams_card(c, f, x, y, w, *count, *share, line),
+        } => cache_card(c, e, look, x, y, w, *share, *cold, legend),
+        Card::WhatIf {
+            line,
+            tally,
+            count,
+            unread,
+        } => what_if_card(c, e, look, x, y, w, line, tally, *count, *unread),
+        Card::Story {
+            rights,
+            now,
+            shifts,
+        } => story_card(c, e, look, x, y, w, rights, now, shifts),
         Card::Mirror {
             recalled,
             noted,
             up,
             down,
-        } => mirror_card(c, f, x, y, w, *recalled, *noted, up, down),
+        } => mirror_card(c, e, look, x, y, w, *recalled, *noted, up, down),
     }
 }
 fn width_pt(cols: usize, cell: (u32, u32)) -> f32 {
@@ -972,7 +1231,7 @@ pub fn height_pt(card: &Card, cols: usize, cell: (u32, u32), f: &CardFonts) -> f
     let mut dry = Canvas::dry();
     draw_body(
         &mut dry,
-        f,
+        &Env { f, cell },
         card,
         MARGIN,
         0.,
@@ -1016,11 +1275,12 @@ pub fn draw_card(
         u32::try_from(rows).ok()?.checked_mul(cell.1)?,
     )?;
     ground(&mut c, cell, backs);
+    let e = Env { f, cell };
     let w = width_pt(cols, cell) - 2. * MARGIN;
     let mut dry = Canvas::dry();
-    let h = draw_body(&mut dry, f, card, MARGIN, 0., w);
-    c.rrect(MARGIN, 0., w, h, 10., CARD);
-    draw_body(&mut c, f, card, MARGIN, 0., w);
+    let h = draw_body(&mut dry, &e, card, MARGIN, 0., w);
+    c.panel(MARGIN, 0., w, h, 5., card.look().face());
+    draw_body(&mut c, &e, card, MARGIN, 0., w);
     Some(c.pm)
 }
 const PILL_GAP: f32 = 10.;
@@ -1044,7 +1304,7 @@ pub fn pill_cols(p: &Pill, cell: (u32, u32), f: &CardFonts) -> usize {
     let cell_pt = cell.0 as f32 / S;
     ((pill_width(p, f) + 2. * MARGIN) / cell_pt).ceil() as usize + 1
 }
-/// The pill in a picture `cols` by `rows` cells.
+/// The pill in a picture `cols` by `rows` cells: the masthead's slate, its data ink.
 pub fn draw_pill(
     p: &Pill,
     cols: usize,
@@ -1060,28 +1320,48 @@ pub fn draw_pill(
     ground(&mut c, cell, backs);
     let height_pt = rows as f32 * cell.1 as f32 / S;
     let (w, h) = (pill_width(p, f), (height_pt - 2.).max(10.));
-    c.rrect(MARGIN, 1., w, h, 10., PILL);
+    if let Some(path) = rrect_path(MARGIN, 1., w, h, 5.) {
+        let [t, b] = [theme::SLATE_TOP, theme::SLATE_BOTTOM];
+        let stops = vec![
+            tiny_skia::GradientStop::new(0., tiny_skia::Color::from_rgba8(t[0], t[1], t[2], 255)),
+            tiny_skia::GradientStop::new(1., tiny_skia::Color::from_rgba8(b[0], b[1], b[2], 255)),
+        ];
+        if let Some(shader) = tiny_skia::LinearGradient::new(
+            tiny_skia::Point::from_xy(0., 1. * S),
+            tiny_skia::Point::from_xy(0., (1. + h) * S),
+            stops,
+            tiny_skia::SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            let mut paint = Paint {
+                anti_alias: true,
+                ..Paint::default()
+            };
+            paint.shader = shader;
+            c.pm.fill_path(&path, &paint, FillRule::Winding, sc(), None);
+        }
+    }
     let n = p.lines.len().max(1) as f32;
     for (li, groups) in p.lines.iter().enumerate() {
         let mid = 1. + h * (li as f32 + 0.5) / n;
         let base = mid + f.cap(p.size, 600.) / 2.;
-        let mut px = MARGIN + 12.;
+        let mut px0 = MARGIN + 12.;
         for (gi, g) in groups.iter().enumerate() {
             for (s, ink, bold) in g {
-                px += c.text(
+                px0 += c.text(
                     f,
                     s,
-                    px,
+                    px0,
                     base,
                     p.size,
                     if *bold { 600. } else { 500. },
-                    ink.rgba(),
+                    px(ink.rgb()),
                     0.,
                     Anchor::L,
                 );
             }
             if gi + 1 < groups.len() {
-                px += PILL_GAP;
+                px0 += PILL_GAP;
             }
         }
     }
@@ -1090,8 +1370,8 @@ pub fn draw_pill(
 
 // ---------------------------------------------------------------- what the pane knows
 
-/// The ring of a quota window, only while its reading is current.
-fn quota_ring(q: &Value, now: f64) -> Option<RingFact> {
+/// The bar of a quota window, only while its reading is current.
+fn quota_bar(q: &Value, now: f64) -> Option<BarFact> {
     let used = q["used"].as_f64()?;
     let code = string(&q["code"]);
     let resets = q["resets"].as_f64();
@@ -1104,8 +1384,7 @@ fn quota_ring(q: &Value, now: f64) -> Option<RingFact> {
             }
         })
         .unwrap_or_default();
-    Some(RingFact {
-        share: (used / 100.).clamp(0., 1.),
+    Some(BarFact {
         name: format!(
             "{code}{}",
             if super::text::ahead_of_pace(q) {
@@ -1114,26 +1393,23 @@ fn quota_ring(q: &Value, now: f64) -> Option<RingFact> {
                 ""
             }
         ),
+        share: (used / 100.).clamp(0., 1.),
         caption,
-        dot: match string(&q["sev"]) {
+        pace: q["pace"].as_f64().filter(|p| (0. ..=1.).contains(p)),
+        tone: match string(&q["sev"]) {
             "red" => Dot::Red,
             "amber" => Dot::Amber,
             _ => Dot::Blue,
         },
     })
 }
-fn ctx_ring(g: &Value) -> Option<RingFact> {
+fn ctx_moon(g: &Value) -> Option<MoonFact> {
     let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.)?;
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
-    Some(RingFact {
+    Some(MoonFact {
         share: (tokens / size).clamp(0., 1.),
-        name: "CTX".into(),
-        caption: format!("{} / {}", short(tokens), short(size)),
-        dot: match string(&g["ctx"]["sev"]) {
-            "red" => Dot::Red,
-            "amber" => Dot::Amber,
-            _ => Dot::Blue,
-        },
+        tokens,
+        caption: format!("{}/{}", short(tokens), short(size)),
     })
 }
 /// Requests as (cached, fresh) token pairs, oldest first, from the transcript's own usage figures.
@@ -1239,32 +1515,71 @@ fn cache_card_of(cache: &Value) -> Option<Card> {
         ],
     })
 }
-/// The dreams this session has: its count, the share of the chapter's asks used, the words.
-pub fn dream_facts(data: &Value, sid: &str) -> Option<(usize, f64, String)> {
+/// The dreams this session has: the open dream's words (else the latest), how many asks are
+/// left, the count, and how many wait unread.
+pub fn dream_facts(data: &Value, sid: &str) -> Option<Card> {
     if data["dreams_on"] == false {
         return None;
     }
-    let mine = array(&data["dreams"])
+    let mine: Vec<&Value> = array(&data["dreams"])
         .iter()
         .filter(|d| d["session"] == sid)
-        .count();
-    if mine == 0 {
+        .collect();
+    let latest = mine.first()?;
+    let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], sid);
+    let open = &fed["star"];
+    let unread = usize::from(!open.is_null());
+    let line = string(if open.is_null() {
+        &latest["line"]
+    } else {
+        &open["line"]
+    });
+    let tally = format!(
+        "{} of {} left",
+        fed["left"].as_u64().unwrap_or(0),
+        fed["of"].as_u64().unwrap_or(0)
+    );
+    Some(Card::WhatIf {
+        line: line.to_owned(),
+        tally,
+        count: mine.len(),
+        unread,
+    })
+}
+/// The session's story as the pane tells it: where work stands and the Shift Map's lines, whose
+/// source line carries the commit receipt. `None` without a story or a map.
+fn story_of(data: &Value, s: &Value, now: f64) -> Option<Card> {
+    let story = &data["story"];
+    let said = string(&story["now"]).trim().to_owned();
+    let rights = if story.is_null() {
+        String::new()
+    } else {
+        super::super::pages::story_rights(story, now)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    };
+    let map = &data["story_map"];
+    let mut shifts: Vec<(String, bool)> = vec![];
+    if map.is_object() {
+        let from = data["story_map_from"].as_str();
+        let messages = if from.is_some() {
+            data["story_map_messages"].as_u64()
+        } else {
+            s["messages"].as_u64()
+        };
+        let (_, rows) =
+            super::super::shiftmap::shift_map_marked(map, messages, 56, false, Some(8), from);
+        shifts = rows;
+    }
+    if said.is_empty() && shifts.is_empty() {
         return None;
     }
-    let fed = dreams::feed(array(&data["dreams"]), &data["chapter"], sid);
-    let unread = usize::from(!fed["star"].is_null());
-    let of = fed["of"].as_f64().unwrap_or(0.);
-    let left = fed["left"].as_f64().unwrap_or(0.);
-    let share = if of > 0. {
-        ((of - left) / of).clamp(0., 1.)
-    } else {
-        0.
-    };
-    Some((
-        mine,
-        share,
-        format!("{unread} unread \u{b7} {} left", left as i64),
-    ))
+    Some(Card::Story {
+        rights,
+        now: said,
+        shifts,
+    })
 }
 fn buckets(times: &[f64], from: f64, to: f64, n: usize) -> Vec<f64> {
     let mut out = vec![0.; n];
@@ -1314,19 +1629,20 @@ pub fn build(
     agents: &agents::Projection,
 ) -> Vec<Card> {
     let mut out = vec![];
-    let mut rings: Vec<RingFact> = vec![];
-    rings.extend(ctx_ring(g));
+    out.extend(story_of(data, s, now));
     let quotas = array(&g["quotas"]);
-    for code in ["5H", "7D"] {
-        rings.extend(
+    let bars: Vec<BarFact> = ["5H", "7D"]
+        .iter()
+        .filter_map(|code| {
             quotas
                 .iter()
-                .find(|q| q["code"] == code)
-                .and_then(|q| quota_ring(q, now)),
-        );
-    }
-    if !rings.is_empty() {
-        out.push(Card::Rings(rings));
+                .find(|q| q["code"] == *code)
+                .and_then(|q| quota_bar(q, now))
+        })
+        .collect();
+    let moon = ctx_moon(g);
+    if moon.is_some() || !bars.is_empty() {
+        out.push(Card::Moon { moon, bars });
     }
     let csr = array(&data["infinite"]["csr_at"]).len();
     out.extend(history_card(g, s, csr));
@@ -1358,9 +1674,7 @@ pub fn build(
         });
     }
     out.extend(cache_card_of(&g["cache"]));
-    if let Some((count, share, line)) = dream_facts(data, string(&s["id"])) {
-        out.push(Card::Dreams { count, share, line });
-    }
+    out.extend(dream_facts(data, string(&s["id"])));
     out.extend(mirror_card_of(s, handed, now));
     out
 }
@@ -1618,14 +1932,34 @@ mod tests {
             (Dot::Blue, "Cached".to_owned(), "91%".to_owned()),
             (Dot::Pink, "Fresh".to_owned(), "9%".to_owned()),
         ];
-        let ring = |name: &str| RingFact {
-            share: 0.5,
+        let bar = |name: &str| BarFact {
             name: name.into(),
-            caption: "104k / 200k".into(),
-            dot: Dot::Blue,
+            share: 0.5,
+            caption: "resets in 2h".into(),
+            pace: Some(0.4),
+            tone: Dot::Blue,
         };
         let cards = [
-            Card::Rings(vec![ring("CTX"), ring("5H"), ring("7D\u{bb}")]),
+            Card::Moon {
+                moon: Some(MoonFact {
+                    share: 0.17,
+                    tokens: 170000.,
+                    caption: "170k/1M".into(),
+                }),
+                bars: vec![bar("5H"), bar("7D\u{bb}")],
+            },
+            Card::Story {
+                rights: "rev 3 \u{b7} Haiku \u{b7} just told \u{b7} next at compact".into(),
+                now: "Work stands at the cards: the moon gauge draws and the pill keeps its facts."
+                    .into(),
+                shifts: vec![
+                    ("1  moon gauge replaced the rings".into(), true),
+                    (
+                        "   Haiku's words \u{b7} names match commit 1c4183bc".into(),
+                        false,
+                    ),
+                ],
+            },
             Card::History {
                 bars: (0..300).map(|i| (i as f64, 20.)).collect(),
                 head: "+34k/turn".into(),
@@ -1640,10 +1974,11 @@ mod tests {
                 cold: false,
                 legend,
             },
-            Card::Dreams {
+            Card::WhatIf {
+                line: "What if the cards drew from the same gauges as the text rows?".into(),
+                tally: "3 of 5 left".into(),
                 count: 2,
-                share: 0.4,
-                line: "1 unread \u{b7} 3 left".into(),
+                unread: 1,
             },
             Card::Mirror {
                 recalled: 3100,

@@ -30,7 +30,7 @@ const CHART_MIN: usize = 10;
 const LANE: usize = 9;
 const ICON: (usize, usize) = (5, 2);
 const FLOOR_ROWS: usize = 5;
-const CARDS_GROUND: Rgb = [22, 27, 38];
+const CARDS_GROUND: Rgb = super::render::theme::PAPER;
 const BAND: (f64, f64) = (180_589., 269_178.);
 pub(super) const CACHE_LOW: f64 = 600.;
 const QUIET_SWITCHES: [&str; 1] = ["RATIFICATION"];
@@ -1197,9 +1197,9 @@ pub fn draw_info(
         let f = f.expect("cards are built only with fonts");
         for card in &stack {
             match card {
-                cards::Card::Rings(items) => {
-                    for r in items {
-                        shows.insert(if r.name.starts_with("5H") { "5h" } else { "7d" });
+                cards::Card::Moon { bars, .. } => {
+                    for b in bars {
+                        shows.insert(if b.name.starts_with("5H") { "5h" } else { "7d" });
                     }
                 }
                 cards::Card::Cache { .. } => {

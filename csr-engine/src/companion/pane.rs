@@ -492,7 +492,10 @@ impl Pane {
             "cell": [cell.0, cell.1],
             "csr": array(&data["infinite"]["csr_at"]).len(),
             "dreams": if cards_on {
-                super::render::cards::dream_facts(&data, &self.sid).map(|d| d.0)
+                match super::render::cards::dream_facts(&data, &self.sid) {
+                    Some(super::render::cards::Card::WhatIf { count, .. }) => Some(count),
+                    _ => None,
+                }
             } else {
                 None
             },
