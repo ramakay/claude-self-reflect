@@ -29,11 +29,15 @@ impl Fx {
     }
 
     pub fn git(&self, dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        // An absolute program keeps std on posix_spawn. A bare name plus a
+        // changed PATH makes it fork+exec, and every forked child holds the
+        // whole test process's flocks (maintenance locks of other tests)
+        // until its exec.
+        let out = Command::new(git_program())
             .args(args)
             .current_dir(dir)
             .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+            .env("PATH", GIT_PATH)
             .env("HOME", &self.home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -185,4 +189,18 @@ pub(crate) fn py(defs: &[&str]) -> String {
     defs.iter()
         .map(|d| format!("def {d}(x):\n    return x\n\n"))
         .collect()
+}
+
+const GIT_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
+
+/// `git` resolved against [`GIT_PATH`] once.
+fn git_program() -> &'static Path {
+    static GIT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    GIT.get_or_init(|| {
+        GIT_PATH
+            .split(':')
+            .map(|dir| Path::new(dir).join("git"))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| "git".into())
+    })
 }
