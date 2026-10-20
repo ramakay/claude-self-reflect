@@ -1501,6 +1501,17 @@ fn history_card(g: &Value, s: &Value, csr: usize) -> Option<Card> {
         legend,
     })
 }
+/// The cache's declared lifetime. The gauge's ttl is the declared one or, when the clock puts more
+/// time left than that, the time left; so a value just over a standard lifetime is that lifetime,
+/// and any other is floored to its minute. Either way it does not creep as the seconds pass.
+fn declared_ttl(ttl: f64) -> f64 {
+    const STANDARD: [f64; 6] = [60., 300., 900., 3600., 7200., 86400.];
+    STANDARD
+        .iter()
+        .copied()
+        .find(|s| ttl >= *s && ttl <= s * 1.1)
+        .unwrap_or_else(|| ((ttl / 60.).floor() * 60.).max(60.))
+}
 fn cache_card_of(cache: &Value) -> Option<Card> {
     let cold = cache["cold"] == true;
     let (left, ttl) = (cache["left"].as_f64(), cache["ttl"].as_f64());
@@ -1520,7 +1531,7 @@ fn cache_card_of(cache: &Value) -> Option<Card> {
     let (left, ttl) = (left?, ttl.filter(|t| *t > 0.)?);
     Some(Card::Cache {
         // the minute shown is the one drawn: seconds would redraw an idle card
-        share: ((left / 60.).floor() * 60. / ttl).clamp(0., 1.),
+        share: ((left / 60.).floor() * 60. / declared_ttl(ttl)).clamp(0., 1.),
         cold,
         legend: vec![
             (Dot::Green, "Warm".into(), String::new()),
@@ -2072,6 +2083,16 @@ mod tests {
         assert_eq!(quota_bar(&q2, 0.), Some(bar));
         let cache = |left: f64| cache_card_of(&json!({"left": left, "ttl": 3600.}));
         assert_eq!(cache(3421.), cache(3423.));
+        // a 1h cache the clock puts at 3610 s left, then 3607: the gauge's ttl follows the left
+        let warm = |now: f64| {
+            let g = masthead::cache_info(
+                &json!({"warm": true, "ttl": "1h", "expires_at": 13610.}),
+                now,
+            );
+            cache_card_of(&g)
+        };
+        assert!(warm(10000.).is_some());
+        assert_eq!(warm(10000.), warm(10003.));
     }
     #[test]
     fn requests_with_input_but_no_cache_traffic_are_all_fresh() {
