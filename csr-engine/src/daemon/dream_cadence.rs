@@ -180,6 +180,14 @@ pub const IDLE_ENV: &str = "CSR_DREAM_IDLE_MINS";
 pub const DEFAULT_FLOOR_HOUR: u32 = 3;
 /// Documented override for [`DEFAULT_FLOOR_HOUR`] (0–23).
 pub const FLOOR_HOUR_ENV: &str = "CSR_DREAM_FLOOR_HOUR";
+/// How long an owed nightly floor pass may wait for a quiet window before it
+/// runs anyway: 6 hours past the floor boundary. A machine that is never
+/// quiet for [`DEFAULT_IDLE_MINS`] (parallel agents, subagent transcripts,
+/// a long-running daemon import) would otherwise defer the pass forever —
+/// the 2026-10-18 to 2026-10-20 stall.
+pub const DEFAULT_FLOOR_GRACE_HOURS: u64 = 6;
+/// Documented override for [`DEFAULT_FLOOR_GRACE_HOURS`] (1–168).
+pub const FLOOR_GRACE_ENV: &str = "CSR_DREAM_FLOOR_GRACE_HOURS";
 
 /// What started a cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,12 +301,40 @@ pub fn floor_due(
     }
 }
 
+/// Configured floor grace in seconds. Anything outside 1–168 hours falls back.
+pub fn floor_grace_secs() -> u64 {
+    floor_grace_secs_from(std::env::var(FLOOR_GRACE_ENV).ok().as_deref())
+}
+
+/// Pure core of [`floor_grace_secs`].
+pub fn floor_grace_secs_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&hours| hours > 0 && hours <= 24 * 7)
+        .unwrap_or(DEFAULT_FLOOR_GRACE_HOURS)
+        * 3600
+}
+
+/// Has the owed floor pass waited at least `grace_secs` past the most recent
+/// floor boundary? Past that point it no longer yields to activity: the pass
+/// is deterministic local CPU/SQLite/git work behind the shared heavy-work
+/// semaphore, and an owed pass that can never start is worse than one that
+/// starts during a busy hour.
+pub fn floor_grace_expired(
+    now_local: chrono::NaiveDateTime,
+    floor_hour: u32,
+    grace_secs: u64,
+) -> bool {
+    let waited = now_local.signed_duration_since(floor_boundary(now_local, floor_hour));
+    waited >= Duration::seconds(i64::try_from(grace_secs).unwrap_or(i64::MAX))
+}
+
 /// Config for [`choose_trigger`], resolved once per decision.
 #[derive(Debug, Clone, Copy)]
 pub struct CadenceConfig {
     pub interval_secs: u64,
     pub idle_secs: u64,
     pub floor_hour: u32,
+    pub floor_grace_secs: u64,
 }
 
 impl CadenceConfig {
@@ -308,6 +344,7 @@ impl CadenceConfig {
             interval_secs: interval_secs(),
             idle_secs: idle_secs(),
             floor_hour: floor_hour(),
+            floor_grace_secs: floor_grace_secs(),
         }
     }
 }
@@ -348,7 +385,9 @@ impl CadenceDecision {
 ///   [`CadenceDecision::FloorOwedDeferred`]: no git/SQLite/AST/model work is
 ///   started underneath a live session, and the debt is reported rather than
 ///   forced. It stays owed (`floor_due` keeps returning true) until a pass
-///   actually completes, so nothing is lost — only postponed to quiet.
+///   actually completes, so nothing is lost — only postponed to quiet. The
+///   postponement is bounded: once the pass has been owed for
+///   `floor_grace_secs` it runs even without a quiet window.
 ///
 /// `now_local` is the same instant as `now` expressed in local time; it is
 /// passed in rather than computed so the decision is deterministic under
@@ -363,7 +402,9 @@ pub fn choose_trigger(
 ) -> CadenceDecision {
     let idle = is_idle(last_activity, now, config.idle_secs);
     if floor_due(last_run_local, now_local, config.floor_hour) {
-        return if idle {
+        let grace_expired =
+            floor_grace_expired(now_local, config.floor_hour, config.floor_grace_secs);
+        return if idle || grace_expired {
             CadenceDecision::Run(Trigger::NightlyFloor)
         } else {
             CadenceDecision::FloorOwedDeferred
@@ -402,6 +443,7 @@ pub fn floor_deferred_for_activity(
 ) -> bool {
     floor_due(last_run_local, now_local, config.floor_hour)
         && !is_idle(last_activity, now, config.idle_secs)
+        && !floor_grace_expired(now_local, config.floor_hour, config.floor_grace_secs)
 }
 
 /// Has enough time passed since `last_run` for a cycle to be due at `now`?
@@ -1138,6 +1180,8 @@ mod tests {
             interval_secs,
             idle_secs,
             floor_hour: 3,
+            // 12h keeps the 09:00-local fixtures below inside the grace window.
+            floor_grace_secs: 12 * 3600,
         }
     }
 
@@ -1308,6 +1352,70 @@ mod tests {
             naive("2026-08-11 09:00:00"),
             cfg(8 * 3600, 1800),
         ));
+    }
+
+    #[test]
+    fn an_owed_floor_pass_runs_after_its_grace_even_when_never_idle() {
+        let now = ts(0);
+        let last_run_local = Some(naive("2026-08-09 13:00:00")); // two floors missed
+        let config = CadenceConfig {
+            floor_grace_secs: 6 * 3600,
+            ..cfg(6 * 3600, 1800)
+        };
+        // 08:00 local is 5h past the 03:00 boundary: still inside the grace.
+        assert_eq!(
+            choose_trigger(
+                Some(now - Duration::seconds(5)),
+                Some(now - Duration::hours(40)),
+                now,
+                naive("2026-08-11 08:00:00"),
+                last_run_local,
+                config,
+            ),
+            CadenceDecision::FloorOwedDeferred
+        );
+        // 09:30 local is past it: the pass starts although the session is live.
+        let late = naive("2026-08-11 09:30:00");
+        assert_eq!(
+            choose_trigger(
+                Some(now - Duration::seconds(5)),
+                Some(now - Duration::hours(40)),
+                now,
+                late,
+                last_run_local,
+                config,
+            ),
+            CadenceDecision::Run(Trigger::NightlyFloor),
+            "a machine that is never quiet must still get its owed pass"
+        );
+        assert!(!floor_deferred_for_activity(
+            Some(now - Duration::seconds(5)),
+            last_run_local,
+            now,
+            late,
+            config,
+        ));
+    }
+
+    #[test]
+    fn floor_grace_falls_back_on_garbage() {
+        assert_eq!(
+            floor_grace_secs_from(None),
+            DEFAULT_FLOOR_GRACE_HOURS * 3600
+        );
+        assert_eq!(floor_grace_secs_from(Some("2")), 7200);
+        assert_eq!(
+            floor_grace_secs_from(Some("0")),
+            DEFAULT_FLOOR_GRACE_HOURS * 3600
+        );
+        assert_eq!(
+            floor_grace_secs_from(Some("9999")),
+            DEFAULT_FLOOR_GRACE_HOURS * 3600
+        );
+        assert_eq!(
+            floor_grace_secs_from(Some("x")),
+            DEFAULT_FLOOR_GRACE_HOURS * 3600
+        );
     }
 
     #[test]
