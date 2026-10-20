@@ -200,6 +200,9 @@ pub struct Pane {
     agent: Option<String>,
     session: Option<Session>,
     pub view: String,
+    pub theme: super::render::theme::Theme,
+    pub instrument_open: super::render::instrument::Open,
+    pub instrument_metrics: Option<super::render::instrument::Metrics>,
     pub open: Value,
     pub sent: Value,
     folds: Vec<Value>,
@@ -273,7 +276,14 @@ impl Pane {
             session: (!sid.is_empty()).then(|| Session::new(&sid)),
             sid,
             agent: args.agent.clone(),
-            view: args.page.clone(),
+            view: if args.page == "info" {
+                "main".into()
+            } else {
+                args.page.clone()
+            },
+            theme: super::render::theme::Theme::from_env(),
+            instrument_open: super::render::instrument::Open::default(),
+            instrument_metrics: None,
             open: Value::Null,
             sent: Value::Null,
             folds: vec![],
@@ -372,7 +382,7 @@ impl Pane {
         let (refreshing, refresh_note) = self.map.poll(now);
         self.dreams.poll(&self.paths);
         let records = &self.dreams.records;
-        let root = self.root.to_string_lossy();
+        let root = self.root.to_string_lossy().into_owned();
         let kept = masthead::kept_status(&self.paths, &self.sid, now);
         let story = self
             .db
@@ -392,6 +402,7 @@ impl Pane {
             "dreams": self.dreams.dreams(&root),
             "chapter": dreams::last_chapter(records, &root, &self.sid),
             "look": dreams::last_look(records, &root),
+            "dream_records": records,
             "dreams_on": dreams::dreams_on(&self.paths),
             "story": story,
             "claude_fields": kept["fields"],
@@ -413,7 +424,9 @@ impl Pane {
             _ => Value::Null,
         };
         let every = match (&self.session, self.view.as_str()) {
-            (Some(session), "threads") => threads::lost_value(&self.paths, session),
+            (Some(session), _) if self.instrument_open.threads || self.view == "threads" => {
+                threads::lost_value(&self.paths, session)
+            }
             _ => vec![],
         };
         let can_refresh = self
@@ -482,6 +495,16 @@ impl Pane {
                 Value::Null
             };
             data["readings"] = json!(self.readers.how_claude_read(&self.paths, &self.sid, 2, now));
+        }
+        if self.view == "main" {
+            data["threads"] = json!(every);
+            data["learnt"] = json!(self
+                .db
+                .as_ref()
+                .map(|db| db.learnt_counts(string(&s["project"]), &self.sid, now))
+                .unwrap_or_default());
+            let composition = super::render::instrument::Composition::build(&data, s, now);
+            return self.instrument_frame(&composition, cols, rows);
         }
         let cards_on = self.pixels && self.cards;
         let cell = super::render::kitty::cell_size();
@@ -765,6 +788,134 @@ impl Pane {
         body.push(foot);
         body
     }
+    fn instrument_frame(
+        &mut self,
+        composition: &super::render::instrument::Composition,
+        cols: usize,
+        rows: usize,
+    ) -> Vec<String> {
+        use super::render::{instrument, raster, text};
+        self.instrument_metrics = None;
+        let semantic = instrument::text_rows(composition, cols, rows, self.instrument_open);
+        self.acts = instrument::acts(composition, cols);
+        self.pill = None;
+        for (row, line) in semantic.iter().enumerate() {
+            if line.starts_with("Story ·") {
+                self.acts.insert(row, json!({"key":"instrument:threads"}));
+            } else if ["! ", "+ ", "~ ", "- "].iter().any(|s| line.starts_with(s)) {
+                self.acts.insert(row, json!({"key":"instrument:changes"}));
+            } else if line.starts_with("CTX ") {
+                self.acts.insert(row, json!({"key":"instrument:figure"}));
+            }
+        }
+        let mut out = semantic;
+        if self.pixels && self.cards {
+            let cell = super::render::kitty::cell_size();
+            if let Some((pm, metrics)) = instrument::draw(
+                composition,
+                cols as u32 * cell.0,
+                rows.saturating_sub(1) as u32 * cell.1,
+                self.theme,
+                self.instrument_open,
+                cols < 46,
+            ) {
+                if let Ok(png) = raster::png(&pm) {
+                    self.instrument_metrics = Some(metrics.clone());
+                    let picture_rows = pm.height().div_ceil(cell.1) as usize;
+                    self.placed = vec![super::render::kitty::Placement {
+                        row: 0,
+                        col: 0,
+                        cols,
+                        rows: picture_rows,
+                        png: png.into(),
+                    }];
+                    out = vec![String::new(); picture_rows];
+                    let to_row = |y: f32| {
+                        ((y / metrics.height) * pm.height() as f32 / cell.1 as f32)
+                            .floor()
+                            .max(0.) as usize
+                    };
+                    let answer = self.acts.values().find(|a| a["dream"].is_string()).cloned();
+                    self.acts.clear();
+                    for row in 0..=to_row(metrics.dream + 16.) {
+                        self.acts.insert(row, json!({"key":"instrument:dreams"}));
+                    }
+                    if let Some((start, height)) = metrics.story_region {
+                        for row in to_row(start)..=to_row(start + height) {
+                            self.acts.insert(row, json!({"key":"instrument:threads"}));
+                        }
+                    }
+                    for y in &metrics.shift_hits {
+                        self.acts
+                            .insert(to_row(*y), json!({"key":"instrument:changes"}));
+                    }
+                    for row in to_row(metrics.figure_region.0)
+                        ..=to_row(metrics.figure_region.0 + metrics.figure_region.1)
+                    {
+                        self.acts.insert(row, json!({"key":"instrument:figure"}));
+                    }
+                    if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
+                        answer["spans"] = json!(metrics
+                            .answer_spans
+                            .iter()
+                            .map(|(a, b, word)| json!([
+                                (a / 605. * cols as f32).floor() as usize,
+                                (b / 605. * cols as f32).ceil() as usize,
+                                word
+                            ]))
+                            .collect::<Vec<_>>());
+                        self.acts.insert(to_row(y - 4.), answer);
+                    }
+                }
+            }
+        }
+        out.truncate(rows.saturating_sub(1));
+        out = out.into_iter().map(|line| text::safe_line(&line)).collect();
+        out.resize(rows.saturating_sub(1), String::new());
+        let token = self.theme.tokens();
+        let rgb = [token.quiet[0], token.quiet[1], token.quiet[2]];
+        let ground = [token.ground[0], token.ground[1], token.ground[2]];
+        let ink = [token.ink[0], token.ink[1], token.ink[2]];
+        for line in &mut out {
+            let padding = " ".repeat(cols.saturating_sub(text::len(line)));
+            *line = format!(
+                "{}{}{line}{padding}{}",
+                text::bg(ground),
+                text::fg(ink),
+                text::OFF
+            );
+        }
+        let footer = text::fit(
+            "d dream  l changes  t threads  i figure  b theme  q close",
+            cols,
+        );
+        let mut start = 0;
+        let mut spans = vec![];
+        for (key, label) in [
+            ("d", "dream"),
+            ("l", "changes"),
+            ("t", "threads"),
+            ("i", "figure"),
+            ("b", "theme"),
+            ("q", "close"),
+        ] {
+            let end = start + key.len() + 1 + label.len();
+            if end <= cols {
+                spans.push(json!([start, end, key]));
+            }
+            start = end + 2;
+        }
+        self.acts
+            .insert(rows.saturating_sub(1), json!({"key":"legend","keys":spans}));
+        out.push(format!(
+            "{}{}{footer}{}{}",
+            text::bg(ground),
+            text::fg(rgb),
+            " ".repeat(cols.saturating_sub(text::len(&footer))),
+            text::OFF
+        ));
+        out
+    }
     /// What only the info page reads: the plan's week, what CSR cost in it, and the facts under a
     /// running compaction.
     fn info_data(
@@ -879,6 +1030,59 @@ impl Pane {
     }
     pub fn key(&mut self, key: &str) -> bool {
         match key {
+            "b" => {
+                self.theme.toggle();
+                return true;
+            }
+            "i" => {
+                self.instrument_open.figure = !self.instrument_open.figure;
+                self.view = "main".into();
+                return true;
+            }
+            "l" | "m" => {
+                self.instrument_open.changes = !self.instrument_open.changes;
+                self.instrument_open.threads = false;
+                self.instrument_open.dreams = false;
+                self.instrument_open.scroll = 0;
+                self.view = "main".into();
+                return true;
+            }
+            "t" | "f" => {
+                self.instrument_open.threads = !self.instrument_open.threads;
+                self.instrument_open.changes = false;
+                self.instrument_open.dreams = false;
+                self.instrument_open.scroll = 0;
+                self.view = "main".into();
+                return true;
+            }
+            "d" => {
+                self.instrument_open.dreams = !self.instrument_open.dreams;
+                self.instrument_open.changes = false;
+                self.instrument_open.threads = false;
+                self.instrument_open.scroll = 0;
+                self.view = "main".into();
+                return true;
+            }
+            "1" | "2" | "3" | "4" if self.view == "main" => {
+                let index = key.parse::<usize>().unwrap_or(1) - 1;
+                let answer = self
+                    .acts
+                    .iter()
+                    .find(|(_, a)| a["dream"].is_string())
+                    .map(|(r, a)| (*r, a.clone()));
+                if let Some((row, act)) = answer {
+                    if let Some(span) = array(&act["spans"]).get(index) {
+                        return self.click(row, num(&span[0]) as usize, super::paths::now());
+                    }
+                }
+                return true;
+            }
+            "escape" if self.view == "main" => {
+                self.instrument_open = Default::default();
+            }
+            _ => (),
+        }
+        match key {
             "q" => return false,
             "d" | "l" => {
                 self.view = if key == "d" { "main" } else { "log" }.into();
@@ -943,6 +1147,14 @@ impl Pane {
         self.map.wait(now)
     }
     pub fn scroll(&mut self, step: isize) {
+        if self.view == "main"
+            && (self.instrument_open.changes
+                || self.instrument_open.threads
+                || self.instrument_open.dreams)
+        {
+            self.instrument_open.scroll = self.instrument_open.scroll.saturating_add_signed(step);
+            return;
+        }
         let top = match self.view.as_str() {
             "main" => &mut self.top,
             "summary" => &mut self.summary_top,
@@ -1029,12 +1241,24 @@ impl Pane {
             self.open = Value::Null;
             return true;
         };
+        if let Some(key) = string(&act["key"]).strip_prefix("instrument:") {
+            return self.key(match key {
+                "dreams" => "d",
+                "threads" => "t",
+                "figure" => "i",
+                "changes" => "l",
+                _ => "escape",
+            });
+        }
         if act["key"] == "legend" {
             if let Some(span) = array(&act["keys"])
                 .iter()
                 .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
             {
-                if matches!(string(&span[2]), "d" | "l" | "r" | "s" | "f" | "i" | "z") {
+                if matches!(
+                    string(&span[2]),
+                    "d" | "l" | "r" | "s" | "f" | "t" | "i" | "b" | "q" | "z"
+                ) {
                     return self.key(string(&span[2]));
                 }
                 return true;
@@ -1084,7 +1308,12 @@ impl Pane {
         }
         let key = string(&act["key"]);
         if let Some(view) = key.strip_prefix("view:") {
-            if matches!(view, "main" | "log" | "info" | "summary" | "threads") {
+            if view == "info" {
+                self.instrument_open.figure = !self.instrument_open.figure;
+                self.view = "main".into();
+                return true;
+            }
+            if matches!(view, "main" | "log" | "summary" | "threads") {
                 self.view = view.into();
                 self.open = Value::Null;
                 if view == "info" {

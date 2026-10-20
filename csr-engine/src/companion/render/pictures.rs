@@ -108,7 +108,10 @@ impl Picture {
         backs: &[Rgb],
         fonts: &raster::Fonts,
     ) -> Option<Pixmap> {
-        let ground = backs.first().copied().unwrap_or([251, 251, 249]);
+        let ground = backs
+            .first()
+            .copied()
+            .unwrap_or(crate::companion::render::theme::SWATCH_4);
         let two = [ground, backs.get(1).copied().unwrap_or(ground)];
         match self {
             Self::Session(f) => raster::session(f, cols, cell, backs),
@@ -289,7 +292,7 @@ mod tests {
             cols: 4,
             rows: 1,
             cell: (16, 34),
-            backs: vec![[47, 58, 72]],
+            backs: vec![crate::companion::render::theme::SWATCH_1],
         };
         let first = cache.get(req.clone()).unwrap();
         assert!(Arc::ptr_eq(&first, &cache.get(req.clone()).unwrap()));
@@ -297,7 +300,7 @@ mod tests {
         changed.cell = (20, 40);
         assert!(!Arc::ptr_eq(&first, &cache.get(changed).unwrap()));
         let mut changed = req;
-        changed.backs[0] = [0; 3];
+        changed.backs[0] = crate::companion::render::theme::SWATCH_6;
         assert!(!Arc::ptr_eq(&first, &cache.get(changed).unwrap()));
     }
 }

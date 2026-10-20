@@ -432,6 +432,7 @@ pub fn gauges(
             "size": size,
             "sev": sev,
         },
+        "band": {"low": super::app::state::BAND_LOW, "high": super::app::state::BAND_HIGH},
         "floor": {
             "tokens": floor,
             "measured": measured,
