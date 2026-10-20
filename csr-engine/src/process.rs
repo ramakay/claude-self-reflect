@@ -6,6 +6,24 @@ use std::time::{Duration, Instant};
 
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The binary a hook re-spawns as a detached `csr-engine <subcommand>` child:
+/// this process's own executable, except when that executable is a cargo test
+/// harness (it lives under `target/<profile>/deps/`). Handing a subcommand to
+/// the libtest runner prints `error: Unrecognized option: '<flag>'` into the
+/// test output and runs nothing, so a test that drives a hook handler
+/// in-process gets `None` and spawns no child.
+pub(crate) fn detached_child_exe() -> io::Result<Option<std::path::PathBuf>> {
+    std::env::current_exe().map(exe_if_engine)
+}
+
+fn exe_if_engine(exe: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let in_test_deps = exe
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "deps");
+    (!in_test_deps).then_some(exe)
+}
+
 pub(crate) trait CommandDeadline {
     fn output_with_deadline(&mut self, limit: Duration) -> io::Result<Output>;
 }
@@ -147,5 +165,44 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout.len(), 262144);
         assert!(out.stderr.ends_with(b"err"));
+    }
+}
+
+#[cfg(test)]
+mod detached_child_exe_tests {
+    use super::exe_if_engine;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_cargo_test_binary_is_never_a_detached_child() {
+        assert_eq!(
+            exe_if_engine(PathBuf::from(
+                "/w/csr-engine/target/release/deps/hooks_integration-0123abcd"
+            )),
+            None
+        );
+        assert_eq!(
+            exe_if_engine(PathBuf::from("/w/target/debug/deps/csr_engine-ff00")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_installed_engine_is_a_detached_child() {
+        for path in [
+            "/usr/local/bin/csr-engine",
+            "/w/csr-engine/target/release/csr-engine",
+        ] {
+            assert_eq!(
+                exe_if_engine(PathBuf::from(path)),
+                Some(PathBuf::from(path))
+            );
+        }
+    }
+
+    #[test]
+    fn this_very_test_binary_is_refused() {
+        // The unit-test harness runs from target/<profile>/deps/.
+        assert_eq!(super::detached_child_exe().unwrap(), None);
     }
 }

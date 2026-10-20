@@ -412,8 +412,10 @@ pub fn spawn_detached_compact_dream() {
     if !compact_dream_enabled() {
         return;
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
+    let exe = match crate::process::detached_child_exe() {
+        Ok(Some(exe)) => exe,
+        // A cargo test harness driving the hook in-process: not an engine.
+        Ok(None) => return,
         Err(error) => {
             tracing::debug!(%error, "compact dream: cannot resolve own exe; skipping");
             return;

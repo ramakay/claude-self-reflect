@@ -1138,8 +1138,10 @@ pub fn spawn_detached_story_generation(transcript: &str, cwd: &str, mode: StoryM
         .to_string_lossy()
         .to_string();
 
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
+    let exe = match crate::process::detached_child_exe() {
+        Ok(Some(e)) => e,
+        // A cargo test harness driving the hook in-process: not an engine.
+        Ok(None) => return,
         Err(e) => {
             eprintln!("CSR: cannot find own exe for story generation: {}", e);
             log_story_event(&project, &conv_id, &format!("error:no_exe({})", e));
