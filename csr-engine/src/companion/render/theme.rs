@@ -256,7 +256,8 @@ mod instrument_tests {
                             .round() as u8;
                     }
                     for ink in [
-                        t.ink, t.quiet, t.faint, t.mint, t.sky, t.dream, t.amber, t.risk, t.asked,
+                        // Dream-section bodies use ink; their short labels use dream amber.
+                        t.ink, t.dream, t.quiet, t.faint, t.mint, t.sky, t.amber, t.risk, t.asked,
                     ] {
                         let a = luminance(card);
                         let b = luminance(ink);

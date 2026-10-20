@@ -46,6 +46,7 @@ pub struct Composition {
     pub agents: agents::Projection,
     pub river: Vec<(f64, String)>,
     pub notice: Option<String>,
+    pub asked_away: bool,
     pub now: f64,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -118,10 +119,16 @@ impl Composition {
                 .iter()
                 .map(|v| (num(v), "♻ Compacted".into())),
         );
-        let story = string(&data["story"]["now"]).trim().to_owned();
+        let raw_story = string(&data["story"]["now"]).trim();
+        let story = ["Work stands at:", "Where the work stands:", "Story:"]
+            .iter()
+            .find_map(|prefix| raw_story.strip_prefix(prefix))
+            .unwrap_or(raw_story)
+            .trim()
+            .to_owned();
         let age = data["story"]["at"]
             .as_f64()
-            .map(|at| format!("{} ago", age_span(now - at)))
+            .map(|at| format!("refreshed {} ago", age_span(now - at)))
             .unwrap_or_default();
         let projection: agents::Projection =
             serde_json::from_value(data["agents"].clone()).unwrap_or_default();
@@ -203,12 +210,32 @@ impl Composition {
             .or_else(|| {
                 let card = &data["infinite"]["card"];
                 (card["stage"] == "done" && card["at"].as_f64().is_some_and(|at| now - at < 120.))
-                    .then(|| "Compacted.".into())
+                    .then(|| {
+                        let tally = &data["infinite"]["tally"];
+                        let mut line = "Compacted.".to_owned();
+                        if let Some(n) = tally["by_csr"].as_u64() {
+                            line.push_str(&format!(" {n} by CSR."));
+                        }
+                        if let Some(n) = tally["payback"].as_f64().filter(|n| *n > 0.) {
+                            line.push_str(&format!(" Saved ~{} so far.", short(n)));
+                        }
+                        line
+                    })
             });
         Self {
             learnt: array(&data["learnt"])
                 .iter()
-                .filter_map(|v| Some(format!("{} {}", v[0].as_u64()?, v[1].as_str()?)))
+                .filter_map(|v| {
+                    Some(format!(
+                        "{} {}",
+                        v[0].as_u64()?,
+                        if v[0] == 1 && v[1] == "facts retired" {
+                            "fact retired"
+                        } else {
+                            v[1].as_str()?
+                        }
+                    ))
+                })
                 .collect(),
             requests: super::cards::request_bars(s)
                 .0
@@ -267,9 +294,17 @@ impl Composition {
                 &data["sts"],
                 &data["compacting"],
             ),
-            tally: data["infinite"]["tally"].clone(),
+            tally: if notice
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Compacted."))
+            {
+                Value::Null
+            } else {
+                data["infinite"]["tally"].clone()
+            },
             agents: projection,
             river,
+            asked_away: gap.is_some_and(|w| num(&top["at"]) > w[0] && num(&top["at"]) < w[1]),
             notice,
             now,
         }
@@ -278,8 +313,7 @@ impl Composition {
         match self.dream.state {
             Batch::Ready => string(&self.dream.top["line"]).into(),
             Batch::Dreaming => "Dreaming.".into(),
-            Batch::Nothing => "The last look found nothing to ask.".into(),
-            Batch::Empty => "Press d. CSR dreams a what-if from your past sessions.".into(),
+            Batch::Nothing | Batch::Empty => "The dreamer looks as you work.".into(),
         }
     }
 }
@@ -346,7 +380,7 @@ fn age_span(seconds: f64) -> String {
 fn status_line(c: &Composition) -> String {
     match c.dream.state {
         Batch::Nothing if c.dream.looks > 0 => format!(
-            "{} of {} looks end this way. · d dream now",
+            "The last look found nothing. {} of {} looks end this way.",
             c.dream.none, c.dream.looks
         ),
         Batch::Dreaming => {
@@ -368,6 +402,7 @@ fn status_line(c: &Composition) -> String {
                 )
             }
         }
+        Batch::Empty => "It asks a what-if from your past sessions.".into(),
         _ => String::new(),
     }
 }
@@ -384,10 +419,10 @@ fn meta(c: &Composition) -> String {
         bits.push(receipt(&d.top));
     }
     if !d.queue.is_empty() {
-        bits.push(format!("+{} more · d", d.queue.len()));
+        bits.push(format!("+{} more", d.queue.len()));
     }
     if let Some(b) = budget(&d.budget) {
-        bits.push(b);
+        bits.push(format!("dreamer {b}"));
     }
     if d.handed > 0 {
         bits.push(format!("{} asked Claude", d.handed));
@@ -397,36 +432,114 @@ fn meta(c: &Composition) -> String {
     }
     bits.join(" · ")
 }
+fn observation_title(item: &Value, should: bool) -> String {
+    if !should {
+        return "Confusing Claude".into();
+    }
+    match string(&item["kind"]) {
+        "skill" => "Should be a skill",
+        "memory" => "Should be a memory",
+        "hook" => "Should be a hook",
+        "CLAUDE.md" | "CLAUDE.md rule" | "claude_md" | "rule" => "Should be a CLAUDE.md rule",
+        _ => "Should be kept",
+    }
+    .into()
+}
+fn evidence_receipt(item: &Value) -> String {
+    let evidence = string(&item["evidence"]);
+    let before_quote = evidence.split(':').next().unwrap_or(evidence);
+    let turns = before_quote
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|n| !n.is_empty())
+        .collect::<Vec<_>>();
+    if turns.is_empty() {
+        "evidence".into()
+    } else {
+        format!(
+            "{} {}",
+            if turns.len() == 1 { "turn" } else { "turns" },
+            turns.join(", ")
+        )
+    }
+}
 fn extras(c: &Composition, counts: bool) -> Vec<String> {
-    [
-        ("Confusing Claude", &c.dream.confusing),
-        ("Should be a …", &c.dream.should_be),
-    ]
-    .into_iter()
-    .filter(|(_, v)| !v.is_empty())
-    .map(|(title, items)| {
-        if counts {
-            format!("{title} · {}", items.len())
+    [(false, &c.dream.confusing), (true, &c.dream.should_be)]
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(should, items)| {
+            let title = observation_title(&items[0], should);
+            if counts {
+                format!("{title} · {}", items.len())
+            } else {
+                format!(
+                    "{title}: {}",
+                    items
+                        .iter()
+                        .map(|i| format!("{} · {}", string(&i["line"]), evidence_receipt(i)))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                )
+            }
+        })
+        .collect()
+}
+fn csr_status(g: &Value) -> Option<(String, &str)> {
+    let sev = g["sts"]["sev"]
+        .as_str()
+        .filter(|s| !s.is_empty() && *s != "green")?;
+    let down = array(&g["sts"]["inop"])
+        .iter()
+        .filter_map(|i| {
+            let name = i[0].as_str()?.to_lowercase().replace('_', " ");
+            let state = if string(&i[1]).starts_with("INHIBITED") {
+                "off"
+            } else {
+                "down"
+            };
+            Some(format!("{name} {state}"))
+        })
+        .collect::<Vec<_>>();
+    Some((
+        if down.is_empty() {
+            format!("CSR check {sev}")
         } else {
-            format!(
-                "{title}: {}",
-                items
-                    .iter()
-                    .map(|i| format!(
-                        "{}{} [{}]",
-                        i["kind"]
-                            .as_str()
-                            .map(|k| format!("{k}: "))
-                            .unwrap_or_default(),
-                        string(&i["line"]),
-                        string(&i["evidence"])
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            )
+            format!("CSR: {}", down.join(", "))
+        },
+        sev,
+    ))
+}
+fn payback(g: &Value) -> String {
+    if g["compacting"].is_object() {
+        let info = &g["compacting"];
+        let mut line = format!("◷ Compacting · {:.0}s", num(&info["elapsed"]));
+        if let Some(high) = info["usual"]["high"].as_f64().filter(|n| *n > 0.) {
+            line.push_str(&format!(" of ~{high:.0}s"));
         }
-    })
-    .collect()
+        return line;
+    }
+    if !g["ctx"]["tokens"].as_f64().is_some_and(|n| n > 0.) {
+        return String::new();
+    }
+    let mut line = string(&g["payback"]["text"]).to_owned();
+    if let Some(alt) = array(&g["payback"]["forms"])
+        .get(1)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        line.push_str(" · ");
+        line.push_str(alt.strip_prefix("♻ ").unwrap_or(alt));
+    }
+    line
+}
+pub fn footer(c: &Composition) -> String {
+    format!(
+        "{}l changes  t threads  i figure  b theme  q close",
+        if c.dream.queue.is_empty() {
+            ""
+        } else {
+            "d queue  "
+        }
+    )
 }
 /// Semantic text rows, also retained beneath pixel placements for accessibility and exports.
 pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<String> {
@@ -480,14 +593,24 @@ pub fn rows_with_figure(
         }
     }
     out.extend(hero);
+    if c.dream.state != Batch::Ready {
+        out.extend(wrap(&status_line(c)));
+        for d in &c.dream.answered {
+            out.extend(wrap(&format!(
+                "{} → {}",
+                string(&d["title"]),
+                dreams::answer_word(string(&d["answer"]))
+            )));
+        }
+    }
+    if c.asked_away {
+        out.extend(wrap("asked while you were away"));
+    }
+    if !c.learnt.is_empty() {
+        out.extend(wrap(&c.learnt.join(" · ")));
+    }
     if let Some(n) = &c.notice {
         out.extend(wrap(n));
-    }
-    if c.dream.state == Batch::Nothing && c.dream.looks > 0 {
-        out.extend(wrap(&format!(
-            "{} of {} looks end this way.",
-            c.dream.none, c.dream.looks
-        )));
     }
     if c.dream.state == Batch::Empty {
         for line in [
@@ -535,6 +658,9 @@ pub fn rows_with_figure(
         for line in extras(c, false) {
             out.extend(wrap(&line));
         }
+        for item in c.dream.confusing.iter().chain(&c.dream.should_be) {
+            out.extend(wrap(string(&item["evidence"])));
+        }
         for d in &c.dream.queue {
             out.extend(wrap(string(&d["line"])));
         }
@@ -565,10 +691,10 @@ pub fn rows_with_figure(
     } else {
         let mut extra = vec![];
         if let Some(n) = c.codex_week["percent"].as_f64() {
-            extra.push(format!("Codex {n:.0}%"));
+            extra.push(format!("Codex 7D {n:.0}%"));
         }
-        if let Some(sev) = c.figure["sts"]["sev"].as_str().filter(|s| !s.is_empty()) {
-            extra.push(format!("STS {sev}"));
+        if let Some((line, _)) = csr_status(&c.figure) {
+            extra.push(format!("● {line}"));
         }
         if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
             extra.push(format!("Saved ~{}", short(n)));
@@ -649,12 +775,9 @@ fn figure_lines(c: &Composition) -> Vec<String> {
             ));
         }
     }
-    if g["compacting"].is_object() {
-        top.push(masthead::compacting_slot(&g["compacting"], false, true).0);
-    } else if !string(&g["payback"]["text"]).is_empty()
-        && g["ctx"]["tokens"].as_f64().is_some_and(|t| t > 0.)
-    {
-        top.push(string(&g["payback"]["text"]).into());
+    let pay = payback(g);
+    if !pay.is_empty() {
+        top.push(pay);
     }
     if let Some(n) = c.tally["by_csr"].as_u64().filter(|n| *n > 0) {
         top.push(format!("{n} by CSR"));
@@ -671,10 +794,10 @@ fn figure_lines(c: &Composition) -> Vec<String> {
         quotas.push(string(&g["cache"]["text"]).replace("CACHE ", "◷ "));
     }
     if let Some(n) = c.codex_week["percent"].as_f64() {
-        quotas.push(format!("Codex {n:.0}%"));
+        quotas.push(format!("Codex 7D {n:.0}%"));
     }
-    if let Some(sev) = g["sts"]["sev"].as_str().filter(|s| !s.is_empty()) {
-        quotas.push(format!("STS {sev}"));
+    if let Some((line, _)) = csr_status(g) {
+        top.insert(0, format!("● {line}"));
     }
     [top.join(" · "), quotas.join(" · ")]
         .into_iter()
@@ -807,16 +930,24 @@ pub fn draw(
     let collapsed = has_extra
         && full_extras
             .iter()
-            .any(|s| f.width(s, sans(10.5, t.regular)) > IW);
+            .any(|s| f.width(s, sans(11.5, t.regular)) > IW * 2.);
     let extra_lines = extras(c, collapsed);
-    let extras_h = extra_lines.len() as f32 * 17.;
+    let extras_h = extra_lines
+        .iter()
+        .map(|s| f.wrap(s, sans(11.5, t.regular), IW).len() as f32 * 16.)
+        .sum::<f32>();
     let status = status_line(c);
     let answered_h = if c.dream.state != Batch::Ready {
         c.dream.answered.len() as f32 * 17.
     } else {
         0.
     };
-    let status_h = if status.is_empty() { 0. } else { 17. };
+    let status_lines = f.wrap(&status, sans(11.5, t.regular), IW);
+    let status_h = if status.is_empty() {
+        0.
+    } else {
+        status_lines.len() as f32 * 17.
+    };
     let overhead = P * 2.
         + 22.
         + if c.dream.state == Batch::Ready {
@@ -883,6 +1014,9 @@ pub fn draw(
         drill_lines.extend(f.wrap(string(&c.dream.top["text"]), sans(11.5, t.regular), IW));
         for s in extras(c, false) {
             drill_lines.extend(f.wrap(&s, sans(11.5, t.regular), IW));
+        }
+        for item in c.dream.confusing.iter().chain(&c.dream.should_be) {
+            drill_lines.extend(f.wrap(string(&item["evidence"]), sans(11.5, t.regular), IW));
         }
         for d in &c.dream.queue {
             drill_lines.extend(f.wrap(string(&d["line"]), sans(11.5, t.regular), IW));
@@ -978,7 +1112,11 @@ pub fn draw(
         &mut canvas,
         f,
         if c.dream.state == Batch::Ready {
-            "The dreamer asks"
+            if c.asked_away {
+                "The dreamer asks · asked while you were away"
+            } else {
+                "The dreamer asks"
+            }
         } else {
             "CSR's dreamer"
         },
@@ -1044,6 +1182,7 @@ pub fn draw(
                         sans(size, t.regular)
                     },
                 ) + 12.
+                    + if p.starts_with("dreamer ") { 34. } else { 0. }
             })
             .sum::<f32>()
             > IW - 18.
@@ -1051,7 +1190,12 @@ pub fn draw(
         {
             size -= 0.5;
         }
-        let mut x = IX + 18.;
+        let mut x = IX
+            + if c.dream.top["confidence"].is_number() {
+                18.
+            } else {
+                0.
+            };
         if let Some(conf) = c.dream.top["confidence"].as_f64() {
             canvas.ring(
                 IX + 5.,
@@ -1063,6 +1207,25 @@ pub fn draw(
             );
         }
         for part in parts {
+            if part.starts_with("dreamer ") {
+                let spent = num(&c.dream.budget["spent"]);
+                let cap = num(&c.dream.budget["cap"]).max(1.);
+                canvas.rrect(x, b - 5., 28., 3., 1.5, t.track);
+                canvas.rrect(
+                    x,
+                    b - 5.,
+                    28. * (spent / cap).clamp(0., 1.) as f32,
+                    3.,
+                    1.5,
+                    t.dream,
+                );
+                x += 34.;
+                canvas.text(f, "dreamer ", x, b, sans(size, t.regular), t.quiet, A::L);
+                x += f.width("dreamer ", sans(size, t.regular));
+                let numbers = part.strip_prefix("dreamer ").unwrap();
+                x += canvas.text(f, numbers, x, b, sans(size, t.regular), t.ink, A::L) + 12.;
+                continue;
+            }
             let st = if part.starts_with('⌗') {
                 mono(size, t.medium)
             } else {
@@ -1118,27 +1281,38 @@ pub fn draw(
         b += 21.;
     }
     if !status.is_empty() {
-        single(&mut canvas, f, &status, IX, b, IW, 11.5, t.quiet, t);
-        b += 17.;
-    }
-    if let (Some(spent), Some(cap)) = (
-        c.dream.budget["spent"].as_f64(),
-        c.dream.budget["cap"].as_f64().filter(|n| *n > 0.),
-    ) {
-        canvas.rrect(W - 152., y + P - 3., 60., 3., 1.5, t.track);
-        canvas.rrect(
-            W - 152.,
-            y + P - 3.,
-            60. * (spent / cap).clamp(0., 1.) as f32,
-            3.,
-            1.5,
-            t.dream,
-        );
+        for line in &status_lines {
+            label(&mut canvas, f, line, IX, b, 11.5, t.quiet, t.regular);
+            b += 17.;
+        }
     }
     for line in extra_lines {
-        if b < y + hero_h - 9. {
-            single(&mut canvas, f, &line, IX, b, IW, 10.5, t.dream, t);
-            b += 17.;
+        let (title, body) = line.split_once(": ").unwrap_or((&line, ""));
+        let st = sans(11.5, t.regular);
+        let title = format!("{title}: ");
+        let tw = f.width(&title, st);
+        label(&mut canvas, f, &title, IX, b, 11.5, t.dream, t.medium);
+        let lines = f.wrap(body, st, IW - tw);
+        for (i, row) in lines.iter().enumerate() {
+            // Evidence is a small mono receipt; the full quote stays in the reasons drill-down.
+            let (body, receipt) = row.split_once(" · ").unwrap_or((row, ""));
+            label(
+                &mut canvas,
+                f,
+                body,
+                IX + if i == 0 { tw } else { 0. },
+                b,
+                11.5,
+                t.ink,
+                t.regular,
+            );
+            if !receipt.is_empty() {
+                let x = IX + if i == 0 { tw } else { 0. } + f.width(body, st) + 6.;
+                let rw = f.width(receipt, mono(9.5, t.medium));
+                canvas.rrect(x - 3., b - 10., rw + 6., 14., 5., t.chip);
+                canvas.text(f, receipt, x, b, mono(9.5, t.medium), t.quiet, A::L);
+            }
+            b += 16.;
         }
     }
     if c.dream.state != Batch::Ready {
@@ -1374,7 +1548,7 @@ pub fn draw(
     single(
         &mut canvas,
         f,
-        "d dream   l changes   t threads   i figure   b theme   q close",
+        &footer(c),
         IX,
         (y + 23.).min(height - 10.),
         IW,
@@ -1434,7 +1608,7 @@ fn figure(
             let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
             if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
             {
-                segs.insert(0, ((low / size) as f32, (high / size) as f32, t.band));
+                segs.push(((low / size) as f32, (high / size) as f32, t.band));
             }
             c.ring(cx, cy, 25., t.ring, t.track, &segs);
             c.text(f, &short(n), cx, cy, serif(14., t.medium), t.ink, A::M);
@@ -1511,7 +1685,7 @@ fn figure(
                 short(trend.abs())
             ),
             IX,
-            y + P + 17.,
+            if expanded { y + 210. } else { y + P + 17. },
             11.5,
             t.quiet,
             t.regular,
@@ -1542,29 +1716,10 @@ fn figure(
             t,
         );
     }
-    if let Some(n) = data.codex_week["percent"].as_f64() {
-        label(
-            c,
-            f,
-            &format!("Codex {n:.0}%"),
-            IX,
-            y + h - 10.,
-            9.5,
-            t.quiet,
-            t.regular,
-        );
-    }
-    if let Some(sev) = g["sts"]["sev"].as_str().filter(|s| !s.is_empty()) {
-        label(
-            c,
-            f,
-            &format!("STS {sev}"),
-            IX,
-            y + h - 103.,
-            9.5,
-            t.amber,
-            t.regular,
-        );
+    if let Some((line, sev)) = csr_status(g) {
+        let col = if sev == "red" { t.risk } else { t.amber };
+        c.circle(IX + 87., y + P - 4., 2.5, col);
+        single(c, f, &line, IX + 95., y + P, 230., 10., t.quiet, t);
     }
     let cy = y + 126.;
     if let (Some(n), Some(size)) = (tokens, size) {
@@ -1612,12 +1767,11 @@ fn figure(
         } else {
             let (cx, r) = (W / 2., 78.);
             c.dots(cx, cy, r + 12., 72, 0.65, &|_| t.band);
-            let mut segs = vec![];
+            let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
             if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
             {
                 segs.push(((low / size) as f32, (high / size) as f32, t.band));
             }
-            segs.push((0., (n / size).clamp(0., 1.) as f32, t.mint));
             c.ring(cx, cy, r, t.ring, t.track, &segs);
             if let Some(trend) = g["trend"].as_f64() {
                 c.tick(
@@ -1642,23 +1796,7 @@ fn figure(
             );
         }
     }
-    let mut pay = if g["compacting"].is_object() {
-        masthead::compacting_slot(&g["compacting"], false, true).0
-    } else if tokens.is_some() {
-        string(&g["payback"]["text"]).into()
-    } else {
-        String::new()
-    };
-    if !g["compacting"].is_object() {
-        if let Some(alternate) = array(&g["payback"]["forms"])
-            .get(1)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            pay.push_str(" · ");
-            pay.push_str(alternate.strip_prefix("♻ ").unwrap_or(alternate));
-        }
-    }
+    let pay = payback(g);
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
             .as_f64()
@@ -1695,8 +1833,9 @@ fn figure(
         .filter(|q| q["used"].is_number())
         .collect();
     satellites.sort_by_key(|q| if q["code"] == "5H" { 0 } else { 1 });
-    let count = satellites.len()
-        + usize::from(g["cache"]["left"].is_number() || g["cache"]["cold"] == true);
+    let codex = data.codex_week["percent"].as_f64();
+    let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
+    let count = satellites.len() + usize::from(cache) + usize::from(codex.is_some());
     let step = IW / (count + 1) as f32;
     for (i, q) in satellites.iter().enumerate() {
         let x = IX + step * (i + 1) as f32;
@@ -1735,7 +1874,7 @@ fn figure(
         .as_f64()
         .or_else(|| (g["cache"]["cold"] == true).then_some(0.))
     {
-        let x = IX + step * count as f32;
+        let x = IX + step * (satellites.len() + 1) as f32;
         let cy = y + h - 53.;
         let cold = g["cache"]["cold"] == true || left <= 0.;
         let ttl = g["cache"]["ttl"].as_f64().unwrap_or(3600.);
@@ -1773,6 +1912,36 @@ fn figure(
             } else {
                 "◷ cache"
             },
+            x,
+            cy + 46.,
+            sans(10., t.medium),
+            t.quiet,
+            A::M,
+        );
+    }
+    if let Some(v) = codex {
+        let x = IX + step * count as f32;
+        let cy = y + h - 53.;
+        c.ring(
+            x,
+            cy,
+            30.,
+            t.ring,
+            t.track,
+            &[(0., (v / 100.).clamp(0., 1.) as f32, t.asked)],
+        );
+        c.text(
+            f,
+            &format!("{v:.0}%"),
+            x,
+            cy + 4.,
+            serif(18., t.medium),
+            t.ink,
+            A::M,
+        );
+        c.text(
+            f,
+            "Codex 7D",
             x,
             cy + 46.,
             sans(10., t.medium),
@@ -1853,12 +2022,11 @@ pub fn strip(
                 c.rect(12. + i as f32 * bw, 58. - bar, bw * 0.7, bar, t.sky);
             }
         } else {
-            let mut segs = vec![];
+            let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
             if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
             {
                 segs.push(((low / size) as f32, (high / size) as f32, t.band));
             }
-            segs.push((0., (n / size).clamp(0., 1.) as f32, t.mint));
             c.ring(36., 45., 24., t.ring, t.track, &segs);
         }
         c.text(f, &short(n), 36., 49., serif(14., t.medium), t.ink, A::M);
@@ -1898,13 +2066,7 @@ pub fn strip(
             A::R,
         );
     }
-    let pay = if g["compacting"].is_object() {
-        masthead::compacting_slot(&g["compacting"], false, true).0
-    } else if ctx.is_some() {
-        string(&g["payback"]["text"]).into()
-    } else {
-        String::new()
-    };
+    let pay = payback(g);
     if !pay.is_empty() {
         let st = sans(10., t.medium);
         c.text(f, &f.fit(&pay, st, w - 86.), 76., 37., st, t.mint, A::L);

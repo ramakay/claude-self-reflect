@@ -1610,7 +1610,7 @@ pub fn dream_facts(data: &Value, sid: &str) -> Option<Card> {
 }
 /// The session's story as the pane tells it: where work stands and the Shift Map's lines, whose
 /// source line carries the commit receipt. `None` without a story or a map.
-fn story_of(data: &Value, s: &Value, now: f64) -> Option<Card> {
+fn story_of(data: &Value, _s: &Value, now: f64) -> Option<Card> {
     let story = &data["story"];
     let said = string(&story["now"]).trim().to_owned();
     let rights = if story.is_null() {
@@ -1624,15 +1624,25 @@ fn story_of(data: &Value, s: &Value, now: f64) -> Option<Card> {
     let map = &data["story_map"];
     let mut shifts: Vec<(String, bool)> = vec![];
     if map.is_object() {
-        let from = data["story_map_from"].as_str();
-        let messages = if from.is_some() {
-            data["story_map_messages"].as_u64()
-        } else {
-            s["messages"].as_u64()
-        };
-        let (_, rows) =
-            super::super::shiftmap::shift_map_marked(map, messages, 56, false, Some(8), from);
-        shifts = rows;
+        // The card is a mark, place and receipt. Claims and the was-text open in l changes.
+        shifts = array(&map["entries"])
+            .iter()
+            .take(3)
+            .map(|entry| {
+                let mut entry = entry.clone();
+                let place = array(&entry["after"])
+                    .first()
+                    .or_else(|| array(&entry["before"]).first())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                for key in ["scope", "sym", "mark"] {
+                    if entry[key].is_null() {
+                        entry[key] = place[key].clone();
+                    }
+                }
+                (super::instrument::shift_row(&entry, false), false)
+            })
+            .collect();
     }
     if said.is_empty() && shifts.is_empty() {
         return None;

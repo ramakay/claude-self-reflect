@@ -1,18 +1,15 @@
 //! What the pane draws around a page (pane.py's `Pane.frame`): the value row above the legend,
-//! the gauge strip beside a column, column mode's main and info pages and the reflow of the rest,
+//! the gauge strip beside a column, column mode's page and the reflow of the rest,
 //! and the countdown to the next read.
 //!
 //! pane.py -> here: `value_codes`, `value_rows`; `strip_tapes`, `strip_width`, `fill_levels` (in
 //! `render::text`), `level_row` and `bug_cell` (in `info`), `ctx_tape`, `quota_tape` and
 //! `cache_tape` (the last two in `info`), `gauge_strip`, `strip_rows`, `cell_text` (in `info`);
-//! `stack_rows`, `column_line`, `draw_column_main`, `TAP_FORMS`, `draw_column_info`,
+//! `stack_rows`, `column_line`, `draw_column_main`, `TAP_FORMS`,
 //! `column_reflow`; `reload_in`.
 use super::{
     array,
-    info::{
-        self, cache_tape, cell_text, info_rows, info_title, paper_ink, quota_tape, Cell, Paint,
-        NIGHT,
-    },
+    info::{self, cache_tape, cell_text, quota_tape, Cell, Paint, NIGHT},
     masthead, num,
     pages::Lines,
     pyfmt::short,
@@ -348,7 +345,7 @@ pub fn draw_column_main(page: &Value, width: usize, phone: bool) -> (Lines, Vec<
         out.rows.push(on_dark(&column_line(forms, width), *ground));
     }
     for row in 0..MASTHEAD_CLICK.min(stack.len()) {
-        out.acts.insert(row, json!({"key": "view:info"}));
+        out.acts.insert(row, json!({"key": "instrument:figure"}));
     }
     for section in array(&page["sections"]) {
         let items = array(&section["items"]);
@@ -401,85 +398,6 @@ fn truthy_star(section: &Value) -> bool {
 }
 fn section_ink(name: &str) -> &'static str {
     section(name)
-}
-
-/// Column mode's i page: the title wrapped on the dark ramp, then the sections as on the wide
-/// page, each heading over its hairline and each fact its label over its value, its note faint
-/// under that, wrapped to `width`. Scrolled by `top`. (lines, the title's grounds, top).
-pub fn draw_column_info(
-    data: &Value,
-    s: &Value,
-    width: usize,
-    rows: usize,
-    top: usize,
-    now: f64,
-) -> (Lines, Vec<Rgb>, usize) {
-    let id: String = string(&s["id"]).chars().take(8).collect();
-    let title = info_title(s)
-        .split(" · ")
-        .filter(|p| *p != id)
-        .collect::<Vec<_>>()
-        .join(" · "); // no room for the id
-    let head: Vec<String> = wrap(&title, width.max(1), 5)
-        .into_iter()
-        .map(|line| format!("{BOLD}{line}{OFF}"))
-        .collect();
-    let grounds = dark_steps(head.len());
-    let mut out = Lines::default();
-    for (line, ground) in head.iter().zip(&grounds) {
-        out.rows.push(on_dark(line, *ground));
-    }
-    let w = width.max(1);
-    let facts = info_rows(data, s, now, width.max(4));
-    let mut body: Vec<String> = vec![];
-    for section in [info::SESSION, info::COST, info::WIRED] {
-        let of: Vec<_> = facts.iter().filter(|f| f.section == section).collect();
-        if of.is_empty() {
-            continue;
-        }
-        if !body.is_empty() {
-            body.push(String::new());
-        }
-        body.extend(
-            wrap(&section.to_uppercase(), w, 2)
-                .into_iter()
-                .map(|piece| format!("{BOLD}{}{piece}{OFF}", ink("you"))),
-        );
-        body.push(format!("{}{}{OFF}", ink("faint"), "─".repeat(w)));
-        for fact in of {
-            let value = if fact.label == "Status line" {
-                plain(&fact.value)
-            } else {
-                fact.value.clone()
-            };
-            if !fact.label.is_empty() {
-                body.push(format!("{}{}{OFF}", ink("quiet"), fit(&fact.label, w)));
-            }
-            let colour = fact
-                .sev
-                .as_deref()
-                .map_or_else(|| ink("you"), |sev| ink(paper_ink(sev)));
-            body.extend(
-                wrap(&one_line(&value, 400), w, 4)
-                    .into_iter()
-                    .map(|piece| format!("{colour}{piece}{OFF}")),
-            );
-            if let Some(note) = &fact.note {
-                body.extend(
-                    wrap(&one_line(note, 400), w, 3)
-                        .into_iter()
-                        .map(|piece| format!("{}{piece}{OFF}", ink("faint"))),
-                );
-            }
-        }
-    }
-    let room = rows.saturating_sub(out.rows.len()).saturating_sub(1);
-    let top = top.min(body.len().saturating_sub(room));
-    out.rows.extend(body.into_iter().skip(top).take(room));
-    for row in 0..head.len() {
-        out.acts.insert(row, json!({"key": "view:main"})); // the title, clicked: back to main
-    }
-    (out, grounds, top)
 }
 
 /// A page drawn at its narrowest, its rows' words rewrapped to `width` for column mode, each row
