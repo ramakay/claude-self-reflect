@@ -251,31 +251,52 @@ mod tests {
     use super::*;
     #[test]
     fn lab_blend_and_readability_match_the_pane() {
-        assert_eq!(blend([47, 58, 72], [14, 15, 17], 0.), [47, 58, 72]);
         assert_eq!(
-            readable([46, 139, 106], [251, 251, 249], 4.5),
-            [36, 131, 99]
+            blend(
+                crate::companion::render::theme::SWATCH_1,
+                crate::companion::render::theme::SWATCH_2,
+                0.
+            ),
+            crate::companion::render::theme::SWATCH_1
         );
-        assert!((contrast([0, 0, 0], [255, 255, 255]) - 21.).abs() < 0.001);
+        assert_eq!(
+            readable(
+                crate::companion::render::theme::SWATCH_3,
+                crate::companion::render::theme::SWATCH_4,
+                4.5
+            ),
+            crate::companion::render::theme::SWATCH_5
+        );
+        assert!(
+            (contrast(
+                crate::companion::render::theme::SWATCH_6,
+                crate::companion::render::theme::SWATCH_7
+            ) - 21.)
+                .abs()
+                < 0.001
+        );
     }
     #[test]
     fn canvas_encodes_straight_alpha_and_missing_fonts_draw_nothing() {
         let mut c = Canvas::new(4, 2, (16, 34)).unwrap();
-        c.rect([0., 0., 5., 5.], [200, 100, 50, 128]);
+        c.rect([0., 0., 5., 5.], crate::companion::render::theme::SWATCH_8);
         let before = c.pixmap.clone();
         c.text(
             &Fonts::default(),
             "test",
             (0., 0.),
             17.,
-            (false, "la", [0; 3]),
+            (false, "la", crate::companion::render::theme::SWATCH_6),
         );
         assert_eq!(c.pixmap.data(), before.data());
         let decoded = image::load_from_memory(&png(&c.pixmap).unwrap())
             .unwrap()
             .to_rgba8();
         assert_eq!(decoded.dimensions(), (64, 68));
-        assert_eq!(decoded.get_pixel(1, 1).0, [199, 100, 50, 128]);
+        assert_eq!(
+            decoded.get_pixel(1, 1).0,
+            crate::companion::render::theme::SWATCH_9
+        );
         assert!(Canvas::new(usize::MAX, 2, (16, 34)).is_none());
     }
 }
@@ -321,13 +342,17 @@ pub struct ContextFacts {
 }
 fn dark(name: &str) -> Rgb {
     match name {
-        "you" | "text" => [238, 245, 250],
-        "ctx" => [58, 127, 224],
-        "learn" | "recall" => [36, 163, 114],
-        "turn" => [232, 88, 44],
-        "dream" => [242, 182, 50],
-        "asked" => [154, 123, 232],
-        _ => blend([238, 245, 250], [47, 58, 72], 0.45),
+        "you" | "text" => crate::companion::render::theme::SWATCH_10,
+        "ctx" => crate::companion::render::theme::SWATCH_11,
+        "learn" | "recall" => crate::companion::render::theme::SWATCH_12,
+        "turn" => crate::companion::render::theme::SWATCH_13,
+        "dream" => crate::companion::render::theme::SWATCH_14,
+        "asked" => crate::companion::render::theme::SWATCH_15,
+        _ => blend(
+            crate::companion::render::theme::SWATCH_10,
+            crate::companion::render::theme::SWATCH_1,
+            0.45,
+        ),
     }
 }
 fn grounds(c: &mut Canvas, cell: Cell, backs: &[Rgb]) {
@@ -360,9 +385,9 @@ pub fn session(f: &SessionFacts, cols: usize, cell: Cell, backs: &[Rgb]) -> Opti
         c.line(
             &[(0., i * lane), (w, i * lane)],
             if backs.is_empty() {
-                [0, 0, 0, 34]
+                crate::companion::render::theme::SWATCH_16
             } else {
-                [255, 255, 255, 40]
+                crate::companion::render::theme::SWATCH_17
             },
             1.,
         );
@@ -373,9 +398,9 @@ pub fn session(f: &SessionFacts, cols: usize, cell: Cell, backs: &[Rgb]) -> Opti
             c.line(
                 &[(bx, y as f32), (bx, y as f32 + 2.)],
                 if backs.is_empty() {
-                    [0, 0, 0, 60]
+                    crate::companion::render::theme::SWATCH_18
                 } else {
-                    [255, 255, 255, 60]
+                    crate::companion::render::theme::SWATCH_19
                 },
                 1.,
             );
@@ -385,9 +410,9 @@ pub fn session(f: &SessionFacts, cols: usize, cell: Cell, backs: &[Rgb]) -> Opti
         c.line(
             &[(x(*t), lane), (x(*t), 2. * lane)],
             if backs.is_empty() {
-                [0, 0, 0, 90]
+                crate::companion::render::theme::SWATCH_20
             } else {
-                [255, 255, 255, 90]
+                crate::companion::render::theme::SWATCH_21
             },
             1.,
         );
@@ -1036,7 +1061,7 @@ impl Iso {
                 {
                     self.c.rect(
                         [x as f32, y as f32, x as f32 + 1., y as f32 + 1.],
-                        mix(ink, [0; 3], 0.55),
+                        mix(ink, crate::companion::render::theme::SWATCH_6, 0.55),
                     );
                 }
             }
@@ -1056,9 +1081,9 @@ impl Iso {
                 pos,
                 size,
                 [
-                    mix(ink, [255; 3], 0.1),
-                    mix(ink, [0; 3], 0.25),
-                    mix(ink, [255; 3], 0.5),
+                    mix(ink, crate::companion::render::theme::SWATCH_7, 0.1),
+                    mix(ink, crate::companion::render::theme::SWATCH_6, 0.25),
+                    mix(ink, crate::companion::render::theme::SWATCH_7, 0.5),
                 ],
             );
             let [x, y, z] = pos;
@@ -1066,12 +1091,12 @@ impl Iso {
             p.line(
                 [x, y + dy, z + dz],
                 [x + dx, y + dy, z + dz],
-                mix(ink, [255; 3], 0.78),
+                mix(ink, crate::companion::render::theme::SWATCH_7, 0.78),
             );
             p.line(
                 [x + dx, y + dy, z + dz],
                 [x + dx, y, z + dz],
-                mix(ink, [255; 3], 0.78),
+                mix(ink, crate::companion::render::theme::SWATCH_7, 0.78),
             );
         });
     }
@@ -1096,10 +1121,10 @@ fn iso_icon(name: &str) -> Option<Pixmap> {
     let mut p = Iso::new(44, 44, (22., 26.), 1.)?;
     let c = text::ink_rgb(text::section(name));
     let quiet = text::ink_rgb("quiet");
-    let paper = [250, 249, 244];
-    let pages = [226, 224, 216];
-    let white = [255; 3];
-    let black = [0; 3];
+    let paper = crate::companion::render::theme::SWATCH_22;
+    let pages = crate::companion::render::theme::SWATCH_23;
+    let white = crate::companion::render::theme::SWATCH_7;
+    let black = crate::companion::render::theme::SWATCH_6;
     match name {
         "touching" | "story" | "last" | "compacted" => {
             p.block([-2., -2., 0.], [14., 12., 2.], c);
@@ -1149,7 +1174,10 @@ fn iso_icon(name: &str) -> Option<Pixmap> {
                 // The cut-out replaces alpha rather than blending transparent paint.
                 let mut cut = Canvas::new(44, 44, (1, 1)).unwrap();
                 cut.aa = false;
-                cut.ellipse([cx - 3., cy - 16., cx + 7., cy - 6.], [255; 4]);
+                cut.ellipse(
+                    [cx - 3., cy - 16., cx + 7., cy - 6.],
+                    crate::companion::render::theme::OPAQUE_WHITE,
+                );
                 for (pixel, mask) in p.c.pixmap.pixels_mut().iter_mut().zip(cut.pixmap.pixels()) {
                     if mask.alpha() > 0 {
                         *pixel = tiny_skia::PremultipliedColorU8::TRANSPARENT;
@@ -1198,25 +1226,29 @@ const LETTERS: [[&str; 5]; 3] = [
     [".##", "#..", ".#.", "..#", "##."],
     ["##.", "#.#", "##.", "#.#", "#.#"],
 ];
-const LETTER_INKS: [Rgb; 3] = [[58, 127, 224], [242, 182, 50], [36, 163, 114]];
+const LETTER_INKS: [Rgb; 3] = [
+    crate::companion::render::theme::SWATCH_11,
+    crate::companion::render::theme::SWATCH_14,
+    crate::companion::render::theme::SWATCH_12,
+];
 fn csr_emblem() -> Option<Pixmap> {
     let mut p = Iso::new(110, 96, (40., 30.), 3.)?;
-    let slab = [47, 58, 72];
+    let slab = crate::companion::render::theme::SWATCH_1;
     p.part(slab, |p| {
         p.cube(
             [-2., -2., -2.],
             [17., 8., 2.],
             [
-                mix(slab, [255; 3], 0.1),
-                mix(slab, [0; 3], 0.25),
-                mix(slab, [255; 3], 0.5),
+                mix(slab, crate::companion::render::theme::SWATCH_7, 0.1),
+                mix(slab, crate::companion::render::theme::SWATCH_6, 0.25),
+                mix(slab, crate::companion::render::theme::SWATCH_7, 0.5),
             ],
         )
     });
     let mut mirror = Iso::new(110, 96, (40., 30.), 3.)?;
     mirror.poly(
         &[[-2., -2., 0.], [15., -2., 0.], [15., 6., 0.], [-2., 6., 0.]],
-        [255; 4],
+        crate::companion::render::theme::OPAQUE_WHITE,
     );
     let mut faint = Iso::new(110, 96, (40., 30.), 3.)?;
     for (k, letter) in LETTERS.iter().enumerate() {
@@ -1258,8 +1290,8 @@ fn csr_emblem() -> Option<Pixmap> {
                             [1., 1., 1.],
                             [
                                 rgba(ink, 255),
-                                mix(ink, [0; 3], 0.45),
-                                mix(ink, [255; 3], 0.22),
+                                mix(ink, crate::companion::render::theme::SWATCH_6, 0.45),
+                                mix(ink, crate::companion::render::theme::SWATCH_7, 0.22),
                             ],
                         );
                     }
@@ -1317,7 +1349,7 @@ fn slot(mark: Pixmap, cell: Cell, backs: [Rgb; 2], emblem: bool) -> Option<Pixma
             let (px, py) = (x + px as i32 + 2 * k, y + py as i32 + k);
             c.rect(
                 [px as f32, py as f32, px as f32 + 1., py as f32 + 1.],
-                [0, 0, 0, 56],
+                crate::companion::render::theme::SWATCH_24,
             );
         }
     }
@@ -1373,7 +1405,7 @@ pub fn logo(cell: Cell, ground: Rgb) -> Option<Pixmap> {
                 (x + v + 2. * t, y - t),
                 (x + v, y),
             ],
-            mix(ink, [255; 3], 0.35),
+            mix(ink, crate::companion::render::theme::SWATCH_7, 0.35),
         );
         pixel_poly(
             &mut c,
@@ -1383,7 +1415,7 @@ pub fn logo(cell: Cell, ground: Rgb) -> Option<Pixmap> {
                 (x + v + 2. * t, y + v - t),
                 (x + v, y + v),
             ],
-            mix(ink, [0; 3], 0.4),
+            mix(ink, crate::companion::render::theme::SWATCH_6, 0.4),
         );
     }
     for (x, y, ink) in cells {

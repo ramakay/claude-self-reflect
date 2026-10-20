@@ -10,29 +10,29 @@ pub const DIM: &str = "\x1b[2m";
 pub type Rgb = [u8; 3];
 pub fn ink_rgb(name: &str) -> Rgb {
     match name {
-        "you" => [23, 25, 28],
-        "ctx" => [44, 90, 160],
-        "learn" => [36, 131, 99],
-        "turn" => [200, 68, 42],
-        "dream" => [152, 108, 0],
-        "recall" => [36, 131, 99],
-        "asked" => [123, 95, 201],
-        "sepia" => [111, 86, 66],
-        "rule" => [0, 0, 0],
-        "quiet" => [94, 94, 89],
-        "faint" => [136, 135, 129],
-        "hair" => [226, 225, 219],
-        _ => [23, 25, 28],
+        "you" => crate::companion::render::theme::SWATCH_25,
+        "ctx" => crate::companion::render::theme::SWATCH_26,
+        "learn" => crate::companion::render::theme::SWATCH_5,
+        "turn" => crate::companion::render::theme::SWATCH_27,
+        "dream" => crate::companion::render::theme::SWATCH_28,
+        "recall" => crate::companion::render::theme::SWATCH_5,
+        "asked" => crate::companion::render::theme::SWATCH_29,
+        "sepia" => crate::companion::render::theme::SWATCH_30,
+        "rule" => crate::companion::render::theme::SWATCH_6,
+        "quiet" => crate::companion::render::theme::SWATCH_31,
+        "faint" => crate::companion::render::theme::SWATCH_32,
+        "hair" => crate::companion::render::theme::SWATCH_33,
+        _ => crate::companion::render::theme::SWATCH_25,
     }
 }
 pub fn sev_rgb(name: &str) -> Rgb {
     match name {
-        "normal" => [147, 155, 165],
-        "data" => [238, 245, 250],
-        "advisory" => [58, 127, 224],
-        "amber" => [242, 182, 50],
-        "red" => [232, 88, 44],
-        _ => [23, 25, 28],
+        "normal" => crate::companion::render::theme::SWATCH_34,
+        "data" => crate::companion::render::theme::SWATCH_10,
+        "advisory" => crate::companion::render::theme::SWATCH_11,
+        "amber" => crate::companion::render::theme::SWATCH_14,
+        "red" => crate::companion::render::theme::SWATCH_13,
+        _ => crate::companion::render::theme::SWATCH_25,
     }
 }
 pub fn section(name: &str) -> &'static str {
@@ -202,7 +202,7 @@ pub fn tinted(text: &str, back: &str) -> String {
 }
 pub fn on_dark(text: &str, ground: Rgb) -> String {
     let back = bg(ground);
-    let fg = fg([238, 245, 250]);
+    let fg = fg(crate::companion::render::theme::SWATCH_10);
     format!(
         "{back}{fg}{}\x1b[K{OFF}",
         text.replace(OFF, &format!("{OFF}{back}{fg}"))
@@ -280,8 +280,8 @@ pub fn dark_steps(n: usize) -> Vec<Rgb> {
     (0..n)
         .map(|i| {
             blend(
-                [47, 58, 72],
-                [14, 15, 17],
+                crate::companion::render::theme::SWATCH_1,
+                crate::companion::render::theme::SWATCH_2,
                 i as f64 / n.saturating_sub(1).max(1) as f64,
             )
         })
@@ -294,11 +294,23 @@ pub fn heat(tokens: f64) -> Rgb {
     let red = masthead::ctx_red().max(hot);
     let v = (v.clamp(0., red) / 1000.).floor() * 1000.;
     if v <= amber {
-        blend([58, 127, 224], [64, 190, 176], v / amber)
+        blend(
+            crate::companion::render::theme::SWATCH_11,
+            crate::companion::render::theme::SWATCH_35,
+            v / amber,
+        )
     } else if v <= hot {
-        blend([64, 190, 176], [242, 182, 50], (v - amber) / (hot - amber))
+        blend(
+            crate::companion::render::theme::SWATCH_35,
+            crate::companion::render::theme::SWATCH_14,
+            (v - amber) / (hot - amber),
+        )
     } else {
-        blend([242, 182, 50], [232, 88, 44], (v - hot) / (red - hot))
+        blend(
+            crate::companion::render::theme::SWATCH_14,
+            crate::companion::render::theme::SWATCH_13,
+            (v - hot) / (red - hot),
+        )
     }
 }
 pub const EIGHTHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -725,7 +737,13 @@ mod tests {
     }
     #[test]
     fn test_the_masthead_steps_down_from_payne_to_night() {
-        assert_eq!(dark_steps(2), vec![[47, 58, 72], [14, 15, 17]]);
+        assert_eq!(
+            dark_steps(2),
+            vec![
+                crate::companion::render::theme::SWATCH_1,
+                crate::companion::render::theme::SWATCH_2
+            ]
+        );
     }
     #[test]
     fn test_the_sparkline_is_the_last_turns_in_eighths_newest_at_the_right() {

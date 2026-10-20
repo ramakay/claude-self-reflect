@@ -33,6 +33,36 @@ struct DreamIndex {
 }
 impl DreamIndex {
     fn apply(&mut self, r: &Value) {
+        if r["kind"] == "batch" {
+            for item in super::array(&r["dreams"]) {
+                let mut item = item.clone();
+                if !item.is_object() {
+                    continue;
+                }
+                for key in [
+                    "at",
+                    "session",
+                    "repo",
+                    "budget",
+                    "threads",
+                    "confusing_claude",
+                    "should_be",
+                ] {
+                    if item[key].is_null() {
+                        item[key] = r[key].clone();
+                    }
+                }
+                item["kind"] = json!("dream");
+                self.apply(&item);
+            }
+            return;
+        }
+        if r["kind"] == "answer" && r["answer"] == "carried" {
+            if let Some(i) = self.positions.get(string(&r["id"])).copied() {
+                self.items[i]["carried"] = json!(true);
+            }
+            return;
+        }
         if r["kind"] == "dream"
             && r["id"].is_string()
             && r["line"].as_str().is_some_and(|s| !s.is_empty())
@@ -93,10 +123,11 @@ impl DreamLog {
                 };
                 if let Ok(row) = sonic_rs::from_slice::<Value>(line) {
                     self.index.apply(&row);
-                    if matches!(string(&row["kind"]), "chapter" | "look" | "dream") {
-                        self.records.push(json!({"kind":row["kind"],"at":row["at"],
-                        "repo":row["repo"],"session":row["session"],"of":row["of"],
-                        "outcome":row["outcome"],"every":row["every"]}));
+                    if matches!(
+                        string(&row["kind"]),
+                        "chapter" | "look" | "dream" | "batch" | "looking"
+                    ) {
+                        self.records.push(row.clone());
                     }
                 }
             },
@@ -147,16 +178,10 @@ pub fn last_look(records: &[Value], root: &str) -> Value {
         .iter()
         .rev()
         .find(|r| {
-            matches!(string(&r["kind"]), "look" | "dream")
+            matches!(string(&r["kind"]), "look" | "dream" | "batch" | "looking")
                 && (r["repo"].is_null() || r["repo"] == root)
         })
-        .map(|r| {
-            json!({
-                "at": num(&r["at"]),
-                "outcome": r["outcome"].as_str().unwrap_or("dream"),
-                "every": r["every"],
-            })
-        })
+        .cloned()
         .unwrap_or(Value::Null)
 }
 pub fn dreams_on(paths: &Paths) -> bool {
@@ -182,11 +207,17 @@ pub fn feed(dreams: &[Value], chapter: &Value, sid: &str) -> Value {
         .iter()
         .filter(|d| ADOPTED.contains(&string(&d["answer"])))
         .count();
-    let star = mine
-        .first()
-        .filter(|d| d["answer"].is_null() && num(&d["at"]) >= start)
+    let mut pending: Vec<_> = mine
+        .iter()
+        .filter(|d| d["answer"].is_null() && (num(&d["at"]) >= start || d["carried"] == true))
         .cloned()
-        .unwrap_or(Value::Null);
+        .collect();
+    pending.sort_by(|a, b| {
+        num(&b["confidence"])
+            .total_cmp(&num(&a["confidence"]))
+            .then_with(|| num(&b["at"]).total_cmp(&num(&a["at"])))
+    });
+    let star = pending.first().cloned().unwrap_or(Value::Null);
     let adopted: Vec<_> = mine
         .iter()
         .filter(|d| ADOPTED.contains(&string(&d["answer"])))
@@ -206,6 +237,8 @@ pub fn feed(dreams: &[Value], chapter: &Value, sid: &str) -> Value {
     json!({
         "left": (of + count).saturating_sub(current.len()),
         "of": of + count,
+        "queue": pending.iter().skip(1).collect::<Vec<_>>(),
+        "budget": star["budget"],
         "star": star,
         "adopted": adopted,
         "folded": folded,
@@ -341,5 +374,26 @@ mod incremental_tests {
         std::fs::write(&file, "").unwrap();
         log.poll(&paths);
         assert!(log.dreams("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    #[test]
+    fn batches_rank_promote_and_carry_without_inventing_metadata() {
+        let rows = vec![
+            json!({"kind":"batch","session":"s","at":1,"budget":{"spent":14,"cap":40},
+            "dreams":[{"id":"a","line":"What if A?","confidence":0.4},
+                      {"id":"b","line":"What if B?","confidence":0.8}]}),
+            json!({"kind":"answer","id":"b","answer":"helpful"}),
+            json!({"kind":"answer","id":"a","answer":"carried"}),
+        ];
+        let dreams = load_dream_log(&rows, "");
+        let f = feed(&dreams, &Value::Null, "s");
+        assert_eq!(f["star"]["id"], "a");
+        assert_eq!(f["star"]["carried"], true);
+        assert_eq!(f["budget"]["cap"], 40);
+        assert!(f["star"]["receipt"].is_null());
     }
 }

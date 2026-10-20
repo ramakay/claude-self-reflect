@@ -29,6 +29,29 @@ impl Db {
             queries: std::sync::atomic::AtomicUsize::new(0),
         })
     }
+    pub fn learnt_counts(&self, project: &str, sid: &str, now: f64) -> Vec<(usize, &'static str)> {
+        let Some(end) = chrono::DateTime::from_timestamp(now as i64, 0) else {
+            return vec![];
+        };
+        let feeds = self.storage.learnt_feeds(
+            project,
+            sid,
+            &end.to_rfc3339(),
+            crate::storage::recap_feeds::dream_consumption_mode(),
+        );
+        let mut out = vec![];
+        if feeds.notes_total > 0 && !feeds.notes.is_empty() && feeds.notes_date.is_some() {
+            out.push((feeds.notes_total, "notes kept"));
+        }
+        if feeds.confirmed_total > 0 && !feeds.confirmed.is_empty() {
+            out.push((feeds.confirmed_total, "findings confirmed"));
+        }
+        let retired = feeds.verdicts.iter().map(|v| v.count).sum::<usize>();
+        if retired > 0 {
+            out.push((retired, "facts retired"));
+        }
+        out
+    }
     pub fn query(&self, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
         self.try_query(sql, params).unwrap_or_default()
     }

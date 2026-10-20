@@ -10,7 +10,7 @@ use super::{
     count, int, out,
     text::{
         cited_commits, dream_id, dream_prompt, leans_on_old, mark_receipts, near_dream,
-        offers_another_way, parse_dream, seen_entry, Dream,
+        offers_another_way, parse_dream, parse_sections, seen_entry, Dream,
     },
 };
 use crate::companion::{
@@ -165,6 +165,10 @@ fn more(
         _ => Map::new(),
     };
     fields.insert("took_ms".into(), int(cx.clock.now() - began));
+    fields.insert(
+        "budget".into(),
+        json!({"spent":pace.dreamer,"cap":super::super::pace::SHARE * pace.claude}),
+    );
     if let Some(reason) = reason.as_ref().filter(|reason| !reason.is_empty()) {
         fields.insert("reason".into(), json!(reason));
     }
@@ -412,6 +416,16 @@ async fn look(
         &asked,
         &agents_text(envelope.as_ref(), &reported),
     );
+    (outside.keep())(
+        cwd.clone(),
+        json!({"kind":"looking","session":session,
+        "at":int(cx.clock.now()/1000.),"outcome":"dreaming",
+        "budget":{"spent":pace.dreamer,"cap":super::super::pace::SHARE*pace.claude}}),
+    )
+    .await;
+    if !tenure.owns().await {
+        return Ok(());
+    }
     trace.forked = true;
     let reply = match cx
         .host
@@ -494,6 +508,7 @@ async fn look(
     }
     // No grounding gate: one kept out the only dream acted on. The prompt asks for a receipt; you
     // judge.
+    let sections = parse_sections(answered_text.unwrap_or(""));
     let found = answered_text.and_then(parse_dream);
     let repeat = found.as_ref().is_some_and(|found| {
         seen.iter()
@@ -531,6 +546,9 @@ async fn look(
             "none"
         };
         let mut extra = more(cx, &pace, last_step, began, &reason, trigger);
+        for key in ["confusing_claude", "should_be"] {
+            extra.insert(key.into(), sections[key].clone());
+        }
         if let Some(against) = &decided {
             extra.insert("against".into(), json!(against));
         }
@@ -602,6 +620,9 @@ async fn look(
     put("title", json!(note["title"]));
     put("text", json!(note["text"]));
     put("tokens", int(used));
+    for key in ["confusing_claude", "should_be"] {
+        put(key, sections[key].clone());
+    }
     for (name, value) in spent_fields(spent.as_ref()) {
         put(&name, value);
     }

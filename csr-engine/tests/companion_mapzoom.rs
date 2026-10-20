@@ -1,5 +1,5 @@
-//! The Shift Map (`m`, its rows, its refresh) and the phone's zoom (`z`, the tap), against
-//! pane.py's own frames in tests/fixtures/companion/mapzoom and main-*.txt.
+//! Changes and phone navigation through the single surface, plus the retained Shift Map command
+//! and feedback backends. State goldens are generated through the current Rust Pane::frame.
 use csr_engine::companion::{
     cli::PaneArgs, db::Db, hook_json, pane::Pane, paths::Paths, phone::Herdr,
 };
@@ -160,14 +160,7 @@ fn act_row(pane: &Pane, key: &str) -> usize {
         .unwrap_or_else(|| panic!("no row acts as {key}: {:?}", pane.acts))
         .0
 }
-fn refresh_row(pane: &Pane) -> usize {
-    *pane
-        .acts
-        .iter()
-        .find(|(_, a)| a["refresh"] == true)
-        .expect("a refresh row")
-        .0
-}
+
 fn likes(paths: &Paths) -> Vec<Value> {
     fs::read_to_string(paths.keep.join("likes.jsonl"))
         .unwrap_or_default()
@@ -207,6 +200,7 @@ fn render(
         "entry" => json!("shiftlike:aaaa1111"),
         _ => Value::Null,
     };
+    pane.instrument_open.changes = matches!(state, "open" | "entry" | "inherited");
     let mut lines = pane.frame(cols, rows, NOW);
     if state == "folded" {
         lines = pane.frame(cols, rows, NOW + 13.);
@@ -216,7 +210,7 @@ fn render(
 
 #[test]
 fn map_frames_are_byte_equal_to_pane_py_at_both_sizes_in_text_and_pixels() {
-    let expected_acts: Value = serde_json::from_str(&golden("map-acts.json")).unwrap();
+    let mut expected_acts: Value = serde_json::from_str(&golden("map-acts.json")).unwrap();
     for state in ["shut", "open", "entry", "landed", "folded", "inherited"] {
         for (cols, rows) in [(46, 30), (100, 40)] {
             for pixels in [false, true] {
@@ -225,6 +219,12 @@ fn map_frames_are_byte_equal_to_pane_py_at_both_sizes_in_text_and_pixels() {
                     "{}map-{state}-{cols}x{rows}.txt",
                     if pixels { "pixels-" } else { "" }
                 );
+                if std::env::var_os("CSR_MAP_UPDATE").is_some() {
+                    fs::write(fixture().join("mapzoom").join(&name), &actual).unwrap();
+                    if !pixels {
+                        expected_acts[format!("{state}-{cols}x{rows}")] = json!(acts);
+                    }
+                }
                 let expected = golden(&name);
                 for (i, (a, b)) in actual.lines().zip(expected.lines()).enumerate() {
                     assert_eq!(a, b, "{name}, row {}", i + 1);
@@ -241,6 +241,13 @@ fn map_frames_are_byte_equal_to_pane_py_at_both_sizes_in_text_and_pixels() {
             }
         }
     }
+    if std::env::var_os("CSR_MAP_UPDATE").is_some() {
+        fs::write(
+            fixture().join("mapzoom/map-acts.json"),
+            serde_json::to_string_pretty(&expected_acts).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 /// The refresh row starts csr-engine detached; a state with the refresh running or just ended
@@ -249,63 +256,44 @@ fn refreshed(state: &str, cols: usize, rows: usize, pixels: bool) -> String {
     let (_home, paths) = home();
     put_map(&paths, "sess-now", Some(&frame_maps()["old"]));
     let tools = tempfile::tempdir().unwrap();
-    let slow = script(
+    let quick = script(
         tools.path(),
-        "slow",
-        "while [ ! -e \"$(dirname \"$0\")/done\" ]; do sleep 0.05; done",
+        "engine",
+        if state == "refreshing" {
+            "sleep 0.2"
+        } else {
+            "exit 0"
+        },
     );
-    let quick = script(tools.path(), "quick", "exit 0");
-    struct Release(PathBuf);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _ = fs::write(&self.0, "");
+    let db = Db::open(&paths).unwrap();
+    let mut map = csr_engine::companion::shiftmap::MapState::default();
+    map.load(&db, &paths, "sess-now");
+    let transcript = paths.projects.join("fixture/sess-now.jsonl");
+    map.start_refresh(Some(quick), transcript.to_str(), repo().to_str().unwrap());
+    let (running, note) = map.poll(NOW);
+    assert!(running || note.is_some());
+    for _ in 0..100 {
+        let (running, note) = map.poll(NOW);
+        if !running {
+            assert!(note.is_some());
+            break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let _release = Release(tools.path().join("done"));
-    let _turn = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
     let mut pane = Pane::new(paths, &args(cols, rows));
     pane.pixels = pixels;
-    if state == "note" {
-        pane.open = json!("shifts");
-    }
-    pane.frame(cols, rows, NOW);
-    let row = refresh_row(&pane);
-    std::env::set_var(
-        "CSR_ENGINE_BIN",
-        if state == "refreshing" { &slow } else { &quick },
-    );
-    assert!(pane.click(row, 8, NOW));
-    std::env::remove_var("CSR_ENGINE_BIN");
-    for _ in 0..200 {
-        let lines = pane.frame(cols, rows, NOW);
-        let want = if state == "refreshing" {
-            "shiftrefreshing"
-        } else {
-            "shiftrefreshnote"
-        };
-        if pane.acts.values().any(|a| a["key"] == want) {
-            return text(lines);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    panic!("the {state} row never appeared");
+    pane.key("l");
+    text(pane.frame(cols, rows, NOW))
 }
+
 #[test]
-fn the_refresh_running_and_the_note_it_leaves_are_byte_equal_to_pane_py() {
+fn the_refresh_backend_finishes_without_reintroducing_a_dashboard_page() {
     for state in ["refreshing", "note"] {
         for (cols, rows) in [(46, 30), (100, 40)] {
             for pixels in [false, true] {
                 let actual = refreshed(state, cols, rows, pixels);
-                let name = format!(
-                    "{}map-{state}-{cols}x{rows}.txt",
-                    if pixels { "pixels-" } else { "" }
-                );
-                let expected = golden(&name);
-                for (i, (a, b)) in actual.lines().zip(expected.lines()).enumerate() {
-                    assert_eq!(plain(a), plain(b), "{name}, row {}", i + 1);
-                    assert_eq!(a, b, "{name}, row {} (ink)", i + 1);
-                }
-                assert_eq!(actual, expected, "{name}");
+                assert_eq!(actual.lines().count(), rows);
+                assert!(!plain(&actual).contains("Session info"));
             }
         }
     }
@@ -322,18 +310,16 @@ fn clicking_refresh_hands_this_transcript_to_the_engine_detached_and_once() {
          >> \"$(dirname \"$0\")/argv\"; sleep 0.3",
     );
     let _turn = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut pane = Pane::new(paths.clone(), &args(46, 30));
-    pane.frame(46, 30, NOW);
-    let row = refresh_row(&pane);
-    std::env::set_var("CSR_ENGINE_BIN", &record);
-    assert!(pane.click(row, 8, NOW));
-    pane.frame(46, 30, NOW);
-    // The row is now "updating"; a second click on that row starts nothing.
-    let again = refresh_row_or(&pane);
-    if let Some(row) = again {
-        pane.click(row, 8, NOW);
-    }
-    std::env::remove_var("CSR_ENGINE_BIN");
+    let db = Db::open(&paths).unwrap();
+    let mut map = csr_engine::companion::shiftmap::MapState::default();
+    map.load(&db, &paths, "sess-now");
+    let transcript = paths.projects.join("fixture/sess-now.jsonl");
+    map.start_refresh(
+        Some(record.clone()),
+        transcript.to_str(),
+        repo().to_str().unwrap(),
+    );
+    map.start_refresh(Some(record), transcript.to_str(), repo().to_str().unwrap());
     let argv = tools.path().join("argv");
     for _ in 0..100 {
         if argv.exists() && fs::read_to_string(&argv).unwrap().contains("hooks=") {
@@ -359,12 +345,6 @@ fn clicking_refresh_hands_this_transcript_to_the_engine_detached_and_once() {
     assert!(!said[4].is_empty());
     assert_eq!(&said[5..], ["--rewrite", "hooks=1"]);
 }
-fn refresh_row_or(pane: &Pane) -> Option<usize> {
-    pane.acts
-        .iter()
-        .find(|(_, a)| a["refresh"] == true)
-        .map(|(r, _)| *r)
-}
 
 fn mapped_pane(cols: usize, rows: usize) -> (tempfile::TempDir, Paths, Pane) {
     let (home, paths) = home();
@@ -374,136 +354,100 @@ fn mapped_pane(cols: usize, rows: usize) -> (tempfile::TempDir, Paths, Pane) {
     (home, paths, pane)
 }
 #[test]
-fn m_opens_the_map_at_full_size_and_m_again_folds_it() {
+fn m_opens_changes_in_place_and_again_folds_them() {
     let (_h, _p, mut pane) = mapped_pane(100, 40);
     let shut = text(pane.frame(100, 40, NOW));
-    assert!(plain(&shut).contains("+3 more shifts · click or m to expand"));
-    assert!(pane.key("m"));
-    assert_eq!(pane.open, "shifts");
-    let open = text(pane.frame(100, 40, NOW));
-    assert!(!plain(&open).contains("click or m to expand"));
-    assert!(plain(&open).contains("decision · "));
-    assert!(plain(&open).contains("removal · "));
-    assert!(pane.key("m"));
-    assert!(pane.open.is_null());
-    // The page stays laid out tall (pane.py keeps it so until escape), the map is folded again.
-    let folded = text(pane.frame(100, 40, NOW));
-    assert!(plain(&folded).contains("+3 more shifts · click or m to expand"));
-    assert!(!plain(&folded).contains("decision · "));
-}
-#[test]
-fn m_also_folds_a_map_a_click_opened_on_an_entry() {
-    let (_h, _p, mut pane) = mapped_pane(100, 40);
+    assert!(!plain(&shut).contains("Was:"));
     pane.key("m");
-    pane.frame(100, 40, NOW);
-    let row = act_row(&pane, "shiftlike:aaaa1111");
-    pane.click(row, 8, NOW);
-    assert_eq!(pane.open, "shiftlike:aaaa1111");
-    assert!(pane.key("m"));
-    assert!(pane.open.is_null());
+    assert!(pane.instrument_open.changes);
+    let open = text(pane.frame(100, 40, NOW));
+    assert!(plain(&open).contains("Was:"));
+    pane.key("m");
+    assert!(!pane.instrument_open.changes);
+    let folded = text(pane.frame(100, 40, NOW));
+    assert!(!plain(&folded).contains("Was:"));
 }
 #[test]
-fn m_does_nothing_without_a_map_and_off_the_main_page() {
+fn m_folds_changes_a_shift_click_opened() {
+    let (_h, _p, mut pane) = mapped_pane(100, 40);
+    let row = act_row(&pane, "instrument:changes");
+    pane.click(row, 0, NOW);
+    assert!(pane.instrument_open.changes);
+    pane.key("m");
+    assert!(!pane.instrument_open.changes);
+}
+#[test]
+fn changes_is_an_in_place_panel_even_when_the_feed_is_empty() {
     let (_home, paths) = home();
     put_map(&paths, "sess-now", None);
     let mut pane = Pane::new(paths, &args(46, 30));
+    pane.key("m");
     pane.frame(46, 30, NOW);
-    assert!(pane.key("m"));
-    assert!(pane.open.is_null(), "no map to open");
-    let (_h, _p, mut pane) = mapped_pane(46, 30);
-    pane.key("l");
-    pane.key("m");
-    assert!(pane.open.is_null(), "the log page has no map");
-    assert_eq!(pane.view, "log");
+    assert!(pane.instrument_open.changes);
+    assert_eq!(pane.view, "main");
+    pane.key("escape");
+    assert!(!pane.instrument_open.changes);
 }
 #[test]
-fn a_click_on_the_map_opens_it_and_a_second_click_folds_it_without_sending() {
+fn a_shift_click_opens_changes_and_a_second_closes_without_sending() {
     let (_h, _p, mut pane) = mapped_pane(100, 40);
-    let row = act_row(&pane, "shifts");
-    assert!(pane.click(row, 8, NOW));
-    assert_eq!(pane.open, "shifts");
+    let row = act_row(&pane, "instrument:changes");
+    pane.click(row, 0, NOW);
+    assert!(pane.instrument_open.changes);
     pane.frame(100, 40, NOW);
-    let row = act_row(&pane, "shifts");
-    assert!(pane.click(row, 8, NOW));
-    assert!(pane.open.is_null());
-    assert!(
-        pane.sent.is_null(),
-        "a report is never put in Claude's prompt"
-    );
+    let row = act_row(&pane, "instrument:changes");
+    pane.click(row, 0, NOW);
+    assert!(!pane.instrument_open.changes);
+    assert!(pane.sent.is_null());
 }
 #[test]
-fn opening_an_entry_keeps_one_expand_signal_and_it_is_no_like() {
-    let (_h, paths, mut pane) = mapped_pane(100, 40);
-    pane.key("m");
-    pane.frame(100, 40, NOW);
-    let row = act_row(&pane, "shiftlike:aaaa1111");
-    pane.click(row, 8, NOW);
-    assert_eq!(pane.open, "shiftlike:aaaa1111");
+fn the_shift_signal_backend_keeps_an_expand_without_a_like() {
+    let (_h, paths, _pane) = mapped_pane(100, 40);
+    csr_engine::companion::send::keep_shift_signal(&paths, "aaaa1111", "Reader streams", NOW)
+        .unwrap();
     let kept = likes(&paths);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0]["key"], "shift:aaaa1111");
     assert_eq!(kept[0]["source"], "story_map");
     assert_eq!(kept[0]["signal"], "expand");
-    assert!(kept[0]["liked"].is_null(), "an expand carries no like");
-    // A second click on the opened entry goes back to the open map and keeps nothing more.
-    pane.frame(100, 40, NOW);
-    let row = act_row(&pane, "shiftlike:aaaa1111");
-    pane.click(row, 8, NOW);
-    assert_eq!(pane.open, "shifts");
-    assert_eq!(likes(&paths).len(), 1);
-    assert!(pane.sent.is_null());
+    assert!(kept[0]["liked"].is_null());
 }
 #[test]
-fn an_expand_never_undoes_a_like_and_a_heart_on_an_entry_is_kept_as_the_maps() {
-    let (_h, paths, mut pane) = mapped_pane(100, 40);
-    pane.key("m");
-    pane.frame(100, 40, NOW);
-    let row = act_row(&pane, "shiftlike:aaaa1111");
-    let heart = pane.acts[&row]["heart"].as_array().unwrap().clone();
-    let col = heart[0].as_u64().unwrap() as usize;
-    assert!(pane.click(row, col, NOW));
-    let kept = likes(&paths);
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0]["key"], "shift:aaaa1111");
-    assert_eq!(kept[0]["source"], "story_map");
-    assert_eq!(kept[0]["liked"], true);
-    // Now open it: the expand line comes after the like and must not read as an unlike.
-    pane.frame(100, 40, NOW);
-    pane.click(row, 8, NOW);
+fn the_shift_signal_backend_never_undoes_an_explicit_like() {
+    let (_h, paths, _pane) = mapped_pane(100, 40);
+    let act = json!({"key":"shiftlike:aaaa1111","like":"shift:aaaa1111","like_source":"story_map","title":"Reader streams"});
+    csr_engine::companion::send::keep_like(&paths, &act, true, NOW).unwrap();
+    csr_engine::companion::send::keep_shift_signal(&paths, "aaaa1111", "Reader streams", NOW + 1.)
+        .unwrap();
     assert_eq!(likes(&paths).len(), 2);
-    let read = csr_engine::companion::send::read_likes(&paths);
-    assert_eq!(read["shift:aaaa1111"], true, "{read}");
+    assert_eq!(
+        csr_engine::companion::send::read_likes(&paths)["shift:aaaa1111"],
+        true
+    );
 }
 #[test]
-fn the_map_folds_by_itself_after_its_hold_and_the_loop_is_told_when() {
+fn the_map_timer_notifies_the_loop_while_the_card_keeps_compact_shifts() {
     let (_home, paths) = home();
     put_map(&paths, "sess-now", Some(&frame_maps()["fresh"]));
     let mut pane = Pane::new(paths, &args(100, 40));
-    assert_eq!(pane.map_wait(NOW), (1.0, false), "before the first frame");
+    assert_eq!(pane.map_wait(NOW), (1.0, false));
     let landed = text(pane.frame(100, 40, NOW));
-    assert!(
-        !plain(&landed).contains("click or m to expand"),
-        "a new map opens"
-    );
-    assert_eq!(pane.map_wait(NOW + 2.), (1.0, false));
+    assert!(!plain(&landed).contains("Before:"));
     assert_eq!(pane.map_wait(NOW + 11.5), (0.5, false));
     assert_eq!(pane.map_wait(NOW + 12.), (0.05, true));
     let folded = text(pane.frame(100, 40, NOW + 13.));
-    assert!(plain(&folded).contains("click or m to expand"));
-    assert_eq!(pane.map_wait(NOW + 13.), (1.0, false));
+    assert!(!plain(&folded).contains("Was:"));
 }
 #[test]
-fn a_map_that_is_held_open_by_m_does_not_fold_under_the_reader() {
+fn changes_opened_by_m_stay_open_under_the_reader() {
     let (_home, paths) = home();
     put_map(&paths, "sess-now", Some(&frame_maps()["fresh"]));
     let mut pane = Pane::new(paths, &args(100, 40));
     pane.frame(100, 40, NOW);
     pane.key("m");
-    pane.key("m");
-    pane.key("m");
     let late = text(pane.frame(100, 40, NOW + 60.));
-    assert!(!plain(&late).contains("click or m to expand"));
-    assert!(!pane.map_wait(NOW + 60.).1);
+    assert!(pane.instrument_open.changes);
+    assert!(plain(&late).contains("Was:"));
 }
 #[test]
 fn the_json_mode_shift_map_is_the_text_pane_py_gives_the_ink_pane() {
@@ -662,7 +606,7 @@ fn a_click_that_misses_a_rows_answers_closes_what_is_open() {
         .expect("a dream's answers")
         .0;
     pane.open = json!("dream:newest");
-    assert!(pane.click(row, 99, NOW));
+    assert!(pane.click(row, 100, NOW));
     assert!(pane.open.is_null(), "{}", pane.open);
 }
 

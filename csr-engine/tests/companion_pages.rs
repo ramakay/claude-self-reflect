@@ -1,6 +1,5 @@
-//! The watch pane's info, summary and threads pages (keys i, s, f; acts view:info, view:summary,
-//! view:threads), against pane.py's own frames. The goldens carry clock times, so every test pins
-//! TZ to UTC; this file is its own test binary, so that touches no other test.
+//! The in-place figure and retained summary/threads endpoints through Pane::frame and the CLI.
+//! Golden updates use the real Rust top frame; the info endpoint is retired.
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
 use std::{fs, path::PathBuf};
 
@@ -69,9 +68,6 @@ fn home() -> (tempfile::TempDir, Paths) {
     }
     (d, paths)
 }
-fn args(page: &str, cols: usize, rows: usize) -> PaneArgs {
-    args_for(page, cols, rows, "sess-now")
-}
 fn args_for(page: &str, cols: usize, rows: usize, sid: &str) -> PaneArgs {
     use clap::Parser;
     #[derive(Parser)]
@@ -85,7 +81,7 @@ fn args_for(page: &str, cols: usize, rows: usize, sid: &str) -> PaneArgs {
         repo().to_str().unwrap(),
         "--frame",
         "--page",
-        page,
+        if page == "figure" { "main" } else { page },
         "--cols",
         &cols.to_string(),
         "--rows",
@@ -97,23 +93,25 @@ fn args_for(page: &str, cols: usize, rows: usize, sid: &str) -> PaneArgs {
 }
 
 #[test]
-fn a_click_on_the_masthead_opens_the_info_page_and_a_click_on_its_title_goes_back() {
-    utc();
-    let (_home, paths) = home();
-    let mut pane = Pane::new(paths, &args("main", 100, 40));
-    pane.pixels = false;
+fn a_click_on_context_opens_the_figure_and_a_second_click_folds_it() {
+    let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
     pane.frame(100, 40, NOW);
-    assert_eq!(pane.acts[&0]["key"], "view:info");
-    assert!(pane.click(0, 5, NOW));
-    assert_eq!(pane.view, "info");
-    pane.frame(100, 40, NOW);
-    assert_eq!(pane.acts[&0]["key"], "view:main");
-    assert!(pane.click(0, 5, NOW));
+    let row = *pane
+        .acts
+        .iter()
+        .find(|(_, a)| a["key"] == "instrument:figure")
+        .unwrap()
+        .0;
+    pane.click(row, 0, NOW);
+    assert!(pane.instrument_open.figure);
     assert_eq!(pane.view, "main");
+    pane.frame(100, 40, NOW);
+    pane.click(row, 0, NOW);
+    assert!(!pane.instrument_open.figure);
 }
 
 const SIZES: [(usize, usize); 2] = [(46, 30), (100, 40)];
-const PAGES: [&str; 3] = ["info", "summary", "threads"];
+const PAGES: [&str; 3] = ["figure", "summary", "threads"];
 
 fn golden(name: &str) -> String {
     fs::read_to_string(fixture().join(name)).unwrap_or_else(|_| panic!("missing golden {name}"))
@@ -130,10 +128,46 @@ fn draw(
     let (home, paths) = home();
     let mut pane = Pane::new(paths, &args_for(page, cols, rows, sid));
     pane.pixels = pixels;
+    if page == "figure" {
+        pane.key("i");
+    }
     if let Some(key) = open {
         pane.open = serde_json::json!(key);
     }
     let lines = pane.frame(cols, rows, NOW);
+    if std::env::var_os("CSR_PAGE_UPDATE").is_some() {
+        let tag = if sid == "sess-lost" { "lost-" } else { "" };
+        let name = format!(
+            "{}{}-{}{}{}x{}",
+            if pixels { "pixels-" } else { "" },
+            page,
+            if open.is_some() { "open-" } else { "" },
+            tag,
+            cols,
+            rows
+        );
+        fs::write(
+            fixture().join(format!("{name}.txt")),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+        let acts = pane
+            .acts
+            .iter()
+            .map(|(r, a)| format!("{r}\t{a}\n"))
+            .collect::<String>();
+        fs::write(fixture().join(format!("{name}.acts.txt")), acts).unwrap();
+        if pixels {
+            fs::write(
+                fixture().join(format!("{name}.pictures.txt")),
+                pane.placed
+                    .iter()
+                    .map(|p| format!("{} {} {} {}\n", p.row, p.col, p.cols, p.rows))
+                    .collect::<String>(),
+            )
+            .unwrap();
+        }
+    }
     (pane, lines, home)
 }
 fn acts_of(pane: &Pane) -> Vec<(usize, serde_json::Value)> {
@@ -254,24 +288,26 @@ fn pane_on(page: &str, sid: &str, size: (usize, usize)) -> (Pane, tempfile::Temp
 }
 
 #[test]
-fn s_f_and_i_open_their_pages_and_the_same_key_or_escape_goes_back() {
-    for (key, view) in [("s", "summary"), ("f", "threads"), ("i", "info")] {
-        let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
-        assert!(pane.key(key));
-        assert_eq!(pane.view, view);
-        assert!(pane.key(key));
-        assert_eq!(pane.view, "main", "{key} again");
-        assert!(pane.key(key));
-        assert!(pane.key("escape"));
-        assert_eq!(pane.view, "main", "escape from {view}");
-        assert!(pane.key(key));
-        assert!(pane.key("d"));
-        assert_eq!(pane.view, "main", "d from {view}");
-    }
+fn s_opens_summary_while_f_and_i_toggle_in_place() {
     let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
     pane.key("s");
+    assert_eq!(pane.view, "summary");
+    pane.key("s");
+    assert_eq!(pane.view, "main");
+    pane.key("f");
+    assert!(pane.instrument_open.threads);
+    pane.key("f");
+    assert!(!pane.instrument_open.threads);
     pane.key("i");
-    assert_eq!(pane.view, "info", "i from the summary page opens info");
+    assert!(pane.instrument_open.figure);
+    pane.key("i");
+    assert!(!pane.instrument_open.figure);
+    pane.key("s");
+    pane.key("i");
+    assert_eq!(pane.view, "main");
+    assert!(pane.instrument_open.figure);
+    pane.key("escape");
+    assert!(!pane.instrument_open.figure);
     assert!(!pane.key("q"));
 }
 
@@ -280,7 +316,11 @@ fn the_legend_of_these_pages_is_back_scroll_close_with_no_change_marks() {
     for page in PAGES {
         let (_pane, lines, _home) = draw(page, "sess-now", (100, 40), false, None);
         let last = plain_rows(&lines).pop().unwrap();
-        assert_eq!(last, " d back   j/k scroll   q close", "{page}");
+        if page == "figure" {
+            assert!(last.contains("i figure"));
+        } else {
+            assert_eq!(last, " d back   j/k scroll   q close", "{page}");
+        }
         assert!(!last.contains("changed"));
         let (pane, ..) = draw(page, "sess-now", (100, 40), false, None);
         let spans: Vec<String> = pane.acts[&39]["keys"]
@@ -289,13 +329,17 @@ fn the_legend_of_these_pages_is_back_scroll_close_with_no_change_marks() {
             .iter()
             .map(|s| s[2].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(spans, ["d", "j/k", "q"], "{page}");
+        if page == "figure" {
+            assert!(spans.contains(&"i".to_owned()));
+        } else {
+            assert_eq!(spans, ["d", "j/k", "q"], "{page}");
+        }
     }
 }
 
 #[test]
-fn a_click_on_a_legend_label_opens_that_page() {
-    for (key, view) in [("s", "summary"), ("f", "threads"), ("i", "info")] {
+fn a_click_on_each_legend_label_toggles_its_live_panel() {
+    for key in ["l", "t", "i"] {
         let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
         pane.frame(100, 40, NOW);
         let span = pane.acts[&39]["keys"]
@@ -303,54 +347,50 @@ fn a_click_on_a_legend_label_opens_that_page() {
             .unwrap()
             .iter()
             .find(|s| s[2] == key)
-            .unwrap_or_else(|| panic!("no {key} on the main legend"))
+            .unwrap()
             .clone();
-        assert!(pane.click(39, span[0].as_u64().unwrap() as usize, NOW));
-        assert_eq!(pane.view, view, "{key}");
-        pane.frame(100, 40, NOW);
-        let back = pane.acts[&39]["keys"][0].clone();
-        assert_eq!(back[2], "d");
-        assert!(pane.click(39, back[0].as_u64().unwrap() as usize, NOW));
+        pane.click(39, span[0].as_u64().unwrap() as usize, NOW);
         assert_eq!(pane.view, "main");
+        assert!(match key {
+            "l" => pane.instrument_open.changes,
+            "t" => pane.instrument_open.threads,
+            _ => pane.instrument_open.figure,
+        });
+        pane.key("escape");
+        assert!(
+            !pane.instrument_open.changes
+                && !pane.instrument_open.threads
+                && !pane.instrument_open.figure
+        );
     }
 }
 
 #[test]
-fn the_view_acts_open_summary_threads_and_info() {
+fn view_acts_keep_summary_and_threads_but_cannot_open_info() {
     for view in ["summary", "threads", "info"] {
         let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
         pane.frame(100, 40, NOW);
         pane.acts
-            .insert(3, serde_json::json!({"key": format!("view:{view}")}));
-        assert!(pane.click(3, 4, NOW));
-        assert_eq!(pane.view, view);
+            .insert(3, serde_json::json!({"key":format!("view:{view}")}));
+        pane.click(3, 4, NOW);
+        assert_eq!(pane.view, if view == "info" { "main" } else { view });
     }
 }
 
 #[test]
-fn only_the_first_two_masthead_rows_open_the_info_page() {
+fn context_rows_have_figure_actions_and_no_info_action() {
     let (mut pane, _home) = pane_on("main", "sess-now", (100, 40));
     pane.frame(100, 40, NOW);
-    let rows: Vec<usize> = pane
-        .acts
-        .iter()
-        .filter(|(_, a)| a["key"] == "view:info")
-        .map(|(r, _)| *r)
-        .collect();
-    // the masthead's first two rows, and the value row above the legend (pane.py's `room - 1`)
-    assert_eq!(rows, [0, 1, 38]);
+    assert!(pane.acts.values().any(|a| a["key"] == "instrument:figure"));
+    assert!(!pane.acts.values().any(|a| a["key"] == "view:info"));
 }
 
 #[test]
-fn the_info_page_marks_its_title_and_instruments_as_back() {
-    let (pane, ..) = draw("info", "sess-now", (100, 40), false, None);
-    let back: Vec<usize> = pane
-        .acts
-        .iter()
-        .filter(|(_, a)| a["key"] == "view:main")
-        .map(|(r, _)| *r)
-        .collect();
-    assert_eq!(back, (0..10).collect::<Vec<_>>());
+fn the_expanded_figure_keeps_its_toggle_on_the_single_surface() {
+    let (pane, ..) = draw("figure", "sess-now", (100, 40), false, None);
+    assert_eq!(pane.view, "main");
+    assert!(pane.instrument_open.figure);
+    assert!(pane.acts.values().any(|a| a["key"] == "instrument:figure"));
 }
 
 #[test]
@@ -377,7 +417,7 @@ fn j_k_and_space_scroll_the_summary_and_never_past_its_ends() {
 
 #[test]
 fn j_k_scroll_the_threads_and_info_pages() {
-    for (page, rows) in [("threads", 8), ("info", 12)] {
+    for (page, rows) in [("threads", 8), ("summary", 5)] {
         let (mut pane, _home) = pane_on(page, "sess-lost", (46, rows));
         let first = plain_rows(&pane.frame(46, rows, NOW));
         pane.key("j");
@@ -518,7 +558,7 @@ fn the_cli_draws_the_three_pages() {
                 repo().to_str().unwrap(),
                 "--frame",
                 "--page",
-                page,
+                if page == "figure" { "main" } else { page },
                 "--sid",
                 "sess-now",
                 "--cols",
@@ -537,7 +577,11 @@ fn the_cli_draws_the_three_pages() {
         );
         let text = plain_rows(&[String::from_utf8(out.stdout).unwrap()]).concat();
         assert!(
-            text.contains("d back   j/k scroll   q close"),
+            if page == "figure" {
+                text.contains("i figure")
+            } else {
+                text.contains("d back   j/k scroll   q close")
+            },
             "{page}: {text}"
         );
     }

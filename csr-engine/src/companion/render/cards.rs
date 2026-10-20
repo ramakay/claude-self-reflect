@@ -71,7 +71,12 @@ impl CardFonts {
         let mut primary = vec![];
         if found.variable {
             let bytes = read_font(&found.regular)?;
-            for (w, o) in [(400., 17.), (500., 17.), (600., 17.), (600., 28.)] {
+            for (w, o) in [
+                (theme::REGULAR, 17.),
+                (theme::MEDIUM, 17.),
+                (theme::BOLD, 17.),
+                (theme::BOLD, 28.),
+            ] {
                 let mut font = FontVec::try_from_vec(bytes.clone()).ok()?;
                 font.set_variation(b"wght", w);
                 font.set_variation(b"opsz", o);
@@ -84,7 +89,7 @@ impl CardFonts {
         } else {
             // fixed weights: the regular stands in for 400 and 500, the bold for 600
             let bold = found.bold.as_ref().unwrap_or(&found.regular);
-            for (path, w) in [(&found.regular, 400.), (bold, 600.)] {
+            for (path, w) in [(&found.regular, theme::REGULAR), (bold, theme::BOLD)] {
                 let font = FontVec::try_from_vec(read_font(path)?).ok()?;
                 primary.push(Face {
                     font,
@@ -124,7 +129,7 @@ impl CardFonts {
                 return m;
             }
         }
-        let wght = if wght == MONO { 400. } else { wght };
+        let wght = if wght == MONO { theme::REGULAR } else { wght };
         let want_o = if size >= 20. { 28. } else { 17. };
         self.primary
             .iter()
@@ -660,20 +665,20 @@ const HEAD_H: f32 = 26.;
 fn heading(c: &mut Canvas, e: &Env, look: Look, x: f32, y: f32, w: f32, right: &str) {
     icon(c, e, look, x + PAD - 4., y + PAD - 6.);
     let tx = x + PAD + 30.;
-    let base = y + PAD + 7. + e.f.cap(10.5, 600.) / 2.;
+    let base = y + PAD + 7. + e.f.cap(10.5, theme::BOLD) / 2.;
     c.text(
         e.f,
         look.title,
         tx,
         base,
         10.5,
-        600.,
+        theme::BOLD,
         px(look.ink()),
         0.8,
         Anchor::L,
     );
     if !right.is_empty() {
-        let room = w - 2. * PAD - 30. - e.f.width(look.title, 10.5, 600., 0.8) - 8.;
+        let room = w - 2. * PAD - 30. - e.f.width(look.title, 10.5, theme::BOLD, 0.8) - 8.;
         let right = fit_width(e.f, right, 11., MONO, room);
         c.text(
             e.f,
@@ -737,7 +742,7 @@ fn legend_row(
     value: &str,
 ) {
     let mid = y + 9.;
-    let base = mid + f.cap(12., 400.) / 2.;
+    let base = mid + f.cap(12., theme::REGULAR) / 2.;
     c.circle(x + 4., mid, 3.5, px(dot));
     c.text(
         f,
@@ -745,7 +750,7 @@ fn legend_row(
         x + 15.,
         base,
         12.,
-        400.,
+        theme::REGULAR,
         px(theme::QUIET),
         0.,
         Anchor::L,
@@ -813,20 +818,30 @@ fn moon(c: &mut Canvas, f: &CardFonts, cx: f32, cy: f32, r: f32, m: &MoonFact) {
         }
     }
     let n = m.percent.to_string();
-    let (l, nr, _, _) = f.ink(&n, 20., 600., 0.);
-    let adv = f.width(&n, 20., 600., 0.);
-    let pr = f.ink("%", 12., 600., 0.).1;
+    let (l, nr, _, _) = f.ink(&n, 20., theme::BOLD, 0.);
+    let adv = f.width(&n, 20., theme::BOLD, 0.);
+    let pr = f.ink("%", 12., theme::BOLD, 0.).1;
     let x0 = cx - (l + adv + 0.5 + pr) / 2.;
-    let base = cy + f.cap(20., 600.) / 2.;
+    let base = cy + f.cap(20., theme::BOLD) / 2.;
     let _ = nr;
-    c.text(f, &n, x0, base, 20., 600., px(theme::DATA), 0., Anchor::L);
+    c.text(
+        f,
+        &n,
+        x0,
+        base,
+        20.,
+        theme::BOLD,
+        px(theme::DATA),
+        0.,
+        Anchor::L,
+    );
     c.text(
         f,
         "%",
         x0 + adv + 0.5,
         base,
         12.,
-        600.,
+        theme::BOLD,
         px(theme::DATA),
         0.,
         Anchor::L,
@@ -875,8 +890,18 @@ fn moon_card(
             Dot::Red => theme::TURN,
             _ => theme::CTX,
         };
-        let base = by + 9. + f.cap(11., 600.) / 2.;
-        c.text(f, &b.name, left, base, 11., 600., px(ink), 0.6, Anchor::L);
+        let base = by + 9. + f.cap(11., theme::BOLD) / 2.;
+        c.text(
+            f,
+            &b.name,
+            left,
+            base,
+            11.,
+            theme::BOLD,
+            px(ink),
+            0.6,
+            Anchor::L,
+        );
         c.text(
             f,
             &format!("{}%", b.percent),
@@ -902,9 +927,9 @@ fn moon_card(
             f,
             &b.caption,
             left,
-            by + 33. + f.cap(10., 400.) / 2.,
+            by + 33. + f.cap(10., theme::REGULAR) / 2.,
             10.,
-            400.,
+            theme::REGULAR,
             px(theme::FAINT),
             0.,
             Anchor::L,
@@ -1007,14 +1032,14 @@ fn what_if_card(
     let mut cy = y + PAD + HEAD_H + 4.;
     let f = e.f;
     if !line.is_empty() {
-        for l in wrap(f, line, 12., 400., iw, 3) {
+        for l in wrap(f, line, 12., theme::REGULAR, iw, 3) {
             c.text(
                 f,
                 &l,
                 ix,
-                cy + 8. + f.cap(12., 400.) / 2.,
+                cy + 8. + f.cap(12., theme::REGULAR) / 2.,
                 12.,
-                400.,
+                theme::REGULAR,
                 px(theme::INK),
                 0.,
                 Anchor::L,
@@ -1031,9 +1056,9 @@ fn what_if_card(
         f,
         &said,
         ix,
-        cy + 6. + f.cap(10., 400.) / 2.,
+        cy + 6. + f.cap(10., theme::REGULAR) / 2.,
         10.,
-        400.,
+        theme::REGULAR,
         px(theme::FAINT),
         0.,
         Anchor::L,
@@ -1070,14 +1095,14 @@ fn story_card(
         );
         cy += 16.;
     }
-    for l in wrap(f, now, 12.5, 400., iw, 4) {
+    for l in wrap(f, now, 12.5, theme::REGULAR, iw, 4) {
         c.text(
             f,
             &l,
             ix,
-            cy + 8. + f.cap(12.5, 400.) / 2.,
+            cy + 8. + f.cap(12.5, theme::REGULAR) / 2.,
             12.5,
-            400.,
+            theme::REGULAR,
             px(theme::INK),
             0.,
             Anchor::L,
@@ -1090,14 +1115,14 @@ fn story_card(
         cy += 6.;
         for (text, loud) in shifts.iter().take(9) {
             if *loud {
-                let l = fit_width(f, text, 11.5, 400., iw);
+                let l = fit_width(f, text, 11.5, theme::REGULAR, iw);
                 c.text(
                     f,
                     &l,
                     ix,
-                    cy + 7. + f.cap(11.5, 400.) / 2.,
+                    cy + 7. + f.cap(11.5, theme::REGULAR) / 2.,
                     11.5,
-                    400.,
+                    theme::REGULAR,
                     px(theme::INK),
                     0.,
                     Anchor::L,
@@ -1153,9 +1178,9 @@ fn mirror_card(
             f,
             label,
             fx + 12.,
-            ly + f.cap(10., 600.) / 2.,
+            ly + f.cap(10., theme::BOLD) / 2.,
             10.,
-            600.,
+            theme::BOLD,
             px(*col),
             0.8,
             Anchor::L,
@@ -1293,7 +1318,12 @@ fn pill_width(p: &Pill, f: &CardFonts) -> f32 {
         let mut w = 0.;
         for (gi, g) in groups.iter().enumerate() {
             for (s, _, bold) in g {
-                w += f.width(s, p.size, if *bold { 600. } else { 500. }, 0.);
+                w += f.width(
+                    s,
+                    p.size,
+                    if *bold { theme::BOLD } else { theme::MEDIUM },
+                    0.,
+                );
             }
             if gi + 1 < groups.len() {
                 w += PILL_GAP;
@@ -1348,7 +1378,7 @@ pub fn draw_pill(
     let n = p.lines.len().max(1) as f32;
     for (li, groups) in p.lines.iter().enumerate() {
         let mid = 1. + h * (li as f32 + 0.5) / n;
-        let base = mid + f.cap(p.size, 600.) / 2.;
+        let base = mid + f.cap(p.size, theme::BOLD) / 2.;
         let mut px0 = MARGIN + 12.;
         for (gi, g) in groups.iter().enumerate() {
             for (s, ink, bold) in g {
@@ -1358,7 +1388,7 @@ pub fn draw_pill(
                     px0,
                     base,
                     p.size,
-                    if *bold { 600. } else { 500. },
+                    if *bold { theme::BOLD } else { theme::MEDIUM },
                     px(ink.rgb()),
                     0.,
                     Anchor::L,
@@ -1426,7 +1456,7 @@ fn ctx_moon(g: &Value) -> Option<MoonFact> {
 /// cached is what was read from the cache; fresh is the rest of the context (uncached input plus
 /// what was written to the cache). A reply row without the cache-read figure is read as
 /// cache-written tokens being the fresh part.
-fn request_bars(s: &Value) -> (Vec<(f64, f64)>, bool) {
+pub(super) fn request_bars(s: &Value) -> (Vec<(f64, f64)>, bool) {
     let mut replies: Vec<(f64, f64, f64)> = array(&s["replies"])
         .iter()
         .map(|r| {
@@ -1580,7 +1610,7 @@ pub fn dream_facts(data: &Value, sid: &str) -> Option<Card> {
 }
 /// The session's story as the pane tells it: where work stands and the Shift Map's lines, whose
 /// source line carries the commit receipt. `None` without a story or a map.
-fn story_of(data: &Value, s: &Value, now: f64) -> Option<Card> {
+fn story_of(data: &Value, _s: &Value, now: f64) -> Option<Card> {
     let story = &data["story"];
     let said = string(&story["now"]).trim().to_owned();
     let rights = if story.is_null() {
@@ -1594,15 +1624,25 @@ fn story_of(data: &Value, s: &Value, now: f64) -> Option<Card> {
     let map = &data["story_map"];
     let mut shifts: Vec<(String, bool)> = vec![];
     if map.is_object() {
-        let from = data["story_map_from"].as_str();
-        let messages = if from.is_some() {
-            data["story_map_messages"].as_u64()
-        } else {
-            s["messages"].as_u64()
-        };
-        let (_, rows) =
-            super::super::shiftmap::shift_map_marked(map, messages, 56, false, Some(8), from);
-        shifts = rows;
+        // The card is a mark, place and receipt. Claims and the was-text open in l changes.
+        shifts = array(&map["entries"])
+            .iter()
+            .take(3)
+            .map(|entry| {
+                let mut entry = entry.clone();
+                let place = array(&entry["after"])
+                    .first()
+                    .or_else(|| array(&entry["before"]).first())
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                for key in ["scope", "sym", "mark"] {
+                    if entry[key].is_null() {
+                        entry[key] = place[key].clone();
+                    }
+                }
+                (super::instrument::shift_row(&entry, false), false)
+            })
+            .collect();
     }
     if said.is_empty() && shifts.is_empty() {
         return None;
@@ -2027,7 +2067,15 @@ mod tests {
         for card in &cards {
             let rows = rows_of(card, 44, cell, f);
             let start = std::time::Instant::now();
-            let pm = draw_card(card, 44, rows, cell, &[[22, 27, 38]], f).unwrap();
+            let pm = draw_card(
+                card,
+                44,
+                rows,
+                cell,
+                &[crate::companion::render::theme::SWATCH_0],
+                f,
+            )
+            .unwrap();
             let took = start.elapsed();
             eprintln!(
                 "{}: {took:?}",
@@ -2046,7 +2094,7 @@ mod tests {
             &serde_json::json!({"ctx": {"tokens": 1000., "size": 2000.}}),
             0,
             Some(2),
-            400.,
+            theme::REGULAR,
             f,
         )
         .unwrap();
@@ -2056,7 +2104,7 @@ mod tests {
             pill_cols(&pill, cell, f),
             2,
             cell,
-            &[[22, 27, 38]],
+            &[crate::companion::render::theme::SWATCH_0],
             f,
         )
         .unwrap();

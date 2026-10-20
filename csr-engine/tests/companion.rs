@@ -101,6 +101,13 @@ fn args(page: &str, cols: usize, rows: usize) -> PaneArgs {
     ])
     .pane
 }
+fn golden(path: PathBuf, actual: &str) -> String {
+    if std::env::var_os("CSR_COMPANION_UPDATE").is_some() {
+        fs::write(&path, actual).unwrap();
+    }
+    fs::read_to_string(path).unwrap()
+}
+
 #[test]
 fn frame_goldens_are_byte_equal() {
     for (cols, rows) in [(46, 30), (100, 40)] {
@@ -109,8 +116,7 @@ fn frame_goldens_are_byte_equal() {
             let mut pane = Pane::new(paths, &args(page, cols, rows));
             pane.pixels = false;
             let actual = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
-            let expected =
-                fs::read_to_string(fixture().join(format!("{page}-{cols}x{rows}.txt"))).unwrap();
+            let expected = golden(fixture().join(format!("{page}-{cols}x{rows}.txt")), &actual);
             assert_eq!(actual.lines().count(), expected.lines().count());
             for (i, (actual, expected)) in actual.lines().zip(expected.lines()).enumerate() {
                 assert_eq!(actual, expected, "{page} {cols}x{rows}, row {}", i + 1);
@@ -223,13 +229,26 @@ fn keys_and_clicks_open_rows_and_keep_a_dream_answer() {
     let row = *pane
         .acts
         .iter()
-        .find(|(_, a)| a["key"] == "dream:newest")
+        .find(|(_, a)| a["key"] == "instrument:dreams")
         .unwrap()
         .0;
     assert!(pane.click(row, 6, 1792320000.));
-    assert_eq!(pane.open, "dream:newest");
+    assert!(pane.instrument_open.dreams);
+    let detail = pane
+        .frame(100, 40, 1792320000.)
+        .iter()
+        .map(|line| csr_engine::companion::render::text::plain(line))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        detail.contains("Keep the heartbeat independent of the renderer."),
+        "{detail}"
+    );
     assert!(pane.key("escape"));
-    assert!(pane.open.is_null());
+    assert!(!pane.instrument_open.dreams);
     pane.frame(100, 40, 1792320000.);
     let row = *pane
         .acts
@@ -241,11 +260,14 @@ fn keys_and_clicks_open_rows_and_keep_a_dream_answer() {
     let text = fs::read_to_string(paths.keep.join("dreams.jsonl")).unwrap();
     let answer: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
     assert_eq!(answer["kind"], "answer");
+    assert_eq!(answer["id"], "newest");
     assert_eq!(answer["answer"], "helpful");
     assert!(pane.key("l"));
-    assert_eq!(pane.view, "log");
+    assert_eq!(pane.view, "main");
+    assert!(pane.instrument_open.changes);
     assert!(pane.key("d"));
     assert_eq!(pane.view, "main");
+    assert!(pane.instrument_open.dreams && !pane.instrument_open.changes);
     assert!(!pane.key("q"));
 }
 
@@ -353,7 +375,9 @@ fn terminal_session(reload: bool) {
             {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            // Drain the whole-pane PNG promptly, as a terminal does. A slow PTY reader
+            // otherwise blocks stdout before watch can poll the replacement binary.
+            std::thread::sleep(Duration::from_millis(1));
         }
         assert!(String::from_utf8_lossy(&output).contains("engine reload:"));
         assert!(fs::metadata(&pid).unwrap().modified().unwrap() > old);
@@ -431,10 +455,12 @@ fn pixel_frames_are_byte_equal_to_pillow_layouts() {
             let (_home, paths) = bare_home();
             let mut pane = Pane::new(paths, &args(page, cols, rows));
             pane.pixels = true;
+            pane.enable_cards();
             let actual = pane.frame(cols, rows, 1792320000.).join("\n") + "\n";
-            let expected =
-                fs::read_to_string(fixture().join(format!("pixels-{page}-{cols}x{rows}.txt")))
-                    .unwrap();
+            let expected = golden(
+                fixture().join(format!("pixels-{page}-{cols}x{rows}.txt")),
+                &actual,
+            );
             for (i, (a, b)) in actual.lines().zip(expected.lines()).enumerate() {
                 assert_eq!(a, b, "pixels {page} {cols}x{rows}, row {}", i + 1);
             }
@@ -442,7 +468,9 @@ fn pixel_frames_are_byte_equal_to_pillow_layouts() {
             assert!(!pane.placed.is_empty());
             assert!(pane.placed.iter().all(|p| p.row + p.rows < rows));
             if page == "main" {
-                assert!(pane.placed.iter().any(|p| p.cols == 4 && p.rows == 1));
+                assert_eq!(pane.placed.len(), 1);
+                assert_eq!(pane.placed[0].cols, cols);
+                assert!(pane.instrument_metrics.is_some());
             }
             eprintln!("text parity: {page} {cols}x{rows}: {rows} rows byte equal");
         }
@@ -588,7 +616,7 @@ fn png_mode_writes_the_oracle_session_and_screen_without_touching_home() {
         format!("{}\n", output.path().display())
     );
     let actual = fs::read_to_string(output.path().join("screen.txt")).unwrap();
-    let expected = fs::read_to_string(fixture().join("pictures/screen.txt")).unwrap();
+    let expected = golden(fixture().join("pictures/screen.txt"), &actual);
     assert_eq!(actual, expected);
     let actual = image::open(output.path().join("session.png"))
         .unwrap()
@@ -637,10 +665,11 @@ fn disabling_pixels_keeps_text_strips_even_in_kitty() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert_eq!(
-        out.stdout,
-        fs::read(fixture().join("main-46x30.txt")).unwrap()
-    );
+    let actual = String::from_utf8(out.stdout).unwrap();
+    assert!(!actual.contains("\x1b_G"));
+    assert!(actual.contains("What if a frame failed"));
+    assert!(actual.contains("CTX "));
+    assert_eq!(actual, golden(fixture().join("main-46x30.txt"), &actual));
 }
 
 #[cfg(test)]

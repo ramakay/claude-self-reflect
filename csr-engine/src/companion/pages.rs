@@ -1177,7 +1177,7 @@ fn closer(page: &Value, width: usize, at: usize, room: usize) -> Vec<String> {
     if !shown("lost") {
         lines.push("CSR keeps quiet threads. Press f.");
     }
-    lines.push("Press l for changes. Press i for info.");
+    lines.push("Press l for changes. Press i for the figure.");
     let lines: Vec<String> = lines
         .into_iter()
         .flat_map(|l| wrap(l, width.saturating_sub(at), 2))
@@ -1300,7 +1300,7 @@ fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     for (row, (text, ground)) in top.iter().zip(grounds).enumerate() {
         out.rows.push(on_dark(text, ground));
         if row < MASTHEAD_CLICK {
-            out.acts.insert(row, json!({"key": "view:info"}));
+            out.acts.insert(row, json!({"key": "instrument:figure"}));
         }
     }
     let mut built = vec![];
@@ -1848,7 +1848,7 @@ mod picture_tests {
             .join("\n");
         assert!(text.contains("Ask about past work."), "{text}");
         assert!(
-            text.contains("Press l for changes. Press i for info."),
+            text.contains("Press l for changes. Press i for the figure."),
             "{text}"
         );
     }

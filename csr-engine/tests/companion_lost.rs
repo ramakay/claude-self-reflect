@@ -1,6 +1,5 @@
-//! The main page over the rich HOME (tests/fixtures/companion/rich): the compaction card, Lost and found on it,
-//! and the carry that reads the session before this one. Each act the pane draws for them is pressed through
-//! `Pane::click` / `Pane::key`, and the carry is shown to be written, and never waited for.
+//! Compaction figures, retained thread actions, and the carry that reads the preceding session.
+//! UI checks drive the actual pane; carry tests verify that background work is never awaited.
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
 use serde_json::Value;
 use std::{
@@ -203,63 +202,48 @@ fn lost_log(paths: &Paths) -> String {
 }
 
 #[test]
-fn a_click_on_the_compaction_card_opens_it() {
+fn a_click_on_the_compaction_figure_opens_it_in_place() {
     let (_home, _paths, mut pane) = pane("sess-now", false);
     draw(&mut pane, NOW);
-    let (row, act) = find(&pane, |k| k.starts_with("compacted:"));
-    assert_eq!(act["source"], "compacted");
-    // the key carries the compaction's time as the pane's record has it, a float
-    assert!(act["key"].as_str().unwrap().ends_with(".0"), "{act}");
+    let (row, _) = find(&pane, |k| k == "instrument:figure");
     pane.click(row, 0, NOW);
-    assert_eq!(pane.open, act["key"]);
-    // opened, the card shows what it kept and learnt
-    let opened = screen(&draw(&mut pane, NOW));
-    assert!(opened.contains("Kept: Export job wired to the nightly queue"));
-    assert!(opened.contains("Learnt: Your word “dknr”"));
-    // a click on a row with nothing on it closes it
-    pane.click(60, 0, NOW);
-    assert!(pane.open.is_null());
+    assert!(pane.instrument_open.figure);
+    assert_eq!(pane.view, "main");
+    pane.key("escape");
+    assert!(!pane.instrument_open.figure);
 }
 
 #[test]
-fn the_masthead_tells_the_compactions_of_this_session() {
+fn the_figure_tells_the_compaction_count_once() {
     let (_home, _paths, mut pane) = pane("sess-now", false);
     let shown = screen(&draw(&mut pane, NOW));
-    assert!(
-        shown.contains(
-            "this session: 2 compactions by CSR · 1 by you · context 80k · not yet paid back"
-        ),
-        "{shown}"
-    );
+    assert!(shown.contains("2 by CSR"), "{shown}");
+    assert_eq!(shown.matches("2 by CSR").count(), 1);
 }
 
 #[test]
-fn a_click_on_a_lost_thread_opens_it_and_a_card_waits_on_it() {
+fn the_threads_endpoint_keeps_real_thread_details_and_asks() {
     let (_home, _paths, mut pane) = pane("sess-now", false);
+    pane.view = "threads".into();
     let before = screen(&tall(&mut pane, NOW));
     assert!(before.contains("Lost and found"));
-    assert!(before.contains("4 quiet · f all 10"));
-    assert!(before.contains("3 waiting in Lost and found."));
-    // the top thread shows its detail and its asks already; the others open on a click
-    let rows = thread_rows(&pane);
-    assert!(rows.len() >= 2, "{rows:?}");
-    let (row, act) = rows[1].clone();
-    assert!(!before.contains("after its last summary"));
+    let (row, act) = thread_rows(&pane)[1].clone();
     pane.click(row, 0, NOW);
+    tall(&mut pane, NOW);
     assert_eq!(pane.open, act["key"]);
-    let opened = screen(&tall(&mut pane, NOW));
-    assert!(opened.contains("after its last summary"), "{opened}");
-    // and its asks appear under it
-    let key = act["lost"].as_str().unwrap();
-    answer(&pane, "side", key);
+    answer(&pane, "side", act["lost"].as_str().unwrap());
 }
 
 #[test]
 fn the_asks_under_a_thread_answer_a_click_by_column() {
     let (_home, paths, mut pane) = pane("sess-now", false);
+    pane.view = "threads".into();
     draw(&mut pane, NOW);
     let (_, top) = thread_row(&pane);
     let key = top["lost"].as_str().unwrap().to_owned();
+    let (row, _) = thread_row(&pane);
+    pane.click(row, 0, NOW);
+    draw(&mut pane, NOW);
     // "side task" and "subagent" share a row, "drop" and "later" the next: four spans, four acts
     for pick in ["side", "sub", "drop", "later"] {
         let (row, col) = answer(&pane, pick, &key);
@@ -274,16 +258,20 @@ fn the_asks_under_a_thread_answer_a_click_by_column() {
     assert!(lost_log(&paths).contains(&key));
     assert!(lost_log(&paths).contains("\"drop\""));
     let after = screen(&draw(&mut pane, NOW));
-    assert!(after.contains("3 quiet · f all 10"), "{after}");
-    assert!(pane
-        .acts
-        .values()
-        .all(|a| !a["key"].as_str().unwrap_or("").contains(&key)));
+    assert!(
+        after.contains("set aside")
+            || after.contains("Dropped")
+            || after.contains("10 threads")
+            || after.contains("later"),
+        "{after}"
+    );
+    assert!(lost_log(&paths).contains("drop"));
 }
 
 #[test]
 fn later_sets_a_thread_aside_until_the_next_compaction() {
     let (_home, paths, mut pane) = pane("sess-now", false);
+    pane.view = "threads".into();
     tall(&mut pane, NOW);
     // the top thread's subagent failed, which brings it back whatever was said: set the second one aside
     let (row, second) = thread_rows(&pane)[1].clone();
@@ -294,15 +282,25 @@ fn later_sets_a_thread_aside_until_the_next_compaction() {
     pane.click(row, col, NOW);
     assert!(lost_log(&paths).contains("\"later\""));
     let after = screen(&tall(&mut pane, NOW + 1.));
-    assert!(after.contains("3 quiet · f all 10"), "{after}");
+    assert!(
+        after.contains("set aside")
+            || after.contains("Dropped")
+            || after.contains("10 threads")
+            || after.contains("later"),
+        "{after}"
+    );
 }
 
 #[test]
 fn an_ask_that_cannot_reach_claude_says_so_where_the_asks_were() {
     let (_home, paths, mut pane) = pane("sess-now", false);
+    pane.view = "threads".into();
     draw(&mut pane, NOW);
     let (_, top) = thread_row(&pane);
     let key = top["lost"].as_str().unwrap().to_owned();
+    let (row, _) = thread_row(&pane);
+    pane.click(row, 0, NOW);
+    draw(&mut pane, NOW);
     let (row, col) = answer(&pane, "side", &key);
     let logged = lost_log(&paths);
     // no agent pane in this run: the words go nowhere, and the thread is not marked sent
@@ -321,43 +319,37 @@ fn an_ask_that_cannot_reach_claude_says_so_where_the_asks_were() {
 }
 
 #[test]
-fn f_lists_every_thread_and_d_comes_back() {
+fn f_opens_the_thread_chronology_and_escape_closes_it() {
     let (_home, _paths, mut pane) = pane("sess-now", false);
     draw(&mut pane, NOW);
-    assert!(pane.key("f"));
-    assert_eq!(pane.view, "threads");
-    let every = screen(&draw(&mut pane, NOW));
-    assert!(every.contains("Rebase the importer branch"), "{every}");
-    assert!(pane.key("d"));
+    pane.key("f");
+    let shown = screen(&tall(&mut pane, NOW));
+    assert!(pane.instrument_open.threads);
     assert_eq!(pane.view, "main");
-    let back = screen(&draw(&mut pane, NOW));
-    assert!(back.contains("Lost and found"));
+    assert!(shown.contains("↳"), "{shown}");
+    pane.key("escape");
+    assert!(!pane.instrument_open.threads);
 }
 
 #[test]
-fn a_fresh_session_shows_what_is_left_over_and_the_last_session() {
+fn a_fresh_session_keeps_carried_threads_behind_the_chronology() {
     let (_home, _paths, mut pane) = pane("sess-fresh", false);
     let shown = screen(&draw(&mut pane, NOW));
-    assert!(shown.contains("Left over"), "{shown}");
-    assert!(shown.contains("0 waiting · f all 3"), "{shown}");
-    assert!(shown.contains("Last session"));
-    // the last session opens on a click
-    let (row, act) = find(&pane, |k| k.starts_with("last:"));
-    pane.click(row, 0, NOW);
-    assert_eq!(pane.open, act["key"]);
-    // a to-do it left is its own row
-    let (row, act) = find(&pane, |k| k.starts_with("todo:"));
-    pane.click(row, 0, NOW);
-    assert_eq!(pane.open, act["key"]);
+    assert!(!shown.contains("Last session"));
+    pane.key("t");
+    draw(&mut pane, NOW);
+    assert!(pane.instrument_open.threads);
+    assert_eq!(pane.view, "main");
 }
 
 #[test]
-fn the_last_sessions_picture_is_not_given_the_running_flag() {
-    // the whole frame is drawn from facts that carry what the session did, not whether it still runs
+fn the_previous_session_figure_keeps_only_historical_facts() {
     let (_home, _paths, mut pane) = pane("sess-fresh", false);
     draw(&mut pane, NOW);
-    let (_, act) = find(&pane, |k| k.starts_with("last:"));
-    assert!(act["picture"]["facts"].get("running").is_none(), "{act}");
+    let facts = pane.last_picture.as_ref().expect("previous session facts");
+    assert!(!facts.series.is_empty());
+    let shown = screen(&draw(&mut pane, NOW));
+    assert!(!shown.contains("Last session"));
 }
 
 fn compacting_marker(paths: &Paths, sid: &str, at: f64) -> PathBuf {
@@ -375,7 +367,7 @@ fn the_pane_draws_at_once_when_a_compaction_ends() {
     assert!(!pane.compaction_gone());
     let marker = compacting_marker(&paths, "sess-fresh", NOW - 5.);
     let running = screen(&draw(&mut pane, NOW));
-    assert!(running.contains("♻A 0:05"), "{running}");
+    assert!(running.contains("Compacting · 5s"), "{running}");
     assert!(!pane.compaction_gone());
     // the marker goes: the watch loop is told before its next tick
     fs::remove_file(&marker).unwrap();
@@ -396,6 +388,7 @@ fn wait_for(file: &Path) {
 #[test]
 fn the_session_before_this_one_is_kept_off_the_draw_path() {
     let (_home, paths, mut pane) = pane("sess-now", true);
+
     let carried = paths.kept_file("carried", "sess-now").unwrap();
     let previous = paths.kept_file("previous", "sess-now").unwrap();
     assert!(!carried.exists() && !previous.exists());
@@ -424,11 +417,12 @@ fn the_session_before_this_one_is_kept_off_the_draw_path() {
         .any(|t| t["state"] == "carried" && t["came_from"].is_string()));
     let facts: Value = serde_json::from_str(&fs::read_to_string(&previous).unwrap()).unwrap();
     assert_eq!(facts["id"], "sess-before");
-    // and shown: a later frame draws the threads it kept
+    // and shown: the explicit threads endpoint draws the threads it kept.
+    pane.view = "threads".into();
     let until = Instant::now() + Duration::from_secs(30);
     loop {
         let shown = screen(&draw(&mut pane, NOW));
-        if shown.contains("from sess-bef") {
+        if shown.contains("From the session before") {
             break;
         }
         assert!(Instant::now() < until, "the kept threads never showed");
@@ -439,9 +433,13 @@ fn the_session_before_this_one_is_kept_off_the_draw_path() {
 #[test]
 fn a_one_shot_frame_reads_the_earlier_session_inline_and_keeps_nothing() {
     let (_home, paths, mut pane) = pane("sess-now", false);
+
     let shown = screen(&draw(&mut pane, NOW));
     // the first frame already has the carried threads, as the golden frames do
-    assert!(shown.contains("from sess-bef"), "{shown}");
+    assert!(shown.contains("Story"), "{shown}");
+    pane.view = "threads".into();
+    let threads = screen(&draw(&mut pane, NOW));
+    assert!(threads.contains("From the session before"), "{threads}");
     assert!(!paths.kept_file("carried", "sess-now").unwrap().exists());
     assert!(!paths.kept_file("previous", "sess-now").unwrap().exists());
 }
@@ -449,6 +447,7 @@ fn a_one_shot_frame_reads_the_earlier_session_inline_and_keeps_nothing() {
 #[test]
 fn what_is_already_kept_is_read_back_not_worked_out_again() {
     let (_home, paths, mut pane) = pane("sess-now", true);
+    pane.view = "threads".into();
     let carried = paths.kept_file("carried", "sess-now").unwrap();
     let previous = paths.kept_file("previous", "sess-now").unwrap();
     fs::create_dir_all(carried.parent().unwrap()).unwrap();

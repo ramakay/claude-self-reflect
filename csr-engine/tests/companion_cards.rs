@@ -1,5 +1,4 @@
-//! The cards and the pill, driven through `Pane::frame` over the rich HOME: what draws, what does not, and
-//! that text mode stays as it was.
+//! Pixel composition, missing feeds, figure clicks and deterministic rendering through Pane::frame.
 use csr_engine::companion::{cli::PaneArgs, pane::Pane, paths::Paths};
 use serde_json::Value;
 use std::{
@@ -148,140 +147,93 @@ fn have_fonts(pane: &Pane) -> bool {
     }
     pane.cards
 }
-/// The card pictures of a frame: the ones one column in and as wide as the text.
-fn card_pictures(pane: &Pane) -> Vec<(usize, usize, image::RgbaImage)> {
-    pane.placed
-        .iter()
-        .filter(|p| p.col == 1 && p.cols == 44)
-        .map(|p| {
-            (
-                p.row,
-                p.rows,
-                image::load_from_memory(&p.png).unwrap().to_rgba8(),
-            )
-        })
-        .collect()
-}
-const PAPER: [u8; 4] = [251, 251, 249, 255];
-/// A picture is a card when its washed face (not the paper ground) is painted left of the icon.
-fn painted(img: &image::RgbaImage) -> bool {
-    let p = img.get_pixel(14, 14).0;
-    p[3] == 255 && p != PAPER && p[0] > 200
-}
-
 #[test]
-fn the_info_frame_draws_every_card_that_has_data_one_picture_each_and_scrolls_by_card() {
+fn the_single_surface_draws_one_complete_instrument_and_scrolls_details() {
     utc();
     let (_home, paths) = rich_home();
-    let mut full = pane(&paths, "info", "sess-now", true);
+    let mut full = pane(&paths, "main", "sess-now", true);
     if !have_fonts(&full) {
         return;
     }
-    let text = full.frame(46, 120, NOW);
-    let cards = card_pictures(&full);
-    assert!(
-        cards.len() == 7,
-        "story, moon, history, agents, cache, what-if and the mirror draw: got {}",
-        cards.len()
-    );
-    for (row, rows, img) in &cards {
-        assert_eq!(img.dimensions(), (44 * 16, *rows as u32 * 34), "row {row}");
-        assert!(painted(img), "card at row {row} has no face");
-        assert!(row + rows <= text.len());
-    }
-    // pictures never overlap and the rows under them are blank grounds, not text
-    for pair in cards.windows(2) {
-        assert!(pair[0].0 + pair[0].1 <= pair[1].0);
-    }
-    // a short screen shows only the cards that fit whole
-    let mut short = pane(&paths, "info", "sess-now", true);
-    short.frame(46, 22, NOW);
-    let shown = card_pictures(&short);
-    assert!(shown.len() < cards.len());
-    assert!(shown.iter().all(|(row, rows, _)| row + rows < 22));
-    // scrolled down, a later card comes into view
-    short.scroll(40);
-    short.frame(46, 22, NOW);
-    assert_ne!(
-        card_pictures(&short)
-            .iter()
-            .map(|c| c.0)
-            .collect::<Vec<_>>(),
-        shown.iter().map(|c| c.0).collect::<Vec<_>>()
-    );
+    let rows = full.frame(46, 120, NOW);
+    assert_eq!(full.placed.len(), 1);
+    let picture = &full.placed[0];
+    let image = image::load_from_memory(&picture.png).unwrap();
+    assert_eq!(image.width(), 46 * 16);
+    assert!(picture.row + picture.rows <= rows.len());
+    let metrics = full.instrument_metrics.as_ref().unwrap();
+    assert!(metrics.dream / metrics.height <= 0.3);
+    full.key("t");
+    full.frame(46, 40, NOW);
+    full.scroll(3);
+    full.frame(46, 40, NOW);
+    assert_eq!(full.instrument_open.scroll, 3);
+    assert_eq!(full.view, "main");
 }
 
 #[test]
-fn a_session_with_less_to_say_draws_fewer_cards_and_never_an_empty_one() {
+fn a_session_with_less_to_say_drops_missing_facts_without_empty_cards() {
     utc();
     let (_home, paths) = rich_home();
-    let mut full = pane(&paths, "info", "sess-now", true);
+    let mut full = pane(&paths, "main", "sess-now", true);
     if !have_fonts(&full) {
         return;
     }
     full.frame(46, 120, NOW);
-    let all = card_pictures(&full).len();
-    // a session the account knows nothing about: no usage file, no agents, no dreams
-    let mut bare = pane(&paths, "info", "sess-before", true);
+    let mut bare = pane(&paths, "main", "sess-before", true);
     bare.frame(46, 120, NOW);
-    let some = card_pictures(&bare);
-    assert!(some.len() < all, "{} !< {all}", some.len());
-    assert!(some.iter().all(|(_, _, img)| painted(img)));
+    assert_eq!(bare.placed.len(), 1);
+    assert_ne!(bare.placed[0].png, full.placed[0].png);
+    bare.pixels = false;
+    let text = bare
+        .frame(46, 120, NOW)
+        .iter()
+        .map(|l| strip(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("♻ --"));
+    assert!(!text.contains("in flight"));
 }
 
 #[test]
-fn the_main_frame_puts_the_pill_where_the_two_masthead_rows_were() {
+fn the_main_frame_replaces_the_old_pill_with_one_live_figure() {
     utc();
     let (_home, paths) = rich_home();
     let mut cards = pane(&paths, "main", "sess-now", true);
     if !have_fonts(&cards) {
         return;
     }
-    let text = cards.frame(46, 40, NOW);
-    let pill = cards
-        .placed
+    cards.frame(46, 67, NOW);
+    assert_eq!(cards.placed.len(), 1);
+    assert_eq!(cards.placed[0].row, 0);
+    assert!(cards.pill.is_none());
+    let row = *cards
+        .acts
         .iter()
-        .find(|p| p.row == 0 && p.col == 1 && p.rows == 2)
-        .expect("the pill picture");
-    let img = image::load_from_memory(&pill.png).unwrap().to_rgba8();
-    assert_eq!(img.dimensions(), (pill.cols as u32 * 16, 2 * 34));
-    assert!(strip(&text[0]).trim().is_empty() && strip(&text[1]).trim().is_empty());
-    // every fact the fixture's text masthead shows is on the pill: context and window, both quotas
-    // with the pace arrow, the cache and the status marker; growth and payback have no data and drop
-    let pill = cards.pill.clone().expect("the pill the frame drew");
-    let said: String = pill
-        .lines
+        .find(|(_, a)| a["key"] == "instrument:figure")
+        .unwrap()
+        .0;
+    cards.click(row, 0, NOW);
+    assert!(cards.instrument_open.figure);
+    assert_eq!(cards.view, "main");
+    cards.pixels = false;
+    let text = cards
+        .frame(46, 67, NOW)
         .iter()
-        .flatten()
-        .map(|g| g.iter().map(|r| r.0.as_str()).collect::<String>() + " | ")
-        .collect();
-    for fact in [
-        "CTX 78k/1M",
-        "7D 62%\u{bb}",
-        "5H 41%",
-        "\u{25f7} 4m",
-        "STS",
-        "2 by CSR",
-    ] {
-        assert!(said.contains(fact), "pill lost {fact:?}: {said}");
+        .map(|l| strip(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for fact in ["CTX 78k/1M", "7D 62%", "5H 41%"] {
+        assert!(text.contains(fact), "{text}");
     }
-    assert_eq!(pill.lines.len(), 2);
-    // a click on the pill still opens the info view
-    assert_eq!(cards.acts[&0]["key"], "view:info");
-    assert_eq!(cards.acts[&1]["key"], "view:info");
-    // the same frame without cards keeps its text masthead
-    let mut plain = pane(&paths, "main", "sess-now", false);
-    plain.pixels = false;
-    let words = plain.frame(46, 40, NOW);
-    assert!(strip(&words[0]).contains("CTX"));
-    assert!(!plain.placed.iter().any(|p| p.rows == 2 && p.col == 1));
+    assert!(!text.contains("STS"));
 }
 
 #[test]
 fn text_mode_is_byte_identical_with_or_without_cards_enabled() {
     utc();
     let (_home, paths) = rich_home();
-    for page in ["main", "info"] {
+    for page in ["main", "summary"] {
         let mut off = Pane::new(paths.clone(), &args(page, "sess-now", 46, 40));
         off.pixels = false;
         let want = off.frame(46, 40, NOW);
@@ -295,34 +247,19 @@ fn text_mode_is_byte_identical_with_or_without_cards_enabled() {
 }
 
 #[test]
-fn an_idle_refresh_reuses_the_cached_pictures() {
+fn a_frame_at_the_same_clock_is_pixel_identical() {
     utc();
     let (_home, paths) = rich_home();
-    let mut p = pane(&paths, "info", "sess-now", true);
+    let mut p = pane(&paths, "main", "sess-now", true);
     if !have_fonts(&p) {
         return;
     }
-    p.frame(46, 120, NOW + 10.);
-    let first: Vec<_> = p
-        .placed
-        .iter()
-        .filter(|x| x.col == 1 && x.cols == 44)
-        .cloned()
-        .collect();
-    p.frame(46, 120, NOW + 13.);
-    let second: Vec<_> = p
-        .placed
-        .iter()
-        .filter(|x| x.col == 1 && x.cols == 44)
-        .cloned()
-        .collect();
-    assert_eq!(first.len(), second.len());
-    assert!(first.len() >= 5);
-    for (a, b) in first.iter().zip(&second) {
-        assert!(
-            std::sync::Arc::ptr_eq(&a.png, &b.png),
-            "card at row {} was re-encoded",
-            a.row
-        );
-    }
+    p.frame(46, 67, NOW);
+    let first = p.placed[0].png.clone();
+    p.frame(46, 67, NOW);
+    assert_eq!(p.placed.len(), 1);
+    assert_eq!(first, p.placed[0].png);
+    p.key("i");
+    p.frame(46, 67, NOW);
+    assert_ne!(first, p.placed[0].png);
 }

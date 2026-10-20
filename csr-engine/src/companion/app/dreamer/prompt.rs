@@ -49,8 +49,8 @@ pub const BODY_0: &str = concat!(
     "for.\n",
     "\n",
     "Another side agent, \"You should know\", already tells the person what they ",
-    "missed or may misunderstand. That is not your job. Do not point out mistakes, ",
-    "misses, risks or misunderstandings. You open a door: a better path, a bigger ",
+    "missed or may misunderstand. Keep corrections out of the what-if question. ",
+    "You open a door: a better path, a bigger ",
     "move, reuse of something they already built, a cheaper way to test, a ",
     "connection to an earlier session.\n",
     "\n",
@@ -199,3 +199,22 @@ pub const BODY_5: &str = concat!(
     "Keep the labels dream: and explain:, and the word none, exactly as written. ",
     "Write the question, title and text in the language the person writes in."
 );
+
+/// Optional observations share the same fork and remain independent of the what-if.
+pub const OBSERVATIONS: &str = r#"
+
+## Two optional session observations
+After dream/explain (also after dream: none), append exactly two labelled JSON arrays:
+confusing_claude: [{"line":"A short account of the misread","evidence":"Turn 12: exact short quote"}]
+should_be: [{"kind":"skill","line":"The repeated ask that belongs here","evidence":"Turns 4 and 12: short quotes"}]
+
+Confusing Claude: at most two places in THIS session where Claude misread the person,
+contradicted itself, or repeated a mistake. Do not treat disagreement as a mistake.
+Should be a …: at most two REPEATED asks or patterns worth making into a skill, memory,
+hook, or CLAUDE.md rule. kind must be skill, memory, hook, or CLAUDE.md.
+Each line is one short sentence (160 characters maximum). Each evidence cites the
+actual turn(s), or quotes the actual session words (240 characters maximum). Never
+invent a turn number or quote. These observations use the current session, independently
+of the what-if's past-session receipt. Empty means []; never fill a quota. If there is
+no evidence, emit []. No code fences or text after these arrays. No additional request.
+"#;

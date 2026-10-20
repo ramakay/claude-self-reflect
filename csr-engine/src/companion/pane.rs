@@ -1,5 +1,5 @@
 use super::{
-    array, carry, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, info, layout, masthead, num,
+    array, carry, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, layout, masthead, num,
     pages, paths::Paths, render::text::*, send, session::Session, string, threads, value,
 };
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ pub fn legend_parts(
     if column {
         let mut keys: Vec<&str> = match view {
             "main" => vec!["l", "s", "i", "q"],
-            "summary" | "threads" | "info" => vec!["d", "j/k", "q"],
+            "summary" | "threads" => vec!["d", "j/k", "q"],
             _ => vec!["d", "q"],
         };
         while keys.len() > 1 && 1 + keys.join(" ").chars().count() > width {
@@ -60,7 +60,7 @@ pub fn legend_parts(
         return (format!(" {shown}"), spans);
     }
     let mut words: Vec<(String, String)> = if view == "main" && phone {
-        let mut keys = vec![("l", "changes"), ("s", "summary"), ("i", "info")];
+        let mut keys = vec![("l", "changes"), ("s", "summary"), ("i", "figure")];
         if zoomed {
             keys.push(("z", "split"));
         }
@@ -71,10 +71,10 @@ pub fn legend_parts(
             ("l", "changes since your sessions"),
             ("s", "compaction summary"),
             ("f", "every lost thread"),
-            ("i", "session info"),
+            ("i", "figure"),
             ("q", "close"),
         ]
-    } else if matches!(view, "summary" | "threads" | "info") {
+    } else if matches!(view, "summary" | "threads") {
         vec![("d", "back"), ("j/k", "scroll"), ("q", "close")]
     } else {
         vec![("d", "back"), ("q", "close")]
@@ -97,7 +97,7 @@ pub fn legend_parts(
             - gap
             + 1
     };
-    let mut marks = if matches!(view, "main" | "summary" | "threads" | "info") {
+    let mut marks = if matches!(view, "main" | "summary" | "threads") {
         ""
     } else {
         "~ changed  - removed  + back   "
@@ -110,7 +110,7 @@ pub fn legend_parts(
             (0, "changes"),
             (1, "summary"),
             (2, "thread"),
-            (3, "info"),
+            (3, "figure"),
         ] {
             if wide(&words, 2, &marks) <= width {
                 break;
@@ -181,11 +181,10 @@ pub fn legend_parts(
     (format!(" {}{marks}{OFF}{shown}", ink("faint")), spans)
 }
 
-/// What the info page's reads borrow from the pane while its session is also borrowed.
+/// Account reads borrowed while the session is also borrowed.
 struct Wide<'a> {
     paths: &'a Paths,
     db: Option<&'a Db>,
-    sid: &'a str,
     persist: bool,
 }
 
@@ -200,6 +199,9 @@ pub struct Pane {
     agent: Option<String>,
     session: Option<Session>,
     pub view: String,
+    pub theme: super::render::theme::Theme,
+    pub instrument_open: super::render::instrument::Open,
+    pub instrument_metrics: Option<super::render::instrument::Metrics>,
     pub open: Value,
     pub sent: Value,
     folds: Vec<Value>,
@@ -207,7 +209,6 @@ pub struct Pane {
     dreams: dreams::DreamLog,
     pub acts: BTreeMap<usize, Value>,
     pub top: usize,
-    pub info_top: usize,
     pub threads_top: usize,
     pub summary_top: usize,
     spend: Option<value::Spend>,
@@ -274,6 +275,9 @@ impl Pane {
             sid,
             agent: args.agent.clone(),
             view: args.page.clone(),
+            theme: super::render::theme::Theme::from_env(),
+            instrument_open: super::render::instrument::Open::default(),
+            instrument_metrics: None,
             open: Value::Null,
             sent: Value::Null,
             folds: vec![],
@@ -281,7 +285,6 @@ impl Pane {
             dreams: dreams::DreamLog::default(),
             acts: BTreeMap::new(),
             top: 0,
-            info_top: 0,
             threads_top: 0,
             summary_top: 0,
             spend: None,
@@ -372,7 +375,7 @@ impl Pane {
         let (refreshing, refresh_note) = self.map.poll(now);
         self.dreams.poll(&self.paths);
         let records = &self.dreams.records;
-        let root = self.root.to_string_lossy();
+        let root = self.root.to_string_lossy().into_owned();
         let kept = masthead::kept_status(&self.paths, &self.sid, now);
         let story = self
             .db
@@ -392,6 +395,7 @@ impl Pane {
             "dreams": self.dreams.dreams(&root),
             "chapter": dreams::last_chapter(records, &root, &self.sid),
             "look": dreams::last_look(records, &root),
+            "dream_records": records,
             "dreams_on": dreams::dreams_on(&self.paths),
             "story": story,
             "claude_fields": kept["fields"],
@@ -411,10 +415,6 @@ impl Pane {
         let summary = match (&self.session, self.view.as_str()) {
             (Some(session), "summary") => threads::newest_summary(session.path.as_deref()),
             _ => Value::Null,
-        };
-        let every = match (&self.session, self.view.as_str()) {
-            (Some(session), "threads") => threads::lost_value(&self.paths, session),
-            _ => vec![],
         };
         let can_refresh = self
             .session
@@ -441,6 +441,11 @@ impl Pane {
         } else {
             carry::lost_of(&self.paths, s, project.as_deref(), self.carry.threads())
         };
+        let every = if self.instrument_open.threads || self.view == "threads" {
+            array(&s["lost"]).to_vec()
+        } else {
+            vec![]
+        };
         // whether the session before this one still runs: kept apart from its facts, which the
         // picture reads
         s["last_running"] = json!(s["last_session"]["id"]
@@ -456,7 +461,7 @@ impl Pane {
             .is_object()
             .then(|| super::render::raster::LastFacts::from_value(&s["last_session"]));
         // the mod's plan and what CSR's compactions did: the main page's card and masthead rows,
-        // the info page's lines
+        // the single instrument's tally
         data["infinite"] = infinite::infinite_info(&self.paths, &self.sid, now, s);
         // the marker went: draw at once, not from what the page last held
         let running = data["compacting"].is_object();
@@ -482,6 +487,18 @@ impl Pane {
                 Value::Null
             };
             data["readings"] = json!(self.readers.how_claude_read(&self.paths, &self.sid, 2, now));
+        }
+        if self.view == "main" {
+            self.phone.foot = Some((phone, column));
+            self.edge = None;
+            data["threads"] = json!(every);
+            data["learnt"] = json!(self
+                .db
+                .as_ref()
+                .map(|db| db.learnt_counts(string(&s["project"]), &self.sid, now))
+                .unwrap_or_default());
+            let composition = super::render::instrument::Composition::build(&data, s, now);
+            return self.instrument_frame(&composition, cols, rows);
         }
         let cards_on = self.pixels && self.cards;
         let cell = super::render::kitty::cell_size();
@@ -509,26 +526,12 @@ impl Pane {
             "folds": self.folds,
             "likes": if self.exporting { Value::Null } else { send::read_likes(&self.paths) },
         });
-        if self.view == "info" {
-            Self::info_data(
-                Wide {
-                    paths: &self.paths,
-                    db: self.db.as_ref(),
-                    sid: &self.sid,
-                    persist: self.persist,
-                },
-                (&mut self.narrative, &mut self.spend),
-                &mut data,
-                now,
-            );
-        }
         // the value row above the main page's legend (not in column mode, not in an export)
         let value = if self.view == "main" && !column && !self.exporting {
             Self::week_data(
                 &Wide {
                     paths: &self.paths,
                     db: self.db.as_ref(),
-                    sid: &self.sid,
                     persist: self.persist,
                 },
                 (&mut self.narrative, &mut self.spend),
@@ -540,7 +543,7 @@ impl Pane {
             vec![]
         };
         let room = rows.saturating_sub(value.len());
-        let extra = matches!(self.view.as_str(), "info" | "summary" | "threads");
+        let extra = matches!(self.view.as_str(), "summary" | "threads");
         let page = if extra {
             Value::Null
         } else if self.view == "log" {
@@ -577,36 +580,9 @@ impl Pane {
             self.view == "main" && !column && (self.tall || self.top > 0 || self.open.is_string());
         let mut strip_grounds = vec![];
         let mut lines = match self.view.as_str() {
-            "info" if column => {
-                let (lines, grounds, top) =
-                    layout::draw_column_info(&data, s, body_cols, rows, self.info_top, now);
-                self.info_top = top;
-                strip_grounds = grounds;
-                lines
-            }
             "main" if column => {
                 let (lines, grounds) = layout::draw_column_main(&page, body_cols, phone);
                 strip_grounds = grounds;
-                lines
-            }
-            "info" => {
-                let agents = if cards_on {
-                    super::agents::agents_of(&self.paths, &self.sid)
-                } else {
-                    Default::default()
-                };
-                let (lines, top) = info::draw_info(
-                    &data,
-                    s,
-                    cols,
-                    rows,
-                    self.info_top,
-                    now,
-                    self.pixels,
-                    cards_on.then_some(cell),
-                    &agents,
-                );
-                self.info_top = top;
                 lines
             }
             "summary" => {
@@ -630,7 +606,7 @@ impl Pane {
             }
             _ => pages::draw_page(&page, body_cols, if self.tall { 10000 } else { room }, &ui),
         };
-        if column && !matches!(self.view.as_str(), "main" | "info") {
+        if column && self.view != "main" {
             // a page laid out at its narrowest, its words rewrapped
             lines = layout::column_reflow(&lines, body_cols);
         }
@@ -712,7 +688,7 @@ impl Pane {
         body.resize(shown, String::new());
         if !value.is_empty() {
             // a click on the value row opens the i page, which says it in words
-            self.acts.insert(shown, json!({"key": "view:info"}));
+            self.acts.insert(shown, json!({"key": "instrument:figure"}));
         }
         body.extend(value);
         if tapes > 0 {
@@ -765,26 +741,216 @@ impl Pane {
         body.push(foot);
         body
     }
-    /// What only the info page reads: the plan's week, what CSR cost in it, and the facts under a
-    /// running compaction.
-    fn info_data(
-        env: Wide,
-        (narrative_kept, spend_kept): (&mut Option<(Value, f64, Value)>, &mut Option<value::Spend>),
-        data: &mut Value,
-        now: f64,
-    ) {
-        Self::week_data(&env, (&mut *narrative_kept, &mut *spend_kept), data, now);
-        let Wide { db, sid, .. } = env;
-        if data["compacting"].is_object() {
-            let facts = db
-                .map(|db| {
-                    infinite::compaction_facts(db, sid, &data["story"], data["dreams_on"] == true)
-                })
-                .unwrap_or_default();
-            data["compacting"]["facts"] = json!(facts);
+    fn instrument_frame(
+        &mut self,
+        composition: &super::render::instrument::Composition,
+        cols: usize,
+        rows: usize,
+    ) -> Vec<String> {
+        use super::render::{instrument, raster, text};
+        self.instrument_metrics = None;
+        let cell = super::render::kitty::cell_size();
+        let strip = if self.pixels && self.cards && cols < 46 {
+            instrument::strip(
+                composition,
+                cols as u32 * cell.0,
+                self.theme,
+                self.instrument_open.figure,
+            )
+        } else {
+            None
+        };
+        let semantic = instrument::rows_with_figure(
+            composition,
+            cols,
+            rows,
+            self.instrument_open,
+            strip.is_none(),
+        );
+        self.acts = instrument::acts(composition, cols);
+        // Answer placement follows the rendered rows, including wrapped metadata.
+        if let Some((row, act)) = self.acts.iter().next().map(|(r, a)| (*r, a.clone())) {
+            if let Some(actual) = semantic
+                .iter()
+                .position(|line| line.starts_with("1 helpful"))
+            {
+                self.acts.remove(&row);
+                self.acts.insert(actual, act);
+            }
         }
+        if composition.dream.state == instrument::Batch::Ready {
+            let question_rows =
+                text::wrap(&format!("☾ {}", composition.question()), cols.max(1), 1000).len();
+            for row in 0..question_rows.min(semantic.len()) {
+                self.acts
+                    .entry(row)
+                    .or_insert_with(|| json!({"key":"instrument:dreams"}));
+            }
+        }
+        self.pill = None;
+        for (row, line) in semantic.iter().enumerate() {
+            if line.starts_with("Story ·") {
+                self.acts.insert(row, json!({"key":"instrument:threads"}));
+            } else if ["! ", "+ ", "~ ", "- "].iter().any(|s| line.starts_with(s)) {
+                self.acts.insert(row, json!({"key":"instrument:changes"}));
+            } else if line.contains(" in flight · ") {
+                self.acts.insert(row, json!({"key":"instrument:agents"}));
+            } else if line.contains("CTX ") {
+                self.acts.insert(row, json!({"key":"instrument:figure"}));
+            }
+        }
+        let mut out = semantic;
+        if let Some(strip) = strip {
+            if let Ok(png) = raster::png(&strip) {
+                let count = strip.height().div_ceil(cell.1) as usize;
+                let row = rows.saturating_sub(1 + count);
+                out.truncate(row);
+                self.placed = vec![super::render::kitty::Placement {
+                    row,
+                    col: 0,
+                    cols,
+                    rows: count,
+                    png: png.into(),
+                }];
+                for r in row..row + count {
+                    self.acts.insert(r, json!({"key":"instrument:figure"}));
+                }
+            }
+        } else if self.pixels && self.cards && cols >= 46 {
+            let cell = super::render::kitty::cell_size();
+            if let Some((pm, metrics)) = instrument::draw(
+                composition,
+                cols as u32 * cell.0,
+                rows.saturating_sub(1) as u32 * cell.1,
+                self.theme,
+                self.instrument_open,
+                cols < 46,
+            ) {
+                if let Ok(png) = raster::png(&pm) {
+                    self.instrument_metrics = Some(metrics.clone());
+                    let picture_rows = pm.height().div_ceil(cell.1) as usize;
+                    self.placed = vec![super::render::kitty::Placement {
+                        row: 0,
+                        col: 0,
+                        cols,
+                        rows: picture_rows,
+                        png: png.into(),
+                    }];
+                    out = vec![String::new(); picture_rows];
+                    let to_row = |y: f32| {
+                        ((y / metrics.height) * pm.height() as f32 / cell.1 as f32)
+                            .floor()
+                            .max(0.) as usize
+                    };
+                    let answer = self.acts.values().find(|a| a["dream"].is_string()).cloned();
+                    self.acts.clear();
+                    for row in 0..=to_row(metrics.dream + 16.) {
+                        self.acts.insert(row, json!({"key":"instrument:dreams"}));
+                    }
+                    if let Some((start, height)) = metrics.story_region {
+                        for row in to_row(start)..=to_row(start + height) {
+                            self.acts.insert(row, json!({"key":"instrument:threads"}));
+                        }
+                    }
+                    if let Some((start, height)) = metrics.agents_region {
+                        for row in to_row(start)..=to_row(start + height) {
+                            self.acts.insert(row, json!({"key":"instrument:agents"}));
+                        }
+                    }
+                    for y in &metrics.shift_hits {
+                        self.acts
+                            .insert(to_row(*y), json!({"key":"instrument:changes"}));
+                    }
+                    for row in to_row(metrics.figure_region.0)
+                        ..=to_row(metrics.figure_region.0 + metrics.figure_region.1)
+                    {
+                        self.acts.insert(row, json!({"key":"instrument:figure"}));
+                    }
+                    if let (Some(mut answer), Some(y)) = (answer, metrics.answer_y) {
+                        answer["spans"] = json!(metrics
+                            .answer_spans
+                            .iter()
+                            .map(|(a, b, word)| json!([
+                                (a / 605. * cols as f32).floor() as usize,
+                                (b / 605. * cols as f32).ceil() as usize,
+                                word
+                            ]))
+                            .collect::<Vec<_>>());
+                        self.acts.insert(to_row(y - 4.), answer);
+                    }
+                }
+            }
+        }
+        out.truncate(rows.saturating_sub(1));
+        out = out.into_iter().map(|line| text::safe_line(&line)).collect();
+        out.resize(rows.saturating_sub(1), String::new());
+        let token = self.theme.tokens();
+        let rgb = [token.quiet[0], token.quiet[1], token.quiet[2]];
+        let ground = [token.ground[0], token.ground[1], token.ground[2]];
+        let ink = [token.ink[0], token.ink[1], token.ink[2]];
+        for line in &mut out {
+            let padding = " ".repeat(cols.saturating_sub(text::len(line)));
+            *line = format!(
+                "{}{}{line}{padding}{}",
+                text::bg(ground),
+                text::fg(ink),
+                text::OFF
+            );
+        }
+        let zoom = self.phone.zoomed;
+        let mut keys = vec![];
+        if zoom {
+            keys.push(("z", "split"));
+        }
+        if !composition.dream.queue.is_empty() {
+            keys.push(("d", "queue"));
+        }
+        keys.extend([
+            ("l", "changes"),
+            ("t", "threads"),
+            ("i", "figure"),
+            ("b", "theme"),
+            ("q", "close"),
+        ]);
+        // Keep close visible; omit whole lower-priority key labels when space is tight.
+        let width = |keys: &[(&str, &str)]| {
+            keys.iter()
+                .map(|(key, label)| key.len() + 1 + label.len())
+                .sum::<usize>()
+                + keys.len().saturating_sub(1) * 2
+        };
+        while keys.len() > 1 && width(&keys) > cols {
+            keys.remove(keys.len() - 2);
+        }
+        let footer = text::fit(
+            &keys
+                .iter()
+                .map(|(key, label)| format!("{key} {label}"))
+                .collect::<Vec<_>>()
+                .join("  "),
+            cols,
+        );
+        let mut start = 0;
+        let mut spans = vec![];
+        for (key, label) in keys {
+            let end = start + key.len() + 1 + label.len();
+            if end <= cols {
+                spans.push(json!([start, end, key]));
+            }
+            start = end + 2;
+        }
+        self.acts
+            .insert(rows.saturating_sub(1), json!({"key":"legend","keys":spans}));
+        out.push(format!(
+            "{}{}{footer}{}{}",
+            text::bg(ground),
+            text::fg(rgb),
+            " ".repeat(cols.saturating_sub(text::len(&footer))),
+            text::OFF
+        ));
+        out
     }
-    /// What the value row and the info page's cost section read: the plan's week, what CSR cost
+    /// Account cost reads: the plan's week, what CSR cost
     /// in it, and the counts of what you took.
     fn week_data(
         env: &Wide,
@@ -879,30 +1045,91 @@ impl Pane {
     }
     pub fn key(&mut self, key: &str) -> bool {
         match key {
+            "a" if self.view == "main" => {
+                self.instrument_open.agents = !self.instrument_open.agents;
+                self.instrument_open.changes = false;
+                self.instrument_open.threads = false;
+                self.instrument_open.dreams = false;
+                self.instrument_open.scroll = 0;
+                return true;
+            }
+            "b" => {
+                self.theme.toggle();
+                return true;
+            }
+            "i" => {
+                self.instrument_open.figure = !self.instrument_open.figure;
+                self.view = "main".into();
+                return true;
+            }
+            "l" | "m" => {
+                self.instrument_open.changes = !self.instrument_open.changes;
+                self.instrument_open.threads = false;
+                self.instrument_open.dreams = false;
+                self.instrument_open.scroll = 0;
+                self.instrument_open.agents = false;
+                self.view = "main".into();
+                return true;
+            }
+            "t" | "f" => {
+                self.instrument_open.threads = !self.instrument_open.threads;
+                self.instrument_open.changes = false;
+                self.instrument_open.dreams = false;
+                self.instrument_open.scroll = 0;
+                self.instrument_open.agents = false;
+                self.view = "main".into();
+                return true;
+            }
+            "d" => {
+                self.instrument_open.dreams = !self.instrument_open.dreams;
+                self.instrument_open.changes = false;
+                self.instrument_open.threads = false;
+                self.instrument_open.scroll = 0;
+                self.instrument_open.agents = false;
+                self.view = "main".into();
+                return true;
+            }
+            "1" | "2" | "3" | "4" if self.view == "main" => {
+                let index = key.parse::<usize>().unwrap_or(1) - 1;
+                let answer = self
+                    .acts
+                    .iter()
+                    .find(|(_, a)| a["dream"].is_string())
+                    .map(|(r, a)| (*r, a.clone()));
+                if let Some((row, act)) = answer {
+                    if let Some(span) = array(&act["spans"]).get(index) {
+                        return self.click(row, num(&span[0]) as usize, super::paths::now());
+                    }
+                }
+                return true;
+            }
+            "escape" if self.view == "main" => {
+                self.instrument_open = Default::default();
+            }
+            _ => (),
+        }
+        match key {
             "q" => return false,
             "d" | "l" => {
                 self.view = if key == "d" { "main" } else { "log" }.into();
                 self.open = Value::Null;
             }
-            "s" | "f" | "i" => {
+            "s" => {
                 let view = match key {
                     "s" => "summary",
-                    "f" => "threads",
-                    _ => "info",
+                    _ => "summary",
                 };
                 self.view = if self.view == view { "main" } else { view }.into();
                 self.open = Value::Null;
-                match self.view.as_str() {
-                    "threads" => self.threads_top = 0,
-                    "info" => self.info_top = 0,
-                    _ => (),
+                if self.view == "threads" {
+                    self.threads_top = 0;
                 }
             }
             "r" => {
                 self.loaded = 0.;
                 self.hold = None;
             }
-            "escape" if matches!(self.view.as_str(), "summary" | "threads" | "info") => {
+            "escape" if matches!(self.view.as_str(), "summary" | "threads") => {
                 self.view = "main".into();
                 self.open = Value::Null;
             }
@@ -943,11 +1170,19 @@ impl Pane {
         self.map.wait(now)
     }
     pub fn scroll(&mut self, step: isize) {
+        if self.view == "main"
+            && (self.instrument_open.agents
+                || self.instrument_open.changes
+                || self.instrument_open.threads
+                || self.instrument_open.dreams)
+        {
+            self.instrument_open.scroll = self.instrument_open.scroll.saturating_add_signed(step);
+            return;
+        }
         let top = match self.view.as_str() {
             "main" => &mut self.top,
             "summary" => &mut self.summary_top,
             "threads" => &mut self.threads_top,
-            "info" => &mut self.info_top,
             _ => return,
         };
         *top = top.saturating_add_signed(step);
@@ -1029,12 +1264,29 @@ impl Pane {
             self.open = Value::Null;
             return true;
         };
+        if let Some(key) = string(&act["key"]).strip_prefix("instrument:") {
+            return self.key(match key {
+                "dreams" => "d",
+                "threads" => "t",
+                "figure" => "i",
+                "changes" => "l",
+                "agents" => "a",
+                _ => "escape",
+            });
+        }
         if act["key"] == "legend" {
             if let Some(span) = array(&act["keys"])
                 .iter()
                 .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
             {
-                if matches!(string(&span[2]), "d" | "l" | "r" | "s" | "f" | "i" | "z") {
+                // Closing requires a deliberate keyboard q, never a stray mouse click.
+                if span[2] == "q" {
+                    return true;
+                }
+                if matches!(
+                    string(&span[2]),
+                    "d" | "l" | "r" | "s" | "f" | "t" | "i" | "b" | "q" | "z"
+                ) {
                     return self.key(string(&span[2]));
                 }
                 return true;
@@ -1084,12 +1336,9 @@ impl Pane {
         }
         let key = string(&act["key"]);
         if let Some(view) = key.strip_prefix("view:") {
-            if matches!(view, "main" | "log" | "info" | "summary" | "threads") {
+            if matches!(view, "main" | "log" | "summary" | "threads") {
                 self.view = view.into();
                 self.open = Value::Null;
-                if view == "info" {
-                    self.info_top = 0;
-                }
             }
             return true;
         }

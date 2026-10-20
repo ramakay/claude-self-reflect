@@ -35,3 +35,262 @@ pub const TRACK: Rgb = [214, 213, 206];
 pub fn wash(ink: Rgb, strength: f64) -> Rgb {
     super::text::blend(PAPER, ink, strength)
 }
+
+/// All appearance choices for the instrument composition. Adding a theme adds one set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Theme(usize);
+impl std::fmt::Debug for Theme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SETS[self.0].0)
+    }
+}
+#[derive(Clone, Copy)]
+pub struct Tokens {
+    pub fresh: [u8; 4],
+    pub ground: [u8; 4],
+    pub ink: [u8; 4],
+    pub quiet: [u8; 4],
+    pub faint: [u8; 4],
+    pub aurora: [&'static [(f32, [u8; 4])]; 4],
+    pub linear_at: [f32; 2],
+    pub glass: [[u8; 4]; 2],
+    pub hair: [u8; 4],
+    pub mint: [u8; 4],
+    pub sky: [u8; 4],
+    pub dream: [u8; 4],
+    pub amber: [u8; 4],
+    pub risk: [u8; 4],
+    pub asked: [u8; 4],
+    pub track: [u8; 4],
+    pub band: [u8; 4],
+    pub chip: [u8; 4],
+    pub ring: f32,
+    pub thin_ring: f32,
+    pub hair_width: f32,
+    pub regular: f32,
+    pub medium: f32,
+    pub bold: f32,
+}
+/// Registering a named set here is sufficient for environment selection and live cycling.
+pub const SETS: &[(&str, Tokens)] = &[
+    (
+        "dark",
+        Tokens {
+            fresh: [244, 145, 199, 255],
+            ground: [18, 20, 23, 255],
+            ink: [242, 244, 246, 255],
+            quiet: [184, 193, 203, 255],
+            faint: [174, 184, 196, 255],
+            aurora: [
+                &[(0., [14, 124, 134, 77]), (1., [14, 124, 134, 0])],
+                &[
+                    (0., [11, 42, 91, 242]),
+                    (0.6, [11, 42, 91, 115]),
+                    (1., [11, 42, 91, 0]),
+                ],
+                &[(0., [14, 124, 134, 191]), (1., [14, 124, 134, 0])],
+                &[(0., [184, 216, 74, 140]), (1., [184, 216, 74, 0])],
+            ],
+            linear_at: [0., 1.],
+            glass: [[34, 38, 45, 179], [21, 24, 28, 189]],
+            hair: [255, 255, 255, 23],
+            mint: [155, 232, 194, 255],
+            sky: [124, 196, 255, 255],
+            dream: [232, 197, 71, 255],
+            amber: [242, 182, 50, 255],
+            risk: [255, 163, 140, 255],
+            asked: [184, 173, 255, 255],
+            track: [58, 66, 77, 255],
+            band: [130, 150, 173, 255],
+            chip: [255, 255, 255, 18],
+            ring: 1.5,
+            thin_ring: 1.,
+            hair_width: 0.5,
+            regular: 400.,
+            medium: 500.,
+            bold: 600.,
+        },
+    ),
+    (
+        "light",
+        Tokens {
+            fresh: [133, 35, 96, 255],
+            ground: [251, 251, 249, 255],
+            ink: [23, 25, 28, 255],
+            quiet: [69, 77, 88, 255],
+            faint: [78, 87, 100, 255],
+            aurora: [
+                &[(0., [108, 196, 192, 40]), (1., [108, 196, 192, 0])],
+                &[
+                    (0., [110, 151, 212, 65]),
+                    (0.6, [110, 151, 212, 30]),
+                    (1., [110, 151, 212, 0]),
+                ],
+                &[(0., [108, 196, 192, 45]), (1., [108, 196, 192, 0])],
+                &[(0., [184, 216, 74, 35]), (1., [184, 216, 74, 0])],
+            ],
+            linear_at: [0., 1.],
+            glass: [[255, 255, 255, 237], [249, 250, 248, 242]],
+            hair: [23, 25, 28, 35],
+            mint: [26, 109, 78, 255],
+            sky: [32, 91, 147, 255],
+            dream: [121, 85, 0, 255],
+            amber: [132, 86, 0, 255],
+            risk: [169, 53, 27, 255],
+            asked: [104, 68, 164, 255],
+            track: [212, 219, 223, 255],
+            band: [128, 145, 163, 255],
+            chip: [23, 25, 28, 12],
+            ring: 1.5,
+            thin_ring: 1.,
+            hair_width: 0.5,
+            regular: 400.,
+            medium: 500.,
+            bold: 600.,
+        },
+    ),
+];
+pub const DARK: Tokens = SETS[0].1;
+pub const LIGHT: Tokens = SETS[1].1;
+pub const REGULAR: f32 = DARK.regular;
+pub const MEDIUM: f32 = DARK.medium;
+pub const BOLD: f32 = DARK.bold;
+impl Theme {
+    #[allow(non_upper_case_globals)]
+    pub const Dark: Self = Self(0);
+    #[allow(non_upper_case_globals)]
+    pub const Light: Self = Self(1);
+    pub fn from_env() -> Self {
+        // There is no background query in the current terminal integration, so auto is dark.
+        let name = std::env::var("CSR_COMPANION_THEME").unwrap_or_else(|_| "auto".into());
+        Self(SETS.iter().position(|(key, _)| *key == name).unwrap_or(0))
+    }
+    pub fn tokens(self) -> &'static Tokens {
+        &SETS[self.0].1
+    }
+    pub fn toggle(&mut self) {
+        self.0 = (self.0 + 1) % SETS.len();
+    }
+}
+
+pub const OPAQUE_WHITE: [u8; 4] = [255, 255, 255, 255];
+pub const SWATCH_0: [u8; 3] = [22, 27, 38];
+pub const SWATCH_1: [u8; 3] = [47, 58, 72];
+pub const SWATCH_2: [u8; 3] = [14, 15, 17];
+pub const SWATCH_3: [u8; 3] = [46, 139, 106];
+pub const SWATCH_4: [u8; 3] = [251, 251, 249];
+pub const SWATCH_5: [u8; 3] = [36, 131, 99];
+pub const SWATCH_6: [u8; 3] = [0, 0, 0];
+pub const SWATCH_7: [u8; 3] = [255, 255, 255];
+pub const SWATCH_8: [u8; 4] = [200, 100, 50, 128];
+pub const SWATCH_9: [u8; 4] = [199, 100, 50, 128];
+pub const SWATCH_10: [u8; 3] = [238, 245, 250];
+pub const SWATCH_11: [u8; 3] = [58, 127, 224];
+pub const SWATCH_12: [u8; 3] = [36, 163, 114];
+pub const SWATCH_13: [u8; 3] = [232, 88, 44];
+pub const SWATCH_14: [u8; 3] = [242, 182, 50];
+pub const SWATCH_15: [u8; 3] = [154, 123, 232];
+pub const SWATCH_16: [u8; 4] = [0, 0, 0, 34];
+pub const SWATCH_17: [u8; 4] = [255, 255, 255, 40];
+pub const SWATCH_18: [u8; 4] = [0, 0, 0, 60];
+pub const SWATCH_19: [u8; 4] = [255, 255, 255, 60];
+pub const SWATCH_20: [u8; 4] = [0, 0, 0, 90];
+pub const SWATCH_21: [u8; 4] = [255, 255, 255, 90];
+pub const SWATCH_22: [u8; 3] = [250, 249, 244];
+pub const SWATCH_23: [u8; 3] = [226, 224, 216];
+pub const SWATCH_24: [u8; 4] = [0, 0, 0, 56];
+pub const SWATCH_25: [u8; 3] = [23, 25, 28];
+pub const SWATCH_26: [u8; 3] = [44, 90, 160];
+pub const SWATCH_27: [u8; 3] = [200, 68, 42];
+pub const SWATCH_28: [u8; 3] = [152, 108, 0];
+pub const SWATCH_29: [u8; 3] = [123, 95, 201];
+pub const SWATCH_30: [u8; 3] = [111, 86, 66];
+pub const SWATCH_31: [u8; 3] = [94, 94, 89];
+pub const SWATCH_32: [u8; 3] = [136, 135, 129];
+pub const SWATCH_33: [u8; 3] = [226, 225, 219];
+pub const SWATCH_34: [u8; 3] = [147, 155, 165];
+pub const SWATCH_35: [u8; 3] = [64, 190, 176];
+
+#[cfg(test)]
+mod instrument_tests {
+    use super::*;
+    fn luminance(c: [u8; 4]) -> f64 {
+        let channel = |v: u8| {
+            let v = f64::from(v) / 255.;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2])
+    }
+    #[test]
+    fn text_meets_aa_on_every_glass_stop_over_every_aurora_stop() {
+        for (_, t) in SETS {
+            let composite = |a: [u8; 4], b: [u8; 4]| {
+                let mut out = b;
+                for i in 0..3 {
+                    out[i] = ((f64::from(a[i]) * f64::from(a[3])
+                        + f64::from(b[i]) * f64::from(255 - a[3]))
+                        / 255.)
+                        .round() as u8;
+                }
+                out[3] = 255;
+                out
+            };
+            let mut grounds = vec![t.ground];
+            for layer in t.aurora {
+                grounds = grounds
+                    .iter()
+                    .flat_map(|base| layer.iter().map(|(_, c)| composite(*c, *base)))
+                    .collect();
+            }
+            for under in &grounds {
+                for glass in t.glass {
+                    let mut card = glass;
+                    for i in 0..3 {
+                        card[i] = ((f64::from(glass[i]) * f64::from(glass[3])
+                            + f64::from(under[i]) * f64::from(255 - glass[3]))
+                            / 255.)
+                            .round() as u8;
+                    }
+                    for ink in [
+                        // Dream-section bodies use ink; their short labels use dream amber.
+                        t.ink, t.dream, t.quiet, t.faint, t.mint, t.sky, t.amber, t.risk, t.asked,
+                    ] {
+                        let a = luminance(card);
+                        let b = luminance(ink);
+                        assert!(
+                            (a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5,
+                            "{ink:?} on {card:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn render_files_have_no_literal_colours() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/companion/render");
+        let pattern=regex::Regex::new(r"\[\s*(?:0|255)\s*;\s*[34]\s*\]|\[\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*\d{1,3})?\s*\]|0x[0-9a-fA-F]{6,8}\b|#[0-9a-fA-F]{6}\b").unwrap();
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|x| x == "rs")
+                && path.file_name().unwrap() != "theme.rs"
+            {
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    !pattern.find_iter(&source).any(|m| m.as_str().contains(';')
+                        || !m.as_str().starts_with('[')
+                        || m.as_str()
+                            .trim_matches(['[', ']'])
+                            .split(',')
+                            .all(|v| v.trim().parse::<u16>().is_ok_and(|v| v <= 255))),
+                    "literal colour in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}

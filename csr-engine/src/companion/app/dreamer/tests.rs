@@ -2025,3 +2025,56 @@ fn the_lease_args_name_the_pane_folder_the_session_and_the_rank_of_this_copy() {
     );
     assert_eq!(rank_of("/home/u/dev-mods/csr-companion"), 1);
 }
+
+#[test]
+fn optional_observations_are_independent_bounded_and_never_pad() {
+    use super::text::parse_sections;
+    let legacy = "dream: What if the upload queue could serve imports?\nexplain:\n**Reuse the queue**\nTry it.";
+    let reply = format!(
+        r#"{legacy}
+confusing_claude: [{{"line":"Repeated the rejected approach.","evidence":"Turn 12: 'keep it local'"}},{{"line":"Misread the target.","evidence":"Turn 15: 'the pane'"}},{{"line":"Third.","evidence":"Turn 18"}}]
+should_be: [{{"kind":"hook","line":"Check formatting before each commit.","evidence":"Turns 4 and 12: 'run fmt'"}},{{"kind":"other","line":"Invalid kind.","evidence":"Turn 9"}}]"#
+    );
+    let sections = parse_sections(&reply);
+    assert_eq!(sections["confusing_claude"].as_array().unwrap().len(), 2);
+    assert_eq!(sections["should_be"].as_array().unwrap().len(), 1);
+    assert_eq!(parse_dream(&reply), parse_dream(legacy));
+    for bad in [
+        "",
+        "confusing_claude: nope",
+        "confusing_claude: []\nshould_be: []",
+        "confusing_claude: [{\"line\":\"No citation\"}]",
+    ] {
+        let sections = parse_sections(bad);
+        assert!(sections["confusing_claude"].as_array().unwrap().is_empty());
+        assert!(sections["should_be"].as_array().unwrap().is_empty());
+        assert_eq!(
+            parse_dream(&format!("{legacy}\n{bad}")),
+            parse_dream(legacy)
+        );
+    }
+    let none = parse_sections("dream: none\nconfusing_claude: []\nshould_be: []");
+    assert_eq!(none["should_be"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn same_fork_persists_optional_sections_even_with_no_what_if() {
+    for first in [dream_reply(), "dream: none".into()] {
+        let reply = format!(
+            r#"{first}
+confusing_claude: [{{"line":"Misread the target.","evidence":"Turn 4: 'the pane'"}}]
+should_be: [{{"kind":"memory","line":"Keep the pane question first.","evidence":"Turns 4 and 8: 'question first'"}}]"#
+        );
+        let r = rig(replies(&[reply]));
+        r.go(12).await;
+        assert!(until(|| r.records().iter().any(|r| r["confusing_claude"].is_array())).await);
+        let record = r
+            .records()
+            .into_iter()
+            .find(|r| r["confusing_claude"].is_array())
+            .unwrap();
+        assert_eq!(record["confusing_claude"].as_array().unwrap().len(), 1);
+        assert_eq!(record["should_be"][0]["kind"], "memory");
+        assert_eq!(r.forks().len(), 1);
+    }
+}
