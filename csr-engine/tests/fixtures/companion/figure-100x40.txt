@@ -37,4 +37,4 @@
 [48;2;18;20;23m[38;2;242;244;246m~ reader.rs · read ⌗8e4e3f27                                                                        [0m
 [48;2;18;20;23m[38;2;242;244;246mCTX 155k/1M · 1 by CSR                                                                              [0m
 [48;2;18;20;23m[38;2;242;244;246m7D 34% · 5H 12% · ◷ COLD ~155k · ● CSR: daemon down                                                 [0m
-[48;2;18;20;23m[38;2;184;193;203ml changes  t threads  i figure  b theme  q close                                                    [0m
+[48;2;18;20;23m[38;2;184;193;203m l changes  t threads  i figure  b theme  q close                                                   [0m

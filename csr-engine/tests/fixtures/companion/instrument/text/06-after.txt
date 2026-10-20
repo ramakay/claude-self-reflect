@@ -64,4 +64,4 @@ Text parity is ready for review.
 ! render/instrument.rs · draw unverified
 CTX 65k/1M
 7D 52%» · 5H 2% · ◷ 59m · Codex 7D 41%
-d queue  l changes  t threads  i figure  b theme  q close
+ d queue  l changes  t threads  i figure  b theme  q close

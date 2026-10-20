@@ -37,4 +37,4 @@ Text parity is ready for review.
 CTX 189k/1M · +6k/turn · ◷ Compacting · 12s of ~45s
 1 by CSR
 7D 52%» · 5H 2% · ◷ 59m · Codex 7D 41%
-d queue  l changes  t threads  i figure  b theme  q close
+ d queue  l changes  t threads  i figure  b theme  q close

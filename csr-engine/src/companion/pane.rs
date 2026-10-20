@@ -951,7 +951,9 @@ impl Pane {
             ("b", "theme"),
             ("q", "close"),
         ]);
-        // Theme is essential at every width. Abbreviate only as many labels as needed; keep q close.
+        // Same left inset as the cards (1 cell); fit labels into cols-2. Keep q close.
+        let inset = if cols > 2 { 1usize } else { 0 };
+        let usable = cols.saturating_sub(inset.saturating_mul(2)).max(1);
         let width = |keys: &[(&str, &str)], gap: usize| {
             keys.iter()
                 .map(|(key, label)| key.len() + usize::from(!label.is_empty()) + label.len())
@@ -959,7 +961,7 @@ impl Pane {
                 + keys.len().saturating_sub(1) * gap
         };
         let mut gap = 2usize;
-        if width(&keys, gap) > cols {
+        if width(&keys, gap) > usable {
             gap = 1;
         }
         for (full, short) in [
@@ -968,7 +970,7 @@ impl Pane {
             ("figure", "fig"),
             ("theme", "thm"),
         ] {
-            if width(&keys, gap) <= cols {
+            if width(&keys, gap) <= usable {
                 break;
             }
             if let Some((_, label)) = keys.iter_mut().find(|(_, label)| *label == full) {
@@ -976,22 +978,22 @@ impl Pane {
             }
         }
         for key in ["l", "t", "i", "d", "z"] {
-            if width(&keys, gap) <= cols {
+            if width(&keys, gap) <= usable {
                 break;
             }
             keys.retain(|(k, _)| *k != key);
         }
-        if width(&keys, gap) > cols {
+        if width(&keys, gap) > usable {
             keys = vec![("b", "theme")];
-            if width(&keys, gap) > cols {
+            if width(&keys, gap) > usable {
                 keys = vec![("b", "thm")];
             }
-            if width(&keys, gap) > cols {
+            if width(&keys, gap) > usable {
                 keys = vec![("b", "")];
             }
         }
         let sep = if gap == 1 { " " } else { "  " };
-        let footer = text::fit(
+        let body = text::fit(
             &keys
                 .iter()
                 .map(|(key, label)| {
@@ -1003,11 +1005,12 @@ impl Pane {
                 })
                 .collect::<Vec<_>>()
                 .join(sep),
-            cols,
+            usable,
         );
-        let mut start = 0;
+        let footer = format!("{}{body}", " ".repeat(inset));
+        let mut start = inset;
         let mut spans = vec![];
-        for (key, label) in keys {
+        for (key, label) in &keys {
             let end = start + key.len() + usize::from(!label.is_empty()) + label.len();
             if end <= cols {
                 spans.push(json!([start, end, key]));

@@ -1133,9 +1133,14 @@ fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
     );
     let help = empty_metrics.help_region.expect("help card");
     assert!(
-        (help.0 + help.1 - empty_metrics.height).abs() < 1.
-            || help.0 + help.1 >= empty_metrics.height - 20.,
-        "help card should reach the pane bottom: help={help:?} height={}",
+        empty_metrics.last_card_bottom_pad >= 10.,
+        "last card pad {}: want >= 10pt above keys",
+        empty_metrics.last_card_bottom_pad
+    );
+    assert!(
+        help.0 + help.1 + empty_metrics.last_card_bottom_pad <= empty_metrics.height + 0.5,
+        "help card overruns pixmap: help={help:?} pad={} height={}",
+        empty_metrics.last_card_bottom_pad,
         empty_metrics.height
     );
 }
@@ -1148,10 +1153,189 @@ fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
     let footer = text::plain(&pane.frame(44, 30, NOW)[29]);
     assert!(footer.contains("q close"), "{footer}");
     assert!(!footer.contains("q quit"), "{footer}");
+    assert!(
+        footer.starts_with(' '),
+        "key row needs col-1 inset: {footer:?}"
+    );
+    let legend = pane.acts.get(&29).expect("legend act");
+    let spans = legend["keys"].as_array().unwrap();
+    assert!(
+        spans[0][0].as_u64().unwrap() >= 1,
+        "first key span starts at col >= 1: {spans:?}"
+    );
+    assert!(
+        spans.last().unwrap()[1].as_u64().unwrap() <= 43,
+        "keys fit cols-2: {spans:?}"
+    );
     // 48-wide fits full words with a single-space join.
     let wide = text::plain(&pane.frame(48, 30, NOW)[29]);
     assert!(wide.contains("changes") || wide.contains("chg"), "{wide}");
     if wide.contains("changes") {
         assert!(wide.contains("threads") && wide.contains("figure") && wide.contains("theme"));
     }
+}
+
+#[test]
+fn collapsed_context_centres_exact_group_with_bottom_clearance() {
+    for (cols, rows) in [(44, 30), (60, 40)] {
+        let (_home, paths) = state_home("02-running");
+        // Drop request history so collapsed layout is independent of per-turn bars.
+        let usage = paths.keep.join("usage/sess-now.json");
+        if usage.exists() {
+            let mut u: Value = serde_json::from_slice(&fs::read(&usage).unwrap()).unwrap();
+            if let Some(obj) = u.as_object_mut() {
+                obj.remove("requests");
+            }
+            write_json(&usage, &u);
+        }
+        let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+        pane.pixels = true;
+        pane.enable_cards();
+        pane.frame(cols, rows, NOW);
+        let metrics = pane.instrument_metrics.as_ref().unwrap();
+        let (cx, cy, r) = metrics.ring_bounds.expect("collapsed ring");
+        let (group_top, group_bottom) = metrics.ring_group.expect("ring group");
+        let avail = metrics
+            .ring_formula_avail
+            .expect("ring formula available_height");
+        let expected = (avail / 2.8).clamp(78., 118.);
+        assert!(
+            (r - expected).abs() < 0.05,
+            "{cols}x{rows}: r={r} != clamp(78, {avail}/2.8, 118)={expected}"
+        );
+        let (fig_y, fig_h) = metrics.figure_region;
+        let card_bottom = fig_y + fig_h;
+        assert!(
+            group_bottom <= card_bottom - 24. + 0.5,
+            "{cols}x{rows}: group_bottom {group_bottom} needs >=24pt above card bottom {card_bottom}"
+        );
+        let title_band = fig_y + 40.;
+        let avail_mid = (title_band + card_bottom - 24.) / 2.;
+        let group_mid = (group_top + group_bottom) / 2.;
+        assert!(
+            (group_mid - avail_mid).abs() < 12.,
+            "{cols}x{rows}: group not centred: mid={group_mid} avail_mid={avail_mid}"
+        );
+        assert!(
+            cy > group_top && cy < group_bottom,
+            "{cols}x{rows}: ring centre outside group"
+        );
+        assert_eq!(
+            pane.placed[0].rows,
+            rows.saturating_sub(1),
+            "picture ends one row above keys"
+        );
+        assert!(metrics.last_card_bottom_pad >= 10.);
+        let _ = cx;
+    }
+}
+
+#[test]
+fn collapsed_ring_formula_holds_for_all_token_fixtures() {
+    for state in STATES {
+        for (cols, rows) in [(44, 30), (60, 40)] {
+            let (_home, paths) = state_home(state);
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+            pane.pixels = true;
+            pane.enable_cards();
+            pane.frame(cols, rows, NOW);
+            let metrics = pane.instrument_metrics.as_ref().unwrap();
+            if let (Some((_, _, r)), Some(avail), Some((gt, gb))) = (
+                metrics.ring_bounds,
+                metrics.ring_formula_avail,
+                metrics.ring_group,
+            ) {
+                let expected = (avail / 2.8).clamp(78., 118.);
+                assert!(
+                    (r - expected).abs() < 0.05,
+                    "{state} {cols}x{rows}: r={r} != {expected} from avail={avail}"
+                );
+                let card_bottom = metrics.figure_region.0 + metrics.figure_region.1;
+                assert!(
+                    gb <= card_bottom - 24. + 0.5,
+                    "{state} {cols}x{rows}: group bottom {gb} vs card {card_bottom}"
+                );
+                assert!(gt < gb, "{state}: empty group");
+            }
+        }
+    }
+}
+
+#[test]
+fn last_card_padding_holds_for_all_fixtures_and_expanded_or_help_tails() {
+    for state in STATES {
+        for (cols, rows) in [(44, 30), (60, 40)] {
+            let (_home, paths) = state_home(state);
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, rows));
+            pane.pixels = true;
+            pane.enable_cards();
+            if state == "03-agents" {
+                pane.key("i");
+            }
+            pane.frame(cols, rows, NOW);
+            let metrics = pane.instrument_metrics.as_ref().unwrap();
+            assert!(
+                metrics.last_card_bottom_pad >= 10.,
+                "{state} {cols}x{rows}: pad {}",
+                metrics.last_card_bottom_pad
+            );
+            if let Some((hy, hh)) = metrics.help_region {
+                assert!(
+                    hy + hh + metrics.last_card_bottom_pad <= metrics.height + 0.5,
+                    "{state}: help overrun"
+                );
+            }
+            let (fy, fh) = metrics.figure_region;
+            if metrics.help_region.is_none() && metrics.agents_region.is_none() {
+                assert!(
+                    fy + fh + metrics.last_card_bottom_pad <= metrics.height + 0.5,
+                    "{state}: figure overrun"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn long_story_cuts_only_on_a_clause_boundary_with_ellipsis() {
+    use csr_engine::companion::render::instrument::{self, story_text_lines, Composition};
+    // Mirrors the live cut: "...so the thread finder has not yet been shown to find them"
+    let story = "Work stands at: the pane redesign is nearly done, so the thread finder has not yet been shown to find them. The next pass still needs the live export and contact sheets before the owner can review.";
+    let lines = story_text_lines(story, 44, 4);
+    let joined = lines.join(" ");
+    assert!(
+        !joined.contains("find them The next"),
+        "must not join mid-sentence without a boundary: {joined}"
+    );
+    assert!(
+        joined.ends_with('…')
+            || joined.ends_with('.')
+            || joined.ends_with(';')
+            || joined.ends_with(',')
+            || joined.ends_with(':'),
+        "long story must end on a clause or ellipsis: {joined}"
+    );
+    assert!(
+        !joined.contains("contact sheets before the owner"),
+        "overflowing tail must be dropped: {joined}"
+    );
+
+    let data = json!({
+        "dreams_on": true,
+        "story": {"now": story, "at": NOW - 30.},
+        "claude_fields": {"context_window": {"total_input_tokens": 192000, "context_window_size": 1000000}},
+        "learnt": []
+    });
+    let c = Composition::build(
+        &data,
+        &json!({"id":"sess-now","main":[1],"prompts":[1]}),
+        NOW,
+    );
+    let (_, metrics) =
+        instrument::draw(&c, 44 * 16, 29 * 34, Theme::Dark, Default::default(), false).unwrap();
+    assert!(
+        metrics.story_line_count >= 1 && metrics.story_line_count <= 4,
+        "story lines {}",
+        metrics.story_line_count
+    );
 }

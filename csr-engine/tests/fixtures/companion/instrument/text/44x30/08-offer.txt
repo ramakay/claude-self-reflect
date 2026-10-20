@@ -27,4 +27,4 @@ Text parity is ready for review.
 CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
 7D 52%» · 5H 2% · ◷ 59m · Codex 7D 41%
-l changes t threads i figure b theme q close
+ l chg t threads i figure b theme q close

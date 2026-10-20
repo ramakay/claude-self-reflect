@@ -678,7 +678,7 @@ pub fn rows_with_figure(
     }
     if !c.story.is_empty() {
         out.extend(fact_rows(&format!("Story · {}", c.story_age), cols));
-        out.extend(wrap(first_sentence(&c.story)).into_iter().take(2));
+        out.extend(story_text_lines(first_sentence(&c.story), cols, 4));
     }
     let mut details_start = out.len();
     for v in c
@@ -896,41 +896,72 @@ fn single(
     c.text(f, &s, x, y, st, col, A::L);
 }
 
-/// Wrap to at most `n` lines. Keep the full text when it fits. Otherwise drop
-/// lower-priority complete clauses (` · `, `; `, or sentence ends), never mid-word.
-fn wrap_clauses(f: &Fonts, s: &str, st: St, maxw: f32, n: usize) -> Vec<String> {
-    let lines = f.wrap(s, st, maxw);
-    if lines.len() <= n {
+/// Match token → kept punctuation (trailing spaces dropped so spaced emdash keeps " —").
+const STORY_BOUNDARIES: &[(&str, &str)] = &[
+    (". ", "."),
+    ("; ", ";"),
+    (": ", ":"),
+    (", ", ","),
+    (" — ", " —"),
+    (" – ", " –"),
+];
+
+/// Candidates that end on a clause boundary with an ellipsis appended. Shared by pixel and text.
+fn story_clause_candidates(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, _) in s.char_indices() {
+        let rest = &s[i..];
+        for &(needle, keep) in STORY_BOUNDARIES {
+            if rest.starts_with(needle) {
+                out.push(format!("{}{keep}…", &s[..i]));
+            }
+        }
+    }
+    out
+}
+
+/// Fit `s` into at most `n` wrapped lines. Full text when it fits; else the longest clause-boundary
+/// candidate that fits; else a standalone ellipsis. Never keeps an arbitrary first line.
+fn fit_story_lines(
+    s: &str,
+    n: usize,
+    wrap: &dyn Fn(&str) -> Vec<String>,
+    line_fits: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let lines = wrap(s);
+    let overflows = lines.len() > n || lines.iter().any(|l| !line_fits(l));
+    if !overflows {
         return lines;
     }
-    let (sep, parts): (&str, Vec<&str>) = if s.contains(" · ") {
-        (" · ", s.split(" · ").collect())
-    } else if s.contains("; ") {
-        ("; ", s.split("; ").collect())
-    } else if s.contains(". ") {
-        (". ", s.split(". ").collect())
-    } else {
-        return lines.into_iter().take(n).collect();
-    };
-    let mut pieces: Vec<&str> = parts;
-    while pieces.len() > 1 {
-        let candidate = if sep == ". " {
-            let mut out = pieces[0].to_owned();
-            for part in &pieces[1..] {
-                out.push_str(". ");
-                out.push_str(part);
-            }
-            out
-        } else {
-            pieces.join(sep)
-        };
-        let wrapped = f.wrap(&candidate, st, maxw);
-        if wrapped.len() <= n {
-            return wrapped;
+    let mut best: Option<String> = None;
+    for candidate in story_clause_candidates(s) {
+        let wrapped = wrap(&candidate);
+        if wrapped.len() <= n && wrapped.iter().all(|l| line_fits(l)) {
+            best = Some(candidate);
         }
-        pieces.pop();
     }
-    f.wrap(pieces[0], st, maxw).into_iter().take(n).collect()
+    if let Some(candidate) = best {
+        return wrap(&candidate);
+    }
+    vec!["…".into()]
+}
+
+/// Wrap story for the pixel path.
+fn wrap_clauses(f: &Fonts, s: &str, st: St, maxw: f32, n: usize) -> Vec<String> {
+    fit_story_lines(s, n, &|c| f.wrap(c, st, maxw), &|l| {
+        f.width(l, st) <= maxw + 0.5
+    })
+}
+
+/// Text-fallback story lines with the same clause-boundary rule as the pixel path.
+pub fn story_text_lines(s: &str, cols: usize, max_lines: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    fit_story_lines(s, max_lines, &|c| text::wrap(c, cols, 1000), &|l| {
+        text::len(l) <= cols
+    })
 }
 
 /// Chart max for expanded request bars: data, compact band, and the context window.
@@ -963,6 +994,15 @@ pub struct Metrics {
     pub help_region: Option<(f32, f32)>,
     /// Context-window ceiling hairline Y in layout pt, when the expanded bars are drawn.
     pub ceiling_y: Option<f32>,
+    /// Collapsed context ring: (cx, cy, radius). Absent when expanded, quotas-only, or compact fallback.
+    pub ring_bounds: Option<(f32, f32, f32)>,
+    /// Collapsed ring+payback+gauge group top/bottom in layout pt (includes label descenders).
+    pub ring_group: Option<(f32, f32)>,
+    /// `available_height` fed to `r = clamp(78, available_height/2.8, 118)` for the collapsed ring.
+    pub ring_formula_avail: Option<f32>,
+    pub story_line_count: usize,
+    /// Layout pt between the last card's bottom edge and the pixmap bottom (above the key row).
+    pub last_card_bottom_pad: f32,
     pub height: f32,
     pub question_lines: Vec<String>,
     pub sections_collapsed: bool,
@@ -1008,6 +1048,15 @@ pub fn draw(
     // picture meets the key row with no hard edge.
     let maxh = (available_height as f32 / (S * ratio)).max(800.);
     let learn_h = if c.learnt.is_empty() { 0. } else { 20. };
+    // Fit up to 4 clause-safe lines once; height uses the actual count so unused
+    // line slots (32–48pt) return to Context instead of reserving a full 4-line card.
+    let story_st = sans(12.5, t.regular);
+    let story_lines_fit = if c.story.is_empty() {
+        Vec::new()
+    } else {
+        wrap_clauses(f, first_sentence(&c.story), story_st, IW, 4)
+    };
+    let story_line_rows = story_lines_fit.len();
     let story_h_base = if c.story.is_empty() && c.shifts.is_empty() {
         if c.learnt.is_empty() {
             0.
@@ -1015,10 +1064,14 @@ pub fn draw(
             P * 2. + learn_h
         }
     } else if c.shifts.is_empty() {
-        // Title, age, up to two story lines.
-        P + 38. + 16. + P + learn_h
+        // Title, age, then the fitted story lines (0..=4).
+        P + 38. + story_line_rows.saturating_sub(1) as f32 * 16. + P + learn_h
     } else {
-        P + 62. + 16. + c.shifts.len().min(3).saturating_sub(1) as f32 * 16. + P + learn_h
+        P + 62.
+            + story_line_rows.saturating_sub(1) as f32 * 16.
+            + c.shifts.len().min(3).saturating_sub(1) as f32 * 16.
+            + P
+            + learn_h
     };
     let story_support = if story_h_base > 0. {
         story_h_base + 12.
@@ -1395,6 +1448,7 @@ pub fn draw(
         y += notice_h + notice_gap;
     }
     let mut shift_hits = vec![];
+    let mut story_line_count = 0usize;
     let story_region = (story_h > 0.).then_some((y, story_h));
     if story_h > 0. {
         panel(&mut canvas, y, story_h, t);
@@ -1423,9 +1477,7 @@ pub fn draw(
             t.quiet,
             t,
         );
-        let story_st = sans(12.5, t.regular);
-        let story_lines = wrap_clauses(f, first_sentence(&c.story), story_st, IW, 2);
-        for (i, line) in story_lines.iter().enumerate() {
+        for (i, line) in story_lines_fit.iter().enumerate() {
             canvas.text(
                 f,
                 line,
@@ -1436,10 +1488,11 @@ pub fn draw(
                 A::L,
             );
         }
-        let story_block = if story_lines.is_empty() {
+        story_line_count = story_lines_fit.len();
+        let story_block = if story_lines_fit.is_empty() {
             38.
         } else {
-            38. + (story_lines.len() - 1) as f32 * 16.
+            38. + (story_lines_fit.len() - 1) as f32 * 16.
         };
         if !c.learnt.is_empty() {
             single(
@@ -1550,15 +1603,23 @@ pub fn draw(
         y += extra_h;
     }
     let mut ceiling_y = None;
-    // Flush the last card to the pane bottom so the background runs to the keys with no strip.
+    let mut ring_bounds = None;
+    let mut ring_group = None;
+    let mut ring_formula_avail = None;
+    // Keep >= 10pt between the last card and the pixmap bottom (key row sits under the picture).
+    const LAST_CARD_PAD: f32 = 10.;
     let figure_draw_h = if !active && help_h <= 0. {
-        (height - y).max(figure_h)
+        (height - y - LAST_CARD_PAD).max(figure_h)
     } else {
         figure_h
     };
     let figure_region = (y, figure_draw_h);
-    if let Some(cy) = figure(&mut canvas, f, c, y, figure_draw_h, t, open.figure, narrow) {
-        ceiling_y = Some(cy);
+    let fig_info = figure(&mut canvas, f, c, y, figure_draw_h, t, open.figure, narrow);
+    if let Some((cy, ring, group, avail)) = fig_info {
+        ceiling_y = cy;
+        ring_bounds = ring;
+        ring_group = group;
+        ring_formula_avail = avail;
     }
     y += figure_draw_h;
     let needs_tail = active || help_h > 0.;
@@ -1570,7 +1631,7 @@ pub fn draw(
         let agents_draw_h = if help_h > 0. {
             agents_h
         } else {
-            (height - y).max(agents_h)
+            (height - y - LAST_CARD_PAD).max(agents_h)
         };
         panel(&mut canvas, y, agents_draw_h, t);
         let mut x = IX + 8.;
@@ -1618,7 +1679,7 @@ pub fn draw(
         }
     }
     let help_region = (help_h > 0.).then(|| {
-        let h = (height - y).max(help_h);
+        let h = (height - y - LAST_CARD_PAD).max(help_h);
         (y, h)
     });
     if let Some((help_y, help_draw_h)) = help_region {
@@ -1635,7 +1696,16 @@ pub fn draw(
                 t.regular,
             );
         }
+        y = help_y + help_draw_h;
     }
+    let last_card_bottom = if let Some((hy, hh)) = help_region {
+        hy + hh
+    } else if active {
+        agents_region.map(|(ay, ah)| ay + ah).unwrap_or(y)
+    } else {
+        figure_region.0 + figure_region.1
+    };
+    let last_card_bottom_pad = (height - last_card_bottom).max(0.);
     let raw = image::RgbaImage::from_raw(
         canvas.pm.width(),
         canvas.pm.height(),
@@ -1673,13 +1743,26 @@ pub fn draw(
             figure_region,
             help_region,
             ceiling_y,
+            ring_bounds,
+            ring_group,
+            ring_formula_avail,
+            story_line_count,
+            last_card_bottom_pad,
             height,
             question_lines: question,
             sections_collapsed: collapsed,
         },
     ))
 }
-/// Draw the figure card. Returns the context-window ceiling hairline Y when expanded bars are shown.
+/// (ceiling_y, ring_bounds, ring_group_top_bottom, ring_formula_avail)
+type FigureInfo = (
+    Option<f32>,
+    Option<(f32, f32, f32)>,
+    Option<(f32, f32)>,
+    Option<f32>,
+);
+
+/// Draw the figure card. Returns (ceiling_y, ring_bounds) for layout metrics.
 fn figure(
     c: &mut Canvas,
     f: &Fonts,
@@ -1689,14 +1772,39 @@ fn figure(
     t: &Tokens,
     expanded: bool,
     narrow: bool,
-) -> Option<f32> {
+) -> Option<FigureInfo> {
     panel(c, y, h, t);
     let g = &data.figure;
-    if narrow || (h < 250. && g["ctx"]["tokens"].as_f64().is_some_and(|n| n > 0.)) {
+    let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
+    let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
+    // Collapsed scaled ring needs title + min_group (r=78) + 24pt label clearance.
+    let collapsed_scaled_fits = {
+        const GAP_RING_PAY: f32 = 16.;
+        const PAY_H: f32 = 18.;
+        const GAP_PAY_GAUGE: f32 = 12.;
+        const GAUGE_R: f32 = 30.;
+        const LABEL_BELOW: f32 = 46.;
+        const LABEL_DESCENT: f32 = 4.;
+        const FIXED_BELOW_RING: f32 =
+            GAP_RING_PAY + PAY_H + GAP_PAY_GAUGE + GAUGE_R + LABEL_BELOW + LABEL_DESCENT;
+        let title_bottom = if g["trend"].as_f64().is_some() {
+            y + P + 34.
+        } else {
+            y + P + 14.
+        };
+        let slot = ((y + h - 24.) - title_bottom).max(0.);
+        let min_group = 2. * (78. + 12.) + FIXED_BELOW_RING;
+        slot + 0.5 >= min_group
+    };
+    // Narrow panes, short cards, or a card too short for the min scaled group → compact side ring.
+    if narrow
+        || (h < 250. && tokens.is_some())
+        || (!expanded && tokens.is_some() && !collapsed_scaled_fits)
+    {
         let lines = figure_lines(data);
-        let ctx = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
+        let ctx = tokens;
         let mut x = IX;
-        if let (Some(n), Some(size)) = (ctx, g["ctx"]["size"].as_f64().filter(|n| *n > 0.)) {
+        if let (Some(n), Some(size)) = (ctx, size) {
             let (cx, cy) = (IX + 28., y + h / 2.);
             let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
             if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
@@ -1750,11 +1858,14 @@ fn figure(
                 t.sky,
             );
         }
-        return None;
+        return Some((None, None, None, None));
     }
-    let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
-    let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.);
     let mut ceiling_y = None;
+    let mut ring_bounds = None;
+    let mut ring_group = None;
+    let mut ring_formula_avail = None;
+    let mut collapsed_pay_y = None;
+    let mut collapsed_sat_cy = None;
     label(
         c,
         f,
@@ -1805,7 +1916,6 @@ fn figure(
         c.circle(IX + 87., y + P - 4., 2.5, col);
         single(c, f, &line, IX + 95., y + P, 230., 10., t.quiet, t);
     }
-    let cy = y + 126.;
     let mut expanded_chart_bottom = y + 195.;
     if let (Some(n), Some(size)) = (tokens, size) {
         if expanded {
@@ -1813,7 +1923,7 @@ fn figure(
             let max = request_bar_max(bars, num(&g["band"]["high"]), size);
             let bw = IW / bars.len().max(1) as f32;
             // Reserve labels + payback above gauges; shrink the chart baseline when the card is short.
-            let gauge_cy = y + h - 53.;
+            let gauge_cy = y + h - 70.;
             let reserve_below = 18. + 18. + 36.;
             let chart_bottom = (y + 195.).min(gauge_cy - reserve_below).max(y + 130.);
             let chart_top = y + 95.;
@@ -1876,8 +1986,38 @@ fn figure(
                 t.regular,
             );
         } else {
-            let (cx, r) = (W / 2., 78.);
-            c.dots(cx, cy, r + 12., 72, 0.65, &|_| t.band);
+            // Collapsed: r = clamp(78, available_height/2.8, 118) after fixed payback/gauge reserve.
+            // Compact fallback already handled above when the min group cannot fit.
+            const GAP_RING_PAY: f32 = 16.;
+            const PAY_H: f32 = 18.;
+            const GAP_PAY_GAUGE: f32 = 12.;
+            const GAUGE_R: f32 = 30.;
+            const LABEL_BELOW: f32 = 46.;
+            const LABEL_DESCENT: f32 = 4.;
+            const FIXED_BELOW_RING: f32 =
+                GAP_RING_PAY + PAY_H + GAP_PAY_GAUGE + GAUGE_R + LABEL_BELOW + LABEL_DESCENT;
+            let title_bottom = if g["trend"].as_f64().is_some() {
+                y + P + 34.
+            } else {
+                y + P + 14.
+            };
+            let slot = ((y + h - 24.) - title_bottom).max(0.);
+            let available_height = (slot - FIXED_BELOW_RING).max(0.);
+            let r = (available_height / 2.8).clamp(78., 118.);
+            let ring_extent = r + 12.;
+            let group_h = 2. * ring_extent + FIXED_BELOW_RING;
+            let group_top = title_bottom + (slot - group_h).max(0.) / 2.;
+            let cy = group_top + ring_extent;
+            let cx = W / 2.;
+            let pay_y = cy + ring_extent + GAP_RING_PAY;
+            let sat_cy = pay_y + PAY_H + GAP_PAY_GAUGE + GAUGE_R;
+            let group_bottom = sat_cy + LABEL_BELOW + LABEL_DESCENT;
+            ring_bounds = Some((cx, cy, r));
+            ring_group = Some((group_top, group_bottom));
+            ring_formula_avail = Some(available_height);
+            collapsed_pay_y = Some(pay_y);
+            collapsed_sat_cy = Some(sat_cy);
+            c.dots(cx, cy, ring_extent, 72, 0.65, &|_| t.band);
             let mut segs = vec![(0., (n / size).clamp(0., 1.) as f32, t.mint)];
             if let (Some(low), Some(high)) = (g["band"]["low"].as_f64(), g["band"]["high"].as_f64())
             {
@@ -1895,7 +2035,16 @@ fn figure(
                     t.mint,
                 );
             }
-            c.text(f, &short(n), cx, cy + 7., serif(44., t.medium), t.ink, A::M);
+            let num_size = (r * 0.55).clamp(28., 44.);
+            c.text(
+                f,
+                &short(n),
+                cx,
+                cy + 7.,
+                serif(num_size, t.medium),
+                t.ink,
+                A::M,
+            );
             c.text(
                 f,
                 &format!("of {}", short(size)),
@@ -1908,20 +2057,23 @@ fn figure(
         }
     }
     let pay = payback(g);
-    let sat_cy = if tokens.is_none() {
-        y + P + 52.
-    } else {
-        y + h - 53.
-    };
-    // Payback sits above the gauges. When expanded, keep it below the chart/labels too.
-    let pay_y = if expanded {
+    // Gauge labels stay >= 24pt above the card bottom; collapsed uses the exact group geometry.
+    let (sat_cy, pay_y) = if tokens.is_none() {
+        (y + P + 52., y + P + 40.)
+    } else if expanded {
+        let sat = y + h - 70.;
         let below_chart = expanded_chart_bottom + 33.;
-        let above_gauges = sat_cy - 36.;
-        below_chart
-            .min(above_gauges)
-            .max(expanded_chart_bottom + 18.)
+        let above_gauges = sat - 36.;
+        (
+            sat,
+            below_chart
+                .min(above_gauges)
+                .max(expanded_chart_bottom + 18.),
+        )
+    } else if let (Some(pay), Some(sat)) = (collapsed_pay_y, collapsed_sat_cy) {
+        (sat, pay)
     } else {
-        (sat_cy - 50.).max(y + P + 40.)
+        (y + h - 70., y + h - 120.)
     };
     if g["compacting"].is_object() {
         if let Some(high) = g["compacting"]["usual"]["high"]
@@ -1964,32 +2116,6 @@ fn figure(
     let cache = g["cache"]["left"].is_number() || g["cache"]["cold"] == true;
     let count = satellites.len() + usize::from(cache) + usize::from(codex.is_some());
     let step = IW / (count + 1) as f32;
-    // Mini history bars only when a dedicated slot fits below the ring and above payback.
-    if tokens.is_some() && !expanded && !data.requests.is_empty() {
-        let slot_top = cy + 90. + 12.;
-        let slot_bottom = y + h - 126.;
-        let available = slot_bottom - slot_top;
-        let bar_h = available.min(36.);
-        if bar_h >= 16. {
-            let bars = &data.requests;
-            let max = bars
-                .iter()
-                .map(|(a, b)| a + b)
-                .fold(1., f64::max)
-                .max(num(&g["band"]["high"]));
-            let bw = IW / bars.len().max(1) as f32;
-            let base = slot_top + bar_h;
-            if let Some(high) = g["band"]["high"].as_f64() {
-                c.hair(IX, base - (high / max * bar_h as f64) as f32, IW, t.band);
-            }
-            for (i, (cached, fresh)) in bars.iter().enumerate() {
-                let bh = ((cached + fresh) / max * bar_h as f64) as f32;
-                let fh = (fresh / max * bar_h as f64) as f32;
-                c.rect(IX + i as f32 * bw, base - bh, bw * 0.7, bh, t.sky);
-                c.rect(IX + i as f32 * bw, base - bh, bw * 0.7, fh, t.fresh);
-            }
-        }
-    }
     for (i, q) in satellites.iter().enumerate() {
         let x = IX + step * (i + 1) as f32;
         let v = num(&q["used"]);
@@ -2099,7 +2225,7 @@ fn figure(
             A::M,
         );
     }
-    ceiling_y
+    Some((ceiling_y, ring_bounds, ring_group, ring_formula_avail))
 }
 
 /// Click rows are derived from the same live composition used by both renderers.
@@ -2326,18 +2452,58 @@ mod tests {
     }
 
     #[test]
-    fn wrap_clauses_keeps_a_two_line_story_whole_and_drops_trailing_clauses() {
+    fn story_fit_preserves_full_text_and_cuts_at_longest_boundary() {
         let fonts = Fonts::load();
         let st = sans(12.5, 400.);
         let short = "Text parity is ready for review.";
-        let kept = wrap_clauses(&fonts, short, st, IW, 2);
-        assert_eq!(kept.join(" "), short);
-        let long =
-            "Alpha clause stays · beta clause stays · gamma clause is lower priority · delta drops";
-        let trimmed = wrap_clauses(&fonts, long, st, 180., 2);
-        let text = trimmed.join(" · ");
-        assert!(text.contains("Alpha"));
-        assert!(!text.contains("delta drops"));
-        assert!(!text.contains('\u{2026}'));
+        assert_eq!(wrap_clauses(&fonts, short, st, IW, 4).join(" "), short);
+        assert_eq!(story_text_lines(short, 80, 4).join(" "), short);
+
+        let long = "First clause ends here. Second clause continues for a while. Third clause still goes. Fourth would overflow the pane budget entirely.";
+        let pixel = wrap_clauses(&fonts, long, st, 220., 2).join(" ");
+        let text_path = story_text_lines(long, 40, 2).join(" ");
+        for joined in [&pixel, &text_path] {
+            assert!(joined.ends_with('…'), "{joined}");
+            assert!(joined.contains("First clause ends here."));
+            assert!(
+                !joined.contains("overflow the pane"),
+                "must drop the overflowing clause: {joined}"
+            );
+        }
+        // Longest fitting boundary: prefer keeping more clauses when width allows.
+        let wider = wrap_clauses(&fonts, long, st, 400., 2).join(" ");
+        assert!(
+            wider.contains("Second clause") || wider.contains("First clause ends here."),
+            "{wider}"
+        );
+    }
+
+    #[test]
+    fn story_fit_handles_emdash_non_ascii_and_clause_free_overflow() {
+        let fonts = Fonts::load();
+        let st = sans(12.5, 400.);
+        let em = "Alpha stays — beta is dropped because it is far too long for the budget here.";
+        let cut = wrap_clauses(&fonts, em, st, 160., 1).join(" ");
+        assert!(
+            cut.ends_with("—…") || cut.ends_with("—…"),
+            "keep spaced emdash: {cut}"
+        );
+        assert!(!cut.contains("beta is dropped"), "{cut}");
+        let text_em = story_text_lines(em, 28, 1).join(" ");
+        assert!(text_em.contains('—') || text_em == "…", "{text_em}");
+
+        let ja = "最初の文です。次の文は長くて枠に入りませんでした。";
+        let ja_cut = story_text_lines(ja, 12, 1).join(" ");
+        assert!(ja_cut.ends_with('…') || ja_cut.ends_with("。…"), "{ja_cut}");
+
+        // Many short words (no punctuation) so wrap exceeds the line budget without a clause cut.
+        let no_clause = "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt";
+        assert_eq!(
+            wrap_clauses(&fonts, no_clause, st, 60., 1),
+            vec!["…".to_string()]
+        );
+        assert_eq!(story_text_lines(no_clause, 8, 1), vec!["…".to_string()]);
+        assert!(wrap_clauses(&fonts, no_clause, st, 60., 0).is_empty());
+        assert!(story_text_lines(no_clause, 8, 0).is_empty());
     }
 }

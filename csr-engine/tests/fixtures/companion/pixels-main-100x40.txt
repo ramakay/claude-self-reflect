@@ -37,4 +37,4 @@
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
-[48;2;18;20;23m[38;2;184;193;203ml changes  t threads  i figure  b theme  q close                                                    [0m
+[48;2;18;20;23m[38;2;184;193;203m l changes  t threads  i figure  b theme  q close                                                   [0m
