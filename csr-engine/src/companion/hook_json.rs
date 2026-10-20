@@ -64,6 +64,7 @@ pub struct PaneJson {
     pub dreams_on: bool,
     pub recalled: u64,
     pub dreams_7d: usize,
+    #[serde(serialize_with = "whole")]
     pub dream_tokens_7d: f64,
     pub reminded_7d: u64,
     pub status: Option<String>,
@@ -77,6 +78,20 @@ pub struct PaneJson {
     pub sample: Option<Option<Sample>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shift_map: Option<Option<ShiftMap>>,
+}
+
+/// Sum token counts. An empty `f64` sum is `-0.0` on current Rust; add `0.` to make it `+0.0`.
+fn tokens_sum(values: impl Iterator<Item = f64>) -> f64 {
+    values.sum::<f64>() + 0.
+}
+
+/// Write a whole number without a fraction (`0`, not `0.0` or `-0.0`), as the Python pane did.
+fn whole<S: serde::Serializer>(value: &f64, out: S) -> Result<S::Ok, S::Error> {
+    if value.is_finite() && value.fract() == 0. && value.abs() < 9e15 {
+        out.serialize_i64(*value as i64)
+    } else {
+        out.serialize_f64(*value)
+    }
 }
 
 pub fn pane_json(paths: &paths::Paths, repo: &Path, sid: &str, limit: usize, now: f64) -> PaneJson {
@@ -122,7 +137,7 @@ pub fn pane_json(paths: &paths::Paths, repo: &Path, sid: &str, limit: usize, now
         .filter(|d| num(&d["at"]) >= now - 7. * 86400.)
         .collect();
     out.dreams_7d = week.len();
-    out.dream_tokens_7d = week.iter().map(|d| num(&d["tokens"])).sum();
+    out.dream_tokens_7d = tokens_sum(week.iter().map(|d| num(&d["tokens"])));
     out.dreams = all_dreams
         .iter()
         .take(20)
@@ -265,4 +280,29 @@ pub fn shift_map_json(db: &Db, paths: &paths::Paths, sid: &str) -> Option<ShiftM
         (source != sid).then_some(source.as_str()),
     );
     Some(ShiftMap { title, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct One {
+        #[serde(serialize_with = "whole")]
+        n: f64,
+    }
+
+    #[test]
+    fn empty_token_sum_prints_zero_not_negative_zero() {
+        let n = tokens_sum(std::iter::empty());
+        assert_eq!(serde_json::to_string(&One { n }).unwrap(), r#"{"n":0}"#);
+    }
+
+    #[test]
+    fn whole_numbers_print_without_fraction_and_fractions_stay() {
+        let one = |n| serde_json::to_string(&One { n }).unwrap();
+        assert_eq!(one(1234.), r#"{"n":1234}"#);
+        assert_eq!(one(-0.), r#"{"n":0}"#);
+        assert_eq!(one(2.5), r#"{"n":2.5}"#);
+    }
 }
