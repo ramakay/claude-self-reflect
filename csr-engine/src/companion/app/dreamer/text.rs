@@ -219,6 +219,7 @@ pub fn dream_prompt(
         BODY_4,
         &listed(known),
         BODY_5,
+        super::prompt::OBSERVATIONS,
     ]
     .concat()
 }
@@ -308,6 +309,16 @@ pub fn parse_dream(reply: &str) -> Option<Dream> {
         return None;
     }
     let after = &reply[end..];
+    let boundary = after
+        .lines()
+        .scan(0, |at, line| {
+            let start = *at;
+            *at += line.len() + 1;
+            Some((start, line.trim()))
+        })
+        .find(|(_, line)| line.starts_with("confusing_claude:") || line.starts_with("should_be:"))
+        .map_or(after.len(), |(at, _)| at);
+    let after = &after[..boundary.min(after.len())];
     let body = js_trim(explain_end(after).map_or("", |at| &after[at..]));
     let lines: Vec<&str> = body.split('\n').collect();
     let bold = bold_title(js_trim(lines[0]));
@@ -322,6 +333,48 @@ pub fn parse_dream(reply: &str) -> Option<Dream> {
         title: title.unwrap_or("A possibility from CSR").to_string(),
         text: js_trim(&text).to_string(),
     })
+}
+
+/// Independent optional observations. A broken section never invalidates a what-if.
+pub fn parse_sections(reply: &str) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let read = |label: &str, classified: bool| -> Vec<Value> {
+        let Some(raw) = reply
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(label))
+        else {
+            return vec![];
+        };
+        let Ok(Value::Array(items)) = serde_json::from_str::<Value>(raw.trim()) else {
+            return vec![];
+        };
+        items
+            .into_iter()
+            .filter_map(|item| {
+                let line = item["line"].as_str()?.trim();
+                let evidence = item["evidence"].as_str()?.trim();
+                if line.is_empty()
+                    || evidence.is_empty()
+                    || line.chars().count() > 160
+                    || evidence.chars().count() > 240
+                {
+                    return None;
+                }
+                let mut out = json!({"line": line, "evidence": evidence});
+                if classified {
+                    let kind = item["kind"].as_str()?;
+                    if !["skill", "memory", "hook", "CLAUDE.md"].contains(&kind) {
+                        return None;
+                    }
+                    out["kind"] = json!(kind);
+                }
+                Some(out)
+            })
+            .take(2)
+            .collect()
+    };
+    json!({"confusing_claude": read("confusing_claude:", false),
+           "should_be": read("should_be:", true)})
 }
 
 // ---------------------------------------------------------------- receipts
