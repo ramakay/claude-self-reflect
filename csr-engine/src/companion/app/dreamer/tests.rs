@@ -1652,6 +1652,99 @@ async fn a_fork_of_you_should_know_that_is_denied_or_empty_or_not_a_propose_is_k
     assert_eq!(r.records()[2]["prompt"], "explain");
 }
 
+/// `path` posted as the relay posts it; the calls the engine asks of Claude Code are answered
+/// with nothing, until the reply is final.
+async fn posted(
+    app: &Arc<crate::companion::relay::dispatch::App>,
+    path: &str,
+    body: Value,
+) -> Value {
+    let mut body = body;
+    body["v"] = json!("1");
+    let mut reply = app.handle(path, &body).await;
+    while reply.get("calls").is_some() {
+        let results: Vec<Value> = reply["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|call| json!({ "id": call["id"], "v": null }))
+            .collect();
+        let step = json!({ "v": "1", "id": reply["id"], "results": results });
+        reply = app.handle("/step", &step).await;
+    }
+    reply
+}
+
+#[tokio::test]
+async fn a_fork_whose_seat_the_relay_posts_beside_the_event_is_told_apart_by_it() {
+    use crate::companion::{
+        relay::{
+            dispatch::{App, Log},
+            host::{Hub, SystemClock},
+        },
+        store::Store,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let kept: Kept = Arc::default();
+    let seen = kept.clone();
+    let keep: pace::Keep = Arc::new(move |cwd, record| {
+        seen.lock().unwrap().push((cwd, record));
+        Box::pin(async {})
+    });
+    let out = Arc::new(Fake::new(keep.clone(), BRIEF));
+    out.set_brief(YSK_BRIEF);
+    let mut table = Table::new();
+    pace::register_with(&mut table, keep);
+    register_with(&mut table, out);
+    let (push, _lines) = tokio::sync::mpsc::unbounded_channel();
+    let app = App::new(
+        "1",
+        Hub::new(push),
+        Arc::new(Store::at(dir.path().join("csr-companion/companion.db"))),
+        Arc::new(SystemClock),
+        Arc::new(Log::default()),
+        table,
+    );
+    let at = |k: &str, e: Value| json!({ "sid": SID, "cwd": "/repo", "k": k, "e": e });
+    posted(
+        &app,
+        "/event",
+        at("start", json!({ "isInteractive": true })),
+    )
+    .await;
+    let fork = |plugin: Option<&str>| {
+        let mut body = at("fork", json!({ "prompt": YSK_PROMPT }));
+        if let Some(plugin) = plugin {
+            body["origin"] = json!({ "plugin": plugin, "tier": "builtin" });
+        }
+        body
+    };
+    // You should know's own fork: CSR's facts go in, and the seat does not go on with the event.
+    let ours = posted(&app, "/event", fork(Some("cc-plugin-you-should-know"))).await;
+    let prompt = ours["next"]["prompt"].as_str().expect("the facts went in");
+    assert!(
+        prompt.contains("## What CSR remembers near this session"),
+        "{ours}"
+    );
+    assert!(ours["next"].get("origin").is_none(), "{ours}");
+    assert!(ours["id"].is_string());
+    // Another plugin's fork, and one with no seat: passed untouched, and logged as such.
+    for (plugin, shown) in [
+        (Some("csr-shifts"), "csr-shifts/builtin"),
+        (None, "unknown"),
+    ] {
+        let theirs = posted(&app, "/event", fork(plugin)).await;
+        assert_eq!(theirs, json!({}), "{shown}");
+        let found = || {
+            let kept = kept.lock().unwrap();
+            kept.iter()
+                .map(|(_, record)| record.clone())
+                .any(|record| record["outcome"] == "other-origin" && record["origin"] == shown)
+        };
+        assert!(until(found).await, "{shown}: {:?}", kept.lock().unwrap());
+    }
+}
+
 #[tokio::test]
 async fn a_headless_child_never_forks_a_look_or_keeps_a_fork_record() {
     let r = rig(World {

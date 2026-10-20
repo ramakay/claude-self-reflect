@@ -34,8 +34,8 @@ use self::{
 };
 use super::{
     fleet::{self, arm_completions, completions, DreamCall, Fleet},
-    pace::{self, counted_chapter, fresh, install_keep, tokens_of},
-    state::{config_rows, update, Options},
+    pace::{counted_chapter, fresh, install_keep, tokens_of},
+    state::{config_rows, is_person, update, Options},
 };
 use crate::companion::{
     relay::{
@@ -202,7 +202,7 @@ fn on_fork_event(outside: Arc<dyn Outside>) -> Handler {
         let outside = outside.clone();
         async move {
             install(&cx, &outside);
-            if !pace::is_person(&cx).await {
+            if !is_person(&cx).await {
                 return Ok(Reply::none());
             }
             let named = |name: &str| e["origin"][name].as_str().map(str::to_string);
@@ -329,7 +329,7 @@ fn on_compact_after(outside: Arc<dyn Outside>) -> Handler {
             if skip || !result["skip"].is_null() || !dreams_on(&cx).await {
                 return Ok(Reply::none());
             }
-            if !pace::is_person(&cx).await {
+            if !is_person(&cx).await {
                 return Ok(Reply::none());
             }
             let (mut expired, mut carried) = (None, None);

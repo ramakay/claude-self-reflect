@@ -1354,6 +1354,44 @@ fn the_pace_text_for_a_chapter_says_what_is_left_in_it() {
 }
 
 #[test]
+fn on_with_no_looks_says_the_chapter_and_that_none_ran() {
+    let said = pace_text(
+        Some(&PaceRow::fresh("s")),
+        Some(&Chapter::fresh("s", 0.)),
+        true,
+    );
+    assert!(said.starts_with(
+        "Dreams are on. 5 of 5 dreams left in this chapter; the next look in about 6 of \
+         Claude's steps, if CSR has something new."
+    ));
+    assert!(said.ends_with("No looks yet this session."));
+    let none = pace_text(None, None, true);
+    assert!(none.contains("5 dreams to a chapter, which starts over at each compaction."));
+}
+
+#[test]
+fn on_after_looks_counts_them_and_names_a_debt() {
+    let pace = PaceRow {
+        claude: 100_000.,
+        dreamer: 30_000.,
+        looks: 1.,
+        dreams: 2.,
+        ..PaceRow::fresh("s")
+    };
+    let chapter = Chapter {
+        steps: 10.,
+        due: 20.,
+        shown: 5.,
+        ..Chapter::fresh("s", 0.)
+    };
+    let said = pace_text(Some(&pace), Some(&chapter), true);
+    assert!(said.contains("No dreams left in this chapter; it starts over at the next compaction."));
+    assert!(said.contains("This session: 1 look, 2 dreams, 30k tokens (30% of Claude's"));
+    assert!(said.contains("100k)."));
+    assert!(said.contains("A look ran over its share by 20k;"));
+}
+
+#[test]
 fn the_pace_registers_where_the_map_puts_it() {
     let mut t = Table::new();
     register(&mut t);

@@ -151,7 +151,10 @@ fn a_failing_claude_step_is_reported_and_exits_non_zero() {
 }
 
 fn claude_available() -> bool {
+    let home = tempfile::tempdir().unwrap();
     Command::new("claude")
+        .env("HOME", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .arg("--version")
         .output()
         .is_ok_and(|out| out.status.success())

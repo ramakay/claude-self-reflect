@@ -501,7 +501,6 @@ async fn a_start_that_is_not_a_person_records_it_and_does_nothing_else() {
     let e = json!({ "cwd": "/repo", "surface": "terminal", "isInteractive": false });
     run(&r.table, "start", &r.fx.cx, e).await;
     r.fx.timers.advance(0., Arc::new(r.fx.host.clone())).await;
-    assert!(!r.fx.cx.kept(|p: &mut Person| p.0));
     assert!(
         r.fx.host.calls().is_empty(),
         "no command, no status, no pane: {:?}",
@@ -511,15 +510,18 @@ async fn a_start_that_is_not_a_person_records_it_and_does_nothing_else() {
     assert!(r.outside.asked.lock().unwrap().is_empty());
     assert!(r.outside.runs().is_empty());
     run(&r.table, "start", &r.fx.cx, start()).await;
-    assert!(r.fx.cx.kept(|p: &mut Person| p.0));
+    assert_eq!(r.fx.host.seen.lock().unwrap().registered.len(), 1);
 }
 
 #[tokio::test]
-async fn a_start_that_does_not_say_it_is_not_a_person_is_taken_for_one() {
+async fn a_start_that_does_not_say_it_is_a_person_is_not_one() {
+    // The TypeScript: `if (!e.isInteractive) return`.
     let r = rig(true, false, shifts());
     run(&r.table, "start", &r.fx.cx, json!({ "cwd": "/repo" })).await;
-    assert!(r.fx.cx.kept(|p: &mut Person| p.0));
-    assert_eq!(r.fx.host.seen.lock().unwrap().registered.len(), 1);
+    r.fx.timers.advance(0., Arc::new(r.fx.host.clone())).await;
+    assert!(r.fx.host.calls().is_empty(), "{:?}", r.fx.host.calls());
+    assert!(r.fx.host.seen.lock().unwrap().registered.is_empty());
+    assert!(r.fx.timers.everies().is_empty());
 }
 
 #[tokio::test]
@@ -562,10 +564,6 @@ async fn a_respawned_start_sets_the_refresh_again_and_opens_nothing() {
     assert!(
         r.fx.host.seen.lock().unwrap().registered.is_empty(),
         "the registration outlived it"
-    );
-    assert!(
-        cx.kept(|p: &mut Person| p.0),
-        "the person record is the engine's own state"
     );
 }
 

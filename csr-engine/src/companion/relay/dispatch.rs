@@ -489,9 +489,20 @@ impl App {
         } else {
             self.events.load(Ordering::Relaxed)
         };
-        let (key, e) = match path {
+        let (key, mut e) = match path {
             "/press" => (PRESS.to_string(), body.clone()),
             _ => (text("k"), body.get("e").cloned().unwrap_or(Value::Null)),
+        };
+        // The seat of a call (a fork's `plugin` and `tier`) is on the hook's `next` in Claude Code,
+        // not in the event; the relay posts it beside the event when it is set. Handlers read it as
+        // `e["origin"]`, unless the event has an origin of its own (a prompt's).
+        let seat = body.get("origin").filter(|seat| !seat.is_null());
+        let seat = match (path, seat, e.as_object_mut()) {
+            ("/event", Some(seat), Some(fields)) if !fields.contains_key("origin") => {
+                fields.insert("origin".to_string(), seat.clone());
+                Some(seat.clone())
+            }
+            _ => None,
         };
         let at = Request {
             sid,
@@ -501,7 +512,7 @@ impl App {
             respawn: body.get("respawn").and_then(Value::as_bool) == Some(true),
         };
         match path {
-            "/event" => self.event(&key, e, at).await,
+            "/event" => without_seat(self.event(&key, e, at).await, seat),
             "/after" => {
                 let id = body.get("id").and_then(Value::as_str).unwrap_or("");
                 let left = at.session.lock().map_or(None, |mut s| s.take_left(id));
@@ -647,6 +658,18 @@ impl App {
             })
             .await
     }
+}
+
+/// The reply with the seat the engine added to the event taken out of the `next` it carries: the
+/// relay passes `next` on to Claude Code, and the seat was never part of the event.
+fn without_seat(mut reply: Value, seat: Option<Value>) -> Value {
+    let carried = reply.get_mut("next").and_then(Value::as_object_mut);
+    if let (Some(seat), Some(next)) = (seat, carried) {
+        if next.get("origin") == Some(&seat) {
+            next.remove("origin");
+        }
+    }
+    reply
 }
 
 struct Request {
@@ -1109,7 +1132,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_conversation_with_no_step_in_thirty_seconds_is_dropped_and_its_handler_errs() {
+    async fn a_conversation_with_no_step_in_eighty_seconds_is_dropped_and_its_handler_errs() {
         let outcome = Arc::new(Mutex::new(None));
         let seen = outcome.clone();
         let rig = rig(table(vec![(
@@ -1126,11 +1149,11 @@ mod tests {
         let first = post(&rig.app, "/event", ev("s", "csr", json!({}))).await;
         let id = first["id"].as_str().unwrap().to_string();
         assert_eq!(rig.app.hub.waiting(), 1);
-        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::time::advance(Duration::from_secs(79)).await;
         settle().await;
         assert!(
             outcome.lock().unwrap().is_none(),
-            "29 s is inside the limit"
+            "79 s is inside the limit"
         );
         tokio::time::advance(Duration::from_secs(2)).await;
         settle().await;
@@ -1582,6 +1605,51 @@ mod tests {
         );
         assert_eq!(trail[2], r#"a saw {"e":{"n":1},"result":{"m":2}}"#);
         assert_eq!(trail.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_seat_the_relay_forwards_reaches_the_handler_in_the_event_and_not_the_next() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let spy = seen.clone();
+        let rig = rig(table(vec![(
+            "fork",
+            event(handler(move |_, e| {
+                let spy = spy.clone();
+                async move {
+                    spy.lock().unwrap().push(e["origin"].clone());
+                    // A handler that rewrites the event hands the whole of it on.
+                    Ok(Reply {
+                        next: Some(e),
+                        ..Reply::none()
+                    })
+                }
+            })),
+        )]));
+        let seat = json!({ "plugin": "you-should-know", "tier": "builtin" });
+        let mut body = ev("s", "fork", json!({ "prompt": "p" }));
+        body["origin"] = seat.clone();
+        let reply = post(&rig.app, "/event", body).await;
+        assert_eq!(seen.lock().unwrap()[0], seat, "the handler reads e.origin");
+        assert_eq!(
+            reply["next"],
+            json!({ "prompt": "p" }),
+            "the seat is not passed on to Claude Code"
+        );
+        // No seat forwarded: the event is as the relay posted it.
+        let reply = post(
+            &rig.app,
+            "/event",
+            ev("s", "fork", json!({ "prompt": "p" })),
+        )
+        .await;
+        assert_eq!(seen.lock().unwrap()[1], Value::Null);
+        assert_eq!(reply["next"], json!({ "prompt": "p" }));
+        // An event with an origin of its own keeps it.
+        let mut body = ev("s", "fork", json!({ "origin": { "kind": "human" } }));
+        body["origin"] = seat;
+        let reply = post(&rig.app, "/event", body).await;
+        assert_eq!(seen.lock().unwrap()[2], json!({ "kind": "human" }));
+        assert_eq!(reply["next"], json!({ "origin": { "kind": "human" } }));
     }
 
     #[test]

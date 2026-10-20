@@ -153,6 +153,28 @@ pub fn config_row(rows: &[Value], name: &str) -> String {
         .map_or_else(|| format!("csr-companion.{name}"), str::to_string)
 }
 
+/// What `is_person` asked of the session's surfaces, kept for the life of the process.
+#[derive(Default)]
+struct Surfaced(Option<bool>);
+
+/// Whether a person is at this session (register.tsx `isPerson`, `person` at 875-876 and
+/// 2386-2387): the session's start said so (`Session.interactive`, set from `e.isInteractive`
+/// when that was a boolean), else it draws somewhere (`session.surfaces` is not empty), asked
+/// once and kept. Every feature that acts only for a person calls this one.
+pub async fn is_person(cx: &Ctx) -> bool {
+    if let Some(interactive) = cx.session.lock().ok().and_then(|s| s.interactive) {
+        return interactive;
+    }
+    if let Some(known) = cx.kept(|s: &mut Surfaced| s.0) {
+        return known;
+    }
+    let drawn = matches!(
+        cx.host.call("session.surfaces", vec![]).await,
+        Ok(Value::Array(surfaces)) if !surfaces.is_empty()
+    );
+    cx.kept(|s: &mut Surfaced| *s.0.get_or_insert(drawn))
+}
+
 /// The person's choices the engine reads from `/config`. The relay passes no options to the
 /// engine, so they are asked of `config.list` where a feature needs them.
 #[derive(Clone, Debug, PartialEq)]

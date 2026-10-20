@@ -62,7 +62,7 @@ fn fn_decl(hook: &super::manifest::Hook) -> String {
         ),
         Shape::Answer => format!(
             "async function {name}($, e) {{ \
-             return (await run($, '/event', {{ k: '{key}', e }})).answer }}"
+             return (await run($, '/event', {{ k: '{key}', e }}, SLOW)).answer }}"
         ),
     }
 }

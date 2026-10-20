@@ -1543,7 +1543,11 @@ mod relay {
         );
         // A second mismatch pushes nothing; the next line is the usage call that a start asks.
         post(&serve.sock, "/event", &json!({ "v": "1", "k": "tool" }));
-        let start = post(&serve.sock, "/event", &json!({ "v": "1", "k": "start" }));
+        let start = post(
+            &serve.sock,
+            "/event",
+            &json!({ "v": "1", "k": "start", "e": { "isInteractive": true } }),
+        );
         post(
             &serve.sock,
             "/step",
@@ -1560,7 +1564,8 @@ mod relay {
         let reply = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "sid": "s1", "k": "start", "e": { "cwd": "/r" } }),
+            &json!({ "v": "1", "sid": "s1", "k": "start",
+                "e": { "cwd": "/r", "isInteractive": true } }),
         );
         assert_eq!(reply["calls"][0]["m"], "command.register");
         let done = post(
@@ -1588,7 +1593,7 @@ mod relay {
         assert_eq!(rows[1]["k"], "start");
         assert_eq!(rows[1]["sid"], "s1");
         assert_eq!(rows[1]["pid"], serve.child.id());
-        assert_eq!(rows[1]["e"], json!({ "cwd": "/r" }));
+        assert_eq!(rows[1]["e"], json!({ "cwd": "/r", "isInteractive": true }));
         assert!(rows[1]["bytes"].as_u64().unwrap() > 0);
         assert!(rows[1]["handle_us"].is_u64());
         assert_eq!(rows[3]["k"], "usage");
@@ -1713,14 +1718,19 @@ mod relay {
     /// scripted by the test kit, so the transport runs with no engine behind it.
     #[test]
     fn the_relay_passes_its_plugin_test_cases() {
-        let Ok(found) = Command::new("claude").arg("--version").output() else {
+        let home = tempfile::tempdir().unwrap();
+        // The CLI writes under its HOME (.claude.json, .claude/backups): never the real one.
+        let Ok(found) = Command::new("claude")
+            .env("HOME", home.path())
+            .arg("--version")
+            .output()
+        else {
             eprintln!("claude is not on PATH: relay cases skipped");
             return;
         };
         if !found.status.success() {
             return;
         }
-        let home = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         let emit = Command::new(env!("CARGO_BIN_EXE_csr-engine"))
             .env("HOME", home.path())
@@ -1737,6 +1747,7 @@ mod relay {
         .unwrap();
         let ran = Command::new("claude")
             .env("HOME", home.path())
+            .env_remove("CLAUDE_CONFIG_DIR")
             .args(["plugin", "test"])
             .arg(out.path())
             .output()
@@ -1750,7 +1761,7 @@ mod relay {
             .find_map(|l| l.trim().strip_suffix(" pass"))
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0);
-        assert_eq!(passed, 16, "{text}");
+        assert_eq!(passed, 20, "{text}");
     }
 
     #[test]
@@ -1780,7 +1791,11 @@ mod relay {
         } else {
             assert!(relay.contains("const SOCK_DIR = '/tmp/csr-"));
         }
-        let Ok(found) = Command::new("claude").arg("--version").output() else {
+        let Ok(found) = Command::new("claude")
+            .env("HOME", home.path())
+            .arg("--version")
+            .output()
+        else {
             eprintln!("claude is not on PATH: validate skipped");
             return;
         };
@@ -1788,6 +1803,8 @@ mod relay {
             return;
         }
         let validated = Command::new("claude")
+            .env("HOME", home.path())
+            .env_remove("CLAUDE_CONFIG_DIR")
             .args(["plugin", "validate"])
             .arg(out.path())
             .output()

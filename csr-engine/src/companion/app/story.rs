@@ -19,7 +19,7 @@
 //! `story::decide` over the news, the starts recorded in the store row `(sid, "storyStarts")`
 //! (the TypeScript's `storyStarts:<sid>`), and the tokens Claude has spent (`pace::pace_of`).
 
-use super::pace::{is_person, pace_of};
+use super::{pace::pace_of, state::is_person};
 use crate::companion::{
     db::Db,
     paths::Paths,

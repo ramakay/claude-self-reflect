@@ -1,8 +1,8 @@
 //! The `/csr` command, the pane, its refresh, and the pane opened beside Claude (register.tsx
 //! 2384-2431, 2485-2739).
 //!
-//! - `start` has two entries. The first (`register`) records whether the session is a person's
-//!   (`Person`), clears the status line, and registers the command. The late one (`register_late`)
+//! - `start` has two entries. The first (`register`) clears the status line and registers the
+//!   command, for a person's session only (`isInteractive` true). The late one (`register_late`)
 //!   sets the 10-minute refresh and, in the background, refreshes once and opens the pane when the
 //!   folder is a repository.
 //! - `csr` routes by the first word: `dreams`, `setup`, `statusline` (retired: one line), or the
@@ -46,11 +46,6 @@ const HERDR_LIMIT: Duration = Duration::from_secs(10);
 const LABEL: &str = "CSR";
 const RETIRED: &str = "The status line wrapper is gone: the pane's masthead shows context and \
     limits, and \"csr-engine hook install --apply\" already put back any wrapped line.";
-
-/// Whether this session is a person's (`e.isInteractive` at the start): a `claude -p` child is not.
-/// Read by the features that act only for a person.
-#[derive(Default)]
-pub struct Person(pub bool);
 
 /// The pane's module state.
 #[derive(Default)]
@@ -129,10 +124,10 @@ pub fn real() -> Arc<dyn Outside> {
     Arc::new(Real)
 }
 
-/// Claude Code says whether a start is a person's (`e.isInteractive`, a boolean). An event that
-/// does not say, as the relay's own tests post, is taken for one, as the stub that stood here did.
-fn is_person(e: &Value) -> bool {
-    e["isInteractive"].as_bool() != Some(false)
+/// Whether a start is a person's: `e.isInteractive` is true (`if (!e.isInteractive) return`). A
+/// start that does not say is not one. The features that act later ask `state::is_person`.
+fn starts_a_person(e: &Value) -> bool {
+    e["isInteractive"] == true
 }
 
 /// Read the shifts data again and keep it as the session's `data` row (register.tsx `refresh`).
@@ -262,9 +257,7 @@ fn has_repo(fresh: &Option<Value>) -> bool {
 
 fn on_start() -> Handler {
     handler(|cx, e| async move {
-        let person = is_person(&e);
-        cx.kept(|p: &mut Person| p.0 = person);
-        if !person || cx.respawn {
+        if !starts_a_person(&e) || cx.respawn {
             // The registration lives in the module, not in the child that died.
             return Ok(Reply::none());
         }
@@ -292,7 +285,7 @@ fn on_start_late(outside: Arc<dyn Outside>) -> Handler {
     handler(move |cx, e| {
         let outside = outside.clone();
         async move {
-            if !is_person(&e) {
+            if !starts_a_person(&e) {
                 return Ok(Reply::none());
             }
             let cwd = e["cwd"].as_str().unwrap_or(&cx.cwd).to_string();

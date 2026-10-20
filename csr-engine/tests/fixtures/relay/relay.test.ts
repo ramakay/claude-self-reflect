@@ -25,7 +25,7 @@ const alive: Child = async function* () {
 }
 
 // The world beneath the relay: one scripted engine, every `$` call it makes recorded.
-function world(on: On, engine: Engine, child: Child = alive, options: { spawnFails?: boolean; fetchFails?: boolean } = {}) {
+function world(on: On, engine: Engine, child: Child = alive, options: { spawnFails?: boolean; fetchFails?: boolean; fetchHangs?: boolean } = {}) {
   const clock = mock.clock(on, { now: 1_000_000 })
   const posts: Array<{ path: string; body: Body; socket: string | undefined }> = []
   const spawned: string[][] = []
@@ -39,6 +39,7 @@ function world(on: On, engine: Engine, child: Child = alive, options: { spawnFai
     const body = JSON.parse(init.body)
     posts.push({ path, body, socket: init.socketPath })
     if (options.fetchFails) return { deny: 'connect ECONNREFUSED' } as never
+    if (options.fetchHangs) await new Promise<never>(() => {}) // an engine that accepts and never answers
     const reply = await engine(path, body)
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(reply ?? {}) } }
   })
@@ -333,4 +334,108 @@ test('with no guard armed, or the guard disarmed again, an engine that is down l
   expect(JSON.stringify(await bash($, 'git push'))).toContain('file text') // disarmed again
   expect(JSON.stringify(await bash($, 'bash -c "git push"'))).toContain('file text')
   expect(seen.seen.tools).toBe(5)
+})
+
+
+// An engine that accepts a post and never answers must not hold the hook for ever: the post waits 20 s (60 s for the `csr`
+// command), then fails like one to a down engine, and the next 30 s of posts fail at once.
+const LIMIT = 20_000
+const PAUSE = 30_000
+
+test('a post the engine never answers fails the hook after 20 s, and an armed guard denies a matching push', async ($, on) => {
+  const options = { fetchHangs: false }
+  const seen = world(on, (path, body) => (path === '/event' && body.k === 'start' ? arms({ pattern: PATTERN, reason: DOWN }) : {}), alive, options)
+  await $.session.start(START as never)
+  options.fetchHangs = true // the engine takes the post and says nothing
+  const state = { done: false }
+  const push = bash($, 'git push origin main').then(r => ((state.done = true), r))
+  await seen.clock.settle()
+  await seen.clock.advance(LIMIT - 1)
+  expect(state.done).toBe(false) // still waiting inside the limit
+  await seen.clock.advance(1)
+  expect(JSON.stringify(await push)).toContain(DOWN)
+  expect(seen.seen.tools).toBe(0) // next never ran
+  // a command the guard does not match goes through, as when the engine is down
+  const status = bash($, 'git status')
+  await seen.clock.settle()
+  expect(JSON.stringify(await status)).toContain('file text')
+})
+
+test('after a post timed out the next hooks fail at once for 30 s, then the engine is asked again with the full limit', async ($, on) => {
+  const options = { fetchHangs: false }
+  const seen = world(on, (path, body) => (path === '/event' && body.k === 'start' ? arms({ pattern: PATTERN, reason: DOWN }) : {}), alive, options)
+  await $.session.start(START as never)
+  options.fetchHangs = true
+  const first = bash($, 'git push')
+  await seen.clock.settle()
+  await seen.clock.advance(LIMIT)
+  expect(JSON.stringify(await first)).toContain(DOWN)
+  const posted = seen.posts.length
+  // inside the pause: no wait, no post; the armed guard still denies, and a command it does not match goes through
+  await seen.clock.advance(PAUSE - 1)
+  expect(JSON.stringify(await bash($, 'git push'))).toContain(DOWN)
+  expect(JSON.stringify(await bash($, 'git status'))).toContain('file text')
+  expect(seen.posts.length).toBe(posted)
+  // past it the engine is tried again, and a stuck one costs the whole limit again
+  await seen.clock.advance(1)
+  const second = bash($, 'git push')
+  await seen.clock.settle()
+  expect(seen.posts.length).toBe(posted + 1)
+  await seen.clock.advance(LIMIT - 1)
+  const state = { done: false }
+  void second.then(() => (state.done = true))
+  await seen.clock.settle()
+  expect(state.done).toBe(false)
+  await seen.clock.advance(1)
+  expect(JSON.stringify(await second)).toContain(DOWN)
+  // a working engine is asked again after the pause, and answers
+  await seen.clock.advance(PAUSE)
+  options.fetchHangs = false
+  const before = seen.posts.length
+  expect(JSON.stringify(await bash($, 'git status'))).toContain('file text')
+  expect(seen.posts.length).toBeGreaterThan(before)
+  // the answers left no pause behind: the engine hangs again, and this hook posts and waits its own limit
+  const answered = seen.posts.length
+  options.fetchHangs = true
+  const third = bash($, 'git push')
+  await seen.clock.settle()
+  expect(seen.posts.length).toBe(answered + 1)
+  await seen.clock.advance(LIMIT)
+  expect(JSON.stringify(await third)).toContain(DOWN)
+})
+
+test('the csr command waits up to 60 s for its answer, a hook 20 s', async ($, on) => {
+  const seen = world(on, async (path, body) => {
+    if (path !== '/event' || (body.k !== 'csr' && body.k !== 'tool')) return {}
+    await seen.clock.sleep(40_000) // the pane reads the shifts data and runs herdr
+    return body.k === 'csr' ? { answer: { text: 'the pane is open' } } : {}
+  })
+  await $.session.start(START as never)
+  const tool = $.tool.call({ tool: 'Read', path: '/a' } as never)
+  await seen.clock.settle()
+  await seen.clock.advance(LIMIT)
+  expect(JSON.stringify(await tool)).toContain('file text') // failed open at 20 s
+  await seen.clock.advance(PAUSE) // the pause the failed post left is over
+  const csr = $.command.run({ command: 'csr', args: '', origin: { kind: 'human' } } as never)
+  await seen.clock.settle()
+  await seen.clock.advance(40_000)
+  expect(JSON.stringify(await csr)).toContain('the pane is open')
+})
+
+test("a fork's origin is on its next, not in the event: the relay posts it beside the event and passes the event on as it was", async ($, on) => {
+  const forked: Body[] = []
+  const seen = world(on, (path, body) => (path === '/event' && body.k === 'start' ? { id: 'e1', calls: [{ id: 'c1', m: 'model.fork', a: [{ prompt: 'p' }] }] } : {}))
+  on('model.fork', async (_$, e) => {
+    forked.push(e as never)
+    return { value: { isAnswered: true, text: 'x', usage: {} } } as never
+  })
+  await $.session.start(START as never)
+  const asked = only(seen.posts, '/event').find(p => p.body.k === 'fork')
+  expect(asked?.body.origin).toEqual({ plugin: 'csr-companion', tier: 'user' })
+  expect(asked?.body.e).toEqual({ prompt: 'p' }) // the event does not carry it
+  expect(forked).toEqual([{ prompt: 'p' }]) // and neither does the call that goes on
+  // another hook posts the body it always did, whatever its next carries
+  await $.tool.call({ tool: 'Read', path: '/a' } as never)
+  const plain = only(seen.posts, '/event').find(p => p.body.k === 'tool')
+  expect('origin' in (plain?.body ?? {})).toBe(false)
 })

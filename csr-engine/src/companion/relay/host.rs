@@ -26,8 +26,12 @@ use tokio::sync::mpsc;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// How long a conversation waits for its `/step` before it is dropped.
-pub const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a conversation waits for its `/step` before it is dropped. The relay runs the calls
+/// of a yield, the slowest being a `model.fork` (60 s of its own), and posts the results within
+/// its post limit (`LIMIT` in register.js, 20 s): a relay that has not answered by then has
+/// abandoned the conversation (its post timed out, the process went), and the handler that waits
+/// gets an error instead of waiting for ever.
+pub const STEP_TIMEOUT: Duration = Duration::from_secs(80);
 
 /// Milliseconds since the epoch, as `$.clock.now()` reads them.
 pub trait Clock: Send + Sync {
@@ -551,6 +555,79 @@ mod tests {
         ];
         assert_eq!(host.batch(pair).await.unwrap().len(), 2);
         assert_eq!(host.seen.lock().unwrap().batches, 5);
+    }
+
+    /// A hub whose conversations give up after `timeout`.
+    fn hub_with(timeout: Duration) -> Arc<Hub> {
+        let (push, _lines) = mpsc::unbounded_channel();
+        Arc::new(Hub {
+            push,
+            open: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(0),
+            timeout,
+        })
+    }
+
+    #[test]
+    fn the_wait_for_a_step_covers_a_fork_and_a_post() {
+        assert!(STEP_TIMEOUT >= Duration::from_secs(60 + 20));
+    }
+
+    #[tokio::test]
+    async fn a_conversation_whose_relay_never_posts_the_step_ends_with_an_error_and_no_state() {
+        let hub = hub_with(Duration::from_millis(60));
+        let saw = Arc::new(Mutex::new(None));
+        let first = hub
+            .converse({
+                let saw = saw.clone();
+                move |host| {
+                    Box::pin(async move {
+                        let asked = host.call("session.usage", vec![]).await;
+                        *saw.lock().unwrap() = Some(asked.map_err(|e| e.to_string()));
+                        json!({ "done": true })
+                    })
+                }
+            })
+            .await;
+        // The relay got the calls and went away: the post that would carry the results is lost.
+        let id = first["id"].as_str().unwrap().to_string();
+        assert_eq!(first["calls"][0]["m"], "session.usage");
+        assert_eq!(hub.waiting(), 1);
+        let began = std::time::Instant::now();
+        assert!(
+            crate::companion::relay::dispatch::testing::until(|| saw.lock().unwrap().is_some())
+                .await
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "the wait has a limit"
+        );
+        let said = saw.lock().unwrap().clone().unwrap().unwrap_err();
+        assert!(said.contains("dropped: no /step in"), "{said}");
+        assert_eq!(hub.waiting(), 0, "the parked conversation is gone");
+        // A step that comes after the limit finds nothing to resume.
+        let late = hub.step(&id, vec![("c1".into(), Ok(json!(1)))]).await;
+        assert_eq!(late, json!({}));
+        assert_eq!(hub.waiting(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_step_inside_the_limit_resumes_the_conversation() {
+        let hub = hub_with(Duration::from_secs(5));
+        let first = hub
+            .converse(|host| {
+                Box::pin(async move {
+                    let got = host.call("session.usage", vec![]).await;
+                    json!({ "got": got.ok() })
+                })
+            })
+            .await;
+        let id = first["id"].as_str().unwrap().to_string();
+        let done = hub
+            .step(&id, vec![("c1".into(), Ok(json!({ "x": 1 })))])
+            .await;
+        assert_eq!(done, json!({ "got": { "x": 1 } }));
+        assert_eq!(hub.waiting(), 0);
     }
 
     #[tokio::test]

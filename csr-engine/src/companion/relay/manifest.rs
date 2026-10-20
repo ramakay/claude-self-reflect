@@ -212,7 +212,7 @@ mod tests {
         const HELPERS: &[&str] = &[
             "post", "act", "settle", "run", "tree", "pushed", "spawn", "gated", "told", "drawn",
             "pass", "register", "ENGINE", "SOCK_DIR", "V", "sock", "gen", "SOON", "LONG", "TRIES",
-            "fails", "bytes", "BIG", "armed",
+            "fails", "bytes", "BIG", "armed", "LIMIT", "SLOW", "PAUSE", "stalled",
         ];
         for h in HOOKS {
             assert!(!HELPERS.contains(&h.name), "{}", h.name);

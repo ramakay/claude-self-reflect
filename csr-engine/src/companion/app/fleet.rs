@@ -22,7 +22,7 @@ use self::model::{
 };
 pub use self::model::{agents_text, completion_key, completion_news, Disposition, Ledger};
 use self::text::{normalize_path, session_name, WS};
-use super::state::{self, Options};
+use super::state::{self, is_person, Options};
 use crate::companion::{
     agents as pane,
     paths::Paths,
@@ -76,8 +76,6 @@ pub struct Fleet {
     pub timer: bool,
     /// The person's `/config` choices, read once.
     pub options: Option<Options>,
-    /// Whether a person is at the session (`person` in register.tsx).
-    pub person: Option<bool>,
     /// The minute poll of `$.agent.list`.
     pub list_timer: Option<u64>,
     /// Where the agents and handoffs files go; none: under `$HOME`. For tests.
@@ -148,17 +146,6 @@ where
 }
 
 // ---------------------------------------------------------------- the person, the options
-
-/// Whether a person is at this session: where it draws (nowhere, in a `-p` run). One process,
-/// one answer.
-pub async fn is_person(cx: &Ctx) -> bool {
-    if let Some(known) = cx.kept(|f: &mut Fleet| f.person) {
-        return known;
-    }
-    let surfaces = cx.host.call("session.surfaces", vec![]).await;
-    let drawn = matches!(surfaces, Ok(Value::Array(list)) if !list.is_empty());
-    cx.kept(|f: &mut Fleet| *f.person.get_or_insert(drawn))
-}
 
 /// The choices the TypeScript got as `options`; here they are asked of `/config` once.
 async fn options(cx: &Ctx) -> Options {
@@ -797,9 +784,7 @@ async fn digit(cx: Ctx, entered: Value) -> Result<Reply> {
 /// The session's start: the agents of this session, the minute poll, one look at the list now,
 /// and the reports a reload left pending.
 async fn start(cx: Ctx, e: Value) -> Result<Reply> {
-    let interactive = e["isInteractive"].as_bool();
-    cx.kept(|f: &mut Fleet| f.person = interactive);
-    if interactive != Some(true) {
+    if e["isInteractive"] != true {
         return Ok(Reply::none());
     }
     watch_agents(&cx);

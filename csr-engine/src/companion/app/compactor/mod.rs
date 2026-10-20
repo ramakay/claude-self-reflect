@@ -22,7 +22,7 @@ mod tests;
 mod watch;
 
 use crate::companion::{
-    app::state::{update, Options},
+    app::state::{is_person, update, Options},
     relay::dispatch::{handler, Ctx, Reply, Table},
 };
 use anyhow::Result;
@@ -175,26 +175,6 @@ pub async fn setting(cx: &Ctx) -> Setting {
         });
     }
     cx.kept(|s: &mut Compactor| s.setting)
-}
-
-/// Whether a person is at this session: it draws somewhere (nowhere, in a `-p` run). Set at the
-/// session start; a module loaded later asks the session where it draws.
-pub async fn is_person(cx: &Ctx) -> bool {
-    let known = cx
-        .session
-        .lock()
-        .map_or(None, |session| session.interactive);
-    if let Some(person) = known {
-        return person;
-    }
-    let surfaces = cx.host.call("session.surfaces", vec![]).await.ok();
-    let person = surfaces
-        .and_then(|surfaces| surfaces.as_array().map(|list| !list.is_empty()))
-        .unwrap_or(false);
-    if let Ok(mut session) = cx.session.lock() {
-        session.interactive = Some(person);
-    }
-    person
 }
 
 fn has_agent(e: &Value) -> bool {

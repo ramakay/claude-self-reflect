@@ -19,13 +19,33 @@ function bytes(text) {
 // What the engine armed (guard.arm): a regex source and a reason, kept as they came. Nothing armed: every
 // hook fails open.
 let armed = null
-async function post($, path, body) {
+// An engine that accepts a post and never answers would hold the hook, and so the tool call, for ever. A
+// post waits LIMIT for it (SLOW for the `csr` command: its default route may read the shifts data, 20 s,
+// and run herdr, 10 s); past that it throws, as a post to a down engine does, and the posts of the next
+// PAUSE fail at once, so a stuck engine costs one wait, not one per hook. An answered post clears it.
+const LIMIT = 20000
+const SLOW = 60000
+const PAUSE = 30000
+let stalled = 0
+async function post($, path, body, limit = LIMIT) {
+  if (stalled && (await $.clock.now()) < stalled) throw new Error('csr ' + path + ' stalled')
   let text = JSON.stringify({ v: V, ...body })
   if (text.length * 3 > BIG && bytes(text) > BIG && body.e && body.e.messages) {
     const { messages, ...rest } = body.e
     text = JSON.stringify({ v: V, ...body, e: { ...rest, messagesOmitted: true } })
   }
-  const r = await $.http.fetch('http://csr' + path, { method: 'POST', body: text, socketPath: sock })
+  let timer, late = false
+  const cutoff = new Promise((_, no) => { timer = $.clock.after(limit, () => { late = true; no(new Error('csr ' + path + ' timed out')) }) })
+  let r
+  try {
+    r = await Promise.race([$.http.fetch('http://csr' + path, { method: 'POST', body: text, socketPath: sock }), cutoff])
+  } catch (error) {
+    if (late) stalled = (await $.clock.now()) + PAUSE
+    throw error
+  } finally {
+    timer.cancel()
+  }
+  stalled = 0
   if (!r.ok) throw new Error('csr ' + path + ' ' + r.status)
   return JSON.parse(r.text)
 }
@@ -52,16 +72,16 @@ async function act($, c) {
     default: throw new Error('csr: unknown call ' + c.m)
   }
 }
-async function settle($, r) {
+async function settle($, r, limit) {
   while (r.calls) {
     const results = []
     for (const c of r.calls) results.push(await act($, c).then(v => ({ id: c.id, v }), e => ({ id: c.id, err: String(e) })))
-    r = await post($, '/step', { id: r.id, results })
+    r = await post($, '/step', { id: r.id, results }, limit)
   }
   return r
 }
-async function run($, path, body) {
-  return settle($, await post($, path, { ...body, sid: await $.session.id(), cwd: await $.session.cwd() }))
+async function run($, path, body, limit) {
+  return settle($, await post($, path, { ...body, sid: await $.session.id(), cwd: await $.session.cwd() }, limit), limit)
 }
 function tree($, e, node, beneath) {
   if (node === '$beneath') return beneath
@@ -118,7 +138,8 @@ async function spawn($, e, again) {
   if (sock === mine) await run($, '/event', again ? { k: 'start', e, respawn: true } : { k: 'start', e }).catch(() => undefined)
 }
 async function gated($, k, e, next) {
-  const r = await run($, '/event', { k, e })
+  // A fork's seat (its plugin and tier) is on `next`, not in the event: the engine is told, beside the event.
+  const r = await run($, '/event', k === 'fork' && next.origin != null ? { k, e, origin: next.origin } : { k, e })
   if (r.answer !== undefined) return r.answer
   let sent = r.next === undefined ? e : r.next
   if (e && e.messages && sent.messages === undefined) {
@@ -175,7 +196,7 @@ function digit($, e, next) { return gated($, 'digit', e, next) }
 function marker($, e, next) { return gated($, 'marker', e, next) }
 function band($, e, next) { return drawn($, 'band', e, next) }
 function config($, e, next) { return gated($, 'config', e, next) }
-async function csr($, e) { return (await run($, '/event', { k: 'csr', e })).answer }
+async function csr($, e) { return (await run($, '/event', { k: 'csr', e }, SLOW)).answer }
 function carry($, e, next) { return gated($, 'carry', e, next) }
 function keep($, e, next) { return gated($, 'keep', e, next) }
 function pane($, e, next) { return drawn($, 'pane', e, next) }

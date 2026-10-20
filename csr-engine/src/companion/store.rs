@@ -11,7 +11,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// How long a write waits for another process's write before it gives up.
@@ -37,6 +37,24 @@ fn now_ms() -> f64 {
         .unwrap_or(0.)
 }
 
+/// Switch the file to WAL. SQLite does not run the busy handler for the switch of a fresh file,
+/// so two processes opening one new store at once can see `database is locked` here: try again
+/// until `BUSY` has gone by, as the handler would have.
+fn wal(conn: &Connection) -> Result<()> {
+    let began = Instant::now();
+    loop {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+            Ok(_) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy && began.elapsed() < BUSY =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 fn open(path: &Path) -> Result<Connection> {
     let folder = path.parent().context("the store path has no folder")?;
     // The file is made 0600 before SQLite sees it; SQLite gives `-wal` and `-shm` its mode.
@@ -44,7 +62,7 @@ fn open(path: &Path) -> Result<Connection> {
         .with_context(|| format!("preparing {}", path.display()))?;
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     conn.busy_timeout(BUSY)?;
-    conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))?;
+    wal(&conn)?;
     conn.execute_batch(
         "PRAGMA synchronous=NORMAL;
          CREATE TABLE IF NOT EXISTS kv (

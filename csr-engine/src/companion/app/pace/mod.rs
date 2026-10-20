@@ -37,8 +37,8 @@
 //! Differences from the TypeScript, each from the engine having no plugin around it:
 //! - `$.session.id()` is `cx.sid`; the options (`dreamsOn`) are read from `/config` where they are
 //!   needed, as `state::Options` does.
-//! - `isPerson` (the module's `person`) is the session's `interactive` from its start, else where
-//!   it draws (`session.surfaces`), asked once.
+//! - `isPerson` is `state::is_person`, the one every feature asks: the session's `interactive` from
+//!   its start, else where it draws (`session.surfaces`), asked once.
 //! - The `--keep` calls of pane.py are `Keep`, the in-process twin of the pane's `--keep` mode.
 //! - A pace's `turns` is kept as a list of `[key, receipt]` pairs: the store's JSON objects have
 //!   no order here, and the order is what the trimming of old turns goes by. A row written as an
@@ -46,7 +46,7 @@
 //! - The sweep reads the sessions that have a chapter with a read-only query of the store's own
 //!   file: `Store` has no call that lists sessions.
 
-use super::state::{config_rows, k, Options};
+use super::state::{config_rows, is_person, k, Options};
 use crate::companion::{
     db::Db,
     dreams,
@@ -573,8 +573,6 @@ pub struct Pace {
     pub fresh: bool,
     /// The chapter after that step's count (`changeChapter`'s result), when `fresh`.
     pub chapter: Option<Chapter>,
-    /// `isPerson`, asked of `session.surfaces` once where the session's start did not say.
-    person: Option<bool>,
     keep: Option<Keep>,
     pace_queue: Arc<tokio::sync::Mutex<()>>,
     chapter_queue: Arc<tokio::sync::Mutex<()>>,
@@ -636,23 +634,6 @@ fn default_keep() -> Keep {
 async fn write_keep(cx: &Ctx, record: Value) {
     let keep = (cx.kept(|p: &mut Pace| p.keep.clone())).unwrap_or_else(default_keep);
     keep(cx.cwd.clone(), record).await;
-}
-
-/// Whether a person is at this session (register.tsx `isPerson`): the session's start said so, or
-/// else it draws on some surface.
-pub async fn is_person(cx: &Ctx) -> bool {
-    if let Some(interactive) = cx.session.lock().ok().and_then(|s| s.interactive) {
-        return interactive;
-    }
-    if let Some(known) = cx.kept(|p: &mut Pace| p.person) {
-        return known;
-    }
-    let drawn = matches!(
-        cx.host.call("session.surfaces", vec![]).await,
-        Ok(Value::Array(surfaces)) if !surfaces.is_empty()
-    );
-    cx.kept(|p: &mut Pace| p.person = Some(drawn));
-    drawn
 }
 
 // ---------------------------------------------------------------- pace changes
