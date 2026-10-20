@@ -121,7 +121,7 @@ fn cli_rejects_unported_modes_with_exit_two() {
             "/fixture",
             "--frame",
             "--page",
-            "summary",
+            "nonesuch",
         ])
         .output()
         .unwrap();

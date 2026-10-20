@@ -401,6 +401,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let panics = epoch.clone();
     let mut restored = 0;
     let mut pane = Pane::new(paths.clone(), args);
+    pane.herdr = super::phone::Herdr::from_env(&paths.home);
     let mine = PidFile::new(&paths, args.sid.as_deref().unwrap_or(""))?;
     let mut beat = Heartbeat::start(
         mine.path.clone(),
@@ -463,6 +464,8 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
                 Ok(false) if reload.settled() => reload_error = None,
                 Ok(false) => (),
             }
+            // The Shift Map's hold is up and it folds: draw it now.
+            pressed |= pane.map_wait(now).1;
             if (boundary.failures > 0 && (boundary.ready(now) || pressed))
                 || (boundary.failures == 0 && (pressed || last.elapsed() >= Duration::from_secs(1)))
             {

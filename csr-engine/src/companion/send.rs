@@ -161,8 +161,16 @@ pub fn send_draft(agent: Option<&str>, text: &str, named: Option<&str>) -> bool 
     true
 }
 pub fn attached_session(paths: &Paths, agent: &str) -> Option<String> {
+    attached_session_with(paths, agent, &herdr)
+}
+/// `attached_session` through `call`, the function that runs herdr's CLI.
+pub fn attached_session_with(
+    paths: &Paths,
+    agent: &str,
+    call: &dyn Fn(&[&str]) -> Option<String>,
+) -> Option<String> {
     let info: Value =
-        serde_json::from_str(&herdr(&["pane", "process-info", "--pane", agent])?).ok()?;
+        serde_json::from_str(&call(&["pane", "process-info", "--pane", agent])?).ok()?;
     let p = &info["result"]["process_info"];
     let leader = array(&p["foreground_processes"])
         .iter()
@@ -178,7 +186,7 @@ pub fn attached_session(paths: &Paths, agent: &str) -> Option<String> {
             .find(|s| !s.starts_with('-'))?
             .to_owned()
     } else if args[1] == "agents" {
-        let v: Value = serde_json::from_str(&herdr(&["pane", "get", agent])?).ok()?;
+        let v: Value = serde_json::from_str(&call(&["pane", "get", agent])?).ok()?;
         let shown = &v["result"]["pane"]["agent_session"];
         if shown["kind"] != "id" {
             return None;
@@ -207,9 +215,25 @@ pub fn keep_like(paths: &Paths, act: &Value, liked: bool, now: f64) -> std::io::
         &paths.keep.join("likes.jsonl"),
         &(super::private::dumps(&json!({
             "key": key,
-            "source": act["source"],
-            "title": act["title"],
+            "source": act.get("like_source").filter(|s| super::truthy(s)).unwrap_or(&act["source"]),
+            "title": one_line(string(&act["title"]), 200),
             "liked": liked,
+            "at": now,
+        })) + "\n"),
+        &paths.keep,
+    )
+}
+/// One implicit signal on a Shift Map entry, as csr-engine's likes.rs reads it: `{key:
+/// shift:<sig>, source: story_map, signal: expand}`. It counts once per entry there. Nothing is
+/// ever sent to Claude.
+pub fn keep_shift_signal(paths: &Paths, sig: &str, title: &str, now: f64) -> std::io::Result<()> {
+    super::private::append(
+        &paths.keep.join("likes.jsonl"),
+        &(super::private::dumps(&json!({
+            "key": format!("shift:{sig}"),
+            "source": "story_map",
+            "signal": "expand",
+            "title": one_line(title, 200),
             "at": now,
         })) + "\n"),
         &paths.keep,
@@ -222,6 +246,10 @@ pub fn read_likes(paths: &Paths) -> Value {
         .lines()
     {
         if let Ok(v) = serde_json::from_str::<Value>(line) {
+            // An expand is no like.
+            if v.get("signal").is_some_and(|s| s != "explicit_like") {
+                continue;
+            }
             if let Some(key) = v["key"].as_str() {
                 likes[key] = json!(v["liked"] == true);
             }

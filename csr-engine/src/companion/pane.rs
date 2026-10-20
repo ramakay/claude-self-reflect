@@ -1,6 +1,6 @@
 use super::{
-    array, cli::PaneArgs, db::Db, dreams, feed::Feed, masthead, num, pages, paths::Paths,
-    render::text::*, send, session::Session, string,
+    array, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, info, masthead, num, pages,
+    paths::Paths, render::text::*, send, session::Session, string, threads, value,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -10,7 +10,63 @@ pub fn legend(
     width: usize,
     reload: Option<u64>,
 ) -> (String, Vec<(usize, usize, String)>) {
-    let mut words: Vec<(String, String)> = if view == "main" {
+    legend_parts(view, width, reload, Layout::default())
+}
+/// How the pane is laid out for the legend: on a phone, in column mode (a pane narrower than
+/// `COLUMN_UNDER`), or zoomed to a phone's whole screen.
+#[derive(Clone, Copy, Default)]
+pub struct Layout {
+    pub phone: bool,
+    pub column: bool,
+    pub zoomed: bool,
+}
+/// The bottom row and where each label sits on it: (text, [(first col, past last col, key)]).
+/// On a phone the main page's keys start short, one word each, and f goes; zoomed, `z split`
+/// gives the screen back to Claude. In column mode, the keys alone.
+pub fn legend_parts(
+    view: &str,
+    width: usize,
+    reload: Option<u64>,
+    layout: Layout,
+) -> (String, Vec<(usize, usize, String)>) {
+    let Layout {
+        phone,
+        column,
+        zoomed,
+    } = layout;
+    if column {
+        let mut keys: Vec<&str> = match view {
+            "main" => vec!["l", "s", "i", "q"],
+            "summary" | "threads" | "info" => vec!["d", "j/k", "q"],
+            _ => vec!["d", "q"],
+        };
+        while keys.len() > 1 && 1 + keys.join(" ").chars().count() > width {
+            keys.remove(keys.len() - 2);
+        }
+        let mut at = 1;
+        let spans = keys
+            .iter()
+            .map(|key| {
+                let span = (at, at + len(key), (*key).to_owned());
+                at += len(key) + 1;
+                span
+            })
+            .collect();
+        let shown = keys
+            .iter()
+            .map(|key| format!("{BOLD}{}{key}{OFF}", ink("you")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return (format!(" {shown}"), spans);
+    }
+    let mut words: Vec<(String, String)> = if view == "main" && phone {
+        let mut keys = vec![("l", "changes"), ("s", "summary"), ("i", "info")];
+        if zoomed {
+            keys.push(("z", "split"));
+        }
+        keys.push(("q", "close"));
+        keys
+    } else if view == "main" {
         vec![
             ("l", "changes since your sessions"),
             ("s", "compaction summary"),
@@ -18,13 +74,15 @@ pub fn legend(
             ("i", "session info"),
             ("q", "close"),
         ]
+    } else if matches!(view, "summary" | "threads" | "info") {
+        vec![("d", "back"), ("j/k", "scroll"), ("q", "close")]
     } else {
         vec![("d", "back"), ("q", "close")]
     }
     .into_iter()
     .map(|(a, b)| (a.into(), b.into()))
     .collect();
-    if let Some(seconds) = reload {
+    if let Some(seconds) = reload.filter(|_| view == "main") {
         let s = format!("↻ {seconds}s");
         let s = format!("{s}{}", " ".repeat(5_usize.saturating_sub(len(&s))));
         let n = words.len() - 1;
@@ -39,13 +97,13 @@ pub fn legend(
             - gap
             + 1
     };
-    let mut marks = if view == "main" {
+    let mut marks = if matches!(view, "main" | "summary" | "threads" | "info") {
         ""
     } else {
         "~ changed  - removed  + back   "
     }
     .to_owned();
-    if view == "main" {
+    if view == "main" && !phone {
         for (i, label) in [
             (0, "changes since your"),
             (0, "changes since"),
@@ -123,6 +181,14 @@ pub fn legend(
     (format!(" {}{marks}{OFF}{shown}", ink("faint")), spans)
 }
 
+/// What the info page's reads borrow from the pane while its session is also borrowed.
+struct Wide<'a> {
+    paths: &'a Paths,
+    db: Option<&'a Db>,
+    sid: &'a str,
+    persist: bool,
+}
+
 pub struct Pane {
     paths: Paths,
     persist: bool,
@@ -135,12 +201,17 @@ pub struct Pane {
     session: Option<Session>,
     pub view: String,
     pub open: Value,
-    sent: Value,
+    pub sent: Value,
     folds: Vec<Value>,
     feed: Feed,
     dreams: dreams::DreamLog,
     pub acts: BTreeMap<usize, Value>,
     pub top: usize,
+    pub info_top: usize,
+    pub threads_top: usize,
+    pub summary_top: usize,
+    spend: Option<value::Spend>,
+    narrative: Option<(Value, f64, Value)>,
     tall: bool,
     anchor: Option<(String, usize)>,
     pub loaded: f64,
@@ -152,6 +223,10 @@ pub struct Pane {
     picture_cache: super::render::pictures::Cache,
     pub session_picture: Option<super::render::raster::SessionFacts>,
     pub last_picture: Option<super::render::raster::LastFacts>,
+    map: super::shiftmap::MapState,
+    pub phone: super::phone::Phone,
+    /// This pane in herdr; set by the watch loop, absent in frame and test runs.
+    pub herdr: Option<super::phone::Herdr>,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -189,6 +264,11 @@ impl Pane {
             dreams: dreams::DreamLog::default(),
             acts: BTreeMap::new(),
             top: 0,
+            info_top: 0,
+            threads_top: 0,
+            summary_top: 0,
+            spend: None,
+            narrative: None,
             tall: false,
             anchor: None,
             loaded: 0.,
@@ -200,6 +280,9 @@ impl Pane {
             picture_cache,
             session_picture: None,
             last_picture: None,
+            map: Default::default(),
+            phone: Default::default(),
+            herdr: None,
         }
     }
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
@@ -226,6 +309,9 @@ impl Pane {
                 return out;
             }
         }
+        let phone = self.phone.read(self.herdr.as_ref(), cols, rows, now);
+        let column = cols < super::phone::COLUMN_UNDER;
+        self.phone.settle(self.herdr.as_ref(), column, phone);
         if self.sent[2].as_f64().is_some_and(|at| now - at > 6.) {
             if self.open == self.sent[0] {
                 self.open = Value::Null;
@@ -242,7 +328,12 @@ impl Pane {
             self.total = self.shifts.len();
             self.shifts.truncate(self.limit);
             self.loaded = now;
+            self.map.cost = self.db.as_ref().and_then(super::shiftmap::story_cost);
         }
+        if let Some(db) = self.db.as_ref() {
+            self.map.load(db, &self.paths, &self.sid);
+        }
+        let (refreshing, refresh_note) = self.map.poll(now);
         self.dreams.poll(&self.paths);
         let records = &self.dreams.records;
         let root = self.root.to_string_lossy();
@@ -252,7 +343,13 @@ impl Pane {
             .as_ref()
             .map(|db| pages::session_story(db, &self.paths, &self.sid))
             .unwrap_or(Value::Null);
-        let data = json!({
+        let mut data = json!({
+            "story_map": self.map.shown,
+            "story_map_from": self.map.from,
+            "story_map_messages": self.map.messages,
+            "refreshing": refreshing,
+            "refresh_note": refresh_note,
+            "story_cost": self.map.cost,
             "repo": root,
             "shifts": self.shifts,
             "total": self.total,
@@ -275,12 +372,25 @@ impl Pane {
         if let Some(session) = self.session.as_mut() {
             session.read_transcript(&self.paths);
         }
+        let summary = match (&self.session, self.view.as_str()) {
+            (Some(session), "summary") => threads::newest_summary(session.path.as_deref()),
+            _ => Value::Null,
+        };
+        let every = match (&self.session, self.view.as_str()) {
+            (Some(session), "threads") => threads::lost_value(&self.paths, session),
+            _ => vec![],
+        };
         if let Some(session) = &self.session {
             if session.data["last_session"].is_null() {
                 let previous = self.previous(&session.data);
                 self.session.as_mut().unwrap().data["last_session"] = previous;
             }
         }
+        let can_refresh = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.path.is_some())
+            && super::shiftmap::engine_binary().is_some();
         let mut empty = json!({"id":null});
         let s = self
             .session
@@ -300,16 +410,45 @@ impl Pane {
         self.last_picture = s["last_session"]
             .is_object()
             .then(|| super::render::raster::LastFacts::from_value(&s["last_session"]));
+        data["map_view"] = match self.map.motion(
+            now,
+            super::shiftmap::map_open(&self.open),
+            s["busy"] == true,
+        ) {
+            Some(open) => json!({ "open": open }),
+            None => Value::Null,
+        };
+        data["can_refresh"] = json!(can_refresh);
         let ui = json!({
             "pixels": self.pixels,
             "rows": rows,
+            "cols": cols,
+            "phone": phone,
+            "column": column,
             "now": now,
             "open": self.open,
             "sent": self.sent,
             "folds": self.folds,
             "likes": if self.exporting { Value::Null } else { send::read_likes(&self.paths) },
         });
-        let page = if self.view == "log" {
+        if self.view == "info" {
+            Self::info_data(
+                Wide {
+                    paths: &self.paths,
+                    db: self.db.as_ref(),
+                    sid: &self.sid,
+                    persist: self.persist,
+                },
+                (&mut self.narrative, &mut self.spend),
+                &mut data,
+                s,
+                now,
+            );
+        }
+        let extra = matches!(self.view.as_str(), "info" | "summary" | "threads");
+        let page = if extra {
+            Value::Null
+        } else if self.view == "log" {
             pages::page_log(&data)
         } else {
             let page = pages::page_main(&data, s, now, &ui, self.db.as_ref());
@@ -330,7 +469,33 @@ impl Pane {
             }
         };
         self.tall = self.view == "main" && (self.tall || self.top > 0 || self.open.is_string());
-        let mut lines = pages::draw_page(&page, cols, if self.tall { 10000 } else { rows }, &ui);
+        let mut lines = match self.view.as_str() {
+            "info" => {
+                let (lines, top) =
+                    info::draw_info(&data, s, cols, rows, self.info_top, now, self.pixels);
+                self.info_top = top;
+                lines
+            }
+            "summary" => {
+                let (lines, top) = threads::draw_summary(&summary, cols, rows, self.summary_top);
+                self.summary_top = top;
+                lines
+            }
+            "threads" => {
+                let (lines, top) = threads::draw_threads(
+                    &every,
+                    cols,
+                    rows,
+                    &self.open,
+                    &self.sent,
+                    self.threads_top,
+                    false,
+                );
+                self.threads_top = top;
+                lines
+            }
+            _ => pages::draw_page(&page, cols, if self.tall { 10000 } else { rows }, &ui),
+        };
         if self.exporting {
             return lines.rows;
         }
@@ -404,15 +569,21 @@ impl Pane {
         let mut body = body;
         body.resize(rows.saturating_sub(1), String::new());
         let countdown = (60. - (now - self.loaded)).ceil().max(0.) as u64;
-        let (foot, spans) = legend(
+        let (foot, spans) = legend_parts(
             &self.view,
             cols.saturating_sub(1),
-            if self.view == "main" {
+            if self.view == "main" && !column {
                 Some(countdown)
             } else {
                 None
             },
+            Layout {
+                phone,
+                column,
+                zoomed: self.phone.zoomed,
+            },
         );
+        self.phone.foot = Some((phone, column));
         self.acts.insert(
             rows - 1,
             json!({
@@ -422,6 +593,61 @@ impl Pane {
         );
         body.push(foot);
         body
+    }
+    /// What only the info page reads: the plan's week, what CSR cost in it, the infinite-session
+    /// rows and the facts under a running compaction.
+    fn info_data(
+        env: Wide,
+        (narrative_kept, spend_kept): (&mut Option<(Value, f64, Value)>, &mut Option<value::Spend>),
+        data: &mut Value,
+        s: &Value,
+        now: f64,
+    ) {
+        let Wide {
+            paths,
+            db,
+            sid,
+            persist,
+        } = env;
+        let plan = value::plan_of(&data["claude_fields"], &data["limits"], now);
+        let week = if plan["mode"] == "plan" {
+            plan["start"].clone()
+        } else {
+            plan["mode"].clone()
+        };
+        let stale = narrative_kept
+            .as_ref()
+            .is_none_or(|(key, at, _)| *key != week || now - at >= 60.);
+        if stale {
+            let narrative = db
+                .map(|db| value::narrative_week(db, num(&plan["start"])))
+                .unwrap_or_else(|| json!({}));
+            *narrative_kept = Some((week, now, narrative));
+        }
+        let narrative = narrative_kept.as_ref().map_or(json!({}), |n| n.2.clone());
+        let mut spent = Value::Null;
+        if plan["mode"] == "plan" {
+            let start = num(&plan["start"]);
+            let spend = spend_kept.get_or_insert_with(|| value::Spend::new(paths, persist));
+            let budget = if persist { 0.1 } else { 30. };
+            spend.step(start, now, std::time::Duration::from_secs_f64(budget));
+            if spend.ready && spend.start() == Some(start) {
+                spent = spend.total();
+            }
+        }
+        data["value"] = value::week_value(paths, &plan, &narrative, &spent);
+        data["plan"] = plan;
+        data["narrative"] = narrative;
+        data["spend"] = spent;
+        data["infinite"] = infinite::infinite_info(paths, sid, now, s);
+        if data["compacting"].is_object() {
+            let facts = db
+                .map(|db| {
+                    infinite::compaction_facts(db, sid, &data["story"], data["dreams_on"] == true)
+                })
+                .unwrap_or_default();
+            data["compacting"]["facts"] = json!(facts);
+        }
     }
     fn previous(&self, s: &Value) -> Value {
         if let Some(path) = self.paths.kept_file("previous", &self.sid) {
@@ -471,14 +697,36 @@ impl Pane {
                 self.view = if key == "d" { "main" } else { "log" }.into();
                 self.open = Value::Null;
             }
+            "s" | "f" | "i" => {
+                let view = match key {
+                    "s" => "summary",
+                    "f" => "threads",
+                    _ => "info",
+                };
+                self.view = if self.view == view { "main" } else { view }.into();
+                self.open = Value::Null;
+                match self.view.as_str() {
+                    "threads" => self.threads_top = 0,
+                    "info" => self.info_top = 0,
+                    _ => (),
+                }
+            }
             "r" => {
                 self.loaded = 0.;
                 self.hold = None;
+            }
+            "escape" if matches!(self.view.as_str(), "summary" | "threads" | "info") => {
+                self.view = "main".into();
+                self.open = Value::Null;
             }
             "escape" => {
                 self.open = Value::Null;
                 self.top = 0;
                 self.tall = false;
+            }
+            "m" => self.map_key(),
+            "z" => {
+                self.phone.zoom_key(self.herdr.as_ref());
             }
             "j" | "down" => self.scroll(3),
             "k" | "up" => self.scroll(-3),
@@ -487,13 +735,103 @@ impl Pane {
         }
         true
     }
+    /// m: open the Shift Map on the main page at its full size, or fold it again. Nothing
+    /// happens with no map to open, or on another page.
+    fn map_key(&mut self) {
+        if self.view != "main" || !self.map.shown.is_object() {
+            return;
+        }
+        if super::shiftmap::map_open(&self.open) {
+            self.open = Value::Null;
+            self.sent = Value::Null;
+        } else {
+            self.open = json!("shifts");
+            self.sent = Value::Null;
+            self.tall = true;
+        }
+    }
+    /// (seconds for the watch loop's wait, whether to draw a frame now): a frame once the Shift
+    /// Map's hold is up and it folds.
+    pub fn map_wait(&self, now: f64) -> (f64, bool) {
+        self.map.wait(now)
+    }
     pub fn scroll(&mut self, step: isize) {
-        if self.view == "main" {
-            self.top = self.top.saturating_add_signed(step);
+        let top = match self.view.as_str() {
+            "main" => &mut self.top,
+            "summary" => &mut self.summary_top,
+            "threads" => &mut self.threads_top,
+            "info" => &mut self.info_top,
+            _ => return,
+        };
+        *top = top.saturating_add_signed(step);
+    }
+    /// A click on a thread's answers: drop and later are kept in the log; the two asks are typed
+    /// into Claude's prompt, unsent, and kept as sent.
+    fn lost_click(&mut self, act: &Value, col: usize, now: f64) {
+        let pick = array(&act["spans"])
+            .iter()
+            .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
+            .map(|s| string(&s[2]).to_owned());
+        let project = threads::project_of(self.session.as_ref());
+        match pick.as_deref() {
+            Some(pick @ ("drop" | "later")) => threads::keep_lost(
+                &self.paths,
+                string(&act["lost"]),
+                pick,
+                now,
+                project.as_deref(),
+                json!({}),
+            ),
+            Some(pick @ ("side" | "sub")) => {
+                let agent = send::agent_pane(self.agent.as_deref());
+                let ask = string(&act["asks"][pick]).to_owned();
+                let handoff = if pick == "sub" {
+                    threads::new_handoff(&self.paths, &self.sid, string(&act["lost"]))
+                } else {
+                    None
+                };
+                let went = match &handoff {
+                    Some((_, envelope)) => send::send_draft(
+                        agent.as_deref(),
+                        &format!("{ask}\n{envelope}"),
+                        self.agent.as_deref(),
+                    ),
+                    None => send::send_text(agent.as_deref(), &ask),
+                };
+                self.sent = json!([act["item"], went, now]);
+                if went {
+                    let more = match &handoff {
+                        Some((request, _)) => json!({"how": pick, "request": request}),
+                        None => json!({"how": pick}),
+                    };
+                    threads::keep_lost(
+                        &self.paths,
+                        string(&act["lost"]),
+                        "sent",
+                        now,
+                        project.as_deref(),
+                        more,
+                    );
+                }
+                send::focus_back();
+            }
+            _ => (),
         }
     }
     pub fn click(&mut self, row: usize, col: usize, now: f64) -> bool {
-        let Some(act) = self.acts.get(&row).cloned() else {
+        let act = self.acts.get(&row).cloned();
+        // On a phone's narrow column a tap anywhere but the legend and the masthead (the i
+        // page) fills the screen.
+        if self.phone.foot == Some((true, true))
+            && self.view == "main"
+            && !act
+                .as_ref()
+                .is_some_and(|a| a["key"] == "legend" || string(&a["key"]).starts_with("view:"))
+        {
+            self.phone.zoom_key(self.herdr.as_ref());
+            return true;
+        }
+        let Some(act) = act else {
             self.open = Value::Null;
             return true;
         };
@@ -502,7 +840,7 @@ impl Pane {
                 .iter()
                 .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
             {
-                if matches!(string(&span[2]), "d" | "l" | "r") {
+                if matches!(string(&span[2]), "d" | "l" | "r" | "s" | "f" | "i" | "z") {
                     return self.key(string(&span[2]));
                 }
                 return true;
@@ -516,6 +854,10 @@ impl Pane {
                 let _ = send::keep_like(&self.paths, &act, likes[key] != true, now);
                 return true;
             }
+        }
+        if act["lost"].is_string() && act["spans"].is_array() {
+            self.lost_click(&act, col, now);
+            return true;
         }
         if let Some(span) = array(&act["spans"])
             .iter()
@@ -540,11 +882,19 @@ impl Pane {
             self.hold = None;
             return true;
         }
+        if !array(&act["spans"]).is_empty() {
+            // A click that misses a row's answers closes whatever is open.
+            self.open = Value::Null;
+            return true;
+        }
         let key = string(&act["key"]);
         if let Some(view) = key.strip_prefix("view:") {
-            if matches!(view, "main" | "log") {
+            if matches!(view, "main" | "log" | "info" | "summary" | "threads") {
                 self.view = view.into();
                 self.open = Value::Null;
+                if view == "info" {
+                    self.info_top = 0;
+                }
             }
             return true;
         }
@@ -565,6 +915,28 @@ impl Pane {
             self.top = 0;
             return true;
         }
+        if act["refresh"] == true {
+            // The shift map's refresh: csr-engine tells the story again, detached; the pane
+            // waits for a new telling.
+            let cwd = self
+                .session
+                .as_ref()
+                .and_then(|s| super::session::session_record(&self.paths, &s.id))
+                .and_then(|record| record["cwd"].as_str().map(str::to_owned))
+                .filter(|cwd| !cwd.is_empty())
+                .unwrap_or_else(|| self.root.to_string_lossy().into_owned());
+            let transcript = self
+                .session
+                .as_ref()
+                .and_then(|s| s.path.as_ref())
+                .map(|p| p.to_string_lossy().into_owned());
+            self.map.start_refresh(
+                super::shiftmap::engine_binary(),
+                transcript.as_deref(),
+                &cwd,
+            );
+            return true;
+        }
         if act["key"] != self.open {
             self.open = act["key"].clone();
             if self.view == "main" {
@@ -572,10 +944,32 @@ impl Pane {
             }
             self.sent = Value::Null;
             self.hold = None;
+            if let Some(sig) = act["expand"].as_str() {
+                // Opening an entry is the expand signal: kept once, never sent anywhere.
+                let _ = send::keep_shift_signal(&self.paths, sig, string(&act["title"]), now);
+            }
+        } else if act["nosend"] == true {
+            // A report is its words, not yours: a second click folds the row, it sends nothing.
+            self.open = if act["expand"].is_string() {
+                json!("shifts")
+            } else {
+                Value::Null
+            };
+            self.sent = Value::Null;
         } else {
             let agent = send::agent_pane(self.agent.as_deref());
             let went = send::send_text(agent.as_deref(), string(&act["send"]));
             self.sent = json!([act["key"], went, now]);
+            if went && act["lost"].is_string() {
+                threads::keep_lost(
+                    &self.paths,
+                    string(&act["lost"]),
+                    "sent",
+                    now,
+                    threads::project_of(self.session.as_ref()).as_deref(),
+                    json!({"how": "side"}),
+                );
+            }
             if went && act["dream"].is_string() {
                 let _ = dreams::keep(
                     &self.paths,

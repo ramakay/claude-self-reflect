@@ -1,0 +1,1322 @@
+[
+ {
+  "hold": null,
+  "scenario": "fresh-then-fold",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1005.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1013.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": true,
+    "due": 7.0
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": null,
+  "scenario": "old",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": null,
+  "scenario": "pinned",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1014.0,
+    "pinned": true,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1015.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": null,
+  "scenario": "busy",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1021.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": null,
+  "scenario": "new-revision",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1100.5,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1120.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": null,
+  "scenario": "no-map",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": null,
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1002.0,
+    "pinned": true,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": 12.0
+   }
+  ]
+ },
+ {
+  "hold": "0",
+  "scenario": "fresh-then-fold",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1005.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1013.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "0",
+  "scenario": "old",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "0",
+  "scenario": "pinned",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1014.0,
+    "pinned": true,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1015.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "0",
+  "scenario": "busy",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1021.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "0",
+  "scenario": "new-revision",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1100.5,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1120.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "0",
+  "scenario": "no-map",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": null,
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1002.0,
+    "pinned": true,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "3",
+  "scenario": "fresh-then-fold",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1005.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1013.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 3.0
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "3",
+  "scenario": "old",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "3",
+  "scenario": "pinned",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1014.0,
+    "pinned": true,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1015.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 3.0
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "3",
+  "scenario": "busy",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1021.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 3.0
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "3",
+  "scenario": "new-revision",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1100.5,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1120.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": 3.0
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "3",
+  "scenario": "no-map",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": null,
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1002.0,
+    "pinned": true,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 3.0
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": 3.0
+   }
+  ]
+ },
+ {
+  "hold": "junk",
+  "scenario": "fresh-then-fold",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1005.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1013.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": true,
+    "due": 7.0
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "junk",
+  "scenario": "old",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "junk",
+  "scenario": "pinned",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1014.0,
+    "pinned": true,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1015.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "junk",
+  "scenario": "busy",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1020.0,
+    "pinned": false,
+    "busy": true
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1021.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": true,
+    "due": null
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "junk",
+  "scenario": "new-revision",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 500.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1100.5,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 5,
+     "at": 1100.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1120.0,
+    "pinned": false,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": false,
+    "due": null
+   }
+  ]
+ },
+ {
+  "hold": "junk",
+  "scenario": "no-map",
+  "steps": [
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1000.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": null,
+    "now": 1001.0,
+    "pinned": false,
+    "busy": false
+   },
+   {
+    "map": {
+     "rev": 4,
+     "at": 990.0,
+     "entries": [
+      1
+     ]
+    },
+    "now": 1002.0,
+    "pinned": true,
+    "busy": false
+   }
+  ],
+  "out": [
+   {
+    "open": true,
+    "due": 12.0
+   },
+   {
+    "open": false,
+    "due": null
+   },
+   {
+    "open": true,
+    "due": 12.0
+   }
+  ]
+ }
+]

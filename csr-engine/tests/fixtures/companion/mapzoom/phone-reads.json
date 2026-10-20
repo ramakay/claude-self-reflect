@@ -1,0 +1,249 @@
+{
+ "is_mobile": [
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 1, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": true
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 1, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": true
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 1, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": true
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 50, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": true
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 50, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": true
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 50, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 64, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": true
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 64, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 64, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 65, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 65, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 65, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 122, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 122, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 122, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 0, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 0, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 0, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": -3, \"height\": 40}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": -3, \"height\": 40}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": -3, \"height\": 40}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "not json",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "not json",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "not json",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": true}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": true}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": true}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 50.0}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 50.0}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": 50.0}}}}",
+   "threshold": 49,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": \"50\"}}}}",
+   "threshold": 64,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": \"50\"}}}}",
+   "threshold": 50,
+   "out": false
+  },
+  {
+   "layout": "{\"result\": {\"layout\": {\"area\": {\"width\": \"50\"}}}}",
+   "threshold": 49,
+   "out": false
+  }
+ ],
+ "threshold": [
+  {
+   "config": "",
+   "out": 64
+  },
+  {
+   "config": "[ui]\nmobile_width_threshold = 80\n",
+   "out": 80
+  },
+  {
+   "config": "[ui]\nmobile_width_threshold = 0\n",
+   "out": 64
+  },
+  {
+   "config": "[ui]\nmobile_width_threshold = true\n",
+   "out": 64
+  },
+  {
+   "config": "[ui]\nmobile_width_threshold = \"80\"\n",
+   "out": 64
+  },
+  {
+   "config": "[ui]\nother = 1\n",
+   "out": 64
+  },
+  {
+   "config": "[other]\nmobile_width_threshold = 99\n",
+   "out": 64
+  },
+  {
+   "config": "ui = 5\n",
+   "out": 64
+  },
+  {
+   "config": "this is = = not toml",
+   "out": 64
+  },
+  {
+   "config": "[ui]\nmobile_width_threshold = -4\n",
+   "out": 64
+  },
+  {
+   "config": "[ui]\nmobile_width_threshold = 80.5\n",
+   "out": 64
+  },
+  {
+   "config": null,
+   "out": 64
+  }
+ ]
+}

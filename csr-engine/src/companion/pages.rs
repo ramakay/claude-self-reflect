@@ -1,5 +1,7 @@
 use super::render::pictures::{Picture, Wanted};
 use super::{array, db::Db, dreams, masthead, num, render::text::*, send, string};
+/// The masthead's first rows: a click anywhere on them opens the i page.
+const MASTHEAD_CLICK: usize = 2;
 const PIC: &str = "\x1b[8m\x1b[28m";
 use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
@@ -213,7 +215,7 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
     };
     let story = &data["story"];
     let rights = story_rights(story, now);
-    let story_items = if story.is_null() {
+    let mut story_items = if story.is_null() {
         vec![]
     } else {
         vec![json!({
@@ -231,6 +233,7 @@ pub fn page_main(data: &Value, s: &Value, now: f64, ui: &Value, db: Option<&Db>)
             ),
         })]
     };
+    story_items.extend(super::shiftmap::map_items(data, s, ui));
     let dream_at = earlier
         .iter()
         .chain(if starred { Some(star) } else { None })
@@ -1156,19 +1159,17 @@ pub fn draw_page(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     }
     for (row, (text, ground)) in top.iter().zip(grounds).enumerate() {
         out.rows.push(on_dark(text, ground));
-        out.acts.insert(
-            row,
-            json!({
-                "key": "view:info",
-            }),
-        );
+        if row < MASTHEAD_CLICK {
+            out.acts.insert(row, json!({"key": "view:info"}));
+        }
     }
     let mut built = vec![];
     for s in array(&page["sections"]) {
         let name = string(&s["name"]);
         let mut blocks: Vec<(Vec<String>, Value)> = vec![];
         for item in array(&s["items"]) {
-            let is_open = ui["open"] == item["key"];
+            let is_open = ui["open"] == item["key"]
+                || (item["key"] == "shifts" && super::shiftmap::map_open(&ui["open"]));
             let heart = ui["likes"].as_object().and_then(|likes| {
                 let key = item["like"].as_str().unwrap_or(string(&item["key"]));
                 (name != "earlier"

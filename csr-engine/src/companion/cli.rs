@@ -135,7 +135,10 @@ pub fn run(args: &CompanionArgs) -> i32 {
                 };
             }
             if !(args.watch || args.frame || args.png.is_some())
-                || !matches!(args.page.as_str(), "main" | "log")
+                || !matches!(
+                    args.page.as_str(),
+                    "main" | "log" | "info" | "summary" | "threads"
+                )
             {
                 eprintln!("companion pane: not yet ported");
                 return 2;
