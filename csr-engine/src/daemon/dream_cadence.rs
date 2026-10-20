@@ -186,7 +186,8 @@ pub const FLOOR_HOUR_ENV: &str = "CSR_DREAM_FLOOR_HOUR";
 /// a long-running daemon import) would otherwise defer the pass forever —
 /// the 2026-10-18 to 2026-10-20 stall.
 pub const DEFAULT_FLOOR_GRACE_HOURS: u64 = 6;
-/// Documented override for [`DEFAULT_FLOOR_GRACE_HOURS`] (1–168).
+/// Documented override for [`DEFAULT_FLOOR_GRACE_HOURS`] (1–23: the grace is
+/// measured from the latest daily boundary, so 24 or more would never expire).
 pub const FLOOR_GRACE_ENV: &str = "CSR_DREAM_FLOOR_GRACE_HOURS";
 
 /// What started a cycle.
@@ -301,7 +302,10 @@ pub fn floor_due(
     }
 }
 
-/// Configured floor grace in seconds. Anything outside 1–168 hours falls back.
+/// Configured floor grace in seconds. Anything outside 1–23 hours falls back
+/// to the default. The grace is measured from the most recent daily floor
+/// boundary (see [`floor_grace_expired`]), which resets every 24 hours, so a
+/// value of 24 or more could never expire.
 pub fn floor_grace_secs() -> u64 {
     floor_grace_secs_from(std::env::var(FLOOR_GRACE_ENV).ok().as_deref())
 }
@@ -309,7 +313,7 @@ pub fn floor_grace_secs() -> u64 {
 /// Pure core of [`floor_grace_secs`].
 pub fn floor_grace_secs_from(raw: Option<&str>) -> u64 {
     raw.and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|&hours| hours > 0 && hours <= 24 * 7)
+        .filter(|&hours| (1..24).contains(&hours))
         .unwrap_or(DEFAULT_FLOOR_GRACE_HOURS)
         * 3600
 }
@@ -1398,12 +1402,41 @@ mod tests {
     }
 
     #[test]
+    fn a_30h_grace_request_still_runs_a_never_idle_machine() {
+        let now = ts(0);
+        // What CSR_DREAM_FLOOR_GRACE_HOURS=30 resolves to.
+        let config = CadenceConfig {
+            floor_grace_secs: floor_grace_secs_from(Some("30")),
+            ..cfg(6 * 3600, 1800)
+        };
+        // Never idle, two floors missed: 09:30 local is 6.5h past the boundary.
+        assert_eq!(
+            choose_trigger(
+                Some(now - Duration::seconds(5)),
+                Some(now - Duration::hours(40)),
+                now,
+                naive("2026-08-11 09:30:00"),
+                Some(naive("2026-08-09 13:00:00")),
+                config,
+            ),
+            CadenceDecision::Run(Trigger::NightlyFloor),
+            "an out-of-range grace must not defer a busy machine forever"
+        );
+    }
+
+    #[test]
     fn floor_grace_falls_back_on_garbage() {
         assert_eq!(
             floor_grace_secs_from(None),
             DEFAULT_FLOOR_GRACE_HOURS * 3600
         );
         assert_eq!(floor_grace_secs_from(Some("2")), 7200);
+        assert_eq!(floor_grace_secs_from(Some("23")), 23 * 3600);
+        assert_eq!(
+            floor_grace_secs_from(Some("24")),
+            DEFAULT_FLOOR_GRACE_HOURS * 3600,
+            "24h or more is measured from a boundary that resets daily and could never expire"
+        );
         assert_eq!(
             floor_grace_secs_from(Some("0")),
             DEFAULT_FLOOR_GRACE_HOURS * 3600
