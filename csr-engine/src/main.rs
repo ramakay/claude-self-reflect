@@ -92,12 +92,16 @@ enum Commands {
     },
     /// Handle Claude Code hook events
     Hook {
-        /// Hook name: session-start, session-end, precompact, stop, post-tool-use, prompt-submit, install, subagent-stop (deprecated, no-op)
+        /// Hook name: session-start, session-end, precompact, stop, stop-work (internal: the detached worker stop starts), post-tool-use, prompt-submit, install, subagent-stop (deprecated, no-op)
         name: String,
 
         /// For install: auto-apply to settings.json
         #[arg(long)]
         apply: bool,
+
+        /// For stop-work: the spool key (the session) whose Stop input to process
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Run the enrichment daemon (file watcher + Layer 2 + Layer 3)
     Daemon {
@@ -1972,7 +1976,12 @@ async fn run(
         return csr_engine::summarizer::generate_story_cli(&eng, transcript, cwd, mode).await;
     }
 
-    if let Some(Commands::Hook { ref name, apply }) = args.command {
+    if let Some(Commands::Hook {
+        ref name,
+        apply,
+        ref session,
+    }) = args.command
+    {
         if name == "install" {
             return csr_engine::hooks::install::handle(apply);
         }
@@ -2013,6 +2022,23 @@ async fn run(
             return Ok(());
         }
 
+        // The detached worker `hook stop` starts: it reads its input from the
+        // spool, not from stdin, and builds its own engine.
+        if name == "stop-work" {
+            if let Some(parent) = args.db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let Some(key) = session.as_deref() else {
+                return Ok(());
+            };
+            return csr_engine::hooks::stop_work::worker_main(
+                &args.db_path,
+                &args.projects_dir,
+                key,
+            )
+            .await;
+        }
+
         // Other hooks need the engine
         if let Some(parent) = args.db_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -2027,6 +2053,20 @@ async fn run(
         let stdin_started = std::time::Instant::now();
         let input = csr_engine::hooks::read_stdin_json();
         let stdin_elapsed = stdin_started.elapsed();
+        // Stop returns at once: the transcript work moves to a detached worker.
+        // Before the engine is built, so the fast path pays for none of it. A
+        // `false` (kill switch, no session id, spool or spawn failure) falls
+        // through to the inline handler below, so no Stop is lost.
+        if name == "stop"
+            && csr_engine::hooks::stop_work::detach_stop(
+                &args.db_path,
+                &args.projects_dir,
+                &input,
+                stdin_elapsed,
+            )
+        {
+            return Ok(());
+        }
         // PostToolUse now fires for every Bash call. One that wrote no file has
         // nothing to record: leave before the engine, the database and the
         // transcript import are touched.

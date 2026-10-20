@@ -25,6 +25,7 @@ pub mod session_end;
 pub mod session_start;
 pub mod statusline_retire;
 pub mod stop;
+pub mod stop_work;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

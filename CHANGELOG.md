@@ -312,6 +312,15 @@ c7188044, 5e762cc6, 4eca3ec4, and the #316 installer rewrite (9cfb1229).
   still-open chunks first (one indexed query, at most 500) and returns when there are none. In a test with 100,000
   chunks and 10 completed tasks it went from 443 ms to 0.09 ms (20,000 chunks: 81 ms to 0.11 ms). A still-open chunk
   that bm25 ranked below the top 3 is now proposed.
+- A Stop hook still held Claude Code for every pass over the transcript: 8.9 s on this repo's 163.5 MB transcript
+  (4.8 s on EnhanceMe), and since Oct 19 a mean of 46 s and a max of 399 s over 102 Stops here. The hook now writes
+  its input to `stop-work/<session>.json`, starts a detached `hook stop-work` worker and exits; it prints nothing
+  before or after. On that transcript (168 MB by now, worker lock held so no worker ran) the hook returns in 6 ms,
+  median of 7 runs (max 8.6 ms); on a 50 MB conversation transcript the old inline hook was still running when it
+  was killed at 565 s, the new one returned in 6 ms. The worker runs the same handler, at most one per session; a
+  Stop that lands while it runs is processed after it, so the last input always is. `CSR_STOP_INLINE=1`, or a spool
+  or spawn failure, runs it inline as before. The episode and the `source=compact` task anchor now appear when the
+  worker finishes, not before the Stop returns.
 - prompt-submit asks the daemon over a private socket within a deadline and fails open (3651e549, 8e473f5e)
   [untraced: empty bodies; from the `src/hooks/prompt_transport.rs` doc]. The daemon index takes rows other
   processes write (a9f252f5, 1414dc1b) [untraced: subject only].
