@@ -267,3 +267,70 @@ test('a gated call that fails is still told to the engine, as a deny, and then f
   const after = only(seen.posts, '/after').find(p => p.body.k === 'marker')
   expect(typeof after?.body.result.deny).toBe('string')
 })
+
+// The guard fails closed where the engine armed it. What the engine's guard.arm call hands the relay is a regex source
+// (the Rust test `the_relay_fixture_carries_the_pattern_the_engine_builds` holds PATTERN equal to `armed_pattern` of a
+// push-only guard) and a reason; the relay tests that one regex when its post to the engine fails.
+const PATTERN = String.raw`(?:^|[^A-Za-z0-9_.-])git[^A-Za-z0-9_-](?:[\s\S]*[^A-Za-z0-9_-])?push(?:[^A-Za-z0-9_-]|$)|(?:^|[^A-Za-z0-9_-])push[^A-Za-z0-9_-](?:[\s\S]*[^A-Za-z0-9_.-])?git(?:[^A-Za-z0-9_-]|$)`
+const DOWN = 'the engine is not answering'
+const arms = (state: unknown) => ({ id: 'a1', calls: [{ id: 'c1', m: 'guard.arm', a: [state] }] })
+const bash = ($: any, command: string) => $.tool.call({ tool: 'Bash', command } as never)
+
+test('a guard that is armed denies a push while the engine is down, and passes the git commands that cannot push', async ($, on) => {
+  const options = { fetchFails: false }
+  const seen = world(on, (path, body) => (path === '/event' && body.k === 'start' ? arms({ pattern: PATTERN, reason: DOWN }) : {}), alive, options)
+  await $.session.start(START as never)
+  options.fetchFails = true // the engine goes away after it armed the relay
+  for (const command of ['git push', 'bash -c "git push"', 'cd x && git push -f', 'git -C /r push origin HEAD', 'cat <<EOF | bash\ngit push origin release/v9\nEOF']) {
+    const before = seen.seen.tools
+    expect(JSON.stringify(await bash($, command))).toContain(DOWN)
+    expect(seen.seen.tools).toBe(before) // next never ran
+  }
+  for (const command of ['git status', 'git log --oneline', 'ls', 'gitk --all']) {
+    const before = seen.seen.tools
+    expect(JSON.stringify(await bash($, command))).toContain('file text')
+    expect(seen.seen.tools).toBe(before + 1)
+  }
+})
+
+test("a guard that is armed and an engine that answers get the engine's verdict, never the relay's", async ($, on) => {
+  const seen = world(on, (path, body) => {
+    if (path === '/event' && body.k === 'start') return arms({ pattern: PATTERN, reason: DOWN })
+    if (path === '/event' && body.k === 'guard' && String(body.e.command).includes('release')) return { answer: { deny: 'engine says no' } }
+    return {}
+  })
+  await $.session.start(START as never)
+  const denied = JSON.stringify(await bash($, 'git push origin release/v9'))
+  expect(denied).toContain('engine says no')
+  expect(denied).not.toContain(DOWN)
+  expect(seen.seen.tools).toBe(0)
+  // the engine let this push through, though the armed pattern matches it: the relay does not second-guess
+  expect(JSON.stringify(await bash($, 'git push origin main'))).toContain('file text')
+  expect(seen.seen.tools).toBe(1)
+})
+
+test('with no guard armed, or the guard disarmed again, an engine that is down lets every command through', async ($, on) => {
+  const state = { next: 'none' }
+  const options = { fetchFails: false }
+  const seen = world(on, (path, body) => {
+    if (path !== '/event' || body.k !== 'guard') return {}
+    if (state.next === 'arm') return arms({ pattern: PATTERN, reason: DOWN })
+    if (state.next === 'disarm') return arms(null) // the guard file went away
+    return {}
+  }, alive, options)
+  await $.session.start(START as never)
+  options.fetchFails = true // never armed
+  expect(JSON.stringify(await bash($, 'git push'))).toContain('file text')
+  options.fetchFails = false
+  state.next = 'arm'
+  expect(JSON.stringify(await bash($, 'git status'))).toContain('file text') // the engine answers, and arms the relay
+  options.fetchFails = true
+  expect(JSON.stringify(await bash($, 'git push'))).toContain(DOWN) // armed now, so the same push is denied
+  options.fetchFails = false
+  state.next = 'disarm'
+  expect(JSON.stringify(await bash($, 'git status'))).toContain('file text')
+  options.fetchFails = true
+  expect(JSON.stringify(await bash($, 'git push'))).toContain('file text') // disarmed again
+  expect(JSON.stringify(await bash($, 'bash -c "git push"'))).toContain('file text')
+  expect(seen.seen.tools).toBe(5)
+})

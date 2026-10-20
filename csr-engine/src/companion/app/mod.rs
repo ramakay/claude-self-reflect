@@ -56,7 +56,7 @@ pub fn table() -> Table {
     t
 }
 
-/// The finished table: each key's features in the order they run (45 entries).
+/// The finished table: each key's features in the order they run (46 entries).
 #[cfg(test)]
 const TARGET: &[(&str, &[&str])] = &[
     ("stop", &["compactor"]),
@@ -93,7 +93,7 @@ const TARGET: &[(&str, &[&str])] = &[
     ("carry", &["carry"]),
     ("keep", &["subagent"]),
     ("pane", &["pane_cmd"]),
-    ("press", &["setup_walk"]),
+    ("press", &["pane_cmd", "setup_walk"]),
     ("measure", &["usage"]),
 ];
 
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn the_table_registers_each_feature_where_the_map_puts_it() {
         let t = table();
-        assert_eq!(TARGET.iter().map(|(_, f)| f.len()).sum::<usize>(), 45);
+        assert_eq!(TARGET.iter().map(|(_, f)| f.len()).sum::<usize>(), 46);
         for key in t.keys() {
             let want = TARGET.iter().find(|(k, _)| *k == key);
             assert!(want.is_some(), "{key} is not a key the map names");
@@ -134,6 +134,9 @@ mod tests {
             "pace",
             "story",
             "subagent",
+            "guard",
+            "pane_cmd",
+            "dreamer",
         ];
         for (key, want) in TARGET {
             let only = |list: &[&str]| -> Vec<String> {

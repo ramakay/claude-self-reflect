@@ -1750,7 +1750,7 @@ mod relay {
             .find_map(|l| l.trim().strip_suffix(" pass"))
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0);
-        assert_eq!(passed, 13, "{text}");
+        assert_eq!(passed, 16, "{text}");
     }
 
     #[test]

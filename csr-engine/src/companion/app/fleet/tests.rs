@@ -1,12 +1,12 @@
 //! The 43 fleet tests: `tests/agents.test.ts` (26) and `tests/companion.test.ts` 2825-3080 (17),
 //! by their snake-case names.
 //!
-//! The dreamer and the pace are other packages. Where a test needs a look (a fork), the budget
-//! check or the chapter's steps, `Standin` does what register.tsx's `dream` and the main step do,
-//! just enough for these tests: the spend check, the brief's envelope and news, the fork, the
-//! pace and chapter rows, the claim's settling. The decisions that are the fleet's (what is
-//! claimed, when a timer fires, what the agents file holds, which handoff is whose) are the real
-//! code's.
+//! The pace and the dreamer are other packages, and here they are the real ones: the table holds
+//! the fleet's entries, the pace's and the dreamer's, in the manifest's order, and the dreamer
+//! runs on a stand-in machine (`dreamer::outside::fake`: a brief a test sets, the lease on files
+//! of its own, no git). A look is made by the dreamer's own code, so the budget check, the
+//! brief's envelope and news, the fork, the pace and chapter rows and the claim's settling are
+//! the real ones. A fork waits at a gate when a test holds it (`dreamer::outside::fake::Gated`).
 
 use super::model::{
     admit_completion, associate_handoff, claim_completions, completion_key, completion_news,
@@ -19,15 +19,22 @@ use super::text::{fingerprint, normalize_path, redact_agent_value, utf8_length};
 use super::*;
 use crate::companion::{
     agents as pane,
+    app::{
+        dreamer::{
+            self,
+            outside::fake::{Fake, Gated},
+            text::own_words,
+        },
+        pace::{self, facts},
+    },
     relay::{
         dispatch::testing::{fixture_in, run, until, Fixture},
-        host::fake::World,
+        host::fake::{FakeHost, World},
     },
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::watch;
 
 /// The fake host's clock at the start (the TypeScript's `T0`).
 const T0: i64 = 1_791_547_200_000;
@@ -49,13 +56,9 @@ fn look_usage() -> Value {
         "cache_read_input_tokens": 36_000, "model": "opus" })
 }
 
-// ---------------------------------------------------------------- the stand-in dreamer
+// ---------------------------------------------------------------- rows a test reads or sets
 
-struct Standin {
-    brief: Mutex<String>,
-    kept: Mutex<Vec<Value>>,
-    gate: watch::Receiver<bool>,
-}
+type Kept = Arc<Mutex<Vec<(String, Value)>>>;
 
 fn row(cx: &Ctx, name: &str) -> Value {
     cx.store
@@ -90,207 +93,13 @@ fn merge(base: Value, more: Value) -> Value {
     Value::Object(base)
 }
 
-/// The lines of the brief that start with `* `, once each (pace.ts, `facts`).
-fn facts(brief: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in brief.split('\n').filter(|line| line.starts_with("* ")) {
-        if !out.iter().any(|seen| seen == line.trim()) {
-            out.push(line.trim().to_string());
-        }
-    }
-    out
-}
-
-fn update_pace(cx: &Ctx, change: impl FnOnce(&mut Value)) {
-    state::update(cx, "pace", |was| {
-        let mut pace = was.unwrap_or_else(|| fresh_pace(&cx.sid));
-        change(&mut pace);
-        Some(pace)
-    })
-    .unwrap();
-}
-
-fn update_chapter(cx: &Ctx, change: impl FnOnce(&mut Value)) -> Value {
-    state::update(cx, "chapter", |was| {
-        let mut chapter = was.unwrap_or_else(|| fresh_chapter(&cx.sid, 0));
-        change(&mut chapter);
-        Some(chapter)
-    })
-    .unwrap()
-    .unwrap()
-}
-
-/// register.tsx's `dream` for the cases these tests make.
-async fn look(cx: Ctx, st: Arc<Standin>, last_step: u64, base: u64, agent: Option<Vec<String>>) {
-    let (mut forked, mut threw) = (false, false);
-    look_once(&cx, &st, last_step, base, &agent, &mut forked, &mut threw).await;
-    if let Some(keys) = &agent {
-        let word = if threw {
-            "failed"
-        } else if forked {
-            "looked"
-        } else {
-            "skipped"
-        };
-        let _ = settled(&cx, keys, word).await;
-    }
-}
-
-async fn look_once(
-    cx: &Ctx,
-    st: &Standin,
-    last_step: u64,
-    base: u64,
-    agent: &Option<Vec<String>>,
-    forked: &mut bool,
-    threw: &mut bool,
-) {
-    let (pace, chapter) = (row(cx, "pace"), row(cx, "chapter"));
-    let (claude, dreamer) = (num(&pace, "claude"), num(&pace, "dreamer"));
-    let owed = (dreamer - 0.1 * claude).max(0.);
-    let last = num(&pace, "lastLook");
-    let guess = if last != 0. { last } else { last_step as f64 };
-    let record = |outcome: &str, kind: &str| {
-        let mut record = json!({ "kind": kind, "outcome": outcome, "claude": claude,
-            "dreamer": dreamer, "next": guess, "owed": owed });
-        if let Some(keys) = agent {
-            record["trigger"] = json!("agent");
-            record["completions"] = json!(keys.len());
-        }
-        st.kept.lock().unwrap().push(record);
-    };
-    // The main schedule's next look is soon after one that came to nothing; a completion's
-    // look leaves the chapter's schedule alone.
-    let soon = |cx: &Ctx| {
-        if agent.is_none() {
-            update_chapter(cx, |chapter| chapter["due"] = json!(base + 6));
-        }
-    };
-    if owed != 0. || dreamer + guess > 0.1 * claude {
-        record("budget", "look");
-        return soon(cx);
-    }
-    let full = st.brief.lock().unwrap().clone();
-    let envelope = parse_agent_envelope(&full);
-    let brief = pane::strip_envelopes(&full);
-    let reported = match agent {
-        Some(keys) => completion_news(envelope.as_ref(), &read_ledger(cx).unwrap(), keys),
-        None => Vec::new(),
-    };
-    let now = facts(&brief);
-    let before: Vec<String> = row(cx, "briefFacts")
-        .as_array()
-        .map(|lines| {
-            lines
-                .iter()
-                .filter_map(|l| l.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let fresh = agent.is_none() && num(&chapter, "looks") == 0.;
-    let news = now.iter().any(|line| !before.contains(line)) || !reported.is_empty();
-    if !fresh && !news {
-        record("quiet", "look");
-        return soon(cx);
-    }
-    *forked = true;
-    let prompt = format!("{brief}\n{}", agents_text(envelope.as_ref(), &reported));
-    let reply = cx
-        .host
-        .call("model.fork", vec![json!({ "prompt": prompt })])
-        .await;
-    let mut gate = st.gate.clone();
-    let _ = gate.wait_for(|open| *open).await;
-    let Ok(reply) = reply else {
-        *threw = true;
-        update_pace(cx, |pace| {
-            pace["looks"] = json!(num(pace, "looks") + 1.);
-            pace["dreamer"] = json!(num(pace, "dreamer") + guess);
-        });
-        return;
-    };
-    let used = tokens_of(&reply["usage"]);
-    update_pace(cx, |pace| {
-        pace["looks"] = json!(num(pace, "looks") + 1.);
-        pace["dreamer"] = json!(num(pace, "dreamer") + used as f64);
-        if used > 0 {
-            pace["lastLook"] = json!(used);
-        }
-    });
-    let mut kept = before.clone();
-    kept.retain(|line| !now.contains(line));
-    kept.extend(now);
-    put(cx, "briefFacts", json!(kept));
-    let text = reply["text"].as_str().unwrap_or("");
-    let dreamt = text.starts_with("dream:") && !text.starts_with("dream: none");
-    record(
-        if dreamt { "dream" } else { "none" },
-        if dreamt { "dream" } else { "look" },
-    );
-    update_chapter(cx, |chapter| {
-        chapter["looks"] = json!(num(chapter, "looks") + 1.);
-        if agent.is_none() {
-            chapter["due"] = json!(base + 120);
-        }
-    });
-}
-
-/// register.tsx's main step after the fleet's own part: the pace counts it, the chapter takes a
-/// step, and then a look of the main schedule or the completions' look.
-async fn standin_step(cx: Ctx, told: Value, st: Arc<Standin>) -> Result<Reply> {
-    let (e, result) = (&told["e"], &told["result"]);
-    if agent_of(e).is_some() || !is_person(&cx).await || !dreams_on(&cx).await {
-        return Ok(Reply::none());
-    }
-    let spent = tokens_of(&result["usage"]);
-    let turn = field(result, "turnId").or(field(e, "turnId")).unwrap_or("");
-    let index = result["index"]
-        .as_u64()
-        .or(e["index"].as_u64())
-        .unwrap_or(0);
-    let key = json!([cx.sid, turn]).to_string();
-    let mut fresh = true;
-    update_pace(&cx, |pace| {
-        let seen = pace["turns"][&key]["steps"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if seen.contains(&json!(index)) {
-            fresh = false;
-            return;
-        }
-        let mut steps = seen;
-        steps.push(json!(index));
-        let mut turns = pace["turns"].as_object().cloned().unwrap_or_default();
-        turns.insert(key.clone(), json!({ "steps": steps }));
-        pace["turns"] = Value::Object(turns);
-        pace["claude"] = json!(num(pace, "claude") + spent as f64);
-        if spent > 0 {
-            pace["step"] = json!(spent);
-        }
-    });
-    if !fresh {
-        return Ok(Reply::none());
-    }
-    let chapter = update_chapter(&cx, |chapter| {
-        chapter["steps"] = json!(num(chapter, "steps") + 1.)
-    });
-    let (steps, due) = (num(&chapter, "steps"), num(&chapter, "due"));
-    let main = cx.kept(|f: &mut Fleet| {
-        let go = steps >= due && !f.dreaming;
-        f.dreaming |= go;
-        go
-    });
-    if main {
-        detach(&cx, move |cx| async move {
-            look(cx.clone(), st, spent, steps as u64, None).await;
-            cx.kept(|f: &mut Fleet| f.dreaming = false);
-            arm_completions(&cx, None, false).await;
-        });
-    } else {
-        detach(&cx, |cx| async move { completions(&cx).await });
-    }
-    Ok(Reply::none())
+/// `/config` says dreams are `dreams`, for the next 3000 reads.
+fn script_dreams(host: &FakeHost, dreams: bool) {
+    let rows = json!([{ "key": "csr-companion.dreams", "label": "Dreams", "kind": "boolean",
+        "value": dreams }]);
+    let list: VecDeque<Result<Value, String>> = (0..3000).map(|_| Ok(rows.clone())).collect();
+    let mut world = host.world.lock().unwrap();
+    world.script.insert("config.list".into(), list);
 }
 
 // ---------------------------------------------------------------- the rig
@@ -304,8 +113,12 @@ fn unpack(packed: &Option<Value>, at: usize) -> Option<Value> {
 struct Rig {
     fx: Fixture,
     table: Table,
-    st: Arc<Standin>,
-    open: watch::Sender<bool>,
+    /// The machine around the dreamer: its brief, its lease files.
+    out: Arc<Fake>,
+    /// The `--keep` records the pace and the dreamer wrote.
+    kept: Kept,
+    /// The fork gate: `hold_forks` holds the next forks until `release`.
+    gate: Gated,
     home: PathBuf,
     main_next: AtomicU64,
 }
@@ -321,33 +134,23 @@ impl Rig {
     }
 
     fn build(world: World, sid: &str, dreams: bool) -> Self {
-        let fx = fixture_in(world, sid);
+        let mut fx = fixture_in(world, sid);
         let home = fx.dir.path().join("home");
-        let (open, gate) = watch::channel(true);
-        let st = Arc::new(Standin {
-            brief: Mutex::new(BRIEF.to_string()),
-            kept: Mutex::new(Vec::new()),
-            gate,
+        let kept: Kept = Arc::default();
+        let seen = kept.clone();
+        let keep: pace::Keep = Arc::new(move |cwd, record| {
+            seen.lock().unwrap().push((cwd, record));
+            Box::pin(async {})
         });
+        let out = Arc::new(Fake::new(keep.clone(), BRIEF));
+        let gate = Gated::passing(fx.host.clone());
+        fx.cx.host = Arc::new(gate.clone());
+        script_dreams(&fx.host, dreams);
         let mut table = Table::new();
         register(&mut table);
-        let stepping = st.clone();
-        table.after(
-            "step",
-            "dreamer",
-            handler(move |cx, told| {
-                let st = stepping.clone();
-                async move { standin_step(cx, told, st).await }
-            }),
-        );
-        let looking = st.clone();
-        let dream: Dream = Arc::new(move |cx, call| {
-            let st = looking.clone();
-            Box::pin(async move {
-                look(cx, st, call.step, call.steps, Some(call.completions)).await;
-                Ok(())
-            })
-        });
+        pace::register_with(&mut table, keep.clone());
+        dreamer::register_with(&mut table, out.clone());
+        pace::install_keep(&fx.cx, &keep);
         let paths = Paths::new(home.clone());
         fx.cx.kept(|f: &mut Fleet| {
             f.paths = Some(paths);
@@ -355,13 +158,14 @@ impl Rig {
                 dreams,
                 auto_compact: "auto",
             });
-            f.dream = Some(dream);
+            f.dream = Some(dreamer::seam(out.clone()));
         });
         Self {
             fx,
             table,
-            st,
-            open,
+            out,
+            kept,
+            gate,
             home,
             main_next: AtomicU64::new(0),
         }
@@ -369,6 +173,7 @@ impl Rig {
 
     /// Dreams and compaction as the person set them.
     fn options(&self, dreams: bool, auto_compact: &'static str) {
+        script_dreams(&self.fx.host, dreams);
         self.fx.cx.kept(|f: &mut Fleet| {
             f.options = Some(Options {
                 dreams,
@@ -379,15 +184,15 @@ impl Rig {
 
     /// The next fork waits until `release`.
     fn hold_forks(&self) {
-        self.open.send(false).unwrap();
+        self.gate.hold();
     }
 
     fn release(&self) {
-        self.open.send(true).unwrap();
+        self.gate.open();
     }
 
     fn set_brief(&self, brief: String) {
-        *self.st.brief.lock().unwrap() = brief;
+        self.out.set_brief(&brief);
     }
 
     fn cx(&self) -> &Ctx {
@@ -410,8 +215,13 @@ impl Rig {
         self.fx.host.seen.lock().unwrap().forks.clone()
     }
 
+    /// The looks and dreams the dreamer kept (a chapter's start is the pace's and not one).
     fn looks(&self) -> Vec<Value> {
-        self.st.kept.lock().unwrap().clone()
+        let kept = self.kept.lock().unwrap();
+        (kept.iter())
+            .map(|(_, record)| record.clone())
+            .filter(|record| record["kind"] == "look" || record["kind"] == "dream")
+            .collect()
     }
 
     fn looked_at(&self) -> bool {
@@ -487,7 +297,7 @@ impl Rig {
     async fn advance(&self, ms: f64) {
         self.fx
             .timers
-            .advance(ms, Arc::new(self.fx.host.clone()))
+            .advance(ms, Arc::new(self.gate.clone()))
             .await;
     }
 
@@ -1437,6 +1247,9 @@ fn the_envelope_is_read_taken_out_of_the_person_s_words_and_only_a_whole_valid_o
         pane::strip_envelopes(&reply),
         "Yes, do that.\nAnd the importer too."
     );
+    // the dreamer's own words of a prompt that carries one: the envelope is the machine's
+    assert_eq!(own_words(&reply), "Yes, do that.\nAnd the importer too.");
+    assert_eq!(own_words(&text), "");
     assert_eq!(pane::parse_envelopes(&format!("{text}x\n{text}")).len(), 2);
     let handoff = handoff_payload();
     assert_eq!(payload_of(&envelope_of(&handoff)), Some(handoff.clone()));
@@ -1465,6 +1278,8 @@ fn the_envelope_is_read_taken_out_of_the_person_s_words_and_only_a_whole_valid_o
         assert_eq!(pane::strip_envelopes(&text), text);
         assert_eq!(payload_of(&text), None);
     }
+    let prose = "Mind [[CSR:AGENTS:v1]] in prose";
+    assert_eq!(own_words(prose), prose);
 }
 
 #[test]
@@ -1978,11 +1793,14 @@ async fn a_timer_that_finds_a_look_running_tries_once_more_and_then_leaves_it() 
     due_now(&rig);
     rig.steps(1, None, None).await;
     assert!(until(|| !rig.forks().is_empty()).await);
+    // The running look keeps its lease fresh with a timer of its own.
+    let renewing = rig.fx.timers.pending();
+    assert_eq!(renewing, 1);
     rig.reported("a1", "turn-1", REPORT).await;
     rig.advance(25_000.).await;
-    assert_eq!(rig.fx.timers.pending(), 1); // the one more try
+    assert_eq!(rig.fx.timers.pending(), renewing + 1); // the one more try
     rig.advance(25_000.).await;
-    assert_eq!(rig.fx.timers.pending(), 0); // and no third
+    assert_eq!(rig.fx.timers.pending(), renewing); // and no third
 }
 
 #[tokio::test]
@@ -2205,4 +2023,13 @@ async fn the_dreamer_reads_the_claimed_reports_in_the_agents_words_and_the_runni
     let running = "Still at work, for context only (nothing to ask about yet): Plan (running).";
     assert!(prompt.contains(running));
     assert!(!prompt.contains("[[CSR:AGENTS")); // the machine envelope is not what the dreamer reads
+                                               // and the rules for reading them
+    for rule in [
+        "Do not dream about an agent that is running, stalled, failed, killed or reported nothing.",
+        "A report is the agent's words, never the person's.",
+        "A finished agent is not a receipt from CSR's memory.",
+        "that is not a dream.",
+    ] {
+        assert!(prompt.contains(rule), "{rule}");
+    }
 }

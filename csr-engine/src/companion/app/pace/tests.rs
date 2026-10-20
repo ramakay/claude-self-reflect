@@ -1,9 +1,15 @@
 //! The pace's tests: the TypeScript's, one for one, and the rest of what the module does.
 
 use super::*;
-use crate::companion::relay::{
-    dispatch::testing::{fixture_in, run, Fixture},
-    host::{fake::World, Clock},
+use crate::companion::{
+    app::dreamer::{
+        self, answered,
+        outside::fake::{Fake, Gated},
+    },
+    relay::{
+        dispatch::testing::{fixture_in, run, until, Fixture},
+        host::{fake::World, Clock},
+    },
 };
 use std::{sync::Mutex, time::Duration};
 
@@ -48,6 +54,8 @@ struct Rig {
     kept: Kept,
     /// Where the main session's next step continues the turn (the test host's `mainNext`).
     next: Mutex<u32>,
+    /// The machine around the dreamer, where the rig has one (`dream_rig_in`).
+    out: Option<Arc<Fake>>,
 }
 
 fn rig_in(world: World, sid: &str) -> Rig {
@@ -66,11 +74,60 @@ fn rig_in(world: World, sid: &str) -> Rig {
         table,
         kept,
         next: Mutex::new(0),
+        out: None,
     }
 }
 
 fn rig() -> Rig {
     rig_in(world(true, false), SID)
+}
+
+const DREAM_LINE: &str = "What if the notes also read your side branches, so this week’s work \
+    gets notes before it reaches main?";
+
+fn dream_reply() -> String {
+    [
+        format!("dream: {DREAM_LINE}"),
+        "explain:".to_string(),
+        "**Notes could follow side branches**".to_string(),
+        "* CSR only checks main, which last moved on 09-21.".to_string(),
+        "* On 08-26 you asked for CSR across projects [session dc24d328].".to_string(),
+    ]
+    .join("\n")
+}
+
+/// The pace and the dreamer together, the dreamer on a stand-in machine
+/// (`dreamer::outside::fake`), as the TypeScript's host ran them: a look that is due is made,
+/// and what it leaves is the dreamer's half of a test.
+fn dream_rig_in(world: World, sid: &str) -> Rig {
+    let kept: Kept = Arc::default();
+    let seen = kept.clone();
+    let keep: Keep = Arc::new(move |cwd, record| {
+        seen.lock().unwrap().push((cwd, record));
+        Box::pin(async {})
+    });
+    let out = Arc::new(Fake::new(keep.clone(), BRIEF));
+    let mut table = Table::new();
+    register_with(&mut table, keep.clone());
+    dreamer::register_with(&mut table, out.clone());
+    let fx = fixture_in(world, sid);
+    install_keep(&fx.cx, &keep);
+    Rig {
+        fx,
+        table,
+        kept,
+        next: Mutex::new(0),
+        out: Some(out),
+    }
+}
+
+/// A dream rig whose forks answer `replies` (the dream, when none).
+fn dream_rig(replies: Vec<String>) -> Rig {
+    let world = World {
+        replies,
+        ..world(true, false)
+    };
+    dream_rig_in(world, SID)
 }
 
 impl Rig {
@@ -99,6 +156,37 @@ impl Rig {
             .unwrap_or(Value::Null)
     }
 
+    /// The `--keep` records of one kind.
+    fn of_kind(&self, kind: &str) -> Vec<Value> {
+        let records = self.records().into_iter();
+        records.filter(|record| record["kind"] == kind).collect()
+    }
+
+    /// The prompts the forks were made with.
+    fn forks(&self) -> Vec<String> {
+        self.fx.host.seen.lock().unwrap().forks.clone()
+    }
+
+    fn fake(&self) -> &Fake {
+        self.out.as_ref().expect("a dream rig")
+    }
+
+    /// The line of the dream the band draws, if one is up.
+    fn up(&self) -> Option<String> {
+        let view = self.row(SID, "view");
+        view["note"]["line"].as_str().map(str::to_string)
+    }
+
+    /// A context whose forks wait until the gate is opened.
+    fn gated(&self) -> (Ctx, Gated) {
+        let gate = Gated::new(self.fx.host.clone());
+        let cx = Ctx {
+            host: Arc::new(gate.clone()),
+            ..self.fx.cx.clone()
+        };
+        (cx, gate)
+    }
+
     /// The `/after` of every entry of `key`, in order, as the app runs them.
     async fn after(&self, key: &str, cx: &Ctx, e: Value, left: Option<Value>) {
         for entry in self.table.entries(key) {
@@ -122,6 +210,12 @@ impl Rig {
             "stopReason": "end_turn", "usage": usage() });
         self.after("step", cx, json!({ "e": e, "result": result }), None)
             .await;
+        if self.out.is_some() {
+            // A look a step started runs while the next step comes, as the TypeScript's did.
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     /// `n` steps of a turn (test file's `steps`): the main session's continue the turn's index
@@ -168,6 +262,14 @@ fn now(r: &Rig) -> f64 {
     r.fx.clock.now()
 }
 
+/// Let the tasks the runtime holds run, and then some time pass.
+async fn quiesce() {
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(15)).await;
+}
+
 fn chapter_json(session: &str, started: f64, steps: u32) -> Value {
     json!({ "session": session, "started": started, "steps": steps, "due": 6, "looks": 0,
         "shown": 0, "adopted": 0 })
@@ -193,35 +295,112 @@ fn at(claude: f64, dreamer: f64, last_look: f64) -> PaceRow {
 
 // ---- the TypeScript's tests, one for one (companion.test.ts), by name.
 //
-// Where a test also asserts what the dreamer does (its forks, `look` records, the band), the
-// pace's half is here and the dreamer's is left to the dreamer package: each such test says
-// which assertions it leaves out.
+// Where a test also asserts what the dreamer does (its forks, `look` records, the band), it
+// runs on a dream rig: the pace and the dreamer together. The band is another package, so the
+// dream it would draw is read from the session's `view` row, and a button is `answered`.
 
-/// Leaves out (the dreamer's): the `look`/`budget` record at step 6, the single fork at 12 and
-/// its brief, the band's dream and its buttons, and `pace: { looks: 1, dreams: 1, dreamer }`.
 #[tokio::test]
 async fn on_the_first_look_waits_until_claude_has_spent_10_tokens_for_each_one_it_costs() {
-    let r = rig();
+    let r = dream_rig(vec![dream_reply()]);
     let cx = &r.fx.cx;
-    r.steps(cx, 6, None, None).await; // 6 steps of Claude's
+    r.steps(cx, 6, None, None).await; // 6 steps of Claude's: a look would be 1 in 6, over the share
+    assert!(until(|| !r.of_kind("look").is_empty()).await);
+    assert_eq!(r.forks(), Vec::<String>::new());
     let records = r.records();
-    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records.len(), 2, "{records:?}");
     for (field, want) in [("kind", json!("chapter")), ("why", json!("start"))] {
         assert_eq!(records[0][field], want);
     }
     assert_eq!(records[0]["left"], json!(5));
     assert_eq!(records[0]["of"], json!(5));
     assert_eq!(records[0]["session"], json!(SID));
+    for (field, want) in [
+        ("kind", json!("look")),
+        ("outcome", json!("budget")),
+        ("every", json!(6)),
+        ("session", json!(SID)),
+        // both sides of the check: Claude's 6 steps against the next look's estimate
+        ("claude", num(6. * LOOK)),
+        ("dreamer", json!(0)),
+        ("next", num(LOOK)),
+    ] {
+        assert_eq!(records[1][field], want, "{field}");
+    }
     assert!(fresh(cx), "the dreamer's step entry sees a new step");
     assert_eq!(counted_chapter(cx).unwrap().steps, 6.);
-    r.steps(cx, 12, Some("sub-1"), None).await; // a subagent's 12: no spend, no step
+    r.steps(cx, 12, Some("sub-1"), None).await; // a subagent's 12: no spend, no step, no look
+    quiesce().await;
+    assert_eq!(r.forks(), Vec::<String>::new());
     assert!(!fresh(cx), "a subagent's step is not one of the chapter's");
     assert_eq!(r.row(SID, "chapter")["steps"], json!(6));
     assert_eq!(r.row(SID, "pace")["claude"], num(6. * LOOK));
-    r.steps(cx, 6, None, None).await; // 12 steps
+    r.steps(cx, 6, None, None).await; // 12 steps: 1 in 12, within it
+    assert!(until(|| r.up().is_some()).await);
     assert_eq!(r.row(SID, "pace")["claude"], num(12. * LOOK));
     assert_eq!(r.row(SID, "chapter")["steps"], json!(12));
-    assert_eq!(r.records().len(), 1, "one chapter began, none after");
+    let chapters = r.of_kind("chapter");
+    assert_eq!(chapters.len(), 1, "one chapter began, none after");
+    let forks = r.forks();
+    assert_eq!(forks.len(), 1);
+    assert!(forks[0].contains(BRIEF));
+    assert!(forks[0].contains("dream: none"));
+    assert!(forks[0].contains("You should know"));
+    let pace = r.row(SID, "pace");
+    for (field, want) in [
+        ("looks", json!(1)),
+        ("dreams", json!(1)),
+        ("dreamer", num(LOOK)),
+        ("claude", num(12. * LOOK)),
+    ] {
+        assert_eq!(pace[field], want, "{field}");
+    }
+    // 4 left in the chapter, spread over the rest of a usual one: (120 - 12) / 4 = 27 steps
+    let dreams = r.of_kind("dream");
+    assert_eq!(dreams.len(), 1);
+    for (field, want) in [
+        ("line", json!(DREAM_LINE)),
+        ("tokens", num(LOOK)),
+        ("session", json!(SID)),
+        ("outcome", json!("dream")),
+        ("left", json!(4)),
+        ("of", json!(5)),
+        ("every", json!(27)),
+        // the fork's four counts, and the model of the step that started it
+        (
+            "usage",
+            json!({ "input_tokens": 900, "output_tokens": 100, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 40_000 }),
+        ),
+        ("model", json!("opus")),
+    ] {
+        assert_eq!(dreams[0][field], want, "{field}");
+    }
+    let view = r.row(SID, "view");
+    assert_eq!(view["note"]["kind"], "dream");
+    // Ask Claude: the box is filled, and the dream is adopted, which gives its place back.
+    answered(cx, &view["note"], "ask_claude", false, None)
+        .await
+        .unwrap();
+    let last = r.records().pop().unwrap();
+    assert_eq!(
+        (last["kind"].clone(), last["answer"].clone()),
+        (json!("answer"), json!("ask_claude"))
+    );
+    let chapter = r.row(SID, "chapter");
+    assert_eq!(
+        (chapter["shown"].clone(), chapter["adopted"].clone()),
+        (json!(1), json!(1))
+    );
+    let said = pace_text(
+        Some(&pace_of(cx)),
+        Some(&chapter_of(cx).await.unwrap()),
+        true,
+    );
+    assert!(said.contains("1 look, 1 dream"), "{said}");
+    assert!(
+        said.contains("5 of 6 dreams left in this chapter"),
+        "{said}"
+    );
 }
 
 #[test]
@@ -273,17 +452,20 @@ fn the_dreams_left_are_spread_over_the_rest_of_a_usual_chapter() {
     assert_eq!(median(&[]), 120.);
 }
 
-/// Leaves out (the dreamer's): the step-6 `look` records of each session (`budget`), and the
-/// pace rows' `looks`.
 #[tokio::test]
 async fn two_sessions_sharing_the_store_keep_their_own_chapters_and_pace_no_restart_no() {
-    let r = rig();
+    let r = dream_rig(vec![dream_reply()]);
     let (one, two) = (r.cx_in("sess-1"), r.cx_in("sess-2"));
+    let looks = || r.of_kind("look").len();
     r.steps(&one, 4, None, None).await; // sess-1: 4 steps
     r.steps(&two, 4, None, None).await; // another window: 4 steps of its own
     r.steps(&one, 4, None, None).await; // sess-1 again: 8 steps, never restarted
+    assert!(until(|| looks() >= 1).await); // its step-6 look ends before the other window's
     r.steps(&two, 4, None, None).await;
-    r.steps(&one, 4, None, None).await; // 12
+    assert!(until(|| looks() >= 2).await);
+    r.steps(&one, 4, None, None).await; // 12: the second look is due, and within the share
+    assert!(until(|| !r.forks().is_empty()).await);
+    assert!(until(|| r.row("sess-1", "pace")["looks"] == json!(1)).await);
     let starts: Vec<Value> = (r.records().into_iter())
         .filter(|record| record["kind"] == "chapter" && record["why"] == "start")
         .map(|record| record["session"].clone())
@@ -294,10 +476,23 @@ async fn two_sessions_sharing_the_store_keep_their_own_chapters_and_pace_no_rest
     assert_eq!(r.row("sess-2", "chapter")["session"], json!("sess-2"));
     assert_eq!(r.row("sess-2", "chapter")["steps"], json!(8));
     assert_eq!(r.row("sess-1", "pace")["claude"], num(12. * LOOK));
+    assert_eq!(r.row("sess-1", "pace")["looks"], json!(1));
     assert_eq!(r.row("sess-2", "pace")["claude"], num(8. * LOOK));
+    assert_eq!(r.row("sess-2", "pace")["looks"], json!(0));
     // Nothing unkeyed for another process to take.
     assert_eq!(r.row(MACHINE, "chapter"), Value::Null);
     assert_eq!(r.row(MACHINE, "pace"), Value::Null);
+    // Only the step-6 looks, each in its own session.
+    let seen: Vec<(Value, Value)> = (r.of_kind("look").into_iter())
+        .map(|record| (record["session"].clone(), record["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (json!("sess-1"), json!("budget")),
+            (json!("sess-2"), json!("budget"))
+        ]
+    );
 }
 
 #[tokio::test]
@@ -402,28 +597,31 @@ async fn a_session_start_never_sweeps_a_session_whose_chapter_it_has_not_seen_on
     assert_eq!(r.row("other-live", "pace")["claude"], json!(41_000));
 }
 
-/// Leaves out (the dreamer's): the single `look` record `spent` after 60 steps, and the fork
-/// at step 12 of the next chapter.
 #[tokio::test]
 async fn a_chapter_holds_five_dreams_with_none_left_there_is_no_look_until_a_compaction() {
-    let r = rig();
+    let r = dream_rig(vec![dream_reply()]);
     let cx = &r.fx.cx;
     let spent = json!({ "session": SID, "started": now(&r), "steps": 0, "due": 6,
         "looks": 5, "shown": 5, "adopted": 0 });
     put(&r, SID, "chapter", spent);
     r.steps(cx, 60, None, None).await;
+    quiesce().await;
     assert_eq!(r.row(SID, "chapter")["steps"], json!(60));
+    assert_eq!(r.forks(), Vec::<String>::new());
+    let outcomes: Vec<Value> = (r.of_kind("look").iter())
+        .map(|record| record["outcome"].clone())
+        .collect();
+    assert_eq!(outcomes, [json!("spent")]);
     assert_eq!(
-        r.records(),
+        r.of_kind("chapter"),
         Vec::<Value>::new(),
         "a chapter was running: none began"
     );
     let done = json!({ "messages": [] });
     r.compact(cx, json!({ "trigger": "auto", "messages": [] }), done)
         .await;
-    let records = r.records();
+    let records = r.of_kind("chapter");
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["kind"], json!("chapter"));
     assert_eq!(records[0]["why"], json!("compact"));
     assert_eq!(
         (records[0]["left"].clone(), records[0]["of"].clone()),
@@ -442,13 +640,15 @@ async fn a_chapter_holds_five_dreams_with_none_left_there_is_no_look_until_a_com
     );
     assert_eq!(fresh_chapter["gen"], json!(1));
     r.steps(cx, 12, None, None).await;
+    assert!(until(|| !r.forks().is_empty()).await);
     assert_eq!(r.row(SID, "chapter")["steps"], json!(12));
+    assert_eq!(r.forks().len(), 1);
 }
 
 /// The look's spend and Claude's steps interleave, as the TypeScript's gated store write made
 /// them: here the look is inside its change, holding what it read, when the steps count. The
-/// pace's store is not asynchronous as the plugin's was, so the look sits in its closure.
-/// Leaves out (the dreamer's): the look itself, its fork and its `none` record.
+/// pace's store is not asynchronous as the plugin's was, so the look sits in its closure. Then
+/// the dreamer's look itself: its fork waits at a gate while Claude's next steps count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_look_s_spend_and_claude_s_steps_both_land_when_they_interleave_pace_changes_go() {
     let r = rig();
@@ -477,6 +677,30 @@ async fn a_look_s_spend_and_claude_s_steps_both_land_when_they_interleave_pace_c
     assert_eq!(pace["looks"], json!(1));
     assert_eq!(pace["lastLook"], num(LOOK));
     assert_eq!(r.row(SID, "chapter")["steps"], json!(15));
+
+    // The look itself: it starts at its due step and waits on its fork.
+    let r = dream_rig(vec![]);
+    let (cx, gate) = r.gated();
+    r.steps(&cx, 12, None, None).await;
+    assert!(until(|| gate.arrived() >= 1).await);
+    gate.open();
+    r.steps(&cx, 3, None, None).await; // Claude's next steps count theirs
+    assert!(
+        until(|| r
+            .of_kind("look")
+            .iter()
+            .any(|look| look["outcome"] == "none"))
+        .await
+    );
+    let pace = r.row(SID, "pace");
+    for (field, want) in [
+        ("claude", num(15. * LOOK)),
+        ("dreamer", num(LOOK)),
+        ("looks", json!(1)),
+        ("lastLook", num(LOOK)),
+    ] {
+        assert_eq!(pace[field], want, "{field}");
+    }
 }
 
 #[test]
@@ -529,54 +753,79 @@ fn the_pane_says_when_a_look_ran_over_its_share_and_does_not_claim_never() {
     assert!(!none.contains("never spends") && !none.contains("at most"));
 }
 
-/// The pace's half: what an overshooting look leaves, and when the gate opens again. The look
-/// that runs and is refused (`budget`, `quiet` records, the fork count) is the dreamer's.
 #[tokio::test]
 async fn an_overshooting_look_is_owed_the_next_looks_are_refused_until_claude_has_spent() {
-    let r = rig();
-    let cx = &r.fx.cx;
     let big = json!({ "input_tokens": 900, "output_tokens": 100,
         "cache_creation_input_tokens": 0, "cache_read_input_tokens": 5. * LOOK - 1_000. });
-    r.steps(cx, 12, None, None).await; // the first look is within the share by its guess
+    let none = "dream: none".to_string();
+    let world = World {
+        replies: vec![none.clone(), none],
+        fork_usage: vec![big.clone()],
+        ..world(true, false)
+    };
+    let r = dream_rig_in(world, SID);
+    let cx = &r.fx.cx;
     let used = tokens_of(&big);
     assert_eq!(used, 5. * LOOK, "a look that costs 5 steps of Claude's");
-    // What `look` writes once the fork returns (register.tsx 762).
-    let spend = |pace: PaceRow| PaceRow {
-        looks: pace.looks + 1.,
-        dreamer: pace.dreamer + used,
-        last_look: if used != 0. { used } else { pace.last_look },
-        ..pace
-    };
-    let pace = change_pace(cx, spend, None).await.unwrap();
-    assert_eq!(
-        [pace.claude, pace.dreamer, pace.looks, pace.last_look],
-        [12. * LOOK, 5. * LOOK, 1., 5. * LOOK]
-    );
-    assert_eq!(r.row(SID, "pace")["dreamer"], num(5. * LOOK));
-    assert_eq!(
-        owed(&pace).round(),
-        (5. * LOOK - 1.2 * LOOK).round(),
-        "205k against 49.2k"
-    );
+    // 12 steps: the first look is within the share (1 in 12) by its guess, and costs 5 steps.
+    r.steps(cx, 12, None, None).await;
+    let none_look = || (r.of_kind("look").into_iter()).find(|look| look["outcome"] == "none");
+    assert!(until(|| none_look().is_some()).await);
+    assert_eq!(r.forks().len(), 1);
+    let pace = r.row(SID, "pace");
+    for (field, want) in [
+        ("claude", num(12. * LOOK)),
+        ("dreamer", num(5. * LOOK)),
+        ("looks", json!(1)),
+        ("lastLook", num(5. * LOOK)),
+    ] {
+        assert_eq!(pace[field], want, "{field}");
+    }
+    let pace = pace_of(cx);
+    let first = none_look().unwrap();
+    // 205k spent against a 49.2k share
+    let want = (5. * LOOK - 1.2 * LOOK).round();
+    assert_eq!(first["owed"].as_f64().unwrap().round(), want);
+    assert_eq!(owed(&pace).round(), want);
     assert!(!can_afford(&pace, LOOK));
+    // The next look is due at 34, and every 6 steps after a refusal.
+    let refused = || {
+        let looks = r.of_kind("look").into_iter();
+        looks
+            .filter(|look| look["outcome"] != "none")
+            .collect::<Vec<_>>()
+    };
     r.steps(cx, 28, None, None).await; // step 40: still over the share
+    assert!(until(|| refused().len() >= 3).await);
+    assert_eq!(r.forks().len(), 1, "not a second fork");
+    assert!(refused().iter().all(|look| look["outcome"] == "budget"));
+    assert!(refused().last().unwrap()["owed"].as_f64().unwrap() > 0.);
     let pace = pace_of(cx);
     assert_eq!(pace.claude, 40. * LOOK);
     assert!(owed(&pace) > 0. && !can_afford(&pace, LOOK));
-    // Claude spends on: the total and the guess fit again, and the gate opens.
+    // Claude spends on: the total and the guess fit again, so the gate opens (the brief holds
+    // nothing new: quiet, no fork).
     let mut row = r.row(SID, "pace");
     row["claude"] = num(100. * LOOK);
     put(&r, SID, "pace", row);
     let pace = pace_of(cx);
     assert_eq!(owed(&pace), 0.);
     assert!(can_afford(&pace, LOOK));
+    let before = refused().len();
+    r.steps(cx, 12, None, None).await;
+    let opened = || refused().len() > before && refused().last().unwrap()["outcome"] != "budget";
+    assert!(until(opened).await);
+    let last = refused().pop().unwrap();
+    assert_eq!(
+        (last["outcome"].clone(), last["owed"].clone()),
+        (json!("quiet"), json!(0))
+    );
 }
 
-/// The pace's half: a spend is written down whatever happens to the look after it (it passes
-/// no `held`), and a change a lost lease holds back is not made. That `look` writes it before
-/// it asks whether it still owns the lease is the dreamer's.
 #[tokio::test]
 async fn a_fork_is_paid_for_even_when_its_look_is_dropped_a_lost_lease_does_not_lose_the() {
+    // The pace's half: a change a lost lease holds back is not made, and a spend with no
+    // `held` is written down whatever happens to the look after it.
     let r = rig();
     let cx = &r.fx.cx;
     r.steps(cx, 12, None, None).await;
@@ -598,12 +847,38 @@ async fn a_fork_is_paid_for_even_when_its_look_is_dropped_a_lost_lease_does_not_
     assert_eq!(pace["dreamer"], num(5. * LOOK));
     assert_eq!(pace["looks"], json!(1));
     assert_eq!(pace["lastLook"], num(5. * LOOK));
+
+    // The dreamer's half: the look writes its spend before it asks whether it still owns the
+    // lease, so a look dropped at that point still paid.
+    let big = json!({ "input_tokens": 900, "output_tokens": 100,
+        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 5. * LOOK - 1_000. });
+    let world = World {
+        replies: vec![dream_reply()],
+        fork_usage: vec![big],
+        ..world(true, false)
+    };
+    let r = dream_rig_in(world, SID);
+    let (cx, gate) = r.gated();
+    r.steps(&cx, 12, None, None).await;
+    assert!(until(|| gate.arrived() >= 1).await);
+    // Another copy holds the lease now.
+    let elsewhere = json!({ "root": "/elsewhere/dev-mods/csr-companion", "rank": 9,
+        "at": now(&r) });
+    r.fake().put_lease(SID, elsewhere);
+    gate.open();
+    assert!(until(|| r.row(SID, "pace")["dreamer"].as_f64().unwrap_or(0.) > 0.).await);
+    let pace = r.row(SID, "pace");
+    assert_eq!(pace["dreamer"], num(5. * LOOK));
+    assert_eq!(pace["looks"], json!(1));
+    assert_eq!(pace["lastLook"], num(5. * LOOK));
+    quiesce().await;
+    // The look was dropped; the money was not forgotten.
+    assert_eq!(r.of_kind("dream"), Vec::<Value>::new());
 }
 
-/// The pace's half: a fork that rejects is charged as the guess (`guess`), here Claude's last
-/// step. Making the fork is the dreamer's.
 #[tokio::test]
 async fn a_fork_that_rejects_may_have_been_paid_for_it_is_charged_as_the_guess() {
+    // The pace's half: a fork that rejects is charged as the guess (`guess`).
     let r = rig();
     let cx = &r.fx.cx;
     r.steps(cx, 12, None, None).await;
@@ -630,15 +905,33 @@ async fn a_fork_that_rejects_may_have_been_paid_for_it_is_charged_as_the_guess()
     let pace = change_pace(cx, charge, None).await.unwrap();
     assert_eq!(pace.dreamer, LOOK + 3. * LOOK, "now the last look's cost");
     assert_eq!(pace.looks, 2.);
+
+    // The dreamer's half: the fork itself rejects.
+    let world = World {
+        fork_fails: true,
+        ..world(true, false)
+    };
+    let r = dream_rig_in(world, SID);
+    r.steps(&r.fx.cx, 12, None, None).await;
+    assert!(until(|| r.row(SID, "pace")["looks"].as_f64().unwrap_or(0.) >= 1.).await);
+    let pace = r.row(SID, "pace");
+    // Claude's last step
+    assert_eq!(
+        (pace["looks"].clone(), pace["dreamer"].clone()),
+        (json!(1), num(LOOK))
+    );
 }
 
 #[tokio::test]
 async fn agent_usage_never_counts_towards_the_share_or_the_chapter() {
-    let r = rig();
+    let r = dream_rig(vec![]);
     let cx = &r.fx.cx;
     r.steps(cx, 2, None, None).await;
     r.steps(cx, 3, Some("sub-1"), None).await; // the dreamer reads the main conversation
     r.steps(cx, 3, Some("sub-1"), None).await; // and a replay changes nothing either
+    quiesce().await;
+    assert_eq!(r.forks(), Vec::<String>::new());
+    assert_eq!(r.of_kind("look"), Vec::<Value>::new());
     assert_eq!(r.row(SID, "pace")["claude"], num(2. * LOOK));
     assert_eq!(
         r.row(SID, "chapter")["steps"],

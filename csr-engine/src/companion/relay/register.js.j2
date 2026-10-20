@@ -16,6 +16,9 @@ function bytes(text) {
   }
   return n
 }
+// What the engine armed (guard.arm): a regex source and a reason, kept as they came. Nothing armed: every
+// hook fails open.
+let armed = null
 async function post($, path, body) {
   let text = JSON.stringify({ v: V, ...body })
   if (text.length * 3 > BIG && bytes(text) > BIG && body.e && body.e.messages) {
@@ -45,6 +48,7 @@ async function act($, c) {
     case 'session.surfaces': return $.session.surfaces()
     case 'session.append': return $.session.append(c.a[0])
     case 'command.register': return $.command.register(c.a[0])
+    case 'guard.arm': armed = c.a[0] ? { re: new RegExp(c.a[0].pattern), reason: c.a[0].reason } : null; return null
     default: throw new Error('csr: unknown call ' + c.m)
   }
 }
@@ -139,7 +143,13 @@ async function drawn($, k, e, next) {
   if (r.tree !== undefined) return tree($, e, r.tree, beneath)
   return e.component === 'AbovePrompt' ? beneath : next(e)
 }
-function pass(_$, e, next) { return next(e) }
+// A hook that failed lets the call go on, unless the engine armed a guard and this is a Bash command its
+// regex matches: the engine cannot be asked, so the call is denied. Claude Code skips the plugin's other
+// hooks for the call once one has failed, so the first to fail must be the one to deny.
+function pass(_$, e, next) {
+  if (armed && e && e.tool === 'Bash' && armed.re.test(String(e.command ?? ''))) return { deny: armed.reason }
+  return next(e)
+}
 async function start($, e, next) {
   const started = await next(e)
   await spawn($, e, false)
