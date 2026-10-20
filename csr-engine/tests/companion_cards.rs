@@ -293,3 +293,36 @@ fn text_mode_is_byte_identical_with_or_without_cards_enabled() {
         assert!(on.placed.is_empty());
     }
 }
+
+#[test]
+fn an_idle_refresh_reuses_the_cached_pictures() {
+    utc();
+    let (_home, paths) = rich_home();
+    let mut p = pane(&paths, "info", "sess-now", true);
+    if !have_fonts(&p) {
+        return;
+    }
+    p.frame(46, 120, NOW + 10.);
+    let first: Vec<_> = p
+        .placed
+        .iter()
+        .filter(|x| x.col == 1 && x.cols == 44)
+        .cloned()
+        .collect();
+    p.frame(46, 120, NOW + 13.);
+    let second: Vec<_> = p
+        .placed
+        .iter()
+        .filter(|x| x.col == 1 && x.cols == 44)
+        .cloned()
+        .collect();
+    assert_eq!(first.len(), second.len());
+    assert!(first.len() >= 5);
+    for (a, b) in first.iter().zip(&second) {
+        assert!(
+            std::sync::Arc::ptr_eq(&a.png, &b.png),
+            "card at row {} was re-encoded",
+            a.row
+        );
+    }
+}

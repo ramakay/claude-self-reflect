@@ -475,6 +475,8 @@ pub type Legend = (Dot, String, String);
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoonFact {
     pub share: f64,
+    /// The measured percent, which may pass 100; `share` is only what is drawn.
+    pub percent: i64,
     pub tokens: f64,
     pub caption: String,
 }
@@ -483,6 +485,8 @@ pub struct MoonFact {
 pub struct BarFact {
     pub name: String,
     pub share: f64,
+    /// The measured percent, which may pass 100; `share` is only what is drawn.
+    pub percent: i64,
     pub caption: String,
     pub pace: Option<f64>,
     pub tone: Dot,
@@ -808,7 +812,7 @@ fn moon(c: &mut Canvas, f: &CardFonts, cx: f32, cy: f32, r: f32, m: &MoonFact) {
             c.lit(&pts, px(super::text::heat(m.tokens)));
         }
     }
-    let n = ((m.share * 100.).round() as i64).to_string();
+    let n = m.percent.to_string();
     let (l, nr, _, _) = f.ink(&n, 20., 600., 0.);
     let adv = f.width(&n, 20., 600., 0.);
     let pr = f.ink("%", 12., 600., 0.).1;
@@ -875,7 +879,7 @@ fn moon_card(
         c.text(f, &b.name, left, base, 11., 600., px(ink), 0.6, Anchor::L);
         c.text(
             f,
-            &format!("{}%", (b.share * 100.).round() as i64),
+            &format!("{}%", b.percent),
             left + bw,
             base,
             13.,
@@ -1394,8 +1398,13 @@ fn quota_bar(q: &Value, now: f64) -> Option<BarFact> {
             }
         ),
         share: (used / 100.).clamp(0., 1.),
+        percent: used.round() as i64,
         caption,
-        pace: q["pace"].as_f64().filter(|p| (0. ..=1.).contains(p)),
+        // the tick lands on a half percent of the bar: a finer pace would redraw an idle card
+        pace: q["pace"]
+            .as_f64()
+            .filter(|p| (0. ..=1.).contains(p))
+            .map(|p| (p * 200.).round() / 200.),
         tone: match string(&q["sev"]) {
             "red" => Dot::Red,
             "amber" => Dot::Amber,
@@ -1408,15 +1417,26 @@ fn ctx_moon(g: &Value) -> Option<MoonFact> {
     let size = g["ctx"]["size"].as_f64().filter(|n| *n > 0.)?;
     Some(MoonFact {
         share: (tokens / size).clamp(0., 1.),
+        percent: (tokens / size * 100.).round() as i64,
         tokens,
         caption: format!("{}/{}", short(tokens), short(size)),
     })
 }
-/// Requests as (cached, fresh) token pairs, oldest first, from the transcript's own usage figures.
+/// Requests as (cached, fresh) token pairs, oldest first, from the transcript's own usage figures:
+/// cached is what was read from the cache; fresh is the rest of the context (uncached input plus
+/// what was written to the cache). A reply row without the cache-read figure is read as
+/// cache-written tokens being the fresh part.
 fn request_bars(s: &Value) -> (Vec<(f64, f64)>, bool) {
     let mut replies: Vec<(f64, f64, f64)> = array(&s["replies"])
         .iter()
-        .map(|r| (num(&r[0]), num(&r[1]), num(&r[3])))
+        .map(|r| {
+            let context = num(&r[1]);
+            let fresh = match r.get(4).and_then(Value::as_f64) {
+                Some(read) => (context - read).max(0.),
+                None => num(&r[3]),
+            };
+            (num(&r[0]), context, fresh)
+        })
         .filter(|(t, c, _)| *t != 0. && *c > 0.)
         .collect();
     if replies.len() >= 2 {
@@ -1499,7 +1519,8 @@ fn cache_card_of(cache: &Value) -> Option<Card> {
     }
     let (left, ttl) = (left?, ttl.filter(|t| *t > 0.)?);
     Some(Card::Cache {
-        share: (left / ttl).clamp(0., 1.),
+        // the minute shown is the one drawn: seconds would redraw an idle card
+        share: ((left / 60.).floor() * 60. / ttl).clamp(0., 1.),
         cold,
         legend: vec![
             (Dot::Green, "Warm".into(), String::new()),
@@ -1592,6 +1613,8 @@ fn buckets(times: &[f64], from: f64, to: f64, n: usize) -> Vec<f64> {
 }
 /// The session's recall in and notes out: counts, and each over time.
 fn mirror_card_of(s: &Value, handed: usize, now: f64) -> Option<Card> {
+    // the time axis ends on the minute: seconds would redraw an idle card
+    let now = (now / 60.).ceil() * 60.;
     let times = |v: &Value| -> Vec<f64> {
         array(v)
             .iter()
@@ -1935,6 +1958,7 @@ mod tests {
         let bar = |name: &str| BarFact {
             name: name.into(),
             share: 0.5,
+            percent: 50,
             caption: "resets in 2h".into(),
             pace: Some(0.4),
             tone: Dot::Blue,
@@ -1943,6 +1967,7 @@ mod tests {
             Card::Moon {
                 moon: Some(MoonFact {
                     share: 0.17,
+                    percent: 17,
                     tokens: 170000.,
                     caption: "170k/1M".into(),
                 }),
@@ -2028,9 +2053,42 @@ mod tests {
     }
     #[test]
     fn cached_and_fresh_come_from_the_transcripts_own_usage() {
-        let s = json!({"replies": [[1., 1000., 10., 100.], [2., 2000., 10., 200.]]});
+        // [t, context, output, cache_creation, cache_read]: cached is the read, fresh the rest
+        let s = json!({"replies": [[1., 1000., 10., 100., 900.], [2., 2000., 10., 200., 1800.]]});
         let (data, split) = request_bars(&s);
         assert!(split);
         assert_eq!(data, vec![(900., 100.), (1800., 200.)]);
+    }
+    #[test]
+    fn a_quota_over_its_limit_is_labelled_with_the_measured_percent_and_drawn_full() {
+        let q = json!({"code": "5H", "used": 125., "sev": "red", "pace": 0.30001});
+        let bar = quota_bar(&q, 0.).unwrap();
+        assert_eq!(bar.percent, 125);
+        assert_eq!(bar.share, 1.);
+        let g = json!({"ctx": {"tokens": 1_250_000., "size": 1_000_000.}});
+        assert_eq!(ctx_moon(&g).unwrap().percent, 125);
+        // an idle refresh moves the pace and the cache's seconds, not the card
+        let q2 = json!({"code": "5H", "used": 125., "sev": "red", "pace": 0.30003});
+        assert_eq!(quota_bar(&q2, 0.), Some(bar));
+        let cache = |left: f64| cache_card_of(&json!({"left": left, "ttl": 3600.}));
+        assert_eq!(cache(3421.), cache(3423.));
+    }
+    #[test]
+    fn requests_with_input_but_no_cache_traffic_are_all_fresh() {
+        let s = json!({"replies": [[1., 1000., 10., 0., 0.], [2., 2000., 10., 0., 0.]]});
+        let (data, _) = request_bars(&s);
+        assert_eq!(data, vec![(0., 1000.), (0., 2000.)]);
+        let card = history_card(&json!({}), &s, 0).unwrap();
+        let Card::History { legend, .. } = card else {
+            panic!()
+        };
+        assert!(
+            legend.contains(&(Dot::Blue, "Cached".into(), "0%".into())),
+            "{legend:?}"
+        );
+        assert!(
+            legend.contains(&(Dot::Pink, "Fresh".into(), "100%".into())),
+            "{legend:?}"
+        );
     }
 }

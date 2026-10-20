@@ -245,6 +245,7 @@ impl Session {
                         m["usage"]["cache_creation_input_tokens"]
                             .as_u64()
                             .unwrap_or(0),
+                        m["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
                     ]),
                 );
             }
