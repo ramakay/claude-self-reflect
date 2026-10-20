@@ -1,6 +1,6 @@
 [48;2;18;20;23m[38;2;242;244;246m☾ What if a frame failed while the agent was busy?                                                  [0m
 [48;2;18;20;23m[38;2;242;244;246m1 helpful · 2 thought of it · 3 not relevant · 4 ask Claude                                         [0m
-[48;2;18;20;23m[38;2;242;244;246mStory · refreshed 30s ago · text parity is ready for review.                                        [0m
+[48;2;18;20;23m[38;2;242;244;246mStory · refreshed 30s ago · Text parity is ready for review.                                        [0m
 [48;2;18;20;23m[38;2;242;244;246m~ reader.rs · read ⌗8e4e3f27                                                                        [0m
 [48;2;18;20;23m[38;2;242;244;246m○ Index the export queue · running · 14m · 11 tools                                                 [0m
 [48;2;18;20;23m[38;2;242;244;246m○ Check retry limits · stalled · 20m · 4 tools                                                      [0m
@@ -9,8 +9,8 @@
 [48;2;18;20;23m[38;2;242;244;246m○ Port the export test · failed · 25m · 6 tools                                                     [0m
 [48;2;18;20;23m[38;2;242;244;246m○ Summarize the logs · completed · 22m · 2 tools                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m○ Compare two queue clients · completed · 18m · 5 tools                                             [0m
-[48;2;18;20;23m[38;2;242;244;246m● CSR: daemon down · CTX 78k/1M · 2 by CSR                                                          [0m
-[48;2;18;20;23m[38;2;242;244;246m7D 62%» · 5H 41% · ◷ 4m · Codex 7D 41%                                                              [0m
+[48;2;18;20;23m[38;2;242;244;246mCTX 78k/1M · 2 by CSR                                                                               [0m
+[48;2;18;20;23m[38;2;242;244;246m7D 62%» · 5H 41% · ◷ 4m · Codex 7D 41% · ● CSR: daemon down                                         [0m
 [48;2;18;20;23m[38;2;242;244;246m3 in flight · 1 stalled                                                                             [0m
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m
 [48;2;18;20;23m[38;2;242;244;246m                                                                                                    [0m

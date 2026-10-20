@@ -5,7 +5,7 @@
   "1": {
     "key": "instrument:dreams"
   },
-  "12": {
+  "11": {
     "key": "instrument:figure"
   },
   "15": {
@@ -24,8 +24,8 @@
       ],
       [
         11,
-        20,
-        "t"
+        18,
+        "q"
       ]
     ]
   },
@@ -55,9 +55,6 @@
         "ask_claude"
       ]
     ]
-  },
-  "6": {
-    "key": "instrument:threads"
   },
   "9": {
     "key": "instrument:changes"

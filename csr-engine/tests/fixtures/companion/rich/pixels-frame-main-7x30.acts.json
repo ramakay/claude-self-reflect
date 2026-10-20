@@ -10,10 +10,16 @@
   },
   "29": {
     "key": "legend",
-    "keys": []
+    "keys": [
+      [
+        0,
+        7,
+        "q"
+      ]
+    ]
   },
   "3": {
-    "key": "instrument:threads"
+    "key": "instrument:dreams"
   },
   "4": {
     "key": "instrument:dreams"

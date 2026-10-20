@@ -898,31 +898,41 @@ impl Pane {
             );
         }
         let zoom = self.phone.zoomed;
-        let footer = text::fit(
-            &format!(
-                "{}{}",
-                if zoom { "z split  " } else { "" },
-                super::render::instrument::footer(composition)
-            ),
-            cols,
-        );
-        let mut start = if zoom { 9 } else { 0 };
-        let mut spans = if zoom {
-            vec![json!([0, 7, "z"])]
-        } else {
-            vec![]
-        };
-        for (key, label) in [
-            ("d", "queue"),
+        let mut keys = vec![];
+        if zoom {
+            keys.push(("z", "split"));
+        }
+        if !composition.dream.queue.is_empty() {
+            keys.push(("d", "queue"));
+        }
+        keys.extend([
             ("l", "changes"),
             ("t", "threads"),
             ("i", "figure"),
             ("b", "theme"),
             ("q", "close"),
-        ] {
-            if key == "d" && composition.dream.queue.is_empty() {
-                continue;
-            }
+        ]);
+        // Keep close visible; omit whole lower-priority key labels when space is tight.
+        let width = |keys: &[(&str, &str)]| {
+            keys.iter()
+                .map(|(key, label)| key.len() + 1 + label.len())
+                .sum::<usize>()
+                + keys.len().saturating_sub(1) * 2
+        };
+        while keys.len() > 1 && width(&keys) > cols {
+            keys.remove(keys.len() - 2);
+        }
+        let footer = text::fit(
+            &keys
+                .iter()
+                .map(|(key, label)| format!("{key} {label}"))
+                .collect::<Vec<_>>()
+                .join("  "),
+            cols,
+        );
+        let mut start = 0;
+        let mut spans = vec![];
+        for (key, label) in keys {
             let end = start + key.len() + 1 + label.len();
             if end <= cols {
                 spans.push(json!([start, end, key]));
@@ -1269,6 +1279,10 @@ impl Pane {
                 .iter()
                 .find(|s| num(&s[0]) <= col as f64 && (col as f64) < num(&s[1]))
             {
+                // Closing requires a deliberate keyboard q, never a stray mouse click.
+                if span[2] == "q" {
+                    return true;
+                }
                 if matches!(
                     string(&span[2]),
                     "d" | "l" | "r" | "s" | "f" | "t" | "i" | "b" | "q" | "z"

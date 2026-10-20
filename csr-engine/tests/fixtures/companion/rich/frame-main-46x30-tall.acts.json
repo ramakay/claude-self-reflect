@@ -5,6 +5,9 @@
   "1": {
     "key": "instrument:dreams"
   },
+  "10": {
+    "key": "instrument:agents"
+  },
   "2": {
     "dream": "newest",
     "key": "dream:newest",
@@ -53,7 +56,7 @@
       [
         32,
         39,
-        "b"
+        "q"
       ]
     ]
   },
@@ -65,8 +68,5 @@
   },
   "7": {
     "key": "instrument:figure"
-  },
-  "9": {
-    "key": "instrument:agents"
   }
 }

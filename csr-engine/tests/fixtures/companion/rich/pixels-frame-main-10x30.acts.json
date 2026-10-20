@@ -5,16 +5,19 @@
   "1": {
     "key": "instrument:dreams"
   },
+  "12": {
+    "key": "instrument:figure"
+  },
   "2": {
-    "key": "instrument:threads"
+    "key": "instrument:dreams"
   },
   "29": {
     "key": "legend",
     "keys": [
       [
         0,
-        9,
-        "l"
+        7,
+        "q"
       ]
     ]
   },
