@@ -21,10 +21,10 @@
 [48;2;241;239;236m      [38;2;23;25;28mKeep the read-only database boundary.[0m[48;2;241;239;236m[K[0m
 [48;2;241;239;236m      [38;2;136;135;129myou said · 10-18 · this session[0m[48;2;241;239;236m                                                             [24m[38;2;136;135;129m♡[0m[48;2;241;239;236m[K[0m
 
-
-
-
-
+      [38;2;136;135;129mAsk about past work. CSR finds it.[0m
+      [38;2;136;135;129mCode changed? CSR warns Claude.[0m
+      [38;2;136;135;129mCSR keeps quiet threads. Press f.[0m
+      [38;2;136;135;129mPress l for changes. Press i for info.[0m
 
 
 
