@@ -1,5 +1,5 @@
-//! The companion's features, behind the relay: one module per feature of the TypeScript plugin
-//! (`plugins/csr-companion/hooks/`). Each has a `register(&mut Table)` that adds its entries to the
+//! The companion's features, behind the relay: one module per feature of the removed TypeScript
+//! plugin. Each has a `register(&mut Table)` that adds its entries to the
 //! hooks it acts in; `table()` calls them in the one order below.
 //!
 //! The order is the order the TypeScript's handlers run their statement groups in where that order

@@ -935,7 +935,8 @@ fn paths_are_normalized_and_a_state_is_keyed_by_its_session() {
     assert_eq!(normalize_path("/a//b/../c", "/x"), "/a/c");
 }
 
-/// `tests/redaction_table.json`, the table `bin/private.py` is held to.
+/// `tests/fixtures/companion/redaction_table.json`, the table the removed `bin/private.py` was
+/// held to.
 const TABLE: [(&str, &str); 35] = [
     (
         "use sk-ant-api03-AbCdEf0123456789_-xyz here",
