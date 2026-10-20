@@ -82,13 +82,13 @@ Project: claude-self-reflect | 2 hours, 102 messages
 
 Fires at the end of every response. Imports the growing transcript so it is searchable now, writes a rolling `session_latest` summary so SessionStart has something to show if the session dies, and extracts a structured episode: what was asked, files investigated and modified, tools, outcome, errors and todos. It also caches the anchor that a later compaction recap uses.
 
-## PreCompact: Import, Refresh, Dream
+## PreCompact: Refresh, Dream
 
-Fires before a compaction. Imports the transcript so it stays searchable after the compact, refreshes the saved task anchor so the post-compaction recap names the current task, and starts one detached dream cycle. It never blocks the compaction. Opt out of the dream with `CSR_NO_DREAM_ON_COMPACT=1` or `CSR_NO_DREAMING=1`.
+Fires before a compaction. Reads the transcript to refresh the saved task anchor, so the post-compaction recap names the current task, and starts one detached dream cycle. It does not index the transcript: the file survives the compaction, and the daemon's watcher and the Stop worker index it, so nothing waits on embeddings while Claude Code compacts. Opt out of the dream with `CSR_NO_DREAM_ON_COMPACT=1` or `CSR_NO_DREAMING=1`.
 
 ## PostToolUse — File Edit Tracking
 
-Records files edited with deduplication. Enables `csr_search_by_file`.
+Records files edited with deduplication. Enables `csr_search_by_file`. It does not index the transcript, so an edit never waits on embeddings; the daemon's watcher and the Stop worker do that.
 
 ## Code Map: Which Directory a Session Works In
 

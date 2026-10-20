@@ -1,8 +1,12 @@
-//! PreCompact hook — imports the transcript before compaction.
+//! PreCompact hook — snapshots the compact anchor before compaction.
 //!
-//! For ALL sessions:
-//! 1. Imports current transcript (so it's searchable post-compact)
-//! 2. Triggers one dream cycle
+//! 1. For a main session, reads the transcript with the importer's parser (no
+//!    embedding, no chunk writes, so no wait on the daemon) and files the compact
+//!    snapshot the post-compact recap reads. A subagent's PreCompact files nothing.
+//! 2. Triggers one dream cycle (all sessions).
+//!
+//! The hook does not index the transcript: the file survives compaction, and the
+//! daemon's watcher and the Stop worker at the end of every turn import it.
 //!
 //! The session's story is written after the compaction instead, by SessionStart, from the
 //! summary Claude Code writes as it compacts: that needs no model call.
@@ -25,10 +29,14 @@ pub(crate) struct CompactSnapshot {
     pub completions_untied: bool,
 }
 
-/// Handle the precompact hook.
-/// Always returns Ok(()) to never block compaction (E-1 fix).
-pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
-    // Import transcript for ALL sessions before compaction destroys context
+/// The conversation rows the compact snapshot is built from: the rows the importer
+/// hands its observer, read with the importer's own parser. Nothing is embedded or
+/// stored, so this never waits on the daemon; the parsed chunks are dropped.
+fn transcript_rows(input: &HookInput, cwd: &Path) -> Vec<serde_json::Value> {
+    let Some(canonical) = super::validated_transcript_path(input) else {
+        return Vec::new();
+    };
+    let project = super::hook_project_name(cwd);
     let mut rows = Vec::new();
     let mut observe = |row: &serde_json::Value| {
         // Progress payloads dominate large transcripts and contain no recap
@@ -40,7 +48,21 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
             rows.push(row.clone());
         }
     };
-    super::import_current_transcript_observing(input, engine, cwd, Some(&mut observe)).await;
+    if let Err(error) = crate::import::parse_jsonl_file_resuming(
+        &canonical,
+        &project,
+        None,
+        Some(&mut observe),
+        None,
+    ) {
+        eprintln!("CSR: transcript parse failed (non-fatal): {error}");
+    }
+    rows
+}
+
+/// Handle the precompact hook.
+/// Always returns Ok(()): a failure here never blocks compaction (E-1 fix).
+pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
     // A subagent's PreCompact carries the PARENT's session id: the snapshot below would
     // be filed under the parent and feed its next compact recap with the subagent's rows.
     let subagent = input.subagent();
@@ -48,6 +70,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
         super::log_subagent_skip("precompact", cwd, agent_type);
     }
     if let Some(session_id) = input.session_id.as_deref().filter(|_| subagent.is_none()) {
+        let rows = transcript_rows(input, cwd);
         if !rows.is_empty() {
             let (sanitized, _) = crate::import::sanitize_messages_for_search(&rows);
             let episode =
@@ -71,7 +94,7 @@ pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()
     }
 
     // v10: a compaction is a natural consolidation boundary. Trigger exactly
-    // one dream cycle over the just-imported transcript, detached and
+    // one dream cycle over the already-indexed corpus, detached and
     // fire-and-forget, so it never blocks compaction. It advertises the live
     // "dreaming" statusline marker for its duration and self-skips if a dream
     // is already running (marker guard in `dream::run_dream_marked`).

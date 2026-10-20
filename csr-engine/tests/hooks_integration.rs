@@ -2378,9 +2378,10 @@ fn test_session_end_resets_ratification_enrichment() {
     );
 }
 
-/// Test: precompact hook imports transcript for all sessions.
+/// Test: precompact reads the transcript for the compact snapshot but embeds and
+/// stores no chunks (the watcher and the Stop worker index the file).
 #[test]
-fn test_precompact_imports_for_all_sessions() {
+fn test_precompact_files_snapshot_without_importing_chunks() {
     let tmp = tempfile::TempDir::new().unwrap();
     let transcript = tmp.path().join("precompact-test.jsonl");
     std::fs::write(
@@ -2397,13 +2398,14 @@ fn test_precompact_imports_for_all_sessions() {
         csr_engine::search::SearchEngine::new(100),
     ));
     let engine = csr_engine::engine::Engine::from_parts(
-        storage,
+        storage.clone(),
         embeddings,
         search.clone(),
         std::path::PathBuf::from("/tmp"),
     );
 
     let input = csr_engine::hooks::HookInput {
+        session_id: Some("precompact-test".into()),
         transcript_path: Some(transcript.to_string_lossy().to_string()),
         cwd: Some(tmp.path().to_string_lossy().to_string()),
         ..Default::default()
@@ -2418,9 +2420,23 @@ fn test_precompact_imports_for_all_sessions() {
     assert!(result.is_ok());
 
     let chunk_count = rt.block_on(async { search.read().await.chunk_count() });
+    assert_eq!(
+        chunk_count, 0,
+        "precompact must not add to the search index"
+    );
+    let stored = storage
+        .get_chunk_ids_for_conversation("precompact-test")
+        .unwrap();
     assert!(
-        chunk_count > 0,
-        "precompact should import transcript before compaction"
+        stored.is_empty(),
+        "precompact must not store chunks: {stored:?}"
+    );
+    assert!(
+        storage
+            .get_meta("compact_anchor:precompact-test")
+            .unwrap()
+            .is_some(),
+        "precompact still files the compact snapshot"
     );
 }
 

@@ -491,22 +491,12 @@ impl Engine {
     /// only new chunks are embedded (chunks beyond prev_count are new).
     /// Returns the number of NEW chunks imported (0 if nothing new).
     pub async fn import_file(&self, file_path: &Path, project_name: &str) -> Result<usize> {
-        self.import_file_observing(file_path, project_name, None)
-            .await
-    }
-
-    pub(crate) async fn import_file_observing(
-        &self,
-        file_path: &Path,
-        project_name: &str,
-        observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
-    ) -> Result<usize> {
         let mut attribution =
             import::derive_conversation_attribution(&self.projects_dir, file_path);
         if attribution.parent_conversation_id.is_none() {
             attribution.project_name = project_name.into();
         }
-        self.import_file_with_observer(file_path, &attribution, observer)
+        self.import_file_with_attribution(file_path, &attribution)
             .await
     }
 
@@ -514,16 +504,6 @@ impl Engine {
         &self,
         file_path: &Path,
         attribution: &import::ConversationAttribution,
-    ) -> Result<usize> {
-        self.import_file_with_observer(file_path, attribution, None)
-            .await
-    }
-
-    async fn import_file_with_observer(
-        &self,
-        file_path: &Path,
-        attribution: &import::ConversationAttribution,
-        observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
     ) -> Result<usize> {
         // Mirror first, ahead of the early return below, so a transcript that is
         // already imported but never mirrored still gets its copy. Outside the
@@ -547,7 +527,7 @@ impl Engine {
             )?;
         }
         // Check if file is unchanged (mtime match = fully imported, nothing new)
-        if observer.is_none() && self.storage.is_file_imported(file_path)? {
+        if self.storage.is_file_imported(file_path)? {
             return Ok(0);
         }
 
@@ -585,7 +565,7 @@ impl Engine {
             file_path,
             &attribution.project_name,
             parent_context.as_ref(),
-            observer,
+            None,
             resume,
         )?;
         let import::ParsedConversation {
@@ -769,7 +749,7 @@ impl Engine {
         {
             tracing::warn!(conv = %conversation_id, %error, "queued-prompt indexing failed (non-fatal)");
         }
-        // Last step of a file's chunk writes on every path of `import_file_with_observer`:
+        // Last step of a file's chunk writes on every path of `import_file_with_attribution`:
         // a proxied engine asks the daemon once for the file, not once per chunk.
         self.search.write().await.sync_pending_chunks();
     }

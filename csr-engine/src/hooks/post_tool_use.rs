@@ -1,8 +1,10 @@
-//! PostToolUse hook — imports transcript + tracks code evolution.
+//! PostToolUse hook — tracks code evolution.
 //!
-//! Fires after each successful tool call. Imports the current transcript
-//! so new content becomes searchable. For Edit/Write operations, tracks
-//! structural code changes (functions/types/imports added/removed).
+//! Fires after each successful tool call. For Edit/Write operations, tracks
+//! structural code changes (functions/types/imports added/removed). It does not
+//! import the transcript: that embeds through the daemon and can wait minutes
+//! while Claude Code waits on this hook. The daemon's watcher and the detached
+//! Stop worker at the end of every turn index the transcript.
 //!
 //! A Bash call is read first (`hooks::bash_writes`): one that wrote no file
 //! returns before the engine is built, so the most frequent tool costs a
@@ -20,8 +22,7 @@ use super::HookInput;
 use crate::engine::Engine;
 
 /// Tool names whose edits this hook tracks (code evolution + code graph).
-/// The transcript sync above the gate runs for every fire regardless; the
-/// installer's PostToolUse matcher (`Edit|Write|MultiEdit|NotebookEdit|Bash`,
+/// The installer's PostToolUse matcher (`Edit|Write|MultiEdit|NotebookEdit|Bash`,
 /// see `hooks::install`) is deliberately a superset of this list. `Bash` is
 /// not here: it names no file in `tool_input`, so it has its own path through
 /// [`bash_written_files`].
@@ -69,20 +70,17 @@ pub fn exits_before_engine(hook_name: &str, input: &HookInput) -> bool {
 
 /// Handle the post-tool-use hook.
 /// Always returns Ok(()) to never block Claude Code (C-2 fix).
-pub async fn handle(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<()> {
+pub async fn handle(input: &HookInput, engine: &Engine, _cwd: &Path) -> Result<()> {
     let bash_files = bash_written_files(input);
     if input.tool_name.as_deref() == Some("Bash") && bash_files.is_empty() {
         return Ok(());
     }
     // Code map session signal: this cwd has a live session. One upsert, first,
-    // so the slow transcript import below cannot delay or starve it.
+    // so the slower steps below cannot delay or starve it.
     super::record_codemap_signal(input, engine, "post_tool_use");
     // A session in a protected folder (Desktop, Documents, ...) is mapped by the
     // session itself: queue the edit and start the detached drain. No-op elsewhere.
     super::codemap_session_post_tool_use(input, engine);
-
-    // Import growing transcript (real-time searchability)
-    super::import_current_transcript(input, engine, cwd).await;
 
     // Track code evolution for Edit/Write/MultiEdit operations (v9) and for
     // the files a Bash call wrote.
@@ -950,6 +948,31 @@ mod tests {
         handle(&edit_input("Write", "/w/repo/src/b.rs"), &engine, cwd)
             .await
             .expect("the hook still returns Ok when the queue table is missing");
+    }
+
+    #[tokio::test]
+    async fn handle_does_not_import_the_transcript() {
+        let (engine, storage) = test_engine();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let transcript = tmp.path().join("ptu-no-import.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"content":[{"type":"text","text":"Working on real-time session memory feature"}]},"timestamp":"2026-02-22T16:00:00Z"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"I'll implement the incremental import optimization."}]},"timestamp":"2026-02-22T16:00:01Z"}
+"#,
+        )
+        .unwrap();
+        let mut input = edit_input("Edit", "/w/repo/src/a.rs");
+        input.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        handle(&input, &engine, tmp.path()).await.unwrap();
+        assert_eq!(queue_rows(&storage), vec!["/w/repo/src/a.rs"]);
+        let stored = storage
+            .get_chunk_ids_for_conversation("ptu-no-import")
+            .unwrap();
+        assert!(
+            stored.is_empty(),
+            "the hook must not import the transcript: {stored:?}"
+        );
     }
 
     #[test]

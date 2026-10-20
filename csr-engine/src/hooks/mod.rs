@@ -360,8 +360,8 @@ fn codemap_session_start_ordinary(input: &HookInput, engine: &Engine) {
 
 /// PostToolUse after an edit in an ordinary git repo with no live daemon: queue
 /// the edit, then start the detached drain (its first full pass registers a repo
-/// the map does not know yet). The queue write comes first and before the slow
-/// transcript import, so the drain never starts on an empty queue. The generic
+/// the map does not know yet). The queue write comes first, so the drain never
+/// starts on an empty queue. The generic
 /// PostToolUse enqueue later pushes the same path again; that is harmless.
 fn codemap_session_post_tool_use_ordinary(input: &HookInput, engine: &Engine) {
     let Some(cwd) = ordinary_hook_cwd(input) else {
@@ -453,50 +453,47 @@ fn resolve_hook_cwd(input_cwd: Option<&str>) -> PathBuf {
 }
 
 /// Shared helper: import the current transcript incrementally.
-/// Used by stop, precompact, prompt_submit, and session_end hooks.
+/// Used by prompt_submit, stop, and session_end hooks.
 pub async fn import_current_transcript(input: &HookInput, engine: &Engine, cwd: &Path) {
-    import_current_transcript_observing(input, engine, cwd, None).await;
+    let Some(canonical) = validated_transcript_path(input) else {
+        return;
+    };
+    let project = hook_project_name(cwd);
+
+    match engine.import_file(&canonical, &project).await {
+        Ok(0) => {} // no new content, silent
+        Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
+        Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),
+    }
 }
 
-pub(crate) async fn import_current_transcript_observing(
-    input: &HookInput,
-    engine: &Engine,
-    cwd: &Path,
-    observer: Option<&mut (dyn FnMut(&serde_json::Value) + Send)>,
-) {
-    let Some(ref transcript) = input.transcript_path else {
-        return;
-    };
-    let tp = std::path::PathBuf::from(transcript);
+/// The canonical transcript path a hook may read: it exists and is a `.jsonl`
+/// file. `None` when the hook carried no path, the path is missing, or the
+/// extension is wrong (the last one says so on stderr).
+///
+/// S-1 fix: the `.jsonl` check keeps crafted hook JSON from pointing the importer
+/// at an arbitrary file (e.g. /etc/passwd). Claude Code only produces `.jsonl`
+/// transcripts.
+pub(crate) fn validated_transcript_path(input: &HookInput) -> Option<PathBuf> {
+    let tp = PathBuf::from(input.transcript_path.as_ref()?);
     if !tp.exists() {
-        return;
+        return None;
     }
-
-    // S-1 fix: validate transcript path is a .jsonl file.
-    // The .jsonl extension check prevents importing arbitrary files (e.g. /etc/passwd)
-    // via crafted hook JSON. Claude Code only produces .jsonl transcripts.
-    let Ok(canonical) = tp.canonicalize() else {
-        return;
-    };
+    let canonical = tp.canonicalize().ok()?;
     if canonical.extension().and_then(|e| e.to_str()) != Some("jsonl") {
         eprintln!(
             "CSR: refusing non-JSONL transcript: {}",
             canonical.display()
         );
-        return;
+        return None;
     }
+    Some(canonical)
+}
 
+/// The project name a hook files its transcript under, from its resolved cwd.
+pub(crate) fn hook_project_name(cwd: &Path) -> String {
     let cwd_str = cwd.to_string_lossy();
-    let project = resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string());
-
-    match engine
-        .import_file_observing(&canonical, &project, observer)
-        .await
-    {
-        Ok(0) => {} // no new content, silent
-        Ok(n) => eprintln!("CSR: indexed {} new chunks from active session", n),
-        Err(e) => eprintln!("CSR: import failed (non-fatal): {}", e),
-    }
+    resolve_project_from_cwd(&cwd_str).unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Redirect this process's stdout (fd 1) onto stderr (fd 2) for the rest of the
