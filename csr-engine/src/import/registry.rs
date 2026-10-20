@@ -17,9 +17,6 @@ use crate::storage::Storage;
 const META_OFFSET: &str = "history_jsonl_offset";
 const META_INODE: &str = "history_jsonl_inode";
 const META_HEAD: &str = "history_jsonl_head";
-/// Marker: the `aux_schema_miss:history` counter was re-derived once after
-/// legacy (pre-`sessionId`) rows stopped counting as schema misses.
-const META_LEGACY_RECONCILED: &str = "history_legacy_rows_reconciled";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IngestStats {
@@ -159,36 +156,8 @@ pub fn ingest_history(storage: &Storage, history_path: &Path) -> Result<IngestSt
     if parse_errors > 0 {
         let _ = storage.bump_aux_counter("history");
     }
-    reconcile_legacy_miss_counter(storage, history_path);
 
     Ok(stats)
-}
-
-/// Older builds counted every row without a `sessionId` as a schema miss, so
-/// `aux_schema_miss:history` carries a count that no longer describes
-/// anything. Once per database, re-derive it from the whole file under the
-/// current classification: legacy rows are not misses, genuinely malformed
-/// lines still are. Fail-open — any error leaves the counter and marker alone
-/// so the next ingest retries.
-fn reconcile_legacy_miss_counter(storage: &Storage, history_path: &Path) {
-    if storage
-        .get_meta(META_LEGACY_RECONCILED)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return;
-    }
-    let Ok(whole_file) = read_parse_from_offset(history_path, 0) else {
-        return;
-    };
-    let genuine_errors = whole_file.parse_errors;
-    // Genuine misses keep whatever the counter already says (the batch above
-    // bumped it if they were new); none means the old count was all legacy.
-    if genuine_errors == 0 && storage.set_meta("aux_schema_miss:history", "0").is_err() {
-        return;
-    }
-    let _ = storage.set_meta(META_LEGACY_RECONCILED, "1");
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -612,26 +581,19 @@ mod tests {
     }
 
     #[test]
-    fn stale_counter_from_legacy_rows_is_reconciled_once() {
+    fn a_counter_an_older_build_left_behind_is_never_erased() {
         let dir = tempfile::tempdir().unwrap();
         let hist = dir.path().join("history.jsonl");
         let good = history_line("ok", 1_721_000_000_000, "/p/proj", "s1");
         write_history(&hist, &[LEGACY_LINE, &good]);
 
-        // State an older build left behind: it counted the legacy row.
+        // State an older build left behind. It may have been a legacy row or a
+        // genuine miss that the file no longer shows; either way it stays.
         let storage = Storage::open_memory().unwrap();
         storage.bump_aux_counter("history").unwrap();
-        assert_eq!(history_counter(&storage), 1);
 
         ingest_history(&storage, &hist).unwrap();
-        assert_eq!(history_counter(&storage), 0, "legacy-only count is cleared");
-
-        // Reconciliation is one-shot: a later real miss is not erased.
-        append_history(&hist, &["NOT JSON {{{"]);
-        ingest_history(&storage, &hist).unwrap();
-        assert_eq!(history_counter(&storage), 1);
-        ingest_history(&storage, &hist).unwrap();
-        assert_eq!(history_counter(&storage), 1);
+        assert_eq!(history_counter(&storage), 1, "no reconcile pass erases it");
     }
 
     #[test]
