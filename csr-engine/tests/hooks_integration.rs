@@ -3250,7 +3250,7 @@ mod statusline_unwrap {
 }
 
 /// C3: SessionEnd re-spawns itself detached; the child's stderr used to go to
-/// /dev/null, so its failures were invisible. It now goes to a bounded log
+/// /dev/null, so its failures were invisible. It now goes to a log (rotated at open past 1 MiB)
 /// under the CSR data dir. Runs the real binary against a temp db/HOME.
 #[cfg(unix)]
 mod session_end_detached_log {

@@ -2011,7 +2011,7 @@ async fn run(
                 .env("CSR_HOOK_DETACHED", "1")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
-                // Failures of the detached child land in a bounded log under
+                // Failures of the detached child land in a log (rotated at open past 1 MiB) under
                 // the data dir instead of vanishing.
                 .stderr(csr_engine::telemetry::detached_session_end_stderr());
             #[cfg(unix)]
