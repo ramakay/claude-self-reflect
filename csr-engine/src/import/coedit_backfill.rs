@@ -55,7 +55,7 @@
 //! carries. The row's `tool_name` is `Bash`. A call whose `tool_result` came
 //! back an error is dropped, and so is a file no longer on disk. Same
 //! idempotency as the edit rows. [`backfill_coedit_once`] runs the replay once
-//! per database for the daemon and setup.
+//! per database for the daemon and setup, once the installed hook records Bash.
 //!
 //! Idempotency: `id` is deterministic —
 //! `"bf-" + sha256(session_id|file_path|timestamp)[..16 hex chars]` — and
@@ -136,7 +136,14 @@ pub struct ProjectCoeditStats {
 /// with the Bash reader. The first backfill (Edit/Write only) never set one, so
 /// transcripts replayed before the Bash path existed are replayed again by this
 /// pass; rows already present are skipped by id.
-pub const BASH_BACKFILL_META_KEY: &str = "coedit_bash_backfill_v1";
+///
+/// This was `coedit_bash_backfill_v1`. That pass ran as soon as a daemon came
+/// up on the new binary, before `hook install --apply` had put `Bash` in the
+/// PostToolUse matcher, so the Bash edits made between the two never reached
+/// file history and the marker said the job was done. `v2` makes those
+/// installs run the pass once more, now that it waits for the hook; the ids
+/// are deterministic, so the rerun inserts only what is missing.
+pub const BASH_BACKFILL_META_KEY: &str = "coedit_bash_backfill_v2";
 
 /// Outcome of a `backfill-coedit` run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -640,23 +647,70 @@ pub fn backfill_coedit(
     Ok(stats)
 }
 
+/// What [`backfill_coedit_once`] did on this call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BashReplay {
+    /// The marker was already set.
+    Done,
+    /// The installed hook config does not record Bash yet; nothing ran and the
+    /// marker is unset.
+    WaitingOnHook,
+    /// The pass ran. The marker is set only if no insert failed.
+    Ran(CoeditBackfillStats),
+}
+
+impl BashReplay {
+    /// The stats of a pass that ran.
+    pub fn stats(self) -> Option<CoeditBackfillStats> {
+        match self {
+            BashReplay::Ran(stats) => Some(stats),
+            _ => None,
+        }
+    }
+}
+
 /// Replay the whole history once per database: the pass that fills in the
-/// files Bash calls wrote before the live hook read them. `None` when it has
-/// already run. The marker is set only after a run with no failed insert, so a
-/// locked database is retried on the next call; rows are keyed by a
-/// deterministic id, so a retry inserts only what is missing.
+/// files Bash calls wrote before the live hook read them. It runs only once
+/// the hook config in `settings_path` records Bash, since a pass that finishes
+/// earlier would leave every Bash edit made before the hook is installed
+/// missing for good; until then it defers and the next call checks again. The
+/// marker is set only after a run with no failed insert, so a locked database
+/// is retried on the next call; rows are keyed by a deterministic id, so a
+/// retry inserts only what is missing.
 pub fn backfill_coedit_once(
     storage: &Storage,
     projects_dir: &Path,
-) -> Result<Option<CoeditBackfillStats>> {
+    settings_path: &Path,
+) -> Result<BashReplay> {
     if storage.get_meta(BASH_BACKFILL_META_KEY)?.is_some() {
-        return Ok(None);
+        return Ok(BashReplay::Done);
+    }
+    if !crate::hooks::install::post_tool_use_records_bash(settings_path) {
+        return Ok(BashReplay::WaitingOnHook);
     }
     let stats = backfill_coedit(storage, projects_dir, false)?;
     if stats.insert_errors == 0 {
         storage.set_meta(BASH_BACKFILL_META_KEY, &chrono::Utc::now().to_rfc3339())?;
     }
-    Ok(Some(stats))
+    Ok(BashReplay::Ran(stats))
+}
+
+/// Where the replay stands, for `status`: `done`, `waiting_on_hook` (the hook
+/// config does not record Bash yet, so file history lacks Bash edits) or
+/// `pending` (the hook is in place and the daemon has not run the pass yet).
+pub fn bash_replay_state(storage: &Storage, settings_path: &Path) -> &'static str {
+    if storage
+        .get_meta(BASH_BACKFILL_META_KEY)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        "done"
+    } else if crate::hooks::install::post_tool_use_records_bash(settings_path) {
+        "pending"
+    } else {
+        "waiting_on_hook"
+    }
 }
 
 #[cfg(test)]
@@ -973,6 +1027,167 @@ mod tests {
         std::fs::write(&rs, "fn a() {}\n").unwrap();
         std::fs::write(&yml, "name: x\n").unwrap();
         (repo, rs, yml)
+    }
+
+    const INSTALLED_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit|Bash";
+
+    /// A settings file in `dir` whose one PostToolUse entry runs CSR's hook
+    /// under `matcher` (`None`: an entry with no matcher at all).
+    fn settings_file(dir: &Path, matcher: Option<&str>) -> PathBuf {
+        let mut entry = serde_json::json!({
+            "hooks": [{"type": "command", "command": "/usr/local/bin/csr-engine hook post-tool-use"}]
+        });
+        if let Some(m) = matcher {
+            entry["matcher"] = m.into();
+        }
+        let path = dir.join("settings.json");
+        let settings = serde_json::json!({"hooks": {"PostToolUse": [entry]}});
+        std::fs::write(&path, settings.to_string()).unwrap();
+        path
+    }
+
+    fn code_evolution_rows(storage: &Storage) -> i64 {
+        storage
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM code_evolution", [], |r| r.get(0))
+                    .map_err(Into::into)
+            })
+            .unwrap()
+    }
+
+    /// One Edit row (already stored) and one Bash write (not yet) in a corpus.
+    fn corpus_with_edit_and_bash(tmp: &Path) -> (tempfile::TempDir, PathBuf) {
+        let (repo, rs, _yml) = repo_with_files();
+        let corpus = tmp.join("corpus");
+        write_jsonl(
+            &corpus,
+            "conv-gate.jsonl",
+            &[
+                edit_line(
+                    "/Users/me/projects/demo/src/lib.rs",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+                bash_line(
+                    &format!("sed -i '' 's/a/b/' {}", rs.display()),
+                    "toolu_g",
+                    "2026-01-01T00:01:00.000Z",
+                ),
+            ],
+        );
+        (repo, corpus)
+    }
+
+    fn seed_edit_row(storage: &Storage) {
+        storage
+            .insert_code_evolution_backfill(
+                &backfill_id(
+                    "conv-gate",
+                    "/Users/me/projects/demo/src/lib.rs",
+                    "2026-01-01T00:00:00.000Z",
+                ),
+                "conv-gate",
+                "demo",
+                "/Users/me/projects/demo/src/lib.rs",
+                "rust",
+                "Edit",
+                "2026-01-01T00:00:00.000Z",
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_pass_runs_and_sets_the_marker_when_the_matcher_names_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, corpus) = corpus_with_edit_and_bash(tmp.path());
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
+        let storage = Storage::open_memory().unwrap();
+        seed_edit_row(&storage);
+        assert_eq!(bash_replay_state(&storage, &settings), "pending");
+        let ran = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .expect("the hook records Bash, so the pass runs");
+        assert_eq!(ran.totals(), (0, 1, 1));
+        assert!(BASH_BACKFILL_META_KEY.ends_with("_v2"));
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
+        assert_eq!(bash_replay_state(&storage, &settings), "done");
+    }
+
+    #[test]
+    fn the_pass_defers_while_the_matcher_lacks_bash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, corpus) = corpus_with_edit_and_bash(tmp.path());
+        let settings = settings_file(tmp.path(), Some("Edit|Write|MultiEdit|NotebookEdit"));
+        let storage = Storage::open_memory().unwrap();
+        seed_edit_row(&storage);
+        assert_eq!(
+            backfill_coedit_once(&storage, &corpus, &settings).unwrap(),
+            BashReplay::WaitingOnHook
+        );
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_none());
+        assert_eq!(code_evolution_rows(&storage), 1, "nothing was inserted");
+        assert_eq!(bash_replay_state(&storage, &settings), "waiting_on_hook");
+
+        // The hook install lands; the next call runs the pass.
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
+        let ran = backfill_coedit_once(&storage, &corpus, &settings).unwrap();
+        assert!(matches!(ran, BashReplay::Ran(_)));
+        assert_eq!(code_evolution_rows(&storage), 2);
+    }
+
+    #[test]
+    fn the_pass_defers_with_no_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, corpus) = corpus_with_edit_and_bash(tmp.path());
+        let settings = tmp.path().join("absent").join("settings.json");
+        let storage = Storage::open_memory().unwrap();
+        assert_eq!(
+            backfill_coedit_once(&storage, &corpus, &settings).unwrap(),
+            BashReplay::WaitingOnHook
+        );
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_none());
+        assert_eq!(code_evolution_rows(&storage), 0);
+    }
+
+    #[test]
+    fn the_pass_runs_when_the_matcher_matches_every_tool() {
+        for matcher in [None, Some(""), Some("*")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (_repo, corpus) = corpus_with_edit_and_bash(tmp.path());
+            let settings = settings_file(tmp.path(), matcher);
+            let storage = Storage::open_memory().unwrap();
+            let outcome = backfill_coedit_once(&storage, &corpus, &settings).unwrap();
+            assert!(matches!(outcome, BashReplay::Ran(_)), "matcher {matcher:?}");
+            assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
+        }
+    }
+
+    /// An install that finished the v1 pass before its hook was live: the v1
+    /// marker does not count, v2 runs once and inserts only what is missing.
+    #[test]
+    fn a_v1_marker_does_not_stop_the_v2_pass_and_it_inserts_only_the_missing_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, corpus) = corpus_with_edit_and_bash(tmp.path());
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
+        let storage = Storage::open_memory().unwrap();
+        storage
+            .set_meta("coedit_bash_backfill_v1", "2026-10-19T15:52:00Z")
+            .unwrap();
+        seed_edit_row(&storage);
+        assert_eq!(code_evolution_rows(&storage), 1);
+
+        let ran = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .expect("v2 is not set, so the pass runs");
+        assert_eq!(ran.totals(), (0, 1, 1), "only the Bash row is new");
+        assert_eq!(code_evolution_rows(&storage), 2);
+        assert_eq!(
+            backfill_coedit_once(&storage, &corpus, &settings).unwrap(),
+            BashReplay::Done
+        );
+        assert_eq!(code_evolution_rows(&storage), 2);
     }
 
     #[test]
@@ -1409,6 +1624,7 @@ mod tests {
                 ),
             ],
         );
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
         let storage = Storage::open_memory().unwrap();
         // An earlier release's pass wrote the Edit row only and set no marker.
         storage
@@ -1429,7 +1645,10 @@ mod tests {
             .unwrap();
         assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_none());
 
-        let first = backfill_coedit_once(&storage, &corpus).unwrap().unwrap();
+        let first = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
         assert_eq!(
             first.totals(),
             (0, 1, 1),
@@ -1437,7 +1656,7 @@ mod tests {
         );
         assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
         assert!(
-            backfill_coedit_once(&storage, &corpus).unwrap().is_none(),
+            backfill_coedit_once(&storage, &corpus, &settings).unwrap() == BashReplay::Done,
             "the marker makes the second call a lookup"
         );
     }
@@ -1456,6 +1675,7 @@ mod tests {
                 "2026-01-01T00:00:00.000Z",
             )],
         );
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
         let storage = Storage::open_memory().unwrap();
         storage
             .with_connection(|conn| {
@@ -1466,7 +1686,10 @@ mod tests {
                 .map_err(Into::into)
             })
             .unwrap();
-        let failed = backfill_coedit_once(&storage, &corpus).unwrap().unwrap();
+        let failed = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
         assert_eq!(failed.insert_errors, 1);
         assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_none());
 
@@ -1476,7 +1699,10 @@ mod tests {
                     .map_err(Into::into)
             })
             .unwrap();
-        let retried = backfill_coedit_once(&storage, &corpus).unwrap().unwrap();
+        let retried = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
         assert_eq!(retried.totals(), (0, 1, 0));
         assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
     }

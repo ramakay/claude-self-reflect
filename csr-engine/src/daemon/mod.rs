@@ -1086,8 +1086,12 @@ impl Daemon {
 
         // One-time replay of every transcript for the files Bash calls wrote
         // (`sed -i`, heredocs, short scripts): the live hook reads them from
-        // now on, this fills in the history before it. Meta-guarded
-        // (`coedit_bash_backfill_v1`), so a restart after it finished is one
+        // now on, this fills in the history before it. It runs only once the
+        // installed hook config records Bash (`~/.claude/settings.json`); until
+        // then it logs that it is waiting, leaves the marker unset and looks
+        // again every ten minutes, so a hook install that lands after the
+        // daemon started still gets the replay. Meta-guarded
+        // (`coedit_bash_backfill_v2`), so a restart after it finished is one
         // lookup; a run that failed an insert leaves the marker unset and is
         // retried at the next start. Rows are keyed by a deterministic id, so
         // a retry inserts only what is missing. It parses every transcript, so
@@ -1099,38 +1103,66 @@ impl Daemon {
             let shutdown = shutdown.clone();
             let heavy_work = heavy_work.clone();
             tokio::spawn(async move {
+                use crate::import::coedit_backfill::BashReplay;
                 for _ in 0..6 {
                     if shutdown.load(Ordering::SeqCst) {
                         return;
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                 }
-                let Some(permit) =
-                    acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref()).await
-                else {
-                    return;
-                };
-                let result = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    crate::import::coedit_backfill::backfill_coedit_once(&storage, &projects_dir)
-                })
-                .await;
-                match result {
-                    Ok(Ok(None)) => {}
-                    Ok(Ok(Some(stats))) => {
-                        let (_, inserted, skipped) = stats.totals();
-                        tracing::info!(
-                            files_scanned = stats.files_scanned,
-                            events_found = stats.events_found,
-                            inserted,
-                            skipped,
-                            already_live = stats.already_live_total(),
-                            insert_errors = stats.insert_errors,
-                            "co-edit (Bash) history backfill completed"
-                        );
+                let settings = crate::hooks::install::default_settings_path().unwrap_or_default();
+                let mut warned = false;
+                loop {
+                    let Some(permit) =
+                        acquire_heavy_work_unless_shutdown(heavy_work.clone(), shutdown.as_ref())
+                            .await
+                    else {
+                        return;
+                    };
+                    let (storage, projects_dir, settings) =
+                        (storage.clone(), projects_dir.clone(), settings.clone());
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        crate::import::coedit_backfill::backfill_coedit_once(
+                            &storage,
+                            &projects_dir,
+                            &settings,
+                        )
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(BashReplay::Done)) => {}
+                        Ok(Ok(BashReplay::WaitingOnHook)) => {
+                            if !warned {
+                                warned = true;
+                                tracing::info!(
+                                    "co-edit (Bash) history backfill waiting: the PostToolUse hook does not record Bash yet (run `csr-engine hook install --apply`)"
+                                );
+                            }
+                            for _ in 0..60 {
+                                if shutdown.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            }
+                            continue;
+                        }
+                        Ok(Ok(BashReplay::Ran(stats))) => {
+                            let (_, inserted, skipped) = stats.totals();
+                            tracing::info!(
+                                files_scanned = stats.files_scanned,
+                                events_found = stats.events_found,
+                                inserted,
+                                skipped,
+                                already_live = stats.already_live_total(),
+                                insert_errors = stats.insert_errors,
+                                "co-edit (Bash) history backfill completed"
+                            );
+                        }
+                        Ok(Err(error)) => tracing::warn!(%error, "co-edit (Bash) backfill failed"),
+                        Err(error) => tracing::warn!(%error, "co-edit (Bash) backfill panicked"),
                     }
-                    Ok(Err(error)) => tracing::warn!(%error, "co-edit (Bash) backfill failed"),
-                    Err(error) => tracing::warn!(%error, "co-edit (Bash) backfill panicked"),
+                    return;
                 }
             })
         };

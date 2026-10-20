@@ -1030,6 +1030,10 @@ pub struct SourceCounts {
 pub struct AuxStatus {
     pub coverage: CoverageStats,
     pub file_history_sessions: usize,
+    /// The one-time replay of Bash-written files into file history: `done`,
+    /// `pending`, or `waiting_on_hook` (the installed PostToolUse hook does not
+    /// record Bash, so file history lacks Bash edits; run `hook install --apply`).
+    pub bash_file_history: &'static str,
     pub transcripts_unindexed: usize,
     pub schema_misses: SchemaMissCounts,
     pub sources: SourceCounts,
@@ -1158,6 +1162,7 @@ pub fn handle(
         deep,
         !compact,
         crate::binary_identity::default_run_dir().as_deref(),
+        crate::hooks::install::default_settings_path().as_deref(),
     )?;
 
     if swiftbar {
@@ -1254,19 +1259,21 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         deep,
         true,
         crate::binary_identity::default_run_dir().as_deref(),
+        crate::hooks::install::default_settings_path().as_deref(),
     )
 }
 
 /// [`gather_status`] with the code map block switchable (`--compact` passes
 /// `false` and gets the default block without touching the code map tables)
-/// and the process registry's run directory passed in, so a test reads its
-/// own registry and never the installation's.
+/// and the process registry's run directory and Claude Code settings file
+/// passed in, so a test reads its own and never the installation's.
 fn gather_status_with(
     db_path: &Path,
     projects_dir: &Path,
     deep: bool,
     with_codemap: bool,
     run_dir: Option<&Path>,
+    settings: Option<&Path>,
 ) -> Result<StatusReport> {
     let now = chrono::Utc::now();
     let dreaming = dream_state::read_active_marker(now).map(|marker| DreamingView {
@@ -1434,7 +1441,7 @@ fn gather_status_with(
         }
     }
 
-    let aux = gather_aux(&storage, projects_dir);
+    let aux = gather_aux(&storage, projects_dir, settings);
     let dream = gather_dream(&storage);
     let dream_threads = gather_dream_threads(&storage);
     let memory_registry = gather_memory_registry(&storage);
@@ -2046,7 +2053,7 @@ fn gather_journal_server() -> DreamServerStatus {
 }
 
 /// Assemble aux coverage / file-history / transcript gap stats. Fail-soft to zeros.
-fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
+fn gather_aux(storage: &Storage, projects_dir: &Path, settings: Option<&Path>) -> AuxStatus {
     let (seen, imported, gap) = storage.coverage_stats().unwrap_or((0, 0, 0));
     let claude_dir = projects_dir.parent();
 
@@ -2097,6 +2104,9 @@ fn gather_aux(storage: &Storage, projects_dir: &Path) -> AuxStatus {
             gap,
         },
         file_history_sessions,
+        bash_file_history: settings.map_or("waiting_on_hook", |settings| {
+            import::coedit_backfill::bash_replay_state(storage, settings)
+        }),
         transcripts_unindexed,
         schema_misses,
         sources: SourceCounts {
@@ -2516,6 +2526,13 @@ fn test_run_dir(db_path: &Path) -> std::path::PathBuf {
     db_path.with_file_name("status-test-run")
 }
 
+/// The Claude Code settings file a status test reads: beside its database,
+/// never the installation's `~/.claude/settings.json`.
+#[cfg(test)]
+fn test_settings(db_path: &Path) -> std::path::PathBuf {
+    db_path.with_file_name("status-test-settings.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2529,6 +2546,7 @@ mod tests {
             deep,
             true,
             Some(&test_run_dir(db_path)),
+            Some(&test_settings(db_path)),
         )
     }
 
@@ -3511,6 +3529,8 @@ mod tests {
         let report = gather_status(&db_path, &projects_dir, false).unwrap();
         assert_eq!(report.aux.coverage, CoverageStats::default());
         assert_eq!(report.aux.file_history_sessions, 0);
+        // No settings file beside the test database: the hook does not record Bash yet.
+        assert_eq!(report.aux.bash_file_history, "waiting_on_hook");
         assert_eq!(report.aux.transcripts_unindexed, 0);
     }
 

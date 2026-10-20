@@ -468,9 +468,12 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   `open`/`write_text` and the read-replace-write idiom; `$`, glob, `/dev/*`, directory and computed paths are skipped,
   and a literal `W=/abs/path; cd $W && ...` resolves. The matcher gains `Bash` (`hook install --apply` upgrades the
   entry in place); a Bash call that wrote nothing exits before the engine opens (p95 7.1 ms). Rows carry
-  `tool_name='Bash'` and empty symbol lists. A one-time replay (`coedit_bash_backfill_v1`, daemon and `setup`) covers
+  `tool_name='Bash'` and empty symbol lists. A one-time replay (`coedit_bash_backfill_v2`, daemon and `setup`) covers
   existing transcripts, subagent ones under their parent session, skips what the live hook already recorded and keeps
-  only what the hook would keep. Checked against git, not command text, on a copy of the owner's DB: of 189 (session,
+  only what the hook would keep. It waits until `~/.claude/settings.json` has the PostToolUse hook recording Bash, so
+  a daemon restarted on the new binary before `hook install --apply` cannot mark the replay done while the live hook
+  still skips Bash (`csr-engine status` shows `aux.bash_file_history: waiting_on_hook` until then; the daemon looks
+  again every 10 minutes). Checked against git, not command text, on a copy of the owner's DB: of 189 (session,
   file) pairs committed during a session and touched by no edit tool, CSR held 0 before and 131 after (83 at the
   worktree path, 48 under the main checkout path every worktree edit is stored at). The full-text fallback of
   `csr_search_by_file` matches a path as a phrase of its tokens; it had recovered 0 of 441.

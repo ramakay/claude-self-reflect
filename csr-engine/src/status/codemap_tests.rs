@@ -13,6 +13,7 @@ fn gather_status(db_path: &Path, projects_dir: &Path, deep: bool) -> Result<Stat
         deep,
         true,
         Some(&test_run_dir(db_path)),
+        Some(&test_settings(db_path)),
     )
 }
 
@@ -257,6 +258,7 @@ fn status_json_has_the_codemap_block_for_an_empty_and_a_filled_map() {
         false,
         false,
         Some(&test_run_dir(&db_path)),
+        Some(&test_settings(&db_path)),
     )
     .unwrap();
     assert_eq!(compact.codemap, CodemapStatusBlock::default());

@@ -219,16 +219,25 @@ pub async fn handle(
 
     // File history for the files Bash calls wrote (`sed -i`, heredocs, short
     // scripts), replayed once from the transcripts just imported; the daemon
-    // does the same for an install that never reruns setup. Meta-guarded.
+    // does the same for an install that never reruns setup. Meta-guarded, and
+    // gated on the same hook check as the daemon: step 3 just installed the
+    // hooks, but if that failed the replay waits rather than mark itself done
+    // while the live hook still skips Bash.
     {
+        use crate::import::coedit_backfill::BashReplay;
         let storage = eng.storage().clone();
         let projects_root = projects_dir.to_path_buf();
+        let settings = crate::hooks::install::default_settings_path().unwrap_or_default();
         match tokio::task::spawn_blocking(move || {
-            crate::import::coedit_backfill::backfill_coedit_once(&storage, &projects_root)
+            crate::import::coedit_backfill::backfill_coedit_once(
+                &storage,
+                &projects_root,
+                &settings,
+            )
         })
         .await
         {
-            Ok(Ok(Some(stats))) => {
+            Ok(Ok(BashReplay::Ran(stats))) => {
                 let (_, inserted, _) = stats.totals();
                 eprintln!(
                     "  File history: {} edits recorded from {} transcripts ({} already live)",
@@ -237,7 +246,10 @@ pub async fn handle(
                     stats.already_live_total()
                 );
             }
-            Ok(Ok(None)) => {}
+            Ok(Ok(BashReplay::WaitingOnHook)) => eprintln!(
+                "  File history: waiting for the Bash hook (run: csr-engine hook install --apply)"
+            ),
+            Ok(Ok(BashReplay::Done)) => {}
             Ok(Err(e)) => eprintln!("  Warning: file-history backfill failed: {e}"),
             Err(e) => eprintln!("  Warning: file-history backfill failed: {e}"),
         }

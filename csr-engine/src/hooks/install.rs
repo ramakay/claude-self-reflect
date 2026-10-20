@@ -283,14 +283,65 @@ fn merge_hook_config(
     Ok(())
 }
 
+/// The settings file hooks are installed into: `~/.claude/settings.json`.
+pub fn default_settings_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|home| home.join(".claude").join("settings.json"))
+}
+
+/// Whether the PostToolUse entries in `settings_path` run CSR's
+/// `hook post-tool-use` for Bash calls: the matcher names `Bash` as one of its
+/// `|`-separated alternatives, or matches every tool (absent, empty, `*`). A
+/// missing or unreadable file, or one without such an entry, is false: the
+/// live hook is not recording Bash yet.
+pub fn post_tool_use_records_bash(settings_path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(settings_path) else {
+        return false;
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(entries) = settings
+        .pointer("/hooks/PostToolUse")
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        let matcher = entry
+            .get("matcher")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .trim();
+        let covers_bash = matcher.is_empty()
+            || matcher == "*"
+            || matcher.split('|').any(|name| name.trim() == "Bash");
+        covers_bash
+            && entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_csr_post_tool_use_command)
+                    })
+                })
+    })
+}
+
+/// `is_csr_hook_command` narrowed to the `post-tool-use` subcommand.
+fn is_csr_post_tool_use_command(command: &str) -> bool {
+    is_csr_hook_command(command)
+        && shell_words(command)
+            .is_some_and(|words| words.get(2).map(String::as_str) == Some("post-tool-use"))
+}
+
 /// Apply hook config to ~/.claude/settings.json.
 /// Merges new hooks into existing config (does not clobber user hooks).
 /// Uses atomic write (write to .tmp then rename) and creates a .bak backup.
 fn apply_to_settings(config: &serde_json::Value) -> Result<()> {
-    let settings_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?
-        .join(".claude")
-        .join("settings.json");
+    let settings_path = default_settings_path()
+        .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
 
     // Ensure parent directory exists
     if let Some(parent) = settings_path.parent() {
@@ -652,6 +703,47 @@ mod tests {
         let new_config = generate_hook_config("/usr/local/bin/csr-engine");
         merge_hook_config(&mut settings, &new_config).unwrap();
         settings
+    }
+
+    fn records_bash(post_tool_use: serde_json::Value) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = serde_json::json!({"hooks": {"PostToolUse": post_tool_use}});
+        std::fs::write(&path, settings.to_string()).unwrap();
+        post_tool_use_records_bash(&path)
+    }
+
+    #[test]
+    fn test_post_tool_use_records_bash_reads_the_matcher() {
+        let csr = hook_cmd("/usr/local/bin/csr-engine hook post-tool-use");
+        let with = |matcher: &str| serde_json::json!([{"matcher": matcher, "hooks": [csr]}]);
+        assert!(records_bash(with("Edit|Write|MultiEdit|NotebookEdit|Bash")));
+        assert!(records_bash(with("Bash")));
+        assert!(records_bash(with("*")));
+        assert!(records_bash(with("")));
+        assert!(records_bash(serde_json::json!([{"hooks": [csr]}])));
+        assert!(!records_bash(with("Edit|Write|MultiEdit|NotebookEdit")));
+        assert!(!records_bash(with("BashOutput")));
+        // Bash is covered, but not by CSR's post-tool-use hook.
+        assert!(!records_bash(serde_json::json!([
+            {"matcher": "Bash", "hooks": [hook_cmd("/usr/local/bin/csr-engine hook stop")]},
+            {"matcher": "Bash", "hooks": [hook_cmd("notify.sh post-tool-use")]},
+        ])));
+        // A real generated-and-merged config is recognised.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = merged(serde_json::json!({}));
+        std::fs::write(&path, settings.to_string()).unwrap();
+        assert!(post_tool_use_records_bash(&path));
+    }
+
+    #[test]
+    fn test_post_tool_use_records_bash_is_false_without_a_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!post_tool_use_records_bash(&dir.path().join("none.json")));
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{not json").unwrap();
+        assert!(!post_tool_use_records_bash(&bad));
     }
 
     /// The sweep covers events CSR never installed, so it must only match a
