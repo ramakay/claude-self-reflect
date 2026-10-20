@@ -219,6 +219,8 @@ pub struct Pane {
     total: usize,
     hold: Option<(Value, f64)>,
     pub pixels: bool,
+    /// Pixel mode draws cards and the pill instead of the dark ramp's text; set by `enable_cards`.
+    pub cards: bool,
     pub placed: Vec<super::render::kitty::Placement>,
     picture_cache: super::render::pictures::Cache,
     pub session_picture: Option<super::render::raster::SessionFacts>,
@@ -289,6 +291,7 @@ impl Pane {
             total: 0,
             hold: None,
             pixels,
+            cards: false,
             placed: vec![],
             picture_cache,
             session_picture: None,
@@ -304,6 +307,10 @@ impl Pane {
             carry_gate: None,
             compacting: false,
         }
+    }
+    /// Draw cards where pixels and a system font allow; text mode is left byte for byte as it was.
+    pub fn enable_cards(&mut self) {
+        self.cards = self.pixels && super::render::cards::fonts().is_some();
     }
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
         self.placed.clear();
@@ -473,9 +480,18 @@ impl Pane {
             };
             data["readings"] = json!(self.readers.how_claude_read(&self.paths, &self.sid, 2, now));
         }
+        let cards_on = self.pixels && self.cards;
+        let cell = super::render::kitty::cell_size();
         let ui = json!({
             "answered": self.answered,
             "pixels": self.pixels,
+            "cards": cards_on,
+            "cell": [cell.0, cell.1],
+            "dreams": if cards_on {
+                super::render::cards::dream_facts(&data, &self.sid).map(|d| d.0)
+            } else {
+                None
+            },
             "rows": rows,
             "cols": cols,
             "phone": phone,
@@ -567,8 +583,22 @@ impl Pane {
                 lines
             }
             "info" => {
-                let (lines, top) =
-                    info::draw_info(&data, s, cols, rows, self.info_top, now, self.pixels);
+                let agents = if cards_on {
+                    super::agents::agents_of(&self.paths, &self.sid)
+                } else {
+                    Default::default()
+                };
+                let (lines, top) = info::draw_info(
+                    &data,
+                    s,
+                    cols,
+                    rows,
+                    self.info_top,
+                    now,
+                    self.pixels,
+                    cards_on.then_some(cell),
+                    &agents,
+                );
                 self.info_top = top;
                 lines
             }

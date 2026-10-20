@@ -1205,7 +1205,23 @@ fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     let at = if ui["phone"] == true { 2 } else { 6 };
     let head = &page["head"];
     let pixels = ui["pixels"] == true;
-    let logo = pixels && head["gauges"].is_object();
+    // the cards' pill takes the two masthead rows when the pane draws cards and it fits
+    let pill = (ui["cards"] == true && head["gauges"].is_object())
+        .then(|| {
+            let fonts = super::render::cards::fonts()?;
+            let cell = (
+                u32::try_from(ui["cell"][0].as_u64()?).ok()?,
+                u32::try_from(ui["cell"][1].as_u64()?).ok()?,
+            );
+            let pill = super::render::cards::pill_of(
+                &head["gauges"],
+                ui["dreams"].as_u64().map(|n| n as usize),
+            )?;
+            let cols = super::render::cards::pill_cols(&pill, cell, fonts);
+            (cols < width).then_some((pill, cols))
+        })
+        .flatten();
+    let logo = pixels && head["gauges"].is_object() && pill.is_none();
     let mut top = if head["gauges"].is_object() {
         let mut top = cockpit(&head["gauges"], width);
         if logo {
@@ -1237,6 +1253,10 @@ fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
     } else {
         None
     };
+    if pill.is_some() {
+        top[0] = " ".into();
+        top[1] = " ".into();
+    }
     // the mod's plan for the next compaction, and the story
     top.extend(super::card::infinite_rows(&head["infinite"], width));
     let grounds = dark_steps(top.len());
@@ -1252,6 +1272,16 @@ fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
                 num(&ui["now"]),
             )),
             backs: grounds[row..row + 3].to_vec(),
+        });
+    }
+    if let Some((pill, cols)) = pill {
+        out.pictures.push(Wanted {
+            row: 0,
+            col: 1,
+            cols,
+            rows: 2,
+            picture: Picture::Pill(pill),
+            backs: grounds[..2].to_vec(),
         });
     }
     if logo {

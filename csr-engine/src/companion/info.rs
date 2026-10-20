@@ -6,6 +6,7 @@ use super::{
     pages::{lanes_legend, Lines},
     pyfmt::{round, short},
     render::{
+        cards,
         pictures::{Picture, Wanted},
         raster::{ContextFacts, SessionFacts},
         text::*,
@@ -29,6 +30,7 @@ const CHART_MIN: usize = 10;
 const LANE: usize = 9;
 const ICON: (usize, usize) = (5, 2);
 const FLOOR_ROWS: usize = 5;
+const CARDS_GROUND: Rgb = [22, 27, 38];
 const BAND: (f64, f64) = (180_589., 269_178.);
 pub(super) const CACHE_LOW: f64 = 600.;
 const QUIET_SWITCHES: [&str; 1] = ["RATIFICATION"];
@@ -1000,7 +1002,7 @@ fn info_panel(s: &Value, g: &Value, width: usize, now: f64, pixels: bool) -> Pan
 
 /// (handed, opened, asked) this session: the hand-offs CSR made to Claude, how many Claude opened,
 /// and the questions Claude asked CSR itself.
-fn handed_counts(s: &Value) -> (usize, usize, usize) {
+pub(super) fn handed_counts(s: &Value) -> (usize, usize, usize) {
     let given = if truthy(&s["gave"]) {
         array(&s["gave"]["recalls"])
             .iter()
@@ -1080,6 +1082,7 @@ fn window(
 /// The i page: its title and the context on the dark ramp (their first EMBLEM columns kept for the
 /// emblem), then the instruments on the ramp below, then on paper the at-a-glance sections. The
 /// title rows stay; the rest scrolls by `top`. (lines, top).
+#[allow(clippy::too_many_arguments)]
 pub fn draw_info(
     data: &Value,
     s: &Value,
@@ -1088,6 +1091,8 @@ pub fn draw_info(
     top: usize,
     now: f64,
     pixels: bool,
+    cell: Option<(u32, u32)>,
+    agents: &super::agents::Projection,
 ) -> (Lines, usize) {
     let width = cols.saturating_sub(1).max(24);
     let g = gauges_of(data, s, now);
@@ -1164,8 +1169,59 @@ pub fn draw_info(
     } else {
         head.push(String::new());
     }
-    let panel = info_panel(s, &g, width, now, pixels);
+    // the cards stand in for the dark ramp's chart and tapes while the pane draws pictures
+    let stack: Vec<cards::Card> = match (cell, cards::fonts()) {
+        (Some(cell), Some(f))
+            if pixels && (width - 1) as f32 * cell.0 as f32 / 2. >= cards::MIN_WIDTH_PT =>
+        {
+            let _ = f;
+            cards::build(data, s, &g, now, handed_counts(s).0, agents)
+        }
+        _ => vec![],
+    };
+    let carded = !stack.is_empty();
+    let panel = if carded {
+        Panel {
+            rows: vec![],
+            shows: BTreeSet::new(),
+            figure: None,
+        }
+    } else {
+        info_panel(s, &g, width, now, pixels)
+    };
     shows.extend(panel.shows.iter().copied());
+    let mut card_pictures: Vec<(usize, Wanted)> = vec![];
+    let mut card_rows: Vec<String> = vec![];
+    if carded {
+        let (cell, f) = (cell.unwrap_or((16, 34)), cards::fonts());
+        let f = f.expect("cards are built only with fonts");
+        for card in &stack {
+            match card {
+                cards::Card::Rings(items) => {
+                    for r in items {
+                        shows.insert(if r.name.starts_with("5H") { "5h" } else { "7d" });
+                    }
+                }
+                cards::Card::Cache { .. } => {
+                    shows.insert("cache");
+                }
+                _ => (),
+            }
+            let r = cards::rows_of(card, width - 1, cell, f);
+            card_pictures.push((
+                card_rows.len(),
+                Wanted {
+                    row: 0,
+                    col: 1,
+                    cols: width - 1,
+                    rows: r,
+                    picture: Picture::Card(card.clone()),
+                    backs: vec![CARDS_GROUND],
+                },
+            ));
+            card_rows.extend(std::iter::repeat_n(on_dark(" ", CARDS_GROUND), r));
+        }
+    }
     let grounds = dark_steps(head.len() + panel.rows.len());
     let mut out = Lines {
         rows: head
@@ -1181,7 +1237,9 @@ pub fn draw_info(
         .zip(&grounds[head.len()..])
         .map(|(row, ground)| on_dark(&row(*ground), *ground))
         .collect();
-    let mut placed: Vec<(usize, Wanted)> = vec![];
+    let mut placed: Vec<(usize, Wanted)> = card_pictures;
+    let card_len = card_rows.len();
+    body.extend(card_rows);
     if let Some(figure) = &panel.figure {
         let series: Vec<(f64, f64)> = array(&s["main"])
             .iter()
@@ -1280,11 +1338,16 @@ pub fn draw_info(
     }));
     body.extend(page.rows);
     let key = format!(
-        "{} · ♻ compact payback · ↻ resets · STS status · ◷ cache",
-        if panel.figure.is_some() {
-            "─ context · ▬ your band · ╷ compacted, red by CSR".to_owned()
+        "{}♻ compact payback · ↻ resets · STS status · ◷ cache",
+        if carded {
+            String::new()
+        } else if panel.figure.is_some() {
+            "─ context · ▬ your band · ╷ compacted, red by CSR · ".to_owned()
         } else {
-            format!("{}▁▃▆ context per turn", if pixels { "" } else { "CTX " })
+            format!(
+                "{}▁▃▆ context per turn · ",
+                if pixels { "" } else { "CTX " }
+            )
         }
     );
     body.extend([
@@ -1300,7 +1363,7 @@ pub fn draw_info(
             tape_key(width.saturating_sub(2))
         ),
     ]);
-    let panel_len = panel.rows.len();
+    let panel_len = panel.rows.len() + card_len;
     let (shown, kept, top) = window(body, pictures, rows.saturating_sub(out.rows.len()), top);
     out.rows.extend(shown);
     let back = json!({"key": "view:main"});

@@ -401,6 +401,7 @@ pub fn watch(paths: Paths, args: &PaneArgs) -> anyhow::Result<()> {
     let panics = epoch.clone();
     let mut restored = 0;
     let mut pane = Pane::new(paths.clone(), args);
+    pane.enable_cards();
     pane.herdr = super::phone::Herdr::from_env(&paths.home);
     let mine = PidFile::new(&paths, args.sid.as_deref().unwrap_or(""))?;
     let mut beat = Heartbeat::start(
