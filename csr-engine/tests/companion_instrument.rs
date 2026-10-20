@@ -516,6 +516,88 @@ fn text_fallback_rows_fit_narrow_terminals() {
 }
 
 #[test]
+fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() {
+    for state in STATES {
+        let golden = fs::read_to_string(
+            fixture()
+                .join("instrument/text")
+                .join(format!("{state}.txt")),
+        )
+        .unwrap();
+        let facts: Vec<_> = golden
+            .lines()
+            .filter(|line| {
+                line.starts_with("0.82")
+                    || line.starts_with("dreamer ")
+                    || line.starts_with("CTX ")
+                    || line.starts_with("7D ")
+                    || line.starts_with("● CSR:")
+                    || line.starts_with("1 by CSR")
+                    || line.starts_with("3 notes kept")
+                    || *line == "carried"
+                    || line.starts_with("1 helpful")
+            })
+            .flat_map(|line| line.split(" · "))
+            .collect();
+        for cols in [60, 80] {
+            let (_home, paths) = state_home(state);
+            let mut pane = Pane::new(paths, &args("main", "sess-now", cols, 67));
+            pane.pixels = false;
+            let lines: Vec<_> = pane
+                .frame(cols, 67, NOW)
+                .iter()
+                .map(|line| text::plain(line).trim_end().to_owned())
+                .collect();
+            for fact in &facts {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.split(" · ").any(|piece| piece == *fact)),
+                    "{state} at {cols}: split or missing fact {fact:?}: {lines:?}"
+                );
+            }
+            assert!(lines.iter().all(|line| text::len(line) <= cols
+                && !line.ends_with(" ·")
+                && !line.starts_with("· ")));
+            if let Some(ctx) = lines.iter().position(|line| line.starts_with("CTX ")) {
+                let status = lines.iter().position(|line| line.contains("● CSR:"));
+                assert!(
+                    status.is_some_and(|row| row > ctx),
+                    "{state}: CSR displaced CTX"
+                );
+                assert!(lines[status.unwrap()].ends_with("● CSR: daemon down"));
+            }
+            assert_eq!(lines.len(), 67);
+            assert!(lines[66].contains("q close"));
+            let shorter = pane.frame(cols, 45, NOW);
+            assert_eq!(shorter.len(), 45);
+            assert!(text::plain(&shorter[44]).contains("q close"));
+            // Resizing only changes the empty terminal area below the content.
+            let content = |rows: Vec<String>| {
+                rows.into_iter()
+                    .take(44)
+                    .map(|line| text::plain(&line).trim_end().to_owned())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                content(shorter),
+                lines[..44]
+                    .iter()
+                    .filter(|line| !line.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            );
+        }
+        if !matches!(state, "01-empty" | "08b-nothing") {
+            assert!(golden.contains("Text parity is ready for review."));
+        }
+        assert!(!golden.contains("Claude:Misread") && !golden.contains("hook:Check"));
+        assert_eq!(golden.contains("Saved ~"), state == "06-after");
+    }
+}
+
+#[test]
 fn narrow_pixels_use_a_short_bottom_strip_and_native_text() {
     for theme in [Theme::Dark, Theme::Light] {
         let (_home, paths) = state_home("02-running");

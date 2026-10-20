@@ -120,12 +120,17 @@ impl Composition {
                 .map(|v| (num(v), "♻ Compacted".into())),
         );
         let raw_story = string(&data["story"]["now"]).trim();
-        let story = ["Work stands at:", "Where the work stands:", "Story:"]
+        let stripped_story = ["Work stands at:", "Where the work stands:", "Story:"]
             .iter()
-            .find_map(|prefix| raw_story.strip_prefix(prefix))
-            .unwrap_or(raw_story)
-            .trim()
-            .to_owned();
+            .find_map(|prefix| raw_story.strip_prefix(prefix));
+        let story = if let Some(stripped) = stripped_story {
+            let mut chars = stripped.trim().chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        } else {
+            raw_story.to_owned()
+        };
         let age = data["story"]["at"]
             .as_f64()
             .map(|at| format!("refreshed {} ago", age_span(now - at)))
@@ -541,6 +546,27 @@ pub fn footer(c: &Composition) -> String {
         }
     )
 }
+/// Keep each instrument or metadata fact intact; an oversized fact is omitted at tiny widths.
+fn fact_rows(s: &str, cols: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for piece in s.split(" · ").filter(|piece| !piece.is_empty()) {
+        if text::len(piece) > cols {
+            continue;
+        }
+        if !row.is_empty() && text::len(&row) + 3 + text::len(piece) > cols {
+            rows.push(std::mem::take(&mut row));
+        }
+        if !row.is_empty() {
+            row.push_str(" · ");
+        }
+        row.push_str(piece);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
 /// Semantic text rows, also retained beneath pixel placements for accessibility and exports.
 pub fn text_rows(c: &Composition, cols: usize, rows: usize, open: Open) -> Vec<String> {
     rows_with_figure(c, cols, rows, open, true)
@@ -562,11 +588,12 @@ pub fn rows_with_figure(
     }
     let metadata = meta(c);
     if !metadata.is_empty() {
-        hero.extend(wrap(&metadata));
+        hero.extend(fact_rows(&metadata, cols));
     }
     if c.dream.state == Batch::Ready {
-        hero.extend(wrap(
+        hero.extend(fact_rows(
             "1 helpful · 2 thought of it · 3 not relevant · 4 ask Claude",
+            cols,
         ));
     }
     let details = extras(c, false);
@@ -607,7 +634,7 @@ pub fn rows_with_figure(
         out.extend(wrap("asked while you were away"));
     }
     if !c.learnt.is_empty() {
-        out.extend(wrap(&c.learnt.join(" · ")));
+        out.extend(fact_rows(&c.learnt.join(" · "), cols));
     }
     if let Some(n) = &c.notice {
         out.extend(wrap(n));
@@ -622,11 +649,10 @@ pub fn rows_with_figure(
         }
     }
     if !c.story.is_empty() {
-        out.extend(wrap(&format!(
-            "Story · {} · {}",
-            c.story_age,
-            first_sentence(&c.story)
-        )));
+        out.extend(fact_rows(
+            &format!("Story · {} · {}", c.story_age, first_sentence(&c.story)),
+            cols,
+        ));
     }
     let mut details_start = out.len();
     for v in c
@@ -673,7 +699,10 @@ pub fn rows_with_figure(
     if open.changes || open.threads || open.dreams || open.agents {
         let details = out.drain(details_start..).collect::<Vec<_>>();
         let figure_rows = if show_figure {
-            figure_lines(c).iter().flat_map(|line| wrap(line)).count()
+            figure_lines(c)
+                .iter()
+                .flat_map(|line| fact_rows(line, cols))
+                .count()
         } else {
             4
         };
@@ -686,7 +715,7 @@ pub fn rows_with_figure(
     }
     if show_figure {
         for line in figure_lines(c) {
-            out.extend(wrap(&line));
+            out.extend(fact_rows(&line, cols));
         }
     } else {
         let mut extra = vec![];
@@ -695,9 +724,6 @@ pub fn rows_with_figure(
         }
         if let Some((line, _)) = csr_status(&c.figure) {
             extra.push(format!("● {line}"));
-        }
-        if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
-            extra.push(format!("Saved ~{}", short(n)));
         }
         if c.figure["cache"]["cold"] == true {
             let line = string(&c.figure["cache"]["long"]);
@@ -712,7 +738,7 @@ pub fn rows_with_figure(
             extra.push(alternate.strip_prefix("♻ ").unwrap_or(alternate).into());
         }
         if !extra.is_empty() {
-            out.extend(wrap(&extra.join(" · ")));
+            out.extend(fact_rows(&extra.join(" · "), cols));
         }
     }
     let active: Vec<_> = c
@@ -782,9 +808,6 @@ fn figure_lines(c: &Composition) -> Vec<String> {
     if let Some(n) = c.tally["by_csr"].as_u64().filter(|n| *n > 0) {
         top.push(format!("{n} by CSR"));
     }
-    if let Some(n) = c.tally["payback"].as_f64().filter(|n| *n > 0.) {
-        top.push(format!("saved ~{}", short(n)));
-    }
     let mut quotas: Vec<_> = array(&g["quotas"])
         .iter()
         .filter(|q| q["used"].is_number())
@@ -797,7 +820,7 @@ fn figure_lines(c: &Composition) -> Vec<String> {
         quotas.push(format!("Codex 7D {n:.0}%"));
     }
     if let Some((line, _)) = csr_status(g) {
-        top.insert(0, format!("● {line}"));
+        quotas.push(format!("● {line}"));
     }
     [top.join(" · "), quotas.join(" · ")]
         .into_iter()
@@ -1289,8 +1312,9 @@ pub fn draw(
     for line in extra_lines {
         let (title, body) = line.split_once(": ").unwrap_or((&line, ""));
         let st = sans(11.5, t.regular);
-        let title = format!("{title}: ");
-        let tw = f.width(&title, st);
+        let title = format!("{title}:");
+        // Measure the label at its actual weight, then add one body-space advance.
+        let tw = f.width(&title, sans(11.5, t.medium)) + f.width(" ", st);
         label(&mut canvas, f, &title, IX, b, 11.5, t.dream, t.medium);
         let lines = f.wrap(body, st, IW - tw);
         for (i, row) in lines.iter().enumerate() {
@@ -1702,19 +1726,6 @@ fn figure(
             A::M,
         );
         label(c, f, "by CSR", W - 84., y + P + 7., 10., t.quiet, t.regular);
-    }
-    if let Some(n) = data.tally["payback"].as_f64().filter(|n| *n > 0.) {
-        single(
-            c,
-            f,
-            &format!("Saved ~{}", short(n)),
-            W - 160.,
-            y + P + 25.,
-            122.,
-            10.,
-            t.quiet,
-            t,
-        );
     }
     if let Some((line, sev)) = csr_status(g) {
         let col = if sev == "red" { t.risk } else { t.amber };
