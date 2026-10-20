@@ -280,14 +280,21 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
             );
         }
         if state == "08-offer" {
-            log.push(json!({"kind":"batch","session":"sess-now","at":NOW-700.,"dreams":[
+            // Dreams are off: prior answered batch only, no open what-if and no in-flight look.
+            log.push(json!({"kind":"batch","session":"sess-now","at":NOW-700.,"budget":{"spent":9000,"cap":40000},"dreams":[
                 {"id":"prev-one","line":"What if the budget had a label?","title":"Label the dream budget","confidence":0.8},
                 {"id":"prev-two","line":"What if the figure opened in place?","title":"Keep the figure in place","confidence":0.7}]}));
             log.push(json!({"kind":"answer","id":"prev-one","answer":"helpful","at":NOW-650.}));
             log.push(
                 json!({"kind":"answer","id":"prev-two","answer":"thought_of_it","at":NOW-640.}),
             );
-            log.push(json!({"kind":"looking","session":"sess-now","at":NOW-38.,"outcome":"dreaming","budget":{"spent":9000,"cap":40000},"threads":["pane redesign","launch images","release landing"]}));
+            log.push(json!({"kind":"look","session":"sess-now","at":NOW-30.,"outcome":"none","budget":{"spent":9000,"cap":40000}}));
+            let settings_dir = paths.home.join(".claude");
+            fs::create_dir_all(&settings_dir).unwrap();
+            write_json(
+                &settings_dir.join("settings.json"),
+                &json!({"pluginConfigs":{"csr-companion@local":{"options":{"dreams":false}}}}),
+            );
         } else if state == "08b-nothing" {
             log.push(json!({"kind":"look","session":"sess-now","at":NOW-30.,"outcome":"none","budget":{"spent":14000,"cap":40000}}));
         } else {
@@ -348,6 +355,14 @@ fn state_home(state: &str) -> (tempfile::TempDir, Paths) {
             &json!({"at":(NOW-12.)*1000.,"trigger":"auto"}),
         );
     }
+    // Instrument states use a live daemon except 08b-nothing, which keeps the down fixture.
+    let lock = paths.home.join(".claude-self-reflect/daemon.lock");
+    if state == "08b-nothing" {
+        fs::write(&lock, "").unwrap();
+    } else {
+        fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        fs::write(&lock, std::process::id().to_string()).unwrap();
+    }
     (home, paths)
 }
 fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<u8>) {
@@ -385,7 +400,7 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     assert!(!plain.contains("d dream"));
     pane.pixels = true;
     pane.enable_cards();
-    pane.frame(cols, rows, NOW);
+    let lines = pane.frame(cols, rows, NOW);
     assert_eq!(
         pane.placed.len(),
         1,
@@ -405,6 +420,23 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
         );
         assert!(metrics.question_lines.len() <= 3);
     }
+    if state == "08-offer" {
+        assert_eq!(metrics.question_lines.join(" "), "Turn dreams on.");
+        assert!(text.iter().any(|l| l.contains("Ask about past work.")));
+        assert!(text
+            .iter()
+            .any(|l| l.contains("Press 1: dreams on in all your sessions.")));
+    }
+    let cell = csr_engine::companion::render::kitty::cell_size();
+    assert_eq!(
+        pane.placed[0].rows,
+        rows.saturating_sub(1),
+        "{state}: instrument must fill every row above the keys"
+    );
+    let frame = csr_engine::companion::png::compose(&lines, &pane.placed, cols, rows, cell, theme)
+        .expect("cell-grid PNG");
+    assert_eq!(frame.width(), cols as u32 * cell.0);
+    assert_eq!(frame.height(), rows as u32 * cell.1);
     let png = pane.placed[0].png.to_vec();
     let hash = Sha256::digest(&png)
         .iter()
@@ -416,12 +448,20 @@ fn snapshot(state: &str, theme: Theme, cols: usize, rows: usize) -> (Value, Vec<
     );
     (
         json!({"text":text,"png_sha256":hash,"acts":pane.acts,"dream_percent":format!("{:.2}",100.*metrics.dream/metrics.height)}),
-        png,
+        // Cell-grid export for contact sheets; placement hash stays in the golden JSON.
+        {
+            let mut out = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut out);
+            image::DynamicImage::ImageRgba8(frame)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
+            out
+        },
     )
 }
 #[test]
 fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
-    for (cols, rows) in [(76, 67), (44, 30)] {
+    for (cols, rows) in [(76, 67), (44, 30), (60, 40)] {
         for theme in [Theme::Dark, Theme::Light] {
             for state in STATES {
                 let (value, png) = snapshot(state, theme, cols, rows);
@@ -439,7 +479,7 @@ fn all_nine_states_and_both_themes_have_honest_top_frame_goldens() {
                     write_json(&golden, &value);
                 }
                 let expected: Value = serde_json::from_slice(&fs::read(&golden).unwrap()).unwrap();
-                assert_eq!(value, expected, "{name}/{state}");
+                assert_eq!(value, expected, "{name}/{state} {cols}x{rows}");
                 if let Some(dir) = std::env::var_os("CSR_INSTRUMENT_PNG") {
                     let dir = PathBuf::from(dir).join(format!("{cols}x{rows}")).join(name);
                     fs::create_dir_all(&dir).unwrap();
@@ -742,11 +782,20 @@ fn text_facts_stay_whole_at_60_and_80_columns_and_footer_uses_terminal_height() 
                 && !line.starts_with("· ")));
             if let Some(ctx) = lines.iter().position(|line| line.starts_with("CTX ")) {
                 let status = lines.iter().position(|line| line.contains("● CSR:"));
-                assert!(
-                    status.is_some_and(|row| row > ctx),
-                    "{state}: CSR displaced CTX"
-                );
-                assert!(lines[status.unwrap()].ends_with("● CSR: daemon down"));
+                if let Some(row) = status {
+                    assert!(row > ctx, "{state}: CSR displaced CTX");
+                }
+                if state == "08b-nothing" {
+                    assert!(
+                        status.is_some_and(|row| lines[row].contains("● CSR: daemon down")),
+                        "{state}: expected daemon down"
+                    );
+                } else {
+                    assert!(
+                        status.is_none_or(|row| !lines[row].contains("daemon down")),
+                        "{state}: running daemon still shows down"
+                    );
+                }
             }
             assert_eq!(lines.len(), 67);
             assert!(lines[66].contains("q close"));
@@ -872,7 +921,16 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             "07-away",
             vec!["asked while you were away", "looked 4×. 3 new what-ifs"],
         ),
-        ("08-offer", vec!["dreamer 9k of 40k", "Dreaming."]),
+        (
+            "08-offer",
+            vec![
+                "Turn dreams on.",
+                "1 Turn dreams on",
+                "Press 1: dreams on in all your sessions.",
+                "Ask about past work. CSR finds it.",
+                "dreamer 9k of 40k",
+            ],
+        ),
         (
             "08b-nothing",
             vec![
@@ -912,5 +970,188 @@ fn corrected_states_use_real_feeds_and_empty_queue_never_requests_a_look() {
             let detail = pane.frame(76, 67, NOW).join("\n");
             assert!(detail.contains("at most 30%"));
         }
+    }
+}
+
+#[test]
+fn offer_hotkey_enables_dreams_on_one_press_in_private_home() {
+    let (_home, paths) = state_home("08-offer");
+    let settings = paths.home.join(".claude/settings.json");
+    write_json(
+        &settings,
+        &json!({
+            "pluginConfigs": {
+                "csr-companion@local": {"options": {"dreams": false, "keep": 1}},
+                "csr-companion@other": {"options": {"dreams": false, "keep": 2}},
+                "unrelated@x": {"options": {"dreams": false}}
+            }
+        }),
+    );
+    let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", 76, 67));
+    pane.pixels = false;
+    let shown = pane
+        .frame(76, 67, NOW)
+        .iter()
+        .map(|l| text::plain(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(shown.contains("1 Turn dreams on"), "{shown}");
+    assert!(pane
+        .acts
+        .values()
+        .any(|a| a["key"] == "instrument:dreams-on"));
+    let mode = fs::metadata(&settings).unwrap().permissions();
+    assert!(pane.key("1"));
+    let after: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        after["pluginConfigs"]["csr-companion@local"]["options"]["dreams"],
+        true
+    );
+    assert_eq!(
+        after["pluginConfigs"]["csr-companion@other"]["options"]["dreams"],
+        true
+    );
+    assert_eq!(
+        after["pluginConfigs"]["csr-companion@local"]["options"]["keep"],
+        1
+    );
+    assert_eq!(
+        after["pluginConfigs"]["csr-companion@other"]["options"]["keep"],
+        2
+    );
+    assert_eq!(
+        after["pluginConfigs"]["unrelated@x"]["options"]["dreams"],
+        false
+    );
+    assert_eq!(fs::metadata(&settings).unwrap().permissions(), mode);
+    let on = pane
+        .frame(76, 67, NOW + 1.)
+        .iter()
+        .map(|l| text::plain(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!on.contains("Turn dreams on"), "{on}");
+    assert!(!on.contains("Couldn't turn dreams on"), "{on}");
+}
+
+#[test]
+fn offer_refuses_malformed_settings_and_surfaces_the_notice() {
+    let (_home, paths) = state_home("08-offer");
+    let settings = paths.home.join(".claude/settings.json");
+    let mut pane = Pane::new(paths.clone(), &args("main", "sess-now", 76, 67));
+    pane.pixels = false;
+    pane.frame(76, 67, NOW);
+    assert!(pane
+        .acts
+        .values()
+        .any(|a| a["key"] == "instrument:dreams-on"));
+    // Corrupt after the offer is on screen so key 1 still routes to the enable path.
+    fs::write(&settings, "not-json{").unwrap();
+    assert!(pane.key("1"));
+    assert_eq!(fs::read_to_string(&settings).unwrap(), "not-json{");
+    let shown = pane.frame(76, 67, NOW + 1.).join("\n");
+    assert!(shown.contains("Couldn't turn dreams on"), "{shown}");
+    assert!(
+        shown.contains("malformed") || shown.contains("settings.json"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn offer_refuses_write_failure_without_claiming_enabled() {
+    let (_home, paths) = state_home("08-offer");
+    let settings = paths.home.join(".claude/settings.json");
+    let before = fs::read_to_string(&settings).unwrap();
+    let claude = paths.home.join(".claude");
+    let mut perms = fs::metadata(&claude).unwrap().permissions();
+    let restored = perms.clone();
+    perms.set_readonly(true);
+    fs::set_permissions(&claude, perms).unwrap();
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+    pane.pixels = false;
+    pane.frame(76, 67, NOW);
+    assert!(pane.key("1"));
+    let shown = pane.frame(76, 67, NOW + 1.).join("\n");
+    let _ = fs::set_permissions(&claude, restored);
+    assert_eq!(fs::read_to_string(&settings).unwrap(), before);
+    assert!(shown.contains("Couldn't turn dreams on"), "{shown}");
+    assert!(shown.contains("Turn dreams on"), "{shown}");
+}
+
+#[test]
+fn daemon_down_is_only_the_08b_fixture_state() {
+    for state in STATES {
+        let (_home, paths) = state_home(state);
+        let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+        pane.pixels = false;
+        let shown = pane.frame(76, 67, NOW).join("\n");
+        let down = shown.contains("daemon down");
+        assert_eq!(down, state == "08b-nothing", "{state}: {shown}");
+    }
+}
+
+#[test]
+fn expanded_bars_report_a_ceiling_on_the_chart_and_quotas_stay_compact() {
+    use csr_engine::companion::render::instrument::{self, Composition};
+    let (_home, paths) = state_home("03-agents");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 76, 67));
+    pane.pixels = true;
+    pane.enable_cards();
+    pane.key("i");
+    pane.frame(76, 67, NOW);
+    let metrics = pane.instrument_metrics.as_ref().unwrap();
+    let ceiling = metrics.ceiling_y.expect("expanded ceiling");
+    let (fig_y, fig_h) = metrics.figure_region;
+    assert!(
+        ceiling >= fig_y + 90. && ceiling <= fig_y + 200.,
+        "ceiling {ceiling} outside figure {fig_y}+{fig_h}"
+    );
+
+    let empty = Composition::build(
+        &json!({
+            "dreams_on": true,
+            "claude_fields": {"context_window": {}},
+            "learnt": []
+        }),
+        &json!({"id":"empty"}),
+        NOW,
+    );
+    let (_, empty_metrics) = instrument::draw(
+        &empty,
+        44 * 16,
+        29 * 34,
+        Theme::Dark,
+        Default::default(),
+        false,
+    )
+    .unwrap();
+    // Content height must clear gauge label baseline (P+52+46) plus descent, without growing.
+    assert!(
+        empty_metrics.figure_region.1 >= 138. && empty_metrics.figure_region.1 <= 140.,
+        "quotas card height {}: want 138..=140 so labels fit and stay compact",
+        empty_metrics.figure_region.1
+    );
+    let help = empty_metrics.help_region.expect("help card");
+    assert!(
+        (help.0 + help.1 - empty_metrics.height).abs() < 1.
+            || help.0 + help.1 >= empty_metrics.height - 20.,
+        "help card should reach the pane bottom: help={help:?} height={}",
+        empty_metrics.height
+    );
+}
+
+#[test]
+fn footer_abbreviates_only_what_must_fit_and_keeps_q_close() {
+    let (_home, paths) = state_home("02-running");
+    let mut pane = Pane::new(paths, &args("main", "sess-now", 44, 30));
+    pane.pixels = false;
+    let footer = text::plain(&pane.frame(44, 30, NOW)[29]);
+    assert!(footer.contains("q close"), "{footer}");
+    assert!(!footer.contains("q quit"), "{footer}");
+    // 48-wide fits full words with a single-space join.
+    let wide = text::plain(&pane.frame(48, 30, NOW)[29]);
+    assert!(wide.contains("changes") || wide.contains("chg"), "{wide}");
+    if wide.contains("changes") {
+        assert!(wide.contains("threads") && wide.contains("figure") && wide.contains("theme"));
     }
 }

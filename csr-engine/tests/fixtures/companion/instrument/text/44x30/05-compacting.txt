@@ -7,6 +7,7 @@
 
 
 
+
 ☾ What if one of Fable's three prototypes
 made the what-if question the star of the
 pane, as you wanted on 10-09?
@@ -26,5 +27,4 @@ Text parity is ready for review.
 CTX 189k/1M · +6k/turn · ◷ Compacting
 12s of ~45s · 1 by CSR
 7D 52%» · 5H 2% · ◷ 59m · Codex 7D 41%
-● CSR: daemon down
-d queue  l chg  t thr  i fig  b thm  q quit
+d queue l chg t thr i figure b theme q close

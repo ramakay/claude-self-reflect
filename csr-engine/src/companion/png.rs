@@ -102,7 +102,8 @@ fn instrument_png(
     Ok(())
 }
 
-fn compose(
+/// Compose text rows and Kitty placements into one pane-sized RGBA image.
+pub fn compose(
     lines: &[String],
     placed: &[kitty::Placement],
     cols: usize,

@@ -244,6 +244,8 @@ pub struct Pane {
     carry_gate: Option<std::sync::mpsc::Receiver<()>>,
     /// A compaction's marker was there at the last frame.
     compacting: bool,
+    /// Visible notice when the dreams-off offer could not write settings.
+    offer_notice: Option<String>,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -312,6 +314,7 @@ impl Pane {
             carry: Default::default(),
             carry_gate: None,
             compacting: false,
+            offer_notice: None,
         }
     }
     /// Draw cards where pixels and a system font allow; text mode is left byte for byte as it was.
@@ -497,6 +500,10 @@ impl Pane {
                 .as_ref()
                 .map(|db| db.learnt_counts(string(&s["project"]), &self.sid, now))
                 .unwrap_or_default());
+            let mut data = data;
+            if let Some(notice) = &self.offer_notice {
+                data["offer_notice"] = json!(notice);
+            }
             let composition = super::render::instrument::Composition::build(&data, s, now);
             return self.instrument_frame(&composition, cols, rows);
         }
@@ -772,7 +779,7 @@ impl Pane {
         if let Some((row, act)) = self.acts.iter().next().map(|(r, a)| (*r, a.clone())) {
             if let Some(actual) = semantic
                 .iter()
-                .position(|line| line.starts_with("1 helpful"))
+                .position(|line| line.starts_with("1 helpful") || line.starts_with("1 Turn dreams"))
             {
                 self.acts.remove(&row);
                 self.acts.insert(actual, act);
@@ -844,8 +851,10 @@ impl Pane {
                     };
                     let answer = self.acts.values().find(|a| a["dream"].is_string()).cloned();
                     self.acts.clear();
-                    for row in 0..=to_row(metrics.dream + 16.) {
-                        self.acts.insert(row, json!({"key":"instrument:dreams"}));
+                    if composition.dream.state == instrument::Batch::Ready {
+                        for row in 0..=to_row(metrics.dream + 16.) {
+                            self.acts.insert(row, json!({"key":"instrument:dreams"}));
+                        }
                     }
                     if let Some((start, height)) = metrics.story_region {
                         for row in to_row(start)..=to_row(start + height) {
@@ -881,6 +890,21 @@ impl Pane {
                             ]))
                             .collect::<Vec<_>>());
                         self.acts.insert(to_row(y - 4.), answer);
+                    }
+                    if let Some((y, x0, x1)) = metrics.offer_hit {
+                        let left = ((metrics.content_left + x0 / 605. * metrics.content_width)
+                            * cols as f32)
+                            .floor() as usize;
+                        let right = ((metrics.content_left + x1 / 605. * metrics.content_width)
+                            * cols as f32)
+                            .ceil() as usize;
+                        self.acts.insert(
+                            to_row(y - 4.),
+                            json!({
+                                "key": "instrument:dreams-on",
+                                "spans": [[left, right, "dreams-on"]],
+                            }),
+                        );
                     }
                 }
             }
@@ -927,37 +951,46 @@ impl Pane {
             ("b", "theme"),
             ("q", "close"),
         ]);
-        // Theme is essential at every width. Abbreviate, then omit secondary keys first.
-        let width = |keys: &[(&str, &str)]| {
+        // Theme is essential at every width. Abbreviate only as many labels as needed; keep q close.
+        let width = |keys: &[(&str, &str)], gap: usize| {
             keys.iter()
                 .map(|(key, label)| key.len() + usize::from(!label.is_empty()) + label.len())
                 .sum::<usize>()
-                + keys.len().saturating_sub(1) * 2
+                + keys.len().saturating_sub(1) * gap
         };
-        if width(&keys) > cols {
-            for (_, label) in &mut keys {
-                *label = match *label {
-                    "changes" => "chg",
-                    "threads" => "thr",
-                    "figure" => "fig",
-                    "theme" => "thm",
-                    "close" => "quit",
-                    other => other,
-                };
+        let mut gap = 2usize;
+        if width(&keys, gap) > cols {
+            gap = 1;
+        }
+        for (full, short) in [
+            ("changes", "chg"),
+            ("threads", "thr"),
+            ("figure", "fig"),
+            ("theme", "thm"),
+        ] {
+            if width(&keys, gap) <= cols {
+                break;
+            }
+            if let Some((_, label)) = keys.iter_mut().find(|(_, label)| *label == full) {
+                *label = short;
             }
         }
         for key in ["l", "t", "i", "d", "z"] {
-            if width(&keys) <= cols {
+            if width(&keys, gap) <= cols {
                 break;
             }
             keys.retain(|(k, _)| *k != key);
         }
-        if width(&keys) > cols {
-            keys = vec![("b", "thm")];
-            if width(&keys) > cols {
+        if width(&keys, gap) > cols {
+            keys = vec![("b", "theme")];
+            if width(&keys, gap) > cols {
+                keys = vec![("b", "thm")];
+            }
+            if width(&keys, gap) > cols {
                 keys = vec![("b", "")];
             }
         }
+        let sep = if gap == 1 { " " } else { "  " };
         let footer = text::fit(
             &keys
                 .iter()
@@ -969,7 +1002,7 @@ impl Pane {
                     }
                 })
                 .collect::<Vec<_>>()
-                .join("  "),
+                .join(sep),
             cols,
         );
         let mut start = 0;
@@ -979,7 +1012,7 @@ impl Pane {
             if end <= cols {
                 spans.push(json!([start, end, key]));
             }
-            start = end + 2;
+            start = end + gap;
         }
         self.acts
             .insert(rows.saturating_sub(1), json!({"key":"legend","keys":spans}));
@@ -1085,6 +1118,148 @@ impl Pane {
                 .kept_file("compacting", &self.sid)
                 .is_none_or(|marker| !marker.exists())
     }
+    /// One press enables dreams in this HOME's settings.json. Never calls the live host config API.
+    fn press_dreams_offer(&mut self) -> bool {
+        match Self::enable_dreams_in_home(&self.paths.home) {
+            Ok(()) => {
+                self.offer_notice = None;
+            }
+            Err(notice) => {
+                self.offer_notice = Some(notice);
+            }
+        }
+        true
+    }
+
+    /// Validate and atomically write `dreams: true` under every csr-companion pluginConfigs entry
+    /// that is currently false, preserving unrelated fields and the original file mode.
+    fn enable_dreams_in_home(home: &std::path::Path) -> Result<(), String> {
+        let path = home.join(".claude/settings.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => "{}".into(),
+            Err(err) => {
+                return Err(format!("Couldn't turn dreams on here: {err}"));
+            }
+        };
+        let prior_mode = std::fs::metadata(&path).ok().map(|m| m.permissions());
+        let mut settings: Value = match serde_json::from_str(&raw) {
+            Ok(Value::Object(map)) => Value::Object(map),
+            Ok(_) => {
+                return Err(
+                    "Couldn't turn dreams on here. settings.json is not a JSON object.".into(),
+                );
+            }
+            Err(_) => {
+                return Err("Couldn't turn dreams on here. settings.json is malformed.".into());
+            }
+        };
+        let root = settings.as_object_mut().unwrap();
+        match root.get("pluginConfigs") {
+            None => {
+                root.insert("pluginConfigs".into(), json!({}));
+            }
+            Some(Value::Object(_)) => {}
+            Some(_) => {
+                return Err(
+                    "Couldn't turn dreams on here. pluginConfigs must be a JSON object.".into(),
+                );
+            }
+        }
+        let plugins = root
+            .get_mut("pluginConfigs")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        let keys: Vec<String> = plugins
+            .keys()
+            .filter(|k| k.split('@').next() == Some("csr-companion"))
+            .cloned()
+            .collect();
+        if keys.is_empty() {
+            plugins.insert(
+                "csr-companion@local".into(),
+                json!({"options": {"dreams": true}}),
+            );
+        } else {
+            for plugin_key in keys {
+                match plugins.get(&plugin_key) {
+                    Some(Value::Object(_)) => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "Couldn't turn dreams on here. {plugin_key} must be a JSON object."
+                        ));
+                    }
+                    None => continue,
+                }
+                let entry = plugins
+                    .get_mut(&plugin_key)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap();
+                match entry.get("options") {
+                    None => {
+                        entry.insert("options".into(), json!({}));
+                    }
+                    Some(Value::Object(_)) => {}
+                    Some(_) => {
+                        return Err(
+                            "Couldn't turn dreams on here. options must be a JSON object.".into(),
+                        );
+                    }
+                }
+                let options = entry.get_mut("options").unwrap().as_object_mut().unwrap();
+                if options.get("dreams") == Some(&json!(false)) {
+                    options.insert("dreams".into(), json!(true));
+                }
+            }
+        }
+        let parent = path.parent().ok_or_else(|| {
+            "Couldn't turn dreams on here: settings path has no directory".to_string()
+        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Couldn't turn dreams on here: {err}"))?;
+        let body = serde_json::to_string_pretty(&settings)
+            .map_err(|err| format!("Couldn't turn dreams on here: {err}"))?;
+        let mut n = 0u32;
+        let tmp = loop {
+            let candidate = parent.join(format!("settings.{}.{n}.tmp", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(err) = file
+                        .write_all(body.as_bytes())
+                        .and_then(|_| file.sync_all())
+                    {
+                        let _ = std::fs::remove_file(&candidate);
+                        return Err(format!("Couldn't turn dreams on here: {err}"));
+                    }
+                    break candidate;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    n = n.saturating_add(1);
+                    if n > 10_000 {
+                        return Err("Couldn't turn dreams on here: temp file collision".into());
+                    }
+                }
+                Err(err) => {
+                    return Err(format!("Couldn't turn dreams on here: {err}"));
+                }
+            }
+        };
+        if let Some(mode) = prior_mode {
+            let _ = std::fs::set_permissions(&tmp, mode);
+        }
+        std::fs::rename(&tmp, &path).map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("Couldn't turn dreams on here: {err}")
+        })?;
+        Ok(())
+    }
     pub fn key(&mut self, key: &str) -> bool {
         match key {
             "a" if self.view == "main" => {
@@ -1142,6 +1317,14 @@ impl Pane {
                     if let Some(span) = array(&act["spans"]).get(index) {
                         return self.click(row, num(&span[0]) as usize, super::paths::now());
                     }
+                }
+                if key == "1"
+                    && self
+                        .acts
+                        .values()
+                        .any(|a| a["key"] == "instrument:dreams-on")
+                {
+                    return self.press_dreams_offer();
                 }
                 return true;
             }
@@ -1307,6 +1490,9 @@ impl Pane {
             return true;
         };
         if let Some(key) = string(&act["key"]).strip_prefix("instrument:") {
+            if key == "dreams-on" {
+                return self.press_dreams_offer();
+            }
             return self.key(match key {
                 "dreams" => "d",
                 "threads" => "t",

@@ -10,14 +10,15 @@
 
 
 
-
-
-☾ Dreaming.
+☾ Turn dreams on.
 dreamer 9k of 40k
-Following 3 threads: pane redesign, launch
-images, release landing · started 38s ago
+1 Turn dreams on
+Press 1: dreams on in all your sessions.
 3 notes kept · 2 findings confirmed
 1 fact retired
+Ask about past work. CSR finds it.
+Code changed? CSR warns Claude.
+CSR keeps the threads you dropped.
 Story · refreshed 30s ago
 Text parity is ready for review.
 ~ reader.rs · read ⌗8e4e3f27
@@ -26,5 +27,4 @@ Text parity is ready for review.
 CTX 192k/1M · +6k/turn · ♻ >15 prompts
 1 by CSR
 7D 52%» · 5H 2% · ◷ 59m · Codex 7D 41%
-● CSR: daemon down
-l chg  t thr  i fig  b thm  q quit
+l changes t threads i figure b theme q close
