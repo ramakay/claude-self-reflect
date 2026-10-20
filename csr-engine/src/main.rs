@@ -842,7 +842,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let _hook_operation = match &args.command {
-        Some(Commands::Hook { name, .. }) if name != "install" => {
+        // `stop-work` waits for the lock itself, below: a maintenance run that
+        // starts between the parent's spool and this process must not strand the
+        // Stop it was started for.
+        Some(Commands::Hook { name, .. }) if name != "install" && name != "stop-work" => {
             let Some(operation) = csr_engine::hooks::try_start(&args.db_path) else {
                 return Ok(());
             };
@@ -2031,6 +2034,19 @@ async fn run(
             let Some(key) = session.as_deref() else {
                 return Ok(());
             };
+            // Nobody waits on this process, so it waits for maintenance to end. On
+            // timeout the spool stays for the stale sweep.
+            let data_dir = args
+                .db_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."));
+            let Ok(_operation) =
+                csr_engine::maintenance::wait_shared(data_dir, std::time::Duration::from_secs(600))
+                    .await
+            else {
+                return Ok(());
+            };
             return csr_engine::hooks::stop_work::worker_main(
                 &args.db_path,
                 &args.projects_dir,
@@ -2054,18 +2070,29 @@ async fn run(
         let input = csr_engine::hooks::read_stdin_json();
         let stdin_elapsed = stdin_started.elapsed();
         // Stop returns at once: the transcript work moves to a detached worker.
-        // Before the engine is built, so the fast path pays for none of it. A
-        // `false` (kill switch, no session id, spool or spawn failure) falls
-        // through to the inline handler below, so no Stop is lost.
-        if name == "stop"
-            && csr_engine::hooks::stop_work::detach_stop(
+        // Before the engine is built, so the fast path pays for none of it.
+        // A worker that did not start leaves the spool and this process drains
+        // that key under the worker's lock. Only the kill switch, a missing
+        // session id or a failed spool write fall through to the inline handler
+        // below, so no Stop is lost.
+        if name == "stop" {
+            match csr_engine::hooks::stop_work::detach_stop(
                 &args.db_path,
                 &args.projects_dir,
                 &input,
                 stdin_elapsed,
-            )
-        {
-            return Ok(());
+            ) {
+                csr_engine::hooks::stop_work::Handoff::Detached => return Ok(()),
+                csr_engine::hooks::stop_work::Handoff::DrainHere(key) => {
+                    return csr_engine::hooks::stop_work::drain_here(
+                        &args.db_path,
+                        &args.projects_dir,
+                        &key,
+                    )
+                    .await;
+                }
+                csr_engine::hooks::stop_work::Handoff::Inline => {}
+            }
         }
         // PostToolUse now fires for every Bash call. One that wrote no file has
         // nothing to record: leave before the engine, the database and the

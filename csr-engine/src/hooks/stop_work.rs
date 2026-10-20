@@ -25,8 +25,11 @@
 //! once more: a spool written while it still held the lock (its own worker having
 //! failed the lock) is picked up by taking the lock again.
 //!
-//! `CSR_STOP_INLINE=1` keeps the old inline behaviour, and so does any failure to
-//! spool or to start the worker.
+//! `CSR_STOP_INLINE=1` keeps the old inline behaviour, and so does a Stop with no
+//! usable session id or a spool write that fails. A worker that fails to start
+//! leaves the spool in place and the hook drains the key itself, under the same
+//! key lock and claim path the worker uses ([`drain_here`]), so it never overlaps
+//! a live worker on the same key and never deletes a newer Stop's input.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -43,9 +46,12 @@ use crate::search::cross_project::resolve_project_from_cwd;
 /// Folder under the data dir holding the spools and locks.
 pub const SPOOL_DIR: &str = "stop-work";
 
-/// A spool older than this with no worker is picked up by the next worker that
-/// starts for any session.
-const STALE_AFTER: Duration = Duration::from_secs(24 * 3600);
+/// A spool (or a `.work` claim) older than this with no worker is picked up by the
+/// next worker that starts for any session. The per-key lock already keeps a sweep
+/// off any key a live worker holds, so the age only has to cover a fresh spool
+/// whose own worker is about to start. A day left an ended session's last Stop, or
+/// a killed worker's claim, unprocessed for a day.
+const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// Stale spools one worker takes on besides its own session's.
 const STALE_PER_WORKER: usize = 2;
@@ -97,6 +103,23 @@ pub fn spool_key(input: &HookInput) -> Option<String> {
         Some(agent) => Some(format!("{session}.{agent}")),
         None => Some(session),
     }
+}
+
+/// A key `spool_key` can produce: `<a>` or `<a>.<b>`, every part non-empty and
+/// made only of the characters `safe` keeps. Anything else is refused.
+pub fn valid_key(key: &str) -> Option<String> {
+    let mut parts = key.split('.');
+    let first = parts.next()?;
+    let second = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    for part in std::iter::once(first).chain(second) {
+        if part.is_empty() || safe(part) != part {
+            return None;
+        }
+    }
+    Some(key.to_string())
 }
 
 fn spool_path(dir: &Path, key: &str) -> PathBuf {
@@ -213,52 +236,56 @@ fn worker_argv(db_path: &Path, projects_dir: &Path, key: &str) -> Vec<OsString> 
     ]
 }
 
-/// Spool this Stop and start its worker. `true`: the work is handed off and the
-/// hook may exit. `false`: the caller runs the handler inline (kill switch, no
-/// session id, spool or spawn failure), so no Stop is lost.
+/// What `hook stop` does after it has tried to hand the Stop off.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// The spool is written and the worker started; the hook may exit.
+    Detached,
+    /// The spool is written but the worker did not start; the hook drains this
+    /// key itself with [`drain_here`].
+    DrainHere(String),
+    /// Kill switch, no usable session id, or the spool write failed: the caller
+    /// runs the handler inline.
+    Inline,
+}
+
+/// Spool this Stop and start its worker.
 pub fn detach_stop_with(
     db_path: &Path,
     projects_dir: &Path,
     input: &HookInput,
     spawner: &dyn WorkerSpawner,
-) -> bool {
+) -> Handoff {
     if inline_requested() {
-        return false;
+        return Handoff::Inline;
     }
     let Some(key) = spool_key(input) else {
-        return false;
+        return Handoff::Inline;
     };
     let dir = spool_dir(db_path);
-    let seq = match write_spool(&dir, &key, input) {
-        Ok(seq) => seq,
-        Err(e) => {
-            eprintln!("CSR: stop spool failed, running inline: {e}");
-            return false;
-        }
-    };
-    if let Err(e) = spawner.spawn(&worker_argv(db_path, projects_dir, &key)) {
-        eprintln!("CSR: stop worker did not start, running inline: {e}");
-        // This input is about to run inline; leave no copy of it behind unless a
-        // newer Stop has replaced it already.
-        let path = spool_path(&dir, &key);
-        if read_spool(&path).is_some_and(|s| s.seq == seq) {
-            let _ = std::fs::remove_file(path);
-        }
-        return false;
+    if let Err(e) = write_spool(&dir, &key, input) {
+        eprintln!("CSR: stop spool failed, running inline: {e}");
+        return Handoff::Inline;
     }
-    true
+    if let Err(e) = spawner.spawn(&worker_argv(db_path, projects_dir, &key)) {
+        eprintln!("CSR: stop worker did not start, draining in the hook: {e}");
+        // The spool stays: removing it here could delete a newer Stop's input.
+        return Handoff::DrainHere(key);
+    }
+    Handoff::Detached
 }
 
-/// The fast path of `hook stop`; logs the hook-timing line the inline path would.
+/// The fast path of `hook stop`; logs the hook-timing line the inline path would
+/// when the worker started.
 pub fn detach_stop(
     db_path: &Path,
     projects_dir: &Path,
     input: &HookInput,
     stdin_elapsed: Duration,
-) -> bool {
+) -> Handoff {
     let started = Instant::now();
-    let detached = detach_stop_with(db_path, projects_dir, input, &DetachedSpawner);
-    if detached {
+    let handoff = detach_stop_with(db_path, projects_dir, input, &DetachedSpawner);
+    if handoff == Handoff::Detached {
         let project = input
             .cwd
             .as_deref()
@@ -272,7 +299,7 @@ pub fn detach_stop(
             (stdin_elapsed + hook).as_millis(),
         ));
     }
-    detached
+    handoff
 }
 
 /// The session's worker lock. Held for as long as the value lives.
@@ -328,17 +355,21 @@ impl KeyLock {
     }
 }
 
-/// Keys with a spool older than [`STALE_AFTER`] and no worker on them.
+/// Keys with a spool or a leftover claim older than [`STALE_AFTER`] and no worker
+/// on them. Each key is returned once, oldest first.
 fn stale_keys(dir: &Path, exclude: &str, now: SystemTime) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut keys: Vec<(SystemTime, String)> = entries
+    let mut found: Vec<(SystemTime, String)> = entries
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let key = name.strip_suffix(".json")?.to_string();
-            if key.starts_with('.') || key == exclude {
+            let stem = name
+                .strip_suffix(".json")
+                .or_else(|| name.strip_suffix(".work"))?;
+            let key = valid_key(stem)?;
+            if key == exclude {
                 return None;
             }
             let modified = entry.metadata().ok()?.modified().ok()?;
@@ -346,11 +377,17 @@ fn stale_keys(dir: &Path, exclude: &str, now: SystemTime) -> Vec<String> {
             (age >= STALE_AFTER).then_some((modified, key))
         })
         .collect();
-    keys.sort();
-    keys.into_iter()
-        .map(|(_, key)| key)
-        .take(STALE_PER_WORKER)
-        .collect()
+    found.sort();
+    let mut keys: Vec<String> = Vec::new();
+    for (_, key) in found {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+        if keys.len() == STALE_PER_WORKER {
+            break;
+        }
+    }
+    keys
 }
 
 /// Engine and log label shared by the runs of one worker.
@@ -403,6 +440,17 @@ impl Runner<'_> {
         Ok(runs)
     }
 
+    /// The `stop-work` timing line, when anything ran.
+    fn log_runs(&self, started: Instant, runs: usize) {
+        if runs > 0 {
+            let project = self.project.as_deref().unwrap_or("unknown");
+            crate::telemetry::append_timing_line(&format!(
+                "CSR hook stop-work [{project}]: total={}ms runs={runs}",
+                started.elapsed().as_millis(),
+            ));
+        }
+    }
+
     /// Today's Stop handler, on a spooled input.
     async fn run_one(&mut self, input: &HookInput) {
         let Some(engine) = self.engine.as_ref() else {
@@ -425,10 +473,9 @@ impl Runner<'_> {
 /// then any spool that has gone stale. Logs one `stop-work` timing line when it
 /// ran something.
 pub async fn worker_main(db_path: &Path, projects_dir: &Path, key: &str) -> Result<()> {
-    let key = safe(key);
-    if key.is_empty() {
+    let Some(key) = valid_key(key) else {
         return Ok(());
-    }
+    };
     let started = Instant::now();
     let dir = spool_dir(db_path);
     let mut runner = Runner {
@@ -441,13 +488,28 @@ pub async fn worker_main(db_path: &Path, projects_dir: &Path, key: &str) -> Resu
     for stale in stale_keys(&dir, &key, SystemTime::now()) {
         runs += runner.drain(&dir, &stale).await?;
     }
-    if runs > 0 {
-        let project = runner.project.as_deref().unwrap_or("unknown");
-        crate::telemetry::append_timing_line(&format!(
-            "CSR hook stop-work [{project}]: total={}ms runs={runs}",
-            started.elapsed().as_millis(),
-        ));
-    }
+    runner.log_runs(started, runs);
+    Ok(())
+}
+
+/// The hook's own drain of one key, for a worker that did not start: the same
+/// key lock and claim path as the worker, no stale sweep (the hook stays short).
+/// When another worker holds the lock this returns at once; that holder claims
+/// the spool before it lets go.
+pub async fn drain_here(db_path: &Path, projects_dir: &Path, key: &str) -> Result<()> {
+    let Some(key) = valid_key(key) else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let dir = spool_dir(db_path);
+    let mut runner = Runner {
+        db_path,
+        projects_dir,
+        engine: None,
+        project: None,
+    };
+    let runs = runner.drain(&dir, &key).await?;
+    runner.log_runs(started, runs);
     Ok(())
 }
 
@@ -513,7 +575,10 @@ mod tests {
         let projects = tmp.path().join("projects");
         let spawner = Recording(Default::default());
         let sent = input("sid1", "/t/one.jsonl");
-        assert!(detach_stop_with(&db, &projects, &sent, &spawner));
+        assert_eq!(
+            detach_stop_with(&db, &projects, &sent, &spawner),
+            Handoff::Detached
+        );
 
         let spool = spool_dir(&db).join("sid1.json");
         let stored = read_spool(&spool).expect("spool written");
@@ -543,13 +608,20 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_spawn_runs_inline_and_leaves_no_spool() {
+    fn a_failed_spawn_hands_the_key_to_the_hook_and_leaves_the_spool() {
         inline_off();
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("csr-engine.db");
         let sent = input("sid2", "/t/two.jsonl");
-        assert!(!detach_stop_with(&db, tmp.path(), &sent, &Failing));
-        assert!(!spool_dir(&db).join("sid2.json").exists());
+        assert_eq!(
+            detach_stop_with(&db, tmp.path(), &sent, &Failing),
+            Handoff::DrainHere("sid2".to_string())
+        );
+        let stored = read_spool(&spool_dir(&db).join("sid2.json")).expect("the spool stays");
+        assert_eq!(
+            stored.input.transcript_path.as_deref(),
+            Some("/t/two.jsonl")
+        );
     }
 
     #[test]
@@ -558,12 +630,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("csr-engine.db");
         let spawner = Recording(Default::default());
-        assert!(!detach_stop_with(
-            &db,
-            tmp.path(),
-            &HookInput::default(),
-            &spawner
-        ));
+        assert_eq!(
+            detach_stop_with(&db, tmp.path(), &HookInput::default(), &spawner),
+            Handoff::Inline
+        );
         assert!(spawner.0.lock().unwrap().is_empty());
     }
 
@@ -652,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_spool_past_a_day_with_no_holder_is_stale() {
+    fn only_a_spool_past_the_stale_age_with_no_holder_is_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("stop-work");
         write_spool(&dir, "old", &input("old", "/t/o.jsonl")).unwrap();
@@ -664,8 +734,52 @@ mod tests {
         assert_eq!(
             keys,
             ["fresh", "old"],
-            "all but the worker's own are a day old by then"
+            "all but the worker's own are past the stale age by then"
         );
         assert!(stale_keys(&dir, "self", SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn a_claim_only_key_and_a_double_file_key_are_each_returned_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stop-work");
+        write_spool(&dir, "killed", &input("killed", "/t/k.jsonl")).unwrap();
+        std::fs::rename(spool_path(&dir, "killed"), work_path(&dir, "killed")).unwrap();
+        write_spool(&dir, "both", &input("both", "/t/b.jsonl")).unwrap();
+        std::fs::copy(spool_path(&dir, "both"), work_path(&dir, "both")).unwrap();
+        std::fs::write(dir.join(".x.123.tmp"), b"{}").unwrap();
+        std::fs::write(dir.join(".x.123.work"), b"{}").unwrap();
+        let later = SystemTime::now() + STALE_AFTER + Duration::from_secs(60);
+        let mut keys = stale_keys(&dir, "self", later);
+        keys.sort();
+        assert_eq!(keys, ["both", "killed"]);
+        assert!(stale_keys(&dir, "self", SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn valid_key_takes_what_spool_key_makes_and_nothing_else() {
+        for ok in ["abc", "abc-1_x.agent_2", "a.b"] {
+            assert_eq!(valid_key(ok).as_deref(), Some(ok), "{ok}");
+        }
+        for bad in ["a.b.c", ".a", "a.", "a/b", "", ".", "a b", "../x"] {
+            assert_eq!(valid_key(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_subagent_key_resolves_to_its_own_spool() {
+        let mut sub = input("sid", "/t/s.jsonl");
+        sub.agent_id = Some("agent_2".into());
+        let key = spool_key(&sub).unwrap();
+        // What worker_main does with the key it was started with.
+        let resolved = valid_key(&key).expect("a subagent key is valid");
+        assert_eq!(resolved, "sid.agent_2");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stop-work");
+        write_spool(&dir, &key, &sub).unwrap();
+        assert!(spool_path(&dir, &resolved).exists());
+        let lock = KeyLock::try_acquire(&dir, &resolved).unwrap();
+        let claimed = lock.claim_next().expect("the subagent spool is claimed");
+        assert_eq!(claimed.agent_id.as_deref(), Some("agent_2"));
     }
 }

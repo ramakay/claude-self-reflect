@@ -571,7 +571,31 @@ fn a_worker_that_cannot_start_runs_the_stop_inline() {
         !spool_dir(&world.db).join("sid-nospawn.json").exists(),
         "an input that ran inline leaves no spool"
     );
-    assert_eq!(world.worker_runs(), 0);
+    assert!(
+        !spool_dir(&world.db).join("sid-nospawn.work").exists(),
+        "and no claim"
+    );
+    // The hook process drained the key itself, under the worker's lock and path.
+    assert_eq!(world.worker_runs(), 1, "{}", world.timing_log());
+}
+
+#[test]
+fn a_subagent_stop_is_processed_by_its_own_detached_worker() {
+    let world = World::new();
+    let session = Session::new("sid-agent");
+    let transcript = session.transcript("t");
+    std::fs::write(&transcript, small_transcript("Take the dump lock first")).unwrap();
+    let mut payload = session.payload(&transcript);
+    payload["agent_id"] = serde_json::json!("agent_7");
+    let (_, output) = world.stop(&payload, &[]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let dir = spool_dir(&world.db);
+    world.wait_for("the subagent's worker", Duration::from_secs(120), |w| {
+        w.worker_runs() >= 1
+            && !dir.join("sid-agent.agent_7.json").exists()
+            && !dir.join("sid-agent.agent_7.work").exists()
+    });
 }
 
 #[test]
