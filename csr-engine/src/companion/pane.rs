@@ -1,5 +1,5 @@
 use super::{
-    array, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, info, masthead, num, pages,
+    array, cli::PaneArgs, db::Db, dreams, feed::Feed, infinite, info, layout, masthead, num, pages,
     paths::Paths, render::text::*, send, session::Session, string, threads, value,
 };
 use serde_json::{json, Value};
@@ -232,6 +232,8 @@ pub struct Pane {
     codex: super::codex_runs::CodexRolloutIndex,
     readers: super::readings::Readers,
     pub answered: Option<(String, String, f64)>,
+    /// Column mode's gauge strip: (first column, first row past it); a click there is on no row.
+    edge: Option<(usize, usize)>,
 }
 impl Pane {
     pub fn new(paths: Paths, args: &PaneArgs) -> Self {
@@ -292,6 +294,7 @@ impl Pane {
             codex,
             readers: Default::default(),
             answered: None,
+            edge: None,
         }
     }
     pub fn frame(&mut self, cols: usize, rows: usize, now: f64) -> Vec<String> {
@@ -321,6 +324,9 @@ impl Pane {
         let phone = self.phone.read(self.herdr.as_ref(), cols, rows, now);
         let column = cols < super::phone::COLUMN_UNDER;
         self.phone.settle(self.herdr.as_ref(), column, phone);
+        // column mode's strip takes the pane's last columns; the pages draw left of it
+        let tapes = layout::strip_tapes(cols, rows, column);
+        let body_cols = cols - layout::strip_width(tapes);
         if self.sent[2].as_f64().is_some_and(|at| now - at > 6.) {
             if self.open == self.sent[0] {
                 self.open = Value::Null;
@@ -468,6 +474,24 @@ impl Pane {
                 now,
             );
         }
+        // the value row above the main page's legend (not in column mode, not in an export)
+        let value = if self.view == "main" && !column && !self.exporting {
+            Self::week_data(
+                &Wide {
+                    paths: &self.paths,
+                    db: self.db.as_ref(),
+                    sid: &self.sid,
+                    persist: self.persist,
+                },
+                (&mut self.narrative, &mut self.spend),
+                &mut data,
+                now,
+            );
+            layout::value_rows(&data["value"], cols - 1)
+        } else {
+            vec![]
+        };
+        let room = rows.saturating_sub(value.len());
         let extra = matches!(self.view.as_str(), "info" | "summary" | "threads");
         let page = if extra {
             Value::Null
@@ -475,7 +499,7 @@ impl Pane {
             pages::page_log(&data)
         } else {
             let page = pages::page_main(&data, s, now, &ui, self.db.as_ref());
-            if self.exporting {
+            if self.exporting || column {
                 page
             } else if s["busy"] == true && self.hold.as_ref().is_some_and(|(_, at)| now - at < 120.)
             {
@@ -501,8 +525,22 @@ impl Pane {
                 page
             }
         };
-        self.tall = self.view == "main" && (self.tall || self.top > 0 || self.open.is_string());
+        self.tall =
+            self.view == "main" && !column && (self.tall || self.top > 0 || self.open.is_string());
+        let mut strip_grounds = vec![];
         let mut lines = match self.view.as_str() {
+            "info" if column => {
+                let (lines, grounds, top) =
+                    layout::draw_column_info(&data, s, body_cols, rows, self.info_top, now);
+                self.info_top = top;
+                strip_grounds = grounds;
+                lines
+            }
+            "main" if column => {
+                let (lines, grounds) = layout::draw_column_main(&page, body_cols, phone);
+                strip_grounds = grounds;
+                lines
+            }
             "info" => {
                 let (lines, top) =
                     info::draw_info(&data, s, cols, rows, self.info_top, now, self.pixels);
@@ -510,14 +548,15 @@ impl Pane {
                 lines
             }
             "summary" => {
-                let (lines, top) = threads::draw_summary(&summary, cols, rows, self.summary_top);
+                let (lines, top) =
+                    threads::draw_summary(&summary, body_cols, rows, self.summary_top);
                 self.summary_top = top;
                 lines
             }
             "threads" => {
                 let (lines, top) = threads::draw_threads(
                     &every,
-                    cols,
+                    body_cols,
                     rows,
                     &self.open,
                     &self.sent,
@@ -527,8 +566,12 @@ impl Pane {
                 self.threads_top = top;
                 lines
             }
-            _ => pages::draw_page(&page, cols, if self.tall { 10000 } else { rows }, &ui),
+            _ => pages::draw_page(&page, body_cols, if self.tall { 10000 } else { room }, &ui),
         };
+        if column && !matches!(self.view.as_str(), "main" | "info") {
+            // a page laid out at its narrowest, its words rewrapped
+            lines = layout::column_reflow(&lines, body_cols);
+        }
         if self.exporting {
             return lines.rows;
         }
@@ -543,19 +586,19 @@ impl Pane {
                 self.top = actual.saturating_sub(row);
             }
         }
-        let top = if self.view == "main" {
-            self.top = self
-                .top
-                .min(lines.rows.len().saturating_sub(rows.saturating_sub(1)));
+        // the rows the page shows: the screen less the value row, the legend's own still counted
+        let shown = room.saturating_sub(1);
+        let top = if self.view == "main" && !column {
+            self.top = self.top.min(lines.rows.len().saturating_sub(shown));
             self.top
         } else {
             0
         };
-        if self.view == "main" {
+        if self.view == "main" && !column {
             let names = lines
                 .heads
                 .iter()
-                .filter(|(r, _)| *r >= top && *r < top + rows.saturating_sub(1))
+                .filter(|(r, _)| *r >= top && *r < top + shown)
                 .map(|(_, n)| n.clone())
                 .collect::<Vec<_>>();
             self.feed.shown(&names, now);
@@ -566,7 +609,7 @@ impl Pane {
         self.acts = lines
             .acts
             .into_iter()
-            .filter(|(r, _)| *r >= top && *r < top + rows.saturating_sub(1))
+            .filter(|(r, _)| *r >= top && *r < top + shown)
             .map(|(r, a)| (r - top, a))
             .collect();
         if self.pixels {
@@ -575,7 +618,7 @@ impl Pane {
                 .pictures
                 .iter()
                 .filter_map(|wanted| {
-                    if wanted.row < top || wanted.row + wanted.rows > top + rows.saturating_sub(1) {
+                    if wanted.row < top || wanted.row + wanted.rows > top + shown {
                         return None;
                     }
                     let mut wanted = wanted.clone();
@@ -596,12 +639,41 @@ impl Pane {
         let body = lines
             .rows
             .drain(top..)
-            .take(rows.saturating_sub(1))
+            .take(shown)
             .map(|s| safe_line(&s))
             .collect::<Vec<_>>();
         let mut body = body;
-        body.resize(rows.saturating_sub(1), String::new());
-        let countdown = (60. - (now - self.loaded)).ceil().max(0.) as u64;
+        body.resize(shown, String::new());
+        if !value.is_empty() {
+            // a click on the value row opens the i page, which says it in words
+            self.acts.insert(shown, json!({"key": "view:info"}));
+        }
+        body.extend(value);
+        if tapes > 0 {
+            // after each row, by absolute position: a repainted row repaints its strip cells
+            let g = masthead::gauges_compacting(
+                &data["claude_fields"],
+                data["claude_at"].as_f64(),
+                s,
+                now,
+                &data["limits"],
+                &data["sts"],
+                &data["compacting"],
+            );
+            let columns = layout::gauge_strip(&g, tapes, rows - 2);
+            for (row, strip) in layout::strip_rows(&columns, cols, &strip_grounds)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(line) = body.get_mut(row) {
+                    line.push_str(&strip);
+                }
+            }
+            self.edge = Some((body_cols, rows - 1));
+        } else {
+            self.edge = None;
+        }
+        let countdown = layout::reload_in(self.loaded, now);
         let (foot, spans) = legend_parts(
             &self.view,
             cols.saturating_sub(1),
@@ -636,12 +708,29 @@ impl Pane {
         s: &Value,
         now: f64,
     ) {
+        Self::week_data(&env, (&mut *narrative_kept, &mut *spend_kept), data, now);
+        let Wide { paths, db, sid, .. } = env;
+        data["infinite"] = infinite::infinite_info(paths, sid, now, s);
+        if data["compacting"].is_object() {
+            let facts = db
+                .map(|db| {
+                    infinite::compaction_facts(db, sid, &data["story"], data["dreams_on"] == true)
+                })
+                .unwrap_or_default();
+            data["compacting"]["facts"] = json!(facts);
+        }
+    }
+    /// What the value row and the info page's cost section read: the plan's week, what CSR cost
+    /// in it, and the counts of what you took.
+    fn week_data(
+        env: &Wide,
+        (narrative_kept, spend_kept): (&mut Option<(Value, f64, Value)>, &mut Option<value::Spend>),
+        data: &mut Value,
+        now: f64,
+    ) {
         let Wide {
-            paths,
-            db,
-            sid,
-            persist,
-        } = env;
+            paths, db, persist, ..
+        } = *env;
         let plan = value::plan_of(&data["claude_fields"], &data["limits"], now);
         let week = if plan["mode"] == "plan" {
             plan["start"].clone()
@@ -672,15 +761,6 @@ impl Pane {
         data["plan"] = plan;
         data["narrative"] = narrative;
         data["spend"] = spent;
-        data["infinite"] = infinite::infinite_info(paths, sid, now, s);
-        if data["compacting"].is_object() {
-            let facts = db
-                .map(|db| {
-                    infinite::compaction_facts(db, sid, &data["story"], data["dreams_on"] == true)
-                })
-                .unwrap_or_default();
-            data["compacting"]["facts"] = json!(facts);
-        }
     }
     fn previous(&self, s: &Value) -> Value {
         if let Some(path) = self.paths.kept_file("previous", &self.sid) {
@@ -862,6 +942,13 @@ impl Pane {
                 .is_some_and(|a| a["key"] == "legend" || string(&a["key"]).starts_with("view:"))
         {
             self.phone.zoom_key(self.herdr.as_ref());
+            return true;
+        }
+        // a click on the gauge strip is on no row
+        if self
+            .edge
+            .is_some_and(|(edge, rows)| col >= edge && row < rows)
+        {
             return true;
         }
         let Some(act) = act else {

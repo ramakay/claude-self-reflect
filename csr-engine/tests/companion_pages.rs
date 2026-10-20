@@ -337,7 +337,8 @@ fn only_the_first_two_masthead_rows_open_the_info_page() {
         .filter(|(_, a)| a["key"] == "view:info")
         .map(|(r, _)| *r)
         .collect();
-    assert_eq!(rows, [0, 1]);
+    // the masthead's first two rows, and the value row above the legend (pane.py's `room - 1`)
+    assert_eq!(rows, [0, 1, 38]);
 }
 
 #[test]

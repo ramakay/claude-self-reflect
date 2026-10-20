@@ -30,15 +30,15 @@ const LANE: usize = 9;
 const ICON: (usize, usize) = (5, 2);
 const FLOOR_ROWS: usize = 5;
 const BAND: (f64, f64) = (180_589., 269_178.);
-const CACHE_LOW: f64 = 600.;
+pub(super) const CACHE_LOW: f64 = 600.;
 const QUIET_SWITCHES: [&str; 1] = ["RATIFICATION"];
-const RAIL: char = '│';
-const WARM: Rgb = [36, 163, 114];
-const OCHRE: Rgb = [242, 182, 50];
-const INDIGO: Rgb = [58, 127, 224];
-const VERMILION: Rgb = [232, 88, 44];
-const CHALK: Rgb = [238, 245, 250];
-const NIGHT: Rgb = [14, 15, 17];
+pub(super) const RAIL: char = '│';
+pub(super) const WARM: Rgb = [36, 163, 114];
+pub(super) const OCHRE: Rgb = [242, 182, 50];
+pub(super) const INDIGO: Rgb = [58, 127, 224];
+pub(super) const VERMILION: Rgb = [232, 88, 44];
+pub(super) const CHALK: Rgb = [238, 245, 250];
+pub(super) const NIGHT: Rgb = [14, 15, 17];
 
 /// One row of the page: a label, its value, the severity it is inked by, a faint note under it, and
 /// the instrument on the ramp that already says it (the page leaves the row out while it is drawn).
@@ -79,7 +79,7 @@ impl Fact {
 fn put(lines: &mut Lines, rows: Vec<String>) {
     lines.rows.extend(rows);
 }
-fn paper_ink(sev: &str) -> &'static str {
+pub(super) fn paper_ink(sev: &str) -> &'static str {
     match sev {
         "advisory" => "ctx",
         "amber" => "dream",
@@ -603,12 +603,12 @@ pub fn info_title(s: &Value) -> String {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Paint {
+pub(super) enum Paint {
     None,
     Rail,
     Rgb(Rgb),
 }
-type Cell = (char, Paint, Option<Rgb>);
+pub(super) type Cell = (char, Paint, Option<Rgb>);
 
 /// A session's context as `height` rows (top first) of one cell a slice: each slice's highest
 /// context in eighths over 0..CTX_RED, in its heat, the part under the floor dimmed.
@@ -685,14 +685,14 @@ fn session_series(s: &Value, n: usize, now: f64) -> Option<Series> {
     })
 }
 
-fn level_row(share: Option<f64>, height: usize) -> usize {
+pub(super) fn level_row(share: Option<f64>, height: usize) -> usize {
     let share = share.filter(|n| n.is_finite()).unwrap_or(0.);
     height - 1 - (height - 1).min((share.clamp(0., 1.) * height as f64) as usize)
 }
-fn bug_cell(fill: usize, paint: Rgb) -> Cell {
+pub(super) fn bug_cell(fill: usize, paint: Rgb) -> Cell {
     ('━', Paint::Rgb(CHALK), (fill >= 4).then_some(paint))
 }
-fn quota_tape(q: Option<&Value>, height: usize) -> Vec<Cell> {
+pub(super) fn quota_tape(q: Option<&Value>, height: usize) -> Vec<Cell> {
     let Some(used) = q.and_then(|q| q["used"].as_f64()) else {
         return vec![(RAIL, Paint::Rail, None); height];
     };
@@ -718,7 +718,7 @@ fn quota_tape(q: Option<&Value>, height: usize) -> Vec<Cell> {
         })
         .collect()
 }
-fn cache_tape(cache: &Value, height: usize) -> Vec<Cell> {
+pub(super) fn cache_tape(cache: &Value, height: usize) -> Vec<Cell> {
     let (left, ttl) = (num(&cache["left"]), num(&cache["ttl"]));
     if cache["cold"] == true || left == 0. || ttl == 0. {
         return vec![(RAIL, Paint::Rail, None); height];
@@ -735,7 +735,7 @@ fn cache_tape(cache: &Value, height: usize) -> Vec<Cell> {
         })
         .collect()
 }
-fn cell_text(cell: &Cell, ground: Rgb) -> String {
+pub(super) fn cell_text(cell: &Cell, ground: Rgb) -> String {
     let (glyph, paint, back) = cell;
     let ink = match paint {
         Paint::Rail => Some(blend(ground, CHALK, 0.24)),
