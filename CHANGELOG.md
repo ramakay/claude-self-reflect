@@ -491,12 +491,12 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
 - **Daemon dreams stalled for two days on a busy machine.** The nightly floor pass waited for 30 quiet minutes, and
   parallel agents kept the machine busy, so the pass owed since 2026-10-19 03:00 never ran (last run 2026-10-18
   13:05Z). An owed floor pass now runs after a grace (default 6 h past the 03:00 boundary,
-  `CSR_DREAM_FLOOR_GRACE_HOURS`, 1-168) even without a quiet window, and status no longer reports a deferral that will
+  `CSR_DREAM_FLOOR_GRACE_HOURS`, 1-23) even without a quiet window, and status no longer reports a deferral that will
   not happen (80b661fd).
 - `history.jsonl` rows from the old Claude Code format (no `sessionId`, 575 rows from 2025-09/10) are skipped, not
-  counted as schema misses; a one-shot reconcile resets a counter that only legacy rows had raised (763374fe).
+  counted as schema misses (763374fe). A counter an older build raised stays as it was.
 - The detached SessionEnd child wrote its errors to `/dev/null`. It now appends them to
-  `~/.claude-self-reflect/logs/session-end-detached.log` (`0600`, rotated once at 1 MiB) and stays non-blocking
+  `~/.claude-self-reflect/logs/session-end-detached.log` (`0600`, rotated at open once it reaches 1 MiB) and stays non-blocking
   (093d1417). In-process hook tests no longer spawn the test binary as a detached engine child (a85afa8b).
 - `companion pane --json` printed `"dream_tokens_7d": -0.0` on an empty week; whole values print as integers (0a815888).
 - Code-graph worktree paths are canonical; 132 code_evolution and 384 code_nodes rows had throwaway keys
