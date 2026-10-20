@@ -1156,8 +1156,16 @@ impl Daemon {
                                 skipped,
                                 already_live = stats.already_live_total(),
                                 insert_errors = stats.insert_errors,
+                                read_errors = stats.read_errors,
                                 "co-edit (Bash) history backfill completed"
                             );
+                            if !stats.complete() {
+                                // No retry loop: the marker is unset, `status` reads
+                                // `pending`, and the next daemon start runs the pass again.
+                                tracing::warn!(
+                                    "co-edit (Bash) history backfill incomplete; it runs again at the next daemon start"
+                                );
+                            }
                         }
                         Ok(Err(error)) => tracing::warn!(%error, "co-edit (Bash) backfill failed"),
                         Err(error) => tracing::warn!(%error, "co-edit (Bash) backfill panicked"),

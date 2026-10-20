@@ -313,8 +313,8 @@ fn statusline_preview() -> Option<String> {
 }
 
 /// Whether the PostToolUse entries in `settings_path` run CSR's
-/// `hook post-tool-use` for Bash calls: the matcher names `Bash` as one of its
-/// `|`-separated alternatives, or matches every tool (absent, empty, `*`). A
+/// `hook post-tool-use` for Bash calls: the matcher selects `Bash` by Claude Code's
+/// rules (see `matcher_covers`: every tool, an exact name in a `|`/`,` list, or a regex). A
 /// missing or unreadable file, or one without such an entry, is false: the
 /// live hook is not recording Bash yet.
 pub fn post_tool_use_records_bash(settings_path: &std::path::Path) -> bool {
@@ -331,15 +331,8 @@ pub fn post_tool_use_records_bash(settings_path: &std::path::Path) -> bool {
         return false;
     };
     entries.iter().any(|entry| {
-        let matcher = entry
-            .get("matcher")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .trim();
-        let covers_bash = matcher.is_empty()
-            || matcher == "*"
-            || matcher.split('|').any(|name| name.trim() == "Bash");
-        covers_bash
+        let matcher = entry.get("matcher").and_then(|m| m.as_str()).unwrap_or("");
+        matcher_covers(matcher, "Bash")
             && entry
                 .get("hooks")
                 .and_then(|h| h.as_array())
@@ -351,6 +344,25 @@ pub fn post_tool_use_records_bash(settings_path: &std::path::Path) -> bool {
                     })
                 })
     })
+}
+
+/// Does a hook `matcher` select `tool`? Claude Code's rules: `*`, empty or missing match
+/// every tool. A matcher of only letters, digits, `_`, `-`, spaces, `,` and `|` is an
+/// exact name, or a list of exact names split on `|` or `,` (spaces around a name are
+/// ignored). Anything else is a JavaScript regex tested unanchored. A pattern the `regex`
+/// crate cannot compile (JavaScript lookaround, say) counts as not selecting the tool: the
+/// caller then waits, which is the safe side.
+fn matcher_covers(matcher: &str, tool: &str) -> bool {
+    if matcher.is_empty() || matcher == "*" {
+        return true;
+    }
+    let plain = matcher
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ' ' | ',' | '|'));
+    if plain {
+        return matcher.split(['|', ',']).any(|name| name.trim() == tool);
+    }
+    regex::Regex::new(matcher).is_ok_and(|re| re.is_match(tool))
 }
 
 /// `is_csr_hook_command` narrowed to the `post-tool-use` subcommand.
@@ -777,6 +789,47 @@ mod tests {
         let settings = merged(serde_json::json!({}));
         std::fs::write(&path, settings.to_string()).unwrap();
         assert!(post_tool_use_records_bash(&path));
+    }
+
+    /// Claude Code's matcher rules: `*`/empty/missing match all; letters, digits, `_`, `-`,
+    /// spaces, `,` and `|` only is a list of exact names; anything else is an unanchored
+    /// JavaScript regex.
+    #[test]
+    fn test_post_tool_use_records_bash_follows_claude_codes_matcher_rules() {
+        let csr = hook_cmd("/usr/local/bin/csr-engine hook post-tool-use");
+        let with = |matcher: &str| serde_json::json!([{"matcher": matcher, "hooks": [csr]}]);
+        for yes in [
+            "Bash",
+            "Edit|Write|Bash",
+            "Edit, Bash",
+            "Edit,Bash",
+            " Bash ",
+            "*",
+            "",
+            ".*",
+            "^Bash$",
+            "B.sh",
+            "Bash.*",
+            "(Edit|Bash)",
+        ] {
+            assert!(records_bash(with(yes)), "matcher {yes:?} should cover Bash");
+        }
+        assert!(records_bash(serde_json::json!([{"hooks": [csr]}])));
+        for no in [
+            "Bas",
+            "bash",
+            "Edit|Write",
+            "^Edit$",
+            "Edit, Write",
+            "BashOutput",
+            "([unclosed",
+            "(?<=x)Bash",
+        ] {
+            assert!(
+                !records_bash(with(no)),
+                "matcher {no:?} must not cover Bash"
+            );
+        }
     }
 
     #[test]

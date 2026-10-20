@@ -1966,11 +1966,12 @@ async fn running_failed_and_empty_agents_never_trigger_looks() {
 }
 
 /// The sweep of the per-session keys of old sessions is the pace's (`sweepSessions`, at the
-/// start): it names `agentLedger` among them. This runs against the whole table.
+/// start): it names `agentLedger` among them. This runs against the rig's table, whose fleet, pace and
+/// dreamer have private paths and pretend seams: the real table's guard and coach would read the
+/// real HOME.
 #[tokio::test]
 async fn the_ledger_of_an_old_session_is_swept_with_its_other_per_session_keys() {
     let rig = Rig::dreaming(World::default());
-    let full = crate::companion::app::table();
     let cx = rig.cx();
     for n in 1..=22 {
         let old = format!("old-{n}");
@@ -1985,7 +1986,7 @@ async fn the_ledger_of_an_old_session_is_swept_with_its_other_per_session_keys()
         .set(SID, AGENT_LEDGER, &json!({ "k": "pending" }))
         .unwrap();
     let e = json!({ "cwd": "/repo", "surface": "terminal", "isInteractive": true, "startedAt": 0 });
-    run(&full, "start", cx, e).await;
+    run(&rig.table, "start", cx, e).await;
     let has = |sid: &str| cx.store.get(sid, AGENT_LEDGER).unwrap().is_some();
     assert!(until(|| !has("old-1")).await);
     assert!(!has("old-1"));

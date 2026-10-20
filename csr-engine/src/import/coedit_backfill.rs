@@ -159,6 +159,10 @@ pub struct CoeditBackfillStats {
     /// Row inserts that failed (a locked database, say). A run with any of
     /// these is not a complete replay.
     pub insert_errors: usize,
+    /// Project folders that could not be listed and transcripts that could not be
+    /// read (a transcript that vanished mid-run does not count). History skipped
+    /// this way is not replayed, so a run with any of these is not complete either.
+    pub read_errors: usize,
     /// Subagent transcripts (`<sid>/subagents/agent-*.jsonl`) scanned.
     pub subagent_files: usize,
     /// Events read from subagent transcripts, and what became of them. They
@@ -169,6 +173,11 @@ pub struct CoeditBackfillStats {
 }
 
 impl CoeditBackfillStats {
+    /// Every folder was listed, every transcript read and every insert landed.
+    pub fn complete(&self) -> bool {
+        self.insert_errors == 0 && self.read_errors == 0
+    }
+
     /// Total across all projects, in `(would_insert, inserted, skipped)` order.
     pub fn totals(&self) -> (usize, usize, usize) {
         self.per_project.values().fold((0, 0, 0), |acc, p| {
@@ -515,6 +524,14 @@ fn extract_events(path: &Path, conv_id: &str) -> Result<Vec<CoeditEvent>> {
     Ok(events)
 }
 
+/// Is `error` a reason history went unread? A file or folder that is gone
+/// (`NotFound`) is not: there is nothing left to replay.
+fn is_read_failure(error: &anyhow::Error) -> bool {
+    !error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Backfill the `code_evolution` co-edit ledger from every JSONL conversation
 /// under `projects_dir`. `dry_run` parses + counts everything but writes
 /// nothing (existence checks are still read-only lookups, so dry-run counts
@@ -553,7 +570,10 @@ pub fn backfill_coedit(
                     }
                 }
             }
-            Err(e) => eprintln!("CSR coedit-backfill: cannot list {} ({e})", dir.display()),
+            Err(e) => {
+                stats.read_errors += usize::from(is_read_failure(&e));
+                eprintln!("CSR coedit-backfill: cannot list {} ({e})", dir.display());
+            }
         }
     }
     files.sort();
@@ -565,6 +585,7 @@ pub fn backfill_coedit(
         let mut events = match extract_events(path, conv_id) {
             Ok(e) => e,
             Err(e) => {
+                stats.read_errors += usize::from(is_read_failure(&e));
                 eprintln!("CSR coedit-backfill: skip {} ({e})", path.display());
                 continue;
             }
@@ -655,7 +676,8 @@ pub enum BashReplay {
     /// The installed hook config does not record Bash yet; nothing ran and the
     /// marker is unset.
     WaitingOnHook,
-    /// The pass ran. The marker is set only if no insert failed.
+    /// The pass ran. The marker is set only if no insert failed and no folder or
+    /// transcript went unread.
     Ran(CoeditBackfillStats),
 }
 
@@ -674,8 +696,9 @@ impl BashReplay {
 /// the hook config in `settings_path` records Bash, since a pass that finishes
 /// earlier would leave every Bash edit made before the hook is installed
 /// missing for good; until then it defers and the next call checks again. The
-/// marker is set only after a run with no failed insert, so a locked database
-/// is retried on the next call; rows are keyed by a deterministic id, so a
+/// marker is set only after a run with no failed insert and no unread folder or
+/// transcript, so a locked database or a file made readable later is retried on
+/// the next call; rows are keyed by a deterministic id, so a
 /// retry inserts only what is missing.
 pub fn backfill_coedit_once(
     storage: &Storage,
@@ -689,7 +712,7 @@ pub fn backfill_coedit_once(
         return Ok(BashReplay::WaitingOnHook);
     }
     let stats = backfill_coedit(storage, projects_dir, false)?;
-    if stats.insert_errors == 0 {
+    if stats.complete() {
         storage.set_meta(BASH_BACKFILL_META_KEY, &chrono::Utc::now().to_rfc3339())?;
     }
     Ok(BashReplay::Ran(stats))
@@ -1705,6 +1728,83 @@ mod tests {
             .unwrap();
         assert_eq!(retried.totals(), (0, 1, 0));
         assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
+    }
+
+    /// A transcript the pass cannot open is skipped history, so the marker stays
+    /// unset until a run reads everything; a restored file is replayed then.
+    #[test]
+    fn an_unreadable_transcript_leaves_the_marker_unset_until_it_is_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (_repo, rs, _yml) = repo_with_files();
+        let corpus = tmp.path().join("corpus");
+        let jsonl = write_jsonl(
+            &corpus,
+            "conv-locked.jsonl",
+            &[bash_line(
+                &format!("sed -i '' 's/a/b/' {}", rs.display()),
+                "toolu_l",
+                "2026-01-01T00:00:00.000Z",
+            )],
+        );
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
+        let storage = Storage::open_memory().unwrap();
+        std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
+        assert_eq!(blocked.read_errors, 1);
+        assert_eq!(blocked.insert_errors, 0);
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_none());
+        assert_eq!(bash_replay_state(&storage, &settings), "pending");
+
+        std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let retried = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
+        assert_eq!(retried.read_errors, 0);
+        assert_eq!(retried.totals(), (0, 1, 0));
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
+        assert_eq!(bash_replay_state(&storage, &settings), "done");
+    }
+
+    /// A project folder the pass cannot list is skipped history too.
+    #[test]
+    fn an_unlistable_project_folder_leaves_the_marker_unset() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = tmp.path().join("corpus");
+        let jsonl = write_jsonl(&corpus, "conv-x.jsonl", &[]);
+        let folder = jsonl.parent().unwrap().to_path_buf();
+        let settings = settings_file(tmp.path(), Some(INSTALLED_MATCHER));
+        let storage = Storage::open_memory().unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(blocked.read_errors, 1);
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_none());
+        let retried = backfill_coedit_once(&storage, &corpus, &settings)
+            .unwrap()
+            .stats()
+            .unwrap();
+        assert_eq!(retried.read_errors, 0);
+        assert!(storage.get_meta(BASH_BACKFILL_META_KEY).unwrap().is_some());
+    }
+
+    /// A transcript deleted between the listing and the read is not a failure:
+    /// there is nothing left to replay.
+    #[test]
+    fn a_transcript_that_vanished_is_not_a_read_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = extract_events(&tmp.path().join("gone.jsonl"), "conv-gone").unwrap_err();
+        assert!(!is_read_failure(&gone), "{gone:#}");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(is_read_failure(&denied.into()));
     }
 
     #[test]

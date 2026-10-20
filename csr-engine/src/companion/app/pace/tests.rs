@@ -1150,6 +1150,25 @@ async fn the_chapter_gate_starts_the_next_chapter_only_for_a_person_s_main_compa
 }
 
 #[tokio::test]
+async fn a_compaction_that_failed_starts_no_chapter() {
+    let r = rig();
+    let cx = &r.fx.cx;
+    r.steps(cx, 3, None, None).await;
+    let still = r.row(SID, "chapter");
+    let before = r.records().len();
+    // The relay tells the engine the call threw: `/after` with `{ deny }`, nothing was compacted.
+    r.fx.clock.advance(1_000.);
+    r.compact(
+        cx,
+        json!({ "trigger": "auto" }),
+        json!({ "deny": "summary failed" }),
+    )
+    .await;
+    assert_eq!(r.row(SID, "chapter"), still);
+    assert_eq!(r.records().len(), before, "no chapter row was written");
+}
+
+#[tokio::test]
 async fn a_chapter_two_hours_old_starts_over_and_a_new_session_starts_one() {
     let r = rig();
     let cx = &r.fx.cx;

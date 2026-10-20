@@ -135,7 +135,11 @@ async function spawn($, e, again) {
     else if (fails++ === TRIES) void $.ui.toast(failed ? 'CSR engine missing: npx claude-self-reflect setup' : 'CSR engine keeps stopping: run csr-engine setup')
   })()
   await up
-  if (sock === mine) await run($, '/event', again ? { k: 'start', e, respawn: true } : { k: 'start', e }).catch(() => undefined)
+  if (sock === mine) {
+    // A child that is ready is a new engine: a pause a timed-out post left for the old one is not its.
+    stalled = 0
+    await run($, '/event', again ? { k: 'start', e, respawn: true } : { k: 'start', e }).catch(() => undefined)
+  }
 }
 async function gated($, k, e, next) {
   // A fork's seat (its plugin and tier) is on `next`, not in the event: the engine is told, beside the event.
@@ -166,9 +170,13 @@ async function drawn($, k, e, next) {
 }
 // A hook that failed lets the call go on, unless the engine armed a guard and this is a Bash command its
 // regex matches: the engine cannot be asked, so the call is denied. Claude Code skips the plugin's other
-// hooks for the call once one has failed, so the first to fail must be the one to deny.
+// hooks for the call once one has failed, so the first to fail must be the one to deny. The regex also
+// reads the command with every quote and backslash removed, as the shell does (`g''it push` is a push).
 function pass(_$, e, next) {
-  if (armed && e && e.tool === 'Bash' && armed.re.test(String(e.command ?? ''))) return { deny: armed.reason }
+  if (armed && e && e.tool === 'Bash') {
+    const command = String(e.command ?? '')
+    if (armed.re.test(command) || armed.re.test(command.replace(/['"\\]/g, ''))) return { deny: armed.reason }
+  }
   return next(e)
 }
 async function start($, e, next) {

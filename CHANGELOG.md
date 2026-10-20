@@ -409,12 +409,15 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   and the pre-commit pytest branch are removed; the CI plugin job now runs `claude plugin test` on the relay
   fixture and `claude plugin validate` on what the binary installs. The status line wrapper (`/csr statusline on`)
   is retired: `csr-engine hook install --apply` puts the original `statusLine.command` back and deletes the
-  wrapper files. At this change (private HOME): lib 4406, `companion` 96, `companion_plugin` 5,
-  `hooks_integration` 75, `integration` 75, and the relay's 20 `claude plugin test` cases, all passing.
+  wrapper files. At this change (private HOME): lib 4420, `companion` 96, `companion_plugin` 5,
+  `hooks_integration` 75, `integration` 75, and the relay's 22 `claude plugin test` cases, all passing.
 - **`csr-engine setup` installs the generated relay.** It writes a local marketplace under
   `~/.claude-self-reflect/csr-companion/marketplace` and installs the plugin from it through `claude plugin` (the same
   steps as `csr-engine companion plugin install`: register the marketplace, install, or update when the engine's
-  version or relay text changed; a plugin the user switched off stays off and its options are kept). `--no-companion`
+  version or relay text changed; a plugin the user switched off stays off and its options are kept: they are read
+  before any step that deletes the plugin, an option read that fails stops that step with nothing removed, and a
+  migration that fails half-way saves the options and the enabled state in
+  `~/.claude-self-reflect/csr-companion/plugin-migration.json` for the rerun). `--no-companion`
   skips it, and a missing `claude`, a failed step or a 120 s timeout prints the reason plus
   `csr-engine companion plugin install` and still exits 0. The GitHub marketplace source,
   `CSR_COMPANION_MARKETPLACE`, the `/plugin marketplace add` lines and the `setup --relay` flag are gone; a machine
@@ -479,7 +482,9 @@ In-flight resource round on rc2 after b1d7de23. Amend at the marker.
   entry in place); a Bash call that wrote nothing exits before the engine opens (p95 7.1 ms). Rows carry
   `tool_name='Bash'` and empty symbol lists. A one-time replay (`coedit_bash_backfill_v2`, daemon and `setup`) covers
   existing transcripts, subagent ones under their parent session, skips what the live hook already recorded and keeps
-  only what the hook would keep. It waits until `~/.claude/settings.json` has the PostToolUse hook recording Bash, so
+  only what the hook would keep, and it is marked done only when every project folder was listed and every transcript
+  read. It waits until `~/.claude/settings.json` has the PostToolUse hook recording Bash (Claude Code's matcher
+  rules: `*`, empty or missing; an exact name in a `|` or `,` list; otherwise a regex tested unanchored), so
   a daemon restarted on the new binary before `hook install --apply` cannot mark the replay done while the live hook
   still skips Bash (`csr-engine status` shows `aux.bash_file_history: waiting_on_hook` until then; the daemon looks
   again every 10 minutes). Checked against git, not command text, on a copy of the owner's DB: of 189 (session,

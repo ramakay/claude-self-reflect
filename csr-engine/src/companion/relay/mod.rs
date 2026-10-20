@@ -14,7 +14,13 @@ pub mod session;
 pub mod timers;
 
 use anyhow::{bail, Context, Result};
-use axum::{body::Bytes, extract::State, http::StatusCode, routing::post, Router};
+use axum::{
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    routing::post,
+    Router,
+};
 use dispatch::{default_table, App, Log};
 use host::{Hub, SystemClock};
 use serde_json::{json, Value};
@@ -36,7 +42,9 @@ pub struct ServeArgs {
     /// Where to listen.
     #[arg(long)]
     pub sock: PathBuf,
-    /// The version of the relay that started this child.
+    /// The version of the relay that started this child. The relay sends its version with every
+    /// request, so a request is checked against this engine's own, not against this argument
+    /// (both come from the same relay file); the argument is accepted for the relay's argv.
     #[arg(long)]
     pub relay: String,
 }
@@ -90,6 +98,11 @@ async fn endpoint(
     (StatusCode::OK, axum::Json(reply))
 }
 
+/// The most a request body may hold. The relay posts a compaction's conversation whole up to 3.5
+/// MiB and `$.http.fetch` refuses over 4 MiB, so no body it sends is larger than 4 MiB; Axum's
+/// own limit of 2 MiB would refuse one it means to send.
+const BODY_LIMIT: usize = 8 * 1024 * 1024;
+
 fn router(app: Arc<App>) -> Router {
     let route = |path: &'static str| {
         post(move |State(app): State<Arc<App>>, body: Bytes| endpoint(app, path, body))
@@ -99,6 +112,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/after", route("/after"))
         .route("/step", route("/step"))
         .route("/press", route("/press"))
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(app)
 }
 
@@ -252,7 +266,6 @@ async fn run(args: &ServeArgs) -> Result<()> {
     let gone = Arc::new(Notify::new());
     // The store opens on the first handler that asks for it, not here.
     let app = App::new(
-        &args.relay,
         Hub::new(push),
         Arc::new(super::store::Store::at(super::store::default_path())),
         Arc::new(SystemClock),
@@ -316,6 +329,50 @@ mod tests {
             UnixStream::from_std(a).unwrap().peer_cred()
         });
         assert!(!same_user(Ok(cred.unwrap()), uid.wrapping_add(1)));
+    }
+
+    /// A compaction's conversation up to the relay's `BIG` (3.5 MiB) is posted whole: the
+    /// server's body limit must be above it, not Axum's default 2 MiB.
+    #[tokio::test]
+    async fn a_body_the_relay_sends_whole_reaches_dispatch() {
+        use axum::{body::Body, http::Request};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        let seen = Arc::new(AtomicUsize::new(0));
+        let mut table = dispatch::Table::new();
+        let counted = seen.clone();
+        table.on(
+            "keep",
+            "test",
+            dispatch::handler(move |_cx, e| {
+                let counted = counted.clone();
+                async move {
+                    let text = e["messages"][0]["text"].as_str().unwrap_or("");
+                    counted.store(text.len(), Ordering::Relaxed);
+                    Ok(dispatch::Reply::none())
+                }
+            }),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (push, _lines) = mpsc::unbounded_channel();
+        let app = App::new(
+            Hub::new(push),
+            Arc::new(crate::companion::store::Store::at(
+                dir.path().join("companion.db"),
+            )),
+            Arc::new(SystemClock),
+            Arc::new(Log::default()),
+            table,
+        );
+        let big = "x".repeat(3_000_000);
+        let body = json!({ "v": env!("CARGO_PKG_VERSION"), "sid": "s", "cwd": "/repo", "k": "keep",
+            "e": { "trigger": "auto", "messages": [{ "role": "user", "text": big }] } });
+        let request = Request::post("/event")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router(app).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.load(Ordering::Relaxed), 3_000_000);
     }
 
     #[test]

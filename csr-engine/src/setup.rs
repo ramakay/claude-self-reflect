@@ -248,6 +248,13 @@ pub async fn handle(
                     stats.files_scanned,
                     stats.already_live_total()
                 );
+                if !stats.complete() {
+                    eprintln!(
+                        "  File history: incomplete ({} unread, {} failed inserts); \
+                         the daemon runs it again at its next start",
+                        stats.read_errors, stats.insert_errors
+                    );
+                }
             }
             Ok(Ok(BashReplay::WaitingOnHook)) => eprintln!(
                 "  File history: waiting for the Bash hook (run: csr-engine hook install --apply)"
@@ -641,16 +648,16 @@ fn relay_is_current(entry: &serde_json::Value, relay: &str) -> bool {
 
 /// The options the user set on the plugin, as `(key, value)`. Removing a marketplace or
 /// uninstalling a plugin deletes them, so they are read first and given back at install.
-fn configured_options(claude: &Path, timeout: Duration) -> Vec<(String, String)> {
+/// A read that fails, times out or prints no JSON object is an error, never an empty list:
+/// an empty list would reinstall the plugin with the defaults over the user's choices. A
+/// successful read of a plugin with nothing set is an empty list.
+fn configured_options(claude: &Path, timeout: Duration) -> Result<Vec<(String, String)>, String> {
     let id = relay_plugin_id();
     let args = ["plugin", "configure", id.as_str(), "--json"];
-    let Ok(run) = run_ok(claude, &args, timeout, "configure") else {
-        return Vec::new();
-    };
-    let Some(info) = first_json(&run.stdout, |v| v.is_object()) else {
-        return Vec::new();
-    };
-    info["configured"]
+    let run = run_ok(claude, &args, timeout, "configure")?;
+    let info = first_json(&run.stdout, |v| v.is_object())
+        .ok_or_else(|| "`claude plugin configure` returned no JSON result".to_string())?;
+    Ok(info["configured"]
         .as_array()
         .into_iter()
         .flatten()
@@ -658,7 +665,89 @@ fn configured_options(claude: &Path, timeout: Duration) -> Vec<(String, String)>
             let key = key.as_str()?;
             Some((key.to_string(), info["inputs"][key].as_str()?.to_string()))
         })
-        .collect()
+        .collect())
+}
+
+/// What the user had on the plugin before a step that deletes it: the options, and whether
+/// it was switched on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    options: Vec<(String, String)>,
+    enabled: bool,
+}
+
+impl Default for Snapshot {
+    /// A plugin that was never there: no options, enabled (what an install gives).
+    fn default() -> Self {
+        Snapshot {
+            options: Vec::new(),
+            enabled: true,
+        }
+    }
+}
+
+/// Where a snapshot waits while the plugin is gone: it survives a migration that fails
+/// half-way, so the rerun installs with the user's options and enabled state.
+fn pending_snapshot_path(home: &Path) -> std::path::PathBuf {
+    crate::companion::paths::Paths::new(home.to_path_buf())
+        .keep
+        .join("plugin-migration.json")
+}
+
+fn save_snapshot(home: &Path, snapshot: &Snapshot) -> Result<(), String> {
+    let path = pending_snapshot_path(home);
+    let options: Vec<[&str; 2]> = snapshot
+        .options
+        .iter()
+        .map(|(k, v)| [k.as_str(), v.as_str()])
+        .collect();
+    let text = serde_json::json!({"options": options, "enabled": snapshot.enabled}).to_string();
+    let root = path.parent().unwrap_or(home).to_path_buf();
+    crate::companion::private::write_atomic(&path, &text, &root).map_err(|e| {
+        format!(
+            "could not save the plugin options to {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// The snapshot a failed migration left, if one is there and readable.
+fn load_snapshot(home: &Path) -> Option<Snapshot> {
+    let text = std::fs::read_to_string(pending_snapshot_path(home)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let options = value["options"]
+        .as_array()?
+        .iter()
+        .map(|pair| Some((pair[0].as_str()?.to_string(), pair[1].as_str()?.to_string())))
+        .collect::<Option<Vec<_>>>()?;
+    Some(Snapshot {
+        options,
+        enabled: value["enabled"].as_bool().unwrap_or(true),
+    })
+}
+
+fn clear_snapshot(home: &Path) {
+    let _ = std::fs::remove_file(pending_snapshot_path(home));
+}
+
+/// Read the options and the enabled state of the installed plugin `entry`, and save them
+/// where a rerun finds them, before the caller deletes the plugin. Any failure stops the
+/// caller: nothing has been removed yet, and the error says how to retry.
+fn snapshot_plugin(
+    claude: &Path,
+    home: &Path,
+    entry: &serde_json::Value,
+    timeout: Duration,
+) -> Result<Snapshot, String> {
+    let retry = "nothing was removed; run `csr-engine companion plugin install` to retry";
+    let options = configured_options(claude, timeout)
+        .map_err(|e| format!("could not read the plugin's options ({e}); {retry}"))?;
+    let snapshot = Snapshot {
+        options,
+        enabled: relay_enabled(Some(entry)),
+    };
+    save_snapshot(home, &snapshot).map_err(|e| format!("{e}; {retry}"))?;
+    Ok(snapshot)
 }
 
 /// `claude plugin install` with the saved options. An install enables the plugin, so one
@@ -724,8 +813,6 @@ fn relay_steps(
     let list = first_json(&run.stdout, |v| v.is_array())
         .ok_or_else(|| "`claude plugin marketplace list` returned no JSON list".to_string())?;
     let add = ["plugin", "marketplace", "add", dir];
-    let mut options = Vec::new();
-    let mut enabled = true;
     match market_state(&list, &market.dir) {
         MarketState::Here => st.steps.push("marketplace already registered".into()),
         MarketState::Absent => {
@@ -737,13 +824,14 @@ fn relay_steps(
             // `add` over the same name repoints it and keeps the plugin and its options.
             // Older Claude Code may refuse; then remove, add and give the options back.
             if let Err(refused) = run_ok(claude, &add, timeout, "marketplace add") {
-                options = configured_options(claude, timeout);
-                // Removing the marketplace uninstalls the plugin; remember if it was off.
-                enabled = relay_enabled(
-                    list_plugins(claude, timeout)?
-                        .iter()
-                        .find(|e| e["id"].as_str() == Some(relay_plugin_id().as_str())),
-                );
+                // Removing the marketplace uninstalls the plugin and drops its options, so
+                // they are read and saved first. A plugin that is not installed has none.
+                let listed = list_plugins(claude, timeout)?;
+                if let Some(entry) = relay_entry(&listed) {
+                    snapshot_plugin(claude, home, entry, timeout)
+                        .map_err(|e| format!("{refused}; {e}"))?;
+                }
+                st.changed = true;
                 let remove = ["plugin", "marketplace", "remove", emit::MARKETPLACE_NAME];
                 run_ok(claude, &remove, timeout, "marketplace remove")
                     .map_err(|e| format!("{refused}; {e}"))?;
@@ -761,6 +849,8 @@ fn relay_steps(
     let listed = list_plugins(claude, timeout)?;
     match relay_entry(&listed) {
         None => {
+            // A migration that failed half-way left the user's options here.
+            let Snapshot { options, enabled } = load_snapshot(home).unwrap_or_default();
             install_relay_plugin(claude, &options, enabled, timeout)?;
             st.changed = true;
             st.plugin_changed = true;
@@ -780,10 +870,7 @@ fn relay_steps(
                 st.steps.push(format!("plugin updated: {was} -> {version}"));
             } else {
                 // The update kept the old cache. Uninstall and install put the new one in.
-                if options.is_empty() {
-                    options = configured_options(claude, timeout);
-                }
-                let enabled = relay_enabled(Some(entry));
+                let Snapshot { options, enabled } = snapshot_plugin(claude, home, entry, timeout)?;
                 let uninstall = ["plugin", "uninstall", id.as_str(), "--keep-data", "--json"];
                 run_outcome_ok(claude, &uninstall, timeout, "uninstall")?;
                 install_relay_plugin(claude, &options, enabled, timeout)?;
@@ -802,6 +889,8 @@ fn relay_steps(
              run `claude plugin uninstall {id}` and then this again"
         ));
     }
+    // The install is confirmed: the saved options have done their job.
+    clear_snapshot(home);
     info_from(entry).ok_or_else(|| "`claude plugin list` named no plugin".to_string())
 }
 
@@ -899,8 +988,14 @@ fn next_steps(report: Option<&RelayReport>) -> String {
                 i.plugin, i.version, i.marketplace, i.scope
             )
         }
-        Some((CompanionOutcome::Failed { reason }, _)) => {
-            format!("companion: not installed: {reason}\n{retry}")
+        Some((CompanionOutcome::Failed { reason }, changed)) => {
+            // A step that failed after something was removed still changed what is loaded.
+            let reload = if changed {
+                format!("{RELOAD_LINE}\n")
+            } else {
+                String::new()
+            };
+            format!("companion: not installed: {reason}\n{retry}{reload}")
         }
         None => format!("companion: skipped (--no-companion)\n{retry}"),
     };
@@ -2029,6 +2124,9 @@ case "$2" in
       add)
         if grep -q github "$D/market" && [ "$(cat "$D/refuses_add")" = true ]; then
           echo "already exists" >&2; exit 1
+        fi
+        if [ -f "$D/add_fails_once" ] && ! grep -q github "$D/market"; then
+          rm "$D/add_fails_once"; echo "network down" >&2; exit 1
         fi ;;
       remove) echo '[]' > "$D/market"; echo absent > "$D/plugin" ;;
     esac ;;
@@ -2042,7 +2140,9 @@ case "$2" in
   disable) echo false > "$D/enabled"
     if [ -f "$D/disable_fails" ]; then echo "settings are read-only" >&2; exit 1; fi
     echo '{{"command":"disable","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
-  install) echo current > "$D/plugin"; echo true > "$D/enabled"
+  install)
+    if [ -f "$D/install_fails_once" ]; then rm "$D/install_fails_once"; echo "disk full" >&2; exit 1; fi
+    echo current > "$D/plugin"; echo true > "$D/enabled"
     echo '{{"command":"install","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
   update)
     if [ "$(cat "$D/update_refreshes")" = true ]; then echo current > "$D/plugin"; fi
@@ -2050,6 +2150,9 @@ case "$2" in
   uninstall) echo absent > "$D/plugin"
     echo '{{"command":"uninstall","outcome":"ok","plugin":"{id}","scope":"user","message":"ok"}}' ;;
   configure)
+    if [ -f "$D/configure_fails" ]; then echo "keychain locked" >&2; exit 1; fi
+    if [ -f "$D/configure_silent" ]; then exit 0; fi
+    if [ -f "$D/configure_none" ]; then echo '{{"configured":[],"inputs":{{}}}}'; exit 0; fi
     echo '{{"configured":["dreams"],"inputs":{{"dreams":"false","autoCompact":"suggest"}}}}' ;;
 esac
 "#,
@@ -2065,6 +2168,20 @@ esac
         fn disabled(self) -> Self {
             std::fs::write(self.dir.path().join("enabled"), "false").unwrap();
             self
+        }
+
+        /// Make the fake's `configure` (the option read) behave in a way: `configure_fails`
+        /// (exit 1), `configure_silent` (exit 0, no output) or `configure_none` (no options).
+        fn with(self, flag: &str) -> Self {
+            std::fs::write(self.dir.path().join(flag), "").unwrap();
+            self
+        }
+
+        /// Where a half-finished migration keeps the user's options.
+        fn pending(&self) -> std::path::PathBuf {
+            self.home
+                .path()
+                .join(".claude-self-reflect/csr-companion/plugin-migration.json")
         }
 
         fn enabled(&self) -> String {
@@ -2275,7 +2392,7 @@ esac
 
     #[test]
     fn relay_install_removes_and_adds_when_add_over_the_name_is_refused() {
-        let fake = RelayFake::new(ON_GITHUB, "absent", true, true);
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true);
         let report = fake.run();
         assert!(
             matches!(report.outcome, CompanionOutcome::Installed(_)),
@@ -2288,6 +2405,173 @@ esac
         assert!(calls
             .iter()
             .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+        // a run that finishes leaves nothing behind
+        assert!(!fake.pending().exists());
+    }
+
+    #[test]
+    fn an_absent_plugin_has_no_options_to_read_before_the_marketplace_moves() {
+        // `configure` would fail for a plugin that is not installed; nothing to lose then
+        let fake = RelayFake::new(ON_GITHUB, "absent", true, true).with("configure_fails");
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        assert!(!calls.iter().any(|c| c.contains("plugin configure")));
+        assert!(calls.iter().any(|c| c.contains("marketplace remove")));
+        assert!(!calls.iter().any(|c| c.contains("--config")));
+    }
+
+    /// S3: a failed read of the options stops the step that would delete them.
+    /// `updated`: the step before it (`plugin update`) already changed the plugin.
+    fn failed_option_read_stops(fake: &RelayFake, what: &str, updated: bool) {
+        let report = fake.run();
+        let CompanionOutcome::Failed { reason } = &report.outcome else {
+            panic!("{what}: {report:?}");
+        };
+        assert!(
+            reason.contains("csr-engine companion plugin install"),
+            "{what}: {reason}"
+        );
+        assert!(reason.contains("options"), "{what}: {reason}");
+        assert_eq!(report.changed, updated, "{what}");
+        assert_eq!(
+            next_steps(Some(&report)).contains(RELOAD_LINE),
+            updated,
+            "{what}"
+        );
+        let calls = fake.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("marketplace remove") || c.contains("plugin uninstall")),
+            "{what}: a destructive step ran: {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("plugin install ")));
+        assert!(!fake.pending().exists(), "{what}");
+    }
+
+    #[test]
+    fn a_failed_option_read_stops_the_marketplace_move() {
+        for flag in ["configure_fails", "configure_silent"] {
+            let fake = RelayFake::new(ON_GITHUB, "stale", true, true).with(flag);
+            failed_option_read_stops(&fake, flag, false);
+        }
+    }
+
+    #[test]
+    fn a_failed_option_read_stops_the_cache_repair() {
+        for flag in ["configure_fails", "configure_silent"] {
+            let fake = RelayFake::new(HERE, "stale", false, false).with(flag);
+            failed_option_read_stops(&fake, flag, true);
+        }
+    }
+
+    #[test]
+    fn an_empty_but_successful_option_read_goes_on_with_no_options() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true).with("configure_none");
+        let report = fake.run();
+        assert!(
+            matches!(report.outcome, CompanionOutcome::Installed(_)),
+            "{report:?}"
+        );
+        let calls = fake.calls();
+        assert!(calls.iter().any(|c| c.contains("marketplace remove")));
+        assert!(!calls.iter().any(|c| c.contains("--config")));
+    }
+
+    /// S4: the marketplace is removed, the add fails, and the options survive for the rerun.
+    #[test]
+    fn a_migration_that_fails_half_way_keeps_the_options_for_the_rerun() {
+        let fake = RelayFake::new(ON_GITHUB, "stale", true, true)
+            .disabled()
+            .with("add_fails_once");
+        let first = fake.run();
+        let CompanionOutcome::Failed { reason } = &first.outcome else {
+            panic!("{first:?}");
+        };
+        assert!(reason.contains("network down"), "{reason}");
+        // a plugin was uninstalled: the failure's report still says to reload
+        assert!(first.changed);
+        assert!(next_steps(Some(&first)).contains(RELOAD_LINE));
+        assert!(fake.pending().is_file(), "the options were not saved");
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(fake.pending())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode, 0o600);
+
+        // the plugin is gone now; the rerun installs with what the user had
+        let before = fake.calls().len();
+        let second = fake.run();
+        assert!(
+            matches!(second.outcome, CompanionOutcome::Installed(_)),
+            "{second:?}"
+        );
+        let calls = fake.calls()[before..].to_vec();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")),
+            "{calls:?}"
+        );
+        assert!(calls.contains(&"plugin disable csr-companion@claude-self-reflect --json".into()));
+        assert_eq!(fake.enabled().trim(), "false");
+        assert!(
+            !fake.pending().exists(),
+            "the file outlived a confirmed install"
+        );
+    }
+
+    #[test]
+    fn a_failed_cache_repair_install_keeps_the_options_for_the_rerun() {
+        let fake = RelayFake::new(HERE, "stale", false, false)
+            .disabled()
+            .with("install_fails_once");
+        let first = fake.run();
+        let CompanionOutcome::Failed { reason } = &first.outcome else {
+            panic!("{first:?}");
+        };
+        assert!(reason.contains("disk full"), "{reason}");
+        assert!(first.changed);
+        assert!(next_steps(Some(&first)).contains(RELOAD_LINE));
+        assert!(fake.pending().is_file(), "the options were not saved");
+
+        let before = fake.calls().len();
+        let second = fake.run();
+        assert!(
+            matches!(second.outcome, CompanionOutcome::Installed(_)),
+            "{second:?}"
+        );
+        let calls = fake.calls()[before..].to_vec();
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with("plugin install ") && c.ends_with("--config dreams=false")));
+        assert_eq!(fake.enabled().trim(), "false");
+        assert!(!fake.pending().exists());
+    }
+
+    #[test]
+    fn a_normal_run_leaves_no_migration_file_behind() {
+        for fake in [
+            RelayFake::new(NONE_REGISTERED, "absent", true, false),
+            RelayFake::new(ON_GITHUB, "stale", true, false),
+            RelayFake::new(HERE, "stale", false, false),
+            RelayFake::new(HERE, "current", true, false),
+        ] {
+            let report = fake.run();
+            assert!(
+                !matches!(report.outcome, CompanionOutcome::Failed { .. }),
+                "{report:?}"
+            );
+            assert!(!fake.pending().exists());
+        }
     }
 
     #[test]

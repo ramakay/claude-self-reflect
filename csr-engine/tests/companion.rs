@@ -1379,6 +1379,11 @@ mod relay {
         }
     }
 
+    /// The version the relay posts: the engine checks it against its own build.
+    const V: &str = env!("CARGO_PKG_VERSION");
+    /// A relay of some other build.
+    const OTHER: &str = "0.0.0-other";
+
     fn start(relay: &str, extra_env: &[(&str, &Path)]) -> Serve {
         let dir = tempfile::Builder::new()
             .prefix("csr-t")
@@ -1461,13 +1466,13 @@ mod relay {
         let reply = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "k": "tool", "e": {} }),
+            &json!({ "v": V, "k": "tool", "e": {} }),
         );
         assert_eq!(reply, json!({}));
         let reply = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "k": "csr", "e": {} }),
+            &json!({ "v": V, "k": "csr", "e": {} }),
         );
         let pid = serve.child.id();
         assert_eq!(
@@ -1520,7 +1525,7 @@ mod relay {
             .read_line(&mut ready)
             .unwrap();
         assert_eq!(ready, "ready\n");
-        post(&sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        post(&sock, "/event", &json!({ "v": V, "k": "tool" }));
         child.kill().unwrap();
         child.wait().unwrap();
         let file = run.join("b.sock");
@@ -1534,7 +1539,7 @@ mod relay {
     #[test]
     fn a_different_relay_version_pushes_one_toast_on_stdout() {
         let mut serve = start("2", &[]);
-        post(&serve.sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        post(&serve.sock, "/event", &json!({ "v": OTHER, "k": "tool" }));
         let pushed = serve.line();
         assert_eq!(pushed["calls"][0]["m"], "ui.toast");
         assert_eq!(
@@ -1542,16 +1547,16 @@ mod relay {
             "CSR updated: run /reload-plugins"
         );
         // A second mismatch pushes nothing; the next line is the usage call that a start asks.
-        post(&serve.sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        post(&serve.sock, "/event", &json!({ "v": OTHER, "k": "tool" }));
         let start = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "k": "start", "e": { "isInteractive": true } }),
+            &json!({ "v": V, "k": "start", "e": { "isInteractive": true } }),
         );
         post(
             &serve.sock,
             "/step",
-            &json!({ "v": "1", "id": start["id"], "results": [] }),
+            &json!({ "v": V, "id": start["id"], "results": [] }),
         );
         assert_eq!(serve.line()["calls"][0]["m"], "session.usage");
     }
@@ -1564,14 +1569,14 @@ mod relay {
         let reply = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "sid": "s1", "k": "start",
+            &json!({ "v": V, "sid": "s1", "k": "start",
                 "e": { "cwd": "/r", "isInteractive": true } }),
         );
         assert_eq!(reply["calls"][0]["m"], "command.register");
         let done = post(
             &serve.sock,
             "/step",
-            &json!({ "v": "1", "id": reply["id"], "results": [{ "id": "c1", "v": {} }] }),
+            &json!({ "v": V, "id": reply["id"], "results": [{ "id": "c1", "v": {} }] }),
         );
         assert_eq!(done, json!({}));
         let pushed = serve.line();
@@ -1579,7 +1584,7 @@ mod relay {
         post(
             &serve.sock,
             "/step",
-            &json!({ "v": "1", "id": pushed["id"], "results": [{ "id": "c1", "v": { "x": 1 } }] }),
+            &json!({ "v": V, "id": pushed["id"], "results": [{ "id": "c1", "v": { "x": 1 } }] }),
         );
         let rows: Vec<Value> = std::fs::read_to_string(&log)
             .unwrap()
@@ -1642,7 +1647,7 @@ mod relay {
             let results: Vec<Value> = (calls.iter())
                 .map(|call| json!({ "id": call["id"], "v": said(call) }))
                 .collect();
-            let body = json!({ "v": "1", "id": reply["id"], "results": results });
+            let body = json!({ "v": V, "id": reply["id"], "results": results });
             reply = post(sock, "/step", &body);
         }
         reply
@@ -1678,13 +1683,13 @@ mod relay {
         let reply = post(
             sock,
             "/event",
-            &json!({ "v": "1", "sid": sid, "cwd": "/repo", "k": "band", "e": e }),
+            &json!({ "v": V, "sid": sid, "cwd": "/repo", "k": "band", "e": e }),
         );
         settle(sock, reply)
     }
 
     fn press(sock: &Path, sid: &str, key: &str) -> Value {
-        let body = json!({ "v": "1", "sid": sid, "cwd": "/repo", "key": key, "requestId": "r1" });
+        let body = json!({ "v": V, "sid": sid, "cwd": "/repo", "key": key, "requestId": "r1" });
         settle(sock, post(sock, "/press", &body))
     }
 
@@ -1748,12 +1753,12 @@ mod relay {
         let start = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "sid": "s2", "cwd": "/repo", "k": "start",
+            &json!({ "v": V, "sid": "s2", "cwd": "/repo", "k": "start",
                 "e": { "cwd": "/repo", "isInteractive": true } }),
         );
         settle(&serve.sock, start);
         let notify = |k: &str, e: Value| {
-            let body = json!({ "v": "1", "sid": "s2", "cwd": "/repo", "k": k, "e": e });
+            let body = json!({ "v": V, "sid": "s2", "cwd": "/repo", "k": k, "e": e });
             post(&serve.sock, "/event", &body)
         };
         notify("turn_start", json!({ "text": "", "turnId": "t" }));
@@ -1808,8 +1813,8 @@ mod relay {
     fn a_step_for_an_id_nobody_waits_for_replies_empty() {
         let serve = start("1", &[]);
         for body in [
-            json!({ "v": "1", "id": "e404", "results": [] }),
-            json!({ "v": "1", "results": [{ "id": "c1", "v": 1 }] }),
+            json!({ "v": V, "id": "e404", "results": [] }),
+            json!({ "v": V, "results": [{ "id": "c1", "v": 1 }] }),
         ] {
             assert_eq!(post(&serve.sock, "/step", &body), json!({}));
         }
@@ -1821,14 +1826,14 @@ mod relay {
         let first = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "sid": "s1", "cwd": "/r", "k": "start",
+            &json!({ "v": V, "sid": "s1", "cwd": "/r", "k": "start",
                 "e": { "isInteractive": true } }),
         );
         assert_eq!(first["calls"][0]["m"], "command.register");
         let again = post(
             &serve.sock,
             "/event",
-            &json!({ "v": "1", "sid": "s1", "cwd": "/r", "k": "start", "respawn": true,
+            &json!({ "v": V, "sid": "s1", "cwd": "/r", "k": "start", "respawn": true,
                 "e": { "isInteractive": true } }),
         );
         assert_eq!(again, json!({}));
@@ -1874,7 +1879,7 @@ mod relay {
         let mut serve = start("2", &[]);
         drop(serve.lines.take());
         let sock = serve.sock.clone();
-        post(&sock, "/event", &json!({ "v": "1", "k": "tool" }));
+        post(&sock, "/event", &json!({ "v": OTHER, "k": "tool" }));
         let status = exited(&mut serve.child, Duration::from_secs(5)).expect("exits on EPIPE");
         assert!(status.success(), "{status:?}");
         assert!(!sock.exists());
@@ -1896,7 +1901,7 @@ mod relay {
             let mut kept = UnixStream::connect(&serve.sock).unwrap();
             let mut times = Vec::new();
             for i in 0..1000 {
-                let body = json!({ "v": "1", "sid": "s", "cwd": "/r", "k": "tool",
+                let body = json!({ "v": V, "sid": "s", "cwd": "/r", "k": "tool",
                     "e": { "tool": "Bash", "n": i, "input": { "command": "ls -la" } } });
                 let started = Instant::now();
                 if fresh {
@@ -1965,7 +1970,7 @@ mod relay {
             .find_map(|l| l.trim().strip_suffix(" pass"))
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0);
-        assert_eq!(passed, 20, "{text}");
+        assert_eq!(passed, 22, "{text}");
     }
 
     #[test]

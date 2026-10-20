@@ -942,14 +942,17 @@ fn on_compact_event() -> Handler {
 }
 
 /// `chapter`, after it: a compaction that went through starts the next
-/// chapter. `e` is what the compaction returned.
+/// chapter. `e` is what the compaction returned: a `skip` is a hook that vetoed it and a `deny`
+/// is the call that threw (the relay tells the engine so that a marker can go); neither is a
+/// compaction.
 fn on_compact_after(keep: Keep) -> Handler {
     handler(move |cx, result| {
         let keep = keep.clone();
         async move {
             install_keep(&cx, &keep);
             let skip = cx.left.as_ref().is_some_and(|left| left["skip"] == true);
-            if skip || !result["skip"].is_null() || !dreams_on(&cx).await {
+            let over = !result["skip"].is_null() || result.get("deny").is_some();
+            if skip || over || !dreams_on(&cx).await {
                 return Ok(Reply::none());
             }
             if !is_person(&cx).await {

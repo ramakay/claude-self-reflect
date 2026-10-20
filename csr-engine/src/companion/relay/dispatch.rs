@@ -416,7 +416,6 @@ async fn chain_after(
 }
 
 pub struct App {
-    relay: String,
     pid: u32,
     hub: Arc<Hub>,
     sessions: Mutex<Sessions>,
@@ -432,7 +431,6 @@ pub struct App {
 
 impl App {
     pub fn new(
-        relay: &str,
         hub: Arc<Hub>,
         store: Arc<Store>,
         clock: Arc<dyn Clock>,
@@ -440,7 +438,6 @@ impl App {
         table: Table,
     ) -> Arc<Self> {
         Arc::new(Self {
-            relay: relay.to_string(),
             pid: std::process::id(),
             timers: HubTimers::new(hub.clone()),
             module: Arc::default(),
@@ -529,10 +526,11 @@ impl App {
         }
     }
 
-    /// The relay's version differs from this engine's: one toast, once.
+    /// The relay's version differs from this engine's: one toast, once. The engine's own version
+    /// is the one the binary was built as: a binary replaced under a running relay is another.
     fn check_version(&self, body: &Value) {
         let sent = body.get("v").and_then(Value::as_str);
-        if sent != Some(self.relay.as_str()) && !self.warned.swap(true, Ordering::Relaxed) {
+        if sent != Some(env!("CARGO_PKG_VERSION")) && !self.warned.swap(true, Ordering::Relaxed) {
             self.hub.detach(|host| {
                 Box::pin(async move {
                     let _ = host.call("ui.toast", vec![json!(TOAST)]).await;
@@ -798,6 +796,7 @@ pub mod testing {
 mod tests {
     use super::super::host::fake::FakeClock;
     use super::*;
+    use crate::companion::app::guard::{self, Machine, Ran};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
@@ -813,7 +812,6 @@ mod tests {
         let (push, lines) = mpsc::unbounded_channel();
         let clock = FakeClock::new(1_000.);
         let app = App::new(
-            "1",
             Hub::new(push),
             Arc::new(Store::at(dir.path().join("csr-companion/companion.db"))),
             clock.clone(),
@@ -826,6 +824,46 @@ mod tests {
             clock,
             _dir: dir,
         }
+    }
+
+    /// A machine with nothing on it: no HOME, no files, no git. The guard asked of it finds no
+    /// guard, so no test that runs the guard entry reads the person's own guard.json.
+    struct Nowhere;
+
+    impl Machine for Nowhere {
+        fn home(&self) -> Option<String> {
+            None
+        }
+        fn exists(&self, _: &str) -> bool {
+            false
+        }
+        fn read(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn write(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        fn keep(&self, _: &str, _: &str) -> bool {
+            false
+        }
+        fn variable(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn git(&self, _: &str, _: &[String], _: &[(String, String)], _: &[&str]) -> Option<Ran> {
+            None
+        }
+        fn coach(&self, _: f64) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    /// The two entries of the `start` the engine answers a session with: the `/csr` command and the
+    /// usage call. Nothing here reads or writes the real HOME, as the rest of the table does.
+    fn the_start() -> Table {
+        let mut t = Table::new();
+        crate::companion::app::pane_cmd::register(&mut t);
+        crate::companion::app::usage::register(&mut t);
+        t
     }
 
     /// Let the tasks the runtime holds run until they wait again.
@@ -853,7 +891,7 @@ mod tests {
 
     async fn post(app: &Arc<App>, path: &str, body: Value) -> Value {
         let mut body = body;
-        body["v"] = json!("1");
+        body["v"] = json!(env!("CARGO_PKG_VERSION"));
         app.handle(path, &body).await
     }
 
@@ -1024,7 +1062,11 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_key_and_a_key_with_no_handler_pass_through() {
-        let mut rig = rig(default_table());
+        // The guard's own entry, on a machine with nothing on it: `default_table()` would read the
+        // person's guard.json, and write pane-errors.log beside it when that file is malformed.
+        let mut pretend = Table::new();
+        guard::register_with(&mut pretend, Arc::new(Nowhere));
+        let mut rig = rig(pretend);
         for k in ["no-such-hook", "guard", "band", "tool"] {
             assert_eq!(
                 post(&rig.app, "/event", ev("s", k, json!({}))).await,
@@ -1078,7 +1120,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pushed_call_from_the_default_start_is_resumed_by_step() {
-        let mut rig = rig(default_table());
+        let mut rig = rig(the_start());
         let start = post(
             &rig.app,
             "/event",
@@ -1110,7 +1152,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_respawned_start_reopens_the_session_and_does_not_register_again() {
-        let mut rig = rig(default_table());
+        let mut rig = rig(the_start());
         let mut body = ev("s1", "start", json!({ "isInteractive": false }));
         body["respawn"] = json!(true);
         assert_eq!(post(&rig.app, "/event", body).await, json!({}));
@@ -1121,7 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_step_for_an_unknown_id_replies_empty() {
-        let rig = rig(default_table());
+        let rig = rig(Table::new());
         for body in [
             json!({ "id": "e99", "results": [] }),
             json!({ "results": [] }),
@@ -1254,7 +1296,9 @@ mod tests {
 
     #[tokio::test]
     async fn csr_answers_with_pid_and_the_running_event_count() {
-        let rig = rig(default_table());
+        let mut pretend = Table::new();
+        crate::companion::app::pane_cmd::register(&mut pretend);
+        let rig = rig(pretend);
         post(&rig.app, "/event", ev("s", "tool", json!({}))).await;
         let reply = post(&rig.app, "/event", ev("s", "csr", json!({}))).await;
         let pid = std::process::id();
@@ -1265,8 +1309,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_different_relay_version_toasts_once_and_the_same_one_never() {
-        let mut old = rig(default_table());
+    async fn a_request_of_another_version_than_the_engine_s_toasts_once_and_its_own_never() {
+        let quiet = || {
+            table(vec![(
+                "tool",
+                event(handler(|_, _| async { Ok(Reply::none()) })),
+            )])
+        };
+        let mut old = rig(quiet());
         let stale = json!({ "v": "0", "sid": "s", "k": "tool" });
         old.app.handle("/event", &stale).await;
         old.app.handle("/event", &stale).await;
@@ -1275,8 +1325,11 @@ mod tests {
         assert_eq!(line["calls"][0]["a"][0], TOAST);
         settle().await;
         assert!(old.lines.try_recv().is_err());
-        let mut same = rig(default_table());
-        post(&same.app, "/event", ev("s", "tool", json!({}))).await;
+        // The relay and the child come from one file, so they always agree with each other: what
+        // counts is this engine's own version.
+        let mut same = rig(quiet());
+        let own = json!({ "v": env!("CARGO_PKG_VERSION"), "sid": "s", "k": "tool" });
+        same.app.handle("/event", &own).await;
         settle().await;
         assert!(same.lines.try_recv().is_err());
     }

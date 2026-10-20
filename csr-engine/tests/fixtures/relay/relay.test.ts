@@ -191,6 +191,32 @@ test('a child that ends is started again after 2 s, on a new socket, and told th
   expect(starts[1]?.socket).toBe(sockets[1])
 })
 
+test('a child respawned inside the pause a timed-out post left is a new engine: its start is posted', async ($, on) => {
+  const gate = { release: () => {} }
+  const child: Child = async function* (n) {
+    yield READY
+    if (n === 1) await new Promise<void>(res => { gate.release = res })
+    else await new Promise<void>(() => {})
+    return { code: 1, signal: null }
+  }
+  const options = { fetchHangs: false }
+  const seen = world(on, () => ({}), child, options)
+  await $.session.start(START as never)
+  options.fetchHangs = true // the engine takes the post and says nothing
+  const tool = $.tool.call({ tool: 'Read', path: '/a' } as never)
+  await seen.clock.settle()
+  await seen.clock.advance(LIMIT)
+  expect(JSON.stringify(await tool)).toContain('file text') // failed open: the pause is on
+  options.fetchHangs = false
+  gate.release() // the stuck engine dies; a new one is up within 2 s, far inside the 30 s pause
+  await seen.clock.advance(2100)
+  expect(seen.spawned).toHaveLength(2)
+  const starts = only(seen.posts, '/event').filter(p => p.body.k === 'start')
+  expect(starts).toHaveLength(2)
+  expect(starts[1]?.body).toMatchObject({ respawn: true })
+  expect(starts[1]?.socket).toBe(seen.spawned[1]?.[seen.spawned[1].indexOf('--sock') + 1])
+})
+
 test('a child that never gets ready is tried 3 times, then one toast says it keeps stopping', async ($, on) => {
   const dies: Child = async function* () {
     return { code: 1, signal: null }
@@ -288,6 +314,23 @@ test('a guard that is armed denies a push while the engine is down, and passes t
     expect(seen.seen.tools).toBe(before) // next never ran
   }
   for (const command of ['git status', 'git log --oneline', 'ls', 'gitk --all']) {
+    const before = seen.seen.tools
+    expect(JSON.stringify(await bash($, command))).toContain('file text')
+    expect(seen.seen.tools).toBe(before + 1)
+  }
+})
+
+test('an armed guard also reads a command with its quotes and backslashes removed, as the shell does, while the engine is down', async ($, on) => {
+  const options = { fetchFails: false }
+  const seen = world(on, (path, body) => (path === '/event' && body.k === 'start' ? arms({ pattern: PATTERN, reason: DOWN }) : {}), alive, options)
+  await $.session.start(START as never)
+  options.fetchFails = true
+  for (const command of ["g''it push origin main", "git pu''sh origin main", '"git" push origin main', 'g\\it push origin main']) {
+    const before = seen.seen.tools
+    expect(JSON.stringify(await bash($, command))).toContain(DOWN)
+    expect(seen.seen.tools).toBe(before) // next never ran
+  }
+  for (const command of ['git status', 'git commit -m "it\'s done"']) {
     const before = seen.seen.tools
     expect(JSON.stringify(await bash($, command))).toContain('file text')
     expect(seen.seen.tools).toBe(before + 1)

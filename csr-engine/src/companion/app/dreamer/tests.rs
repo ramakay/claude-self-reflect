@@ -1778,7 +1778,7 @@ async fn posted(
     body: Value,
 ) -> Value {
     let mut body = body;
-    body["v"] = json!("1");
+    body["v"] = json!(env!("CARGO_PKG_VERSION"));
     let mut reply = app.handle(path, &body).await;
     while reply.get("calls").is_some() {
         let results: Vec<Value> = reply["calls"]
@@ -1787,7 +1787,7 @@ async fn posted(
             .iter()
             .map(|call| json!({ "id": call["id"], "v": null }))
             .collect();
-        let step = json!({ "v": "1", "id": reply["id"], "results": results });
+        let step = json!({ "v": env!("CARGO_PKG_VERSION"), "id": reply["id"], "results": results });
         reply = app.handle("/step", &step).await;
     }
     reply
@@ -1816,7 +1816,6 @@ async fn a_fork_whose_seat_the_relay_posts_beside_the_event_is_told_apart_by_it(
     register_with(&mut table, out);
     let (push, _lines) = tokio::sync::mpsc::unbounded_channel();
     let app = App::new(
-        "1",
         Hub::new(push),
         Arc::new(Store::at(dir.path().join("csr-companion/companion.db"))),
         Arc::new(SystemClock),
@@ -1902,6 +1901,31 @@ async fn a_compaction_with_no_dream_up_or_one_a_subagent_ran_carries_nothing() {
         .await;
     assert_eq!(r.row(SID, "view")["carried"], Value::Null);
     assert!(r.with("answer", "answer", "carried").is_empty());
+}
+
+#[tokio::test]
+async fn a_compaction_that_failed_leaves_the_dream_that_is_up_as_it_was() {
+    let r = rig(replies(&[dream_reply()]));
+    let cx = r.cx();
+    r.go(12).await;
+    assert!(until(|| r.up().is_some()).await);
+    let view = r.row(SID, "view");
+    let chapter = r.row(SID, "chapter");
+    for _ in 0..2 {
+        // The relay tells the engine the call threw: `/after` with `{ deny }`.
+        let before = run(&r.table, "chapter", &cx, json!({ "trigger": "manual" })).await;
+        r.after(
+            "chapter",
+            &cx,
+            json!({ "deny": "summary failed" }),
+            &before.left,
+        )
+        .await;
+    }
+    assert_eq!(r.row(SID, "view"), view, "not carried, not expired");
+    assert_eq!(r.row(SID, "chapter"), chapter, "no new chapter");
+    assert!(r.with("answer", "answer", "carried").is_empty());
+    assert!(r.with("answer", "answer", "expired").is_empty());
 }
 
 #[tokio::test]

@@ -319,14 +319,16 @@ fn on_compact_event() -> Handler {
 
 /// `chapter`, after it: a dream still open is carried into the next
 /// chapter once, marked "still open", with two prompts again to answer it; one already carried
-/// expires. The chapter itself starts in pace's entry, which ran first.
+/// expires. The chapter itself starts in pace's entry, which ran first. A `skip` (a hook vetoed it)
+/// or a `deny` (the call threw) in the result is no compaction.
 fn on_compact_after(outside: Arc<dyn Outside>) -> Handler {
     handler(move |cx, result| {
         let outside = outside.clone();
         async move {
             install(&cx, &outside);
             let skip = cx.left.as_ref().is_some_and(|left| left["skip"] == true);
-            if skip || !result["skip"].is_null() || !dreams_on(&cx).await {
+            let over = !result["skip"].is_null() || result.get("deny").is_some();
+            if skip || over || !dreams_on(&cx).await {
                 return Ok(Reply::none());
             }
             if !is_person(&cx).await {
