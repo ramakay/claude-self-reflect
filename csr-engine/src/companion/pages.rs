@@ -1215,7 +1215,10 @@ fn draw_sections(page: &Value, cols: usize, rows: usize, ui: &Value) -> Lines {
             );
             let pill = super::render::cards::pill_of(
                 &head["gauges"],
+                ui["csr"].as_u64().unwrap_or(0) as usize,
                 ui["dreams"].as_u64().map(|n| n as usize),
+                (width - 1) as f32 * cell.0 as f32 / 2. - 8.,
+                fonts,
             )?;
             let cols = super::render::cards::pill_cols(&pill, cell, fonts);
             (cols < width).then_some((pill, cols))

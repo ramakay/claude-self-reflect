@@ -245,6 +245,26 @@ fn the_main_frame_puts_the_pill_where_the_two_masthead_rows_were() {
     let img = image::load_from_memory(&pill.png).unwrap().to_rgba8();
     assert_eq!(img.dimensions(), (pill.cols as u32 * 16, 2 * 34));
     assert!(strip(&text[0]).trim().is_empty() && strip(&text[1]).trim().is_empty());
+    // every fact the fixture's text masthead shows is on the pill: context and window, both quotas
+    // with the pace arrow, the cache and the status marker; growth and payback have no data and drop
+    let pill = cards.pill.clone().expect("the pill the frame drew");
+    let said: String = pill
+        .lines
+        .iter()
+        .flatten()
+        .map(|g| g.iter().map(|r| r.0.as_str()).collect::<String>() + " | ")
+        .collect();
+    for fact in [
+        "CTX 78k/1M",
+        "7D 62%\u{bb}",
+        "5H 41%",
+        "\u{25f7} 4m",
+        "STS",
+        "2 by CSR",
+    ] {
+        assert!(said.contains(fact), "pill lost {fact:?}: {said}");
+    }
+    assert_eq!(pill.lines.len(), 2);
     // a click on the pill still opens the info view
     assert_eq!(cards.acts[&0]["key"], "view:info");
     assert_eq!(cards.acts[&1]["key"], "view:info");

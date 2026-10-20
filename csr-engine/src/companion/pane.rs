@@ -221,6 +221,8 @@ pub struct Pane {
     pub pixels: bool,
     /// Pixel mode draws cards and the pill instead of the dark ramp's text; set by `enable_cards`.
     pub cards: bool,
+    /// The pill the last frame drew in place of the masthead, for tests and the PNG export.
+    pub pill: Option<super::render::cards::Pill>,
     pub placed: Vec<super::render::kitty::Placement>,
     picture_cache: super::render::pictures::Cache,
     pub session_picture: Option<super::render::raster::SessionFacts>,
@@ -292,6 +294,7 @@ impl Pane {
             hold: None,
             pixels,
             cards: false,
+            pill: None,
             placed: vec![],
             picture_cache,
             session_picture: None,
@@ -487,6 +490,7 @@ impl Pane {
             "pixels": self.pixels,
             "cards": cards_on,
             "cell": [cell.0, cell.1],
+            "csr": array(&data["infinite"]["csr_at"]).len(),
             "dreams": if cards_on {
                 super::render::cards::dream_facts(&data, &self.sid).map(|d| d.0)
             } else {
@@ -667,6 +671,10 @@ impl Pane {
             .filter(|(r, _)| *r >= top && *r < top + shown)
             .map(|(r, a)| (r - top, a))
             .collect();
+        self.pill = lines.pictures.iter().find_map(|w| match &w.picture {
+            super::render::pictures::Picture::Pill(p) => Some(p.clone()),
+            _ => None,
+        });
         if self.pixels {
             let cell = super::render::kitty::cell_size();
             self.placed = lines

@@ -3,7 +3,7 @@
 //! Every figure a card draws is measured: the builders at the bottom read the same gauges, session and
 //! dream data the text rows read, and a card with nothing real to say is not built at all.
 use super::text::Rgb;
-use crate::companion::{agents, array, dreams, masthead, num, pyfmt::short, string, truthy};
+use crate::companion::{agents, array, dreams, masthead, num, pyfmt::short, string};
 use ab_glyph::{point, Font, FontVec, GlyphId, ScaleFont, VariableFont};
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -593,10 +593,11 @@ impl Ink {
         }
     }
 }
-/// The collapsed masthead: groups of runs in one rounded pill.
+/// The collapsed masthead: two lines of groups of runs in one rounded pill, at one text size.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pill {
-    pub groups: Vec<Vec<Run>>,
+    pub size: f32,
+    pub lines: Vec<Vec<Vec<Run>>>,
 }
 
 // ---------------------------------------------------------------- widgets
@@ -1022,17 +1023,21 @@ pub fn draw_card(
     draw_body(&mut c, f, card, MARGIN, 0., w);
     Some(c.pm)
 }
+const PILL_GAP: f32 = 10.;
 fn pill_width(p: &Pill, f: &CardFonts) -> f32 {
-    let mut w = 0.;
-    for (gi, g) in p.groups.iter().enumerate() {
-        for (s, _, bold) in g {
-            w += f.width(s, 13., if *bold { 600. } else { 500. }, 0.);
+    let line = |groups: &Vec<Vec<Run>>| {
+        let mut w = 0.;
+        for (gi, g) in groups.iter().enumerate() {
+            for (s, _, bold) in g {
+                w += f.width(s, p.size, if *bold { 600. } else { 500. }, 0.);
+            }
+            if gi + 1 < groups.len() {
+                w += PILL_GAP;
+            }
         }
-        if gi + 1 < p.groups.len() {
-            w += 11.;
-        }
-    }
-    w + 2. * 12.
+        w
+    };
+    p.lines.iter().map(line).fold(0., f32::max) + 2. * 12.
 }
 /// The pill's width in cells, one cell of air at its right.
 pub fn pill_cols(p: &Pill, cell: (u32, u32), f: &CardFonts) -> usize {
@@ -1054,27 +1059,30 @@ pub fn draw_pill(
     )?;
     ground(&mut c, cell, backs);
     let height_pt = rows as f32 * cell.1 as f32 / S;
-    let (w, h) = (pill_width(p, f), 26.);
-    let y = ((height_pt - h) / 2.).max(0.);
-    c.rrect(MARGIN, y, w, h, 13., PILL);
-    let base = y + h / 2. + f.cap(13., 600.) / 2.;
-    let mut px = MARGIN + 12.;
-    for (gi, g) in p.groups.iter().enumerate() {
-        for (s, ink, bold) in g {
-            px += c.text(
-                f,
-                s,
-                px,
-                base,
-                13.,
-                if *bold { 600. } else { 500. },
-                ink.rgba(),
-                0.,
-                Anchor::L,
-            );
-        }
-        if gi + 1 < p.groups.len() {
-            px += 11.;
+    let (w, h) = (pill_width(p, f), (height_pt - 2.).max(10.));
+    c.rrect(MARGIN, 1., w, h, 10., PILL);
+    let n = p.lines.len().max(1) as f32;
+    for (li, groups) in p.lines.iter().enumerate() {
+        let mid = 1. + h * (li as f32 + 0.5) / n;
+        let base = mid + f.cap(p.size, 600.) / 2.;
+        let mut px = MARGIN + 12.;
+        for (gi, g) in groups.iter().enumerate() {
+            for (s, ink, bold) in g {
+                px += c.text(
+                    f,
+                    s,
+                    px,
+                    base,
+                    p.size,
+                    if *bold { 600. } else { 500. },
+                    ink.rgba(),
+                    0.,
+                    Anchor::L,
+                );
+            }
+            if gi + 1 < groups.len() {
+                px += PILL_GAP;
+            }
         }
     }
     Some(c.pm)
@@ -1356,67 +1364,133 @@ pub fn build(
     out.extend(mirror_card_of(s, handed, now));
     out
 }
-/// The collapsed masthead's groups; `None` when it has nothing to say (the text rows stay).
-pub fn pill_of(g: &Value, dreams: Option<usize>) -> Option<Pill> {
+/// What a pill line says, level `short` trading words for room: every fact stays, once.
+fn pill_lines(
+    g: &Value,
+    csr: usize,
+    dreams: Option<usize>,
+    short_form: bool,
+) -> Vec<Vec<Vec<Run>>> {
     let sev_ink = |sev: &str| match sev {
         "red" => Ink::Red,
         "amber" => Ink::Amber,
         _ => Ink::White,
     };
-    let mut groups: Vec<Vec<Run>> = vec![];
-    if let Some(r) = ctx_ring(g) {
-        groups.push(vec![
-            ("CTX ".into(), Ink::Dim, false),
-            (
-                format!("{}%", (r.share * 100.).round() as i64),
-                sev_ink(string(&g["ctx"]["sev"])),
-                true,
-            ),
-        ]);
+    let word = |label: &str, value: String, ink: Ink| -> Vec<Run> {
+        vec![(format!("{label} "), Ink::Dim, false), (value, ink, true)]
+    };
+    let mut first: Vec<Vec<Run>> = vec![];
+    let tokens = g["ctx"]["tokens"].as_f64().filter(|n| *n > 0.);
+    if let Some(t) = tokens {
+        let value = match g["ctx"]["size"].as_f64().filter(|n| *n > 0.) {
+            Some(size) => format!("{}/{}", short(t), short(size)),
+            None => short(t),
+        };
+        first.push(word("CTX", value, sev_ink(string(&g["ctx"]["sev"]))));
     }
-    if let Some(q) = array(&g["quotas"]).iter().find(|q| q["code"] == "5H") {
-        if let Some(used) = q["used"].as_f64() {
-            groups.push(vec![
-                ("5h ".into(), Ink::Dim, false),
-                (
-                    format!(
-                        "{}%{}",
-                        used.round() as i64,
-                        if super::text::ahead_of_pace(q) {
-                            "\u{bb}"
-                        } else {
-                            ""
-                        }
-                    ),
-                    sev_ink(string(&q["sev"])),
-                    true,
+    if tokens.is_some() {
+        if let Some(t) = g["trend"].as_f64().filter(|t| *t != 0.) {
+            first.push(vec![(
+                format!(
+                    "{}{}/{}",
+                    if t > 0. { "+" } else { "-" },
+                    short(t.abs()),
+                    if short_form { "t" } else { "turn" }
                 ),
-            ]);
-        }
-    }
-    let pay = string(&g["payback"]["text"]);
-    if truthy(&g["payback"]["text"]) && !truthy(&g["compacting"]) {
-        let words: Vec<&str> = pay
-            .trim_start_matches('\u{267b}')
-            .split_whitespace()
-            .collect();
-        if let Some(n) = words.first() {
-            let unit = match words.get(1).copied().unwrap_or("") {
-                u if u.starts_with("prompt") => "p",
-                u if u.starts_with("call") => "r",
-                _ => "",
-            };
-            groups.push(vec![(
-                format!("\u{267b} {}{unit}", n.trim_start_matches('~')),
-                Ink::Green,
-                true,
+                Ink::Dim,
+                false,
             )]);
         }
     }
-    if let Some(n) = dreams.filter(|n| *n > 0) {
-        groups.push(vec![(format!("\u{263e} {n}"), Ink::Lavender, true)]);
+    let pay = if g["compacting"].is_object() {
+        masthead::compacting_slot(&g["compacting"], false, true).0
+    } else {
+        string(&g["payback"]["text"]).to_owned()
+    };
+    if !pay.is_empty() {
+        let pay = if short_form {
+            pay.replace(" calls", "c")
+                .replace(" call", "c")
+                .replace(" prompts", "p")
+                .replace(" prompt", "p")
+        } else {
+            pay
+        };
+        let ink = match string(&g["payback"]["sev"]) {
+            "amber" => Ink::Amber,
+            "advisory" => Ink::Lavender,
+            _ => Ink::Green,
+        };
+        first.push(vec![(pay, ink, true)]);
     }
-    (!groups.is_empty()).then_some(Pill { groups })
+    if csr > 0 {
+        first.push(vec![(
+            format!("{csr} {}", if short_form { "CSR" } else { "by CSR" }),
+            Ink::Dim,
+            false,
+        )]);
+    }
+    let mut second: Vec<Vec<Run>> = vec![];
+    for q in array(&g["quotas"]).iter().filter(|q| q["used"].is_number()) {
+        let said = super::text::paced(q);
+        let said = if short_form {
+            said.split(" \u{21bb}").next().unwrap_or(&said).to_owned()
+        } else {
+            said
+        };
+        let (code, rest) = said.split_once(' ').unwrap_or(("", &said));
+        second.push(word(code, rest.to_owned(), sev_ink(string(&q["sev"]))));
+    }
+    let cache = string(&g["cache"]["text"]);
+    if cache != "CACHE --" && !cache.is_empty() {
+        let left = cache.strip_prefix("CACHE ").unwrap_or(cache);
+        second.push(vec![(
+            format!("\u{25f7} {left}"),
+            sev_ink(string(&g["cache"]["sev"])),
+            true,
+        )]);
+    }
+    let sts = string(&g["sts"]["sev"]);
+    if !sts.is_empty() {
+        second.push(vec![("STS".into(), sev_ink(sts), true)]);
+    }
+    if let Some(n) = dreams.filter(|n| *n > 0) {
+        second.push(vec![(format!("\u{263e} {n}"), Ink::Lavender, true)]);
+    }
+    [first, second]
+        .into_iter()
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+/// The collapsed masthead: the facts the text masthead shows, on two lines, at the largest size
+/// that fits `avail` points. `None` when it has nothing to say or cannot hold it all (the text
+/// rows stay, and they hold everything).
+pub fn pill_of(
+    g: &Value,
+    csr: usize,
+    dreams: Option<usize>,
+    avail: f32,
+    f: &CardFonts,
+) -> Option<Pill> {
+    // the dreams go first when room is short: they are on the info view's dreams card too
+    for (size, short_form, with_dreams) in [
+        (12., false, true),
+        (12., false, false),
+        (12., true, true),
+        (12., true, false),
+        (11., true, true),
+        (11., true, false),
+    ] {
+        let lines = pill_lines(g, csr, dreams.filter(|_| with_dreams), short_form);
+        if lines.is_empty() {
+            return None;
+        }
+        let pill = Pill { size, lines };
+        if pill_width(&pill, f) + 2. * MARGIN <= avail {
+            return Some(pill);
+        }
+    }
+    None
 }
 #[cfg(test)]
 mod tests {
@@ -1454,22 +1528,71 @@ mod tests {
         assert!(!found.variable && found.bold.is_none());
         assert_eq!(pick_family(only(&[]), "/home/me"), None);
     }
-    #[test]
-    fn a_pill_says_only_what_it_measured() {
-        assert!(pill_of(&json!({}), None).is_none());
-        let g = json!({
-            "ctx": {"tokens": 104000., "size": 200000., "sev": "normal"},
-            "quotas": [{"code": "5H", "used": 31., "sev": "normal", "pace": null}],
-            "payback": {"text": "\u{267b} ~3 calls"},
-        });
-        let p = pill_of(&g, Some(2)).unwrap();
-        let said: Vec<String> = p
-            .groups
+    fn full_gauges() -> Value {
+        json!({
+            "ctx": {"tokens": 170000., "size": 1000000., "sev": "normal"},
+            "trend": 22000.,
+            "payback": {"text": "\u{267b} ~3 calls", "sev": "normal"},
+            "quotas": [
+                {"code": "7D", "used": 62., "sev": "normal", "pace": 0.3, "text": "7D 62% \u{21bb}Sun 09:00"},
+                {"code": "5H", "used": 41., "sev": "normal", "pace": null, "text": "5H 41%"},
+            ],
+            "cache": {"text": "CACHE 57m", "sev": "normal"},
+            "sts": {"sev": "amber"},
+        })
+    }
+    fn said(p: &Pill) -> String {
+        p.lines
             .iter()
+            .flatten()
             .map(|g| g.iter().map(|r| r.0.as_str()).collect::<String>())
-            .collect();
-        assert_eq!(said, ["CTX 52%", "5h 31%", "\u{267b} 3r", "\u{263e} 2"]);
-        assert_eq!(pill_of(&g, None).unwrap().groups.len(), 3);
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+    #[test]
+    fn the_pill_keeps_every_fact_of_the_text_masthead_at_46_and_33_columns() {
+        let Some(f) = fonts() else {
+            eprintln!("no usable font: skipped");
+            return;
+        };
+        let g = full_gauges();
+        // the pane's picture width at that many columns, as draw_page works it out
+        for cols in [46usize, 33] {
+            let width = cols - 1;
+            let avail = (width - 1) as f32 * 16. / 2. - 8.;
+            let pill = pill_of(&g, 2, None, avail, f).unwrap_or_else(|| panic!("{cols} cols"));
+            let text = said(&pill);
+            eprintln!("{cols}: {text}");
+            for fact in [
+                "CTX 170k/1M",
+                "22k/",
+                "\u{267b} ~3",
+                "2 ",
+                "5H 41%",
+                "7D 62%",
+                "\u{25f7} 57m",
+                "STS",
+            ] {
+                assert!(text.contains(fact), "{cols} cols lost {fact:?}: {text}");
+            }
+            assert!(pill_cols(&pill, (16, 34), f) < width, "{cols}");
+        }
+        // the pace arrow rides the 7D reading
+        let mut ahead = g.clone();
+        ahead["quotas"][0]["used"] = json!(80.);
+        ahead["quotas"][0]["text"] = json!("7D 80% \u{21bb}Sun 09:00");
+        let pill = pill_of(&ahead, 0, None, 360., f).unwrap();
+        assert!(said(&pill).contains("7D 80%\u{bb}"), "{}", said(&pill));
+    }
+    #[test]
+    fn a_pill_fact_with_no_data_drops_and_no_data_means_no_pill() {
+        let Some(f) = fonts() else {
+            return;
+        };
+        assert!(pill_of(&json!({}), 0, None, 360., f).is_none());
+        let g = json!({"ctx": {"tokens": 88000., "size": 1000000., "sev": "normal"}});
+        let text = said(&pill_of(&g, 0, None, 360., f).unwrap());
+        assert_eq!(text, "CTX 88k/1M");
     }
     #[test]
     fn a_card_without_data_is_not_built() {
@@ -1549,8 +1672,11 @@ mod tests {
             }
         }
         let pill = pill_of(
-            &serde_json::json!({"ctx": {"tokens": 1., "size": 2.}}),
+            &serde_json::json!({"ctx": {"tokens": 1000., "size": 2000.}}),
+            0,
             Some(2),
+            400.,
+            f,
         )
         .unwrap();
         let start = std::time::Instant::now();
