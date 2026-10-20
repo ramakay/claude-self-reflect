@@ -55,8 +55,7 @@ impl MessageIndex {
     /// [`Self::raw_inputs`] when `raw`): the other three documents are never
     /// built, which on a large transcript is most of the memory. The inputs
     /// are byte-identical to the full index's. `limit` reads only the first
-    /// that many bytes of a Claude Code transcript (a snapshot of a file that
-    /// is still being appended to); it does not apply to plan or Codex files.
+    /// that many bytes (a snapshot of a file that is still being appended to).
     pub(super) fn read_inputs_only(
         path: &Path,
         conversation_id: &str,
@@ -123,7 +122,17 @@ impl MessageIndex {
             Document::default(),
         ];
         if plan {
-            let text = std::fs::read_to_string(path)?;
+            let text = match limit {
+                Some(limit) => {
+                    let mut text = String::new();
+                    std::io::Read::read_to_string(
+                        &mut std::io::Read::take(std::fs::File::open(path)?, limit),
+                        &mut text,
+                    )?;
+                    text
+                }
+                None => std::fs::read_to_string(path)?,
+            };
             let mtime: chrono::DateTime<chrono::Utc> = std::fs::metadata(path)?.modified()?.into();
             let message =
                 serde_json::json!({"uuid":content_hash(&text),"timestamp":mtime.to_rfc3339()});
@@ -235,7 +244,7 @@ impl MessageIndex {
                 Ok(())
             };
             if codex {
-                super::codex_rollout::visit_raw_rollout_messages(path, |message| {
+                super::codex_rollout::visit_raw_rollout_messages(path, limit, |message| {
                     let offset = message
                         .get("_csr_receipt_ref")
                         .and_then(|v| v.as_str())

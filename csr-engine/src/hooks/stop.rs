@@ -1399,12 +1399,12 @@ fn episode_support(
 /// ("never measured") without the Stop hook itself ever failing.
 fn scan_instrumentation(
     transcript_path: &Path,
+    limit: u64,
 ) -> Option<crate::transcript::instrumentation::SessionInstrumentation> {
-    let metadata = std::fs::metadata(transcript_path).ok()?;
-    if metadata.len() > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
+    if limit > crate::transcript::instrumentation::MAX_TRANSCRIPT_SCAN_BYTES {
         return None;
     }
-    let parsed = crate::transcript::parse_transcript(transcript_path).ok()?;
+    let parsed = crate::transcript::parse_transcript_limited(transcript_path, limit).ok()?;
     Some(crate::transcript::instrumentation::from_parsed(&parsed))
 }
 
@@ -1463,7 +1463,7 @@ pub async fn extract_and_store_episode(
     // malformed content — leaves the fields `None` ("never measured")
     // rather than ever failing the hook (repo CLAUDE.md: hooks must never
     // block Claude Code; plan §8 R4).
-    if let Some(instrumentation) = scan_instrumentation(&tp) {
+    if let Some(instrumentation) = scan_instrumentation(&tp, snapshot_len) {
         episode.error_count = Some(instrumentation.error_count);
         episode.top_errors = instrumentation.top_errors;
         episode.steer_count = Some(instrumentation.steer_count);
@@ -3027,7 +3027,7 @@ mod tests {
         .unwrap();
 
         // File present at the point the caller would normally scan it.
-        assert!(scan_instrumentation(&transcript).is_some());
+        assert!(scan_instrumentation(&transcript, 1 << 20).is_some());
 
         // The transcript vanishes between the hook's initial existence
         // check/read and a later instrumentation scan attempt (real-world
@@ -3038,7 +3038,7 @@ mod tests {
         // `None` while still storing the rest of the episode. Hooks must
         // never block Claude Code (repo CLAUDE.md).
         std::fs::remove_file(&transcript).unwrap();
-        assert!(scan_instrumentation(&transcript).is_none());
+        assert!(scan_instrumentation(&transcript, 1 << 20).is_none());
     }
 
     /// Assistant tool_use line with an explicit block id and free-form input.
@@ -4507,11 +4507,14 @@ mod tests {
         expected_episode.timestamp.clear();
         let expected_episode = serde_json::to_string(&expected_episode).unwrap();
 
-        let appended: [&[u8]; 3] = [
+        let appended: [&[u8]; 4] = [
             // a whole new row that would add a tool, a file and a message
             br#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Write","input":{"file_path":"/src/late.rs"}}]}}
 "#,
             b"\xff\xfe\n",
+            // a failed tool result that instrumentation would count
+            br#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"late","is_error":true,"content":"late failure"}]}}
+"#,
             // the start of a row still being written
             br#"{"type":"user","message":{"content":"half"#,
         ];
@@ -4525,6 +4528,11 @@ mod tests {
                 "{:?}",
                 crate::import::transcript_inputs(&storage, &live, "s").unwrap()
             );
+            let scan = |path: &Path, limit: u64| {
+                let found = scan_instrumentation(path, limit).unwrap();
+                (found.error_count, format!("{:?}", found.top_errors))
+            };
+            let expected_scan = scan(&live, snapshot_len);
             let inputs =
                 crate::import::transcript_inputs_limited(&storage, &live, "s", snapshot_len)
                     .unwrap();
@@ -4539,6 +4547,7 @@ mod tests {
             episode.timestamp.clear();
             assert_eq!(serde_json::to_string(&episode).unwrap(), expected_episode);
             assert_eq!(format!("{inputs:?}"), expected_inputs);
+            assert_eq!(scan(&live, snapshot_len), expected_scan);
             // and a provenance read taken after the append is also capped
             let late = crate::import::transcript_inputs_limited(&storage, &live, "s", snapshot_len)
                 .unwrap();

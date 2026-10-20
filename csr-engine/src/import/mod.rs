@@ -4060,4 +4060,58 @@ mod tests {
         assert_eq!(total, 4);
         assert!(by_kind.contains(&("stripe_key".to_string(), 1)));
     }
+
+    fn joined_input_text(inputs: &crate::storage::artifact_provenance::InputEnvelope) -> String {
+        inputs
+            .inputs()
+            .iter()
+            .map(|input| input.text())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// `transcript_inputs_limited` reads a plan file's first `limit` bytes only.
+    #[test]
+    fn limited_inputs_cap_a_plan_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let plan = temp.path().join("plan.md");
+        std::fs::write(&plan, "ABCDEF").unwrap();
+        let full = transcript_inputs(&storage, &plan, "plan:x").unwrap();
+        assert!(joined_input_text(&full).contains("ABCDEF"));
+        let capped = transcript_inputs_limited(&storage, &plan, "plan:x", 3).unwrap();
+        let text = joined_input_text(&capped);
+        assert!(text.contains("ABC"), "{text}");
+        assert!(!text.contains("ABCD"), "{text}");
+        assert!(!text.contains("DEF"), "{text}");
+    }
+
+    /// `transcript_inputs_limited` reads a Codex rollout's first `limit` bytes only.
+    #[test]
+    fn limited_inputs_cap_a_codex_rollout() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open_memory().unwrap();
+        let rollout = temp.path().join("rollout-limit.jsonl");
+        let first = r#"{"timestamp":"2026-09-01T09:00:02Z","type":"response_item","payload":{"type":"message","id":"user-1","role":"user","content":[{"type":"input_text","text":"first request"}]}}"#;
+        let second = r#"{"timestamp":"2026-09-01T09:00:03Z","type":"response_item","payload":{"type":"message","id":"assistant-1","role":"assistant","content":[{"type":"output_text","text":"second reply"}]}}"#;
+        std::fs::write(&rollout, format!("{first}\n{second}\n")).unwrap();
+        let full = transcript_inputs_limited(&storage, &rollout, "c", u64::MAX).unwrap();
+        let text = joined_input_text(&full);
+        assert!(
+            text.contains("first request") && text.contains("second reply"),
+            "{text}"
+        );
+        let one =
+            transcript_inputs_limited(&storage, &rollout, "c", first.len() as u64 + 1).unwrap();
+        let text = joined_input_text(&one);
+        assert!(
+            text.contains("first request") && !text.contains("second reply"),
+            "{text}"
+        );
+        let none = transcript_inputs_limited(&storage, &rollout, "c", 0).unwrap();
+        assert!(
+            !joined_input_text(&none).contains("first request"),
+            "a zero limit must read nothing"
+        );
+    }
 }

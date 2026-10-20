@@ -227,6 +227,15 @@ pub fn parse_mirrored_transcript(path: &Path) -> Result<ParsedTranscript> {
     Ok(parsed)
 }
 
+/// [`parse_transcript`] over the first `limit` bytes only, for a caller that
+/// took the file's length earlier and must not see rows appended since.
+pub fn parse_transcript_limited(path: &Path, limit: u64) -> Result<ParsedTranscript> {
+    use std::io::Read;
+    let file =
+        File::open(path).with_context(|| format!("opening transcript {}", path.display()))?;
+    Ok(parse_transcript_reader(BufReader::new(file.take(limit))))
+}
+
 pub(crate) fn parse_transcript_fragment(raw: &str) -> ParsedTranscript {
     parse_transcript_reader(BufReader::new(raw.as_bytes()))
 }

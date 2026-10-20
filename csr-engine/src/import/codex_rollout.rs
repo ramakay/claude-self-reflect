@@ -182,20 +182,23 @@ fn visit_rollout_messages<F>(
 where
     F: FnMut(serde_json::Value) -> Result<()>,
 {
-    visit_rollout_messages_inner(path, true, visit)
+    visit_rollout_messages_inner(path, true, None, visit)
 }
 
-pub(super) fn visit_raw_rollout_messages<F>(path: &Path, visit: F) -> Result<()>
+/// `limit` reads only the first that many bytes, for a caller that took the
+/// file's length earlier and must not see rows appended since.
+pub(super) fn visit_raw_rollout_messages<F>(path: &Path, limit: Option<u64>, visit: F) -> Result<()>
 where
     F: FnMut(serde_json::Value) -> Result<()>,
 {
-    visit_rollout_messages_inner(path, false, visit)?;
+    visit_rollout_messages_inner(path, false, limit, visit)?;
     Ok(())
 }
 
 fn visit_rollout_messages_inner<F>(
     path: &Path,
     sanitize: bool,
+    limit: Option<u64>,
     mut visit: F,
 ) -> Result<Option<(RolloutMetadata, RolloutStreamOutcome)>>
 where
@@ -215,7 +218,11 @@ where
     let mut is_subagent = false;
     let mut sanitizer = super::CsrMessageSanitizer::for_chunks();
 
-    let mut reader = BufReader::new(file);
+    let source: Box<dyn std::io::Read> = match limit {
+        Some(limit) => Box::new(std::io::Read::take(file, limit)),
+        None => Box::new(file),
+    };
+    let mut reader = BufReader::new(source);
     let mut byte_offset = 0u64;
     loop {
         let line_start = byte_offset;
